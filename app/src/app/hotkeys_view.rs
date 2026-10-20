@@ -251,6 +251,11 @@ impl TerminalApp {
                 ui,
                 "help-panels",
                 &[
+                    (&["UNIV"], "Whats-News archive: last bar date, STALE and MISSING coverage"),
+                    (
+                        &["SCAN DARVAS_BREAKOUT", "SCAN NEAR_HIGH"],
+                        "Scan archived bars; click a result for its archived chart",
+                    ),
                     (&["WEI"], "World markets overview"),
                     (&["GC"], "US Treasury yield curve"),
                     (&["N", "AAPL CN"], "News headlines (for a security)"),

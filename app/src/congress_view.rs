@@ -13,6 +13,7 @@ use crate::worker::Profile;
 #[derive(Debug, Clone, PartialEq)]
 pub enum Action {
     OpenChart(String),
+    OpenArchiveChart(String),
     OpenTicker(String),
     OpenProfile(String),
     Track(String, bool),

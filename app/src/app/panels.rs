@@ -61,6 +61,13 @@ impl TerminalApp {
                     self.search_pending = Some((query.clone(), Instant::now()));
                 }
             }
+            PaneKind::Research(r) => {
+                let (a, refresh) = r.show(ui);
+                actions.extend(a);
+                if refresh {
+                    r.request(id, &self.worker);
+                }
+            }
             PaneKind::News(n) => {
                 let offline = self.provider.eq_ignore_ascii_case("sample");
                 if let Some(refresh) = news(ui, n, offline) {

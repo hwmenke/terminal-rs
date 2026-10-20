@@ -27,6 +27,15 @@ pub type PaneId = u64;
 pub const CONGRESS_REFRESH_MIN: u64 = 30;
 
 pub enum Request {
+    Research {
+        pane: PaneId,
+        scan: Option<String>,
+    },
+    ArchiveHistory {
+        pane: PaneId,
+        generation: u64,
+        symbol: String,
+    },
     /// Load the brokerage portfolio through SnapTrade (`None` = the simulated sample).
     Portfolio(Option<tr_broker::Credentials>),
     /// Register a SnapTrade user under the partner keys.
@@ -198,6 +207,14 @@ pub struct Profile {
 }
 
 pub enum Response {
+    Universe {
+        pane: PaneId,
+        result: Result<tr_data::whats_news::Snapshot<Vec<tr_data::whats_news::Symbol>>, String>,
+    },
+    Scan {
+        pane: PaneId,
+        result: Result<tr_data::whats_news::Snapshot<tr_data::whats_news::Scan>, String>,
+    },
     Portfolio(Result<Box<tr_broker::Portfolio>, String>),
     /// `(userId, userSecret)` for a newly registered SnapTrade user.
     BrokerRegistered(Result<(String, String), String>),
@@ -376,6 +393,14 @@ impl Worker {
         Ok(Self { tx, rx, _rt: rt })
     }
 
+    #[cfg(test)]
+    pub(crate) fn test_channel() -> (Self, tokio::sync::mpsc::UnboundedReceiver<Request>) {
+        let (tx, requests) = tokio::sync::mpsc::unbounded_channel();
+        let (_out, rx) = mpsc::channel();
+        let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
+        (Self { tx, rx, _rt: rt }, requests)
+    }
+
     pub fn send(&self, req: Request) {
         let _ = self.tx.send(req);
     }
@@ -481,6 +506,41 @@ pub fn initial_limit(tf: Timeframe) -> usize {
 
 async fn handle(s: &Arc<Shared>, req: Request) {
     match req {
+        Request::Research { pane, scan } => {
+            let bridge = tr_data::whats_news::Bridge::from_env();
+            if let Some(name) = scan {
+                s.send(Response::Scan { pane, result: bridge.scan(&name).await.map_err(|e| format!("{e:#}")) });
+            } else {
+                s.send(Response::Universe { pane, result: bridge.universe().await.map_err(|e| format!("{e:#}")) });
+            }
+        }
+        Request::ArchiveHistory { pane, generation, symbol } => {
+            if !claim_series(s, pane, generation) {
+                return;
+            }
+            match tr_data::whats_news::Bridge::from_env().bars(&symbol).await {
+                Ok(snapshot) => {
+                    let bars = Arc::new(snapshot.data);
+                    if !store_series(s, pane, generation, bars.clone()) {
+                        return;
+                    }
+                    let gpu = build_gpu(bars.clone()).await;
+                    s.send(Response::History {
+                        pane,
+                        generation,
+                        symbol: tr_data::security(&symbol).key(),
+                        tf: Timeframe::D1,
+                        bars,
+                        gpu,
+                        prepended: 0,
+                        from_cache: false,
+                        exhausted: true,
+                        live: false,
+                    });
+                }
+                Err(e) => s.send(Response::HistoryError { pane, generation, error: format!("{e:#}") }),
+            }
+        }
         Request::History { pane, generation, symbol, tf, limit } => {
             if !claim_series(s, pane, generation) {
                 return; // a newer load for this pane is already running

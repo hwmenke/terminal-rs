@@ -12,6 +12,7 @@ mod options_view;
 mod palette_view;
 mod panels;
 mod portfolio_view;
+mod research;
 mod settings_view;
 mod theming;
 mod trading;
@@ -61,6 +62,7 @@ pub enum PaneKind {
     },
     Politicians,
     Alerts,
+    Research(Box<research::ResearchPane>),
     Watchlist,
     Help,
     Wei,
@@ -175,6 +177,9 @@ impl PaneKind {
             }
             PaneKind::Politicians => "Politicians".into(),
             PaneKind::Alerts => "Alerts".into(),
+            PaneKind::Research(r) => {
+                r.scan.as_ref().map(|s| format!("Scan: {s}")).unwrap_or_else(|| "Archive universe".into())
+            }
             PaneKind::Watchlist => "Watchlist".into(),
             PaneKind::Help => "Help".into(),
             PaneKind::Wei => "World Markets".into(),
@@ -199,6 +204,13 @@ impl PaneKind {
             PaneKind::Feed { .. } | PaneKind::Ticker { .. } => "CONG",
             PaneKind::Profile { .. } | PaneKind::Politicians => "POL",
             PaneKind::Alerts => "ALRT",
+            PaneKind::Research(r) => {
+                if r.scan.is_some() {
+                    "SCAN"
+                } else {
+                    "UNIV"
+                }
+            }
             PaneKind::Watchlist => "WL",
             PaneKind::Help => "HELP",
             PaneKind::Wei => "WEI",
@@ -238,6 +250,7 @@ impl PaneKind {
     fn settings(&self) -> PaneSettings {
         match self {
             PaneKind::Chart(c) => PaneSettings::Chart {
+                archive: c.archive,
                 symbol: c.symbol.clone(),
                 tf: c.tf,
                 chart_type: c.chart_type,
@@ -256,6 +269,7 @@ impl PaneKind {
             PaneKind::Profile { query, .. } => PaneSettings::Profile(query.clone()),
             PaneKind::Politicians => PaneSettings::Politicians,
             PaneKind::Alerts => PaneSettings::Alerts,
+            PaneKind::Research(r) => PaneSettings::Research(r.scan.clone()),
             PaneKind::Watchlist => PaneSettings::Watchlist,
             PaneKind::Help => PaneSettings::Help,
             PaneKind::Wei => PaneSettings::Wei,
@@ -282,6 +296,7 @@ impl PaneKind {
     fn from_settings(p: PaneSettings) -> PaneKind {
         match p {
             PaneSettings::Chart {
+                archive,
                 symbol,
                 tf,
                 chart_type,
@@ -294,6 +309,7 @@ impl PaneKind {
                 magnet,
             } => {
                 let mut c = ChartState::new(0, &symbol, tf);
+                c.archive = archive;
                 c.chart_type = chart_type;
                 c.log = log;
                 c.indicators = indicators;
@@ -309,6 +325,7 @@ impl PaneKind {
             PaneSettings::Profile(q) => PaneKind::Profile { query: q, data: None, loading: true },
             PaneSettings::Politicians => PaneKind::Politicians,
             PaneSettings::Alerts => PaneKind::Alerts,
+            PaneSettings::Research(scan) => PaneKind::Research(Box::new(research::ResearchPane::new(scan))),
             PaneSettings::Watchlist => PaneKind::Watchlist,
             PaneSettings::Help => PaneKind::Help,
             PaneSettings::Wei => PaneKind::Wei,
@@ -705,6 +722,11 @@ impl TerminalApp {
     fn run_actions(&mut self, actions: Vec<Action>) {
         for a in actions {
             match a {
+                Action::OpenArchiveChart(s) => {
+                    let mut c = ChartState::new(0, &s, tr_core::Timeframe::D1);
+                    c.archive = true;
+                    self.open_panel(PaneKind::Chart(Box::new(c)));
+                }
                 Action::OpenChart(s) => self.open_security(&s),
                 Action::OpenTicker(s) => {
                     self.open_panel(PaneKind::Ticker { symbol: s, trades: Vec::new(), loading: true })
@@ -808,6 +830,10 @@ impl TerminalApp {
                 self.open_panel(PaneKind::Alerts);
             }
             Function::Refresh => self.worker.send(Request::RefreshCongress),
+            Function::Universe => self.open_panel(PaneKind::Research(Box::new(research::ResearchPane::new(None)))),
+            Function::Scan(name) => {
+                self.open_panel(PaneKind::Research(Box::new(research::ResearchPane::new(Some(name)))))
+            }
             Function::Watchlist => self.open_panel(PaneKind::Watchlist),
             Function::WatchAdd(words) => {
                 for key in keys_from_words(&words) {
@@ -935,6 +961,28 @@ impl TerminalApp {
     fn drain(&mut self) {
         while let Ok(r) = self.worker.rx.try_recv() {
             match r {
+                Response::Universe { pane, result } => {
+                    if let Some(PaneKind::Research(r)) =
+                        self.panes.iter_mut().find(|p| p.id == pane).map(|p| &mut p.kind)
+                    {
+                        r.loading = false;
+                        match result {
+                            Ok(data) => r.universe = Some(data),
+                            Err(e) => r.error = Some(e),
+                        }
+                    }
+                }
+                Response::Scan { pane, result } => {
+                    if let Some(PaneKind::Research(r)) =
+                        self.panes.iter_mut().find(|p| p.id == pane).map(|p| &mut p.kind)
+                    {
+                        r.loading = false;
+                        match result {
+                            Ok(data) => r.results = Some(data),
+                            Err(e) => r.error = Some(e),
+                        }
+                    }
+                }
                 Response::History {
                     pane,
                     generation,
@@ -1613,6 +1661,13 @@ mod tests {
             PaneSettings::Search("gold".into()),
             PaneSettings::Settings,
             PaneSettings::Wei,
+            PaneSettings::Research(None),
+            PaneSettings::Research(Some("DARVAS_BREAKOUT".into())),
+            {
+                let mut c = ChartState::new(0, "AAPL", tr_core::Timeframe::D1);
+                c.archive = true;
+                PaneKind::Chart(Box::new(c)).settings()
+            },
         ] {
             assert_eq!(PaneKind::from_settings(s.clone()).settings(), s);
         }

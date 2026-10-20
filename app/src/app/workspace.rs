@@ -367,6 +367,10 @@ impl TerminalApp {
 
     fn init_kind(&mut self, id: PaneId, kind: PaneKind) -> PaneKind {
         match kind {
+            PaneKind::Research(mut r) => {
+                r.request(id, &self.worker);
+                PaneKind::Research(r)
+            }
             PaneKind::Chart(mut c) => {
                 c.id = id;
                 c.load(&self.worker);
@@ -667,6 +671,10 @@ impl TerminalApp {
                 current.as_deref().unwrap_or("AAPL US Equity"),
                 d,
             )),
+            "UNIV" => PaneKind::Research(Box::new(super::research::ResearchPane::new(None))),
+            "SCAN" => PaneKind::Research(Box::new(super::research::ResearchPane::new(Some(
+                words[1..].join(" ").to_ascii_uppercase(),
+            )))),
             "WL" | "WATCHLIST" | "W" => PaneKind::Watchlist,
             "NEWS" | "N" | "CN" | "TOP" => PaneKind::News(Box::new(NewsPane::new(current))),
             "BOOK" | "OB" | "DEPTH" | "DOM" => {
