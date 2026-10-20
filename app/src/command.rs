@@ -228,6 +228,8 @@ pub enum Function {
     Untrack(String),
     Alerts,
     Refresh,
+    Universe,
+    Scan(String),
     Watchlist,
     WatchAdd(Vec<String>),
     WatchRemove(Vec<String>),
@@ -308,6 +310,8 @@ fn parse_function(head: &str, rest: &[&str]) -> Option<Function> {
         "VL" | "VLINE" => Function::Draw(Tool::Vertical),
         "FIB" => Function::Draw(Tool::Fib),
         "MAGNET" | "MAG" => Function::Magnet,
+        "UNIV" if rest.is_empty() => Function::Universe,
+        "SCAN" => Function::Scan(words().join(" ")),
         "CONG" | "CONGRESS" => Function::Congress,
         "POL" | "PROFILE" => Function::Politician(joined()),
         "TRACK" => Function::Track(joined()),
@@ -461,6 +465,8 @@ fn describe(f: &Function) -> String {
         Function::Untrack(n) => format!("Stop tracking {n}"),
         Function::Alerts => "Alerts".into(),
         Function::Refresh => "Refresh congressional disclosures now".into(),
+        Function::Universe => "Browse Whats-News archive coverage".into(),
+        Function::Scan(name) => format!("Scan Whats-News archive: {name}"),
         Function::Watchlist => "Watchlist".into(),
         Function::WatchAdd(s) => format!("Add {} to watchlist", s.join(", ")),
         Function::WatchRemove(s) => format!("Remove {} from watchlist", s.join(", ")),
@@ -570,6 +576,13 @@ mod tests {
         assert_eq!(parse("YTD"), Some(Command::Function(Function::Range(Range::Ytd))));
         assert_eq!(parse("RANGE 5D"), Some(Command::Function(Function::Range(Range::D5))));
         assert_eq!(Range::Y5.timeframe(), Timeframe::W1);
+    }
+
+    #[test]
+    fn research_commands() {
+        assert_eq!(parse("UNIV <GO>"), Some(Command::Function(Function::Universe)));
+        assert_eq!(parse("scan darvas_breakout"), Some(Command::Function(Function::Scan("DARVAS_BREAKOUT".into()))));
+        assert_eq!(parse("SCAN"), Some(Command::Function(Function::Scan(String::new()))));
     }
 
     #[test]

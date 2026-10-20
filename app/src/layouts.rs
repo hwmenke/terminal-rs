@@ -57,6 +57,8 @@ impl Link {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum PaneSettings {
     Chart {
+        #[serde(default)]
+        archive: bool,
         symbol: String,
         tf: Timeframe,
         chart_type: ChartType,
@@ -77,6 +79,7 @@ pub enum PaneSettings {
     Profile(String),
     Politicians,
     Alerts,
+    Research(Option<String>),
     Watchlist,
     Help,
     Wei,
@@ -263,6 +266,7 @@ impl LayoutDoc {
 
 pub fn chart_settings(symbol: &str, d: &crate::prefs::PanelDefaults) -> PaneSettings {
     PaneSettings::Chart {
+        archive: false,
         symbol: symbol.into(),
         tf: d.timeframe,
         chart_type: d.chart_type,

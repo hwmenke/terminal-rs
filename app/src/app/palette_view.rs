@@ -39,6 +39,8 @@ const COMMANDS: &[(&str, &str, &str, Option<Action>)] = &[
     ("OB", "", "order book depth dom", None),
     ("WEI", "", "world equity indices markets", None),
     ("GC", "", "yield curve treasury rates", None),
+    ("UNIV", "Whats-News archive universe", "coverage stale missing research", None),
+    ("SCAN DARVAS_BREAKOUT", "Scan archived Darvas breakouts", "whats-news research setups", None),
     ("SECF", "Security search", "search find", None),
     ("LAYOUTS", "", "saved layouts workspaces", None),
     ("LAYOUT NEW", "Start a new saved layout", "workspace", None),

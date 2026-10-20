@@ -70,6 +70,7 @@ struct DrawState {
 
 pub struct ChartState {
     pub id: PaneId,
+    pub archive: bool,
     pub symbol: String,
     pub tf: Timeframe,
     pub chart_type: ChartType,
@@ -121,6 +122,7 @@ impl ChartState {
     pub fn new(id: PaneId, symbol: &str, tf: Timeframe) -> Self {
         Self {
             id,
+            archive: false,
             symbol: tr_data::security(symbol).key(),
             tf,
             chart_type: if tr_data::security(symbol).class == AssetClass::Govt {
@@ -184,6 +186,17 @@ impl ChartState {
         self.bars = Arc::new(Vec::new());
         self.gpu = None;
         self.built.clear();
+        self.last_live = None;
+        if self.archive {
+            self.tf = Timeframe::D1;
+            self.compare = None;
+            w.send(Request::ArchiveHistory {
+                pane: self.id,
+                generation: self.generation,
+                symbol: self.sec.ticker.clone(),
+            });
+            return;
+        }
         w.send(Request::History {
             pane: self.id,
             generation: self.generation,
@@ -191,7 +204,6 @@ impl ChartState {
             tf: self.tf,
             limit: initial_limit(self.tf),
         });
-        self.last_live = None;
         if self.sec.has_congress_trades() {
             w.send(Request::Markers { pane: self.id, symbol: self.symbol.clone() });
         }
@@ -211,6 +223,10 @@ impl ChartState {
     }
 
     pub fn set_timeframe(&mut self, tf: Timeframe, w: &Worker) {
+        if self.archive && tf != Timeframe::D1 {
+            self.error = Some("Whats-News archive charts support daily bars only".into());
+            return;
+        }
         if tf != self.tf {
             self.tf = tf;
             self.load(w);
@@ -219,7 +235,7 @@ impl ChartState {
 
     pub fn set_range(&mut self, r: Range, w: &Worker) {
         self.pending_range = Some(r);
-        if r.timeframe() != self.tf {
+        if !self.archive && r.timeframe() != self.tf {
             self.tf = r.timeframe();
             self.load(w);
         } else {
@@ -280,6 +296,10 @@ impl ChartState {
     }
 
     pub fn set_compare(&mut self, symbol: Option<String>, w: &Worker) {
+        if self.archive {
+            self.error = Some("Comparisons require a regular market chart".into());
+            return;
+        }
         self.compare = symbol;
         self.compare_line = None;
         self.request_compare(w);
@@ -375,6 +395,9 @@ impl ChartState {
     }
 
     fn request_compare(&self, w: &Worker) {
+        if self.archive {
+            return;
+        }
         if let (Some(sym), false) = (&self.compare, self.bars.is_empty()) {
             w.send(Request::Compare {
                 pane: self.id,
@@ -584,6 +607,15 @@ impl ChartState {
                     }
                 });
             }
+        }
+        if self.archive {
+            painter.text(
+                pos2(rect.right() - AXIS_W - 8.0, header.bottom() + 10.0),
+                Align2::RIGHT_TOP,
+                "WHATS-NEWS ARCHIVE · DAILY",
+                ui_font(10.0),
+                amber(),
+            );
         }
         if self.last_live.is_some_and(|t| t.elapsed().as_secs() < 5) {
             // Pulsing live dot in the plot's top-right corner (clear of the price axis labels).
@@ -1438,6 +1470,26 @@ fn hover_card(ui: &Ui, at: Pos2, t: &Trade) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn archive_charts_never_request_market_data() {
+        let (worker, mut requests) = Worker::test_channel();
+        let mut chart = ChartState::new(42, "AAPL", Timeframe::M5);
+        chart.archive = true;
+        chart.load(&worker);
+        assert!(matches!(requests.try_recv(), Ok(Request::ArchiveHistory { pane:42, symbol, .. }) if symbol == "AAPL"));
+        assert!(requests.try_recv().is_err(), "No market history, live feed, or marker requests");
+        chart.set_timeframe(Timeframe::W1, &worker);
+        chart.set_range(Range::M1, &worker);
+        chart.set_compare(Some("SPY".into()), &worker);
+        chart.request_compare(&worker);
+        assert_eq!(chart.tf, Timeframe::D1);
+        assert!(chart.compare.is_none());
+        assert!(
+            requests.try_recv().is_err(),
+            "Timeframes, ranges and comparisons cannot fall back to market providers"
+        );
+    }
 
     #[test]
     fn glide_pans_linearly_and_zooms_evenly() {

@@ -19,6 +19,7 @@ pub mod markets;
 pub mod rss;
 pub mod sample;
 pub mod treasury;
+pub mod whats_news;
 pub mod yahoo;
 
 use std::sync::Arc;
