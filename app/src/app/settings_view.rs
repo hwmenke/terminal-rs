@@ -207,29 +207,10 @@ impl TerminalApp {
 
     pub(super) fn refresh_whats_news_panes(&mut self) {
         self.command_catalogue = Default::default();
-        let connected = self.whats_news_health.connected();
-        let message = self.whats_news_health.message.clone();
         for pane in &mut self.panes {
             match &mut pane.kind {
-                super::PaneKind::Research(r) => {
-                    if connected {
-                        r.request(pane.id, &self.worker);
-                    } else {
-                        r.generation += 1;
-                        if r.scan.is_some() {
-                            r.accept_scan(Err(message.clone()));
-                        } else {
-                            r.accept_universe(Err(message.clone()));
-                        }
-                    }
-                }
-                super::PaneKind::Chart(c) if c.archive => {
-                    if connected {
-                        c.load(&self.worker);
-                    } else {
-                        c.archive_disconnected(&message, &self.worker);
-                    }
-                }
+                super::PaneKind::Research(r) => r.request(pane.id, &self.worker),
+                super::PaneKind::Chart(c) if c.archive => c.load(&self.worker),
                 _ => {}
             }
         }
@@ -865,7 +846,9 @@ mod connection_tests {
         let dropped = Health { state: LinkState::Disconnected, message: message.into(), ..connected.clone() };
         out.send(Response::WhatsNewsHealth { epoch: 1, health: dropped }).unwrap();
         app.drain();
-        assert_eq!(research(&app), (false, Some(message.into()), false));
+        assert_eq!(research(&app), (true, None, false));
+        // Local archive remains available when Whats-News drops; worker rechecks both.
+        assert!(matches!(requests.try_recv(), Ok(Request::Research { pane: id, .. }) if id == pane));
         out.send(Response::WhatsNewsHealth { epoch: 1, health: connected }).unwrap();
         app.drain();
         assert_eq!(research(&app), (true, None, false));

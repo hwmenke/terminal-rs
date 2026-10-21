@@ -27,6 +27,8 @@ pub type PaneId = u64;
 pub const CONGRESS_REFRESH_MIN: u64 = 30;
 
 pub enum Request {
+    HistoryStatus,
+    HistoryTask(String),
     ConfigureWhatsNews {
         epoch: u64,
         config: tr_data::whats_news::Config,
@@ -41,6 +43,7 @@ pub enum Request {
         pane: PaneId,
         generation: u64,
         symbol: String,
+        tf: Timeframe,
     },
     /// Load the brokerage portfolio through SnapTrade (`None` = the simulated sample).
     Portfolio(Option<tr_broker::Credentials>),
@@ -214,6 +217,8 @@ pub struct Profile {
 }
 
 pub enum Response {
+    HistoryStatus(Result<tr_data::history::Status, String>),
+    HistoryChanged,
     WhatsNews {
         epoch: u64,
         response: Box<Response>,
@@ -324,6 +329,7 @@ pub struct Worker {
 type SeriesMap = HashMap<PaneId, (u64, Arc<Vec<Bar>>)>;
 
 struct Shared {
+    history: Arc<tr_data::history::Service>,
     whats_news: tokio::sync::watch::Sender<(u64, tr_data::whats_news::Config)>,
     provider: Provider,
     /// Authoritative bars per chart pane (history, paging and live ticks all merge here),
@@ -377,6 +383,11 @@ impl Worker {
         let (whats_news, _) =
             tokio::sync::watch::channel((0, crate::prefs::Prefs::load(&dir.join("prefs.json")).whats_news));
         let shared = Arc::new(Shared {
+            history: Arc::new(tr_data::history::Service::new(
+                tr_data::history::Archive::open(dir.join("history.sqlite3"))?,
+                Arc::new(tr_data::yahoo::YahooProvider::new()?),
+                Default::default(),
+            )),
             whats_news,
             provider,
             series: Default::default(),
@@ -566,14 +577,144 @@ pub fn initial_limit(tf: Timeframe) -> usize {
     std::env::var("TR_HISTORY_LIMIT").ok().and_then(|v| v.parse().ok()).unwrap_or_else(|| default_limit(tf))
 }
 
+async fn research_universe(
+    s: &Shared,
+    bridge: &tr_data::whats_news::Bridge,
+) -> anyhow::Result<tr_data::whats_news::Snapshot<Vec<tr_data::whats_news::Symbol>>> {
+    let local = s.history.db(|db| db.universe()).await?;
+    let external = bridge.universe().await;
+    if local.data.is_empty() {
+        return external;
+    }
+    let mut rows = std::collections::BTreeMap::new();
+    let mut source = local.source.clone();
+    match external {
+        Ok(wn) => {
+            source.push_str(&format!(" + {}", wn.source));
+            for row in wn.data {
+                rows.insert(row.symbol.clone(), row);
+            }
+        }
+        Err(e) if bridge.enabled => source.push_str(&format!(" · Whats-News unavailable: {e}")),
+        _ => {}
+    }
+    for row in local.data {
+        if row.last_date.is_some() || !rows.contains_key(&row.symbol) {
+            rows.insert(row.symbol.clone(), row);
+        }
+    }
+    Ok(tr_data::whats_news::Snapshot {
+        data: rows.into_values().collect(),
+        source,
+        provenance: tr_core::Provenance::Cached,
+    })
+}
+async fn research_scan(
+    s: &Shared,
+    bridge: &tr_data::whats_news::Bridge,
+    name: &str,
+) -> anyhow::Result<tr_data::whats_news::Snapshot<tr_data::whats_news::Scan>> {
+    use futures::StreamExt;
+    // Preserve service-only RSI scans until the local scanner supports them.
+    if name.starts_with("RSI_") {
+        return bridge.scan(name).await;
+    }
+    let local = s
+        .history
+        .db(|db| {
+            db.universe()?
+                .data
+                .into_iter()
+                .map(|row| Ok((row.symbol.clone(), db.daily(&row.symbol)?)))
+                .collect::<anyhow::Result<std::collections::BTreeMap<_, _>>>()
+        })
+        .await?;
+    if local.is_empty() {
+        return bridge.scan(name).await;
+    }
+    if !tr_data::whats_news::SETUPS.contains(&name) {
+        anyhow::bail!("Unknown scan {name}");
+    }
+    let mut histories = local;
+    let mut source = "Local Yahoo daily research archive".to_string();
+    if bridge.enabled {
+        match bridge.universe().await {
+            Ok(external) => {
+                source.push_str(&format!(" + {}", external.source));
+                let missing: Vec<_> = external
+                    .data
+                    .into_iter()
+                    .filter(|r| r.last_date.is_some() && !histories.get(&r.symbol).is_some_and(|b| !b.is_empty()))
+                    .collect();
+                let mut loads = futures::stream::iter(missing.into_iter().map(|row| async move {
+                    let snapshot = bridge.bars(&row.symbol).await?;
+                    Ok::<_, anyhow::Error>((row.symbol, snapshot.data))
+                }))
+                .buffer_unordered(6);
+                while let Some(rows) = loads.next().await {
+                    let (symbol, bars) = rows?;
+                    histories.insert(symbol, bars);
+                }
+            }
+            Err(e) => source.push_str(&format!(" · Whats-News unavailable: {e}")),
+        }
+    }
+    let name = name.to_string();
+    let data = tokio::task::spawn_blocking(move || {
+        tr_data::whats_news::scan_histories(&name, histories.into_iter().collect(), tr_core::Provenance::Cached)
+    })
+    .await??;
+    Ok(tr_data::whats_news::Snapshot { data, provenance: tr_core::Provenance::Cached, source })
+}
+
 async fn handle(s: &Arc<Shared>, req: Request) {
     let (epoch, config) = s.whats_news.borrow().clone();
     let send = |response| s.send(Response::WhatsNews { epoch, response: Box::new(response) });
     match req {
         Request::ConfigureWhatsNews { .. } => unreachable!("configured in dispatcher"),
+        Request::HistoryStatus => {
+            s.send(Response::HistoryStatus(s.history.status().await.map_err(|e| format!("{e:#}"))))
+        }
+        Request::HistoryTask(command) => {
+            let (action, args) = command.trim().split_once(' ').unwrap_or((command.trim(), ""));
+            let action = action.to_ascii_uppercase();
+            if action == "CANCEL" {
+                s.history.cancel();
+                return;
+            }
+            let result = async {
+                if !["ADD", "REFRESH", "RETRY", "RESUME"].contains(&action.as_str()) {
+                    anyhow::bail!(
+                        "Use HIST ADD <US|NASDAQ|ETFS|ALL|WHATS-NEWS|symbols>, REFRESH, CANCEL, RESUME or RETRY"
+                    );
+                }
+                let added = if action == "ADD" {
+                    let mut symbols = Vec::new();
+                    for token in args.split(|c: char| c.is_whitespace() || c == ',').filter(|t| !t.is_empty()) {
+                        if token.eq_ignore_ascii_case("WHATS-NEWS") || token.eq_ignore_ascii_case("WN") {
+                            symbols.extend(config.bridge().universe().await?.data);
+                        } else {
+                            symbols.extend(tr_data::history::universe::resolve(token)?);
+                        }
+                    }
+                    if symbols.is_empty() {
+                        anyhow::bail!("HIST ADD needs a list or ticker symbols");
+                    }
+                    symbols
+                } else {
+                    Vec::new()
+                };
+                s.history.run(&action, added, |status| s.send(Response::HistoryStatus(Ok(status)))).await
+            }
+            .await;
+            if let Err(e) = result {
+                s.send(Response::HistoryStatus(Err(format!("{e:#}"))));
+            }
+            s.send(Response::HistoryChanged);
+        }
         Request::AutocompleteUniverse => {
             let bridge = config.bridge();
-            let result = bridge.universe().await.map_err(|e| format!("{e:#}"));
+            let result = research_universe(s, &bridge).await.map_err(|e| format!("{e:#}"));
             send(Response::AutocompleteUniverse(result));
         }
         Request::Research { pane, generation, scan } => {
@@ -582,24 +723,36 @@ async fn handle(s: &Arc<Shared>, req: Request) {
                 send(Response::Scan {
                     pane,
                     generation,
-                    result: bridge.scan(&name).await.map_err(|e| format!("{e:#}")),
+                    result: research_scan(s, &bridge, &name).await.map_err(|e| format!("{e:#}")),
                 });
             } else {
                 send(Response::Universe {
                     pane,
                     generation,
-                    result: bridge.universe().await.map_err(|e| format!("{e:#}")),
+                    result: research_universe(s, &bridge).await.map_err(|e| format!("{e:#}")),
                 });
             }
         }
-        Request::ArchiveHistory { pane, generation, symbol } => {
+        Request::ArchiveHistory { pane, generation, symbol, tf } => {
             let bridge = config.bridge();
             if current_series(s, pane, generation).is_none() {
                 return;
             }
-            match bridge.bars(&symbol).await {
+            let ticker = tr_data::yahoo::yahoo_symbol(&tr_data::security(&symbol));
+            let remote = ticker.clone();
+            let local = s.history.db(move |db| db.daily(&ticker)).await;
+            let result = match local {
+                Ok(data) if !data.is_empty() => Ok(tr_data::whats_news::Snapshot {
+                    data,
+                    provenance: tr_core::Provenance::Cached,
+                    source: "Local Yahoo archive".into(),
+                }),
+                Ok(_) => bridge.bars(&remote).await,
+                Err(e) => Err(e),
+            };
+            match result {
                 Ok(snapshot) => {
-                    let bars = Arc::new(snapshot.data);
+                    let bars = Arc::new(tf.resample(&snapshot.data));
                     if !store_series(s, pane, generation, bars.clone()) {
                         return;
                     }
@@ -608,7 +761,7 @@ async fn handle(s: &Arc<Shared>, req: Request) {
                         pane,
                         generation,
                         symbol: tr_data::security(&symbol).key(),
-                        tf: Timeframe::D1,
+                        tf,
                         bars,
                         gpu,
                         prepended: 0,
@@ -1083,6 +1236,11 @@ mod tests {
         let (out, rx) = mpsc::channel();
         (
             Arc::new(Shared {
+                history: Arc::new(tr_data::history::Service::new(
+                    tr_data::history::Archive::memory().unwrap(),
+                    Arc::new(tr_data::yahoo::YahooProvider::new().unwrap()),
+                    Default::default(),
+                )),
                 whats_news: tokio::sync::watch::channel((0, Default::default())).0,
                 provider,
                 series: Default::default(),
@@ -1093,6 +1251,111 @@ mod tests {
             }),
             rx,
         )
+    }
+
+    struct ArchivePrices;
+    #[async_trait::async_trait]
+    impl tr_data::history::DailyHistory for ArchivePrices {
+        async fn daily(
+            &self,
+            _: &str,
+            start: Option<chrono::NaiveDate>,
+            _: chrono::NaiveDate,
+        ) -> Result<Vec<Bar>, tr_data::history::Failure> {
+            let days = if start.is_none() {
+                vec!["2026-08-31", "2026-09-01", "2026-09-04", "2026-09-08"]
+            } else {
+                vec!["2026-09-01", "2026-09-04", "2026-09-08", "2026-09-09"]
+            };
+            Ok(days
+                .into_iter()
+                .map(|day| {
+                    Bar::new(
+                        day.parse::<chrono::NaiveDate>().unwrap().and_hms_opt(0, 0, 0).unwrap().and_utc().timestamp(),
+                        10.0,
+                        12.0,
+                        9.0,
+                        11.0,
+                        5.0,
+                    )
+                    .with_provenance(tr_core::Provenance::Real)
+                })
+                .collect())
+        }
+    }
+    #[tokio::test]
+    async fn local_research_and_full_archive_candles_work_without_whats_news_or_market_provider() {
+        let (mut s, rx) = shared(Arc::new(tr_data::sample::SampleProvider::at(0, 10)), None);
+        Arc::get_mut(&mut s).unwrap().history = Arc::new(tr_data::history::Service::new(
+            tr_data::history::Archive::memory().unwrap(),
+            Arc::new(ArchivePrices),
+            tr_data::history::Policy { spacing: Duration::ZERO, ..Default::default() },
+        ));
+        let config = tr_data::whats_news::Config { enabled: false, ..Default::default() };
+        s.whats_news.send_replace((0, config.clone()));
+        s.history.run("ADD", tr_data::history::universe::resolve("AAPL").unwrap(), |_| {}).await.unwrap();
+        s.history.run("REFRESH", vec![], |_| {}).await.unwrap();
+        let universe = research_universe(&s, &config.bridge()).await.unwrap();
+        assert_eq!(universe.data.len(), 1);
+        assert_eq!(universe.data[0].last_date.as_deref(), Some("2026-09-09"));
+        let scan = research_scan(&s, &config.bridge(), "NEAR_HIGH").await.unwrap();
+        assert!(scan.provenance.is_verified());
+        for tf in [Timeframe::W1, Timeframe::MN1] {
+            let req = Request::ArchiveHistory { pane: 1, generation: 1, symbol: "AAPL US Equity".into(), tf };
+            assert!(begin_request(&s, &req));
+            handle(&s, req).await;
+            let Response::WhatsNews { response, .. } = rx.try_recv().unwrap() else {
+                panic!("expected archive response")
+            };
+            let Response::History { bars, symbol, tf: actual, live, .. } = *response else {
+                panic!("expected verified daily-derived candles")
+            };
+            assert_eq!(actual, tf);
+            assert_eq!(symbol, "AAPL US Equity");
+            assert!(!live);
+            assert_eq!(bars.len(), 2);
+            assert!(bars.iter().all(|b| b.provenance.is_verified()));
+            assert_eq!(bars.iter().map(|b| b.volume).sum::<f64>(), 25.0);
+            if tf == Timeframe::W1 {
+                assert_eq!(bars[0].volume, 15.0);
+                assert_eq!(bars[1].volume, 10.0);
+            } else {
+                assert_eq!(bars[0].volume, 5.0);
+                assert_eq!(bars[1].volume, 20.0);
+            }
+        }
+    }
+    #[tokio::test]
+    async fn whats_news_weekly_rows_are_ignored_in_favor_of_all_daily_rows() {
+        let path = std::env::temp_dir().join(format!("tr-worker-archive-{}.sqlite", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        // Only this isolated test database is writable. The upstream tree is never opened for writes.
+        let c = rusqlite::Connection::open(&path).unwrap();
+        c.execute_batch("CREATE TABLE symbols(symbol TEXT PRIMARY KEY,name TEXT,group_tag TEXT); CREATE TABLE ohlcv(symbol TEXT,freq TEXT,date TEXT,open REAL,high REAL,low REAL,close REAL,volume REAL); INSERT INTO symbols VALUES('AAPL','Apple','test'); INSERT INTO ohlcv VALUES('AAPL','daily','2026-09-01',10,12,9,11,5),('AAPL','daily','2026-09-04',10,12,9,11,5),('AAPL','daily','2026-09-08',10,12,9,11,5),('AAPL','weekly','2026-09-04',999,999,999,999,999);").unwrap();
+        drop(c);
+        let before = std::fs::read(&path).unwrap();
+        let (s, rx) = shared(Arc::new(tr_data::sample::SampleProvider::at(0, 10)), None);
+        s.whats_news.send_replace((
+            0,
+            tr_data::whats_news::Config {
+                enabled: true,
+                archive_path: path.to_string_lossy().into(),
+                http_url: String::new(),
+                prefer_http: false,
+            },
+        ));
+        let req =
+            Request::ArchiveHistory { pane: 1, generation: 1, symbol: "AAPL US Equity".into(), tf: Timeframe::W1 };
+        assert!(begin_request(&s, &req));
+        handle(&s, req).await;
+        let Response::WhatsNews { response, .. } = rx.try_recv().unwrap() else { panic!() };
+        let Response::History { bars, .. } = *response else { panic!() };
+        assert_eq!(bars.len(), 2);
+        assert_eq!(bars[0].open, 10.0);
+        assert_eq!(bars[0].volume, 10.0);
+        assert_eq!(bars[1].volume, 5.0);
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        let _ = std::fs::remove_file(path);
     }
 
     #[tokio::test]
@@ -1203,6 +1466,11 @@ mod tests {
     fn series_generations_only_move_forward() {
         let (out, _rx) = mpsc::channel();
         let s = Shared {
+            history: Arc::new(tr_data::history::Service::new(
+                tr_data::history::Archive::memory().unwrap(),
+                Arc::new(tr_data::yahoo::YahooProvider::new().unwrap()),
+                Default::default(),
+            )),
             whats_news: tokio::sync::watch::channel((0, Default::default())).0,
             provider: std::sync::Arc::new(tr_data::sample::SampleProvider::at(0, 10)),
             series: Default::default(),

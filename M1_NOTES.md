@@ -1,5 +1,8 @@
 # M1 first slice: Archive → Scan
 
+The price-history backlog item supersedes the five-session freshness threshold and daily-only
+chart limitation described below. See [Price history](docs/PRICE_HISTORY.md) for current behavior.
+
 Implemented in terminal-rs only. No commits or pushes; no changes to `~/wn-fix`.
 Context: `~/tr-plan.log` (archive → scanners → chart discovery loop).
 

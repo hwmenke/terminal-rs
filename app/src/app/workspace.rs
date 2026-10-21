@@ -579,7 +579,7 @@ impl TerminalApp {
         if let Some(p) = self.panes.iter().find(|p| same(&p.kind)) {
             return Some(p.id);
         }
-        let disc = |id: PaneId| kind_of(id).map(std::mem::discriminant);
+        let disc = |id: PaneId| kind_of(id).map(PaneKind::panel_type);
         let non_chart: Vec<PaneId> = visible
             .iter()
             .copied()
@@ -595,9 +595,9 @@ impl TerminalApp {
     /// tab beside a suitable panel, else split it in next to the focused pane. Panels the
     /// user arranged are never discarded.
     pub(super) fn open_panel(&mut self, kind: PaneKind) {
-        let disc = std::mem::discriminant(&kind);
-        let same = self.panes.iter().any(|p| std::mem::discriminant(&p.kind) == disc);
-        let id = match self.target_pane(|k| std::mem::discriminant(k) == disc) {
+        let disc = kind.panel_type();
+        let same = self.panes.iter().any(|p| p.kind.panel_type() == disc);
+        let id = match self.target_pane(|k| k.panel_type() == disc) {
             Some(t) if same => {
                 let id = self.replace_pane(t, kind);
                 self.reveal(id);
@@ -679,6 +679,7 @@ impl TerminalApp {
                 current.as_deref().unwrap_or("AAPL US Equity"),
                 d,
             )),
+            "HIST" | "HISTORY" => PaneKind::Research(Box::new(super::research::ResearchPane::price_history())),
             "UNIV" => PaneKind::Research(Box::new(super::research::ResearchPane::new(None))),
             "SCAN" => PaneKind::Research(Box::new(super::research::ResearchPane::new(Some(
                 words[1..].join(" ").to_ascii_uppercase(),

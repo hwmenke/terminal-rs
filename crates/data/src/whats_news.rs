@@ -5,8 +5,9 @@ use std::{path::PathBuf, time::Duration};
 mod link;
 pub use link::{Config, DEFAULT_URL, Health, LinkState, detect_archive, retry_delay};
 
+use crate::history::calendar::is_session;
 use anyhow::{Context, Result, bail};
-use chrono::{Datelike, Local, NaiveDate, Weekday};
+use chrono::{Local, NaiveDate};
 use futures::{StreamExt, TryStreamExt, stream};
 use rusqlite::{Connection, OpenFlags};
 use serde::Deserialize;
@@ -51,10 +52,18 @@ pub struct Symbol {
     pub last_date: Option<String>,
 }
 impl Symbol {
+    /// Date-only callers assume today has not yet completed. UI uses status_at.
     pub fn status(&self, today: NaiveDate) -> &'static str {
         match self.last_date.as_deref().and_then(|s| NaiveDate::parse_from_str(s, "%Y-%m-%d").ok()) {
             None => "MISSING",
-            Some(d) if trading_days_since(d, today) > 5 => "STALE",
+            Some(d) if d < crate::history::calendar::previous_session(today) => "STALE",
+            Some(_) => "OK",
+        }
+    }
+    pub fn status_at(&self, now: chrono::DateTime<chrono::Utc>) -> &'static str {
+        match self.last_date.as_deref().and_then(|s| NaiveDate::parse_from_str(s, "%Y-%m-%d").ok()) {
+            None => "MISSING",
+            Some(d) if d < crate::history::calendar::last_expected_session(now) => "STALE",
             Some(_) => "OK",
         }
     }
@@ -468,7 +477,7 @@ fn scan_sql(c: &Connection, name: &str) -> Result<Scan> {
         .collect::<Result<Vec<_>>>()?;
     scan_histories(name, histories, Provenance::Cached)
 }
-fn scan_histories(name: &str, histories: Vec<(String, Vec<Bar>)>, provenance: Provenance) -> Result<Scan> {
+pub fn scan_histories(name: &str, histories: Vec<(String, Vec<Bar>)>, provenance: Provenance) -> Result<Scan> {
     if name.starts_with("RSI_") {
         bail!(
             "{name} requires the main Whats-News app on port 8050. The data service on port 8051 only supplies history for local scans."
@@ -527,49 +536,6 @@ pub fn trading_days_since(last: NaiveDate, today: NaiveDate) -> usize {
     }
     n
 }
-fn is_session(d: NaiveDate) -> bool {
-    let (y, m, day) = (d.year(), d.month(), d.day());
-    if matches!(d.weekday(), Weekday::Sat | Weekday::Sun) {
-        return false;
-    }
-    let observed = |m, day| {
-        let h = NaiveDate::from_ymd_opt(y, m, day).unwrap();
-        match h.weekday() {
-            Weekday::Sat => h.pred_opt().unwrap(),
-            Weekday::Sun => h.succ_opt().unwrap(),
-            _ => h,
-        }
-    };
-    // NYSE does not observe a Saturday New Year's Day on the preceding Friday.
-    let new_year = NaiveDate::from_ymd_opt(y, 1, 1).unwrap();
-    if d == new_year
-        || (new_year.weekday() == Weekday::Sun && m == 1 && day == 2)
-        || d == observed(7, 4)
-        || d == observed(12, 25)
-        || (y >= 2022 && d == observed(6, 19))
-    {
-        return false;
-    }
-    if (m == 1 && d.weekday() == Weekday::Mon && (15..=21).contains(&day))
-        || (m == 2 && d.weekday() == Weekday::Mon && (15..=21).contains(&day))
-        || (m == 5 && d.weekday() == Weekday::Mon && day + 7 > 31)
-        || (m == 9 && d.weekday() == Weekday::Mon && day <= 7)
-        || (m == 11 && d.weekday() == Weekday::Thu && (22..=28).contains(&day))
-    {
-        return false;
-    }
-    // Gregorian Easter (Meeus), then Good Friday.
-    let a = y % 19;
-    let b = y / 100;
-    let c = y % 100;
-    let h = (19 * a + b - b / 4 - (b - (b + 8) / 25 + 1) / 3 + 15) % 30;
-    let l = (32 + 2 * (b % 4) + 2 * (c / 4) - h - c % 4) % 7;
-    let k = (a + 11 * h + 22 * l) / 451;
-    let easter =
-        NaiveDate::from_ymd_opt(y, ((h + l - 7 * k + 114) / 31) as u32, ((h + l - 7 * k + 114) % 31 + 1) as u32)
-            .unwrap();
-    d != easter - chrono::Duration::days(2)
-}
 pub fn today() -> NaiveDate {
     Local::now().date_naive()
 }
@@ -623,7 +589,9 @@ mod tests {
         let mut row = Symbol { symbol: "X".into(), name: None, group_tag: None, last_date: None };
         assert_eq!(row.status(d("2026-10-20")), "MISSING");
         row.last_date = Some("2026-10-12".into());
-        assert_eq!(row.status(d("2026-10-19")), "OK"); // exactly five sessions
+        assert_eq!(row.status(d("2026-10-19")), "STALE"); // previous completed session is Friday
+        row.last_date = Some("2026-10-16".into());
+        assert_eq!(row.status(d("2026-10-19")), "OK");
         assert_eq!(row.status(d("2026-10-20")), "STALE");
         assert_eq!(trading_days_since(d("2026-07-02"), d("2026-07-06")), 1); // observed July 4 + weekend
         assert_eq!(trading_days_since(d("2026-04-02"), d("2026-04-06")), 1); // Good Friday

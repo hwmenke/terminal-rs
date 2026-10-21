@@ -80,6 +80,7 @@ pub enum PaneSettings {
     Politicians,
     Alerts,
     Research(Option<String>),
+    PriceHistory,
     Watchlist,
     Help,
     Wei,

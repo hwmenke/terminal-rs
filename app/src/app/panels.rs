@@ -62,7 +62,7 @@ impl TerminalApp {
                 }
             }
             PaneKind::Research(r) => {
-                let (a, refresh) = r.show(ui);
+                let (a, refresh) = r.show(ui, &self.worker);
                 actions.extend(a);
                 if refresh {
                     r.request(id, &self.worker);

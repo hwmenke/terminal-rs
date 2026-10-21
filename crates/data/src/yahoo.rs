@@ -563,3 +563,146 @@ mod tests {
         assert_eq!(urlencode("BRK B"), "BRK%20B");
     }
 }
+
+/// Archive downloads deliberately bypass MarketData's display fallback and bar limit.
+#[async_trait]
+impl crate::history::DailyHistory for YahooProvider {
+    async fn daily(
+        &self,
+        symbol: &str,
+        start: Option<chrono::NaiveDate>,
+        end: chrono::NaiveDate,
+    ) -> Result<Vec<Bar>, crate::history::Failure> {
+        use crate::history::{Failure, FailureKind};
+        let midnight = |d: chrono::NaiveDate| d.and_hms_opt(0, 0, 0).unwrap().and_utc().timestamp();
+        let response = self
+            .client
+            .get(format!("{BASE}/{}", urlencode(symbol)))
+            .query(&[
+                ("interval", "1d".to_string()),
+                ("period1", start.map(midnight).unwrap_or(-2_208_988_800).to_string()),
+                ("period2", midnight(end).to_string()),
+                ("includeAdjustedClose", "true".into()),
+                ("events", "div,splits".into()),
+            ])
+            .send()
+            .await
+            .map_err(|e| {
+                Failure::new(
+                    FailureKind::Network,
+                    if e.is_timeout() { "Yahoo timed out" } else { "Could not reach Yahoo" },
+                )
+            })?;
+        let status = response.status();
+        if !status.is_success() {
+            let kind = match status.as_u16() {
+                404 => FailureKind::NotFound,
+                429 | 401 | 403 => FailureKind::RateLimited,
+                _ => FailureKind::Network,
+            };
+            return Err(Failure::new(kind, format!("Yahoo returned HTTP {status}")));
+        }
+        let body =
+            response.text().await.map_err(|_| Failure::new(FailureKind::Network, "Yahoo response was interrupted"))?;
+        parse_archive_daily(&body)
+    }
+}
+
+/// Yahoo quote OHLC is split adjusted; adjclose additionally incorporates dividends.
+/// Scale ALL OHLC by adjclose/close. Never fabricate a missing adjusted value.
+pub fn parse_archive_daily(json: &str) -> Result<Vec<Bar>, crate::history::Failure> {
+    use crate::history::{Failure, FailureKind};
+    let rejected = |message| Failure::new(FailureKind::Rejected, message);
+    let v: serde_json::Value = serde_json::from_str(json).map_err(|_| rejected("Yahoo returned invalid JSON"))?;
+    if let Some(e) = v["chart"]["error"].as_object() {
+        let code = e.get("code").and_then(|v| v.as_str()).unwrap_or_default();
+        let message = e.get("description").and_then(|v| v.as_str()).unwrap_or("Yahoo could not supply history");
+        let kind = if code.eq_ignore_ascii_case("Not Found") {
+            FailureKind::NotFound
+        } else if code.contains("Too Many") || code.contains("Unauthorized") {
+            FailureKind::RateLimited
+        } else {
+            FailureKind::NoData
+        };
+        return Err(Failure::new(kind, message));
+    }
+    // Explicit provenance, if supplied (e.g. replay/proxy), may never claim sample data.
+    let real = |v: &serde_json::Value| {
+        v.get("provenance").is_none_or(|p| p.as_str() == Some("Real") || p.as_str() == Some("real"))
+    };
+    if !real(&v) {
+        return Err(rejected("Sample or unverified response refused"));
+    }
+    let r = &v["chart"]["result"][0];
+    if !real(r) {
+        return Err(rejected("Sample or unverified result refused"));
+    }
+    let Some(timestamps) = r["timestamp"].as_array() else {
+        return Err(Failure::new(FailureKind::NoData, "Yahoo returned no daily history"));
+    };
+    let q = &r["indicators"]["quote"][0];
+    let adj = &r["indicators"]["adjclose"][0]["adjclose"];
+    let mut bars = Vec::new();
+    for (i, t) in timestamps.iter().enumerate() {
+        let (Some(o), Some(h), Some(l), Some(c)) =
+            (q["open"][i].as_f64(), q["high"][i].as_f64(), q["low"][i].as_f64(), q["close"][i].as_f64())
+        else {
+            continue;
+        };
+        let a = adj[i].as_f64().ok_or_else(|| rejected("Yahoo omitted adjusted close; history preserved"))?;
+        let volume = q["volume"][i].as_f64().ok_or_else(|| rejected("Yahoo omitted daily volume"))?;
+        let ts = t
+            .as_i64()
+            .and_then(|ts| chrono::DateTime::from_timestamp(ts, 0))
+            .ok_or_else(|| rejected("Invalid Yahoo timestamp"))?
+            .date_naive()
+            .and_hms_opt(0, 0, 0)
+            .unwrap()
+            .and_utc()
+            .timestamp();
+        let factor = a / c;
+        bars.push(
+            Bar::new(ts, o * factor, h * factor, l * factor, c * factor, volume)
+                .with_provenance(tr_core::Provenance::Real),
+        );
+    }
+    // Do not hide duplicate dates: archive validation refuses them.
+    bars.sort_by_key(|b| b.ts);
+    Ok(bars)
+}
+
+#[cfg(test)]
+mod archive_tests {
+    use super::*;
+    use crate::history::FailureKind;
+    #[test]
+    fn archive_parser_uses_adjusted_ohlc_and_session_dates() {
+        let fixture = include_str!("../tests/fixtures/yahoo_aapl_1d.json");
+        let mut json: serde_json::Value = serde_json::from_str(fixture).unwrap();
+        let r = &mut json["chart"]["result"][0];
+        let close = r["indicators"]["quote"][0]["close"][0].as_f64().unwrap();
+        let open = r["indicators"]["quote"][0]["open"][0].as_f64().unwrap();
+        r["indicators"]["adjclose"][0]["adjclose"][0] = (close / 2.0).into();
+        let bars = parse_archive_daily(&json.to_string()).unwrap();
+        assert_eq!(bars[0].close, close / 2.0);
+        assert_eq!(bars[0].open, open / 2.0);
+        assert!(bars.iter().all(|b| b.ts % 86400 == 0 && b.provenance == tr_core::Provenance::Real));
+        json["chart"]["result"][0]["indicators"]["adjclose"][0]["adjclose"][0] = serde_json::Value::Null;
+        assert_eq!(parse_archive_daily(&json.to_string()).unwrap_err().kind, FailureKind::Rejected);
+        json["provenance"] = "Sample".into();
+        assert_eq!(parse_archive_daily(&json.to_string()).unwrap_err().kind, FailureKind::Rejected);
+    }
+    #[test]
+    fn archive_parser_reports_not_found_and_rate_limits() {
+        for (code, kind) in [
+            ("Not Found", FailureKind::NotFound),
+            ("Too Many Requests", FailureKind::RateLimited),
+            ("No Data", FailureKind::NoData),
+        ] {
+            let json = serde_json::json!({"chart":{"result":null,"error":{"code":code,"description":"Yahoo could not serve this symbol"}}});
+            let err = parse_archive_daily(&json.to_string()).unwrap_err();
+            assert_eq!(err.kind, kind);
+            assert!(err.reason().contains("Yahoo"));
+        }
+    }
+}
