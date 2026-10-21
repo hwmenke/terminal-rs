@@ -20,6 +20,9 @@ impl TerminalApp {
         let dragging = self.drag.is_some_and(|d| d.active);
         if let PaneKind::Chart(c) = &mut self.panes[i].kind {
             c.hover_enabled = !dragging;
+            if focused {
+                self.watch_ui.active_chart = Some(id);
+            }
             let clicked = c.show(ui, rect, focused, &self.worker);
             actions.append(&mut c.actions);
             return (actions, clicked);
@@ -134,117 +137,6 @@ impl TerminalApp {
             _ => {}
         }
         (actions, false)
-    }
-
-    fn watchlist(&mut self, ui: &mut Ui) -> Vec<Action> {
-        let mut out = Vec::new();
-        let row_h = dp(36.0);
-        let w = ui.available_width();
-        let (hdr, _) = ui.allocate_exact_size(vec2(w, dp(22.0)), Sense::hover());
-        let p = ui.painter();
-        p.rect_filled(hdr, theme::CONTROL_RADIUS, theme::header());
-        let cols = [0.0, 0.34, 0.58, 0.79, 1.0];
-        let col = |r: Rect, k: usize| r.left() + 8.0 + (r.width() - 16.0) * cols[k];
-        p.text(pos2(col(hdr, 0), hdr.center().y), Align2::LEFT_CENTER, "Security", ui_font(11.5), muted());
-        for (k, h) in [(2, "Last"), (3, "Change"), (4, "%")] {
-            p.text(pos2(col(hdr, k), hdr.center().y), Align2::RIGHT_CENTER, h, ui_font(11.5), muted());
-        }
-        let mut remove = None;
-        egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
-            for s in &self.watchlist {
-                let sec = tr_data::security(s);
-                let (r, resp) = ui.allocate_exact_size(vec2(w, row_h), Sense::click());
-                widgets::hover_wash(ui, r, &resp, false);
-                let p = ui.painter();
-                p.text(pos2(col(r, 0), r.center().y - dp(6.0)), Align2::LEFT_CENTER, &sec.ticker, mono(12.5), amber());
-                p.text(
-                    pos2(col(r, 0) + 74.0, r.center().y - dp(6.0)),
-                    Align2::LEFT_CENTER,
-                    sec.class.yellow_key().label(),
-                    ui_font(11.0),
-                    muted(),
-                );
-                let provenance = self.quotes.get(s).map(|q| q.provenance).unwrap_or_default();
-                p.text(
-                    pos2(col(r, 0), r.bottom() - 1.0),
-                    Align2::LEFT_BOTTOM,
-                    provenance.label(),
-                    mono(10.0),
-                    if provenance.is_verified() { muted() } else { theme::down() },
-                );
-                match self.quotes.get(s) {
-                    Some(q) => {
-                        let c = if q.change() >= 0.0 { theme::up() } else { theme::down() };
-                        let d = sec.decimals(q.last);
-                        p.text(
-                            pos2(col(r, 2), r.center().y - dp(6.0)),
-                            Align2::RIGHT_CENTER,
-                            format!("{:.d$}", q.last),
-                            mono(12.5),
-                            text(),
-                        );
-                        p.text(
-                            pos2(col(r, 3), r.center().y - dp(6.0)),
-                            Align2::RIGHT_CENTER,
-                            markets_view::change_text(&sec, q),
-                            mono(12.5),
-                            c,
-                        );
-                        p.text(
-                            pos2(col(r, 4), r.center().y - dp(6.0)),
-                            Align2::RIGHT_CENTER,
-                            format!("{:+.2}%", q.change_pct()),
-                            mono(12.5),
-                            c,
-                        );
-                    }
-                    None => {
-                        p.text(pos2(col(r, 4), r.center().y - dp(6.0)), Align2::RIGHT_CENTER, "…", mono(12.5), muted());
-                    }
-                }
-                let tradable = matches!(sec.class, tr_core::AssetClass::Equity | tr_core::AssetClass::Etf);
-                let pills = if tradable { widgets::buy_sell_pills().to_vec() } else { Vec::new() };
-                let tips = [format!("Buy {} (⇧B)", sec.ticker), format!("Sell {} (⇧S)", sec.ticker)];
-                let tips: Vec<&str> = tips.iter().map(String::as_str).collect();
-                match widgets::row_pills(ui, r, ("wl-pills", s), &pills, &tips) {
-                    Some(i) => out.push(Action::Command(format!("{} {s}", if i == 0 { "BUY" } else { "SELL" }))),
-                    None if resp.clicked() => out.push(Action::OpenChart(s.clone())),
-                    None => {}
-                }
-                resp.context_menu(|ui| {
-                    if tradable {
-                        for (label, side) in [("Buy", "BUY"), ("Sell", "SELL")] {
-                            if ui.button(format!("{label} {}…", sec.ticker)).clicked() {
-                                out.push(Action::Command(format!("{side} {s}")));
-                                ui.close();
-                            }
-                        }
-                        ui.separator();
-                    }
-                    if ui.button("Open Chart").clicked() {
-                        out.push(Action::OpenChart(s.clone()));
-                        ui.close();
-                    }
-                    if sec.has_congress_trades() && ui.button("Who in Congress Traded This").clicked() {
-                        out.push(Action::OpenTicker(sec.ticker.clone()));
-                        ui.close();
-                    }
-                    ui.separator();
-                    if ui.button("Remove from Watchlist").clicked() {
-                        remove = Some(s.clone());
-                        ui.close();
-                    }
-                });
-            }
-            ui.add_space(4.0);
-            ui.label(
-                RichText::new("WL ADD <KEY> to add · right-click a row for options").font(ui_font(11.0)).color(muted()),
-            );
-        });
-        if let Some(s) = remove {
-            self.watchlist.retain(|x| *x != s);
-        }
-        out
     }
 }
 
