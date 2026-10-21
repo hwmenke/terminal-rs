@@ -175,6 +175,19 @@ impl ChartState {
         self.bars.is_empty()
     }
 
+    /// Retire pending history and remove bars when the archive connection drops.
+    pub fn archive_disconnected(&mut self, message: &str, worker: &Worker) {
+        self.generation += 1;
+        worker.send(Request::Forget(self.id));
+        self.loading = false;
+        self.paging = false;
+        self.bars = Arc::new(Vec::new());
+        self.provenance = Provenance::Missing;
+        self.gpu = None;
+        self.built.clear();
+        self.error = Some(message.to_owned());
+    }
+
     /// (Re)load history for the current symbol and timeframe.
     pub fn load(&mut self, w: &Worker) {
         self.generation += 1;
@@ -1719,5 +1732,25 @@ mod tests {
         assert_eq!((g.from, g.to.right), (shown, shown.right - 40.0));
         c.reset_view();
         assert_eq!(c.glide.map(|g| g.to), Some(Viewport::fit_last(500, DEFAULT_VISIBLE, 800.0)));
+    }
+    #[test]
+    fn archive_disconnect_clears_history_and_rejects_pending_prices() {
+        let (worker, mut requests) = Worker::test_channel();
+        let mut chart = ChartState::new(42, "AAPL", Timeframe::D1);
+        chart.archive = true;
+        chart.load(&worker);
+        let generation = chart.generation;
+        let _ = requests.try_recv().unwrap();
+        let bars = Arc::new(vec![Bar::new(0, 10.0, 12.0, 9.0, 11.0, 1.0).with_provenance(Provenance::Real)]);
+        chart.on_history(generation, bars.clone(), SeriesGpu::build(&bars), 0, false, true, false, &worker);
+        assert!(!chart.is_empty());
+        let message = "Whats-News archive file is missing. Choose finance.db in Settings › Whats-News.";
+        chart.archive_disconnected(message, &worker);
+        assert!(chart.is_empty());
+        assert_eq!(chart.provenance, Provenance::Missing);
+        assert_eq!(chart.error.as_deref(), Some(message));
+        assert!(!chart.loading);
+        chart.on_history(generation, bars.clone(), SeriesGpu::build(&bars), 0, false, true, false, &worker);
+        assert!(chart.is_empty(), "A response from before the disconnect cannot restore bars");
     }
 }

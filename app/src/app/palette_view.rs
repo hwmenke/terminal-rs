@@ -147,6 +147,7 @@ fn settings_blurb(tab: SettingsTab) -> &'static str {
         SettingsTab::Layouts => "Saved layouts and presets",
         SettingsTab::Brokerage => "SnapTrade keys and connected brokerages",
         SettingsTab::Trading => "Enable trading, order limits and confirmations",
+        SettingsTab::WhatsNews => "Archive path, local HTTP connection, status and test connection",
     }
 }
 

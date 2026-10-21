@@ -5,6 +5,7 @@ use tr_data::whats_news::{Scan, Snapshot, Symbol, today};
 
 pub struct ResearchPane {
     pub scan: Option<String>,
+    pub generation: u64,
     pub universe: Option<Snapshot<Vec<Symbol>>>,
     pub results: Option<Snapshot<Scan>>,
     pub loading: bool,
@@ -45,14 +46,15 @@ impl ResearchPane {
     }
 
     pub fn new(scan: Option<String>) -> Self {
-        Self { scan, universe: None, results: None, loading: true, error: None, search: String::new() }
+        Self { scan, generation: 0, universe: None, results: None, loading: true, error: None, search: String::new() }
     }
     pub fn request(&mut self, pane: u64, worker: &crate::worker::Worker) {
+        self.generation += 1;
         self.loading = true;
         self.error = None;
         self.universe = None;
         self.results = None;
-        worker.send(Request::Research { pane, scan: self.scan.clone() });
+        worker.send(Request::Research { pane, generation: self.generation, scan: self.scan.clone() });
     }
     pub fn show(&mut self, ui: &mut Ui) -> (Vec<Action>, bool) {
         let mut actions = Vec::new();

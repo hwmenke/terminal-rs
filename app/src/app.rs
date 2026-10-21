@@ -475,6 +475,8 @@ pub struct TerminalApp {
     rebinding: Option<prefs::Action>,
     hotkey_filter: String,
     settings_tab: SettingsTab,
+    whats_news_epoch: u64,
+    whats_news_health: tr_data::whats_news::Health,
     io_path: String,
 
     curves: Option<Box<YieldCurves>>,
@@ -644,6 +646,8 @@ impl TerminalApp {
             rebinding: None,
             hotkey_filter: String::new(),
             settings_tab: SettingsTab::Appearance,
+            whats_news_epoch: 0,
+            whats_news_health: tr_data::whats_news::Health::pending(),
             io_path: String::new(),
             curves: None,
             last_wei: None,
@@ -708,6 +712,8 @@ impl TerminalApp {
         let doc = doc
             .or_else(|| app.store.list().first().and_then(|n| app.store.load(n).ok()))
             .unwrap_or_else(|| LayoutDoc::default_workspace("Default", &app.prefs.panels));
+        app.worker
+            .send(Request::ConfigureWhatsNews { epoch: app.whats_news_epoch, config: app.prefs.whats_news.clone() });
         app.apply_doc(doc);
         if !app.store.exists(&app.layout_name) {
             app.save_layout();
@@ -989,20 +995,48 @@ impl TerminalApp {
 
     fn drain(&mut self) {
         while let Ok(r) = self.worker.rx.try_recv() {
+            let r = match r {
+                Response::WhatsNews { epoch, response } if epoch == self.whats_news_epoch => *response,
+                Response::WhatsNews { .. } => continue,
+                other => other,
+            };
             match r {
-                Response::AutocompleteUniverse(result) => self.command_catalogue.accept(result),
-                Response::Universe { pane, result } => {
-                    if let Some(PaneKind::Research(r)) =
-                        self.panes.iter_mut().find(|p| p.id == pane).map(|p| &mut p.kind)
-                    {
-                        r.accept_universe(result);
+                Response::WhatsNews { .. } => unreachable!(),
+                Response::WhatsNewsHealth { epoch, health } => {
+                    if epoch != self.whats_news_epoch {
+                        continue;
+                    }
+                    let changed = self.whats_news_health.state != health.state
+                        || self.whats_news_health.source != health.source
+                        || self.whats_news_health.message != health.message;
+                    self.whats_news_health = health;
+                    if changed {
+                        self.refresh_whats_news_panes();
                     }
                 }
-                Response::Scan { pane, result } => {
+                Response::AutocompleteUniverse(result) => self.command_catalogue.accept(result),
+                Response::Universe { pane, generation, result } => {
                     if let Some(PaneKind::Research(r)) =
                         self.panes.iter_mut().find(|p| p.id == pane).map(|p| &mut p.kind)
+                        && r.generation == generation
                     {
-                        r.accept_scan(result);
+                        r.accept_universe(if self.whats_news_health.connected() {
+                            result
+                        } else {
+                            Err(self.whats_news_health.message.clone())
+                        });
+                    }
+                }
+                Response::Scan { pane, generation, result } => {
+                    if let Some(PaneKind::Research(r)) =
+                        self.panes.iter_mut().find(|p| p.id == pane).map(|p| &mut p.kind)
+                        && r.generation == generation
+                    {
+                        r.accept_scan(if self.whats_news_health.connected() {
+                            result
+                        } else {
+                            Err(self.whats_news_health.message.clone())
+                        });
                     }
                 }
                 Response::History {
@@ -1761,6 +1795,8 @@ mod tests {
             rebinding: None,
             hotkey_filter: String::new(),
             settings_tab: SettingsTab::Appearance,
+            whats_news_epoch: 0,
+            whats_news_health: tr_data::whats_news::Health::pending(),
             io_path: String::new(),
             curves: None,
             last_wei: None,

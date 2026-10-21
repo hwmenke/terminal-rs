@@ -656,6 +656,7 @@ pub const PREFS_VERSION: u32 = 3;
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Prefs {
+    pub whats_news: tr_data::whats_news::Config,
     /// File format revision, for migrating defaults (absent in v1 files, hence 0).
     #[serde(default)]
     pub version: u32,
@@ -672,6 +673,7 @@ pub struct Prefs {
 impl Default for Prefs {
     fn default() -> Self {
         Self {
+            whats_news: Default::default(),
             version: PREFS_VERSION,
             appearance: Appearance::default(),
             hotkeys: Keymap::default(),
@@ -893,5 +895,28 @@ mod tests {
         // Legacy fields are no longer written.
         let json = serde_json::to_string(&p).unwrap();
         assert!(!json.contains("font_scale") && json.contains("\"theme\":\"My Theme\""), "{json}");
+    }
+    #[test]
+    fn whats_news_config_persists_in_prefs_and_old_files_get_defaults() {
+        let dir = std::env::temp_dir().join(format!("terminal-rs-whats-news-prefs-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("prefs.json");
+        let mut prefs = Prefs::default();
+        prefs.whats_news = tr_data::whats_news::Config {
+            archive_path: "/archive/real prices.db".into(),
+            http_url: "http://localhost:8051".into(),
+            prefer_http: false,
+            enabled: true,
+        };
+        prefs.save(&path).unwrap();
+        assert_eq!(Prefs::load(&path).whats_news, prefs.whats_news);
+        prefs.whats_news.http_url.clear();
+        prefs.whats_news.archive_path.clear();
+        prefs.whats_news.enabled = false;
+        prefs.save(&path).unwrap();
+        assert_eq!(Prefs::load(&path).whats_news, prefs.whats_news);
+        let old: Prefs = serde_json::from_str("{}").unwrap();
+        assert_eq!(old.whats_news, tr_data::whats_news::Config::default());
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }
