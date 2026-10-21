@@ -14,7 +14,7 @@ use tr_chart::scene::{self, ChartType, Overlay, PricePane, SeriesGpu};
 use tr_chart::viewport::{PriceScale, Viewport};
 use tr_congress::{Trade, TxType};
 use tr_core::indicators::registry::{self, Category};
-use tr_core::{AssetClass, Bar, Security, Timeframe};
+use tr_core::{AssetClass, Bar, Provenance, Security, Timeframe};
 
 use crate::command::{IndicatorSpec, Range};
 use crate::congress_view::Action;
@@ -83,6 +83,7 @@ pub struct ChartState {
     pub compare: Option<String>,
 
     bars: Arc<Vec<Bar>>,
+    provenance: Provenance,
     gpu: Option<SeriesGpu>,
     generation: u64,
     viewport: Option<Viewport>,
@@ -119,6 +120,9 @@ pub struct ChartState {
 }
 
 impl ChartState {
+    pub fn provenance(&self) -> Provenance {
+        self.provenance
+    }
     pub fn new(id: PaneId, symbol: &str, tf: Timeframe) -> Self {
         Self {
             id,
@@ -138,6 +142,7 @@ impl ChartState {
             drawings: Vec::new(),
             compare: None,
             bars: Arc::new(Vec::new()),
+            provenance: Provenance::Missing,
             gpu: None,
             generation: 0,
             viewport: None,
@@ -184,6 +189,7 @@ impl ChartState {
         self.markers.clear();
         // Never show the previous symbol's bars under the new title.
         self.bars = Arc::new(Vec::new());
+        self.provenance = Provenance::Missing;
         self.gpu = None;
         self.built.clear();
         self.last_live = None;
@@ -441,6 +447,7 @@ impl ChartState {
             g.from.right += shift;
             g.to.right += shift;
         }
+        self.provenance = Bar::provenance(&bars);
         self.bars = bars;
         self.gpu = Some(gpu);
         self.paging = false;
@@ -608,16 +615,8 @@ impl ChartState {
                 });
             }
         }
-        if self.archive {
-            painter.text(
-                pos2(rect.right() - AXIS_W - 8.0, header.bottom() + 10.0),
-                Align2::RIGHT_TOP,
-                "WHATS-NEWS ARCHIVE · DAILY",
-                ui_font(10.0),
-                amber(),
-            );
-        }
-        if self.last_live.is_some_and(|t| t.elapsed().as_secs() < 5) {
+        let provenance = self.provenance();
+        if provenance.is_verified() && self.last_live.is_some_and(|t| t.elapsed().as_secs() < 5) {
             // Pulsing live dot in the plot's top-right corner (clear of the price axis labels).
             let pulse = 0.6 + 0.4 * ((ui.input(|i| i.time) * 3.0).sin() as f32).abs();
             let c = pos2(rect.right() - AXIS_W + 12.0, header.bottom() + 10.0);
@@ -659,9 +658,9 @@ impl ChartState {
         painter.text(
             pos2(range_row.right() - 6.0, range_row.center().y),
             Align2::RIGHT_CENTER,
-            status,
-            mono(10.5),
-            muted(),
+            format!("{} · {status}", provenance.label()),
+            mono(if provenance.is_verified() { 10.5 } else { 12.0 }),
+            if provenance.is_verified() { muted() } else { theme::down() },
         );
 
         let body = Rect::from_min_max(pos2(rect.left(), header.bottom()), pos2(rect.right(), range_row.top()));
@@ -1002,6 +1001,20 @@ impl ChartState {
             clicked |= self.trade_buttons(ui, plot_all);
         }
 
+        {
+            let label = if self.archive {
+                format!("{} · WHATS-NEWS ARCHIVE · DAILY", provenance.label())
+            } else {
+                provenance.label().to_string()
+            };
+            painter.text(
+                pos2(rect.right() - AXIS_W - 8.0, header.bottom() + 35.0),
+                Align2::RIGHT_TOP,
+                label,
+                mono(if provenance.is_verified() { 10.0 } else { 13.0 }),
+                if provenance.is_verified() { amber() } else { theme::down() },
+            );
+        }
         let _ = focused; // the surrounding card shows focus
         clicked
     }

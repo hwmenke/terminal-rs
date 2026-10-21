@@ -50,7 +50,7 @@ fn row(ui: &mut Ui, l: &Listing, quotes: &HashMap<String, Quote>, out: &mut Vec<
     let sec = l.security();
     let key = l.key();
     let q = quotes.get(&key);
-    let h = theme::dp(16.0);
+    let h = theme::dp(30.0);
     let (rect, resp) = ui.allocate_exact_size(vec2(width, h), Sense::click());
     if resp.hovered() {
         ui.painter().rect_filled(rect, 3.0, theme::control());
@@ -60,8 +60,16 @@ fn row(ui: &mut Ui, l: &Listing, quotes: &HashMap<String, Quote>, out: &mut Vec<
         out.push(Action::OpenChart(key.clone()));
     }
     let p = ui.painter_at(rect);
-    let y = rect.center().y;
+    let y = rect.top() + theme::dp(8.0);
     let x = rect.left() + 2.0;
+    let provenance = q.map(|q| q.provenance).unwrap_or_default();
+    p.text(
+        pos2(x, rect.bottom() - 2.0),
+        Align2::LEFT_BOTTOM,
+        provenance.label(),
+        mono(10.0),
+        if provenance.is_verified() { muted() } else { theme::down() },
+    );
     p.text(pos2(x, y), Align2::LEFT_CENTER, l.ticker, mono(12.0), amber());
     let right = rect.right() - 2.0;
     // Narrow columns drop the net change, then the sparkline, then the name.
@@ -352,9 +360,23 @@ mod tests {
 
     #[test]
     fn change_formatting() {
-        let q = Quote { symbol: "US10Y Govt".into(), last: 4.25, prev_close: 4.22, ts: 0, spark: vec![] };
+        let q = Quote {
+            provenance: tr_core::Provenance::Real,
+            symbol: "US10Y Govt".into(),
+            last: 4.25,
+            prev_close: 4.22,
+            ts: 0,
+            spark: vec![],
+        };
         assert_eq!(change_text(&Security::parse("US10Y Govt").unwrap(), &q), "+3.0bp");
-        let q = Quote { symbol: "EURUSD Curncy".into(), last: 1.0912, prev_close: 1.0900, ts: 0, spark: vec![] };
+        let q = Quote {
+            provenance: tr_core::Provenance::Real,
+            symbol: "EURUSD Curncy".into(),
+            last: 1.0912,
+            prev_close: 1.0900,
+            ts: 0,
+            spark: vec![],
+        };
         assert_eq!(change_text(&Security::parse("EURUSD Curncy").unwrap(), &q), "+0.0012");
     }
 

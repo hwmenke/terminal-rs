@@ -137,7 +137,9 @@ pub fn parse_chart(json: &str) -> Result<Chart> {
     for (i, &ts) in r.timestamp.iter().enumerate() {
         let get = |v: &Vec<Option<f64>>| v.get(i).copied().flatten();
         if let (Some(o), Some(h), Some(l), Some(c)) = (get(&q.open), get(&q.high), get(&q.low), get(&q.close)) {
-            bars.push(Bar::new(ts, o, h, l, c, get(&q.volume).unwrap_or(0.0)));
+            bars.push(
+                Bar::new(ts, o, h, l, c, get(&q.volume).unwrap_or(0.0)).with_provenance(tr_core::Provenance::Real),
+            );
         }
     }
     Ok(Chart {
@@ -373,7 +375,14 @@ pub fn parse_spark(json: &str) -> Result<Vec<Quote>> {
         let prev =
             if closes.len() >= 2 { closes[closes.len() - 2] } else { d["chartPreviousClose"].as_f64().unwrap_or(last) };
         let ts = d["timestamp"].as_array().and_then(|a| a.last()).and_then(|t| t.as_i64()).unwrap_or_default();
-        out.push(Quote { symbol: sym.clone(), last, prev_close: prev, ts, spark: closes });
+        out.push(Quote {
+            provenance: tr_core::Provenance::Real,
+            symbol: sym.clone(),
+            last,
+            prev_close: prev,
+            ts,
+            spark: closes,
+        });
     }
     Ok(out)
 }

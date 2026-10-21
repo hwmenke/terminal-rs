@@ -5,7 +5,7 @@ use std::path::Path;
 
 use anyhow::Result;
 use rusqlite::{Connection, params};
-use tr_core::{Bar, Timeframe};
+use tr_core::{Bar, Provenance, Timeframe};
 
 pub struct BarCache {
     conn: Connection,
@@ -31,6 +31,16 @@ impl BarCache {
                 PRIMARY KEY (symbol, tf, ts)
             ) WITHOUT ROWID;",
         )?;
+        // Migration is conservative: pre-provenance rows remain unverified.
+        let has_provenance = conn
+            .prepare("PRAGMA table_info(bars)")?
+            .query_map([], |r| r.get::<_, String>(1))?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+            .iter()
+            .any(|name| name == "provenance");
+        if !has_provenance {
+            conn.execute_batch("ALTER TABLE bars ADD COLUMN provenance TEXT NOT NULL DEFAULT 'Missing';")?;
+        }
         Ok(Self { conn })
     }
 
@@ -38,12 +48,22 @@ impl BarCache {
         let tx = self.conn.transaction()?;
         {
             let mut st = tx.prepare_cached(
-                "INSERT INTO bars (symbol, tf, ts, o, h, l, c, v) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                "INSERT INTO bars (symbol, tf, ts, o, h, l, c, v, provenance) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
                  ON CONFLICT (symbol, tf, ts) DO UPDATE SET o = excluded.o, h = excluded.h, l = excluded.l,
-                   c = excluded.c, v = excluded.v",
+                   c = excluded.c, v = excluded.v, provenance = excluded.provenance",
             )?;
             for b in bars {
-                st.execute(params![symbol, tf.label(), b.ts, b.open, b.high, b.low, b.close, b.volume])?;
+                st.execute(params![
+                    symbol,
+                    tf.label(),
+                    b.ts,
+                    b.open,
+                    b.high,
+                    b.low,
+                    b.close,
+                    b.volume,
+                    format!("{:?}", b.provenance)
+                ])?;
             }
         }
         tx.commit()?;
@@ -53,11 +73,18 @@ impl BarCache {
     /// The most recent `limit` cached bars, ascending.
     pub fn load(&self, symbol: &str, tf: Timeframe, limit: usize) -> Result<Vec<Bar>> {
         let mut st = self.conn.prepare_cached(
-            "SELECT ts, o, h, l, c, v FROM bars WHERE symbol = ?1 AND tf = ?2 ORDER BY ts DESC LIMIT ?3",
+            "SELECT ts, o, h, l, c, v, provenance FROM bars WHERE symbol = ?1 AND tf = ?2 ORDER BY ts DESC LIMIT ?3",
         )?;
         let mut bars: Vec<Bar> = st
             .query_map(params![symbol, tf.label(), limit as i64], |r| {
-                Ok(Bar::new(r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?))
+                let recorded: Option<String> = r.get(6)?;
+                let provenance = match recorded.as_deref() {
+                    Some("Real" | "Cached") => Provenance::Cached,
+                    Some("Sample") => Provenance::Sample,
+                    _ => Provenance::Missing,
+                };
+                Ok(Bar::new(r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)
+                    .with_provenance(provenance))
             })?
             .collect::<rusqlite::Result<_>>()?;
         bars.reverse();
@@ -80,5 +107,38 @@ mod tests {
         assert_eq!(got[0].ts, 40 * 60);
         assert_eq!(got[9].close, 2.5);
         assert!(c.load("AAPL", Timeframe::D1, 10).unwrap().is_empty());
+    }
+
+    #[test]
+    fn provenance_survives_cache_and_updates() {
+        let mut cache = BarCache::open_in_memory().unwrap();
+        for (i, provenance) in
+            [Provenance::Real, Provenance::Cached, Provenance::Sample, Provenance::Missing].into_iter().enumerate()
+        {
+            cache
+                .store("X", Timeframe::D1, &[Bar::new(i as i64, 1.0, 1.0, 1.0, 1.0, 1.0).with_provenance(provenance)])
+                .unwrap();
+        }
+        let bars = cache.load("X", Timeframe::D1, 10).unwrap();
+        assert_eq!(
+            bars.iter().map(|b| b.provenance).collect::<Vec<_>>(),
+            vec![Provenance::Cached, Provenance::Cached, Provenance::Sample, Provenance::Missing]
+        );
+        cache.store("X", Timeframe::D1, &[bars[0].with_provenance(Provenance::Sample)]).unwrap();
+        assert_eq!(cache.load("X", Timeframe::D1, 10).unwrap()[0].provenance, Provenance::Sample);
+    }
+
+    #[test]
+    fn legacy_cache_is_unverified() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE bars (symbol TEXT, tf TEXT, ts INTEGER, o REAL, h REAL, l REAL, c REAL, v REAL, PRIMARY KEY(symbol, tf, ts)) WITHOUT ROWID;
+            INSERT INTO bars VALUES ('X', '1D', 0, 1, 1, 1, 1, 1);").unwrap();
+        let cache = BarCache::init(conn).unwrap();
+        // Use the canonical timeframe label regardless of display spelling.
+        cache.conn.execute("UPDATE bars SET tf = ?", [Timeframe::D1.label()]).unwrap();
+        let bars = cache.load("X", Timeframe::D1, 10).unwrap();
+        assert_eq!(bars.len(), 1);
+        assert_eq!(bars[0].provenance, Provenance::Missing);
+        assert!(Bar::require_verified(&bars, "Backtest").is_err());
     }
 }

@@ -1,10 +1,12 @@
 use serde::{Deserialize, Serialize};
 
-use crate::Timeframe;
+use crate::{Provenance, Timeframe};
 
 /// One OHLCV bar. `ts` is the bar open time in Unix seconds (UTC).
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct Bar {
+    #[serde(default)]
+    pub provenance: Provenance,
     pub ts: i64,
     pub open: f64,
     pub high: f64,
@@ -15,7 +17,21 @@ pub struct Bar {
 
 impl Bar {
     pub fn new(ts: i64, open: f64, high: f64, low: f64, close: f64, volume: f64) -> Self {
-        Self { ts, open, high, low, close, volume }
+        Self { ts, open, high, low, close, volume, provenance: Provenance::Missing }
+    }
+
+    pub fn with_provenance(mut self, provenance: Provenance) -> Self {
+        self.provenance = provenance;
+        self
+    }
+
+    pub fn provenance(bars: &[Self]) -> Provenance {
+        bars.iter().map(|b| b.provenance).reduce(Provenance::combine).unwrap_or_default()
+    }
+
+    /// Shared gate for scans, research and historical performance/backtest callers.
+    pub fn require_verified(bars: &[Self], operation: &str) -> Result<(), String> {
+        Self::provenance(bars).require_verified(operation)
     }
 
     /// Typical price (high + low + close) / 3, used by VWAP.
@@ -35,6 +51,7 @@ impl Bar {
         self.low = self.low.min(live.low);
         self.close = live.close;
         self.volume = self.volume.max(live.volume);
+        self.provenance = self.provenance.combine(live.provenance);
     }
 }
 
@@ -47,6 +64,10 @@ pub struct Series {
 }
 
 impl Series {
+    pub fn provenance(&self) -> Provenance {
+        Bar::provenance(&self.bars)
+    }
+
     pub fn new(symbol: impl Into<String>, timeframe: Timeframe, bars: Vec<Bar>) -> Self {
         let mut s = Self { symbol: symbol.into(), timeframe, bars };
         s.normalize();
@@ -131,6 +152,26 @@ mod tests {
 
     fn b(ts: i64, c: f64) -> Bar {
         Bar::new(ts, c, c, c, c, 1.0)
+    }
+
+    #[test]
+    fn missing_metadata_and_mixed_prices_are_never_verified() {
+        let legacy: Bar = serde_json::from_str(r#"{"ts":0,"open":1,"high":1,"low":1,"close":1,"volume":1}"#).unwrap();
+        assert_eq!(legacy.provenance, Provenance::Missing);
+        let real = b(0, 1.0).with_provenance(Provenance::Real);
+        let sample = b(1, 2.0).with_provenance(Provenance::Sample);
+        let bars = vec![real, sample];
+        assert_eq!(Series::new("X", Timeframe::M1, bars.clone()).provenance(), Provenance::Sample);
+        assert_eq!(Timeframe::D1.resample(&bars)[0].provenance, Provenance::Sample);
+        let mut absorbed = real;
+        absorbed.absorb(&Bar { ts: 0, ..sample });
+        assert_eq!(absorbed.provenance, Provenance::Sample);
+        for operation in ["Research", "Scan", "Backtest"] {
+            assert!(Bar::require_verified(&bars, operation).unwrap_err().contains("SAMPLE DATA"));
+            assert!(Bar::require_verified(&[legacy], operation).unwrap_err().contains("UNVERIFIED"));
+            assert!(Bar::require_verified(&[], operation).is_err());
+            assert!(Bar::require_verified(&[real], operation).is_ok());
+        }
     }
 
     #[test]

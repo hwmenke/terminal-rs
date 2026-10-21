@@ -70,14 +70,17 @@ pub fn parse_binance_klines(json: &str) -> Result<Vec<Bar>> {
     Ok(rows
         .iter()
         .filter_map(|r| {
-            Some(Bar::new(
-                r.first()?.as_i64()? / 1000,
-                num(r.get(1)?)?,
-                num(r.get(2)?)?,
-                num(r.get(3)?)?,
-                num(r.get(4)?)?,
-                num(r.get(5)?)?,
-            ))
+            Some(
+                Bar::new(
+                    r.first()?.as_i64()? / 1000,
+                    num(r.get(1)?)?,
+                    num(r.get(2)?)?,
+                    num(r.get(3)?)?,
+                    num(r.get(4)?)?,
+                    num(r.get(5)?)?,
+                )
+                .with_provenance(tr_core::Provenance::Real),
+            )
         })
         .collect())
 }
@@ -95,15 +98,21 @@ pub fn parse_binance_24hr(json: &str) -> Result<Vec<(String, f64, f64)>> {
 pub fn parse_binance_ws(text: &str) -> Option<Bar> {
     let v: Value = serde_json::from_str(text).ok()?;
     let k = v.get("k")?;
-    Some(Bar::new(k["t"].as_i64()? / 1000, num(&k["o"])?, num(&k["h"])?, num(&k["l"])?, num(&k["c"])?, num(&k["v"])?))
+    Some(
+        Bar::new(k["t"].as_i64()? / 1000, num(&k["o"])?, num(&k["h"])?, num(&k["l"])?, num(&k["c"])?, num(&k["v"])?)
+            .with_provenance(tr_core::Provenance::Real),
+    )
 }
 
 /// Parse Coinbase `/products/{id}/candles`: `[time, low, high, open, close, volume]`,
 /// newest first. Returned ascending.
 pub fn parse_coinbase_candles(json: &str) -> Result<Vec<Bar>> {
     let rows: Vec<Vec<f64>> = serde_json::from_str(json).context("parsing Coinbase candles")?;
-    let mut bars: Vec<Bar> =
-        rows.iter().filter(|r| r.len() >= 6).map(|r| Bar::new(r[0] as i64, r[3], r[2], r[1], r[4], r[5])).collect();
+    let mut bars: Vec<Bar> = rows
+        .iter()
+        .filter(|r| r.len() >= 6)
+        .map(|r| Bar::new(r[0] as i64, r[3], r[2], r[1], r[4], r[5]).with_provenance(tr_core::Provenance::Real))
+        .collect();
     bars.sort_by_key(|b| b.ts);
     bars.dedup_by_key(|b| b.ts);
     Ok(bars)
@@ -350,7 +359,14 @@ impl CryptoProvider {
                 .await
                 .map(|b| b.iter().map(|x| x.close).collect())
                 .unwrap_or_default();
-            out.push(Quote { symbol: key.clone(), last, prev_close: prev, ts: now, spark });
+            out.push(Quote {
+                provenance: tr_core::Provenance::Real,
+                symbol: key.clone(),
+                last,
+                prev_close: prev,
+                ts: now,
+                spark,
+            });
         }
         if out.is_empty() && !secs.is_empty() {
             bail!("no crypto quotes available");
@@ -422,7 +438,7 @@ async fn coinbase_ws(product: &str, tf: Timeframe, tx: &mpsc::Sender<Bar>) -> Re
                 b.volume += size;
                 *b
             }
-            _ => *bar.insert(Bar::new(bucket, px, px, px, px, size)),
+            _ => *bar.insert(Bar::new(bucket, px, px, px, px, size).with_provenance(tr_core::Provenance::Real)),
         };
         if tx.send(b).await.is_err() {
             return Ok(());

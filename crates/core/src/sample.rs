@@ -92,7 +92,7 @@ pub fn generate_with(
         let high = open.max(close) + wick * rng.f64();
         let low = (open.min(close) - wick * rng.f64()).max(0.005);
         let volume = base_vol * (0.5 + rng.f64()) * (1.0 + 20.0 * ret.abs() / sigma.max(1e-9) * 0.05);
-        bars.push(Bar::new(ts, open, high, low, close, volume.round()));
+        bars.push(Bar::new(ts, open, high, low, close, volume.round()).with_provenance(crate::Provenance::Sample));
         price = close;
     }
     bars.dedup_by_key(|b| b.ts);

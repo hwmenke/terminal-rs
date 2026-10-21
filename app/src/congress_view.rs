@@ -290,13 +290,20 @@ pub fn profile(ui: &mut Ui, query: &str, p: Option<&Profile>, loading: bool) -> 
         }
     });
     let perf = &p.perf;
+    for warning in &p.price_warnings {
+        ui.label(RichText::new(warning).color(theme::down()));
+    }
     let ret_col = if perf.weighted_return >= 0.0 { theme::up() } else { theme::down() };
     ui.horizontal(|ui| {
         plain(ui, format!("Trades {}", p.trades.len()), text());
         plain(ui, format!("Scored {}", perf.scored), muted());
-        ui.label(RichText::new(format!("Est. return {:+.1}%", perf.weighted_return * 100.0)).font(mono(12.0)).color(ret_col))
-            .on_hover_text("Amount-weighted directional return from each trade date to today (buys long, sells short). Estimate: disclosures give value bands only.");
-        plain(ui, format!("Hit rate {:.0}%", perf.hit_rate * 100.0), text());
+        if perf.scored == 0 {
+            plain(ui, "Performance unavailable: no verified prices to score.", theme::down());
+        } else {
+            ui.label(RichText::new(format!("Est. return {:+.1}%", perf.weighted_return * 100.0)).font(mono(12.0)).color(ret_col))
+                .on_hover_text("Amount-weighted directional return from each trade date to today (buys long, sells short). Estimate: disclosures give value bands only.");
+            plain(ui, format!("Hit rate {:.0}%", perf.hit_rate * 100.0), text());
+        }
         plain(ui, format!("Avg lag {:.0}d", perf.avg_lag_days), if perf.avg_lag_days > 45.0 { theme::down() } else { muted() });
     });
     // Top tickers by count.

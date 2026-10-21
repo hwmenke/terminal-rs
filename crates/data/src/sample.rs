@@ -81,7 +81,8 @@ impl MarketData for SampleProvider {
                 let now = chrono::Utc::now().timestamp();
                 let bucket = tf.bucket_start(now);
                 if bucket > bar.ts {
-                    bar = Bar::new(bucket, bar.close, bar.close, bar.close, bar.close, 0.0);
+                    bar = Bar::new(bucket, bar.close, bar.close, bar.close, bar.close, 0.0)
+                        .with_provenance(tr_core::Provenance::Sample);
                 }
                 let px = bar.close * (tick_vol * rng.normal()).exp();
                 bar.close = px;

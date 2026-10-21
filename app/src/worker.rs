@@ -199,6 +199,7 @@ pub struct BuiltIndicator {
 }
 
 pub struct Profile {
+    pub price_warnings: Vec<String>,
     pub politician: Politician,
     pub trades: Vec<Trade>,
     pub perf: Performance,
@@ -635,8 +636,12 @@ async fn handle(s: &Arc<Shared>, req: Request) {
             s.send(Response::Indicators { pane, generation, built });
         }
         Request::Compare { pane, generation, symbol, tf, base } => {
+            if let Err(error) = Bar::require_verified(&base, "Comparison") {
+                s.send(Response::Status(error));
+                return;
+            }
             let limit = base.len().max(100);
-            match s.provider.history(&symbol, tf, None, limit).await {
+            match s.provider.history_for_analysis(&symbol, tf, None, limit, "Comparison").await {
                 Ok(other) => {
                     let line = tokio::task::spawn_blocking(move || line_ref(&align_compare(&base, &other))).await;
                     if let Ok(line) = line {
@@ -910,13 +915,25 @@ async fn profile(s: &Shared, query: &str) -> Option<Profile> {
     let fetches = tickers.into_iter().map(|t| {
         let provider = provider.clone();
         async move {
-            let r = provider.history(&format!("{t} US Equity"), Timeframe::D1, None, days.min(4000)).await;
+            let r = provider
+                .history_for_analysis(
+                    &format!("{t} US Equity"),
+                    Timeframe::D1,
+                    None,
+                    days.min(4000),
+                    "Historical performance/backtest",
+                )
+                .await;
             (t, r)
         }
     });
+    let mut price_warnings = Vec::new();
     for (t, r) in futures_join(fetches).await {
-        if let Ok(b) = r {
-            prices.insert(t, b);
+        match r {
+            Ok(b) => {
+                prices.insert(t, b);
+            }
+            Err(e) => price_warnings.push(format!("{t}: excluded from performance: {e:#}")),
         }
     }
     let (perf, returns) = performance::estimate(
@@ -929,7 +946,7 @@ async fn profile(s: &Shared, query: &str) -> Option<Profile> {
         },
         |tk| prices.get(tk).and_then(|b| b.last()).map(|b| b.close),
     );
-    Some(Profile { politician, trades, perf, returns, tracked })
+    Some(Profile { politician, trades, perf, returns, tracked, price_warnings })
 }
 
 /// Run futures concurrently, at most 6 in flight (keeps data providers happy).

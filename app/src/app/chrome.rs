@@ -15,7 +15,7 @@ use crate::command::{self, Function};
 use crate::congress_view::Action;
 use crate::layout::Layout;
 use crate::markets_view;
-use crate::theme::{self, amber, mono, muted, text, ui_font};
+use crate::theme::{self, amber, dp, mono, muted, text, ui_font};
 use crate::widgets::{self, Icon};
 
 /// Default toolbar height; on macOS it matches a unified `NSToolbar` so the traffic lights
@@ -101,12 +101,14 @@ impl TerminalApp {
         resp.context_menu(|ui| self.view_menu(ui));
 
         // Data source chip (the window title itself is redundant in a compact toolbar).
-        let live = !self.provider.eq_ignore_ascii_case("sample");
-        let chip_text = p.layout_no_wrap(if live { "Live" } else { "Offline" }.into(), ui_font(11.0), muted());
+        let provenance = self.data_provenance();
+        let live = provenance.is_verified();
+        let chip_color = if live { muted() } else { theme::down() };
+        let chip_text = p.layout_no_wrap(provenance.label().into(), mono(11.0), chip_color);
         let chip = Rect::from_min_size(pos2(x, cy - 9.0), vec2(chip_text.size().x + 20.0, 18.0));
         p.rect_filled(chip, 9.0, theme::control());
         p.circle_filled(pos2(chip.left() + 8.0, cy), 3.0, if live { theme::up() } else { amber() });
-        p.galley(pos2(chip.left() + 14.0, cy - chip_text.size().y / 2.0), chip_text, muted());
+        p.galley(pos2(chip.left() + 14.0, cy - chip_text.size().y / 2.0), chip_text, chip_color);
         ui.interact(chip, Id::new("source-chip"), Sense::hover()).on_hover_text(self.provider_label());
         x = chip.right() + 8.0;
 
@@ -282,8 +284,20 @@ impl TerminalApp {
     }
 
     fn provider_label(&self) -> String {
-        let n = self.provider.to_lowercase();
-        if n.contains("sample") { "Offline · sample data".into() } else { format!("Live · {}", self.provider) }
+        let provenance = self.data_provenance();
+        format!("{} · {}", provenance.label(), provenance.source_label(&self.provider))
+    }
+
+    fn data_provenance(&self) -> tr_core::Provenance {
+        self.panes
+            .iter()
+            .filter_map(|pane| match &pane.kind {
+                PaneKind::Chart(chart) => Some(chart.provenance()),
+                _ => None,
+            })
+            .chain(self.quotes.values().map(|q| q.provenance))
+            .reduce(tr_core::Provenance::combine)
+            .unwrap_or_default()
     }
 
     /// The Bloomberg command line, drawn as a rounded macOS search field.
@@ -556,20 +570,35 @@ impl TerminalApp {
             let mut remove = None;
             for key in &self.watchlist {
                 let sec = tr_data::security(key);
-                let resp = row_frame(ui, false);
-                let r = resp.rect;
+                let (r, resp) = ui.allocate_exact_size(vec2(ui.available_width(), dp(38.0)), Sense::click());
+                widgets::hover_wash(ui, r, &resp, false);
                 let pt = ui.painter();
-                pt.text(pos2(r.left() + 8.0, r.center().y), Align2::LEFT_CENTER, &sec.ticker, mono(12.0), text());
+                pt.text(
+                    pos2(r.left() + 8.0, r.center().y - dp(6.0)),
+                    Align2::LEFT_CENTER,
+                    &sec.ticker,
+                    mono(12.0),
+                    text(),
+                );
+                let provenance = self.quotes.get(key).map(|q| q.provenance).unwrap_or_default();
+                pt.text(
+                    pos2(r.left() + 8.0, r.bottom() - 1.0),
+                    Align2::LEFT_BOTTOM,
+                    provenance.label(),
+                    mono(10.0),
+                    if provenance.is_verified() { muted() } else { theme::down() },
+                );
                 if let Some(q) = self.quotes.get(key) {
                     let up = q.change() >= 0.0;
                     let c = if up { theme::up() } else { theme::down() };
                     let pct = format!("{:+.2}%", q.change_pct());
-                    let pill = Rect::from_min_size(pos2(r.right() - 62.0, r.center().y - 8.0), vec2(58.0, 16.0));
+                    let pill =
+                        Rect::from_min_size(pos2(r.right() - 62.0, r.center().y - dp(6.0) - 8.0), vec2(58.0, 16.0));
                     pt.rect_filled(pill, 4.0, c.gamma_multiply(0.16));
                     pt.text(pill.right_center() - vec2(5.0, 0.0), Align2::RIGHT_CENTER, pct, mono(11.0), c);
                     let d = sec.decimals(q.last);
                     pt.text(
-                        pos2(pill.left() - 8.0, r.center().y),
+                        pos2(pill.left() - 8.0, r.center().y - dp(6.0)),
                         Align2::RIGHT_CENTER,
                         format!("{:.d$}", q.last),
                         mono(11.5),
@@ -577,7 +606,7 @@ impl TerminalApp {
                     );
                 } else {
                     pt.text(
-                        pos2(r.right() - 8.0, r.center().y),
+                        pos2(r.right() - 8.0, r.center().y - dp(6.0)),
                         Align2::RIGHT_CENTER,
                         sec.class.yellow_key().label(),
                         ui_font(10.5),
