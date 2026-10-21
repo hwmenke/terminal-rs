@@ -561,8 +561,8 @@ impl TerminalApp {
         child.set_clip_rect(body.intersect(ui.clip_rect()));
         egui::ScrollArea::vertical().auto_shrink([false, false]).show(&mut child, |ui| {
             ui.spacing_mut().item_spacing.y = 1.0;
-            let focused = self.idx(self.focus).map(|i| std::mem::discriminant(&self.panes[i].kind));
-            let is_focused = |k: &PaneKind| focused == Some(std::mem::discriminant(k));
+            let focused = self.idx(self.focus).map(|i| self.panes[i].kind.panel_type());
+            let is_focused = |k: &PaneKind| focused == Some(k.panel_type());
 
             section(ui, "Watchlist");
             let mut remove = None;
@@ -644,6 +644,13 @@ impl TerminalApp {
 
             section(ui, "Markets");
             let items = [
+                (
+                    Icon::List,
+                    "Price history",
+                    "HIST",
+                    Function::History(String::new()),
+                    PaneKind::Research(Box::new(super::research::ResearchPane::price_history())),
+                ),
                 (Icon::Globe, "World Markets", "WEI", Function::Wei, PaneKind::Wei),
                 (Icon::Curve, "Yield Curve", "GC", Function::Curve, PaneKind::Curve),
                 (

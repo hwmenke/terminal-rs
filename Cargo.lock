@@ -4096,6 +4096,7 @@ dependencies = [
  "egui",
  "futures",
  "raw-window-handle",
+ "rusqlite",
  "serde",
  "serde_json",
  "tokio",

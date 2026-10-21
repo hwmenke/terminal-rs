@@ -255,6 +255,7 @@ mod tests {
     fn every_function_family_and_indicator_is_discoverable() {
         let mut app = super::super::tests::test_app();
         for code in [
+            "HIST",
             "UNIV",
             "SCAN",
             "TRACK",

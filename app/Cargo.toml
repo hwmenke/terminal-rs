@@ -28,4 +28,5 @@ tr-macos.workspace = true
 raw-window-handle = "0.6"
 
 [dev-dependencies]
+rusqlite.workspace = true
 async-trait = "0.1"

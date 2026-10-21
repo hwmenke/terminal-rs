@@ -170,6 +170,12 @@ gets the native title bar with traffic lights, window vibrancy behind the sideba
   company names, recent symbols, functions and indicators: ↑↓ select, Tab completes,
   Enter or a click accepts, Esc closes. Whats-News symbols are loaded in the background
   and cached for five minutes; only verified archive metadata is accepted.
+- **Price history and research archive** — `HIST` opens the Price history panel; `HIST ADD ALL`
+  downloads full Yahoo daily history for 582 named bundled equities, ETFs and indices. Add your own
+  symbols or the connected Whats-News universe. Refreshes use an overlap and rebuild history when
+  adjusted prices change. Progress, failures, freshness, cancel/resume and retry-failed controls are
+  available in the panel. `UNIV` and `SCAN` use archived daily prices; archived charts support
+  daily, weekly and monthly candles. See [Price history](docs/PRICE_HISTORY.md).
 - **Command palette** — ⌘⇧K (Ctrl+Shift+K on Linux and Windows) opens a centred, theme-matched palette
   that fuzzy-searches every function code (`PORT`, `POS`, `ORD`, `OMON`, `THEME`, …), tickers
   (load the quote and chart), new panels, layout presets and saved layouts, themes, Settings tabs

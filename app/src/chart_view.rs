@@ -175,19 +175,6 @@ impl ChartState {
         self.bars.is_empty()
     }
 
-    /// Retire pending history and remove bars when the archive connection drops.
-    pub fn archive_disconnected(&mut self, message: &str, worker: &Worker) {
-        self.generation += 1;
-        worker.send(Request::Forget(self.id));
-        self.loading = false;
-        self.paging = false;
-        self.bars = Arc::new(Vec::new());
-        self.provenance = Provenance::Missing;
-        self.gpu = None;
-        self.built.clear();
-        self.error = Some(message.to_owned());
-    }
-
     /// (Re)load history for the current symbol and timeframe.
     pub fn load(&mut self, w: &Worker) {
         self.generation += 1;
@@ -217,12 +204,15 @@ impl ChartState {
             return;
         }
         if self.archive {
-            self.tf = Timeframe::D1;
+            if self.tf.is_intraday() {
+                self.tf = Timeframe::D1;
+            }
             self.compare = None;
             w.send(Request::ArchiveHistory {
                 pane: self.id,
                 generation: self.generation,
-                symbol: self.sec.ticker.clone(),
+                symbol: self.symbol.clone(),
+                tf: self.tf,
             });
             return;
         }
@@ -257,8 +247,8 @@ impl ChartState {
     }
 
     pub fn set_timeframe(&mut self, tf: Timeframe, w: &Worker) {
-        if self.archive && tf != Timeframe::D1 {
-            self.error = Some("Whats-News archive charts support daily bars only".into());
+        if self.archive && tf.is_intraday() {
+            self.error = Some("Research archive supports daily, weekly and monthly bars".into());
             return;
         }
         if tf != self.tf {
@@ -1060,7 +1050,7 @@ impl ChartState {
 
         {
             let label = if self.archive {
-                format!("{} · WHATS-NEWS ARCHIVE · DAILY", provenance.label())
+                format!("{} · RESEARCH ARCHIVE · {}", provenance.label(), self.tf.label())
             } else {
                 provenance.label().to_string()
             };
@@ -1689,13 +1679,20 @@ mod tests {
         let mut chart = ChartState::new(42, "AAPL", Timeframe::M5);
         chart.archive = true;
         chart.load(&worker);
-        assert!(matches!(requests.try_recv(), Ok(Request::ArchiveHistory { pane:42, symbol, .. }) if symbol == "AAPL"));
+        assert!(
+            matches!(requests.try_recv(), Ok(Request::ArchiveHistory { pane:42, symbol, .. }) if symbol == "AAPL US Equity")
+        );
         assert!(requests.try_recv().is_err(), "No market history, live feed, or marker requests");
         chart.set_timeframe(Timeframe::W1, &worker);
         chart.set_range(Range::M1, &worker);
         chart.set_compare(Some("SPY".into()), &worker);
         chart.request_compare(&worker);
-        assert_eq!(chart.tf, Timeframe::D1);
+        assert_eq!(chart.tf, Timeframe::W1);
+        assert!(matches!(requests.try_recv(), Ok(Request::ArchiveHistory { tf: Timeframe::W1, .. })));
+        chart.set_timeframe(Timeframe::MN1, &worker);
+        assert!(matches!(requests.try_recv(), Ok(Request::ArchiveHistory { tf: Timeframe::MN1, .. })));
+        chart.set_timeframe(Timeframe::M1, &worker);
+        assert_eq!(chart.tf, Timeframe::MN1);
         assert!(chart.compare.is_none());
         assert!(
             requests.try_recv().is_err(),
@@ -1734,7 +1731,7 @@ mod tests {
         assert_eq!(c.glide.map(|g| g.to), Some(Viewport::fit_last(500, DEFAULT_VISIBLE, 800.0)));
     }
     #[test]
-    fn archive_disconnect_clears_history_and_rejects_pending_prices() {
+    fn archive_reload_clears_history_and_rejects_pending_prices() {
         let (worker, mut requests) = Worker::test_channel();
         let mut chart = ChartState::new(42, "AAPL", Timeframe::D1);
         chart.archive = true;
@@ -1744,12 +1741,12 @@ mod tests {
         let bars = Arc::new(vec![Bar::new(0, 10.0, 12.0, 9.0, 11.0, 1.0).with_provenance(Provenance::Real)]);
         chart.on_history(generation, bars.clone(), SeriesGpu::build(&bars), 0, false, true, false, &worker);
         assert!(!chart.is_empty());
-        let message = "Whats-News archive file is missing. Choose finance.db in Settings › Whats-News.";
-        chart.archive_disconnected(message, &worker);
+        // Connection changes recheck local and external archives through a new generation.
+        chart.load(&worker);
         assert!(chart.is_empty());
         assert_eq!(chart.provenance, Provenance::Missing);
-        assert_eq!(chart.error.as_deref(), Some(message));
-        assert!(!chart.loading);
+        assert!(chart.error.is_none());
+        assert!(chart.loading);
         chart.on_history(generation, bars.clone(), SeriesGpu::build(&bars), 0, false, true, false, &worker);
         assert!(chart.is_empty(), "A response from before the disconnect cannot restore bars");
     }

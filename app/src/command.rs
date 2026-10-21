@@ -231,6 +231,7 @@ pub enum Function {
     Untrack(String),
     Alerts,
     Refresh,
+    History(String),
     Universe,
     Scan(String),
     Watchlist,
@@ -313,6 +314,7 @@ fn parse_function(head: &str, rest: &[&str]) -> Option<Function> {
         "VL" | "VLINE" => Function::Draw(Tool::Vertical),
         "FIB" => Function::Draw(Tool::Fib),
         "MAGNET" | "MAG" => Function::Magnet,
+        "HIST" | "HISTORY" => Function::History(words().join(" ")),
         "UNIV" if rest.is_empty() => Function::Universe,
         "SCAN" => Function::Scan(words().join(" ")),
         "CONG" | "CONGRESS" => Function::Congress,
@@ -471,6 +473,7 @@ fn describe(f: &Function) -> String {
         Function::Untrack(n) => format!("Stop tracking {n}"),
         Function::Alerts => "Alerts".into(),
         Function::Refresh => "Refresh congressional disclosures now".into(),
+        Function::History(args) => format!("Price history {args}"),
         Function::Universe => "Browse Whats-News archive coverage".into(),
         Function::Scan(name) => format!("Scan Whats-News archive: {name}"),
         Function::Watchlist => "Watchlist".into(),
@@ -586,6 +589,11 @@ mod tests {
 
     #[test]
     fn research_commands() {
+        assert_eq!(parse("hist"), Some(Command::Function(Function::History(String::new()))));
+        assert_eq!(parse("HIST ADD aapl,msft"), Some(Command::Function(Function::History("ADD AAPL,MSFT".into()))));
+        for action in ["REFRESH", "CANCEL", "RESUME", "RETRY"] {
+            assert_eq!(parse(&format!("HIST {action}")), Some(Command::Function(Function::History(action.into()))));
+        }
         assert_eq!(parse("UNIV <GO>"), Some(Command::Function(Function::Universe)));
         assert_eq!(parse("scan darvas_breakout"), Some(Command::Function(Function::Scan("DARVAS_BREAKOUT".into()))));
         assert_eq!(parse("SCAN"), Some(Command::Function(Function::Scan(String::new()))));

@@ -1,0 +1,523 @@
+# Bundled broad US research universe; curated static catalogue, not live index membership.
+# Yahoo symbols and security names. Delisted/unavailable names are reported by provider.
+AAPL	Apple
+MSFT	Microsoft
+NVDA	NVIDIA
+AMZN	Amazon
+GOOGL	Alphabet Class A
+GOOG	Alphabet Class C
+META	Meta Platforms
+AVGO	Broadcom
+TSLA	Tesla
+BRK-B	Berkshire Hathaway Class B
+JPM	JPMorgan Chase
+LLY	Eli Lilly
+V	Visa
+MA	Mastercard
+UNH	UnitedHealth Group
+XOM	Exxon Mobil
+COST	Costco Wholesale
+HD	Home Depot
+PG	Procter & Gamble
+JNJ	Johnson & Johnson
+ABBV	AbbVie
+WMT	Walmart
+BAC	Bank of America
+NFLX	Netflix
+CRM	Salesforce
+ORCL	Oracle
+CVX	Chevron
+KO	Coca-Cola
+MRK	Merck
+ADBE	Adobe
+PEP	PepsiCo
+AMD	Advanced Micro Devices
+TMO	Thermo Fisher Scientific
+LIN	Linde
+ACN	Accenture
+MCD	McDonald's
+CSCO	Cisco Systems
+ABT	Abbott Laboratories
+GE	GE Aerospace
+WFC	Wells Fargo
+IBM	International Business Machines
+CAT	Caterpillar
+PM	Philip Morris International
+NOW	ServiceNow
+ISRG	Intuitive Surgical
+QCOM	Qualcomm
+AXP	American Express
+INTU	Intuit
+DIS	Walt Disney
+VZ	Verizon Communications
+TXN	Texas Instruments
+DHR	Danaher
+AMGN	Amgen
+PFE	Pfizer
+RTX	RTX Corporation
+SPGI	S&P Global
+CMCSA	Comcast
+NEE	NextEra Energy
+LOW	Lowe's
+HON	Honeywell International
+UNP	Union Pacific
+UBER	Uber Technologies
+AMAT	Applied Materials
+GS	Goldman Sachs
+BKNG	Booking Holdings
+T	AT&T
+COP	ConocoPhillips
+TJX	TJX Companies
+LMT	Lockheed Martin
+VRTX	Vertex Pharmaceuticals
+SYK	Stryker
+BLK	BlackRock
+MS	Morgan Stanley
+C	Citigroup
+SCHW	Charles Schwab
+BSX	Boston Scientific
+PANW	Palo Alto Networks
+ADP	Automatic Data Processing
+CB	Chubb
+ETN	Eaton
+MMC	Marsh & McLennan
+PLD	Prologis
+DE	Deere & Company
+ADI	Analog Devices
+UPS	United Parcel Service
+BMY	Bristol Myers Squibb
+MU	Micron Technology
+GILD	Gilead Sciences
+MDT	Medtronic
+SBUX	Starbucks
+BA	Boeing
+NKE	Nike
+LRCX	Lam Research
+KLAC	KLA Corporation
+PLTR	Palantir Technologies
+SO	Southern Company
+DUK	Duke Energy
+MO	Altria Group
+MCO	Moody's
+ICE	Intercontinental Exchange
+SHW	Sherwin-Williams
+ELV	Elevance Health
+CI	Cigna Group
+WM	Waste Management
+CME	CME Group
+EQIX	Equinix
+WELL	Welltower
+MDLZ	Mondelez International
+APH	Amphenol
+CL	Colgate-Palmolive
+GD	General Dynamics
+TT	Trane Technologies
+PH	Parker-Hannifin
+ANET	Arista Networks
+SNPS	Synopsys
+CDNS	Cadence Design Systems
+MMM	3M
+HCA	HCA Healthcare
+AON	Aon
+ITW	Illinois Tool Works
+NOC	Northrop Grumman
+EOG	EOG Resources
+MCK	McKesson
+USB	US Bancorp
+PNC	PNC Financial Services
+TDG	TransDigm Group
+CTAS	Cintas
+EMR	Emerson Electric
+MSI	Motorola Solutions
+ECL	Ecolab
+ZTS	Zoetis
+ORLY	O'Reilly Automotive
+MAR	Marriott International
+WMB	Williams Companies
+AJG	Arthur J Gallagher
+FDX	FedEx
+CSX	CSX Corporation
+APD	Air Products and Chemicals
+ABNB	Airbnb
+ROP	Roper Technologies
+NXPI	NXP Semiconductors
+PYPL	PayPal Holdings
+TGT	Target
+RSG	Republic Services
+FTNT	Fortinet
+PSX	Phillips 66
+SLB	SLB
+OKE	ONEOK
+AFL	Aflac
+FCX	Freeport-McMoRan
+AEP	American Electric Power
+SPG	Simon Property Group
+AZO	AutoZone
+TRV	Travelers Companies
+NSC	Norfolk Southern
+GM	General Motors
+PCAR	PACCAR
+SRE	Sempra
+CPRT	Copart
+MPC	Marathon Petroleum
+HLT	Hilton Worldwide
+FICO	Fair Isaac
+MET	MetLife
+JCI	Johnson Controls International
+KMI	Kinder Morgan
+D	Dominion Energy
+GWW	WW Grainger
+COF	Capital One Financial
+O	Realty Income
+CCI	Crown Castle
+PAYX	Paychex
+TEL	TE Connectivity
+EW	Edwards Lifesciences
+FAST	Fastenal
+DHI	DR Horton
+AIG	American International Group
+ALL	Allstate
+LEN	Lennar
+VLO	Valero Energy
+PSA	Public Storage
+FIS	Fidelity National Information Services
+AMP	Ameriprise Financial
+PRU	Prudential Financial
+F	Ford Motor
+HES	Hess
+DOW	Dow
+CMG	Chipotle Mexican Grill
+PCG	PG&E
+ROST	Ross Stores
+URI	United Rentals
+COR	Cencora
+IDXX	IDEXX Laboratories
+IQV	IQVIA Holdings
+NEM	Newmont
+KDP	Keurig Dr Pepper
+CTVA	Corteva
+KMB	Kimberly-Clark
+SYY	Sysco
+EXC	Exelon
+MNST	Monster Beverage
+CARR	Carrier Global
+NUE	Nucor
+GIS	General Mills
+BKR	Baker Hughes
+A	Agilent Technologies
+HSY	Hershey
+VRSK	Verisk Analytics
+YUM	Yum Brands
+PEG	Public Service Enterprise Group
+CNC	Centene
+IR	Ingersoll Rand
+VMC	Vulcan Materials
+ACGL	Arch Capital Group
+ED	Consolidated Edison
+STZ	Constellation Brands
+OTIS	Otis Worldwide
+MLM	Martin Marietta Materials
+HPQ	HP
+CTSH	Cognizant Technology Solutions
+DD	DuPont de Nemours
+RMD	ResMed
+EXR	Extra Space Storage
+IT	Gartner
+WEC	WEC Energy Group
+KR	Kroger
+VICI	VICI Properties
+GEHC	GE HealthCare Technologies
+HUM	Humana
+EA	Electronic Arts
+XEL	Xcel Energy
+HIG	Hartford Financial Services
+ODFL	Old Dominion Freight Line
+CBRE	CBRE Group
+DFS	Discover Financial Services
+EFX	Equifax
+XYL	Xylem
+ON	ON Semiconductor
+CSGP	CoStar Group
+WAB	Westinghouse Air Brake Technologies
+CHTR	Charter Communications
+TTWO	Take-Two Interactive Software
+FANG	Diamondback Energy
+TSCO	Tractor Supply
+EIX	Edison International
+RCL	Royal Caribbean Group
+AVB	AvalonBay Communities
+BRO	Brown & Brown
+ROK	Rockwell Automation
+HAL	Halliburton
+VTR	Ventas
+WTW	Willis Towers Watson
+DLR	Digital Realty Trust
+ANSS	ANSYS
+DOV	Dover
+EBAY	eBay
+CDW	CDW Corporation
+FTV	Fortive
+DTE	DTE Energy
+WST	West Pharmaceutical Services
+LYB	LyondellBasell Industries
+EQR	Equity Residential
+HPE	Hewlett Packard Enterprise
+WAT	Waters
+VRSN	VeriSign
+PPG	PPG Industries
+NTRS	Northern Trust
+KHC	Kraft Heinz
+STE	STERIS
+FITB	Fifth Third Bancorp
+FE	FirstEnergy
+PPL	PPL Corporation
+DVN	Devon Energy
+ES	Eversource Energy
+GRMN	Garmin
+AWK	American Water Works
+KEYS	Keysight Technologies
+SBAC	SBA Communications
+CHD	Church & Dwight
+ROL	Rollins
+TER	Teradyne
+CCL	Carnival Corporation
+HBAN	Huntington Bancshares
+STT	State Street
+MTD	Mettler-Toledo International
+CPAY	Corpay
+WDC	Western Digital
+PTC	PTC
+INVH	Invitation Homes
+DASH	DoorDash
+WBD	Warner Bros Discovery
+PHM	PulteGroup
+AXON	Axon Enterprise
+PWR	Quanta Services
+TPL	Texas Pacific Land
+HUBB	Hubbell
+TROW	T Rowe Price Group
+IFF	International Flavors & Fragrances
+TSN	Tyson Foods
+NTAP	NetApp
+ZBH	Zimmer Biomet
+ATO	Atmos Energy
+DRI	Darden Restaurants
+CBOE	Cboe Global Markets
+CMS	CMS Energy
+NVR	NVR
+MKC	McCormick & Company
+CINF	Cincinnati Financial
+LDOS	Leidos Holdings
+LVS	Las Vegas Sands
+TYL	Tyler Technologies
+TRGP	Targa Resources
+ESS	Essex Property Trust
+CFG	Citizens Financial Group
+UAL	United Airlines Holdings
+DAL	Delta Air Lines
+SYF	Synchrony Financial
+DG	Dollar General
+DLTR	Dollar Tree
+SWK	Stanley Black & Decker
+RF	Regions Financial
+LH	Labcorp Holdings
+STX	Seagate Technology
+LUV	Southwest Airlines
+KEY	KeyCorp
+L	Loews
+PKG	Packaging Corporation of America
+IP	International Paper
+NDAQ	Nasdaq
+CNP	CenterPoint Energy
+DGX	Quest Diagnostics
+NI	NiSource
+SNA	Snap-on
+LNT	Alliant Energy
+NDSN	Nordson
+MAA	Mid-America Apartment Communities
+BALL	Ball Corporation
+ARE	Alexandria Real Estate Equities
+FDS	FactSet Research Systems
+J	Jacobs Solutions
+COO	Cooper Companies
+CF	CF Industries Holdings
+EXPD	Expeditors International
+AVY	Avery Dennison
+TXT	Textron
+TRMB	Trimble
+IEX	IDEX Corporation
+MAS	Masco
+ALGN	Align Technology
+PAYC	Paycom Software
+CLX	Clorox
+HOLX	Hologic
+OMC	Omnicom Group
+UDR	UDR
+PNR	Pentair
+BAX	Baxter International
+SWKS	Skyworks Solutions
+POOL	Pool Corporation
+CAG	Conagra Brands
+AKAM	Akamai Technologies
+BEN	Franklin Resources
+AES	AES Corporation
+EPAM	EPAM Systems
+KIM	Kimco Realty
+REG	Regency Centers
+EG	Everest Group
+NRG	NRG Energy
+LKQ	LKQ Corporation
+AOS	AO Smith
+NWSA	News Corporation Class A
+NWS	News Corporation Class B
+UHS	Universal Health Services
+JKHY	Jack Henry & Associates
+KMX	CarMax
+PNW	Pinnacle West Capital
+HST	Host Hotels & Resorts
+AIZ	Assurant
+EMN	Eastman Chemical
+INCY	Incyte
+SJM	JM Smucker
+ALLE	Allegion
+VTRS	Viatris
+HSIC	Henry Schein
+FOXA	Fox Corporation Class A
+FOX	Fox Corporation Class B
+FRT	Federal Realty Investment Trust
+CPB	Campbell's Company
+BWA	BorgWarner
+CHRW	CH Robinson Worldwide
+TECH	Bio-Techne
+MHK	Mohawk Industries
+BXP	BXP
+HAS	Hasbro
+TPR	Tapestry
+MOS	Mosaic
+RL	Ralph Lauren
+DVA	DaVita
+MTCH	Match Group
+AAL	American Airlines Group
+NCLH	Norwegian Cruise Line Holdings
+WY	Weyerhaeuser
+APA	APA Corporation
+MGM	MGM Resorts International
+WYNN	Wynn Resorts
+BBY	Best Buy
+FMC	FMC Corporation
+IVZ	Invesco
+CZR	Caesars Entertainment
+CE	Celanese
+BF-B	Brown-Forman Class B
+GNRC	Generac Holdings
+DAY	Dayforce
+ENPH	Enphase Energy
+SOLV	Solventum
+GEV	GE Vernova
+VLTO	Veralto
+SW	Smurfit Westrock
+DELL	Dell Technologies
+SMCI	Super Micro Computer
+KKR	KKR
+BX	Blackstone
+APO	Apollo Global Management
+HOOD	Robinhood Markets
+COIN	Coinbase Global
+CRWD	CrowdStrike Holdings
+APP	AppLovin
+TTD	Trade Desk
+WDAY	Workday
+ADSK	Autodesk
+TEAM	Atlassian
+ZS	Zscaler
+DDOG	Datadog
+MDB	MongoDB
+NET	Cloudflare
+SNOW	Snowflake
+ARM	Arm Holdings
+ASML	ASML Holding
+MELI	MercadoLibre
+PDD	PDD Holdings
+JD	JD.com
+BIDU	Baidu
+BABA	Alibaba Group
+CEG	Constellation Energy
+VST	Vistra
+FSLR	First Solar
+MSTR	Strategy
+LULU	Lululemon Athletica
+DXCM	DexCom
+BIIB	Biogen
+ILMN	Illumina
+ALNY	Alnylam Pharmaceuticals
+REGN	Regeneron Pharmaceuticals
+MRNA	Moderna
+GFS	GlobalFoundries
+MCHP	Microchip Technology
+INTC	Intel
+ENTG	Entegris
+MPWR	Monolithic Power Systems
+ONON	On Holding
+RIVN	Rivian Automotive
+LCID	Lucid Group
+RBLX	Roblox
+U	Unity Software
+ROKU	Roku
+SPOT	Spotify Technology
+ZM	Zoom Communications
+DOCU	DocuSign
+OKTA	Okta
+HUBS	HubSpot
+XYZ	Block
+PYPL	PayPal Holdings
+AFRM	Affirm Holdings
+SOFI	SoFi Technologies
+TOST	Toast
+DUOL	Duolingo
+CAVA	Cava Group
+WING	Wingstop
+SHOP	Shopify
+SE	Sea Limited
+NU	Nu Holdings
+IBKR	Interactive Brokers Group
+FNF	Fidelity National Financial
+TFC	Truist Financial
+BK	Bank of New York Mellon
+AME	AMETEK
+AMT	American Tower
+APTV	Aptiv
+BDX	Becton Dickinson
+BR	Broadridge Financial Solutions
+CAH	Cardinal Health
+DHR	Danaher
+DPZ	Domino's Pizza
+EL	Estee Lauder Companies
+ETSY	Etsy
+FI	Fiserv
+GL	Globe Life
+GLW	Corning
+GPC	Genuine Parts
+HRL	Hormel Foods
+HWM	Howmet Aerospace
+IRM	Iron Mountain
+JBHT	JB Hunt Transport Services
+JBL	Jabil
+K	Kellanova
+LW	Lamb Weston Holdings
+LYV	Live Nation Entertainment
+MSCI	MSCI
+MTB	M&T Bank
+NVT	nVent Electric
+PODD	Insulet
+RJF	Raymond James Financial
+RVTY	Revvity
+STLD	Steel Dynamics
+TDY	Teledyne Technologies
+TFX	Teleflex
+TAP	Molson Coors Beverage
+UAA	Under Armour Class A
+UA	Under Armour Class C
+ULTA	Ulta Beauty
+WRB	WR Berkley
+ZBRA	Zebra Technologies
+ZION	Zions Bancorporation

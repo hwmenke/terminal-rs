@@ -251,6 +251,8 @@ impl TerminalApp {
                 ui,
                 "help-panels",
                 &[
+                    (&["HIST"], "Price history: bundled universe, download, refresh, cancel, resume and retry failed"),
+                    (&["HIST ADD ALL"], "Archive full daily Yahoo history for the bundled research universe"),
                     (&["UNIV"], "Whats-News archive: last bar date, STALE and MISSING coverage"),
                     (
                         &["SCAN DARVAS_BREAKOUT", "SCAN NEAR_HIGH"],

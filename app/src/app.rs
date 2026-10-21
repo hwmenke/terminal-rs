@@ -166,6 +166,11 @@ impl BookPane {
 }
 
 impl PaneKind {
+    /// Price history has its own panel identity, so opening research keeps job progress visible.
+    fn panel_type(&self) -> (std::mem::Discriminant<Self>, bool) {
+        (std::mem::discriminant(self), matches!(self,Self::Research(r) if r.history))
+    }
+
     /// Short tab title.
     fn tab_title(&self) -> String {
         let short = |s: &str| tr_data::security(s).ticker;
@@ -179,7 +184,11 @@ impl PaneKind {
             PaneKind::Politicians => "Politicians".into(),
             PaneKind::Alerts => "Alerts".into(),
             PaneKind::Research(r) => {
-                r.scan.as_ref().map(|s| format!("Scan: {s}")).unwrap_or_else(|| "Archive universe".into())
+                if r.history {
+                    "Price history".into()
+                } else {
+                    r.scan.as_ref().map(|s| format!("Scan: {s}")).unwrap_or_else(|| "Archive universe".into())
+                }
             }
             PaneKind::Watchlist => "Watchlist".into(),
             PaneKind::Help => "Help".into(),
@@ -206,7 +215,9 @@ impl PaneKind {
             PaneKind::Profile { .. } | PaneKind::Politicians => "POL",
             PaneKind::Alerts => "ALRT",
             PaneKind::Research(r) => {
-                if r.scan.is_some() {
+                if r.history {
+                    "HIST"
+                } else if r.scan.is_some() {
                     "SCAN"
                 } else {
                     "UNIV"
@@ -270,7 +281,13 @@ impl PaneKind {
             PaneKind::Profile { query, .. } => PaneSettings::Profile(query.clone()),
             PaneKind::Politicians => PaneSettings::Politicians,
             PaneKind::Alerts => PaneSettings::Alerts,
-            PaneKind::Research(r) => PaneSettings::Research(r.scan.clone()),
+            PaneKind::Research(r) => {
+                if r.history {
+                    PaneSettings::PriceHistory
+                } else {
+                    PaneSettings::Research(r.scan.clone())
+                }
+            }
             PaneKind::Watchlist => PaneSettings::Watchlist,
             PaneKind::Help => PaneSettings::Help,
             PaneKind::Wei => PaneSettings::Wei,
@@ -326,6 +343,7 @@ impl PaneKind {
             PaneSettings::Profile(q) => PaneKind::Profile { query: q, data: None, loading: true },
             PaneSettings::Politicians => PaneKind::Politicians,
             PaneSettings::Alerts => PaneKind::Alerts,
+            PaneSettings::PriceHistory => PaneKind::Research(Box::new(research::ResearchPane::price_history())),
             PaneSettings::Research(scan) => PaneKind::Research(Box::new(research::ResearchPane::new(scan))),
             PaneSettings::Watchlist => PaneKind::Watchlist,
             PaneSettings::Help => PaneKind::Help,
@@ -865,6 +883,12 @@ impl TerminalApp {
                 self.open_panel(PaneKind::Alerts);
             }
             Function::Refresh => self.worker.send(Request::RefreshCongress),
+            Function::History(command) => {
+                if !command.is_empty() {
+                    self.worker.send(Request::HistoryTask(command));
+                }
+                self.open_panel(PaneKind::Research(Box::new(research::ResearchPane::price_history())));
+            }
             Function::Universe => self.open_panel(PaneKind::Research(Box::new(research::ResearchPane::new(None)))),
             Function::Scan(name) => {
                 self.open_panel(PaneKind::Research(Box::new(research::ResearchPane::new(Some(name)))))
@@ -1014,17 +1038,32 @@ impl TerminalApp {
                         self.refresh_whats_news_panes();
                     }
                 }
+                Response::HistoryStatus(result) => {
+                    for pane in &mut self.panes {
+                        if let PaneKind::Research(r) = &mut pane.kind
+                            && r.history
+                        {
+                            r.accept_history(result.clone());
+                        }
+                    }
+                }
+                Response::HistoryChanged => {
+                    self.command_catalogue = Default::default();
+                    for pane in &mut self.panes {
+                        match &mut pane.kind {
+                            PaneKind::Research(r) => r.request(pane.id, &self.worker),
+                            PaneKind::Chart(c) if c.archive => c.load(&self.worker),
+                            _ => {}
+                        }
+                    }
+                }
                 Response::AutocompleteUniverse(result) => self.command_catalogue.accept(result),
                 Response::Universe { pane, generation, result } => {
                     if let Some(PaneKind::Research(r)) =
                         self.panes.iter_mut().find(|p| p.id == pane).map(|p| &mut p.kind)
                         && r.generation == generation
                     {
-                        r.accept_universe(if self.whats_news_health.connected() {
-                            result
-                        } else {
-                            Err(self.whats_news_health.message.clone())
-                        });
+                        r.accept_universe(result);
                     }
                 }
                 Response::Scan { pane, generation, result } => {
@@ -1032,11 +1071,7 @@ impl TerminalApp {
                         self.panes.iter_mut().find(|p| p.id == pane).map(|p| &mut p.kind)
                         && r.generation == generation
                     {
-                        r.accept_scan(if self.whats_news_health.connected() {
-                            result
-                        } else {
-                            Err(self.whats_news_health.message.clone())
-                        });
+                        r.accept_scan(result);
                     }
                 }
                 Response::History {
@@ -1843,6 +1878,26 @@ mod tests {
     }
 
     #[test]
+    fn price_history_commands_preserve_progress_panel_and_submit_background_work() {
+        let mut app = test_app();
+        let (worker, mut requests) = Worker::test_channel();
+        app.worker = worker;
+        app.apply(Function::History("ADD AAPL,MSFT".into()));
+        assert!(matches!(requests.try_recv(),Ok(Request::HistoryTask(command)) if command=="ADD AAPL,MSFT"));
+        assert!(matches!(requests.try_recv(), Ok(Request::HistoryStatus)));
+        assert!(app.panes.iter().any(|p| p.kind.settings() == PaneSettings::PriceHistory));
+        app.apply(Function::Universe);
+        assert!(matches!(requests.try_recv(), Ok(Request::Research { scan: None, .. })));
+        assert_eq!(app.panes.len(), 2, "Research must preserve the price-history progress panel");
+        app.apply(Function::History("CANCEL".into()));
+        assert!(matches!(requests.try_recv(),Ok(Request::HistoryTask(command)) if command=="CANCEL"));
+        assert!(app.panes.iter().any(|p| p.kind.settings() == PaneSettings::Research(None)));
+        assert_eq!(app.panes.len(), 2);
+        let kind = app.panel_from_spec("HIST", None).unwrap();
+        assert_eq!(kind.settings(), PaneSettings::PriceHistory);
+    }
+
+    #[test]
     fn recent_fx_keys_are_repaired_and_deduplicated_at_startup() {
         let symbols = ["USDBRLUSD Curncy", "BRL Curncy", "BRL=X", "BTC", "???", "ação", "SPY"].map(String::from);
         assert_eq!(canonical_recent_symbols(&symbols), ["USDBRL Curncy", "BTCUSD Curncy", "SPY US Equity"]);
@@ -1878,6 +1933,7 @@ mod tests {
             PaneSettings::Search("gold".into()),
             PaneSettings::Settings,
             PaneSettings::Wei,
+            PaneSettings::PriceHistory,
             PaneSettings::Research(None),
             PaneSettings::Research(Some("DARVAS_BREAKOUT".into())),
             {
