@@ -965,22 +965,14 @@ impl TerminalApp {
                     if let Some(PaneKind::Research(r)) =
                         self.panes.iter_mut().find(|p| p.id == pane).map(|p| &mut p.kind)
                     {
-                        r.loading = false;
-                        match result {
-                            Ok(data) => r.universe = Some(data),
-                            Err(e) => r.error = Some(e),
-                        }
+                        r.accept_universe(result);
                     }
                 }
                 Response::Scan { pane, result } => {
                     if let Some(PaneKind::Research(r)) =
                         self.panes.iter_mut().find(|p| p.id == pane).map(|p| &mut p.kind)
                     {
-                        r.loading = false;
-                        match result {
-                            Ok(data) => r.results = Some(data),
-                            Err(e) => r.error = Some(e),
-                        }
+                        r.accept_scan(result);
                     }
                 }
                 Response::History {

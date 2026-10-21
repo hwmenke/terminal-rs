@@ -31,10 +31,13 @@ use tokio::sync::mpsc;
 use tr_core::{AssetClass, Bar, Security, Timeframe, catalog};
 
 pub use cache::BarCache;
+pub use tr_core::Provenance;
 
 /// Latest quote for a symbol.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Quote {
+    #[serde(default)]
+    pub provenance: Provenance,
     pub symbol: String,
     pub last: f64,
     pub prev_close: f64,
@@ -217,6 +220,21 @@ pub trait MarketData: Send + Sync {
     /// oldest bar already held.
     async fn history(&self, symbol: &str, tf: Timeframe, end: Option<i64>, limit: usize) -> Result<Vec<Bar>>;
 
+    /// Entry point for research, scans and backtests: never compute with fallback or
+    /// unverified prices. Display the returned error instead of analysis results.
+    async fn history_for_analysis(
+        &self,
+        symbol: &str,
+        tf: Timeframe,
+        end: Option<i64>,
+        limit: usize,
+        operation: &str,
+    ) -> Result<Vec<Bar>> {
+        let bars = self.history(symbol, tf, end, limit).await?;
+        Bar::require_verified(&bars, operation).map_err(anyhow::Error::msg)?;
+        Ok(bars)
+    }
+
     /// Latest quotes for `symbols`. The default derives them from daily history.
     async fn quotes(&self, symbols: &[String]) -> Result<Vec<Quote>> {
         let mut out = Vec::with_capacity(symbols.len());
@@ -224,7 +242,14 @@ pub trait MarketData: Send + Sync {
             let bars = self.history(s, Timeframe::D1, None, 2).await?;
             if let Some(last) = bars.last() {
                 let prev = if bars.len() > 1 { bars[bars.len() - 2].close } else { last.open };
-                out.push(Quote { symbol: s.clone(), last: last.close, prev_close: prev, ts: last.ts, spark: vec![] });
+                out.push(Quote {
+                    provenance: Bar::provenance(&bars),
+                    symbol: s.clone(),
+                    last: last.close,
+                    prev_close: prev,
+                    ts: last.ts,
+                    spark: vec![],
+                });
             }
         }
         Ok(out)
@@ -301,7 +326,8 @@ impl<P: MarketData> Fallback<P> {
 #[async_trait]
 impl<P: MarketData> MarketData for Fallback<P> {
     fn name(&self) -> &str {
-        &self.name
+        // A provider-wide name cannot describe per-request substitutions.
+        "Market data"
     }
 
     async fn history(&self, symbol: &str, tf: Timeframe, end: Option<i64>, limit: usize) -> Result<Vec<Bar>> {
@@ -472,7 +498,42 @@ mod tests {
         assert_eq!(q.len(), 1);
         // Paging must surface the error instead of mixing in synthetic bars.
         assert!(p.history("AAPL", Timeframe::D1, Some(bars[0].ts), 100).await.is_err());
-        assert_eq!(p.name(), "broken");
+        assert_eq!(p.name(), "Market data");
+        assert!(bars.iter().all(|b| b.provenance == Provenance::Sample));
+        assert_eq!(q[0].provenance, Provenance::Sample);
+        assert_eq!(Bar::provenance(&bars).source_label(p.name()), "SAMPLE DATA");
+        assert_eq!(q[0].provenance.source_label(p.name()), "SAMPLE DATA");
+    }
+
+    struct UnverifiedProvider;
+    #[async_trait]
+    impl MarketData for UnverifiedProvider {
+        fn name(&self) -> &str {
+            "unverified"
+        }
+        async fn history(&self, _: &str, _: Timeframe, _: Option<i64>, _: usize) -> Result<Vec<Bar>> {
+            Ok(vec![Bar::new(0, 1.0, 1.0, 1.0, 1.0, 1.0)])
+        }
+    }
+
+    #[tokio::test]
+    async fn analysis_entry_points_reject_sample_and_unverified_history() {
+        let fallback = Fallback::new(Broken);
+        for operation in ["Research", "Scan", "Backtest"] {
+            let err = fallback.history_for_analysis("X", Timeframe::D1, None, 30, operation).await.unwrap_err();
+            assert!(err.to_string().contains("SAMPLE DATA"));
+            assert!(err.to_string().contains(operation));
+            let err =
+                UnverifiedProvider.history_for_analysis("X", Timeframe::D1, None, 30, operation).await.unwrap_err();
+            assert!(err.to_string().contains("UNVERIFIED"));
+        }
+    }
+
+    #[test]
+    fn legacy_quotes_are_unverified() {
+        let q: Quote = serde_json::from_str(r#"{"symbol":"X","last":1,"prev_close":1,"ts":0}"#).unwrap();
+        assert_eq!(q.provenance, Provenance::Missing);
+        assert_eq!(q.provenance.source_label("Yahoo"), "UNVERIFIED DATA");
     }
 
     #[tokio::test]
@@ -504,7 +565,14 @@ mod tests {
 
     #[test]
     fn quote_change() {
-        let q = Quote { symbol: "X".into(), last: 110.0, prev_close: 100.0, ts: 0, spark: vec![] };
+        let q = Quote {
+            provenance: Provenance::Real,
+            symbol: "X".into(),
+            last: 110.0,
+            prev_close: 100.0,
+            ts: 0,
+            spark: vec![],
+        };
         assert_eq!(q.change(), 10.0);
         assert!((q.change_pct() - 10.0).abs() < 1e-9);
     }

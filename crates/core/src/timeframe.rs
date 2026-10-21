@@ -94,6 +94,7 @@ impl Timeframe {
                     cur.low = cur.low.min(b.low);
                     cur.close = b.close;
                     cur.volume += b.volume;
+                    cur.provenance = cur.provenance.combine(b.provenance);
                 }
                 _ => out.push(Bar { ts: start, ..*b }),
             }

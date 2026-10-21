@@ -1,4 +1,6 @@
 //! Read-only Whats-News archive bridge. No ingestion, schema changes, or sample fallback.
+//! Whats-News stores real Yahoo Finance downloads without provenance metadata, so
+//! absent metadata means Real here. Explicit unverified/sample provenance is refused.
 use std::{path::PathBuf, time::Duration};
 
 use anyhow::{Context, Result, bail};
@@ -6,7 +8,23 @@ use chrono::{Datelike, Local, NaiveDate, Weekday};
 use futures::{StreamExt, TryStreamExt, stream};
 use rusqlite::{Connection, OpenFlags};
 use serde::Deserialize;
-use tr_core::Bar;
+use tr_core::{Bar, Provenance};
+
+#[derive(Debug)]
+struct Unverified(String);
+impl std::fmt::Display for Unverified {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+impl std::error::Error for Unverified {}
+fn verify(provenance: Provenance, operation: &str) -> Result<()> {
+    provenance.require_verified(operation).map_err(|e| anyhow::Error::new(Unverified(e)))
+}
+// Source-specific default: this does not apply to the terminal's legacy price cache.
+fn archive_provenance() -> Provenance {
+    Provenance::Real
+}
 
 pub const SETUPS: &[&str] = &[
     "DARVAS_BREAKOUT",
@@ -41,6 +59,8 @@ impl Symbol {
 }
 #[derive(Debug, Clone, Deserialize)]
 pub struct ScanRow {
+    #[serde(default = "archive_provenance")]
+    pub provenance: Provenance,
     pub symbol: String,
     pub price: Option<f64>,
     #[serde(default)]
@@ -54,11 +74,14 @@ pub struct ScanRow {
 }
 #[derive(Debug, Clone, Deserialize)]
 pub struct Scan {
+    #[serde(default = "archive_provenance")]
+    pub provenance: Provenance,
     pub scanned: usize,
     pub results: Vec<ScanRow>,
 }
 #[derive(Debug, Clone)]
 pub struct Snapshot<T> {
+    pub provenance: Provenance,
     pub source: String,
     pub data: T,
 }
@@ -132,7 +155,7 @@ impl Bridge {
             f(conn)
         })
         .await??;
-        Ok(Snapshot { source, data })
+        Ok(Snapshot { source, data, provenance: Provenance::Cached })
     }
     pub async fn universe(&self) -> Result<Snapshot<Vec<Symbol>>> {
         self.check()?;
@@ -152,9 +175,12 @@ impl Bridge {
         .await
         .unwrap_or_else(|e| Err(e.into()));
         match api {
-            Ok(data) => {
-                Ok(Snapshot { source: format!("Whats-News HTTP: {}", self.url.as_deref().unwrap_or_default()), data })
-            }
+            Ok(data) => Ok(Snapshot {
+                source: format!("Whats-News HTTP: {}", self.url.as_deref().unwrap_or_default()),
+                data,
+                provenance: Provenance::Real,
+            }),
+            Err(http) if http.is::<Unverified>() => Err(http),
             Err(http) => self
                 .sql(|c| universe_sql(&c))
                 .await
@@ -182,7 +208,10 @@ impl Bridge {
     pub async fn bars(&self, symbol: &str) -> Result<Snapshot<Vec<Bar>>> {
         self.check()?;
         match self.http_bars(symbol, 1_000_000).await {
-            Ok(data) if !data.is_empty() => Ok(Snapshot { source: "Whats-News HTTP archive".into(), data }),
+            Ok(data) if !data.is_empty() => {
+                Ok(Snapshot { provenance: Bar::provenance(&data), source: "Whats-News HTTP archive".into(), data })
+            }
+            Err(e) if e.is::<Unverified>() => Err(e),
             _ => {
                 let symbol = symbol.to_owned();
                 let result = self
@@ -203,8 +232,12 @@ impl Bridge {
         }
         let api = async {
             let mut scan: Scan = self.get(&format!("/api/setups/scan?setup={name}&universe=1&limit=0")).await?;
+            verify(scan.provenance, "Whats-News scan")?;
             scan.results = stream::iter(scan.results.into_iter().map(|mut row| async move {
-                row.last_date = self.http_bars(&row.symbol, 1).await?.last().map(|b| date(b.ts));
+                verify(row.provenance, "Whats-News scan result")?;
+                let bars = self.http_bars(&row.symbol, 1_000_000).await?;
+                verify(Bar::provenance(&bars), "Whats-News scan")?;
+                row.last_date = bars.last().map(|b| date(b.ts));
                 Ok::<_, anyhow::Error>(row)
             }))
             .buffered(12)
@@ -214,7 +247,12 @@ impl Bridge {
         }
         .await;
         match api {
-            Ok(data) => Ok(Snapshot { source: "Whats-News HTTP setup scanner (service score)".into(), data }),
+            Ok(data) => Ok(Snapshot {
+                provenance: data.provenance,
+                source: "Whats-News HTTP setup scanner (service score)".into(),
+                data,
+            }),
+            Err(http) if http.is::<Unverified>() => Err(http),
             Err(http) => {
                 let name = name.to_owned();
                 self.sql(move |c| scan_sql(&c, &name))
@@ -229,6 +267,8 @@ fn date(ts: i64) -> String {
 }
 #[derive(Deserialize)]
 struct StoredBar {
+    #[serde(default = "archive_provenance")]
+    provenance: Provenance,
     date: String,
     open: f64,
     high: f64,
@@ -239,6 +279,7 @@ struct StoredBar {
 fn convert(rows: Vec<StoredBar>) -> Result<Vec<Bar>> {
     let mut bars = Vec::with_capacity(rows.len());
     for r in rows {
+        verify(r.provenance, "Whats-News research/archive")?;
         let ts = NaiveDate::parse_from_str(&r.date, "%Y-%m-%d")?.and_hms_opt(0, 0, 0).unwrap().and_utc().timestamp();
         if ![r.open, r.high, r.low, r.close, r.volume].iter().all(|n| n.is_finite())
             || r.low <= 0.0
@@ -250,7 +291,7 @@ fn convert(rows: Vec<StoredBar>) -> Result<Vec<Bar>> {
         {
             bail!("invalid archived OHLCV on {}", r.date);
         }
-        bars.push(Bar::new(ts, r.open, r.high, r.low, r.close, r.volume));
+        bars.push(Bar::new(ts, r.open, r.high, r.low, r.close, r.volume).with_provenance(r.provenance));
     }
     bars.sort_by_key(|b| b.ts);
     bars.dedup_by_key(|b| b.ts);
@@ -258,17 +299,27 @@ fn convert(rows: Vec<StoredBar>) -> Result<Vec<Bar>> {
 }
 fn universe_sql(c: &Connection) -> Result<Vec<Symbol>> {
     let mut stmt = c.prepare("SELECT s.symbol, s.name, s.group_tag, MAX(o.date) FROM symbols s LEFT JOIN ohlcv o ON o.symbol=s.symbol AND o.freq='daily' GROUP BY s.symbol ORDER BY s.symbol")?;
-    Ok(stmt
+    let rows: Vec<Symbol> = stmt
         .query_map([], |r| {
             Ok(Symbol { symbol: r.get(0)?, name: r.get(1)?, group_tag: r.get(2)?, last_date: r.get(3)? })
         })?
-        .collect::<rusqlite::Result<_>>()?)
+        .collect::<rusqlite::Result<_>>()?;
+    for row in &rows {
+        // Coverage must not make artificial/unverified archive rows look usable.
+        bars_sql(c, &row.symbol, 1_000_000)?;
+    }
+    Ok(rows)
 }
 fn bars_sql(c: &Connection, symbol: &str, limit: usize) -> Result<Vec<Bar>> {
-    let mut stmt = c.prepare("SELECT date, open, high, low, close, volume FROM ohlcv WHERE symbol=? AND freq='daily' ORDER BY date DESC LIMIT ?")?;
+    let provenance = if c.prepare("SELECT provenance FROM ohlcv LIMIT 0").is_ok() { "provenance" } else { "'Real'" };
+    let mut stmt = c.prepare(&format!("SELECT date, open, high, low, close, volume, {provenance} FROM ohlcv WHERE symbol=? AND freq='daily' ORDER BY date DESC LIMIT ?"))?;
     let rows = stmt
         .query_map(rusqlite::params![symbol, limit as i64], |r| {
             Ok(StoredBar {
+                provenance: r
+                    .get::<_, Option<String>>(6)?
+                    .map(|s| serde_json::from_value(serde_json::Value::String(s)).unwrap_or_default())
+                    .unwrap_or_default(),
                 date: r.get(0)?,
                 open: r.get(1)?,
                 high: r.get(2)?,
@@ -316,12 +367,13 @@ fn scan_sql(c: &Connection, name: &str) -> Result<Scan> {
     }
     // One read transaction gives coverage and calculations the same archive snapshot.
     c.execute_batch("BEGIN DEFERRED")?;
-    let mut scan = Scan { scanned: 0, results: Vec::new() };
+    let mut scan = Scan { provenance: Provenance::Cached, scanned: 0, results: Vec::new() };
     for symbol in universe_sql(c)? {
         let b = bars_sql(c, &symbol.symbol, 260)?;
         if b.len() < 30 {
             continue;
         }
+        Bar::require_verified(&b, "Whats-News scan").map_err(anyhow::Error::msg)?;
         scan.scanned += 1;
         let last = b.last().unwrap();
         let top20 = b[b.len() - 20..].iter().map(|b| b.high).fold(0.0, f64::max);
@@ -340,6 +392,7 @@ fn scan_sql(c: &Connection, name: &str) -> Result<Scan> {
         };
         if matched {
             scan.results.push(ScanRow {
+                provenance: Provenance::Cached,
                 symbol: symbol.symbol,
                 price: Some(last.close),
                 setup_score: None,
@@ -439,12 +492,12 @@ mod tests {
                 let (open, high, close, vol) =
                     if i == 29 { (11.0, 12.0, 11.5, 200.0) } else { (9.0, 10.0, 9.0, 100.0) };
                 c.execute(
-                    "INSERT INTO ohlcv VALUES('BREAK','daily',?,?,?,?,?,?)",
+                    "INSERT INTO ohlcv(symbol,freq,date,open,high,low,close,volume) VALUES('BREAK','daily',?,?,?,?,?,?)",
                     rusqlite::params![day.to_string(), open, high, 8.0, close, vol],
                 )
                 .unwrap();
             }
-            c.execute_batch("INSERT INTO ohlcv VALUES('SHORT','daily','2026-08-30',1,1,1,1,0); INSERT INTO ohlcv VALUES('EMPTY','weekly','2026-08-30',1,1,1,1,0);").unwrap();
+            c.execute_batch("INSERT INTO ohlcv(symbol,freq,date,open,high,low,close,volume) VALUES('SHORT','daily','2026-08-30',1,1,1,1,0); INSERT INTO ohlcv(symbol,freq,date,open,high,low,close,volume) VALUES('EMPTY','weekly','2026-08-30',1,1,1,1,0);").unwrap();
             Self(path)
         }
         fn bridge(&self) -> Bridge {
@@ -494,11 +547,63 @@ mod tests {
         let rows: Vec<StoredBar> = serde_json::from_str(r#"[{"date":"2026-10-20","open":10,"high":12,"low":9,"close":11,"volume":2},{"date":"2026-10-19","open":10,"high":12,"low":9,"close":11,"volume":2}]"#).unwrap();
         let bars = convert(rows).unwrap();
         assert!(bars[0].ts < bars[1].ts);
+        assert_eq!(Bar::provenance(&bars), Provenance::Real);
         for bad in ["null", "-1", "1"] {
             let json = format!(r#"[{{"date":"2026-10-20","open":10,"high":{bad},"low":9,"close":11,"volume":2}}]"#);
             assert!(
                 serde_json::from_str::<Vec<StoredBar>>(&json).map_err(anyhow::Error::from).and_then(convert).is_err()
             );
+        }
+    }
+
+    #[test]
+    fn archive_conversion_rejects_explicit_unverified_provenance() {
+        for provenance in ["Sample", "Missing", "unknown"] {
+            let json = format!(
+                r#"[{{"date":"2026-10-20","open":10,"high":12,"low":9,"close":11,"volume":2,"provenance":"{provenance}"}}]"#
+            );
+            let err = convert(serde_json::from_str(&json).unwrap()).unwrap_err();
+            assert!(err.to_string().contains("refused"));
+        }
+    }
+
+    #[test]
+    fn scan_json_defaults_to_real_but_preserves_explicit_unverified_provenance() {
+        let json = serde_json::json!({"scanned":40,"results":[{"symbol":"API","price":11,"setup_score":3}]});
+        let scan: Scan = serde_json::from_value(json.clone()).unwrap();
+        assert_eq!(scan.provenance, Provenance::Real);
+        assert_eq!(scan.results[0].provenance, Provenance::Real);
+        for (value, expected) in
+            [("Sample", Provenance::Sample), ("Missing", Provenance::Missing), ("unknown", Provenance::Missing)]
+        {
+            let mut json = json.clone();
+            json["provenance"] = value.into();
+            json["results"][0]["provenance"] = value.into();
+            let scan: Scan = serde_json::from_value(json).unwrap();
+            for provenance in [scan.provenance, scan.results[0].provenance] {
+                assert_eq!(provenance, expected);
+                let error = verify(provenance, "Whats-News scan").unwrap_err().to_string();
+                assert!(error.contains("refused"));
+                assert!(error.contains(expected.label()));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn research_scan_and_archive_entry_points_refuse_unverified_prices() {
+        for provenance in ["Sample", "Missing", "unknown"] {
+            let f = Fixture::new();
+            let c = Connection::open(&f.0).unwrap();
+            c.execute_batch("ALTER TABLE ohlcv ADD COLUMN provenance TEXT;").unwrap();
+            c.execute("UPDATE ohlcv SET provenance=?", [provenance]).unwrap();
+            let bridge = f.bridge();
+            for error in [
+                bridge.universe().await.unwrap_err(),
+                bridge.scan("NEAR_HIGH").await.unwrap_err(),
+                bridge.bars("BREAK").await.unwrap_err(),
+            ] {
+                assert!(format!("{error:#}").contains("refused"));
+            }
         }
     }
     #[tokio::test]
@@ -511,7 +616,9 @@ mod tests {
         assert_eq!(universe.data.len(), 3);
         assert_eq!(universe.data[1].symbol, "EMPTY");
         assert_eq!(universe.data[1].last_date, None); // weekly-only is MISSING daily coverage
-        assert_eq!(b.bars("BREAK").await.unwrap().data.len(), 30);
+        let bars = b.bars("BREAK").await.unwrap();
+        assert_eq!(bars.data.len(), 30);
+        assert_eq!(Bar::provenance(&bars.data), Provenance::Real);
         assert!(b.bars("EMPTY").await.unwrap_err().to_string().contains("MISSING"));
         let scan = b.scan("DARVAS_BREAKOUT").await.unwrap();
         assert_eq!(scan.data.scanned, 1);
@@ -547,11 +654,14 @@ mod tests {
         assert!(!missing.exists());
     }
     // Minimal HTTP fixture also enforces GET-only requests; no service or real DB needed.
-    fn http_fixture(routes: Vec<(&'static str, u16, &'static str)>) -> (String, std::thread::JoinHandle<()>) {
+    fn http_fixture(
+        routes: Vec<(&'static str, u16, impl Into<String> + Send + 'static)>,
+    ) -> (String, std::thread::JoinHandle<()>) {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
         let handle = std::thread::spawn(move || {
             for (path, status, body) in routes {
+                let body = body.into();
                 let (mut socket, _) = listener.accept().unwrap();
                 socket.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
                 let mut request = Vec::new();
@@ -578,7 +688,7 @@ mod tests {
                 200,
                 r#"{"scanned":40,"results":[{"symbol":"API","price":11,"setup_score":3}]}"#,
             ),
-            ("/api/ohlcv/API?freq=daily&limit=1", 200, BAR_JSON),
+            ("/api/ohlcv/API?freq=daily&limit=1000000", 200, BAR_JSON),
             ("/api/ohlcv/API?freq=daily&limit=1000000", 200, BAR_JSON),
         ]);
         let f = Fixture::new();
@@ -588,9 +698,15 @@ mod tests {
         assert_eq!(universe.data[0].symbol, "API");
         assert_eq!(universe.data[0].status(today()), "MISSING");
         let scan = b.scan("DARVAS_BREAKOUT").await.unwrap();
+        assert_eq!(scan.provenance, Provenance::Real);
+        assert_eq!(scan.data.provenance, Provenance::Real);
+        assert_eq!(scan.data.results[0].provenance, Provenance::Real);
         assert_eq!(scan.data.scanned, 40);
         assert_eq!(scan.data.results[0].last_date.as_deref(), Some("2026-10-20"));
-        assert_eq!(b.bars("API").await.unwrap().data[0].close, 11.0);
+        let bars = b.bars("API").await.unwrap();
+        assert_eq!(bars.data[0].close, 11.0);
+        assert_eq!(bars.provenance, Provenance::Real);
+        assert_eq!(Bar::provenance(&bars.data), Provenance::Real);
         server.join().unwrap();
     }
     #[tokio::test]
@@ -602,5 +718,50 @@ mod tests {
         assert!(universe.source.contains("SQLite"));
         assert_eq!(universe.data.len(), 3);
         server.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn unverified_http_scan_is_refused_even_with_real_sqlite_available() {
+        for provenance in ["Sample", "Missing", "unknown"] {
+            for scope in ["scan", "result", "bars"] {
+                let mut scan = serde_json::json!({"scanned":40,"results":[{"symbol":"API","price":11}]});
+                let mut bars: serde_json::Value = serde_json::from_str(BAR_JSON).unwrap();
+                match scope {
+                    "scan" => scan["provenance"] = provenance.into(),
+                    "result" => scan["results"][0]["provenance"] = provenance.into(),
+                    _ => bars[0]["provenance"] = provenance.into(),
+                }
+                let mut routes = vec![("/api/setups/scan?setup=NEAR_HIGH&universe=1&limit=0", 200, scan.to_string())];
+                if scope == "bars" {
+                    routes.push(("/api/ohlcv/API?freq=daily&limit=1000000", 200, bars.to_string()));
+                }
+                let (url, server) = http_fixture(routes);
+                let f = Fixture::new();
+                let error = Bridge::new(f.0.clone(), Some(url), true).scan("NEAR_HIGH").await.unwrap_err();
+                assert!(error.is::<Unverified>(), "{scope}: {error:#}");
+                assert!(error.to_string().contains("refused"));
+                server.join().unwrap();
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn unverified_http_bars_and_coverage_are_refused_even_with_real_sqlite_available() {
+        for provenance in ["Sample", "Missing", "unknown"] {
+            let mut bars: serde_json::Value = serde_json::from_str(BAR_JSON).unwrap();
+            bars[0]["provenance"] = provenance.into();
+            let (url, server) = http_fixture(vec![
+                ("/api/symbols", 200, r#"[{"symbol":"API"}]"#.to_owned()),
+                ("/api/ohlcv/API?freq=daily&limit=1", 200, bars.to_string()),
+                ("/api/ohlcv/BREAK?freq=daily&limit=1000000", 200, bars.to_string()),
+            ]);
+            let f = Fixture::new();
+            let bridge = Bridge::new(f.0.clone(), Some(url), true);
+            for error in [bridge.universe().await.unwrap_err(), bridge.bars("BREAK").await.unwrap_err()] {
+                assert!(error.is::<Unverified>(), "{error:#}");
+                assert!(error.to_string().contains("refused"));
+            }
+            server.join().unwrap();
+        }
     }
 }

@@ -11,7 +11,39 @@ pub struct ResearchPane {
     pub error: Option<String>,
     search: String,
 }
+
 impl ResearchPane {
+    fn verify<T>(snapshot: Snapshot<T>, operation: &str) -> Result<Snapshot<T>, String> {
+        snapshot.provenance.require_verified(operation)?;
+        Ok(snapshot)
+    }
+
+    pub fn accept_universe(&mut self, result: Result<Snapshot<Vec<Symbol>>, String>) {
+        self.loading = false;
+        self.error = None;
+        self.universe = None;
+        match result.and_then(|s| Self::verify(s, "UNIV research")) {
+            Ok(snapshot) => self.universe = Some(snapshot),
+            Err(error) => self.error = Some(error),
+        }
+    }
+
+    pub fn accept_scan(&mut self, result: Result<Snapshot<Scan>, String>) {
+        self.loading = false;
+        self.error = None;
+        self.results = None;
+        match result.and_then(|s| {
+            s.data.provenance.require_verified("SCAN research")?;
+            for row in &s.data.results {
+                row.provenance.require_verified("SCAN research result")?;
+            }
+            Self::verify(s, "SCAN research")
+        }) {
+            Ok(snapshot) => self.results = Some(snapshot),
+            Err(error) => self.error = Some(error),
+        }
+    }
+
     pub fn new(scan: Option<String>) -> Self {
         Self { scan, universe: None, results: None, loading: true, error: None, search: String::new() }
     }
@@ -42,7 +74,12 @@ impl ResearchPane {
         }
         let query = self.search.trim().to_ascii_uppercase();
         if let Some(snapshot) = &self.universe {
-            ui.label(format!("{} · {} registered tickers", snapshot.source, snapshot.data.len()));
+            ui.label(format!(
+                "[{}] {} · {} registered tickers",
+                snapshot.provenance.label(),
+                snapshot.source,
+                snapshot.data.len()
+            ));
             ui.label("STALE: more than 5 US trading sessions old · MISSING: no daily bars");
             if snapshot.data.is_empty() {
                 ui.label("Archive contains no registered tickers.");
@@ -79,7 +116,7 @@ impl ResearchPane {
             });
         }
         if let Some(snapshot) = &self.results {
-            ui.label(&snapshot.source);
+            ui.label(format!("[{}] {}", snapshot.provenance.label(), snapshot.source));
             ui.label(format!(
                 "{} · {} matches / {} symbols scanned (≥30 daily bars)",
                 self.scan.as_deref().unwrap_or_default(),
@@ -123,5 +160,53 @@ impl ResearchPane {
             }
         }
         (actions, refresh)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tr_core::Provenance;
+
+    #[test]
+    fn research_pane_rejects_sample_and_unverified_results() {
+        for provenance in [Provenance::Sample, Provenance::Missing] {
+            let mut pane = ResearchPane::new(None);
+            pane.accept_universe(Ok(Snapshot { source: "must not be displayed".into(), provenance, data: vec![] }));
+            assert!(pane.universe.is_none());
+            assert!(pane.error.as_deref().unwrap().contains("refused"));
+            pane.accept_scan(Ok(Snapshot {
+                source: "must not be displayed".into(),
+                provenance,
+                data: Scan { provenance: Provenance::Real, scanned: 1, results: vec![] },
+            }));
+            assert!(pane.results.is_none());
+            assert!(pane.error.as_deref().unwrap().contains("refused"));
+            pane.accept_scan(Ok(Snapshot {
+                source: "must not be displayed".into(),
+                provenance: Provenance::Real,
+                data: Scan { provenance, scanned: 1, results: vec![] },
+            }));
+            assert!(pane.results.is_none());
+            pane.accept_scan(Ok(Snapshot {
+                source: "must not be displayed".into(),
+                provenance: Provenance::Real,
+                data: Scan {
+                    provenance: Provenance::Real,
+                    scanned: 1,
+                    results: vec![tr_data::whats_news::ScanRow {
+                        provenance,
+                        symbol: "X".into(),
+                        price: Some(1.0),
+                        setup_score: None,
+                        darvas_top: None,
+                        darvas_bottom: None,
+                        last_date: None,
+                    }],
+                },
+            }));
+            assert!(pane.results.is_none());
+            assert!(pane.error.as_deref().unwrap().contains("refused"));
+        }
     }
 }

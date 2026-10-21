@@ -138,9 +138,9 @@ impl TerminalApp {
 
     fn watchlist(&mut self, ui: &mut Ui) -> Vec<Action> {
         let mut out = Vec::new();
-        let row_h = dp(22.0);
+        let row_h = dp(36.0);
         let w = ui.available_width();
-        let (hdr, _) = ui.allocate_exact_size(vec2(w, row_h), Sense::hover());
+        let (hdr, _) = ui.allocate_exact_size(vec2(w, dp(22.0)), Sense::hover());
         let p = ui.painter();
         p.rect_filled(hdr, theme::CONTROL_RADIUS, theme::header());
         let cols = [0.0, 0.34, 0.58, 0.79, 1.0];
@@ -156,34 +156,42 @@ impl TerminalApp {
                 let (r, resp) = ui.allocate_exact_size(vec2(w, row_h), Sense::click());
                 widgets::hover_wash(ui, r, &resp, false);
                 let p = ui.painter();
-                p.text(pos2(col(r, 0), r.center().y), Align2::LEFT_CENTER, &sec.ticker, mono(12.5), amber());
+                p.text(pos2(col(r, 0), r.center().y - dp(6.0)), Align2::LEFT_CENTER, &sec.ticker, mono(12.5), amber());
                 p.text(
-                    pos2(col(r, 0) + 74.0, r.center().y),
+                    pos2(col(r, 0) + 74.0, r.center().y - dp(6.0)),
                     Align2::LEFT_CENTER,
                     sec.class.yellow_key().label(),
                     ui_font(11.0),
                     muted(),
+                );
+                let provenance = self.quotes.get(s).map(|q| q.provenance).unwrap_or_default();
+                p.text(
+                    pos2(col(r, 0), r.bottom() - 1.0),
+                    Align2::LEFT_BOTTOM,
+                    provenance.label(),
+                    mono(10.0),
+                    if provenance.is_verified() { muted() } else { theme::down() },
                 );
                 match self.quotes.get(s) {
                     Some(q) => {
                         let c = if q.change() >= 0.0 { theme::up() } else { theme::down() };
                         let d = sec.decimals(q.last);
                         p.text(
-                            pos2(col(r, 2), r.center().y),
+                            pos2(col(r, 2), r.center().y - dp(6.0)),
                             Align2::RIGHT_CENTER,
                             format!("{:.d$}", q.last),
                             mono(12.5),
                             text(),
                         );
                         p.text(
-                            pos2(col(r, 3), r.center().y),
+                            pos2(col(r, 3), r.center().y - dp(6.0)),
                             Align2::RIGHT_CENTER,
                             markets_view::change_text(&sec, q),
                             mono(12.5),
                             c,
                         );
                         p.text(
-                            pos2(col(r, 4), r.center().y),
+                            pos2(col(r, 4), r.center().y - dp(6.0)),
                             Align2::RIGHT_CENTER,
                             format!("{:+.2}%", q.change_pct()),
                             mono(12.5),
@@ -191,7 +199,7 @@ impl TerminalApp {
                         );
                     }
                     None => {
-                        p.text(pos2(col(r, 4), r.center().y), Align2::RIGHT_CENTER, "…", mono(12.5), muted());
+                        p.text(pos2(col(r, 4), r.center().y - dp(6.0)), Align2::RIGHT_CENTER, "…", mono(12.5), muted());
                     }
                 }
                 let tradable = matches!(sec.class, tr_core::AssetClass::Equity | tr_core::AssetClass::Etf);

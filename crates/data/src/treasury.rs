@@ -70,14 +70,20 @@ pub fn parse_fred_csv(csv: &str) -> Result<Vec<Bar>> {
             let (d, v) = l.split_once(',')?;
             let date = NaiveDate::parse_from_str(d.trim(), "%Y-%m-%d").ok()?;
             let y: f64 = v.trim().parse().ok()?;
-            Some(Bar::new(midnight(date), y, y, y, y, 0.0))
+            Some(Bar::new(midnight(date), y, y, y, y, 0.0).with_provenance(tr_core::Provenance::Real))
         })
         .collect())
 }
 
 /// Daily bars for one curve column.
 pub fn column_bars(rows: &[CurveRow], column: &str) -> Vec<Bar> {
-    rows.iter().filter_map(|r| r.values.get(column).map(|&y| Bar::new(midnight(r.date), y, y, y, y, 0.0))).collect()
+    rows.iter()
+        .filter_map(|r| {
+            r.values
+                .get(column)
+                .map(|&y| Bar::new(midnight(r.date), y, y, y, y, 0.0).with_provenance(tr_core::Provenance::Real))
+        })
+        .collect()
 }
 
 /// Curve snapshots (now, ~1M, ~1Y ago) from parsed rows.
@@ -219,7 +225,14 @@ impl TreasuryProvider {
                 let last = bars.last()?;
                 let prev = bars.get(bars.len().checked_sub(2)?).map(|b| b.close).unwrap_or(last.close);
                 let spark = bars.iter().rev().take(8).rev().map(|b| b.close).collect();
-                Some(crate::Quote { symbol: key.clone(), last: last.close, prev_close: prev, ts: last.ts, spark })
+                Some(crate::Quote {
+                    provenance: tr_core::Provenance::Real,
+                    symbol: key.clone(),
+                    last: last.close,
+                    prev_close: prev,
+                    ts: last.ts,
+                    spark,
+                })
             })
             .collect())
     }
