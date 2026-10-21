@@ -305,6 +305,11 @@ impl TerminalApp {
 
     /// The Bloomberg command line, drawn as a rounded macOS search field.
     pub(super) fn command_field(&mut self, ui: &mut Ui, field: Rect) -> bool {
+        if self.cmd.len() > command::MAX_INPUT_BYTES {
+            self.cmd.clear();
+            self.command_changed();
+            self.status = "Command too long (maximum 4096 bytes)".into();
+        }
         let id = Id::new("command-line");
         // A dropdown row receives the click over two frames. Keep the text field
         // alive during that click so the row still exists on pointer release.
@@ -387,6 +392,7 @@ impl TerminalApp {
         let inner = Rect::from_min_max(pos2(field.left() + 28.0, field.top()), pos2(go.left() - 6.0, field.bottom()));
         let mut child = ui.new_child(UiBuilder::new().max_rect(inner));
         let te = egui::TextEdit::singleline(&mut self.cmd)
+            .char_limit(command::MAX_INPUT_BYTES)
             .id(id)
             .font(mono(12.5))
             .text_color(amber())

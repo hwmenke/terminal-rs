@@ -556,6 +556,23 @@ fn keys_from_words(words: &[String]) -> Vec<String> {
     out
 }
 
+/// Canonicalise persisted recents, including old malformed FX/crypto keys.
+fn canonical_recent_symbols(symbols: &[String]) -> Vec<String> {
+    let mut out = Vec::new();
+    for symbol in symbols {
+        if let Some(sec) = tr_core::Security::parse(symbol) {
+            let key = sec.key();
+            if !out.contains(&key) {
+                out.push(key);
+            }
+        }
+        if out.len() == 30 {
+            break;
+        }
+    }
+    out
+}
+
 fn settings_path() -> std::path::PathBuf {
     data_dir().join("settings.json")
 }
@@ -636,7 +653,7 @@ impl TerminalApp {
             search_pending: None,
             suggestion: None,
             command_catalogue: Default::default(),
-            recent_symbols: settings.as_ref().map(|s| s.recent_symbols.clone()).unwrap_or_default(),
+            recent_symbols: settings.as_ref().map(|s| canonical_recent_symbols(&s.recent_symbols)).unwrap_or_default(),
             cmd: String::new(),
             cmd_history: Vec::new(),
             cmd_hist_pos: None,
@@ -767,6 +784,10 @@ impl TerminalApp {
     }
 
     fn execute(&mut self, input: &str) {
+        if input.len() > command::MAX_INPUT_BYTES {
+            self.status = "Command too long (maximum 4096 bytes)".into();
+            return;
+        }
         let Some(cmd) = command::parse(input) else {
             self.status = format!("Unknown command: {input}  (HELP lists functions)");
             return;
@@ -1006,10 +1027,8 @@ impl TerminalApp {
                 }
                 Response::HistoryError { pane, generation, error } => {
                     // Errors while paging just mean "no older history"; only report failed loads.
-                    let empty = self.chart_mut(pane).map(|c| {
-                        c.on_history_error(generation, error.clone());
-                        c.is_empty()
-                    });
+                    let empty =
+                        self.chart_mut(pane).map(|c| c.on_history_error(generation, error.clone()) && c.is_empty());
                     if empty == Some(true) {
                         self.status = format!("data error: {error}");
                     }
@@ -1788,6 +1807,12 @@ mod tests {
     }
 
     #[test]
+    fn recent_fx_keys_are_repaired_and_deduplicated_at_startup() {
+        let symbols = ["USDBRLUSD Curncy", "BRL Curncy", "BRL=X", "BTC", "???", "ação", "SPY"].map(String::from);
+        assert_eq!(canonical_recent_symbols(&symbols), ["USDBRL Curncy", "BTCUSD Curncy", "SPY US Equity"]);
+    }
+
+    #[test]
     fn legacy_settings_migrate_to_a_layout() {
         let old = r#"{"layout":"MainRight2","watchlist":["AAPL","BTCUSD Curncy"],"sidebar":false,
             "panes":[{"Chart":{"symbol":"NVDA","tf":"D1","chart_type":"Candles","log":false,"indicators":[],
@@ -1829,3 +1854,6 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+mod ticker_switch_tests;

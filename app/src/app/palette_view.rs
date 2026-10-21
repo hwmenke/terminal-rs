@@ -324,7 +324,12 @@ impl TerminalApp {
                     v.push(Item::new(Kind::Indicator, spec.label(), sub, Target::Run(q.into())));
                 }
                 Some(command::Command::Symbol(key)) => {
-                    v.push(ticker_item(&key));
+                    let mut item = ticker_item(&key);
+                    // The typed alias (e.g. BRL=X) must survive ranking after
+                    // resolution changes the displayed market key.
+                    item.keywords.push(' ');
+                    item.keywords.push_str(q);
+                    v.push(item);
                     let sec = tr_data::security(&key);
                     if matches!(sec.class, tr_core::AssetClass::Equity | tr_core::AssetClass::Etf) {
                         let t = &sec.ticker;
@@ -397,6 +402,10 @@ impl TerminalApp {
     /// Keyboard handling, the overlay, and running the pick. Runs before the panes so
     /// arrows, Enter and Esc go to the palette while it is open.
     pub(super) fn command_palette(&mut self, ctx: &egui::Context) {
+        if self.palette.query.len() > command::MAX_INPUT_BYTES {
+            self.palette.query.clear();
+            self.status = "Command too long (maximum 4096 bytes)".into();
+        }
         let input_id = Id::new(INPUT_ID);
         if !self.palette.open {
             // Give the keyboard back once closed (by its hotkey, a pick or Esc).
@@ -435,6 +444,7 @@ impl TerminalApp {
 
                 // The query first, so results (and Enter) see this frame's typing.
                 let edit = egui::TextEdit::singleline(&mut self.palette.query)
+                    .char_limit(command::MAX_INPUT_BYTES)
                     .id(input_id)
                     .font(ui_font(16.0))
                     .frame(egui::Frame::NONE)

@@ -127,7 +127,7 @@ impl ChartState {
         Self {
             id,
             archive: false,
-            symbol: tr_data::security(symbol).key(),
+            symbol: Security::parse(symbol).map(|s| s.key()).unwrap_or_else(|| symbol.into()),
             tf,
             chart_type: if tr_data::security(symbol).class == AssetClass::Govt {
                 ChartType::Line
@@ -185,6 +185,10 @@ impl ChartState {
         self.viewport = None;
         self.manual_scale = None;
         self.glide = None;
+        self.shown_scale = None;
+        self.hover_marker = None;
+        self.last_indicator_req = None;
+        self.compare_scale = 1.0;
         self.compare_line = None;
         self.markers.clear();
         // Never show the previous symbol's bars under the new title.
@@ -193,6 +197,12 @@ impl ChartState {
         self.gpu = None;
         self.built.clear();
         self.last_live = None;
+        if Security::parse(&self.symbol).is_none() {
+            self.loading = false;
+            self.exhausted = true;
+            self.error = Some("Invalid security".into());
+            return;
+        }
         if self.archive {
             self.tf = Timeframe::D1;
             self.compare = None;
@@ -216,7 +226,10 @@ impl ChartState {
     }
 
     pub fn set_symbol(&mut self, symbol: &str, w: &Worker) {
-        let sec = tr_data::security(symbol);
+        let Some(sec) = Security::parse(symbol) else {
+            self.error = Some("Invalid security".into());
+            return;
+        };
         if sec.class == AssetClass::Govt {
             self.chart_type = ChartType::Line;
         } else if self.sec.class == AssetClass::Govt {
@@ -225,6 +238,8 @@ impl ChartState {
         self.symbol = sec.key();
         self.sec = sec;
         self.draw = DrawState::default();
+        self.drawings.clear();
+        self.pending_range = None;
         self.load(w);
     }
 
@@ -480,7 +495,7 @@ impl ChartState {
         }
     }
 
-    pub fn on_history_error(&mut self, generation: u64, error: String) {
+    pub fn on_history_error(&mut self, generation: u64, error: String) -> bool {
         if generation == self.generation {
             self.loading = false;
             self.paging = false;
@@ -488,12 +503,15 @@ impl ChartState {
             if self.bars.is_empty() {
                 self.error = Some(error);
             }
+            return true;
         }
+        false
     }
 
     pub fn on_indicators(&mut self, generation: u64, built: Vec<BuiltIndicator>) {
         if generation == self.generation {
-            self.built = built;
+            // An in-flight computation may finish after a study was removed.
+            self.built = built.into_iter().filter(|b| self.indicators.contains(&b.spec)).collect();
         }
     }
 
@@ -663,14 +681,33 @@ impl ChartState {
             if provenance.is_verified() { muted() } else { theme::down() },
         );
 
-        let body = Rect::from_min_max(pos2(rect.left(), header.bottom()), pos2(rect.right(), range_row.top()));
+        let warning_h = if provenance == Provenance::Sample { 28.0 } else { 0.0 };
+        if warning_h > 0.0 {
+            let warning = Rect::from_min_size(pos2(rect.left(), header.bottom()), vec2(rect.width(), warning_h));
+            painter.rect_filled(warning, 0.0, Color32::from_rgb(150, 25, 25));
+            painter.text(
+                warning.center(),
+                Align2::CENTER_CENTER,
+                "SAMPLE DATA · SYNTHETIC PRICES",
+                mono(14.0),
+                Color32::WHITE,
+            );
+        }
+        let body =
+            Rect::from_min_max(pos2(rect.left(), header.bottom() + warning_h), pos2(rect.right(), range_row.top()));
         let plot_all = Rect::from_min_max(body.min, pos2(body.right() - AXIS_W, body.bottom() - TIME_H));
         if plot_all.width() < 40.0 || plot_all.height() < 40.0 {
             return clicked;
         }
 
-        let Some(gpu) = self.gpu.clone() else {
-            let msg = self.error.clone().unwrap_or_else(|| format!("Loading {} {}…", self.symbol, self.tf));
+        let Some(gpu) = self.gpu.clone().filter(|g| !g.is_empty()) else {
+            let msg = self.error.clone().unwrap_or_else(|| {
+                if self.loading {
+                    format!("Loading {} {}…", self.symbol, self.tf)
+                } else {
+                    "No bars available".into()
+                }
+            });
             painter.text(plot_all.center(), Align2::CENTER_CENTER, msg, mono(13.0), amber_dim());
             return clicked;
         };
@@ -713,7 +750,14 @@ impl ChartState {
         }
         let hover = plot_resp.hover_pos().filter(|p| self.hover_enabled && plot_all.contains(*p));
         if self.draw.tool.is_none() {
+            let specs = self.indicators.clone();
             plot_resp.context_menu(|ui| self.context_menu(ui, w));
+            // The menu can remove built oscillator panes. Their indices and layout
+            // above belong to the old state; rebuild them on the next frame.
+            if specs != self.indicators {
+                ui.ctx().request_repaint();
+                return clicked;
+            }
         }
 
         if plot_resp.hovered() || axis_resp.hovered() || time_resp.hovered() {
@@ -1483,6 +1527,148 @@ fn hover_card(ui: &Ui, at: Pos2, t: &Trade) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn chart_frame(
+        ctx: &egui::Context,
+        chart: &mut ChartState,
+        worker: &Worker,
+        events: Vec<egui::Event>,
+    ) -> egui::FullOutput {
+        let mut output = ctx.run_ui(
+            egui::RawInput {
+                time: Some(ctx.input(|i| i.time) + 0.2),
+                events,
+                screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(1200.0, 900.0))),
+                ..Default::default()
+            },
+            |ui| {
+                chart.show(ui, Rect::from_min_size(pos2(10.0, 10.0), vec2(1100.0, 800.0)), true, worker);
+            },
+        );
+        output.textures_delta.clear();
+        output
+    }
+
+    fn text_position(shapes: &[egui::epaint::ClippedShape], needle: &str) -> Pos2 {
+        fn find(shape: &egui::Shape, needle: &str) -> Option<Pos2> {
+            match shape {
+                egui::Shape::Text(t) if t.galley.job.text == needle => Some(t.pos + t.galley.size() * 0.5),
+                egui::Shape::Vec(v) => v.iter().find_map(|s| find(s, needle)),
+                _ => None,
+            }
+        }
+        shapes.iter().find_map(|s| find(&s.shape, needle)).unwrap_or_else(|| panic!("missing UI text {needle:?}"))
+    }
+
+    fn pointer(pos: Pos2, button: egui::PointerButton, pressed: bool) -> egui::Event {
+        egui::Event::PointerButton { pos, button, pressed, modifiers: egui::Modifiers::NONE }
+    }
+
+    #[test]
+    fn removing_oscillator_panes_from_context_menu_does_not_index_old_built_panes() {
+        let ctx = egui::Context::default();
+        let (worker, _) = Worker::test_channel();
+        let mut chart = ChartState::new(1, "SPY", Timeframe::D1);
+        chart.indicators = vec![IndicatorSpec::new("RSI", &[]).unwrap(), IndicatorSpec::new("MACD", &[]).unwrap()];
+        chart.load(&worker);
+        let bars = Arc::new(tr_core::sample::generate("SPY", Timeframe::D1, 300, 1_790_000_000));
+        chart.on_history(chart.generation, bars.clone(), SeriesGpu::build(&bars), 0, false, true, false, &worker);
+        chart.built = crate::worker::build_indicators(&bars, chart.tf, &chart.indicators, &theme::palette());
+        chart_frame(&ctx, &mut chart, &worker, vec![]);
+        let pos = pos2(500.0, 300.0);
+        chart_frame(
+            &ctx,
+            &mut chart,
+            &worker,
+            vec![egui::Event::PointerMoved(pos), pointer(pos, egui::PointerButton::Secondary, true)],
+        );
+        chart_frame(&ctx, &mut chart, &worker, vec![pointer(pos, egui::PointerButton::Secondary, false)]);
+        let output = chart_frame(&ctx, &mut chart, &worker, vec![]);
+        let pos = text_position(&output.shapes, "Indicators");
+        chart_frame(
+            &ctx,
+            &mut chart,
+            &worker,
+            vec![egui::Event::PointerMoved(pos), pointer(pos, egui::PointerButton::Primary, true)],
+        );
+        chart_frame(&ctx, &mut chart, &worker, vec![pointer(pos, egui::PointerButton::Primary, false)]);
+        let output = chart_frame(&ctx, &mut chart, &worker, vec![]);
+        let pos = text_position(&output.shapes, "Remove All");
+        chart_frame(
+            &ctx,
+            &mut chart,
+            &worker,
+            vec![egui::Event::PointerMoved(pos), pointer(pos, egui::PointerButton::Primary, true)],
+        );
+        chart_frame(&ctx, &mut chart, &worker, vec![pointer(pos, egui::PointerButton::Primary, false)]);
+        assert!(chart.built.is_empty());
+        assert!(chart.indicators.is_empty());
+        chart_frame(&ctx, &mut chart, &worker, vec![]);
+    }
+
+    #[test]
+    fn symbol_switch_resets_instrument_state_and_rejects_stale_responses() {
+        let (worker, _) = Worker::test_channel();
+        let mut c = ChartState::new(1, "SPY", Timeframe::D1);
+        c.load(&worker);
+        let old_generation = c.generation;
+        let old = Arc::new(tr_core::sample::generate("SPY", Timeframe::D1, 300, 1_790_000_000));
+        c.on_history(old_generation, old.clone(), SeriesGpu::build(&old), 0, false, true, false, &worker);
+        c.manual_scale = Some(PriceScale::new(100.0, 500.0, false, 800.0));
+        c.shown_scale = Some((100.0, 500.0, false));
+        c.drawings.push(Drawing::new(Tool::Horizontal, Anchor { ts: 0, price: 400.0 }, Anchor { ts: 0, price: 400.0 }));
+        c.hover_marker = Some(50);
+        c.pending_range = Some(Range::M1);
+        c.set_symbol("USDBRL CURNCY", &worker);
+        assert_eq!(c.sec.class, AssetClass::Fx);
+        assert_eq!(c.sec.decimals(5.03), 4);
+        assert!(c.bars.is_empty() && c.gpu.is_none() && c.built.is_empty());
+        assert!(c.drawings.is_empty() && c.hover_marker.is_none() && c.pending_range.is_none());
+        assert!(c.shown_scale.is_none() && c.manual_scale.is_none() && c.glide.is_none());
+        c.clear_indicators();
+        c.on_indicators(
+            c.generation,
+            crate::worker::build_indicators(
+                &old,
+                Timeframe::D1,
+                &[IndicatorSpec::new("RSI", &[]).unwrap()],
+                &theme::palette(),
+            ),
+        );
+        assert!(c.built.is_empty(), "removed studies must not be restored by in-flight work");
+        c.on_history(old_generation, old.clone(), SeriesGpu::build(&old), 0, false, true, true, &worker);
+        c.on_indicators(
+            old_generation,
+            crate::worker::build_indicators(&old, Timeframe::D1, &c.indicators, &theme::palette()),
+        );
+        c.on_compare(old_generation, "SPY", scene::line_ref(&[400.0]));
+        assert!(!c.on_history_error(old_generation, "obsolete".into()));
+        assert!(c.bars.is_empty() && c.built.is_empty() && c.compare_line.is_none() && c.error.is_none());
+        c.set_symbol("US10Y Govt", &worker);
+        assert_eq!(c.chart_type, ChartType::Line);
+        c.set_symbol("BTC", &worker);
+        assert_eq!(c.chart_type, ChartType::Candles);
+        assert_eq!(c.sec.class, AssetClass::Crypto);
+    }
+
+    #[test]
+    fn sample_warning_is_painted_inside_the_chart_and_invalid_layout_symbols_do_not_fetch() {
+        let ctx = egui::Context::default();
+        let (worker, mut requests) = Worker::test_channel();
+        for input in ["", "???", "ação", &"A".repeat(100_000)] {
+            let mut c = ChartState::new(1, input, Timeframe::D1);
+            c.load(&worker);
+            assert!(requests.try_recv().is_err());
+            chart_frame(&ctx, &mut c, &worker, vec![]);
+        }
+        let mut c = ChartState::new(1, "USDBRL", Timeframe::D1);
+        c.load(&worker);
+        let bars = Arc::new(vec![Bar::new(0, 350.0, 436.0, 239.0, 350.0, 1.0).with_provenance(Provenance::Sample)]);
+        c.on_history(c.generation, bars.clone(), SeriesGpu::build(&bars), 0, false, true, false, &worker);
+        let out = chart_frame(&ctx, &mut c, &worker, vec![]);
+        let pos = text_position(&out.shapes, "SAMPLE DATA · SYNTHETIC PRICES");
+        assert!(pos.y < 80.0, "prominent banner above the plot");
+    }
 
     #[test]
     fn archive_charts_never_request_market_data() {

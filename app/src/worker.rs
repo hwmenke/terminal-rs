@@ -371,6 +371,11 @@ impl Worker {
         let s = shared.clone();
         rt.spawn(async move {
             while let Some(req) = req_rx.recv().await {
+                // Reserve generations and retire panes in channel order, before
+                // asynchronous tasks can finish (or even start) out of order.
+                if !begin_request(&s, &req) {
+                    continue;
+                }
                 let s = s.clone();
                 tokio::spawn(async move { handle(&s, req).await });
             }
@@ -398,10 +403,17 @@ impl Worker {
 
     #[cfg(test)]
     pub(crate) fn test_channel() -> (Self, tokio::sync::mpsc::UnboundedReceiver<Request>) {
+        let (worker, requests, _) = Self::test_channel_with_responses();
+        (worker, requests)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_channel_with_responses()
+    -> (Self, tokio::sync::mpsc::UnboundedReceiver<Request>, mpsc::Sender<Response>) {
         let (tx, requests) = tokio::sync::mpsc::unbounded_channel();
-        let (_out, rx) = mpsc::channel();
+        let (out, rx) = mpsc::channel();
         let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
-        (Self { tx, rx, _rt: rt }, requests)
+        (Self { tx, rx, _rt: rt }, requests, out)
     }
 
     pub fn send(&self, req: Request) {
@@ -522,7 +534,7 @@ async fn handle(s: &Arc<Shared>, req: Request) {
             }
         }
         Request::ArchiveHistory { pane, generation, symbol } => {
-            if !claim_series(s, pane, generation) {
+            if current_series(s, pane, generation).is_none() {
                 return;
             }
             match tr_data::whats_news::Bridge::from_env().bars(&symbol).await {
@@ -549,12 +561,14 @@ async fn handle(s: &Arc<Shared>, req: Request) {
             }
         }
         Request::History { pane, generation, symbol, tf, limit } => {
-            if !claim_series(s, pane, generation) {
+            if current_series(s, pane, generation).is_none() {
                 return; // a newer load for this pane is already running
             }
             // Paint from the disk cache immediately, then refresh from the network.
             let cached = s.cache.lock().ok().and_then(|c| c.as_ref().and_then(|c| c.load(&symbol, tf, limit).ok()));
-            if let Some(bars) = cached.filter(|b| !b.is_empty()) {
+            if let Some(bars) = cached.filter(|b| {
+                s.provider.name() != "sample" && !b.is_empty() && b.iter().all(|b| b.provenance.is_verified())
+            }) {
                 let bars = Arc::new(bars);
                 let gpu = build_gpu(bars.clone()).await;
                 s.send(Response::History {
@@ -572,7 +586,8 @@ async fn handle(s: &Arc<Shared>, req: Request) {
             }
             match s.provider.history(&symbol, tf, None, limit).await {
                 Ok(bars) if !bars.is_empty() => {
-                    if let Ok(mut c) = s.cache.lock()
+                    if bars.iter().all(|b| b.provenance.is_verified())
+                        && let Ok(mut c) = s.cache.lock()
                         && let Some(c) = c.as_mut()
                     {
                         let _ = c.store(&symbol, tf, &bars);
@@ -808,6 +823,21 @@ async fn trade(t: TradeRequest) -> TradeResponse {
     }
 }
 
+/// Run lifecycle changes synchronously in dispatcher order. A closed pane cannot
+/// be resurrected by an older history task that happens to start or finish later.
+fn begin_request(s: &Shared, req: &Request) -> bool {
+    match req {
+        Request::History { pane, generation, .. } | Request::ArchiveHistory { pane, generation, .. } => {
+            claim_series(s, *pane, *generation)
+        }
+        Request::Forget(pane) => {
+            s.series.lock().expect("series lock").remove(pane);
+            false
+        }
+        _ => true,
+    }
+}
+
 /// Register a load for `generation`; generations only move forward, since request
 /// tasks run concurrently and may start out of order.
 fn claim_series(s: &Shared, pane: PaneId, generation: u64) -> bool {
@@ -825,13 +855,13 @@ fn claim_series(s: &Shared, pane: PaneId, generation: u64) -> bool {
 /// Store freshly loaded bars for a pane if `generation` is still the newest.
 fn store_series(s: &Shared, pane: PaneId, generation: u64, bars: Arc<Vec<Bar>>) -> bool {
     let mut map = s.series.lock().expect("series lock");
-    match map.get(&pane) {
-        Some((g, _)) if *g > generation => false,
-        _ => {
-            map.insert(pane, (generation, bars));
-            true
-        }
+    if let Some((g, current)) = map.get_mut(&pane)
+        && *g == generation
+    {
+        *current = bars;
+        return true;
     }
+    false
 }
 
 fn current_series(s: &Shared, pane: PaneId, generation: u64) -> Option<Arc<Vec<Bar>>> {
@@ -967,6 +997,112 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct OfflinePrices {
+        calls: std::sync::atomic::AtomicUsize,
+        provenance: tr_core::Provenance,
+    }
+
+    #[async_trait::async_trait]
+    impl tr_data::MarketData for OfflinePrices {
+        fn name(&self) -> &str {
+            "offline test provider"
+        }
+        async fn history(&self, symbol: &str, _: Timeframe, _: Option<i64>, _: usize) -> anyhow::Result<Vec<Bar>> {
+            assert_eq!(tr_data::yahoo::yahoo_symbol(&tr_data::security(symbol)), "BRL=X");
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(vec![Bar::new(6001, 5.0, 5.1, 4.9, 5.03, 1.0).with_provenance(self.provenance)])
+        }
+    }
+
+    fn shared(provider: Provider, cache: Option<BarCache>) -> (Arc<Shared>, mpsc::Receiver<Response>) {
+        let (out, rx) = mpsc::channel();
+        (
+            Arc::new(Shared {
+                provider,
+                series: Default::default(),
+                cache: std::sync::Mutex::new(cache),
+                db: Mutex::new(Db::open_in_memory().unwrap()),
+                out,
+                ctx: egui::Context::default(),
+            }),
+            rx,
+        )
+    }
+
+    #[tokio::test]
+    async fn startup_refetches_sample_cache_and_does_not_publish_it_as_real() {
+        use tr_core::Provenance;
+        for provenance in [Provenance::Sample, Provenance::Missing, Provenance::Real] {
+            let provider = Arc::new(OfflinePrices { calls: Default::default(), provenance: Provenance::Real });
+            let mut cache = BarCache::open_in_memory().unwrap();
+            let old: Vec<_> =
+                (0..6000).map(|i| Bar::new(i, 300.0, 436.0, 239.0, 350.0, 1.0).with_provenance(provenance)).collect();
+            cache.store("USDBRL Curncy", Timeframe::D1, &old).unwrap();
+            let (s, rx) = shared(provider.clone(), Some(cache));
+            let req = Request::History {
+                pane: 1,
+                generation: 1,
+                symbol: "USDBRL Curncy".into(),
+                tf: Timeframe::D1,
+                limit: 6000,
+            };
+            assert!(begin_request(&s, &req));
+            handle(&s, req).await;
+            assert_eq!(provider.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+            let replies: Vec<_> = rx
+                .try_iter()
+                .filter_map(|r| match r {
+                    Response::History { from_cache, bars, .. } => Some((from_cache, bars)),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(replies.len(), if provenance.is_verified() { 2 } else { 1 });
+            assert!(!replies.last().unwrap().0);
+            assert_eq!(replies.last().unwrap().1[0].close, 5.03);
+            assert!(replies.iter().all(|(_, b)| b.iter().all(|b| b.provenance.is_verified())));
+            let cached = s.cache.lock().unwrap().as_ref().unwrap().load("USDBRL Curncy", Timeframe::D1, 6000).unwrap();
+            assert!(cached.iter().all(|b| b.provenance.is_verified()));
+            if !provenance.is_verified() {
+                assert_eq!(cached.len(), 1);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn fallback_sample_results_are_not_written_to_the_bar_cache() {
+        let provider = Arc::new(OfflinePrices { calls: Default::default(), provenance: tr_core::Provenance::Sample });
+        let (s, rx) = shared(provider, Some(BarCache::open_in_memory().unwrap()));
+        let req =
+            Request::History { pane: 1, generation: 1, symbol: "USDBRL Curncy".into(), tf: Timeframe::D1, limit: 6000 };
+        assert!(begin_request(&s, &req));
+        handle(&s, req).await;
+        assert!(
+            matches!(rx.try_recv(), Ok(Response::History { bars, from_cache: false, .. }) if Bar::provenance(&bars) == tr_core::Provenance::Sample)
+        );
+        assert!(
+            s.cache.lock().unwrap().as_ref().unwrap().load("USDBRL Curncy", Timeframe::D1, 6000).unwrap().is_empty()
+        );
+    }
+
+    #[test]
+    fn retired_and_superseded_history_tasks_cannot_restore_series() {
+        let (s, _rx) = shared(Arc::new(tr_data::sample::SampleProvider::at(0, 10)), None);
+        let req = |generation| Request::History {
+            pane: 1,
+            generation,
+            symbol: "SPY US Equity".into(),
+            tf: Timeframe::D1,
+            limit: 10,
+        };
+        assert!(begin_request(&s, &req(1)));
+        assert!(begin_request(&s, &req(2)));
+        assert!(!store_series(&s, 1, 1, Arc::new(vec![])));
+        assert!(store_series(&s, 1, 2, Arc::new(vec![])));
+        assert!(!begin_request(&s, &Request::Forget(1)));
+        assert!(!store_series(&s, 1, 2, Arc::new(vec![])), "a closed pane must not be resurrected");
+        assert!(current_series(&s, 1, 2).is_none());
+    }
 
     #[test]
     fn compare_alignment_carries_last_close() {

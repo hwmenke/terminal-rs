@@ -8,6 +8,9 @@ use tr_chart::scene::ChartType;
 pub use tr_core::indicators::registry::Spec as IndicatorSpec;
 use tr_core::{Security, Timeframe, YellowKey};
 
+/// Bound search, shaping and command parsing work for pasted input.
+pub const MAX_INPUT_BYTES: usize = 4096;
+
 /// Indicators on a new chart: the 20 and 50 bar simple moving averages.
 pub fn default_indicators() -> Vec<IndicatorSpec> {
     [20.0, 50.0].iter().filter_map(|n| IndicatorSpec::new("SMA", &[*n])).collect()
@@ -384,6 +387,9 @@ fn parse_function(head: &str, rest: &[&str]) -> Option<Function> {
 
 /// Parse one command line. Returns `None` for empty or unrecognised input.
 pub fn parse(input: &str) -> Option<Command> {
+    if input.len() > MAX_INPUT_BYTES {
+        return None;
+    }
     let tokens: Vec<&str> = input.split_whitespace().filter(|t| !t.eq_ignore_ascii_case("<GO>")).collect();
     let (&head, rest) = tokens.split_first()?;
     // `<TICKER> <YELLOW KEY>` is always a security, even if the ticker spells a function.

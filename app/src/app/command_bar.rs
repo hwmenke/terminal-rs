@@ -121,7 +121,7 @@ impl TerminalApp {
     pub(super) fn suggestions(&self) -> Vec<Suggestion> {
         let mut items: Vec<_> =
             tr_core::catalog::CATALOG.iter().map(|s| Suggestion::ticker(&s.key(), s.name)).collect();
-        for s in self.watchlist.iter().chain(&self.recent_symbols) {
+        for s in self.watchlist.iter().chain(&self.recent_symbols).filter(|s| tr_core::Security::parse(s).is_some()) {
             let name = tr_core::Security::parse(s).and_then(|s| s.name()).unwrap_or_default();
             items.push(Suggestion::ticker(s, name));
         }
@@ -163,6 +163,7 @@ impl TerminalApp {
         let q = self.cmd.trim();
         // Unknown tickers need discovery too; don't require an existing local match.
         self.search_pending = (q.len() >= 2
+            && tr_core::Security::parse(q).is_some()
             && !q.contains(char::is_whitespace)
             && !matches!(command::parse(q), Some(command::Command::Function(_))))
         .then(|| (q.to_string(), Instant::now()));
