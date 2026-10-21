@@ -1,13 +1,13 @@
 //! Window chrome in the style of a SwiftUI macOS app: a unified toolbar holding the
 //! command line, a translucent (vibrancy) sidebar, rounded pane cards and a status bar.
 
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
+use super::command_bar::Suggestion;
 use egui::{
     Align2, Color32, CornerRadius, CursorIcon, Id, Key, Modifiers, Rect, RichText, Sense, Shadow, Stroke, StrokeKind,
     Ui, UiBuilder, ViewportCommand, pos2, vec2,
 };
-use tr_data::SearchHit;
 
 use super::{PaneKind, TerminalApp};
 use crate::anim;
@@ -48,15 +48,18 @@ fn window_drag_region(ui: &Ui, rect: Rect, salt: &str) {
 }
 
 impl TerminalApp {
-    /// Toolbar height: at least the system title bar region on macOS, so nothing interactive
-    /// sits under the window's native drag area (which would swallow clicks and drags).
+    /// Native chrome overlaps the full-size content view. Reserve that strip *above*
+    /// the app toolbar: increasing toolbar height still leaves its controls inside it.
+    pub(super) fn native_titlebar_h(&self) -> f32 {
+        self.chrome.map_or(if MAC { TOOLBAR_H } else { 0.0 }, |c| c.titlebar_height.max(0.0))
+    }
+
     pub(super) fn toolbar_h(&self) -> f32 {
-        match self.chrome {
-            Some(c) if c.titlebar_height > 0.0 => c.titlebar_height.max(TOOLBAR_H),
-            // Full screen: no title bar strip.
-            Some(_) => 34.0,
-            None => TOOLBAR_H,
-        }
+        34.0
+    }
+
+    pub(super) fn toolbar_rect(&self, main: Rect) -> Rect {
+        Rect::from_min_size(main.min + vec2(0.0, self.native_titlebar_h()), vec2(main.width(), self.toolbar_h()))
     }
 
     pub(super) fn traffic_inset(&self) -> f32 {
@@ -301,12 +304,25 @@ impl TerminalApp {
     }
 
     /// The Bloomberg command line, drawn as a rounded macOS search field.
-    fn command_field(&mut self, ui: &mut Ui, field: Rect) -> bool {
-        let suggestions = self.suggestions();
-        // Claim navigation keys for the dropdown before the text field sees them.
-        let (sel_down, sel_up, complete) = if suggestions.is_empty() {
-            (false, false, false)
-        } else {
+    pub(super) fn command_field(&mut self, ui: &mut Ui, field: Rect) -> bool {
+        let id = Id::new("command-line");
+        // A dropdown row receives the click over two frames. Keep the text field
+        // alive during that click so the row still exists on pointer release.
+        let over_dropdown = ui.ctx().pointer_latest_pos().is_some_and(|pos| {
+            ui.ctx().layer_id_at(pos) == Some(egui::LayerId::new(egui::Order::Foreground, Id::new("cmd-suggestions")))
+        });
+        let keep_dropdown = over_dropdown && ui.ctx().memory(|m| m.has_focus(id) || m.had_focus_last_frame(id));
+        if (self.focus_cmd || keep_dropdown) && !ui.ctx().memory(|m| m.has_focus(id)) {
+            ui.ctx().memory_mut(|m| m.request_focus(id));
+        }
+        let had_focus = ui.ctx().memory(|m| m.has_focus(id));
+        if had_focus {
+            self.command_catalogue.request(&self.worker);
+        }
+        // Only this field's focus may claim dropdown navigation. Other text inputs
+        // keep their arrows and Tab even when an old query remains in the bar.
+        let suggestions = if had_focus { self.suggestions() } else { Vec::new() };
+        let (sel_down, sel_up, complete) = if had_focus && !suggestions.is_empty() {
             ui.input_mut(|i| {
                 (
                     i.consume_key(Modifiers::NONE, Key::ArrowDown),
@@ -314,22 +330,21 @@ impl TerminalApp {
                     i.consume_key(Modifiers::NONE, Key::Tab),
                 )
             })
+        } else {
+            (false, false, false)
         };
         if sel_down {
             self.suggestion = Some(self.suggestion.map_or(0, |i| (i + 1).min(suggestions.len() - 1)));
         }
         if sel_up {
-            self.suggestion = self.suggestion.and_then(|i| i.checked_sub(1));
+            self.suggestion = Some(self.suggestion.map_or(suggestions.len() - 1, |i| i.saturating_sub(1)));
         }
         if complete {
-            let pick = &suggestions[self.suggestion.unwrap_or(0)];
+            let pick = &suggestions[self.suggestion.unwrap_or(0).min(suggestions.len() - 1)];
             self.cmd = format!("{} ", pick.key);
-            self.suggestion = None;
+            self.command_changed();
             self.focus_cmd = true;
         }
-
-        let id = Id::new("command-line");
-        let had_focus = ui.ctx().memory(|m| m.has_focus(id));
         let ring = anim::spring_bool(ui.ctx(), id.with("ring"), had_focus);
         let p = ui.painter();
         let radius = CornerRadius::same(6);
@@ -376,24 +391,23 @@ impl TerminalApp {
             .font(mono(12.5))
             .text_color(amber())
             .vertical_align(egui::Align::Center)
-            .hint_text(
-                RichText::new("Search or type a command — BTCUSD <CRNCY> · US10Y GOVT · CL1 CMDTY · AAPL · WEI · GC")
-                    .font(ui_font(12.0))
-                    .color(muted()),
-            )
+            .hint_text(RichText::new("Ticker or command…   / · : · Ctrl+K").font(ui_font(12.0)).color(muted()))
             .desired_width(inner.width())
             .min_size(vec2(inner.width(), inner.height()))
             .frame(egui::Frame::NONE);
-        let resp = child.add(te.lock_focus(true));
+        let resp = child.add(te.event_filter(egui::EventFilter {
+            tab: true,
+            escape: true,
+            horizontal_arrows: true,
+            vertical_arrows: true,
+        }));
         if resp.changed() {
-            self.suggestion = None;
-            let q = self.cmd.trim().to_string();
-            if q.len() >= 2 && !self.suggestions().is_empty() {
-                self.search_pending = Some((q, Instant::now()));
-            }
+            self.command_changed();
         }
         if self.focus_cmd {
-            resp.request_focus();
+            if !resp.has_focus() {
+                resp.request_focus();
+            }
             // Place the cursor at the end after type-to-command.
             if let Some(mut state) = egui::TextEdit::load_state(ui.ctx(), id) {
                 let ccursor = egui::text::CCursor::new(self.cmd.chars().count());
@@ -411,26 +425,21 @@ impl TerminalApp {
                 i.key_pressed(Key::ArrowDown),
             )
         });
-        if (resp.lost_focus() && enter) || go_clicked {
+        if ((had_focus || focused || resp.lost_focus()) && enter) || go_clicked {
             if enter {
                 ui.ctx().data_mut(|d| d.insert_temp(id.with("go-entered"), now));
                 ui.ctx().request_repaint();
             }
-            let input = std::mem::take(&mut self.cmd);
-            match self.suggestion.take().and_then(|i| suggestions.get(i)) {
-                Some(pick) => self.execute(&pick.key),
-                None if !input.trim().is_empty() => self.execute(&input),
-                None => {}
-            }
-            self.cmd_hist_pos = None;
-            // The command line stays live, Bloomberg-style, unless the command opened the
-            // order ticket (which takes the keyboard for its quantity) or the palette.
-            self.focus_cmd = !self.palette.open && !self.trading.ticket.as_ref().is_some_and(|t| t.focus_qty > 0);
-            if !self.focus_cmd {
-                resp.surrender_focus();
-            }
+            // Recompute after TextEdit: text and Enter may arrive in the same frame.
+            let current = self.suggestions();
+            let pick = self.suggestion.and_then(|i| current.get(i)).map(|s| s.key.clone());
+            self.accept_command(pick.as_deref());
+            resp.surrender_focus();
         } else if had_focus && esc {
             self.cmd.clear();
+            self.suggestion = None;
+            self.search_pending = None;
+            self.focus_cmd = false;
             resp.surrender_focus();
         } else if focused && (up || down) && !self.cmd_history.is_empty() {
             let n = self.cmd_history.len();
@@ -447,33 +456,21 @@ impl TerminalApp {
             self.cmd_hist_pos = Some(pos);
             self.cmd = self.cmd_history[pos].clone();
         }
-        if focused && !self.cmd.is_empty() {
-            self.dropdown(ui.ctx(), field, &suggestions);
+        let focused = ui.ctx().memory(|m| m.has_focus(id));
+        if focused || keep_dropdown {
+            let current = self.suggestions();
+            self.dropdown(ui.ctx(), field, &current);
         }
         focused
     }
 
-    /// Security suggestions for what is typed, unless it is a function command.
-    pub(super) fn suggestions(&self) -> Vec<SearchHit> {
-        let q = self.cmd.trim();
-        if q.is_empty()
-            || matches!(command::parse(q), Some(command::Command::Function(_) | command::Command::SymbolFunction(..)))
-        {
-            return Vec::new();
-        }
-        let net: &[SearchHit] = if self.net_hits.0 == q { &self.net_hits.1 } else { &[] };
-        let mut v = markets_view::merged_hits(q, net);
-        v.truncate(8);
-        v
-    }
-
     /// Autocomplete popover under the command field.
-    fn dropdown(&mut self, ctx: &egui::Context, below: Rect, hits: &[SearchHit]) {
+    fn dropdown(&mut self, ctx: &egui::Context, below: Rect, hits: &[Suggestion]) {
         if hits.is_empty() {
             return;
         }
         let mut clicked = None;
-        let width = below.width().clamp(420.0, 680.0);
+        let width = below.width().clamp(420.0, 680.0).min(ctx.content_rect().width() - 12.0);
         let shown = anim::ease_out(anim::appear(ctx, Id::new("cmd-suggestions-in"), 0.18));
         egui::Area::new(Id::new("cmd-suggestions"))
             .order(egui::Order::Foreground)
@@ -490,36 +487,33 @@ impl TerminalApp {
                         ui.set_width(width);
                         let glider = widgets::Glider::new(ui, Id::new("cmd-suggestions-sel"));
                         for (i, h) in hits.iter().enumerate() {
-                            let (r, resp) = ui.allocate_exact_size(vec2(width, 26.0), Sense::click());
+                            let (r, _) = ui.allocate_exact_size(vec2(width, 26.0), Sense::hover());
+                            let resp = ui.interact(r, Id::new(("command-suggestion", &h.key)), Sense::click());
                             if self.suggestion == Some(i) {
                                 glider.on(ui, r);
                             }
                             widgets::hover_wash(ui, r, &resp, false);
-                            let p = ui.painter();
-                            let class_c = markets_view::class_color(h.class);
+                            let p = ui.painter_at(r);
+                            let class_c = h.class.map_or(amber(), markets_view::class_color);
                             let pill = Rect::from_min_size(pos2(r.left() + 6.0, r.center().y - 8.0), vec2(52.0, 16.0));
                             p.rect_filled(pill, 8.0, class_c.gamma_multiply(0.18));
-                            p.text(pill.center(), Align2::CENTER_CENTER, h.class.label(), ui_font(10.0), class_c);
-                            p.text(
+                            p.text(pill.center(), Align2::CENTER_CENTER, h.label(), ui_font(10.0), class_c);
+                            let name_x = pill.right() + 190.0;
+                            p.with_clip_rect(Rect::from_min_max(r.min, pos2(name_x - 8.0, r.bottom()))).text(
                                 pos2(pill.right() + 10.0, r.center().y),
                                 Align2::LEFT_CENTER,
                                 &h.key,
                                 mono(12.5),
                                 text(),
                             );
-                            p.text(
-                                pos2(pill.right() + 190.0, r.center().y),
-                                Align2::LEFT_CENTER,
-                                &h.name,
-                                ui_font(12.5),
-                                muted(),
-                            );
+                            p.text(pos2(name_x, r.center().y), Align2::LEFT_CENTER, &h.name, ui_font(12.5), muted());
                             if resp.hovered() {
                                 ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
                             }
                             if resp.clicked() {
                                 clicked = Some(h.key.clone());
                             }
+                            resp.on_hover_text(format!("{} — {}", h.key, h.name));
                         }
                         ui.add_space(2.0);
                         ui.label(
@@ -534,10 +528,8 @@ impl TerminalApp {
                     });
             });
         if let Some(key) = clicked {
-            self.cmd.clear();
-            self.suggestion = None;
-            self.execute(&key);
-            self.focus_cmd = true;
+            self.accept_command(Some(&key));
+            ctx.memory_mut(|m| m.surrender_focus(Id::new("command-line")));
         }
     }
 
@@ -552,7 +544,7 @@ impl TerminalApp {
         let on_right = self.prefs.appearance.sidebar_side == crate::prefs::SidebarSide::Right;
         let edge = if on_right { rect.left() + 0.5 } else { rect.right() - 0.5 };
         p.vline(edge, rect.y_range(), Stroke::new(1.0, theme::border()));
-        let head = Rect::from_min_size(rect.min, vec2(rect.width(), self.toolbar_h()));
+        let head = Rect::from_min_size(rect.min, vec2(rect.width(), self.native_titlebar_h() + self.toolbar_h()));
         window_drag_region(ui, head, "sidebar");
         if !cfg!(target_os = "macos") {
             p.text(head.left_center() + vec2(14.0, 0.0), Align2::LEFT_CENTER, "TERMINAL-RS", mono(12.5), amber());
@@ -996,4 +988,278 @@ fn nav_row(ui: &mut Ui, icon: Icon, label: &str, trailing: Option<&str>, selecte
         }
     }
     resp
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::app::{Pane, tests::test_app};
+    use egui::Event;
+
+    fn key(key: Key, modifiers: Modifiers) -> Event {
+        Event::Key { key, physical_key: None, pressed: true, repeat: false, modifiers }
+    }
+    fn frame(ctx: &egui::Context, app: &mut TerminalApp, events: Vec<Event>) {
+        let time = ctx.input(|i| i.time) + 0.1;
+        ctx.run_ui(
+            egui::RawInput {
+                time: Some(time),
+                screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(1000.0, 700.0))),
+                events,
+                ..Default::default()
+            },
+            |ui| {
+                app.hotkeys(ui.ctx());
+                app.command_field(ui, Rect::from_min_size(pos2(20.0, 50.0), vec2(600.0, 22.0)));
+            },
+        )
+        .textures_delta
+        .clear();
+    }
+    fn chart_app() -> TerminalApp {
+        let mut app = test_app();
+        app.panes.push(Pane {
+            id: 1,
+            kind: PaneKind::Chart(Box::new(crate::chart_view::ChartState::new(
+                1,
+                "AAPL US Equity",
+                tr_core::Timeframe::D1,
+            ))),
+            link: None,
+            title: None,
+            window: None,
+        });
+        app.focus = 1;
+        app.next_id = 2;
+        app.dock = crate::dock::Node::preset(Layout::One, &[1]);
+        app.focus_cmd = false;
+        app
+    }
+    fn focused(ctx: &egui::Context) -> bool {
+        ctx.memory(|m| m.has_focus(Id::new("command-line")))
+    }
+
+    #[test]
+    fn native_titlebar_never_overlaps_toolbar_controls() {
+        let mut app = test_app();
+        let main = Rect::from_min_size(pos2(232.0, 0.0), vec2(1000.0, 700.0));
+        for height in [38.0, 52.0, 0.0] {
+            app.chrome = Some(tr_macos::Chrome { titlebar_height: height, traffic_lights_width: 76.0 });
+            let toolbar = app.toolbar_rect(main);
+            assert_eq!(toolbar.top(), height);
+            assert!(toolbar.center().y - 11.0 >= height, "command field must be below the native hit-test strip");
+        }
+    }
+
+    #[test]
+    fn slash_colon_and_ctrl_k_focus_and_do_not_insert_the_hotkey() {
+        for event in [Event::Text("/".into()), Event::Text(":".into()), key(Key::K, Modifiers::CTRL)] {
+            let ctx = egui::Context::default();
+            let mut app = chart_app();
+            frame(&ctx, &mut app, vec![]);
+            frame(&ctx, &mut app, vec![event]);
+            assert!(focused(&ctx));
+            assert_eq!(app.cmd, "");
+            assert!(!app.palette.open);
+        }
+    }
+
+    #[test]
+    fn typing_from_a_focused_non_text_widget_transfers_text_exactly_once() {
+        let ctx = egui::Context::default();
+        let mut app = chart_app();
+        frame(&ctx, &mut app, vec![]);
+        ctx.memory_mut(|m| m.request_focus(Id::new("chart-panel")));
+        frame(&ctx, &mut app, vec![key(Key::B, Modifiers::NONE), Event::Text("b".into())]);
+        assert_eq!(app.cmd, "B");
+        assert!(focused(&ctx));
+        frame(&ctx, &mut app, vec![Event::Text("TCUSD".into())]);
+        assert_eq!(app.cmd, "BTCUSD");
+        // The old type-anywhere guard treated any focused widget as a text input.
+        // Shift+B must start a query too, rather than opening a trade ticket.
+        ctx.memory_mut(|m| m.surrender_focus(Id::new("command-line")));
+        app.cmd = "stale query".into();
+        frame(&ctx, &mut app, vec![key(Key::B, Modifiers::SHIFT), Event::Text("B".into())]);
+        assert_eq!(app.cmd, "B");
+        assert!(app.trading.ticket.is_none());
+    }
+
+    #[test]
+    fn another_text_input_keeps_typing_navigation_and_enter_but_ctrl_k_takes_focus() {
+        let ctx = egui::Context::default();
+        let mut app = chart_app();
+        let other = Id::new("other-input");
+        let mut text = String::new();
+        ctx.run_ui(Default::default(), |ui| {
+            ui.add(egui::TextEdit::singleline(&mut text).id(other)).request_focus();
+        })
+        .textures_delta
+        .clear();
+        app.cmd = "AAP".into();
+        frame(
+            &ctx,
+            &mut app,
+            vec![Event::Text("x".into()), key(Key::ArrowDown, Modifiers::NONE), key(Key::Enter, Modifiers::NONE)],
+        );
+        assert_eq!(app.cmd, "AAP");
+        assert!(app.suggestion.is_none());
+        assert!(ctx.input(|i| i.key_pressed(Key::ArrowDown)), "dropdown must not consume another input's arrows");
+        assert!(app.cmd_history.is_empty(), "another input's Enter must not run the bar");
+        ctx.memory_mut(|m| m.request_focus(other));
+        frame(&ctx, &mut app, vec![key(Key::K, Modifiers::CTRL)]);
+        assert!(focused(&ctx));
+    }
+
+    #[test]
+    fn enter_switches_the_active_chart_then_runs_a_function_and_escape_closes() {
+        let ctx = egui::Context::default();
+        let mut app = chart_app();
+        frame(&ctx, &mut app, vec![Event::Text("msft".into())]);
+        frame(&ctx, &mut app, vec![key(Key::Enter, Modifiers::NONE)]);
+        assert_eq!(app.focus, 1);
+        assert_eq!(app.panes.len(), 1);
+        assert_eq!(app.panes[0].kind.symbol(), Some("MSFT US Equity"));
+        assert_eq!(app.recent_symbols.first().map(String::as_str), Some("MSFT US Equity"));
+        assert!(!focused(&ctx));
+        frame(&ctx, &mut app, vec![Event::Text("LOG".into())]);
+        frame(&ctx, &mut app, vec![key(Key::Enter, Modifiers::NONE)]);
+        assert!(matches!(&app.panes[0].kind, PaneKind::Chart(c) if c.log));
+        frame(&ctx, &mut app, vec![Event::Text("NVDA".into())]);
+        frame(&ctx, &mut app, vec![key(Key::Escape, Modifiers::NONE)]);
+        assert_eq!(app.cmd, "");
+        assert!(!focused(&ctx));
+        assert!(app.suggestion.is_none());
+    }
+
+    #[test]
+    fn arrows_enter_and_tab_operate_on_the_dropdown() {
+        let ctx = egui::Context::default();
+        let mut app = chart_app();
+        frame(&ctx, &mut app, vec![Event::Text("appl".into())]);
+        let first = app.suggestions()[0].key.clone();
+        frame(&ctx, &mut app, vec![key(Key::ArrowDown, Modifiers::NONE)]);
+        assert_eq!(app.suggestion, Some(0));
+        frame(&ctx, &mut app, vec![key(Key::Enter, Modifiers::NONE)]);
+        assert_eq!(app.panes[0].kind.symbol(), Some(first.as_str()));
+        frame(&ctx, &mut app, vec![Event::Text("uni".into())]);
+        frame(&ctx, &mut app, vec![key(Key::Tab, Modifiers::NONE)]);
+        assert_eq!(app.cmd.trim(), "UNIV");
+        assert!(focused(&ctx));
+        frame(&ctx, &mut app, vec![key(Key::ArrowUp, Modifiers::NONE)]);
+        assert!(app.suggestion.is_some());
+        // Tab must complete even an empty focused bar; it must not cycle pane focus.
+        app.cmd.clear();
+        app.command_changed();
+        let first = app.suggestions()[0].key.clone();
+        frame(&ctx, &mut app, vec![key(Key::Tab, Modifiers::NONE)]);
+        assert_eq!(app.cmd.trim(), first);
+    }
+
+    #[test]
+    fn mouse_click_focuses_field_and_clicking_a_suggestion_loads_it() {
+        let ctx = egui::Context::default();
+        let mut app = chart_app();
+        frame(&ctx, &mut app, vec![]);
+        let pos = pos2(150.0, 61.0);
+        let click = |pos, pressed| Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: Modifiers::NONE,
+        };
+        frame(&ctx, &mut app, vec![Event::PointerMoved(pos), click(pos, true)]);
+        frame(&ctx, &mut app, vec![click(pos, false)]);
+        assert!(focused(&ctx));
+        frame(&ctx, &mut app, vec![Event::Text("NVDA".into())]);
+        frame(&ctx, &mut app, vec![]);
+        let id = Id::new(("command-suggestion", &"NVDA US Equity".to_string()));
+        let row = ctx.read_response(id).expect("visible NVDA suggestion").rect;
+        let pos = row.center();
+        frame(&ctx, &mut app, vec![Event::PointerMoved(pos), click(pos, true)]);
+        frame(&ctx, &mut app, vec![click(pos, false)]);
+        assert_eq!(app.panes[0].kind.symbol(), Some("NVDA US Equity"));
+        assert!(app.cmd.is_empty());
+    }
+    #[test]
+    fn toolbar_drag_region_does_not_intercept_field_or_go_clicks() {
+        let ctx = egui::Context::default();
+        let mut app = chart_app();
+        app.chrome = Some(tr_macos::Chrome { titlebar_height: 52.0, traffic_lights_width: 76.0 });
+        let mut step = |events: Vec<Event>| {
+            let time = ctx.input(|i| i.time) + 0.1;
+            ctx.run_ui(
+                egui::RawInput {
+                    time: Some(time),
+                    events,
+                    screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(1200.0, 700.0))),
+                    ..Default::default()
+                },
+                |ui| {
+                    app.hotkeys(ui.ctx());
+                    let rect = app.toolbar_rect(ui.max_rect());
+                    app.toolbar(ui, rect, 76.0);
+                },
+            )
+            .textures_delta
+            .clear();
+        };
+        step(vec![]);
+        let input = ctx.read_response(Id::new("command-line")).unwrap().rect;
+        assert!(input.top() >= 52.0);
+        let click = |pos, pressed| Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: Modifiers::NONE,
+        };
+        step(vec![Event::PointerMoved(input.center()), click(input.center(), true)]);
+        step(vec![click(input.center(), false)]);
+        assert!(focused(&ctx));
+        step(vec![Event::Text("MSFT".into())]);
+        let go = ctx.read_response(Id::new("command-line").with("go")).unwrap().rect.center();
+        step(vec![Event::PointerMoved(go), click(go, true)]);
+        step(vec![click(go, false)]);
+        assert_eq!(app.panes[0].kind.symbol(), Some("MSFT US Equity"));
+    }
+
+    #[test]
+    fn dropdown_enter_runs_univ_and_scan_commands() {
+        let ctx = egui::Context::default();
+        let mut app = chart_app();
+        frame(&ctx, &mut app, vec![Event::Text("UNIV".into())]);
+        frame(&ctx, &mut app, vec![key(Key::ArrowDown, Modifiers::NONE)]);
+        frame(&ctx, &mut app, vec![key(Key::Enter, Modifiers::NONE)]);
+        assert!(app.panes.iter().any(|p| matches!(&p.kind, PaneKind::Research(r) if r.scan.is_none())));
+        frame(&ctx, &mut app, vec![Event::Text("SCAN NEAR_HIGH".into())]);
+        frame(&ctx, &mut app, vec![key(Key::ArrowDown, Modifiers::NONE)]);
+        frame(&ctx, &mut app, vec![key(Key::Enter, Modifiers::NONE)]);
+        assert!(
+            app.panes
+                .iter()
+                .any(|p| matches!(&p.kind, PaneKind::Research(r) if r.scan.as_deref() == Some("NEAR_HIGH")))
+        );
+    }
+
+    #[test]
+    fn switching_an_archive_chart_keeps_archive_mode_and_never_requests_live_prices() {
+        let ctx = egui::Context::default();
+        let mut app = chart_app();
+        let (worker, mut requests) = crate::worker::Worker::test_channel();
+        app.worker = worker;
+        if let PaneKind::Chart(c) = &mut app.panes[0].kind {
+            c.archive = true;
+        }
+        frame(&ctx, &mut app, vec![Event::Text("NVDA".into())]);
+        frame(&ctx, &mut app, vec![key(Key::Enter, Modifiers::NONE)]);
+        assert!(matches!(&app.panes[0].kind, PaneKind::Chart(c) if c.archive && c.symbol == "NVDA US Equity"));
+        let mut archive_requested = false;
+        while let Ok(req) = requests.try_recv() {
+            match req {
+                crate::worker::Request::ArchiveHistory { .. } => archive_requested = true,
+                crate::worker::Request::History { .. } => panic!("archive ticker switching requested market data"),
+                _ => {}
+            }
+        }
+        assert!(archive_requested);
+    }
 }

@@ -27,6 +27,7 @@ pub type PaneId = u64;
 pub const CONGRESS_REFRESH_MIN: u64 = 30;
 
 pub enum Request {
+    AutocompleteUniverse,
     Research {
         pane: PaneId,
         scan: Option<String>,
@@ -208,6 +209,7 @@ pub struct Profile {
 }
 
 pub enum Response {
+    AutocompleteUniverse(Result<tr_data::whats_news::Snapshot<Vec<tr_data::whats_news::Symbol>>, String>),
     Universe {
         pane: PaneId,
         result: Result<tr_data::whats_news::Snapshot<Vec<tr_data::whats_news::Symbol>>, String>,
@@ -507,6 +509,10 @@ pub fn initial_limit(tf: Timeframe) -> usize {
 
 async fn handle(s: &Arc<Shared>, req: Request) {
     match req {
+        Request::AutocompleteUniverse => {
+            let result = tr_data::whats_news::Bridge::from_env().universe().await.map_err(|e| format!("{e:#}"));
+            s.send(Response::AutocompleteUniverse(result));
+        }
         Request::Research { pane, scan } => {
             let bridge = tr_data::whats_news::Bridge::from_env();
             if let Some(name) = scan {

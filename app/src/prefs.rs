@@ -595,8 +595,8 @@ impl Default for Keymap {
         bind(Action::PopOut, "Cmd+Shift+P");
         bind(Action::SaveLayout, "Cmd+S");
         bind(Action::Settings, "Cmd+Comma");
-        // ⌘K on macOS, Ctrl+K elsewhere (`Cmd` is the platform command key).
-        bind(Action::CommandPalette, "Cmd+K");
+        // Ctrl+K focuses the toolbar; Shift keeps the full palette available everywhere.
+        bind(Action::CommandPalette, "Cmd+Shift+K");
         bind(Action::DrawTrendline, "Alt+T");
         bind(Action::DrawHorizontal, "Alt+H");
         bind(Action::DrawVertical, "Alt+V");
@@ -792,7 +792,7 @@ mod tests {
         assert_eq!(k.action_for(Key::Num1, Modifiers::COMMAND), Some(Action::NewChart));
         assert_eq!(k.action_for(Key::Num0, Modifiers::COMMAND), Some(Action::NewSearch));
         assert_eq!(k.action_for(Key::Num3, Modifiers::ALT), Some(Action::Layout3));
-        assert_eq!(k.action_for(Key::K, Modifiers::COMMAND), Some(Action::CommandPalette));
+        assert_eq!(k.action_for(Key::K, Modifiers::COMMAND | Modifiers::SHIFT), Some(Action::CommandPalette));
         // Every action has a default binding, and no two share one.
         let chords: Vec<Chord> = Action::ALL.iter().filter_map(|a| k.chord(*a)).collect();
         assert_eq!(chords.len(), Action::ALL.len());

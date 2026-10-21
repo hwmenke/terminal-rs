@@ -6,6 +6,7 @@
 
 mod broker;
 mod chrome;
+mod command_bar;
 mod demo;
 mod hotkeys_view;
 mod options_view;
@@ -372,6 +373,8 @@ struct Settings {
     /// Name of the layout to restore on launch.
     #[serde(default)]
     active_layout: Option<String>,
+    #[serde(default)]
+    recent_symbols: Vec<String>,
     // Pre-docking settings files stored a preset and a pane list here.
     #[serde(default, skip_serializing)]
     layout: Option<Layout>,
@@ -483,6 +486,8 @@ pub struct TerminalApp {
     /// Query typed in the command line awaiting a debounced network search.
     search_pending: Option<(String, Instant)>,
     suggestion: Option<usize>,
+    command_catalogue: command_bar::Catalogue,
+    recent_symbols: Vec<String>,
 
     cmd: String,
     cmd_history: Vec<String>,
@@ -530,7 +535,7 @@ pub struct TerminalApp {
     trading: trading::TradingState,
     /// The paper-trading demo account (selected by default).
     demo: demo::DemoState,
-    /// ⌘K command palette.
+    /// Full command palette (separate from the toolbar input).
     palette: crate::palette::Palette,
 }
 
@@ -630,6 +635,8 @@ impl TerminalApp {
             net_hits: (String::new(), Vec::new()),
             search_pending: None,
             suggestion: None,
+            command_catalogue: Default::default(),
+            recent_symbols: settings.as_ref().map(|s| s.recent_symbols.clone()).unwrap_or_default(),
             cmd: String::new(),
             cmd_history: Vec::new(),
             cmd_hist_pos: None,
@@ -701,6 +708,7 @@ impl TerminalApp {
     fn save_settings(&self) {
         let s = Settings {
             watchlist: self.watchlist.clone(),
+            recent_symbols: self.recent_symbols.clone(),
             sidebar: self.sidebar_open,
             active_layout: Some(self.layout_name.clone()),
             layout: None,
@@ -961,6 +969,7 @@ impl TerminalApp {
     fn drain(&mut self) {
         while let Ok(r) = self.worker.rx.try_recv() {
             match r {
+                Response::AutocompleteUniverse(result) => self.command_catalogue.accept(result),
                 Response::Universe { pane, result } => {
                     if let Some(PaneKind::Research(r)) =
                         self.panes.iter_mut().find(|p| p.id == pane).map(|p| &mut p.kind)
@@ -1200,10 +1209,28 @@ impl TerminalApp {
             }
             return;
         }
-        // ⌘K (Ctrl+K) opens and closes the palette from anywhere, even from a text field.
-        if let Some(&(key, m)) =
-            presses.iter().find(|(k, m)| self.prefs.hotkeys.action_for(*k, *m) == Some(prefs::Action::CommandPalette))
-        {
+        let focus_chord = presses.iter().find(|(k, m)| *k == Key::K && m.ctrl && !m.alt && !m.shift);
+        let focus_text = ctx.input(|i| i.events.iter().any(|e| matches!(e, Event::Text(t) if t == "/" || t == ":")))
+            && !ctx.text_edit_focused();
+        if focus_chord.is_some() || focus_text {
+            ctx.input_mut(|i| {
+                if let Some(&(key, m)) = focus_chord {
+                    i.consume_key(m, key);
+                }
+                i.events.retain(|e| !matches!(e, Event::Text(t) if t == "/" || t == ":"));
+            });
+            self.palette.open = false;
+            self.cmd.clear();
+            self.command_changed();
+            self.focus_cmd = true;
+            ctx.memory_mut(|m| m.request_focus(egui::Id::new("command-line")));
+            return;
+        }
+        // The full palette remains available from text fields; Ctrl+K is reserved for the bar.
+        if let Some(&(key, m)) = presses.iter().find(|(k, m)| {
+            (*k == Key::K && m.shift && (m.command || m.ctrl) && !m.alt)
+                || self.prefs.hotkeys.action_for(*k, *m) == Some(prefs::Action::CommandPalette)
+        }) {
             ctx.input_mut(|i| i.consume_key(m, key));
             self.palette.toggle();
             return;
@@ -1213,23 +1240,40 @@ impl TerminalApp {
             return;
         }
         let cmd_id = egui::Id::new("command-line");
+        // egui processes focus navigation at begin_pass, before app hotkeys. A newly
+        // focused TextEdit may not have installed its filter yet; keep its first Tab,
+        // arrows and Escape in the command bar instead of moving to another widget.
+        let navigation = presses
+            .iter()
+            .any(|(k, m)| !m.any() && matches!(k, Key::Tab | Key::Escape | Key::ArrowUp | Key::ArrowDown));
+        let owns_navigation =
+            ctx.memory(|m| m.has_focus(cmd_id) || (m.focused().is_none() && m.had_focus_last_frame(cmd_id)));
+        if navigation && owns_navigation {
+            ctx.memory_mut(|m| {
+                if !m.has_focus(cmd_id) {
+                    m.request_focus(cmd_id);
+                }
+                m.move_focus(egui::FocusDirection::None);
+            });
+        }
         let focused = ctx.memory(|m| m.focused());
         let cmd_focused = focused == Some(cmd_id);
-        let other_text_focused = focused.is_some() && !cmd_focused;
+        let other_text_focused = ctx.text_edit_focused() && !cmd_focused;
         if other_text_focused {
             return;
         }
         // Chorded bindings (⌘, Ctrl, Alt) work even while the command line has text.
+        let typing = ctx.input(|i| i.events.iter().any(|e| matches!(e, Event::Text(t) if !t.is_empty())));
         let mut swallow_text = false;
         for &(key, m) in &presses {
             let Some(action) = self.prefs.hotkeys.action_for(key, m) else { continue };
             let chorded = m.command || m.ctrl || m.alt;
-            if !chorded && !self.cmd.is_empty() {
+            if !chorded && (!self.cmd.is_empty() || (cmd_focused && key == Key::Tab)) {
                 continue;
             }
             // ⇧B / ⇧S type letters: never while the command line is being typed into.
             let letter = !chorded && Self::types_text(key);
-            if letter && cmd_focused {
+            if letter && (cmd_focused || typing) {
                 continue;
             }
             if !self.hotkey_applies(action) {
@@ -1261,12 +1305,16 @@ impl TerminalApp {
                 let starts = !self.cmd.is_empty()
                     || typed.chars().next().is_some_and(|c| c.is_ascii_alphanumeric() || c == '^' || c == '?');
                 if starts {
-                    self.cmd.push_str(&typed.to_ascii_uppercase());
+                    self.cmd = typed.to_ascii_uppercase();
+                    self.command_changed();
                     self.focus_cmd = true;
+                    // Transfer these text events once, before TextEdit is rendered.
+                    ctx.input_mut(|i| i.events.retain(|e| !matches!(e, Event::Text(_))));
+                    ctx.memory_mut(|m| m.request_focus(cmd_id));
                 }
             }
         }
-        if !self.cmd.is_empty() || !self.focused_is_chart() {
+        if cmd_focused || self.focus_cmd || !self.cmd.is_empty() || !self.focused_is_chart() {
             return;
         }
         let pressed = |m: Modifiers, k: Key| ctx.input_mut(|i| i.consume_key(m, k));
@@ -1537,7 +1585,7 @@ impl eframe::App for TerminalApp {
             Rect::from_min_max(pos2(screen.left() + sb_w, screen.top()), screen.max)
         };
         ui.painter().rect_filled(main, 0.0, theme::window());
-        let toolbar = Rect::from_min_size(main.min, vec2(main.width(), self.toolbar_h()));
+        let toolbar = self.toolbar_rect(main);
         let status = Rect::from_min_max(pos2(main.left(), main.bottom() - STATUS_H), main.max);
         let gap = theme::dp(6.0);
         let area = Rect::from_min_max(
@@ -1622,6 +1670,122 @@ impl eframe::App for TerminalApp {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Isolated UI fixture: all paths are temporary and the worker only records requests.
+    pub(super) fn test_app() -> TerminalApp {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "terminal-rs-bar-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        let (worker, _) = Worker::test_channel();
+        let ctx = egui::Context::default();
+        let prefs = Prefs::default();
+        let themes = crate::themes::builtins();
+        let theme_store = crate::themes::ThemeStore::new(dir.join("themes"));
+        let system_accent = theme::DEFAULT_ACCENT;
+        let (demo, _) = demo::DemoState::load(dir.join("demo.json"));
+        let broker = broker::BrokerState {
+            store: tr_broker::SecretStore::file(dir.join("unused-secrets.json")),
+            saved: Default::default(),
+            form: Default::default(),
+            creds: Default::default(),
+            from_env: false,
+            reveal: false,
+            portfolio: None,
+            error: None,
+            loading: false,
+            fetched: None,
+            message: None,
+            busy: None,
+            portal_url: None,
+            connecting_since: None,
+            simulate: true,
+            last_quotes: None,
+            testing: false,
+            confirm_disconnect: None,
+            disconnecting: None,
+        };
+        TerminalApp {
+            broker,
+            trading: Default::default(),
+            demo,
+            worker,
+            provider: "sample".into(),
+            panes: Vec::new(),
+            dock: Node::default(),
+            focus: 0,
+            next_id: 1,
+            last_opened: None,
+            preset: None,
+            drag: None,
+            dock_motion: Default::default(),
+            renaming_tab: None,
+            store: Store::new(dir.join("layouts")),
+            layout_name: "Default".into(),
+            layout_names: Vec::new(),
+            last_saved: Vec::new(),
+            renaming_layout: None,
+            editing_theme: prefs.appearance.theme.clone(),
+            themes,
+            theme_store,
+            applied_theme: None,
+            dirty_themes: Vec::new(),
+            themes_changed_at: None,
+            renaming_theme: None,
+            theme_io: String::new(),
+            system_theme: ctx.system_theme(),
+            layout_theme: false,
+            prefs,
+            rebinding: None,
+            hotkey_filter: String::new(),
+            settings_tab: SettingsTab::Appearance,
+            io_path: String::new(),
+            curves: None,
+            last_wei: None,
+            last_curve: None,
+            wei_updated: None,
+            net_hits: (String::new(), Vec::new()),
+            search_pending: None,
+            suggestion: None,
+            command_catalogue: Default::default(),
+            recent_symbols: Vec::new(),
+            cmd: String::new(),
+            cmd_history: Vec::new(),
+            cmd_hist_pos: None,
+            focus_cmd: true,
+            status: "Ready. Type a ticker and press <GO> (Enter). F1 for help.".into(),
+            toasts: Vec::new(),
+            latest: Vec::new(),
+            politicians: Vec::new(),
+            pol_search: String::new(),
+            alerts: Vec::new(),
+            congress_status: String::new(),
+            congress_checked: None,
+            watchlist: DEFAULT_WATCHLIST.map(String::from).to_vec(),
+            quotes: HashMap::new(),
+            last_quotes: None,
+            last_feed: None,
+            last_save: Instant::now(),
+            started: Instant::now(),
+            smoke_done: false,
+            show_perf: false,
+            perf_cpu_ms: 0.0,
+            perf_dt_ms: 0.0,
+            last_frame: None,
+            sidebar_open: true,
+            system_accent,
+            last_accent_poll: None,
+            window_styled: false,
+            updater_started: false,
+            vibrancy: false,
+            chrome: None,
+            last_chrome_poll: None,
+            palette: Default::default(),
+        }
+    }
 
     #[test]
     fn legacy_settings_migrate_to_a_layout() {
