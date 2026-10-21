@@ -26,3 +26,6 @@ tr-macos.workspace = true
 
 [target.'cfg(target_os = "macos")'.dependencies]
 raw-window-handle = "0.6"
+
+[dev-dependencies]
+async-trait = "0.1"

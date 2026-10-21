@@ -46,6 +46,14 @@ impl BarCache {
 
     pub fn store(&mut self, symbol: &str, tf: Timeframe, bars: &[Bar]) -> Result<()> {
         let tx = self.conn.transaction()?;
+        // A shorter real refetch must not leave a synthetic tail to be loaded or
+        // paged into real prices on the next startup.
+        if !bars.is_empty() && bars.iter().all(|b| b.provenance.is_verified()) {
+            tx.execute(
+                "DELETE FROM bars WHERE symbol = ?1 AND tf = ?2 AND provenance NOT IN ('Real', 'Cached')",
+                params![symbol, tf.label()],
+            )?;
+        }
         {
             let mut st = tx.prepare_cached(
                 "INSERT INTO bars (symbol, tf, ts, o, h, l, c, v, provenance) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
@@ -126,6 +134,21 @@ mod tests {
         );
         cache.store("X", Timeframe::D1, &[bars[0].with_provenance(Provenance::Sample)]).unwrap();
         assert_eq!(cache.load("X", Timeframe::D1, 10).unwrap()[0].provenance, Provenance::Sample);
+    }
+
+    #[test]
+    fn real_refetch_removes_the_entire_synthetic_tail() {
+        let mut cache = BarCache::open_in_memory().unwrap();
+        let sample: Vec<_> = (0..6000)
+            .map(|i| Bar::new(i, 300.0, 400.0, 200.0, 350.0, 1.0).with_provenance(Provenance::Sample))
+            .collect();
+        cache.store("USDBRL Curncy", Timeframe::D1, &sample).unwrap();
+        let real = [Bar::new(6000, 5.0, 5.1, 4.9, 5.03, 1.0).with_provenance(Provenance::Real)];
+        cache.store("USDBRL Curncy", Timeframe::D1, &real).unwrap();
+        let got = cache.load("USDBRL Curncy", Timeframe::D1, 6000).unwrap();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].close, 5.03);
+        assert_eq!(got[0].provenance, Provenance::Cached);
     }
 
     #[test]

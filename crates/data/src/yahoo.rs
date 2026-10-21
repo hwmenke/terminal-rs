@@ -400,7 +400,7 @@ pub fn security_for_yahoo(symbol: &str, quote_type: &str) -> Option<Security> {
         "EQUITY" => Security::new(class_share(symbol), AssetClass::Equity),
         "ETF" => Security::new(class_share(symbol), AssetClass::Etf),
         "INDEX" => Security::new(symbol, AssetClass::Index),
-        "CURRENCY" => Security::new(symbol.trim_end_matches("=X"), AssetClass::Fx),
+        "CURRENCY" => Security::parse(&format!("{symbol} Curncy")).filter(|s| s.class == AssetClass::Fx)?,
         "CRYPTOCURRENCY" => Security::new(symbol.replace('-', ""), AssetClass::Crypto),
         "FUTURE" => Security::new(symbol, AssetClass::Cmdty),
         _ => return None,
@@ -416,7 +416,10 @@ pub fn yahoo_symbol(sec: &Security) -> String {
         AssetClass::Equity | AssetClass::Etf => sec.ticker.replace('.', "-"),
         AssetClass::Index if sec.ticker.starts_with('^') => sec.ticker.clone(),
         AssetClass::Index => format!("^{}", sec.ticker),
-        AssetClass::Fx => format!("{}=X", sec.ticker),
+        AssetClass::Fx => {
+            let pair = sec.ticker.strip_suffix("=X").unwrap_or(&sec.ticker);
+            format!("{}=X", pair.strip_prefix("USD").filter(|q| q.len() == 3).unwrap_or(pair))
+        }
         AssetClass::Crypto => match sec.pair() {
             Some((b, q)) => format!("{b}-{}", if q == "USDT" { "USD" } else { q }),
             None => sec.ticker.clone(),
@@ -507,6 +510,37 @@ mod tests {
         assert_eq!(hits[0].key, "NVDA US Equity");
         assert!(hits.iter().any(|h| h.class == AssetClass::Etf));
         assert!(hits.iter().any(|h| h.class == AssetClass::Cmdty));
+    }
+
+    #[test]
+    fn user_fx_inputs_reach_yahoo_without_crypto_suffixes() {
+        for (input, key, yahoo) in [
+            ("USDBRL CURNCY", "USDBRL Curncy", "BRL=X"),
+            ("usdbrl curncy", "USDBRL Curncy", "BRL=X"),
+            ("BRL Curncy", "USDBRL Curncy", "BRL=X"),
+            ("BRL=X", "USDBRL Curncy", "BRL=X"),
+            ("USDBRL=X", "USDBRL Curncy", "BRL=X"),
+            ("EURBRL Curncy", "EURBRL Curncy", "EURBRL=X"),
+            ("EURUSD Curncy", "EURUSD Curncy", "EURUSD=X"),
+            ("USDJPY Curncy", "USDJPY Curncy", "JPY=X"),
+            ("SPY", "SPY US Equity", "SPY"),
+            ("SPX Index", "SPX Index", "^GSPC"),
+        ] {
+            let sec = Security::parse(input).unwrap();
+            assert_eq!(sec.key(), key, "{input}");
+            assert_eq!(yahoo_symbol(&sec), yahoo, "{input}");
+            if sec.class == AssetClass::Fx {
+                assert_eq!(security_for_yahoo(yahoo, "CURRENCY"), Some(sec));
+            }
+        }
+        for input in ["BTC", "BTCUSD", "BTCUSD Curncy"] {
+            let sec = Security::parse(input).unwrap();
+            assert_eq!(sec.class, AssetClass::Crypto);
+            assert_eq!(crate::crypto::binance_symbol(&sec), "BTCUSDT");
+        }
+        for l in catalog::group(tr_core::catalog::Group::Fx) {
+            assert_eq!(l.yahoo.unwrap(), yahoo_symbol(&l.security()));
+        }
     }
 
     #[test]

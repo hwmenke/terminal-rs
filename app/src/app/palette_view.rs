@@ -1,4 +1,4 @@
-//! Command palette overlay (⌘K, Ctrl+K elsewhere): the live catalogue of items built
+//! Command palette overlay (⌘⇧K, Ctrl+Shift+K elsewhere): the live catalogue of items built
 //! from the app's state, the centred search card, and running the picked item.
 
 use egui::{Color32, Id, Key, Modifiers, Rect, Sense, Stroke, StrokeKind, Ui, UiBuilder, pos2, vec2};
@@ -91,6 +91,40 @@ const COMMANDS: &[(&str, &str, &str, Option<Action>)] = &[
     ("RANGE 5Y", "", "quick range history years", None),
     ("RANGE ALL", "", "quick range full history", None),
 ];
+
+/// Argument-taking function forms offered by toolbar autocomplete.
+pub(super) fn bar_items() -> Vec<Item> {
+    let mut items = static_items();
+    let extra: &[(&str, &str, &str, Option<Action>)] = &[
+        ("SCAN", "Scan Whats-News archive setups", "research setups", None),
+        ("TRACK", "Track a politician: TRACK <name>", "congress alerts", None),
+        ("UNTRACK", "Stop tracking a politician: UNTRACK <name>", "congress alerts", None),
+        ("WL ADD", "Add symbols: WL ADD <ticker>", "watchlist", None),
+        ("WL DEL", "Remove symbols: WL DEL <ticker>", "watchlist", None),
+        ("LAYOUT", "Switch or manage layouts: LAYOUT <name|preset|subcommand>", "workspace", None),
+        ("NEW", "Add a panel: NEW <panel> [ticker]", "pane chart", None),
+        ("LINK", "Link a pane: LINK <colour|OFF>", "group", None),
+        ("SIDEBAR", "Toggle or position sidebar: SIDEBAR LEFT|RIGHT|SWAP|SHOW|HIDE", "view", None),
+        ("THEME", "Select theme or density: THEME <name>", "appearance", None),
+        ("TITLE", "Rename the focused tab: TITLE <name>", "rename", None),
+        ("BUY", "Fill a buy ticket: BUY <ticker> <quantity>", "trade", None),
+        ("SELL", "Fill a sell ticket: SELL <ticker> <quantity>", "trade", None),
+        ("BROKER", "Brokerage connection settings", "snaptrade", None),
+        ("DEMO", "Use the paper trading account", "account", None),
+        ("MODE LIVE", "Switch to live brokerage accounts (confirmation required)", "account", None),
+        ("30", "", "interval timeframe minutes", None),
+    ];
+    items.extend(extra.iter().map(|(code, desc, words, _)| {
+        Item::new(
+            Kind::Command,
+            *code,
+            if desc.is_empty() { command::hint(code) } else { (*desc).into() },
+            Target::Run((*code).into()),
+        )
+        .keywords(*words)
+    }));
+    items
+}
 
 /// Workspace actions run through their hotkey handler, with extra search words.
 const ACTIONS: &[(Action, &str)] = &[
@@ -290,7 +324,12 @@ impl TerminalApp {
                     v.push(Item::new(Kind::Indicator, spec.label(), sub, Target::Run(q.into())));
                 }
                 Some(command::Command::Symbol(key)) => {
-                    v.push(ticker_item(&key));
+                    let mut item = ticker_item(&key);
+                    // The typed alias (e.g. BRL=X) must survive ranking after
+                    // resolution changes the displayed market key.
+                    item.keywords.push(' ');
+                    item.keywords.push_str(q);
+                    v.push(item);
                     let sec = tr_data::security(&key);
                     if matches!(sec.class, tr_core::AssetClass::Equity | tr_core::AssetClass::Etf) {
                         let t = &sec.ticker;
@@ -363,9 +402,13 @@ impl TerminalApp {
     /// Keyboard handling, the overlay, and running the pick. Runs before the panes so
     /// arrows, Enter and Esc go to the palette while it is open.
     pub(super) fn command_palette(&mut self, ctx: &egui::Context) {
+        if self.palette.query.len() > command::MAX_INPUT_BYTES {
+            self.palette.query.clear();
+            self.status = "Command too long (maximum 4096 bytes)".into();
+        }
         let input_id = Id::new(INPUT_ID);
         if !self.palette.open {
-            // Give the keyboard back once closed (by ⌘K, a pick or Esc).
+            // Give the keyboard back once closed (by its hotkey, a pick or Esc).
             if ctx.memory(|m| m.has_focus(input_id)) {
                 ctx.memory_mut(|m| m.surrender_focus(input_id));
             }
@@ -401,6 +444,7 @@ impl TerminalApp {
 
                 // The query first, so results (and Enter) see this frame's typing.
                 let edit = egui::TextEdit::singleline(&mut self.palette.query)
+                    .char_limit(command::MAX_INPUT_BYTES)
                     .id(input_id)
                     .font(ui_font(16.0))
                     .frame(egui::Frame::NONE)

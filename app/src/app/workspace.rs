@@ -460,7 +460,8 @@ impl TerminalApp {
     /// Point a symbol-driven pane at `symbol`. Returns whether it follows symbols.
     pub(super) fn set_pane_symbol(&mut self, i: usize, symbol: &str) -> bool {
         let id = self.panes[i].id;
-        let key = tr_data::security(symbol).key();
+        let Some(sec) = tr_core::Security::parse(symbol) else { return false };
+        let key = sec.key();
         match &mut self.panes[i].kind {
             PaneKind::Chart(c) => {
                 if c.symbol != key {
@@ -528,7 +529,14 @@ impl TerminalApp {
     /// Load a security: into the focused pane when it follows symbols (and its link group),
     /// else into the focused pane's link group, else into a chart.
     pub(super) fn open_security(&mut self, symbol: &str) {
-        let key = tr_data::security(symbol).key();
+        let Some(sec) = tr_core::Security::parse(symbol) else {
+            self.status = "Invalid security".into();
+            return;
+        };
+        let key = sec.key();
+        self.recent_symbols.retain(|s| s != &key);
+        self.recent_symbols.insert(0, key.clone());
+        self.recent_symbols.truncate(30);
         if let Some(i) = self.idx(self.focus) {
             let link = self.panes[i].link;
             if self.panes[i].kind.follows_symbol() {

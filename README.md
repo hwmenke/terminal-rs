@@ -164,7 +164,13 @@ gets the native title bar with traffic lights, window vibrancy behind the sideba
   the quote crosses) and persist in the app data folder; Settings › Trading resets the account.
   Live orders stay opt-in and go through SnapTrade's preview and a single confirmation. See
   [Trading](#trading-opt-in).
-- **Command palette** — ⌘K (Ctrl+K on Linux and Windows) opens a centred, theme-matched palette
+- **Ticker / command bar** — `/`, `:` or Ctrl+K focuses the top bar. Typing a letter from
+  a chart or panel starts a new query; other text fields keep normal typing. Enter loads
+  the typed ticker in the active chart or runs a command. The dropdown mixes tickers,
+  company names, recent symbols, functions and indicators: ↑↓ select, Tab completes,
+  Enter or a click accepts, Esc closes. Whats-News symbols are loaded in the background
+  and cached for five minutes; only verified archive metadata is accepted.
+- **Command palette** — ⌘⇧K (Ctrl+Shift+K on Linux and Windows) opens a centred, theme-matched palette
   that fuzzy-searches every function code (`PORT`, `POS`, `ORD`, `OMON`, `THEME`, …), tickers
   (load the quote and chart), new panels, layout presets and saved layouts, themes, Settings tabs
   and workspace actions (move the sidebar, open Brokerage settings). Each row shows its shortcut;
@@ -285,7 +291,8 @@ Settings › Hotkeys. On Linux and Windows ⌘ is Ctrl and ⌥ is Alt.
 
 | Keys | Action |
 |---|---|
-| ⌘K (Ctrl+K) | command palette: fuzzy search over commands, tickers, panels, layouts, themes, settings and actions |
+| / · : · Ctrl+K | focus the ticker / command bar |
+| ⌘⇧K (Ctrl+Shift+K) | command palette: fuzzy search over commands, tickers, panels, layouts, themes, settings and actions |
 | F1 · F2 · F3 · F4 · F5 · F6 · F12 | help · Congress feed · politicians · alerts · watchlist · refresh filings · frame timing |
 | F7 · F8 · F9 | brokerage portfolio · positions · orders |
 | Tab · ⇧Tab | next · previous pane |
