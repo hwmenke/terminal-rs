@@ -27,9 +27,14 @@ pub type PaneId = u64;
 pub const CONGRESS_REFRESH_MIN: u64 = 30;
 
 pub enum Request {
+    ConfigureWhatsNews {
+        epoch: u64,
+        config: tr_data::whats_news::Config,
+    },
     AutocompleteUniverse,
     Research {
         pane: PaneId,
+        generation: u64,
         scan: Option<String>,
     },
     ArchiveHistory {
@@ -209,13 +214,23 @@ pub struct Profile {
 }
 
 pub enum Response {
+    WhatsNews {
+        epoch: u64,
+        response: Box<Response>,
+    },
+    WhatsNewsHealth {
+        epoch: u64,
+        health: tr_data::whats_news::Health,
+    },
     AutocompleteUniverse(Result<tr_data::whats_news::Snapshot<Vec<tr_data::whats_news::Symbol>>, String>),
     Universe {
         pane: PaneId,
+        generation: u64,
         result: Result<tr_data::whats_news::Snapshot<Vec<tr_data::whats_news::Symbol>>, String>,
     },
     Scan {
         pane: PaneId,
+        generation: u64,
         result: Result<tr_data::whats_news::Snapshot<tr_data::whats_news::Scan>, String>,
     },
     Portfolio(Result<Box<tr_broker::Portfolio>, String>),
@@ -309,6 +324,7 @@ pub struct Worker {
 type SeriesMap = HashMap<PaneId, (u64, Arc<Vec<Bar>>)>;
 
 struct Shared {
+    whats_news: tokio::sync::watch::Sender<(u64, tr_data::whats_news::Config)>,
     provider: Provider,
     /// Authoritative bars per chart pane (history, paging and live ticks all merge here),
     /// tagged with the pane's load generation.
@@ -358,7 +374,10 @@ impl Worker {
             .build()?;
         let (tx, mut req_rx) = tokio::sync::mpsc::unbounded_channel::<Request>();
         let (out, rx) = mpsc::channel();
+        let (whats_news, _) =
+            tokio::sync::watch::channel((0, crate::prefs::Prefs::load(&dir.join("prefs.json")).whats_news));
         let shared = Arc::new(Shared {
+            whats_news,
             provider,
             series: Default::default(),
             cache: std::sync::Mutex::new(cache),
@@ -378,6 +397,34 @@ impl Worker {
                 }
                 let s = s.clone();
                 tokio::spawn(async move { handle(&s, req).await });
+            }
+        });
+
+        // Independent health task: config changes cancel an obsolete probe/backoff.
+        let s = shared.clone();
+        rt.spawn(async move {
+            let mut config = s.whats_news.subscribe();
+            let mut failures = 0;
+            loop {
+                let (epoch, settings) = config.borrow_and_update().clone();
+                let bridge = settings.bridge();
+                let health = tokio::select! {
+                    health = bridge.health() => health,
+                    changed = config.changed() => {
+                        if changed.is_err() { break; }
+                        failures = 0;
+                        continue;
+                    }
+                };
+                failures = if health.connected() { 0 } else { failures + 1 };
+                s.send(Response::WhatsNewsHealth { epoch, health });
+                tokio::select! {
+                    _ = tokio::time::sleep(tr_data::whats_news::retry_delay(failures)) => {},
+                    changed = config.changed() => {
+                        if changed.is_err() { break; }
+                        failures = 0;
+                    }
+                }
             }
         });
 
@@ -520,31 +567,44 @@ pub fn initial_limit(tf: Timeframe) -> usize {
 }
 
 async fn handle(s: &Arc<Shared>, req: Request) {
+    let (epoch, config) = s.whats_news.borrow().clone();
+    let send = |response| s.send(Response::WhatsNews { epoch, response: Box::new(response) });
     match req {
+        Request::ConfigureWhatsNews { .. } => unreachable!("configured in dispatcher"),
         Request::AutocompleteUniverse => {
-            let result = tr_data::whats_news::Bridge::from_env().universe().await.map_err(|e| format!("{e:#}"));
-            s.send(Response::AutocompleteUniverse(result));
+            let bridge = config.bridge();
+            let result = bridge.universe().await.map_err(|e| format!("{e:#}"));
+            send(Response::AutocompleteUniverse(result));
         }
-        Request::Research { pane, scan } => {
-            let bridge = tr_data::whats_news::Bridge::from_env();
+        Request::Research { pane, generation, scan } => {
+            let bridge = config.bridge();
             if let Some(name) = scan {
-                s.send(Response::Scan { pane, result: bridge.scan(&name).await.map_err(|e| format!("{e:#}")) });
+                send(Response::Scan {
+                    pane,
+                    generation,
+                    result: bridge.scan(&name).await.map_err(|e| format!("{e:#}")),
+                });
             } else {
-                s.send(Response::Universe { pane, result: bridge.universe().await.map_err(|e| format!("{e:#}")) });
+                send(Response::Universe {
+                    pane,
+                    generation,
+                    result: bridge.universe().await.map_err(|e| format!("{e:#}")),
+                });
             }
         }
         Request::ArchiveHistory { pane, generation, symbol } => {
+            let bridge = config.bridge();
             if current_series(s, pane, generation).is_none() {
                 return;
             }
-            match tr_data::whats_news::Bridge::from_env().bars(&symbol).await {
+            match bridge.bars(&symbol).await {
                 Ok(snapshot) => {
                     let bars = Arc::new(snapshot.data);
                     if !store_series(s, pane, generation, bars.clone()) {
                         return;
                     }
                     let gpu = build_gpu(bars.clone()).await;
-                    s.send(Response::History {
+                    send(Response::History {
                         pane,
                         generation,
                         symbol: tr_data::security(&symbol).key(),
@@ -557,7 +617,7 @@ async fn handle(s: &Arc<Shared>, req: Request) {
                         live: false,
                     });
                 }
-                Err(e) => s.send(Response::HistoryError { pane, generation, error: format!("{e:#}") }),
+                Err(e) => send(Response::HistoryError { pane, generation, error: format!("{e:#}") }),
             }
         }
         Request::History { pane, generation, symbol, tf, limit } => {
@@ -827,6 +887,10 @@ async fn trade(t: TradeRequest) -> TradeResponse {
 /// be resurrected by an older history task that happens to start or finish later.
 fn begin_request(s: &Shared, req: &Request) -> bool {
     match req {
+        Request::ConfigureWhatsNews { epoch, config } => {
+            s.whats_news.send_replace((*epoch, config.clone()));
+            false
+        }
         Request::History { pane, generation, .. } | Request::ArchiveHistory { pane, generation, .. } => {
             claim_series(s, *pane, *generation)
         }
@@ -1019,6 +1083,7 @@ mod tests {
         let (out, rx) = mpsc::channel();
         (
             Arc::new(Shared {
+                whats_news: tokio::sync::watch::channel((0, Default::default())).0,
                 provider,
                 series: Default::default(),
                 cache: std::sync::Mutex::new(cache),
@@ -1138,6 +1203,7 @@ mod tests {
     fn series_generations_only_move_forward() {
         let (out, _rx) = mpsc::channel();
         let s = Shared {
+            whats_news: tokio::sync::watch::channel((0, Default::default())).0,
             provider: std::sync::Arc::new(tr_data::sample::SampleProvider::at(0, 10)),
             series: Default::default(),
             cache: std::sync::Mutex::new(None),

@@ -23,7 +23,7 @@ use crate::widgets::{self, Icon};
 pub const TOOLBAR_H: f32 = if cfg!(target_os = "macos") { tr_macos::TITLEBAR_HEIGHT } else { 34.0 };
 /// Default space kept clear for the traffic lights when the sidebar is collapsed.
 pub const TRAFFIC_INSET: f32 = if cfg!(target_os = "macos") { tr_macos::TRAFFIC_LIGHTS_WIDTH } else { 0.0 };
-pub const STATUS_H: f32 = 22.0;
+pub const STATUS_H: f32 = 44.0;
 pub const SIDEBAR_W: f32 = 232.0;
 const ROW_H: f32 = 24.0;
 const MAC: bool = cfg!(target_os = "macos");
@@ -845,7 +845,33 @@ impl TerminalApp {
         }
     }
 
-    pub(super) fn status_bar(&self, ui: &Ui, rect: Rect) {
+    pub(super) fn status_bar(&mut self, ui: &Ui, rect: Rect) {
+        let link_rect = Rect::from_min_max(rect.min, pos2(rect.right(), rect.top() + 22.0));
+        let health = &self.whats_news_health;
+        let label = if health.connected() {
+            format!(
+                "Whats-News: {} · {} symbols · latest {} · {}{}",
+                health.label(),
+                health.symbol_count,
+                health.latest_date.as_deref().unwrap_or("no daily data"),
+                health.source,
+                if health.message.is_empty() { String::new() } else { format!(" · {}", health.message) }
+            )
+        } else {
+            format!("Whats-News: {} · {}", health.label(), health.message)
+        };
+        let color = if health.connected() && health.message.is_empty() { theme::up() } else { amber() };
+        let p = ui.painter_at(link_rect.shrink2(vec2(8.0, 0.0)));
+        p.text(pos2(link_rect.left() + 10.0, link_rect.center().y), Align2::LEFT_CENTER, label, ui_font(11.5), color);
+        let clicked = ui
+            .interact(link_rect, Id::new("whats-news-status"), Sense::click())
+            .on_hover_text(format!("{}\n{}\nClick to open Settings › Whats-News", health.summary(), health.message))
+            .clicked();
+        if clicked {
+            self.settings_tab = super::settings_view::SettingsTab::WhatsNews;
+            self.open_panel(super::PaneKind::Settings);
+        }
+        let rect = Rect::from_min_max(pos2(rect.left(), rect.top() + 22.0), rect.max);
         let p = ui.painter_at(rect);
         p.hline(rect.x_range(), rect.top() + 0.5, Stroke::new(1.0, theme::border()));
         let cy = rect.center().y;
@@ -1267,5 +1293,42 @@ mod tests {
             }
         }
         assert!(archive_requested);
+    }
+    #[test]
+    fn connection_status_click_opens_whats_news_settings() {
+        let ctx = egui::Context::default();
+        let mut app = chart_app();
+        let position = pos2(200.0, 20.0);
+        for events in [
+            vec![],
+            vec![
+                Event::PointerMoved(position),
+                Event::PointerButton {
+                    pos: position,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: Modifiers::NONE,
+                },
+            ],
+            vec![Event::PointerButton {
+                pos: position,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: Modifiers::NONE,
+            }],
+        ] {
+            ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(1000.0, 700.0))),
+                    events,
+                    ..Default::default()
+                },
+                |ui| app.status_bar(ui, Rect::from_min_size(pos2(10.0, 10.0), vec2(980.0, STATUS_H))),
+            )
+            .textures_delta
+            .clear();
+        }
+        assert_eq!(app.settings_tab, super::super::settings_view::SettingsTab::WhatsNews);
+        assert!(app.panes.iter().any(|pane| pane.id == app.focus && matches!(pane.kind, PaneKind::Settings)));
     }
 }

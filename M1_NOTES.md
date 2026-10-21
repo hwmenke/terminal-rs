@@ -16,31 +16,45 @@ Context: `~/tr-plan.log` (archive → scanners → chart discovery loop).
 
 `crates/data/src/whats_news.rs` implements the bridge; `app/src/app/research.rs` renders results, with worker requests/responses in `app/src/worker.rs`.
 
-Whats-News already has read endpoints in `~/wn-fix/app.py`. The bridge prefers **GET-only** local HTTP requests:
+Settings › **Whats-News** now persists the archive path, optional HTTP URL, source preference, and enable toggle in `prefs.json`. Changes apply immediately, and **Test connection** starts a fresh background check. A blank archive path auto-detects `~/wn-fix/finance.db`, `~/Whats-News/finance.db`, then `~/whats-news/finance.db`; an explicit missing path is never replaced. `~/` is expanded. The configured archive is checked for existence, readable Whats-News schema, daily coverage and explicit unverified provenance even when HTTP is active.
+
+The clickable status strip opens that settings section and reports **Connected (HTTP)**, **Connected (archive file)**, **Disconnected**, or **Not configured**, with the selected path/URL, registered symbol count and latest daily data date. Failed preferred sources produce an actionable warning when the alternate source is used.
+
+An independent worker task checks health every 30 seconds. Failures retry after 5, 10, 20, 40, 80, then at most 120 seconds; recovery resets that schedule. Configuration changes cancel obsolete probes/backoff. Settings generations discard obsolete responses, and open research panes/archive charts clear on disconnect and reload on recovery. Research errors use the same plain-English connection message. All work remains read-only; there is no sample fallback.
+
+Whats-News has read endpoints in `~/wn-fix/app.py`. The bridge uses **GET-only** local HTTP requests:
 
 - `/api/symbols`, plus `/api/ohlcv/<ticker>?freq=daily&limit=1` for coverage (up to 12 concurrent requests; 30-second universe timeout).
 - `/api/setups/scan?setup=<NAME>&universe=1&limit=0`, then latest dates for matched symbols.
 - `/api/ohlcv/<ticker>?freq=daily&limit=1000000` for archived chart history.
 
-HTTP defaults to `http://127.0.0.1:8050` (the Python app's default). Redirects are disabled and URLs must use local/loopback HTTP. Network requests have timeouts. No fetch, sync, promote, refresh-ingestion, or other mutation endpoints are called.
+HTTP defaults to `http://127.0.0.1:8050` (the main Python app's default); the optional `data_service/app.py` defaults to port **8051**. Both provide `/api/symbols` and `/api/ohlcv/<ticker>`. The data service lacks `/api/setups/scan`, so a 404 there uses HTTP archive history for the seven local scan calculations, preserving the HTTP source and provenance. Redirects are disabled and URLs must use local/loopback HTTP. Requests have a 1-second connect timeout and 4-second total timeout; universe reads have a 15-second overall HTTP budget and scans a 20-second budget. No fetch, sync, promote, refresh-ingestion, or other mutation endpoints are called.
 
 If HTTP fails, use SQLite with `SQLITE_OPEN_READ_ONLY` and connection-local `PRAGMA query_only=ON`; missing files are never created. Scans use one read transaction. Invalid OHLCV causes a visible error, not fabricated bars. Nothing initializes or migrates the upstream database or runs Python code there.
 
-Environment variables, read at request time:
+Environment variables seed connection preferences when that section is absent from `prefs.json`; saved settings take precedence and can be changed without restarting:
 
 | Variable | Behavior |
 | --- | --- |
-| `WHATS_NEWS_DB` | SQLite fallback path. Defaults to `$HOME/wn-fix/finance.db` if it exists, otherwise `$HOME/Whats-News/finance.db`. Use an absolute or shell-expanded path. |
+| `WHATS_NEWS_DB` | Archive path. If absent/blank, auto-detect the locations above. Absolute paths and `~/` paths are supported. |
 | `WHATS_NEWS_URL` | Local HTTP service URL. Set to `off` (or empty) to use SQLite directly. An explicit DB path still follows HTTP unless HTTP is disabled. |
-| `WHATS_NEWS_OFF=1` | Disable the entire bridge, including SQLite. |
+| `WHATS_NEWS_OFF=1` | Seed the connection enable toggle as off, including SQLite. |
 
-Example: `WHATS_NEWS_URL=off WHATS_NEWS_DB="$HOME/wn-fix/finance.db" cargo run`, then enter `UNIV` or `SCAN DARVAS_BREAKOUT`.
+Example (before a connection configuration has been saved): `WHATS_NEWS_URL=off WHATS_NEWS_DB="$HOME/wn-fix/finance.db" cargo run`, then enter `UNIV` or `SCAN DARVAS_BREAKOUT`.
 
 HTTP supports the existing service's nine setups: `DARVAS_BREAKOUT`, `DARVAS_BOX`, `DARVAS_FAIL`, `NEAR_HIGH`, `VOL_SURGE`, `EP`, `BREAKOUT_QUEUE`, `RSI_OB`, `RSI_OS`. Invalid names (including bare `SCAN`) display the choices.
 
 SQLite supports the first seven. Darvas follows `portfolio.py`'s 20-bar high / three-bar confirmation over up to 260 stored daily bars. Basic gap, near-high and volume conditions follow the same thresholds; volume compares the latest bar with the **preceding** 20 bars. SQLite scans require at least 30 daily bars and sort by ticker. They deliberately omit the Python composite score/rank; HTTP results retain the service score. Source and ordering differences are explained in the pane. Stale symbols remain eligible and are clearly marked.
 
-## Validation
+## Dependable-link validation
+
+- `cargo build --offline`: passed.
+- Application tests: **110 passed**, including preferences persistence, live configuration changes, obsolete response rejection across settings changes and reconnects, status-strip navigation, and research/chart disconnect/recovery.
+- Whats-News tests excluding socket fixtures: **13 passed**, covering archive disconnect/recovery, auto-detect, schema/path validation, missing file/bad URL/empty archive messages, preference, backoff, provenance, and read-only access.
+- Localhost tests are written for both main-app and data-service routes, HTTP disconnect/recovery, timeout advice and archive fallback. The sandbox rejects listener creation with `Operation not permitted`, so these cannot run here. Existing brokerage socket tests block the full workspace test run for the same reason.
+- No changes or ingestion in `~/wn-fix`; no commits.
+
+## Original M1 validation (historical)
 
 Added tests for command parsing, layout/source persistence, archive-only chart request routing, freshness/weekends/holidays, Darvas states/confirmation, malformed OHLCV, SQLite coverage and scans, read-only enforcement, absent/disabled bridges, HTTP preference/404 missing data, and HTTP failure → SQLite fallback.
 

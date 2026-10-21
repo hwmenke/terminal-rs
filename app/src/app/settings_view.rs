@@ -21,10 +21,11 @@ pub enum SettingsTab {
     Layouts,
     Brokerage,
     Trading,
+    WhatsNews,
 }
 
 impl SettingsTab {
-    pub(super) const ALL: [SettingsTab; 7] = [
+    pub(super) const ALL: [SettingsTab; 8] = [
         SettingsTab::Appearance,
         SettingsTab::Themes,
         SettingsTab::Hotkeys,
@@ -32,6 +33,7 @@ impl SettingsTab {
         SettingsTab::Layouts,
         SettingsTab::Brokerage,
         SettingsTab::Trading,
+        SettingsTab::WhatsNews,
     ];
 
     pub(super) fn label(self) -> &'static str {
@@ -43,6 +45,7 @@ impl SettingsTab {
             SettingsTab::Layouts => "Layouts",
             SettingsTab::Brokerage => "Brokerage",
             SettingsTab::Trading => "Trading",
+            SettingsTab::WhatsNews => "Whats-News",
         }
     }
 }
@@ -131,6 +134,7 @@ impl TerminalApp {
                 SettingsTab::Layouts => self.layouts_tab(ui, &mut cmds),
                 SettingsTab::Brokerage => self.brokerage_tab(ui),
                 SettingsTab::Trading => self.trading_tab(ui, &mut cmds),
+                SettingsTab::WhatsNews => self.whats_news_tab(ui),
             }
         });
         cmds
@@ -141,6 +145,92 @@ impl TerminalApp {
             match c {
                 SettingsCmd::Layout(op) => self.layout_op(op),
                 SettingsCmd::SavePrefs => self.save_prefs(),
+            }
+        }
+    }
+
+    fn whats_news_tab(&mut self, ui: &mut Ui) {
+        section(ui, "Whats-News");
+        ui.label("Read-only daily price history for research, SCAN, UNIV and archive charts.");
+        let before = self.prefs.whats_news.clone();
+        let config = &mut self.prefs.whats_news;
+        ui.checkbox(&mut config.enabled, "Enable Whats-News connection");
+        ui.label("SQLite archive path (leave blank to auto-detect)");
+        ui.add(
+            egui::TextEdit::singleline(&mut config.archive_path).hint_text("~/wn-fix/finance.db").desired_width(500.0),
+        );
+        ui.horizontal(|ui| {
+            if ui.button("Auto-detect archive").clicked() {
+                config.archive_path.clear();
+            }
+            let path = config.archive();
+            ui.label(if path.as_os_str().is_empty() {
+                "No default archive found".into()
+            } else {
+                format!("Archive: {}", path.display())
+            });
+        });
+        ui.label("Optional local HTTP URL (leave blank for archive only)");
+        ui.add(
+            egui::TextEdit::singleline(&mut config.http_url)
+                .hint_text(tr_data::whats_news::DEFAULT_URL)
+                .desired_width(500.0),
+        );
+        ui.label("Main app: http://127.0.0.1:8050 · optional data service: http://127.0.0.1:8051");
+        ui.checkbox(&mut config.prefer_http, "Prefer HTTP (otherwise prefer the archive file)");
+        ui.label(
+            "If the preferred source is unavailable, the other configured source is tried. No sample data is used.",
+        );
+        let test = ui.button("Test connection").clicked();
+        if before != self.prefs.whats_news || test {
+            self.save_prefs();
+            self.apply_whats_news_config();
+        }
+        ui.separator();
+        ui.label(self.whats_news_health.summary());
+        ui.label(&self.whats_news_health.archive_validation);
+        if !self.whats_news_health.message.is_empty() {
+            ui.colored_label(crate::theme::amber(), &self.whats_news_health.message);
+        }
+        ui.label("Settings apply immediately. Connection checks and recovery run in the background.");
+    }
+
+    pub(super) fn apply_whats_news_config(&mut self) {
+        self.whats_news_epoch += 1;
+        self.whats_news_health = tr_data::whats_news::Health::pending();
+        self.worker.send(crate::worker::Request::ConfigureWhatsNews {
+            epoch: self.whats_news_epoch,
+            config: self.prefs.whats_news.clone(),
+        });
+        self.refresh_whats_news_panes();
+    }
+
+    pub(super) fn refresh_whats_news_panes(&mut self) {
+        self.command_catalogue = Default::default();
+        let connected = self.whats_news_health.connected();
+        let message = self.whats_news_health.message.clone();
+        for pane in &mut self.panes {
+            match &mut pane.kind {
+                super::PaneKind::Research(r) => {
+                    if connected {
+                        r.request(pane.id, &self.worker);
+                    } else {
+                        r.generation += 1;
+                        if r.scan.is_some() {
+                            r.accept_scan(Err(message.clone()));
+                        } else {
+                            r.accept_universe(Err(message.clone()));
+                        }
+                    }
+                }
+                super::PaneKind::Chart(c) if c.archive => {
+                    if connected {
+                        c.load(&self.worker);
+                    } else {
+                        c.archive_disconnected(&message, &self.worker);
+                    }
+                }
+                _ => {}
             }
         }
     }
@@ -715,5 +805,81 @@ impl TerminalApp {
             .font(ui_font(11.5))
             .color(muted()),
         );
+    }
+}
+
+#[cfg(test)]
+mod connection_tests {
+    use super::*;
+    use crate::app::{PaneKind, research::ResearchPane};
+    use crate::worker::{Request, Response, Worker};
+    use tr_data::whats_news::{Health, LinkState, Snapshot};
+
+    #[test]
+    fn live_changes_reject_old_results_and_panes_follow_drop_and_recovery() {
+        let mut app = crate::app::tests::test_app();
+        let (worker, mut requests, out) = Worker::test_channel_with_responses();
+        app.worker = worker;
+        app.open_panel(PaneKind::Research(Box::new(ResearchPane::new(None))));
+        let pane = app.focus;
+        while requests.try_recv().is_ok() {}
+        app.prefs.whats_news.http_url = "http://localhost:8051".into();
+        app.apply_whats_news_config();
+        assert!(
+            matches!(requests.try_recv(), Ok(Request::ConfigureWhatsNews { epoch: 1, config }) if config.http_url.ends_with("8051"))
+        );
+        let connected = Health {
+            state: LinkState::Http,
+            source: "Whats-News HTTP: http://localhost:8051".into(),
+            symbol_count: 2,
+            archive_validation: "test archive validated".into(),
+            latest_date: Some("2026-10-20".into()),
+            message: String::new(),
+        };
+        out.send(Response::WhatsNewsHealth { epoch: 1, health: connected.clone() }).unwrap();
+        app.drain();
+        let before_drop_generation = match requests.try_recv().unwrap() {
+            Request::Research { pane: id, generation, .. } if id == pane => generation,
+            _ => panic!("Expected a research request after the connection became healthy"),
+        };
+        out.send(Response::WhatsNews {
+            epoch: 0,
+            response: Box::new(Response::Universe {
+                pane,
+                generation: 0,
+                result: Ok(Snapshot {
+                    source: "old source".into(),
+                    provenance: tr_core::Provenance::Real,
+                    data: vec![],
+                }),
+            }),
+        })
+        .unwrap();
+        app.drain();
+        let research = |app: &TerminalApp| -> (bool, Option<String>, bool) {
+            let PaneKind::Research(r) = &app.panes.iter().find(|p| p.id == pane).unwrap().kind else { panic!() };
+            (r.loading, r.error.clone(), r.universe.is_some())
+        };
+        assert_eq!(research(&app), (true, None, false));
+        let message = "Whats-News isn't running. Start it or switch to the archive file.";
+        let dropped = Health { state: LinkState::Disconnected, message: message.into(), ..connected.clone() };
+        out.send(Response::WhatsNewsHealth { epoch: 1, health: dropped }).unwrap();
+        app.drain();
+        assert_eq!(research(&app), (false, Some(message.into()), false));
+        out.send(Response::WhatsNewsHealth { epoch: 1, health: connected }).unwrap();
+        app.drain();
+        assert_eq!(research(&app), (true, None, false));
+        assert!(matches!(requests.try_recv(), Ok(Request::Research { pane: id, .. }) if id == pane));
+        out.send(Response::WhatsNews {
+            epoch: 1,
+            response: Box::new(Response::Universe {
+                pane,
+                generation: before_drop_generation,
+                result: Err("obsolete request from before the disconnect".into()),
+            }),
+        })
+        .unwrap();
+        app.drain();
+        assert_eq!(research(&app), (true, None, false));
     }
 }
