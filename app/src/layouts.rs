@@ -59,6 +59,8 @@ pub enum PaneSettings {
     Chart {
         #[serde(default)]
         archive: bool,
+        #[serde(default)]
+        watch_group: Option<String>,
         symbol: String,
         tf: Timeframe,
         chart_type: ChartType,
@@ -268,6 +270,7 @@ impl LayoutDoc {
 pub fn chart_settings(symbol: &str, d: &crate::prefs::PanelDefaults) -> PaneSettings {
     PaneSettings::Chart {
         archive: false,
+        watch_group: None,
         symbol: symbol.into(),
         tf: d.timeframe,
         chart_type: d.chart_type,

@@ -14,6 +14,7 @@ use crate::worker::Profile;
 pub enum Action {
     OpenChart(String),
     OpenArchiveChart(String),
+    WatchChart(String, String, bool),
     OpenTicker(String),
     OpenProfile(String),
     Track(String, bool),

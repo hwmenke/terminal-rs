@@ -235,8 +235,7 @@ pub enum Function {
     Universe,
     Scan(String),
     Watchlist,
-    WatchAdd(Vec<String>),
-    WatchRemove(Vec<String>),
+    WatchCommand(String),
     /// `LAYOUT 1|2|2H|3|4|6` preset, `LAYOUT <name>` switch, or a layout subcommand
     /// (`SAVE`, `SAVEAS`, `NEW`, `RENAME`, `DUP`, `DEL`, `EXPORT`, `IMPORT`).
     Layout(String),
@@ -323,11 +322,13 @@ fn parse_function(head: &str, rest: &[&str]) -> Option<Function> {
         "UNTRACK" => Function::Untrack(joined()),
         "ALRT" | "ALERTS" | "ALERT" => Function::Alerts,
         "REFRESH" | "SYNC" => Function::Refresh,
-        "W" | "WL" | "WATCH" | "WATCHLIST" | "MON" => match words().first().map(String::as_str) {
-            Some("ADD") => Function::WatchAdd(words()[1..].to_vec()),
-            Some("DEL") | Some("RM") | Some("REMOVE") => Function::WatchRemove(words()[1..].to_vec()),
-            _ => Function::Watchlist,
-        },
+        "W" | "WL" | "WATCH" | "WATCHLIST" | "MON" => {
+            if rest.is_empty() {
+                Function::Watchlist
+            } else {
+                Function::WatchCommand(joined())
+            }
+        }
         "LAYOUT" | "GRID" | "LP" => Function::Layout(joined()),
         "LAYOUTS" => Function::Layouts,
         "NEW" | "ADD" => Function::NewPanel(joined()),
@@ -477,8 +478,7 @@ fn describe(f: &Function) -> String {
         Function::Universe => "Browse Whats-News archive coverage".into(),
         Function::Scan(name) => format!("Scan Whats-News archive: {name}"),
         Function::Watchlist => "Watchlist".into(),
-        Function::WatchAdd(s) => format!("Add {} to watchlist", s.join(", ")),
-        Function::WatchRemove(s) => format!("Remove {} from watchlist", s.join(", ")),
+        Function::WatchCommand(s) => format!("Watchlists: {s}"),
         Function::Layout(l) if l.trim().is_empty() => "Saved layouts".into(),
         Function::Layout(l) => format!("Layout {l}"),
         Function::Layouts => "Saved layouts".into(),
@@ -619,10 +619,7 @@ mod tests {
         assert_eq!(parse("FIB"), Some(Command::Function(Function::Draw(Tool::Fib))));
         assert_eq!(parse("CLEAR DRAW"), Some(Command::Function(Function::ClearDrawings)));
         assert_eq!(parse("POL Nancy Pelosi"), Some(Command::Function(Function::Politician("Nancy Pelosi".into()))));
-        assert_eq!(
-            parse("WL ADD msft nvda"),
-            Some(Command::Function(Function::WatchAdd(vec!["MSFT".into(), "NVDA".into()])))
-        );
+        assert_eq!(parse("WL ADD msft nvda"), Some(Command::Function(Function::WatchCommand("ADD msft nvda".into()))));
         assert_eq!(parse("LAYOUT 4"), Some(Command::Function(Function::Layout("4".into()))));
         assert_eq!(
             parse("LAYOUT save Morning Desk"),

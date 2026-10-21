@@ -15,8 +15,10 @@ mod panels;
 mod portfolio_view;
 mod research;
 mod settings_view;
+mod settings_writer;
 mod theming;
 mod trading;
+mod watchlists;
 mod workspace;
 
 pub use broker::PosSort;
@@ -263,6 +265,7 @@ impl PaneKind {
         match self {
             PaneKind::Chart(c) => PaneSettings::Chart {
                 archive: c.archive,
+                watch_group: c.watch_group.clone(),
                 symbol: c.symbol.clone(),
                 tf: c.tf,
                 chart_type: c.chart_type,
@@ -315,6 +318,7 @@ impl PaneKind {
         match p {
             PaneSettings::Chart {
                 archive,
+                watch_group,
                 symbol,
                 tf,
                 chart_type,
@@ -328,6 +332,7 @@ impl PaneKind {
             } => {
                 let mut c = ChartState::new(0, &symbol, tf);
                 c.archive = archive;
+                c.watch_group = watch_group;
                 c.chart_type = chart_type;
                 c.log = log;
                 c.indicators = indicators;
@@ -386,6 +391,8 @@ impl Pane {
 struct Settings {
     #[serde(default)]
     watchlist: Vec<String>,
+    #[serde(default)]
+    watchlists: Option<watchlists::Watchlists>,
     #[serde(default = "default_true")]
     sidebar: bool,
     /// Name of the layout to restore on launch.
@@ -526,6 +533,9 @@ pub struct TerminalApp {
     congress_checked: Option<chrono::DateTime<chrono::Local>>,
 
     watchlist: Vec<String>,
+    watchlists: watchlists::Watchlists,
+    watch_ui: watchlists::UiState,
+    settings_writer: Option<settings_writer::Writer>,
     quotes: HashMap<String, Quote>,
     last_quotes: Option<Instant>,
     last_feed: Option<Instant>,
@@ -689,6 +699,9 @@ impl TerminalApp {
             congress_status: String::new(),
             congress_checked: None,
             watchlist: DEFAULT_WATCHLIST.map(String::from).to_vec(),
+            watchlists: watchlists::Watchlists::migrate(&DEFAULT_WATCHLIST.map(String::from)),
+            watch_ui: Default::default(),
+            settings_writer: None,
             quotes: HashMap::new(),
             last_quotes: None,
             last_feed: None,
@@ -711,11 +724,8 @@ impl TerminalApp {
         };
         let mut doc = None;
         if let Some(s) = &settings {
-            if !s.watchlist.is_empty() {
-                // Older settings stored bare tickers; normalise to market keys.
-                app.watchlist = s.watchlist.iter().map(|w| tr_data::security(w).key()).collect();
-                app.watchlist.dedup();
-            }
+            app.watchlists = s.watchlists.clone().unwrap_or_else(|| watchlists::Watchlists::migrate(&s.watchlist));
+            app.watchlist = app.watchlists.symbols();
             app.sidebar_open = s.sidebar;
             if let Some(name) = &s.active_layout {
                 match app.store.load(name) {
@@ -746,19 +756,22 @@ impl TerminalApp {
         app
     }
 
-    fn save_settings(&self) {
+    fn save_settings(&mut self) {
         let s = Settings {
             watchlist: self.watchlist.clone(),
+            watchlists: Some(self.watchlists.clone()),
             recent_symbols: self.recent_symbols.clone(),
             sidebar: self.sidebar_open,
             active_layout: Some(self.layout_name.clone()),
             layout: None,
             panes: None,
         };
-        if let Ok(json) = serde_json::to_vec_pretty(&s)
-            && let Err(e) = crate::layouts::write_atomic(&settings_path(), &json)
-        {
-            tracing::warn!("saving settings: {e}");
+        match serde_json::to_vec_pretty(&s) {
+            Ok(json) => {
+                let path = self.store.dir.parent().expect("layouts parent").join("settings.json");
+                self.settings_writer.get_or_insert_with(|| settings_writer::Writer::new(path)).save(json);
+            }
+            Err(e) => self.status = format!("Could not serialize settings: {e}"),
         }
     }
 
@@ -771,23 +784,16 @@ impl TerminalApp {
     fn run_actions(&mut self, actions: Vec<Action>) {
         for a in actions {
             match a {
-                Action::OpenArchiveChart(s) => {
-                    let mut c = ChartState::new(0, &s, tr_core::Timeframe::D1);
-                    c.archive = true;
-                    self.open_panel(PaneKind::Chart(Box::new(c)));
-                }
+                Action::OpenArchiveChart(s) => self.open_list_symbol(&s, true, None),
+                Action::WatchChart(group, symbol, archive) => self.open_list_symbol(&symbol, archive, Some(group)),
                 Action::OpenChart(s) => self.open_security(&s),
                 Action::OpenTicker(s) => {
                     self.open_panel(PaneKind::Ticker { symbol: s, trades: Vec::new(), loading: true })
                 }
                 Action::OpenProfile(q) => self.open_panel(PaneKind::Profile { query: q, data: None, loading: true }),
                 Action::AddToWatchlist(s) => {
-                    let key = tr_data::security(&s).key();
-                    if !self.watchlist.contains(&key) {
-                        self.status = format!("Added {key} to the watchlist");
-                        self.watchlist.push(key);
-                        self.last_quotes = None;
-                    }
+                    self.watch_ui.picker = Some(self.member_for_save(&s));
+                    self.watch_ui.picker_index = self.watchlists.index(&self.watchlists.last_used).unwrap_or(0);
                 }
                 Action::LinkedSymbol(link, s) => self.broadcast(link, &s, None),
                 Action::Command(line) => match command::parse(&line) {
@@ -894,18 +900,7 @@ impl TerminalApp {
                 self.open_panel(PaneKind::Research(Box::new(research::ResearchPane::new(Some(name)))))
             }
             Function::Watchlist => self.open_panel(PaneKind::Watchlist),
-            Function::WatchAdd(words) => {
-                for key in keys_from_words(&words) {
-                    if !self.watchlist.contains(&key) {
-                        self.watchlist.push(key);
-                    }
-                }
-                self.last_quotes = None;
-            }
-            Function::WatchRemove(words) => {
-                let keys = keys_from_words(&words);
-                self.watchlist.retain(|s| !keys.contains(s));
-            }
+            Function::WatchCommand(line) => self.watch_command(&line),
             Function::Layout(arg) => self.layout_command(&arg),
             Function::Layouts => {
                 self.settings_tab = SettingsTab::Layouts;
@@ -1324,7 +1319,11 @@ impl TerminalApp {
             return;
         }
         // While it is open, the palette owns the keyboard.
-        if self.palette.open {
+        if self.palette.open
+            || self.watch_ui.picker.is_some()
+            || self.watch_ui.delete.is_some()
+            || self.watch_ui.edit.is_some()
+        {
             return;
         }
         let cmd_id = egui::Id::new("command-line");
@@ -1348,6 +1347,9 @@ impl TerminalApp {
         let cmd_focused = focused == Some(cmd_id);
         let other_text_focused = ctx.text_edit_focused() && !cmd_focused;
         if other_text_focused {
+            return;
+        }
+        if !cmd_focused && !self.focus_cmd && self.cmd.is_empty() && self.workflow_keys(ctx) {
             return;
         }
         // Chorded bindings (⌘, Ctrl, Alt) work even while the command line has text.
@@ -1681,8 +1683,12 @@ impl eframe::App for TerminalApp {
             pos2(main.right() - gap, status.top() - gap * 0.5),
         );
 
+        if let Some(error) = self.settings_writer.as_ref().and_then(|w| w.error()) {
+            self.status = error;
+        }
         self.hotkeys(&ctx);
         self.command_palette(&ctx);
+        self.watchlist_dialogs(&ctx);
         let mut sidebar_cmds = Vec::new();
         if sb_w >= 1.0 {
             // The sidebar slides in from its edge.
@@ -1855,6 +1861,9 @@ mod tests {
             congress_status: String::new(),
             congress_checked: None,
             watchlist: DEFAULT_WATCHLIST.map(String::from).to_vec(),
+            watchlists: watchlists::Watchlists::migrate(&DEFAULT_WATCHLIST.map(String::from)),
+            watch_ui: Default::default(),
+            settings_writer: None,
             quotes: HashMap::new(),
             last_quotes: None,
             last_feed: None,

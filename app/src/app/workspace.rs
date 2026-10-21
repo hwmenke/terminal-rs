@@ -621,7 +621,7 @@ impl TerminalApp {
 
     /// The chart commands act on: the focused one, a visible one, any (revealed), or a new
     /// chart beside the focused pane.
-    fn chart_target(&mut self) -> PaneId {
+    pub(super) fn chart_target(&mut self) -> PaneId {
         if self.focused_is_chart() {
             return self.focus;
         }

@@ -176,6 +176,22 @@ gets the native title bar with traffic lights, window vibrancy behind the sideba
   adjusted prices change. Progress, failures, freshness, cancel/resume and retry-failed controls are
   available in the panel. `UNIV` and `SCAN` use archived daily prices; archived charts support
   daily, weekly and monthly candles. See [Price history](docs/PRICE_HISTORY.md).
+- **Scan → chart → watchlist** — `SCAN <setup>` and `UNIV` highlight a selected row.
+  ↑/↓ or j/k, PageUp/PageDown and Home/End move through results; Enter opens the archived
+  symbol in the active chart and updates its linked panes while keeping the result list focused.
+  Clicks still open symbols. With a result or chart focused, **w** opens a group picker (↑/↓,
+  Enter, Esc), and **W** saves directly to the last-used group. `/` focuses the command bar.
+  `WL NEW Growth`, `WL ADD Growth AAPL MSFT`, `WL RM Growth MSFT`, `WL RENAME Growth Winners`,
+  `WL SHOW Winners` and `WL DELETE Winners` manage groups; deletion asks for confirmation.
+  Quote names with spaces, for example `WL NEW "Long Term"`. The watchlist panel also has
+  create, rename, delete and remove controls. Saved scan rows retain scan name, source,
+  save time and bar date. The panel shows last price, change %, provenance and completed-session
+  freshness; sample and unverified quotes are explicitly labelled, and scan closes are dated
+  archive observations. Existing flat watchlists migrate to **Default**; settings save atomically
+  in the background. Click a member or use `WL LINK Winners` / **Link active chart**, then
+  **] / [** or **Alt+Down / Alt+Up** step forward/back through the group with wrapping.
+  The status bar shows the group and position (for example `Winners 3/12`); chart links save
+  with the layout.
 - **Command palette** — ⌘⇧K (Ctrl+Shift+K on Linux and Windows) opens a centred, theme-matched palette
   that fuzzy-searches every function code (`PORT`, `POS`, `ORD`, `OMON`, `THEME`, …), tickers
   (load the quote and chart), new panels, layout presets and saved layouts, themes, Settings tabs

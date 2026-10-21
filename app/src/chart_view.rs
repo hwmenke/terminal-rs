@@ -71,6 +71,8 @@ struct DrawState {
 pub struct ChartState {
     pub id: PaneId,
     pub archive: bool,
+    /// Named watchlist used by bracket / Alt+arrow quick-switching.
+    pub watch_group: Option<String>,
     pub symbol: String,
     pub tf: Timeframe,
     pub chart_type: ChartType,
@@ -127,6 +129,7 @@ impl ChartState {
         Self {
             id,
             archive: false,
+            watch_group: None,
             symbol: Security::parse(symbol).map(|s| s.key()).unwrap_or_else(|| symbol.into()),
             tf,
             chart_type: if tr_data::security(symbol).class == AssetClass::Govt {

@@ -636,7 +636,10 @@ impl TerminalApp {
                 });
             }
             if let Some(k) = remove {
-                self.watchlist.retain(|x| *x != k);
+                for group in &mut self.watchlists.groups {
+                    group.members.retain(|m| m.symbol != k);
+                }
+                self.watchlists_changed();
             }
             if nav_row(ui, Icon::List, "Open Watchlist Pane", None, is_focused(&PaneKind::Watchlist)).clicked() {
                 out.push(SidebarCmd::Function(Function::Watchlist));
@@ -915,7 +918,7 @@ impl TerminalApp {
         } else {
             p.text(pos2(x, cy), Align2::LEFT_CENTER, command::hint(&self.cmd), mono(11.0), text());
         }
-        let status = if self.show_perf {
+        let mut status = if self.show_perf {
             format!(
                 "UI {:.2} ms · frame {:.1} ms ({:.0} fps) · {}",
                 self.perf_cpu_ms,
@@ -926,6 +929,9 @@ impl TerminalApp {
         } else {
             self.status.clone()
         };
+        if let Some(position) = self.watch_position() {
+            status = format!("{position} · {status}");
+        }
         p.text(pos2(rect.right() - 10.0, cy), Align2::RIGHT_CENTER, status, ui_font(11.5), muted());
     }
 
