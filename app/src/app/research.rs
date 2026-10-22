@@ -2,7 +2,7 @@
 use super::watchlists::{Member, Origin};
 use crate::{congress_view::Action, worker::Request};
 use egui::{Key, RichText, Ui};
-use tr_data::whats_news::{Scan, Snapshot, Symbol};
+use tr_data::whats_news::{Condition, Scan, ScanFilter, Snapshot, Sort, Symbol};
 
 enum DisplayRow<'a> {
     Universe(&'a Symbol),
@@ -30,15 +30,19 @@ impl DisplayRow<'_> {
                     Symbol { symbol: r.symbol.clone(), name: None, group_tag: None, last_date: r.last_date.clone() }
                         .status_at(chrono::Utc::now());
                 let num = |n: Option<f64>| n.map(|n| format!("{n:.2}")).unwrap_or_else(|| "—".into());
+                let m = r.metrics.as_ref();
                 format!(
-                    "{:<12} {:<12} {:<8} {:>10} {:>8} {:>10} {:>10}",
+                    "{:<12} {:<12} {:<8} {:>9} {:>6} {:>8} {:>7} {:>12} {:>7} {:>7}",
                     r.symbol,
                     r.last_date.as_deref().unwrap_or("—"),
                     status,
                     num(r.price),
-                    num(r.setup_score),
-                    num(r.darvas_top),
-                    num(r.darvas_bottom)
+                    num(m.map(|m| m.score)),
+                    num(m.map(|m| m.ret_21d_pct)),
+                    num(m.and_then(|m| m.daily.rsi)),
+                    num(m.map(|m| m.volume)),
+                    num(m.and_then(|m| m.volume_ratio)),
+                    num(m.map(|m| m.adr_pct))
                 )
             }
         }
@@ -58,6 +62,7 @@ pub struct ResearchPane {
     pub loading: bool,
     pub error: Option<String>,
     search: String,
+    filter: ScanFilter,
     selected: usize,
     scroll_selected: bool,
     page_rows: usize,
@@ -99,6 +104,11 @@ impl ResearchPane {
         }
     }
 
+    #[cfg(test)]
+    pub(super) fn set_include_stale_for_test(&mut self) {
+        self.filter.include_stale = true;
+    }
+
     pub fn new(scan: Option<String>) -> Self {
         Self {
             scan,
@@ -113,6 +123,7 @@ impl ResearchPane {
             loading: true,
             error: None,
             search: String::new(),
+            filter: ScanFilter::default(),
             selected: 0,
             scroll_selected: false,
             page_rows: 10,
@@ -148,11 +159,10 @@ impl ResearchPane {
     fn visible_symbols(&self) -> Vec<&str> {
         let query = self.search.trim().to_ascii_uppercase();
         if let Some(s) = &self.results {
-            return s
-                .data
-                .results
-                .iter()
-                .filter(|r| r.symbol.to_ascii_uppercase().contains(&query))
+            return self
+                .filter
+                .rows(&s.data, &query, tr_data::history::calendar::last_expected_session(chrono::Utc::now()))
+                .into_iter()
                 .map(|r| r.symbol.as_str())
                 .collect();
         }
@@ -245,6 +255,10 @@ impl ResearchPane {
                 refresh
             })
             .inner;
+        if self.scan.is_some() {
+            ui.ctx().request_repaint_after(std::time::Duration::from_secs(60));
+            self.scan_controls(ui);
+        }
         ui.label("↑/↓ j/k · PgUp/PgDn Home/End · Enter: chart · w/W: save to group");
         if self.loading {
             ui.spinner();
@@ -270,17 +284,37 @@ impl ResearchPane {
         }
         if let Some(snapshot) = &self.results {
             ui.label(format!("[{}] {}", snapshot.provenance.label(), snapshot.source));
+            let expected = tr_data::history::calendar::last_expected_session(chrono::Utc::now());
+            let visible = self.filter.rows(&snapshot.data, &self.search, expected);
             ui.label(format!(
-                "{} · {} matches / {} scanned",
+                "{} · {} shown / {} setup matches · {} evaluated · {} skipped before matching",
                 self.scan.as_deref().unwrap_or_default(),
+                visible.len(),
                 snapshot.data.results.len(),
-                snapshot.data.scanned
+                snapshot.data.scanned,
+                snapshot.data.skipped.len()
             ));
+            ui.collapsing("Skipped / excluded symbols", |ui| {
+                egui::ScrollArea::vertical().id_salt("scan-excluded").max_height(160.0).show(ui, |ui| {
+                    for skip in &snapshot.data.skipped {
+                        ui.label(format!("{} · {}", skip.symbol, skip.reason));
+                    }
+                    for row in &snapshot.data.results {
+                        if let Some(reason) = self.filter.reason(row, expected) {
+                            ui.label(format!("{} · {}", row.symbol, reason));
+                        }
+                    }
+                });
+                ui.label("Non-matching setups and text search omissions are not data failures.");
+            });
+            if let Some(row) = visible.get(self.selected) {
+                Self::scan_details(ui, row);
+            }
             ui.monospace(format!(
-                "{:<12} {:<12} {:<8} {:>10} {:>8} {:>10} {:>10}",
-                "TICKER", "LAST BAR", "STATUS", "CLOSE", "SCORE", "BOX TOP", "BOX LOW"
+                "{:<12} {:<12} {:<8} {:>9} {:>6} {:>8} {:>7} {:>12} {:>7} {:>7}",
+                "TICKER", "LAST BAR", "STATUS", "CLOSE", "SCORE", "RET21%", "RSI14", "VOLUME", "VOL×20", "ADR20%"
             ));
-            rows.extend(snapshot.data.results.iter().filter(|r| symbols.contains(&r.symbol)).map(DisplayRow::Scan));
+            rows.extend(visible.into_iter().map(DisplayRow::Scan));
         }
         if rows.is_empty() && !self.loading && self.error.is_none() {
             ui.label("No matching results.");
@@ -311,6 +345,79 @@ impl ResearchPane {
             }
         });
         (actions, refresh)
+    }
+    fn scan_controls(&mut self, ui: &mut Ui) {
+        let before = self.filter.clone();
+        ui.horizontal_wrapped(|ui| {
+            ui.checkbox(&mut self.filter.include_stale, "Include stale / undated");
+            egui::ComboBox::from_id_salt("scan-sort").selected_text(self.filter.sort.label()).show_ui(ui, |ui| {
+                for sort in Sort::ALL {
+                    ui.selectable_value(&mut self.filter.sort, sort, sort.label());
+                }
+            });
+            ui.checkbox(&mut self.filter.descending, "Descending");
+            if ui.button("Reset filters").clicked() {
+                self.filter = ScanFilter::default();
+            }
+        });
+        ui.collapsing("Strength, volume, range & timeframe filters",|ui| {
+            fn bound(ui: &mut Ui,label: &str,value: &mut Option<f64>,initial:f64) {
+                let mut enabled=value.is_some();
+                if ui.checkbox(&mut enabled,label).changed() { *value=enabled.then_some(initial); }
+                if let Some(v)=value { ui.add(egui::DragValue::new(v).speed(0.1)); }
+            }
+            ui.horizontal_wrapped(|ui| {
+                bound(ui,"Min score",&mut self.filter.min_score,1.0);
+                bound(ui,"Min return21 %",&mut self.filter.min_strength,0.0);
+                bound(ui,"Min RSI14",&mut self.filter.min_rsi,30.0);
+                bound(ui,"Max RSI14",&mut self.filter.max_rsi,70.0);
+            });
+            ui.horizontal_wrapped(|ui| {
+                bound(ui,"Min volume",&mut self.filter.min_volume,1_000_000.0);
+                bound(ui,"Min vol×20",&mut self.filter.min_volume_ratio,1.5);
+                bound(ui,"Min ADR20 %",&mut self.filter.min_range,2.0);
+                bound(ui,"Max ADR20 %",&mut self.filter.max_range,10.0);
+            });
+            ui.horizontal_wrapped(|ui| {
+                for (label,condition) in [("Daily",&mut self.filter.daily),("Weekly",&mut self.filter.weekly),("Monthly",&mut self.filter.monthly)] {
+                    ui.label(label);
+                    egui::ComboBox::from_id_salt(("scan-condition",label)).selected_text(condition.label()).show_ui(ui,|ui| {
+                        for c in Condition::ALL { ui.selectable_value(condition,c,c.label()); }
+                    });
+                }
+            });
+            ui.label("Rust calculations: Wilder RSI14; 21-bar return; last volume / prior 20 mean; ADR20 = mean((H−L)/C) %. Thresholds use full precision.");
+            ui.label("Score: near 20-bar high + volume surge + gap EP + 2 for box breakout (or 1 for a box near its high). W/M: completed calendar periods, 20 bars required.");
+            ui.label("Stale = older than the last completed US session. RS ranks compare eligible archive names on the same bar date, before filters. Service fields below retain service definitions.");
+        });
+        if before != self.filter {
+            self.selected = 0;
+            self.scroll_selected = true;
+        }
+    }
+    fn scan_details(ui: &mut Ui, row: &tr_data::whats_news::ScanRow) {
+        ui.collapsing(format!("{} · conditions / source fields",row.symbol),|ui| {
+            let num=|v:Option<f64>|v.map(|v|format!("{v:.2}")).unwrap_or_else(||"—".into());
+            if let Some(m)=&row.metrics {
+                ui.label(format!("Rust: change {}% · return21 {}% · mean prior volume {} · 5/20 volume {} · gap {}% · distance from high {}%",
+                    num(Some(m.change_pct)),num(Some(m.ret_21d_pct)),num(Some(m.avg_volume20)),num(m.vol_ratio_5_20),num(Some(m.gap_pct)),num(Some(m.dist_20d_high_pct))));
+                if m.rs_n>0 { ui.label(format!("Archive RS rank: {} / {} (same-date universe)",m.rs_rank,m.rs_n)); }
+                for (label,c) in [("Daily",&m.daily),("Weekly",&m.weekly),("Monthly",&m.monthly)] {
+                    ui.label(format!("{label}: {} bars · RSI {} · {}",c.bars,num(c.rsi),c.unavailable.clone().unwrap_or_else(||if c.above_sma20==Some(true) { "Close ≥ SMA20".into() } else { "Close < SMA20".into() })));
+                }
+            }
+            ui.label(format!("{} box: top {} · bottom {}",if row.from_service {"Service"} else {"Rust"},num(row.darvas_top),num(row.darvas_bottom)));
+            let s=&row.service;
+            if row.from_service {
+                ui.label(format!("Service readiness: {}",s.ready.map(|r|if r {"ready"}else{"not ready"}).unwrap_or("not supplied")));
+                if let Some(error)=&s.error { ui.label(format!("Service: {error}")); }
+                ui.label(format!("Service: score {} · change {}% · setups {} · count {} · state {}",
+                    num(row.setup_score),num(s.change_pct),s.setups.join(", "),s.setup_count.map(|n|n.to_string()).unwrap_or_else(||"—".into()),s.darvas_state.as_deref().unwrap_or("—")));
+                ui.label(format!("Service: RS rank {} / {} · return21 {}% · distance high {}% · vol_ratio_5_20 {} · ADR {}% · gap {}%",
+                    s.rs_rank_21d.map(|n|n.to_string()).unwrap_or_else(||"—".into()),s.rs_n.map(|n|n.to_string()).unwrap_or_else(||"—".into()),num(s.ret_21d_pct),num(s.dist_20d_high_pct),num(s.vol_ratio_5_20),num(s.adr_pct),num(s.gap_pct)));
+                ui.label(format!("Service regimes: daily {} · weekly {}",s.regime.as_deref().unwrap_or("—"),s.regime_weekly.as_deref().unwrap_or("—")));
+            }
+        });
     }
     fn show_history(&mut self, ui: &mut Ui, worker: &crate::worker::Worker) -> Vec<Action> {
         let mut actions = Vec::new();
@@ -440,14 +547,14 @@ mod tests {
             pane.accept_scan(Ok(Snapshot {
                 source: "must not be displayed".into(),
                 provenance,
-                data: Scan { provenance: Provenance::Real, scanned: 1, results: vec![] },
+                data: Scan { provenance: Provenance::Real, scanned: 1, skipped: vec![], results: vec![] },
             }));
             assert!(pane.results.is_none());
             assert!(pane.error.as_deref().unwrap().contains("refused"));
             pane.accept_scan(Ok(Snapshot {
                 source: "must not be displayed".into(),
                 provenance: Provenance::Real,
-                data: Scan { provenance, scanned: 1, results: vec![] },
+                data: Scan { provenance, scanned: 1, skipped: vec![], results: vec![] },
             }));
             assert!(pane.results.is_none());
             pane.accept_scan(Ok(Snapshot {
@@ -456,6 +563,7 @@ mod tests {
                 data: Scan {
                     provenance: Provenance::Real,
                     scanned: 1,
+                    skipped: vec![],
                     results: vec![tr_data::whats_news::ScanRow {
                         provenance,
                         symbol: "X".into(),
@@ -464,6 +572,7 @@ mod tests {
                         darvas_top: None,
                         darvas_bottom: None,
                         last_date: None,
+                        ..Default::default()
                     }],
                 },
             }));
@@ -481,6 +590,7 @@ mod navigation_tests {
     fn navigation_clamps_empty_filtered_and_replaced_results() {
         for scan in [false, true] {
             let mut pane = ResearchPane::new(scan.then(|| "NEAR_HIGH".into()));
+            pane.filter.include_stale = true;
             for key in [Key::Enter, Key::ArrowUp, Key::End, Key::PageDown] {
                 assert_eq!(pane.navigate(key), None);
             }
@@ -492,6 +602,7 @@ mod navigation_tests {
                     data: Scan {
                         provenance: Provenance::Real,
                         scanned: 3,
+                        skipped: vec![],
                         results: symbols
                             .iter()
                             .map(|s| tr_data::whats_news::ScanRow {
@@ -502,6 +613,7 @@ mod navigation_tests {
                                 darvas_top: None,
                                 darvas_bottom: None,
                                 last_date: Some("2026-10-20".into()),
+                                ..Default::default()
                             })
                             .collect(),
                     },
@@ -553,6 +665,96 @@ mod navigation_tests {
             assert_eq!(pane.selected, 1);
             pane.navigate(Key::PageUp);
             assert_eq!(pane.selected, 0);
+        }
+    }
+    #[test]
+    fn scanner_view_defaults_stale_off_and_navigation_uses_the_sorted_filtered_rows() {
+        use tr_data::whats_news::{Metrics, ScanRow, Skipped};
+        let expected = tr_data::history::calendar::last_expected_session(chrono::Utc::now());
+        let candidate = |symbol: &str, score: f64, date: chrono::NaiveDate| ScanRow {
+            provenance: Provenance::Real,
+            symbol: symbol.into(),
+            price: Some(100.0),
+            last_date: Some(date.to_string()),
+            metrics: Some(Metrics { score, ..Default::default() }),
+            ..Default::default()
+        };
+        let mut pane = ResearchPane::new(Some("NEAR_HIGH".into()));
+        pane.accept_scan(Ok(Snapshot {
+            provenance: Provenance::Cached,
+            source: "verified archive".into(),
+            data: Scan {
+                provenance: Provenance::Cached,
+                scanned: 3,
+                skipped: vec![Skipped {
+                    symbol: "SHORT".into(),
+                    reason: "insufficient daily history: need 30 bars, have 2".into(),
+                }],
+                results: vec![
+                    candidate("AAPL", 1.0, expected),
+                    candidate("MSFT", 4.0, expected),
+                    candidate("OLD", 5.0, expected - chrono::Duration::days(10)),
+                ],
+            },
+        }));
+        assert_eq!(pane.visible_symbols(), ["MSFT", "AAPL"]);
+        assert_eq!(pane.selected_member().unwrap().symbol, "MSFT US Equity");
+        pane.navigate(Key::ArrowDown);
+        assert_eq!(pane.selected_member().unwrap().symbol, "AAPL US Equity");
+        pane.filter.min_score = Some(2.0);
+        pane.navigate(Key::Home);
+        assert_eq!(pane.visible_symbols(), ["MSFT"]);
+        pane.filter.include_stale = true;
+        pane.navigate(Key::Home);
+        assert_eq!(pane.visible_symbols(), ["OLD", "MSFT"]);
+        pane.filter.sort = Sort::Symbol;
+        pane.filter.descending = false;
+        pane.navigate(Key::Home);
+        assert_eq!(pane.visible_symbols(), ["MSFT", "OLD"]);
+        pane.search = "old".into();
+        assert_eq!(pane.visible_symbols(), ["OLD"]);
+        let member = pane.selected_member().unwrap();
+        assert_eq!(member.origins[0].source, "verified archive");
+        assert_eq!(member.origins[0].provenance, Provenance::Cached);
+        let (worker, _) = crate::worker::Worker::test_channel();
+        let ctx = egui::Context::default();
+        ctx.memory_mut(|m| m.set_everything_is_visible(true));
+        let mut output = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1200.0, 2000.0))),
+                ..Default::default()
+            },
+            |ui| {
+                pane.show(ui, &worker);
+            },
+        );
+        output.textures_delta.clear();
+        fn texts(shapes: &[egui::epaint::ClippedShape]) -> String {
+            fn add(shape: &egui::Shape, out: &mut String) {
+                match shape {
+                    egui::Shape::Text(t) => {
+                        out.push_str(&t.galley.job.text);
+                        out.push('\n');
+                    }
+                    egui::Shape::Vec(shapes) => {
+                        for s in shapes {
+                            add(s, out)
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            let mut out = String::new();
+            for s in shapes {
+                add(&s.shape, &mut out);
+            }
+            out
+        }
+        let text = texts(&output.shapes);
+        for label in
+            ["Include stale", "Skipped / excluded symbols", "SHORT", "need 30 bars", "RET21%", "VOL×20", "ADR20%"]
+        {
+            assert!(text.contains(label), "missing {label}: {text}");
         }
     }
 }

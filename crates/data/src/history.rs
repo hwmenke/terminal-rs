@@ -233,16 +233,32 @@ impl Archive {
             .collect();
         Ok(Snapshot { data, provenance: Provenance::Cached, source: "Local Yahoo daily research archive".into() })
     }
-    pub fn scan(&self, name: &str) -> Result<Snapshot<Scan>> {
-        if !crate::whats_news::SETUPS.contains(&name) {
-            bail!("Unknown scan {name}");
+    /// Scan coverage and bars in one read transaction/query, including symbols
+    /// with no history. Raw validation/skip diagnostics live in the shared scanner.
+    pub fn histories(&self) -> Result<BTreeMap<String, Vec<Bar>>> {
+        let tx = self.conn.unchecked_transaction()?;
+        let mut histories = BTreeMap::<String, Vec<Bar>>::new();
+        {
+            let mut st = tx.prepare("SELECT s.symbol,d.ts,d.o,d.h,d.l,d.c,d.v,d.source,d.provenance FROM history_symbols s LEFT JOIN history_daily d ON d.symbol=s.symbol ORDER BY s.symbol,d.ts")?;
+            let mut rows = st.query([])?;
+            while let Some(r) = rows.next()? {
+                let bars = histories.entry(r.get(0)?).or_default();
+                if let Some(ts) = r.get::<_, Option<i64>>(1)? {
+                    let source: String = r.get(7)?;
+                    let provenance: String = r.get(8)?;
+                    let b = Bar::new(ts, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?).with_provenance(
+                        if source == "yahoo" && provenance == "Real" { Provenance::Real } else { Provenance::Missing },
+                    );
+                    b.provenance.require_verified("Research archive scan").map_err(anyhow::Error::msg)?;
+                    bars.push(b);
+                }
+            }
         }
-        let histories = self
-            .universe()?
-            .data
-            .into_iter()
-            .map(|s| Ok((s.symbol.clone(), self.daily(&s.symbol)?)))
-            .collect::<Result<Vec<_>>>()?;
+        tx.commit()?;
+        Ok(histories)
+    }
+    pub fn scan(&self, name: &str) -> Result<Snapshot<Scan>> {
+        let histories = self.histories()?.into_iter().collect();
         let data = crate::whats_news::scan_histories(name, histories, Provenance::Cached)?;
         Ok(Snapshot { data, provenance: Provenance::Cached, source: "Local Yahoo daily research archive".into() })
     }
@@ -840,5 +856,35 @@ mod tests {
         assert_eq!(provider.calls.lock().unwrap()[2].1, None);
         assert_eq!(service.db(|db| db.daily("AAPL")).await.unwrap(), old);
         assert!(service.status().await.unwrap().entries[0].error.as_ref().unwrap().contains("early dates"));
+    }
+    #[test]
+    fn batched_local_scan_includes_missing_symbols_rsi_scores_and_full_monthly_history() {
+        let mut archive = Archive::memory().unwrap();
+        archive.add(&symbols("AAPL EMPTY SHORT")).unwrap();
+        let first = d("2022-01-03");
+        let bars: Vec<_> = (0..1100)
+            .map(|i| first + chrono::Duration::days(i))
+            .filter(|d| calendar::is_session(*d))
+            .enumerate()
+            .map(|(i, date)| b(&date.to_string(), 100.0 + i as f64))
+            .collect();
+        archive.store("AAPL", &bars, true).unwrap();
+        archive.store("SHORT", &bars[..2], true).unwrap();
+        let histories = archive.histories().unwrap();
+        assert_eq!(histories.len(), 3);
+        assert!(histories["EMPTY"].is_empty());
+        assert_eq!(histories["AAPL"].len(), bars.len());
+        let scan = archive.scan("RSI_OB").unwrap();
+        assert!(scan.provenance.is_verified());
+        assert_eq!(scan.data.scanned, 1);
+        assert_eq!(scan.data.results.len(), 1);
+        let m = scan.data.results[0].metrics.as_ref().unwrap();
+        assert_eq!(m.daily.rsi, Some(100.0));
+        assert_eq!(scan.data.results[0].setup_score, Some(m.score));
+        assert!(m.monthly.bars >= 35);
+        assert!(m.monthly.unavailable.is_none());
+        assert_eq!(scan.data.skipped.len(), 2);
+        assert!(scan.data.skipped.iter().any(|s| s.symbol == "EMPTY" && s.reason.contains("missing daily")));
+        assert!(scan.data.skipped.iter().any(|s| s.symbol == "SHORT" && s.reason.contains("have 2")));
     }
 }

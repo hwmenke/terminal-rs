@@ -176,6 +176,11 @@ gets the native title bar with traffic lights, window vibrancy behind the sideba
   adjusted prices change. Progress, failures, freshness, cancel/resume and retry-failed controls are
   available in the panel. `UNIV` and `SCAN` use archived daily prices; archived charts support
   daily, weekly and monthly candles. See [Price history](docs/PRICE_HISTORY.md).
+- **Broader archive scanners** — `SCAN` supports strength/RSI, volume and ADR range
+  filters, daily/weekly/monthly conditions, ascending/descending sorts and named skip
+  reasons. Stale names are hidden by default with a toggle. SQLite computes RSI and
+  scores from verified full history; original HTTP service fields remain inspectable.
+  See [Scanner calculations and controls](docs/SCANNERS.md).
 - **Scan → chart → watchlist** — `SCAN <setup>` and `UNIV` highlight a selected row.
   ↑/↓ or j/k, PageUp/PageDown and Home/End move through results; Enter opens the archived
   symbol in the active chart and updates its linked panes while keeping the result list focused.

@@ -614,21 +614,7 @@ async fn research_scan(
     bridge: &tr_data::whats_news::Bridge,
     name: &str,
 ) -> anyhow::Result<tr_data::whats_news::Snapshot<tr_data::whats_news::Scan>> {
-    use futures::StreamExt;
-    // Preserve service-only RSI scans until the local scanner supports them.
-    if name.starts_with("RSI_") {
-        return bridge.scan(name).await;
-    }
-    let local = s
-        .history
-        .db(|db| {
-            db.universe()?
-                .data
-                .into_iter()
-                .map(|row| Ok((row.symbol.clone(), db.daily(&row.symbol)?)))
-                .collect::<anyhow::Result<std::collections::BTreeMap<_, _>>>()
-        })
-        .await?;
+    let local = s.history.db(|db| db.histories()).await?;
     if local.is_empty() {
         return bridge.scan(name).await;
     }
@@ -637,33 +623,45 @@ async fn research_scan(
     }
     let mut histories = local;
     let mut source = "Local Yahoo daily research archive".to_string();
+    let mut skipped = vec![];
+    let mut service = None;
     if bridge.enabled {
-        match bridge.universe().await {
+        match bridge.histories().await {
             Ok(external) => {
+                external.provenance.require_verified("SCAN archive").map_err(anyhow::Error::msg)?;
                 source.push_str(&format!(" + {}", external.source));
-                let missing: Vec<_> = external
+                if external.source.starts_with("Whats-News HTTP") {
+                    match bridge.service_scan().await {
+                        Ok(fields) => service = fields,
+                        Err(e) if tr_data::whats_news::is_unverified(&e) => return Err(e),
+                        Err(e) => source.push_str(&format!(" · Service fields unavailable: {e}")),
+                    }
+                }
+                skipped = external
                     .data
+                    .skipped
                     .into_iter()
-                    .filter(|r| r.last_date.is_some() && !histories.get(&r.symbol).is_some_and(|b| !b.is_empty()))
+                    .filter(|skip| !histories.get(&skip.symbol).is_some_and(|b| !b.is_empty()))
                     .collect();
-                let mut loads = futures::stream::iter(missing.into_iter().map(|row| async move {
-                    let snapshot = bridge.bars(&row.symbol).await?;
-                    Ok::<_, anyhow::Error>((row.symbol, snapshot.data))
-                }))
-                .buffer_unordered(6);
-                while let Some(rows) = loads.next().await {
-                    let (symbol, bars) = rows?;
-                    histories.insert(symbol, bars);
+                for (symbol, bars) in external.data.bars {
+                    if !histories.get(&symbol).is_some_and(|b| !b.is_empty()) {
+                        histories.insert(symbol, bars);
+                    }
                 }
             }
+            Err(e) if tr_data::whats_news::is_unverified(&e) => return Err(e),
             Err(e) => source.push_str(&format!(" · Whats-News unavailable: {e}")),
         }
     }
     let name = name.to_string();
-    let data = tokio::task::spawn_blocking(move || {
+    let mut data = tokio::task::spawn_blocking(move || {
         tr_data::whats_news::scan_histories(&name, histories.into_iter().collect(), tr_core::Provenance::Cached)
     })
     .await??;
+    data.skipped.extend(skipped);
+    if let Some(service) = service {
+        tr_data::whats_news::attach_service(&mut data, service)?;
+    }
     Ok(tr_data::whats_news::Snapshot { data, provenance: tr_core::Provenance::Cached, source })
 }
 
