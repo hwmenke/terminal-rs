@@ -3,7 +3,9 @@
 //! absent metadata means Real here. Explicit unverified/sample provenance is refused.
 use std::{path::PathBuf, time::Duration};
 mod link;
+mod scanner;
 pub use link::{Config, DEFAULT_URL, Health, LinkState, detect_archive, retry_delay};
+pub use scanner::{Condition, Conditions, Metrics, ScanCache, ScanFilter, Skipped, Sort};
 
 use crate::history::calendar::is_session;
 use anyhow::{Context, Result, bail};
@@ -25,6 +27,9 @@ fn verify(provenance: Provenance, operation: &str) -> Result<()> {
     provenance.require_verified(operation).map_err(|e| anyhow::Error::new(Unverified(e)))
 }
 // Source-specific default: this does not apply to the terminal's legacy price cache.
+pub fn is_unverified(error: &anyhow::Error) -> bool {
+    error.is::<Unverified>()
+}
 fn archive_provenance() -> Provenance {
     Provenance::Real
 }
@@ -68,12 +73,18 @@ impl Symbol {
         }
     }
 }
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 pub struct ScanRow {
     #[serde(default = "archive_provenance")]
     pub provenance: Provenance,
     pub symbol: String,
     pub price: Option<f64>,
+    #[serde(default)]
+    pub metrics: Option<Metrics>,
+    #[serde(skip)]
+    pub from_service: bool,
+    #[serde(flatten)]
+    pub service: ServiceFields,
     #[serde(default)]
     pub setup_score: Option<f64>,
     #[serde(default)]
@@ -83,18 +94,46 @@ pub struct ScanRow {
     #[serde(default)]
     pub last_date: Option<String>,
 }
+/// Original HTTP service fields retain their names and meanings. Rust metrics
+/// are separate: service RSI/regimes/ranks can use different seeds or universes.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+pub struct ServiceFields {
+    pub ready: Option<bool>,
+    pub error: Option<String>,
+    pub change_pct: Option<f64>,
+    pub setups: Vec<String>,
+    pub setup_count: Option<usize>,
+    pub rs_rank_21d: Option<usize>,
+    pub rs_n: Option<usize>,
+    pub dist_20d_high_pct: Option<f64>,
+    pub vol_ratio_5_20: Option<f64>,
+    pub adr_pct: Option<f64>,
+    pub gap_pct: Option<f64>,
+    pub regime: Option<String>,
+    pub regime_weekly: Option<String>,
+    pub ret_21d_pct: Option<f64>,
+    pub darvas_state: Option<String>,
+}
 #[derive(Debug, Clone, Deserialize)]
 pub struct Scan {
     #[serde(default = "archive_provenance")]
     pub provenance: Provenance,
     pub scanned: usize,
     pub results: Vec<ScanRow>,
+    #[serde(default)]
+    pub skipped: Vec<Skipped>,
 }
 #[derive(Debug, Clone)]
 pub struct Snapshot<T> {
     pub provenance: Provenance,
     pub source: String,
     pub data: T,
+}
+#[derive(Debug, Clone)]
+pub struct Histories {
+    pub bars: Vec<(String, Vec<Bar>)>,
+    pub skipped: Vec<Skipped>,
 }
 #[derive(Clone)]
 pub struct Bridge {
@@ -297,57 +336,105 @@ impl Bridge {
             }
         }
     }
+    /// Batched SQLite snapshot, or bounded HTTP history reads (the services
+    /// expose only per-symbol OHLCV). Avoid a separate coverage/history pass.
+    pub async fn histories(&self) -> Result<Snapshot<Histories>> {
+        self.check()?;
+        if !self.prefer_http || self.url.is_none() {
+            match self.sql(read_histories_sql).await {
+                Ok(snapshot) => return Ok(snapshot),
+                Err(e) if e.is::<Unverified>() || self.url.is_none() => return Err(e),
+                Err(_) => {}
+            }
+        }
+        let http = tokio::time::timeout(Duration::from_secs(20), self.http_histories())
+            .await
+            .unwrap_or_else(|_| Err(anyhow::anyhow!("Whats-News timed out reading scan histories")));
+        match http {
+            Ok(data) => Ok(Snapshot {
+                data,
+                provenance: Provenance::Real,
+                source: format!("Whats-News HTTP archive: {}", self.url.as_deref().unwrap_or_default()),
+            }),
+            Err(e) if e.is::<Unverified>() => Err(e),
+            Err(http) => self
+                .sql(read_histories_sql)
+                .await
+                .map_err(|db| anyhow::anyhow!("Whats-News unavailable: HTTP: {http}; SQLite: {db:#}")),
+        }
+    }
+    async fn http_histories(&self) -> Result<Histories> {
+        let symbols: Vec<Symbol> = self.get("/api/symbols").await?;
+        require_symbols(&symbols)?;
+        let rows: Vec<_> = stream::iter(symbols.into_iter().map(|s| async move {
+            match self.http_bars(&s.symbol, 1_000_000).await {
+                Ok(bars) => Ok((s.symbol, Ok(bars))),
+                Err(e) if e.is::<Unverified>() || e.downcast_ref::<reqwest::Error>().is_some() => Err(e),
+                Err(e) => Ok((s.symbol, Err(format!("invalid archived history: {e}")))),
+            }
+        }))
+        .buffered(12)
+        .try_collect::<Vec<_>>()
+        .await?;
+        let mut histories = Histories { bars: vec![], skipped: vec![] };
+        for (symbol, bars) in rows {
+            match bars {
+                Ok(bars) => histories.bars.push((symbol, bars)),
+                Err(reason) => histories.skipped.push(Skipped { symbol, reason }),
+            }
+        }
+        Ok(histories)
+    }
+    /// Original service fields are supplementary. Setup membership and all user
+    /// filters use the shared Rust calculation contract over verified history.
+    pub async fn service_scan(&self) -> Result<Option<Scan>> {
+        let scan: Scan = match self.get("/api/setups/scan?universe=1&limit=0").await {
+            Ok(scan) => scan,
+            Err(e)
+                if e.downcast_ref::<reqwest::Error>()
+                    .is_some_and(|e| e.status() == Some(reqwest::StatusCode::NOT_FOUND)) =>
+            {
+                return Ok(None);
+            }
+            Err(e) => return Err(e),
+        };
+        verify(scan.provenance, "Whats-News service scan")?;
+        for row in &scan.results {
+            verify(row.provenance, "Whats-News service scan result")?;
+        }
+        Ok(Some(scan))
+    }
     pub async fn scan(&self, name: &str) -> Result<Snapshot<Scan>> {
         self.check()?;
         if !SETUPS.contains(&name) {
             bail!("Unknown scan {name:?}. Available: {}", SETUPS.join(", "));
         }
         if !self.prefer_http || self.url.is_none() {
-            let setup = name.to_owned();
-            match self.sql(move |c| scan_sql(&c, &setup)).await {
-                Ok(s) => return Ok(s),
+            let name = name.to_owned();
+            match self.sql(move |c| scan_sql(&c, &name)).await {
+                Ok(snapshot) => return Ok(snapshot),
                 Err(e) if e.is::<Unverified>() || self.url.is_none() => return Err(e),
                 Err(_) => {}
             }
         }
-        let api = tokio::time::timeout(Duration::from_secs(20), async {
-            let mut scan: Scan = match self.get(&format!("/api/setups/scan?setup={name}&universe=1&limit=0")).await {
-                Ok(scan) => scan,
-                Err(e) if e.downcast_ref::<reqwest::Error>().is_some_and(|e| e.status() == Some(reqwest::StatusCode::NOT_FOUND)) => {
-                    // Optional data_service has history routes but no setup scanner.
-                    let symbols: Vec<Symbol> = self.get("/api/symbols").await?;
-                    require_symbols(&symbols)?;
-                    let histories = stream::iter(symbols.into_iter().map(|symbol| async move {
-                        let bars = self.http_bars(&symbol.symbol, 260).await?;
-                        Ok::<_, anyhow::Error>((symbol.symbol, bars))
-                    })).buffered(12).try_collect().await?;
-                    return scan_histories(name, histories, Provenance::Real);
-                }
-                Err(e) => return Err(e),
-            };
-            verify(scan.provenance, "Whats-News scan")?;
-            scan.results = stream::iter(scan.results.into_iter().map(|mut row| async move {
-                verify(row.provenance, "Whats-News scan result")?;
-                let bars = self.http_bars(&row.symbol, 1_000_000).await?;
-                verify(Bar::provenance(&bars), "Whats-News scan")?;
-                row.last_date = bars.last().map(|b| date(b.ts));
-                Ok::<_, anyhow::Error>(row)
-            }))
-            .buffered(12)
-            .try_collect()
-            .await?;
-            Ok::<_, anyhow::Error>(scan)
-        }).await.unwrap_or_else(|_| Err(anyhow::anyhow!("Whats-News timed out scanning history. Check the app or switch to the archive file in Settings › Whats-News.")));
+        let api=tokio::time::timeout(Duration::from_secs(20),async {
+            let service=self.service_scan().await?;
+            let histories=self.http_histories().await?;
+            let mut scan=scan_histories(name,histories.bars,Provenance::Real)?;
+            scan.skipped.extend(histories.skipped);
+            if let Some(service)=service { attach_service(&mut scan,service)?; }
+            Ok::<_,anyhow::Error>(scan)
+        }).await.unwrap_or_else(|_|Err(anyhow::anyhow!("Whats-News timed out scanning history. Check the app or switch to the archive file in Settings › Whats-News.")));
         match api {
             Ok(data) => Ok(Snapshot {
                 provenance: data.provenance,
                 source: format!(
-                    "Whats-News HTTP scanner: {} (service scores when available)",
+                    "Whats-News HTTP scanner: {} · Rust calculations; original service fields when available",
                     self.url.as_deref().unwrap_or_default()
                 ),
                 data,
             }),
-            Err(http) if http.is::<Unverified>() => Err(http),
+            Err(e) if e.is::<Unverified>() => Err(e),
             Err(http) => {
                 let name = name.to_owned();
                 self.sql(move |c| scan_sql(&c, &name))
@@ -357,6 +444,28 @@ impl Bridge {
         }
     }
 }
+/// Preserve original service values separately from the Rust filter metrics.
+pub fn attach_service(scan: &mut Scan, service: Scan) -> Result<()> {
+    verify(scan.provenance, "Whats-News scan")?;
+    verify(service.provenance, "Whats-News service scan")?;
+    for row in &service.results {
+        verify(row.provenance, "Whats-News service scan result")?;
+    }
+    let mut rows: std::collections::BTreeMap<_, _> =
+        service.results.into_iter().map(|r| (r.symbol.clone(), r)).collect();
+    for row in &mut scan.results {
+        if let Some(original) = rows.remove(&row.symbol) {
+            row.provenance = row.provenance.combine(original.provenance);
+            row.setup_score = original.setup_score;
+            row.darvas_top = original.darvas_top;
+            row.darvas_bottom = original.darvas_bottom;
+            row.service = original.service;
+            row.from_service = true;
+        }
+    }
+    Ok(())
+}
+
 fn date(ts: i64) -> String {
     chrono::DateTime::from_timestamp(ts, 0).unwrap_or_default().format("%Y-%m-%d").to_string()
 }
@@ -401,17 +510,21 @@ fn require_symbols(rows: &[Symbol]) -> Result<()> {
     Ok(())
 }
 fn universe_sql(c: &Connection) -> Result<Vec<Symbol>> {
-    let mut stmt = c.prepare("SELECT s.symbol, s.name, s.group_tag, MAX(o.date) FROM symbols s LEFT JOIN ohlcv o ON o.symbol=s.symbol AND o.freq='daily' GROUP BY s.symbol ORDER BY s.symbol")?;
+    let tx = c.unchecked_transaction()?;
+    let mut stmt = tx.prepare("SELECT s.symbol, s.name, s.group_tag, MAX(o.date) FROM symbols s LEFT JOIN ohlcv o ON o.symbol=s.symbol AND o.freq='daily' GROUP BY s.symbol ORDER BY s.symbol")?;
     let rows: Vec<Symbol> = stmt
         .query_map([], |r| {
             Ok(Symbol { symbol: r.get(0)?, name: r.get(1)?, group_tag: r.get(2)?, last_date: r.get(3)? })
         })?
         .collect::<rusqlite::Result<_>>()?;
     require_symbols(&rows)?;
-    for row in &rows {
-        // Coverage must not make artificial/unverified archive rows look usable.
-        bars_sql(c, &row.symbol, 1_000_000)?;
+    // One batch validates all registered daily coverage; no per-symbol reads.
+    let (_, skipped) = histories_sql(&tx, &rows)?;
+    if let Some(skip) = skipped.first() {
+        bail!("{}: {}", skip.symbol, skip.reason);
     }
+    drop(stmt);
+    tx.commit()?;
     Ok(rows)
 }
 fn bars_sql(c: &Connection, symbol: &str, limit: usize) -> Result<Vec<Bar>> {
@@ -435,12 +548,13 @@ fn bars_sql(c: &Connection, symbol: &str, limit: usize) -> Result<Vec<Bar>> {
         .collect::<rusqlite::Result<_>>()?;
     convert(rows)
 }
-/// Matches portfolio.py's 20-bar high / three-bar confirmation; latest bar is the outcome.
+/// 20-bar high / three-bar confirmation. Reserve the latest bar for the
+/// outcome so a fresh low cannot redefine its own box and hide a failure.
 fn darvas(b: &[Bar]) -> Option<(f64, f64, &'static str)> {
     if b.len() < 25 {
         return None;
     }
-    for i in (20..=b.len() - 4).rev() {
+    for i in (20..=b.len() - 5).rev() {
         let top = b[i - 19..=i].iter().map(|b| b.high).fold(f64::NEG_INFINITY, f64::max);
         if b[i + 1..i + 4].iter().all(|b| b.high <= top + 1e-9) {
             let low = b[i - 19..i + 4].iter().map(|b| b.low).fold(f64::INFINITY, f64::min);
@@ -463,61 +577,75 @@ fn darvas(b: &[Bar]) -> Option<(f64, f64, &'static str)> {
     }
     None
 }
-fn scan_sql(c: &Connection, name: &str) -> Result<Scan> {
-    if name.starts_with("RSI_") {
-        bail!(
-            "{name} requires the Whats-News HTTP service; SQLite scans support Darvas, EP, NEAR_HIGH, VOL_SURGE, BREAKOUT_QUEUE"
-        );
+/// Batch ALL daily history in one query, retaining per-symbol data failures.
+/// Unverified provenance remains a hard failure at every research entry point.
+fn histories_sql(c: &Connection, symbols: &[Symbol]) -> Result<(Vec<(String, Vec<Bar>)>, Vec<Skipped>)> {
+    use std::collections::BTreeMap;
+    let provenance = if c.prepare("SELECT provenance FROM ohlcv LIMIT 0").is_ok() { "o.provenance" } else { "'Real'" };
+    let mut stmt = c.prepare(&format!("SELECT o.symbol,o.date,o.open,o.high,o.low,o.close,o.volume,{provenance} FROM ohlcv o JOIN symbols s ON s.symbol=o.symbol WHERE o.freq='daily' ORDER BY o.symbol,o.date"))?;
+    let raw = stmt
+        .query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                StoredBar {
+                    date: r.get(1)?,
+                    open: r.get(2)?,
+                    high: r.get(3)?,
+                    low: r.get(4)?,
+                    close: r.get(5)?,
+                    volume: r.get(6)?,
+                    provenance: r
+                        .get::<_, Option<String>>(7)?
+                        .map(|s| serde_json::from_value(serde_json::Value::String(s)).unwrap_or_default())
+                        .unwrap_or_default(),
+                },
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let mut grouped: BTreeMap<String, Vec<StoredBar>> = symbols.iter().map(|s| (s.symbol.clone(), vec![])).collect();
+    for (symbol, bar) in raw {
+        grouped.entry(symbol).or_default().push(bar);
     }
-    // One read transaction gives coverage and calculations the same archive snapshot.
-    c.execute_batch("BEGIN DEFERRED")?;
-    let histories = universe_sql(c)?
-        .into_iter()
-        .map(|symbol| Ok((symbol.symbol.clone(), bars_sql(c, &symbol.symbol, 260)?)))
-        .collect::<Result<Vec<_>>>()?;
-    scan_histories(name, histories, Provenance::Cached)
+    let mut histories = vec![];
+    let mut skipped = vec![];
+    for (symbol, rows) in grouped {
+        // Check every row before conversion can stop at an invalid earlier bar.
+        for row in &rows {
+            verify(row.provenance, "Whats-News scan/archive")?;
+        }
+        match convert(rows) {
+            Ok(bars) => histories.push((symbol, bars)),
+            Err(e) if e.is::<Unverified>() => return Err(e),
+            Err(e) => skipped.push(Skipped { symbol, reason: format!("invalid archived history: {e}") }),
+        }
+    }
+    Ok((histories, skipped))
+}
+fn read_histories_sql(c: Connection) -> Result<Histories> {
+    read_histories_conn(&c)
+}
+fn read_histories_conn(c: &Connection) -> Result<Histories> {
+    let tx = c.unchecked_transaction()?;
+    let symbols = {
+        let mut stmt = tx.prepare("SELECT symbol,name,group_tag FROM symbols ORDER BY symbol")?;
+        stmt.query_map([], |r| {
+            Ok(Symbol { symbol: r.get(0)?, name: r.get(1)?, group_tag: r.get(2)?, last_date: None })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    require_symbols(&symbols)?;
+    let (bars, skipped) = histories_sql(&tx, &symbols)?;
+    tx.commit()?;
+    Ok(Histories { bars, skipped })
+}
+fn scan_sql(c: &Connection, name: &str) -> Result<Scan> {
+    let histories = read_histories_conn(c)?;
+    let mut scan = scan_histories(name, histories.bars, Provenance::Cached)?;
+    scan.skipped.extend(histories.skipped);
+    Ok(scan)
 }
 pub fn scan_histories(name: &str, histories: Vec<(String, Vec<Bar>)>, provenance: Provenance) -> Result<Scan> {
-    if name.starts_with("RSI_") {
-        bail!(
-            "{name} requires the main Whats-News app on port 8050. The data service on port 8051 only supplies history for local scans."
-        );
-    }
-    let mut scan = Scan { provenance, scanned: 0, results: Vec::new() };
-    for (symbol, b) in histories {
-        if b.len() < 30 {
-            continue;
-        }
-        Bar::require_verified(&b, "Whats-News scan").map_err(anyhow::Error::msg)?;
-        scan.scanned += 1;
-        let last = b.last().unwrap();
-        let top20 = b[b.len() - 20..].iter().map(|b| b.high).fold(0.0, f64::max);
-        let mean_vol = b[b.len() - 21..b.len() - 1].iter().map(|b| b.volume).sum::<f64>() / 20.0;
-        let round2 = |n: f64| (n * 100.0).round_ties_even() / 100.0;
-        let near = round2((last.close / top20 - 1.0) * 100.0) >= -5.0;
-        let surge = mean_vol > 0.0 && round2(last.volume / mean_vol) >= 1.5;
-        let ep = round2((last.open / b[b.len() - 2].close - 1.0) * 100.0) >= 4.0 && surge;
-        let box_ = darvas(&b);
-        let matched = match name {
-            "NEAR_HIGH" => near,
-            "VOL_SURGE" => surge,
-            "EP" => ep,
-            "BREAKOUT_QUEUE" => near || surge,
-            _ => box_.is_some_and(|(_, _, state)| state == name),
-        };
-        if matched {
-            scan.results.push(ScanRow {
-                provenance,
-                symbol,
-                price: Some(last.close),
-                setup_score: None,
-                darvas_top: box_.map(|b| b.0),
-                darvas_bottom: box_.map(|b| b.1),
-                last_date: Some(date(last.ts)),
-            });
-        }
-    }
-    Ok(scan)
+    scanner::scan_cached(name, histories, provenance)
 }
 
 /// US equity sessions after `last` through `today`, saturated at six (the stale threshold).
@@ -699,7 +827,7 @@ mod tests {
         assert_eq!(scan.data.results.len(), 1);
         assert_eq!(scan.data.results[0].symbol, "BREAK");
         assert_eq!(scan.data.results[0].darvas_top, Some(10.0));
-        assert_eq!(scan.data.results[0].setup_score, None);
+        assert_eq!(scan.data.results[0].setup_score, Some(5.0));
         assert_eq!(b.scan("EP").await.unwrap().data.results.len(), 1);
         assert!(
             b.sql(|c| {
@@ -710,7 +838,15 @@ mod tests {
             .is_err()
         );
         assert_eq!(std::fs::read(&f.0).unwrap(), before);
-        assert!(b.scan("RSI_OB").await.unwrap_err().to_string().contains("requires the Whats-News HTTP"));
+        assert!(
+            b.scan("RSI_OB")
+                .await
+                .unwrap()
+                .data
+                .results
+                .iter()
+                .all(|r| r.metrics.as_ref().unwrap().daily.rsi.unwrap() >= 70.0)
+        );
         assert!(b.scan("TYPO").await.unwrap_err().to_string().contains("Unknown scan"));
     }
     #[tokio::test]
@@ -728,14 +864,12 @@ mod tests {
         assert!(!missing.exists());
     }
     // Minimal HTTP fixture also enforces GET-only requests; no service or real DB needed.
-    fn http_fixture(
-        routes: Vec<(&'static str, u16, impl Into<String> + Send + 'static)>,
-    ) -> (String, std::thread::JoinHandle<()>) {
+    fn http_fixture(routes: Vec<(&'static str, u16, impl Into<String>)>) -> (String, std::thread::JoinHandle<()>) {
+        let routes: Vec<_> = routes.into_iter().map(|(path, status, body)| (path, status, body.into())).collect();
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
         let handle = std::thread::spawn(move || {
             for (path, status, body) in routes {
-                let body = body.into();
                 let (mut socket, _) = listener.accept().unwrap();
                 socket.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
                 let mut request = Vec::new();
@@ -751,6 +885,20 @@ mod tests {
         });
         (url, handle)
     }
+    fn scan_bar_json() -> String {
+        let end = d("2026-10-20");
+        serde_json::Value::Array(
+            (0..30)
+                .map(|i| {
+                    serde_json::json!({
+                        "date":(end-chrono::Duration::days(29-i)).to_string(),
+                        "open":10,"high":11,"low":9,"close":11,"volume":100
+                    })
+                })
+                .collect(),
+        )
+        .to_string()
+    }
     const BAR_JSON: &str = r#"[{"date":"2026-10-20","open":10,"high":12,"low":9,"close":11,"volume":100}]"#;
     #[tokio::test]
     async fn prefers_http_and_displays_missing_from_404() {
@@ -758,11 +906,12 @@ mod tests {
             ("/api/symbols", 200, r#"[{"symbol":"API","name":"HTTP only"}]"#),
             ("/api/ohlcv/API?freq=daily&limit=1", 404, r#"{"error":"No data. Fetch the symbol first."}"#),
             (
-                "/api/setups/scan?setup=DARVAS_BREAKOUT&universe=1&limit=0",
+                "/api/setups/scan?universe=1&limit=0",
                 200,
                 r#"{"scanned":40,"results":[{"symbol":"API","price":11,"setup_score":3}]}"#,
             ),
-            ("/api/ohlcv/API?freq=daily&limit=1000000", 200, BAR_JSON),
+            ("/api/symbols", 200, r#"[{"symbol":"API"}]"#),
+            ("/api/ohlcv/API?freq=daily&limit=1000000", 200, &scan_bar_json()),
             ("/api/ohlcv/API?freq=daily&limit=1000000", 200, BAR_JSON),
         ]);
         let f = Fixture::new();
@@ -771,11 +920,11 @@ mod tests {
         assert!(universe.source.contains("HTTP"));
         assert_eq!(universe.data[0].symbol, "API");
         assert_eq!(universe.data[0].status(today()), "MISSING");
-        let scan = b.scan("DARVAS_BREAKOUT").await.unwrap();
+        let scan = b.scan("NEAR_HIGH").await.unwrap();
         assert_eq!(scan.provenance, Provenance::Real);
         assert_eq!(scan.data.provenance, Provenance::Real);
         assert_eq!(scan.data.results[0].provenance, Provenance::Real);
-        assert_eq!(scan.data.scanned, 40);
+        assert_eq!(scan.data.scanned, 1);
         assert_eq!(scan.data.results[0].last_date.as_deref(), Some("2026-10-20"));
         let bars = b.bars("API").await.unwrap();
         assert_eq!(bars.data[0].close, 11.0);
@@ -805,8 +954,9 @@ mod tests {
                     "result" => scan["results"][0]["provenance"] = provenance.into(),
                     _ => bars[0]["provenance"] = provenance.into(),
                 }
-                let mut routes = vec![("/api/setups/scan?setup=NEAR_HIGH&universe=1&limit=0", 200, scan.to_string())];
+                let mut routes = vec![("/api/setups/scan?universe=1&limit=0", 200, scan.to_string())];
                 if scope == "bars" {
+                    routes.push(("/api/symbols", 200, r#"[{"symbol":"API"}]"#.to_owned()));
                     routes.push(("/api/ohlcv/API?freq=daily&limit=1000000", 200, bars.to_string()));
                 }
                 let (url, server) = http_fixture(routes);
@@ -948,9 +1098,9 @@ mod tests {
             })
             .collect();
         let (url, server) = http_fixture(vec![
-            ("/api/setups/scan?setup=NEAR_HIGH&universe=1&limit=0", 404, "{}".to_owned()),
+            ("/api/setups/scan?universe=1&limit=0", 404, "{}".to_owned()),
             ("/api/symbols", 200, r#"[{"symbol":"API"}]"#.to_owned()),
-            ("/api/ohlcv/API?freq=daily&limit=260", 200, serde_json::to_string(&rows).unwrap()),
+            ("/api/ohlcv/API?freq=daily&limit=1000000", 200, serde_json::to_string(&rows).unwrap()),
         ]);
         let f = Fixture::new();
         let scan = Bridge::new(f.0.with_extension("missing"), Some(url), true).scan("NEAR_HIGH").await.unwrap();
@@ -1006,5 +1156,87 @@ mod tests {
         let mut tilde = config;
         tilde.archive_path = "~/archive/finance.db".into();
         assert_eq!(tilde.archive(), PathBuf::from(std::env::var_os("HOME").unwrap()).join("archive/finance.db"));
+    }
+    #[test]
+    fn service_fields_are_preserved_without_overwriting_rust_metrics_and_reject_samples() {
+        let json = serde_json::json!({"scanned":1,"results":[{
+            "symbol":"X","price":100,"ready":true,"change_pct":2.0,"setups":["NEAR_HIGH"],
+            "setup_count":1,"setup_score":4,"rs_rank_21d":2,"rs_n":10,
+            "dist_20d_high_pct":-1.0,"vol_ratio_5_20":1.6,"adr_pct":3.0,"gap_pct":0.5,
+            "regime":"uptrend","regime_weekly":"range","ret_21d_pct":8.0,
+            "darvas_state":"in_box","darvas_top":101.0,"darvas_bottom":90.0
+        }]});
+        let mut scan = Scan {
+            provenance: Provenance::Cached,
+            scanned: 1,
+            skipped: vec![],
+            results: vec![ScanRow {
+                provenance: Provenance::Cached,
+                symbol: "X".into(),
+                price: Some(100.0),
+                metrics: Some(Metrics { score: 2.0, ret_21d_pct: 5.0, ..Default::default() }),
+                ..Default::default()
+            }],
+        };
+        attach_service(&mut scan, serde_json::from_value(json.clone()).unwrap()).unwrap();
+        let row = &scan.results[0];
+        let fields = &row.service;
+        assert!(row.from_service);
+        assert_eq!(row.setup_score, Some(4.0));
+        assert_eq!(row.darvas_top, Some(101.0));
+        assert_eq!(row.darvas_bottom, Some(90.0));
+        assert_eq!(row.metrics.as_ref().unwrap().score, 2.0);
+        assert_eq!(row.metrics.as_ref().unwrap().ret_21d_pct, 5.0);
+        assert_eq!(fields.ready, Some(true));
+        assert_eq!(fields.change_pct, Some(2.0));
+        assert_eq!(fields.setups, ["NEAR_HIGH"]);
+        assert_eq!(fields.setup_count, Some(1));
+        assert_eq!((fields.rs_rank_21d, fields.rs_n), (Some(2), Some(10)));
+        assert_eq!(fields.dist_20d_high_pct, Some(-1.0));
+        assert_eq!(fields.vol_ratio_5_20, Some(1.6));
+        assert_eq!(fields.adr_pct, Some(3.0));
+        assert_eq!(fields.gap_pct, Some(0.5));
+        assert_eq!(fields.regime.as_deref(), Some("uptrend"));
+        assert_eq!(fields.regime_weekly.as_deref(), Some("range"));
+        assert_eq!(fields.ret_21d_pct, Some(8.0));
+        assert_eq!(fields.darvas_state.as_deref(), Some("in_box"));
+        assert_eq!(scan.provenance, Provenance::Cached);
+        for scope in ["scan", "row"] {
+            let mut bad = json.clone();
+            if scope == "scan" {
+                bad["provenance"] = "Sample".into();
+            } else {
+                bad["results"][0]["provenance"] = "Sample".into();
+            }
+            assert!(
+                attach_service(&mut scan, serde_json::from_value(bad).unwrap())
+                    .unwrap_err()
+                    .to_string()
+                    .contains("refused")
+            );
+        }
+    }
+    #[tokio::test]
+    async fn sqlite_reports_skips_and_invalidates_cached_scans_after_archive_changes() {
+        let fixture = Fixture::new();
+        let bridge = fixture.bridge();
+        let c = Connection::open(&fixture.0).unwrap();
+        c.execute_batch("INSERT INTO symbols VALUES('BAD',NULL,NULL); INSERT INTO ohlcv VALUES('BAD','daily','2026-08-30',10,1,8,9,100);").unwrap();
+        let first = bridge.scan("VOL_SURGE").await.unwrap();
+        assert_eq!(first.data.results.len(), 1);
+        for (symbol, reason) in
+            [("BAD", "invalid archived"), ("EMPTY", "missing daily"), ("SHORT", "insufficient daily")]
+        {
+            assert!(first.data.skipped.iter().find(|s| s.symbol == symbol).unwrap().reason.contains(reason));
+        }
+        c.execute_batch("UPDATE ohlcv SET volume=100 WHERE symbol='BREAK'").unwrap();
+        assert!(bridge.scan("VOL_SURGE").await.unwrap().data.results.is_empty());
+        let near = bridge.scan("NEAR_HIGH").await.unwrap();
+        let m = near.data.results[0].metrics.as_ref().unwrap();
+        assert_eq!(m.volume_ratio, Some(1.0));
+        assert!(m.daily.rsi.is_some());
+        assert!(m.monthly.unavailable.is_some());
+        c.execute_batch("ALTER TABLE ohlcv ADD COLUMN provenance TEXT DEFAULT 'Real'; UPDATE ohlcv SET provenance='Sample' WHERE symbol='BAD'").unwrap();
+        assert!(bridge.scan("NEAR_HIGH").await.unwrap_err().is::<Unverified>());
     }
 }

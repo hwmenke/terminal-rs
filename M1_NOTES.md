@@ -47,7 +47,13 @@ Example (before a connection configuration has been saved): `WHATS_NEWS_URL=off 
 
 HTTP supports the existing service's nine setups: `DARVAS_BREAKOUT`, `DARVAS_BOX`, `DARVAS_FAIL`, `NEAR_HIGH`, `VOL_SURGE`, `EP`, `BREAKOUT_QUEUE`, `RSI_OB`, `RSI_OS`. Invalid names (including bare `SCAN`) display the choices.
 
-SQLite supports the first seven. Darvas follows `portfolio.py`'s 20-bar high / three-bar confirmation over up to 260 stored daily bars. Basic gap, near-high and volume conditions follow the same thresholds; volume compares the latest bar with the **preceding** 20 bars. SQLite scans require at least 30 daily bars and sort by ticker. They deliberately omit the Python composite score/rank; HTTP results retain the service score. Source and ordering differences are explained in the pane. Stale symbols remain eligible and are clearly marked.
+Step 5 extends SQLite and local Yahoo archives to all nine setups, using shared
+Rust calculations over full daily history. It adds strength/RSI, volume and range
+filters and sorting, completed weekly/monthly conditions, default stale exclusion,
+per-symbol skip explanations, batched SQLite reads and calculation caching.
+Original HTTP service fields remain separately labelled. See
+[Scanner calculations and controls](docs/SCANNERS.md) for the current contract.
+
 
 ## Dependable-link validation
 

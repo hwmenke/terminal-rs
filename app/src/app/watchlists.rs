@@ -825,12 +825,14 @@ mod tests {
         let chart = app.new_pane(PaneKind::Chart(Box::new(ChartState::new(0, "SPY", tr_core::Timeframe::D1))));
         let list = app.new_pane(PaneKind::Research(Box::new(ResearchPane::new(Some("NEAR_HIGH".into())))));
         if let PaneKind::Research(r) = &mut app.panes[1].kind {
+            r.set_include_stale_for_test();
             r.accept_scan(Ok(Snapshot {
                 source: "test archive".into(),
                 provenance: Provenance::Real,
                 data: Scan {
                     provenance: Provenance::Real,
                     scanned: 3,
+                    skipped: vec![],
                     results: ["AAPL", "MSFT", "NVDA"]
                         .iter()
                         .map(|s| ScanRow {
@@ -841,6 +843,7 @@ mod tests {
                             darvas_top: None,
                             darvas_bottom: None,
                             last_date: Some("2026-10-20".into()),
+                            ..Default::default()
                         })
                         .collect(),
                 },
