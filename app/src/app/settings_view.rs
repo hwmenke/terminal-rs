@@ -224,6 +224,7 @@ impl TerminalApp {
                 super::PaneKind::Research(r) => r.request(pane.id, &self.worker),
                 super::PaneKind::Chart(c) if c.archive => c.load(&self.worker),
                 super::PaneKind::Stats(s) => s.request(pane.id, &self.worker),
+                super::PaneKind::Backtest(b) => b.request(pane.id, &self.worker),
                 _ => {}
             }
         }
@@ -844,6 +845,9 @@ impl TerminalApp {
             if ui.button("Export statistics").clicked() {
                 self.run_export(crate::command::ExportKind::Stats, &self.io_path.clone());
             }
+            if ui.button("Export backtest").clicked() {
+                self.run_export(crate::command::ExportKind::Backtest, &self.io_path.clone());
+            }
         });
         ui.horizontal_wrapped(|ui| {
             if ui.button("Back up workspace").clicked() {
@@ -865,7 +869,7 @@ impl TerminalApp {
         ui.add_space(8.0);
         ui.label(
             RichText::new(format!(
-                "Commands: EXPORT · EXPORT SCAN · EXPORT JOURNAL · EXPORT HIST · EXPORT STATS · BACKUP · RESTORE <path>. Files stay out of {}/secrets.",
+                "Commands: EXPORT · EXPORT SCAN · EXPORT JOURNAL · EXPORT HIST · EXPORT STATS · EXPORT BACKTEST · BACKUP · RESTORE <path>. Files stay out of {}/secrets.",
                 crate::worker::data_dir().display()
             ))
             .font(ui_font(11.5))

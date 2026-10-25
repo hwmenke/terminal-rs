@@ -138,6 +138,21 @@ pub enum PaneSettings {
         #[serde(default)]
         conditional: bool,
     },
+    /// Paper strategy backtest vs buy-and-hold for one research symbol.
+    Backtest {
+        #[serde(default)]
+        symbol: String,
+        #[serde(default)]
+        spec: String,
+        #[serde(default)]
+        holdout: String,
+        #[serde(default)]
+        commission: String,
+        #[serde(default)]
+        slippage: String,
+        #[serde(default)]
+        shorts: bool,
+    },
     /// Brokerage portfolio view (credentials are never stored in layouts).
     Portfolio {
         #[serde(default)]

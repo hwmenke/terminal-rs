@@ -661,6 +661,20 @@ impl TerminalApp {
             }
             if nav_row(
                 ui,
+                Icon::Chart,
+                "Backtest",
+                Some("BT"),
+                is_focused(&PaneKind::Backtest(Box::new(super::backtest::BacktestPane::new(
+                    String::new(),
+                    String::new(),
+                )))),
+            )
+            .clicked()
+            {
+                out.push(SidebarCmd::Function(Function::Backtest { spec: String::new() }));
+            }
+            if nav_row(
+                ui,
                 Icon::Grid,
                 "PM Desk",
                 Some("DESK"),

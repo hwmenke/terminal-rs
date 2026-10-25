@@ -56,6 +56,15 @@ const COMMANDS: &[(&str, &str, &str, Option<Action>)] = &[
     ("CDIST", "Conditional returns (alias)", "distribution baseline", None),
     ("EXPORT STATS", "Export statistics with source and date", "conditional returns provenance", None),
     (
+        "BACKTEST",
+        "Paper backtest vs buy-and-hold with costs and a chronological holdout",
+        "strategy evaluate cagr completed trades",
+        None,
+    ),
+    ("AAPL BACKTEST", "AAPL paper backtest versus buy-and-hold", "holdout costs next open", None),
+    ("AAPL BT ADTREND", "AAPL Adaptive Trend vs buy-and-hold on the evaluate window", "adaptive trend backtest", None),
+    ("EXPORT BACKTEST", "Export backtest settings, costs, holdout and metrics", "paper research provenance", None),
+    (
         "JOURNAL",
         "Trade journal: setups, checklist, $ and R outcomes",
         "checklist tradelog notes",
@@ -240,6 +249,10 @@ pub(super) fn static_items() -> Vec<Item> {
     v.push(
         Item::new(Kind::Panel, "New Statistics pane", "NEW STATS", Target::Run("NEW STATS".into()))
             .keywords("panel pane statistics conditional returns"),
+    );
+    v.push(
+        Item::new(Kind::Panel, "New Backtest pane", "NEW BACKTEST", Target::Run("NEW BACKTEST".into()))
+            .keywords("panel pane backtest strategy buy hold holdout costs"),
     );
     v.push(
         Item::new(

@@ -5,6 +5,7 @@
 //! content) and `settings_view` (preferences UI).
 
 mod alerts;
+mod backtest;
 mod backup;
 mod broker;
 mod chrome;
@@ -89,6 +90,8 @@ pub enum PaneKind {
     Journal(Box<journal::JournalPane>),
     /// Historical risk/return and conditional forward returns (`STATS` / `COND`).
     Stats(Box<stats::StatsPane>),
+    /// Strategy vs buy-and-hold paper backtest (`BACKTEST` / `BT`).
+    Backtest(Box<backtest::BacktestPane>),
     Settings,
 }
 
@@ -279,6 +282,13 @@ impl PaneKind {
                     format!("{} Stats", tr_data::security(&s.symbol).ticker)
                 }
             }
+            PaneKind::Backtest(b) => {
+                if b.symbol.trim().is_empty() {
+                    "Backtest".into()
+                } else {
+                    format!("{} Backtest", tr_data::security(&b.symbol).ticker)
+                }
+            }
             PaneKind::Settings => "Settings".into(),
         }
     }
@@ -311,6 +321,7 @@ impl PaneKind {
             PaneKind::Desk(_) => "DESK",
             PaneKind::Journal(_) => "JRNL",
             PaneKind::Stats(_) => "STATS",
+            PaneKind::Backtest(_) => "BT",
             PaneKind::Settings => "PDF",
         }
     }
@@ -395,6 +406,14 @@ impl PaneKind {
                 condition: s.condition.clone(),
                 conditional: s.tab == stats::StatsTab::Conditional,
             },
+            PaneKind::Backtest(b) => PaneSettings::Backtest {
+                symbol: b.symbol.clone(),
+                spec: b.strategies.clone(),
+                holdout: b.holdout.clone(),
+                commission: b.commission.clone(),
+                slippage: b.slippage.clone(),
+                shorts: b.allow_short,
+            },
         }
     }
 
@@ -468,6 +487,14 @@ impl PaneKind {
             PaneSettings::Journal { filter } => PaneKind::Journal(Box::new(journal::JournalPane::new(filter))),
             PaneSettings::Stats { symbol, condition, conditional } => {
                 PaneKind::Stats(Box::new(stats::StatsPane::new(symbol, condition, conditional)))
+            }
+            PaneSettings::Backtest { symbol, spec, holdout, commission, slippage, shorts } => {
+                let mut pane = backtest::BacktestPane::new(symbol, spec);
+                pane.holdout = holdout;
+                pane.commission = commission;
+                pane.slippage = slippage;
+                pane.allow_short = shorts;
+                PaneKind::Backtest(Box::new(pane))
             }
         }
     }
@@ -971,6 +998,7 @@ impl TerminalApp {
             Command::SymbolFunction(s, Function::Stats { condition, conditional }) => {
                 self.open_stats(Some(&s), &condition, conditional)
             }
+            Command::SymbolFunction(s, Function::Backtest { spec }) => self.open_backtest(Some(&s), &spec),
             Command::SymbolFunction(s, Function::JournalNote { date, text }) => {
                 self.add_journal_note(Some(&s), &date, &text)
             }
@@ -1050,7 +1078,7 @@ impl TerminalApp {
                     }
                     None => {
                         self.status = format!(
-                            "Unknown panel {spec:?}; try CHART, NEWS, BOOK, WEI, GC, CONG, WL, DESK, JOURNAL, STATS, PORT"
+                            "Unknown panel {spec:?}; try CHART, NEWS, BOOK, WEI, GC, CONG, WL, DESK, JOURNAL, STATS, BACKTEST, PORT"
                         )
                     }
                 }
@@ -1142,6 +1170,7 @@ impl TerminalApp {
             Function::Desk => self.open_desk(symbol.as_deref()),
             Function::Journal(extra) => self.open_journal(symbol.as_deref(), &extra),
             Function::Stats { condition, conditional } => self.open_stats(symbol.as_deref(), &condition, conditional),
+            Function::Backtest { spec } => self.open_backtest(symbol.as_deref(), &spec),
             Function::JournalNote { date, text } => self.add_journal_note(symbol.as_deref(), &date, &text),
             Function::Latest => self.with_chart(|c, _| c.jump_latest()),
             Function::ReviewOverlay(which) => self.with_chart(|c, _| match which {
@@ -1209,6 +1238,7 @@ impl TerminalApp {
                             PaneKind::Research(r) => r.request(pane.id, &self.worker),
                             PaneKind::Chart(c) if c.archive => c.load(&self.worker),
                             PaneKind::Stats(s) => s.request(pane.id, &self.worker),
+                            PaneKind::Backtest(b) => b.request(pane.id, &self.worker),
                             _ => {}
                         }
                     }
@@ -1250,6 +1280,13 @@ impl TerminalApp {
                     if let Some(PaneKind::Stats(s)) = self.panes.iter_mut().find(|p| p.id == pane).map(|p| &mut p.kind)
                     {
                         s.accept(generation, result);
+                    }
+                }
+                Response::Backtest { pane, generation, result } => {
+                    if let Some(PaneKind::Backtest(b)) =
+                        self.panes.iter_mut().find(|p| p.id == pane).map(|p| &mut p.kind)
+                    {
+                        b.accept(generation, result);
                     }
                 }
                 Response::History {
@@ -2247,6 +2284,14 @@ mod tests {
             PaneSettings::Research(None),
             PaneSettings::Research(Some("DARVAS_BREAKOUT".into())),
             PaneSettings::Desk { group: "Growth".into(), selected: Some("AAPL US Equity".into()) },
+            PaneSettings::Backtest {
+                symbol: "AAPL US Equity".into(),
+                spec: "ADTREND".into(),
+                holdout: "20%".into(),
+                commission: "5".into(),
+                slippage: "5".into(),
+                shorts: false,
+            },
             {
                 let mut c = ChartState::new(0, "AAPL", tr_core::Timeframe::D1);
                 c.archive = true;

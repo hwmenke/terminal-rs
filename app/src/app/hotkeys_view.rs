@@ -284,8 +284,12 @@ impl TerminalApp {
                         "Historical risk/returns; what followed low RSI or price above a moving average",
                     ),
                     (
-                        &["EXPORT", "EXPORT SCAN", "EXPORT JOURNAL", "EXPORT HIST", "BACKUP", "RESTORE"],
-                        "Export scans/history/journal with source and date; back up or restore workspace (no credentials)",
+                        &["BACKTEST", "AAPL BACKTEST", "AAPL BT ADTREND"],
+                        "Paper backtest vs buy-and-hold: costs, next-open fills, chronological holdout, completed-trade win rate",
+                    ),
+                    (
+                        &["EXPORT", "EXPORT SCAN", "EXPORT JOURNAL", "EXPORT HIST", "EXPORT BACKTEST", "BACKUP", "RESTORE"],
+                        "Export scans/history/journal/backtests with source and date; back up or restore workspace (no credentials)",
                     ),
                     (&["PREFS"], "Settings: theme, fonts, density, hotkeys, layouts, backup"),
                     (&["UPDATE"], "Check for updates"),

@@ -20,7 +20,7 @@ use crate::widgets::{self, Icon};
 use crate::worker::{Request, Worker};
 
 /// Panels offered by the + menus: label and command word.
-pub const PANELS: [(&str, &str); 15] = [
+pub const PANELS: [(&str, &str); 16] = [
     ("Chart", "CHART"),
     ("Watchlist", "WL"),
     ("News", "NEWS"),
@@ -33,6 +33,7 @@ pub const PANELS: [(&str, &str); 15] = [
     ("Politicians", "POL"),
     ("Alerts", "ALRT"),
     ("Journal", "JOURNAL"),
+    ("Backtest", "BACKTEST"),
     ("Security Search", "SECF"),
     ("Settings", "PREFS"),
     ("Help", "HELP"),
@@ -397,6 +398,15 @@ impl TerminalApp {
                 }
                 s.request(id, &self.worker);
                 PaneKind::Stats(s)
+            }
+            PaneKind::Backtest(mut b) => {
+                if b.symbol.trim().is_empty() {
+                    if let Some(sym) = self.focused_symbol() {
+                        b.symbol = sym;
+                    }
+                }
+                b.request(id, &self.worker);
+                PaneKind::Backtest(b)
             }
             PaneKind::Ticker { symbol, .. } => {
                 self.worker.send(Request::TickerTrades { pane: id, symbol: symbol.clone() });
@@ -799,6 +809,11 @@ impl TerminalApp {
                     condition,
                     matches!(head.as_str(), "COND" | "CDIST" | "CONDRET"),
                 )))
+            }
+            "BACKTEST" | "BT" | "BTEST" => {
+                let symbol = given.or(current).unwrap_or_default();
+                let spec = words.get(1..).unwrap_or(&[]).join(" ");
+                PaneKind::Backtest(Box::new(super::backtest::BacktestPane::new(symbol, spec)))
             }
             "DESK" | "PM" | "PMDESK" | "RISK" => {
                 let group = words.get(1).cloned().unwrap_or(self.watch_ui.selected_group.as_str()).to_string();

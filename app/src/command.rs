@@ -297,6 +297,10 @@ pub enum Function {
         condition: String,
         conditional: bool,
     },
+    /// Paper strategy backtest vs buy-and-hold (`BACKTEST`, `AAPL BT ADTREND`).
+    Backtest {
+        spec: String,
+    },
     /// Attach a note to a historical chart date (`NOTE`, `AAPL NOTE 2026-10-24 text`).
     JournalNote {
         date: String,
@@ -306,7 +310,7 @@ pub enum Function {
     Latest,
     /// Toggle a persisted review overlay on the focused chart.
     ReviewOverlay(ReviewOverlay),
-    /// `EXPORT SCAN|JOURNAL|HIST|STATS|WORKSPACE [path]`.
+    /// `EXPORT SCAN|JOURNAL|HIST|STATS|BACKTEST|WORKSPACE [path]`.
     Export(ExportKind, String),
     /// `BACKUP [path]` — portable workspace backup (no credentials).
     Backup(String),
@@ -322,6 +326,7 @@ pub enum ExportKind {
     History,
     Workspace,
     Stats,
+    Backtest,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -476,6 +481,7 @@ fn parse_function(head: &str, rest: &[&str]) -> Option<Function> {
         "JOURNAL" | "JRNL" | "CHECKLIST" | "TRADELOG" => Function::Journal(joined()),
         "STATS" | "STAT" | "STATISTICS" => Function::Stats { condition: joined(), conditional: !rest.is_empty() },
         "COND" | "CDIST" | "CONDRET" => Function::Stats { condition: joined(), conditional: true },
+        "BACKTEST" | "BT" | "BTEST" => Function::Backtest { spec: joined() },
         "NOTE" | "JNOTE" => {
             let (date, text) = split_note_args(rest);
             Function::JournalNote { date, text }
@@ -493,6 +499,7 @@ fn parse_function(head: &str, rest: &[&str]) -> Option<Function> {
                 Some("STATS" | "STAT" | "COND" | "CDIST") => {
                     (ExportKind::Stats, rest.get(1..).unwrap_or(&[]).join(" "))
                 }
+                Some("BACKTEST" | "BT" | "BTEST") => (ExportKind::Backtest, rest.get(1..).unwrap_or(&[]).join(" ")),
                 Some("WORKSPACE" | "BACKUP" | "WS") => (ExportKind::Workspace, rest.get(1..).unwrap_or(&[]).join(" ")),
                 _ => (ExportKind::Auto, joined()),
             };
@@ -695,6 +702,10 @@ fn describe(f: &Function) -> String {
             }
         }
         Function::Stats { condition, .. } => format!("Conditional returns after {condition}"),
+        Function::Backtest { spec } if spec.is_empty() => {
+            "Paper backtest: declared strategies vs buy-and-hold on a chronological holdout".into()
+        }
+        Function::Backtest { spec } => format!("Paper backtest vs buy-and-hold ({spec})"),
         Function::JournalNote { date, text } if date.is_empty() && text.is_empty() => {
             "Attach a note to the focused chart date".into()
         }
@@ -729,6 +740,10 @@ fn describe(f: &Function) -> String {
             "Export statistics and conditional returns with source, as-of and provenance".into()
         }
         Function::Export(ExportKind::Stats, p) => format!("Export statistics to {p}"),
+        Function::Export(ExportKind::Backtest, p) if p.is_empty() => {
+            "Export the paper backtest with costs, holdout, execution and provenance".into()
+        }
+        Function::Export(ExportKind::Backtest, p) => format!("Export backtest to {p}"),
         Function::Export(ExportKind::Workspace, p) if p.is_empty() => {
             "Back up personal workspace data (credentials excluded)".into()
         }
@@ -843,6 +858,15 @@ mod tests {
             Some(Command::Function(Function::Stats { condition: "RSI(14) < 30".into(), conditional: true }))
         );
         assert_eq!(parse("EXPORT STATS"), Some(Command::Function(Function::Export(ExportKind::Stats, String::new()))));
+        assert_eq!(parse("BACKTEST"), Some(Command::Function(Function::Backtest { spec: String::new() })));
+        assert_eq!(
+            parse("AAPL BT ADTREND"),
+            Some(Command::SymbolFunction("AAPL US Equity".into(), Function::Backtest { spec: "ADTREND".into() }))
+        );
+        assert_eq!(
+            parse("EXPORT BACKTEST"),
+            Some(Command::Function(Function::Export(ExportKind::Backtest, String::new())))
+        );
         assert_eq!(parse("BACKUP"), Some(Command::Function(Function::Backup(String::new()))));
         assert_eq!(
             parse("RESTORE ~/Downloads/workspace.json"),

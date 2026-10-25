@@ -33,6 +33,7 @@ impl TerminalApp {
             ExportKind::Journal => self.export_journal(path),
             ExportKind::History => self.export_history(path),
             ExportKind::Stats => self.export_stats(path),
+            ExportKind::Backtest => self.export_backtest(path),
             ExportKind::Workspace => self.backup_workspace(path),
         }
     }
@@ -43,6 +44,7 @@ impl TerminalApp {
             Some(PaneKind::Research(_)) => Some(ExportKind::Scan),
             Some(PaneKind::Journal(_)) => Some(ExportKind::Journal),
             Some(PaneKind::Stats(_)) => Some(ExportKind::Stats),
+            Some(PaneKind::Backtest(_)) => Some(ExportKind::Backtest),
             Some(PaneKind::Settings) => Some(ExportKind::Workspace),
             _ => None,
         }
@@ -98,6 +100,31 @@ impl TerminalApp {
         };
         match env::stats_document(snapshot, env::now_rfc3339()) {
             Ok(doc) => self.finish_write(&doc, path, "Exported statistics"),
+            Err(e) => self.status = e,
+        }
+    }
+
+    fn export_backtest(&mut self, path: &str) {
+        let pane = self.panes.iter().find(|p| p.id == self.focus).and_then(|p| match &p.kind {
+            PaneKind::Backtest(b) => Some(b),
+            _ => None,
+        });
+        let pane = pane.or_else(|| {
+            self.panes.iter().find_map(|p| match &p.kind {
+                PaneKind::Backtest(b) => Some(b),
+                _ => None,
+            })
+        });
+        let Some(pane) = pane else {
+            self.status = "EXPORT BACKTEST needs an open BACKTEST pane with results".into();
+            return;
+        };
+        let Some(report) = &pane.report else {
+            self.status = "BACKTEST has no results to export yet".into();
+            return;
+        };
+        match env::backtest_document(report, env::now_rfc3339()) {
+            Ok(doc) => self.finish_write(&doc, path, "Exported backtest"),
             Err(e) => self.status = e,
         }
     }
@@ -170,6 +197,11 @@ impl TerminalApp {
             Kind::Stats => {
                 self.status =
                     "Statistics exports are snapshots and are not restored into STATS. Open the JSON file instead."
+                        .into();
+            }
+            Kind::Backtest => {
+                self.status =
+                    "Backtest exports are snapshots and are not restored into BACKTEST. Open the JSON file instead."
                         .into();
             }
         }

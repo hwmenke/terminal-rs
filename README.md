@@ -228,8 +228,13 @@ gets the native title bar with traffic lights, window vibrancy behind the sideba
   Trend on the chart: SB/MB/LB baselines, destination bands, medium-regime flips
   and MRT/LRT trailing-stop guides. Sample / unverified bars are refused. See
   [Adaptive Trend](docs/ADAPTIVE_TREND.md).
-- **Export and recovery** — `EXPORT SCAN`, `EXPORT JOURNAL`, `EXPORT HIST` and
-  `EXPORT STATS` write JSON
+- **Strategy backtests** — `BACKTEST` (or `AAPL BACKTEST`, `AAPL BT ADTREND`)
+  compares declared strategies to buy-and-hold on a chronological holdout, with
+  commission and slippage, next-open fills, CAGR and **completed-trade** win
+  rate (not up-days). Sample bars are refused. Paper / research only. See
+  [Backtests](docs/BACKTEST.md).
+- **Export and recovery** — `EXPORT SCAN`, `EXPORT JOURNAL`, `EXPORT HIST`,
+  `EXPORT STATS` and `EXPORT BACKTEST` write JSON
   with source, as-of date and provenance. Sample-tagged rows name the file `SAMPLE`.
   `BACKUP` / `RESTORE` copy personal workspace data (layouts, themes, prefs, watchlists,
   journal, alerts) and **exclude credentials**. See
@@ -384,7 +389,9 @@ Settings › Hotkeys. On Linux and Windows ⌘ is Ctrl and ⌥ is Alt.
 | `THEME BLOOMBERG` · `THEME NEXT` · `THEME SYSTEM` · `THEME EDIT` · `THEME COMPACT` · `LAYOUT THEME ON` | themes |
 | `DESK` · `AAPL DESK` · `NEW DESK` | PM Desk: watchlist leaders, group performance, position size |
 | `JOURNAL` · `AAPL JOURNAL` · `AAPL NOTE 2026-10-24 wait` · `NEW JOURNAL` | Trade journal: setup, checklist, $ risk, $ and R outcome, date notes |
-| `EXPORT` · `EXPORT SCAN` · `EXPORT JOURNAL` · `EXPORT HIST` · `BACKUP` · `RESTORE path` | Export scans/history/journal; workspace backup/restore (no credentials) |
+| `STATS` · `AAPL STATS` · `AAPL COND RSI(14) < 30` | Historical risk/returns and what followed a condition |
+| `BACKTEST` · `AAPL BACKTEST` · `AAPL BT ADTREND` · `NEW BACKTEST` | Paper backtest vs buy-and-hold (costs, next-open, chronological holdout) |
+| `EXPORT` · `EXPORT SCAN` · `EXPORT JOURNAL` · `EXPORT HIST` · `EXPORT STATS` · `EXPORT BACKTEST` · `BACKUP` · `RESTORE path` | Export scans/history/journal/stats/backtests; workspace backup/restore (no credentials) |
 | `PORT` · `ACCT` · `POS` · `ORD` · `ACTV` · `AAPL POS` · `AAPL ORD` | brokerage portfolio · accounts and balances · positions · orders · activity · one security |
 | `PORT REFRESH` · `PORT CONNECT` · `PORT SETUP` (`BROKER`) | reload accounts · connect a broker in the browser · SnapTrade keys |
 | `BUY AAPL 10` · `SELL ALL TSLA` · `SELL MSFT 5 LMT 410` · `SELL TSLA 3 STP 250 LMT 245` · `BUY NVDA $500` · `TRADE` | order ticket, prefilled (demo: one click; live: review and confirm) |

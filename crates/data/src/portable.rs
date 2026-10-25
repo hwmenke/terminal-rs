@@ -47,6 +47,7 @@ pub enum Kind {
     Journal,
     Workspace,
     Stats,
+    Backtest,
 }
 
 impl Kind {
@@ -57,6 +58,7 @@ impl Kind {
             Self::Journal => "journal",
             Self::Workspace => "workspace",
             Self::Stats => "stats",
+            Self::Backtest => "backtest",
         }
     }
 }
@@ -473,6 +475,31 @@ pub fn import_history(archive: &mut Archive, doc: &Document) -> Result<usize, St
     Ok(imported)
 }
 
+/// Strategy backtest snapshot. Sample-tagged reports stay labelled and are not restored.
+pub fn backtest_document(
+    report: &crate::backtest::BacktestReport,
+    exported_at: impl Into<String>,
+) -> Result<Document, String> {
+    let sample = report.provenance == Provenance::Sample || !report.provenance.is_verified();
+    if !sample {
+        report.provenance.require_verified("export BACKTEST")?;
+    }
+    let payload = serde_json::to_value(report).map_err(|e| format!("backtest payload: {e}"))?;
+    let (sample, sample_label) = sample_fields(sample || report.provenance == Provenance::Sample);
+    Ok(Document {
+        format: FORMAT,
+        kind: Kind::Backtest,
+        exported_at: exported_at.into(),
+        source: report.source.clone(),
+        as_of_date: Some(report.as_of.clone()).filter(|s| !s.is_empty()),
+        provenance: report.provenance,
+        sample,
+        sample_label,
+        credentials_excluded: true,
+        payload,
+    })
+}
+
 /// Statistics / conditional-return snapshot. Sample-tagged reports stay labelled.
 pub fn stats_document(
     snapshot: &crate::stats::ResearchSnapshot,
@@ -709,5 +736,41 @@ mod tests {
         assert_eq!(doc.provenance, Provenance::Real);
         assert_eq!(doc.payload["stats"]["ticker"], "AAPL");
         assert!(doc.filename().starts_with("terminal-rs-stats-"));
+    }
+
+    #[test]
+    fn backtest_export_keeps_source_as_of_and_settings() {
+        let ts = |d: &str| {
+            chrono::NaiveDate::parse_from_str(d, "%Y-%m-%d")
+                .unwrap()
+                .and_hms_opt(0, 0, 0)
+                .unwrap()
+                .and_utc()
+                .timestamp()
+        };
+        let bars: Vec<Bar> = (0..80)
+            .map(|i| {
+                let c = 50.0 + i as f64 * 0.1;
+                Bar::new(ts("2024-01-02") + i * 86_400, c, c, c, c, 1_000.0).with_provenance(Provenance::Real)
+            })
+            .collect();
+        let settings =
+            crate::backtest::RunSettings::default().with_strategies(vec![crate::backtest::StrategySpec::BuyAndHold]);
+        let report = crate::backtest::compute_report(
+            "AAPL US Equity",
+            "AAPL",
+            &bars,
+            &settings,
+            "Local Yahoo daily research archive",
+        )
+        .unwrap();
+        let doc = backtest_document(&report, "2026-10-25T00:00:00Z").unwrap();
+        assert_eq!(doc.kind, Kind::Backtest);
+        assert!(!doc.sample);
+        assert_eq!(doc.source, "Local Yahoo daily research archive");
+        assert_eq!(doc.as_of_date.as_deref(), Some(report.as_of.as_str()));
+        assert_eq!(doc.provenance, Provenance::Real);
+        assert_eq!(doc.payload["ticker"], "AAPL");
+        assert!(doc.filename().starts_with("terminal-rs-backtest-"));
     }
 }
