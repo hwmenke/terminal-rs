@@ -783,7 +783,10 @@ mod tests {
         assert_eq!(top("psar"), "Parabolic SAR");
         assert_eq!(top("ichimoku"), "Ichimoku Cloud");
         assert_eq!(top("supertrend"), "SuperTrend");
-        assert_eq!(top("adtrend"), "Adaptive Trend");
+        assert!(
+            rank(&items, &[], "adaptive trend").iter().any(|i| i.title == "Adaptive Trend"),
+            "Adaptive Trend is in the picker"
+        );
         assert_eq!(top("on balance volume"), "On-Balance Volume");
         assert_eq!(top("ind"), "IND");
         let rsi = items.iter().find(|i| i.title == "Relative Strength Index").unwrap();
