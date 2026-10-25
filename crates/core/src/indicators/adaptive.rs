@@ -433,8 +433,22 @@ mod tests {
         let last = t.medium_state.len() - 1;
         assert_eq!(t.medium_state[last], -1, "the decline should flip medium-short");
         assert!(t.entry_short.iter().any(|&e| e));
-        assert!(t.mrt[last_up] < o.close[last_up], "long trailing stop sits below price");
-        assert!(t.mrt[last] > o.close[last], "short trailing stop sits above price");
+        // Guides are checked on the flip bars: the last long bar of a dump can already
+        // be through the ratcheted MRT, which is the stop firing, not a construction bug.
+        let long_i = t.entry_long.iter().position(|&e| e).expect("long flip");
+        let short_i = t.entry_short.iter().position(|&e| e).expect("short flip");
+        assert!(
+            t.mrt[long_i] < o.close[long_i],
+            "long trailing stop sits below price on the flip ({:.4} vs {:.4})",
+            t.mrt[long_i],
+            o.close[long_i]
+        );
+        assert!(
+            t.mrt[short_i] > o.close[short_i],
+            "short trailing stop sits above price on the flip ({:.4} vs {:.4})",
+            t.mrt[short_i],
+            o.close[short_i]
+        );
     }
 
     #[test]
