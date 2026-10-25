@@ -31,3 +31,4 @@ Tests for the parsers and indicators, frame-time benchmarks, and a README noting
 - [x] Brokerage accounts through SnapTrade (read-only): setup screen, Keychain credential storage, Connection Portal, `PORT`/`ACCT`/`POS`/`ORD`/`ACTV` panes with live-repriced P&L.
 - [x] Tests for parsers, indicators, layouts, prefs, themes and the SnapTrade client; frame-time benchmarks; README.
 - [x] Paper strategy backtests vs buy-and-hold (`BACKTEST`) with costs, next-open fills, chronological holdout and completed-trade metrics. Sample bars refused.
+- [x] Historical lookalikes (`LOOKALIKE` / `KNN`) on verified archive bars: standardized Euclidean neighbors, incomplete horizons labelled, overlapping neighbors reduced, per-horizon counts before frequencies, chart jump to neighbor dates. Sample bars refused.

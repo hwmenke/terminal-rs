@@ -288,8 +288,12 @@ impl TerminalApp {
                         "Paper backtest vs buy-and-hold: costs, next-open fills, chronological holdout, completed-trade win rate",
                     ),
                     (
-                        &["EXPORT", "EXPORT SCAN", "EXPORT JOURNAL", "EXPORT HIST", "EXPORT BACKTEST", "BACKUP", "RESTORE"],
-                        "Export scans/history/journal/backtests with source and date; back up or restore workspace (no credentials)",
+                        &["LOOKALIKE", "AAPL LOOKALIKE", "AAPL KNN 2024-01-15", "GOTO 2024-01-15"],
+                        "Historical lookalikes: nearest past conditions, per-horizon counts, jump to neighbor dates",
+                    ),
+                    (
+                        &["EXPORT", "EXPORT SCAN", "EXPORT JOURNAL", "EXPORT HIST", "EXPORT BACKTEST", "EXPORT LOOKALIKE", "BACKUP", "RESTORE"],
+                        "Export scans/history/journal/backtests/lookalikes with source and date; back up or restore workspace (no credentials)",
                     ),
                     (&["PREFS"], "Settings: theme, fonts, density, hotkeys, layouts, backup"),
                     (&["UPDATE"], "Check for updates"),

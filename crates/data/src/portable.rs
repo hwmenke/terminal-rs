@@ -48,6 +48,7 @@ pub enum Kind {
     Workspace,
     Stats,
     Backtest,
+    Lookalike,
 }
 
 impl Kind {
@@ -59,6 +60,7 @@ impl Kind {
             Self::Workspace => "workspace",
             Self::Stats => "stats",
             Self::Backtest => "backtest",
+            Self::Lookalike => "lookalike",
         }
     }
 }
@@ -500,6 +502,31 @@ pub fn backtest_document(
     })
 }
 
+/// Historical lookalike snapshot. Sample-tagged reports stay labelled and are not restored.
+pub fn lookalike_document(
+    report: &crate::lookalike::LookalikeReport,
+    exported_at: impl Into<String>,
+) -> Result<Document, String> {
+    let sample = report.provenance == Provenance::Sample || !report.provenance.is_verified();
+    if !sample {
+        report.provenance.require_verified("export LOOKALIKE")?;
+    }
+    let payload = serde_json::to_value(report).map_err(|e| format!("lookalike payload: {e}"))?;
+    let (sample, sample_label) = sample_fields(sample || report.provenance == Provenance::Sample);
+    Ok(Document {
+        format: FORMAT,
+        kind: Kind::Lookalike,
+        exported_at: exported_at.into(),
+        source: report.source.clone(),
+        as_of_date: Some(report.as_of.clone()).filter(|s| !s.is_empty()),
+        provenance: report.provenance,
+        sample,
+        sample_label,
+        credentials_excluded: true,
+        payload,
+    })
+}
+
 /// Statistics / conditional-return snapshot. Sample-tagged reports stay labelled.
 pub fn stats_document(
     snapshot: &crate::stats::ResearchSnapshot,
@@ -772,5 +799,41 @@ mod tests {
         assert_eq!(doc.provenance, Provenance::Real);
         assert_eq!(doc.payload["ticker"], "AAPL");
         assert!(doc.filename().starts_with("terminal-rs-backtest-"));
+    }
+
+    #[test]
+    fn lookalike_export_keeps_source_as_of_and_counts() {
+        let ts = |d: &str| {
+            chrono::NaiveDate::parse_from_str(d, "%Y-%m-%d")
+                .unwrap()
+                .and_hms_opt(0, 0, 0)
+                .unwrap()
+                .and_utc()
+                .timestamp()
+        };
+        let bars: Vec<Bar> = (0..160)
+            .map(|i| {
+                let c = 80.0 + i as f64 * 0.15;
+                Bar::new(ts("2024-01-02") + i * 86_400, c, c + 1.0, c - 1.0, c, 1_000.0)
+                    .with_provenance(Provenance::Real)
+            })
+            .collect();
+        let report = crate::lookalike::compute_report(
+            "AAPL US Equity",
+            "AAPL",
+            &bars,
+            &crate::lookalike::LookalikeQuery { k: 6, horizons: vec![5, 10], as_of: None, gap: 8 },
+            "Local Yahoo daily research archive",
+        )
+        .unwrap();
+        let doc = lookalike_document(&report, "2026-10-25T00:00:00Z").unwrap();
+        assert_eq!(doc.kind, Kind::Lookalike);
+        assert!(!doc.sample);
+        assert_eq!(doc.source, "Local Yahoo daily research archive");
+        assert_eq!(doc.as_of_date.as_deref(), Some(report.as_of.as_str()));
+        assert_eq!(doc.provenance, Provenance::Real);
+        assert_eq!(doc.payload["ticker"], "AAPL");
+        assert!(doc.payload["by_horizon"][0]["completed_n"].is_number());
+        assert!(doc.filename().starts_with("terminal-rs-lookalike-"));
     }
 }

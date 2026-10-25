@@ -301,6 +301,14 @@ pub enum Function {
     Backtest {
         spec: String,
     },
+    /// Historical lookalikes / nearest neighbors (`LOOKALIKE`, `AAPL KNN 2024-01-15 K=15`).
+    Lookalike {
+        spec: String,
+    },
+    /// Jump the focused (or named) archive chart to a session date (`GOTO 2024-01-15`).
+    Goto {
+        date: String,
+    },
     /// Attach a note to a historical chart date (`NOTE`, `AAPL NOTE 2026-10-24 text`).
     JournalNote {
         date: String,
@@ -310,7 +318,7 @@ pub enum Function {
     Latest,
     /// Toggle a persisted review overlay on the focused chart.
     ReviewOverlay(ReviewOverlay),
-    /// `EXPORT SCAN|JOURNAL|HIST|STATS|BACKTEST|WORKSPACE [path]`.
+    /// `EXPORT SCAN|JOURNAL|HIST|STATS|BACKTEST|LOOKALIKE|WORKSPACE [path]`.
     Export(ExportKind, String),
     /// `BACKUP [path]` — portable workspace backup (no credentials).
     Backup(String),
@@ -327,6 +335,7 @@ pub enum ExportKind {
     Workspace,
     Stats,
     Backtest,
+    Lookalike,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -482,6 +491,8 @@ fn parse_function(head: &str, rest: &[&str]) -> Option<Function> {
         "STATS" | "STAT" | "STATISTICS" => Function::Stats { condition: joined(), conditional: !rest.is_empty() },
         "COND" | "CDIST" | "CONDRET" => Function::Stats { condition: joined(), conditional: true },
         "BACKTEST" | "BT" | "BTEST" => Function::Backtest { spec: joined() },
+        "LOOKALIKE" | "LOOKALIKES" | "KNN" | "ANALOG" | "ANALOGUE" | "NN" => Function::Lookalike { spec: joined() },
+        "GOTO" | "JUMP" | "GTO" => Function::Goto { date: joined() },
         "NOTE" | "JNOTE" => {
             let (date, text) = split_note_args(rest);
             Function::JournalNote { date, text }
@@ -500,6 +511,9 @@ fn parse_function(head: &str, rest: &[&str]) -> Option<Function> {
                     (ExportKind::Stats, rest.get(1..).unwrap_or(&[]).join(" "))
                 }
                 Some("BACKTEST" | "BT" | "BTEST") => (ExportKind::Backtest, rest.get(1..).unwrap_or(&[]).join(" ")),
+                Some("LOOKALIKE" | "LOOKALIKES" | "KNN" | "ANALOG" | "ANALOGUE") => {
+                    (ExportKind::Lookalike, rest.get(1..).unwrap_or(&[]).join(" "))
+                }
                 Some("WORKSPACE" | "BACKUP" | "WS") => (ExportKind::Workspace, rest.get(1..).unwrap_or(&[]).join(" ")),
                 _ => (ExportKind::Auto, joined()),
             };
@@ -706,6 +720,12 @@ fn describe(f: &Function) -> String {
             "Paper backtest: declared strategies vs buy-and-hold on a chronological holdout".into()
         }
         Function::Backtest { spec } => format!("Paper backtest vs buy-and-hold ({spec})"),
+        Function::Lookalike { spec } if spec.is_empty() => {
+            "Historical lookalikes: nearest past conditions, per-horizon counts, jump to neighbor dates".into()
+        }
+        Function::Lookalike { spec } => format!("Historical lookalikes ({spec})"),
+        Function::Goto { date } if date.is_empty() => "Jump the focused archive chart to a YYYY-MM-DD session".into(),
+        Function::Goto { date } => format!("Jump the archive chart to {date}"),
         Function::JournalNote { date, text } if date.is_empty() && text.is_empty() => {
             "Attach a note to the focused chart date".into()
         }
@@ -744,6 +764,10 @@ fn describe(f: &Function) -> String {
             "Export the paper backtest with costs, holdout, execution and provenance".into()
         }
         Function::Export(ExportKind::Backtest, p) => format!("Export backtest to {p}"),
+        Function::Export(ExportKind::Lookalike, p) if p.is_empty() => {
+            "Export lookalikes with source, as-of, per-horizon counts and overlap".into()
+        }
+        Function::Export(ExportKind::Lookalike, p) => format!("Export lookalikes to {p}"),
         Function::Export(ExportKind::Workspace, p) if p.is_empty() => {
             "Back up personal workspace data (credentials excluded)".into()
         }
@@ -866,6 +890,19 @@ mod tests {
         assert_eq!(
             parse("EXPORT BACKTEST"),
             Some(Command::Function(Function::Export(ExportKind::Backtest, String::new())))
+        );
+        assert_eq!(parse("LOOKALIKE"), Some(Command::Function(Function::Lookalike { spec: String::new() })));
+        assert_eq!(
+            parse("AAPL KNN 2024-01-15 K=15"),
+            Some(Command::SymbolFunction(
+                "AAPL US Equity".into(),
+                Function::Lookalike { spec: "2024-01-15 K=15".into() }
+            ))
+        );
+        assert_eq!(parse("GOTO 2024-01-15"), Some(Command::Function(Function::Goto { date: "2024-01-15".into() })));
+        assert_eq!(
+            parse("EXPORT LOOKALIKE"),
+            Some(Command::Function(Function::Export(ExportKind::Lookalike, String::new())))
         );
         assert_eq!(parse("BACKUP"), Some(Command::Function(Function::Backup(String::new()))));
         assert_eq!(

@@ -675,6 +675,20 @@ impl TerminalApp {
             }
             if nav_row(
                 ui,
+                Icon::Search,
+                "Lookalikes",
+                Some("KNN"),
+                is_focused(&PaneKind::Lookalike(Box::new(super::lookalike::LookalikePane::new(
+                    String::new(),
+                    String::new(),
+                )))),
+            )
+            .clicked()
+            {
+                out.push(SidebarCmd::Function(Function::Lookalike { spec: String::new() }));
+            }
+            if nav_row(
+                ui,
                 Icon::Grid,
                 "PM Desk",
                 Some("DESK"),

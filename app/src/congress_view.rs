@@ -14,6 +14,11 @@ use crate::worker::Profile;
 pub enum Action {
     OpenChart(String),
     OpenArchiveChart(String),
+    /// Open the archive chart for `symbol` and jump to session `ts`.
+    OpenArchiveAt {
+        symbol: String,
+        ts: i64,
+    },
     WatchChart(String, String, bool),
     OpenTicker(String),
     OpenProfile(String),

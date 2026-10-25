@@ -233,8 +233,15 @@ gets the native title bar with traffic lights, window vibrancy behind the sideba
   commission and slippage, next-open fills, CAGR and **completed-trade** win
   rate (not up-days). Sample bars are refused. Paper / research only. See
   [Backtests](docs/BACKTEST.md).
+- **Historical lookalikes** — `LOOKALIKE` (or `AAPL LOOKALIKE`, `AAPL KNN
+  2024-01-15`) finds past sessions whose backward-looking features match the
+  query date (standardized Euclidean distance), shows **per-horizon completed /
+  incomplete counts before frequencies**, reduces overlapping neighbors, and
+  jumps the archive chart to a neighbor date. Incomplete horizons are labelled,
+  never invented. Sample bars are refused. Paper / research only. See
+  [Lookalikes](docs/LOOKALIKE.md).
 - **Export and recovery** — `EXPORT SCAN`, `EXPORT JOURNAL`, `EXPORT HIST`,
-  `EXPORT STATS` and `EXPORT BACKTEST` write JSON
+  `EXPORT STATS`, `EXPORT BACKTEST` and `EXPORT LOOKALIKE` write JSON
   with source, as-of date and provenance. Sample-tagged rows name the file `SAMPLE`.
   `BACKUP` / `RESTORE` copy personal workspace data (layouts, themes, prefs, watchlists,
   journal, alerts) and **exclude credentials**. See
@@ -391,7 +398,8 @@ Settings › Hotkeys. On Linux and Windows ⌘ is Ctrl and ⌥ is Alt.
 | `JOURNAL` · `AAPL JOURNAL` · `AAPL NOTE 2026-10-24 wait` · `NEW JOURNAL` | Trade journal: setup, checklist, $ risk, $ and R outcome, date notes |
 | `STATS` · `AAPL STATS` · `AAPL COND RSI(14) < 30` | Historical risk/returns and what followed a condition |
 | `BACKTEST` · `AAPL BACKTEST` · `AAPL BT ADTREND` · `NEW BACKTEST` | Paper backtest vs buy-and-hold (costs, next-open, chronological holdout) |
-| `EXPORT` · `EXPORT SCAN` · `EXPORT JOURNAL` · `EXPORT HIST` · `EXPORT STATS` · `EXPORT BACKTEST` · `BACKUP` · `RESTORE path` | Export scans/history/journal/stats/backtests; workspace backup/restore (no credentials) |
+| `LOOKALIKE` · `AAPL LOOKALIKE` · `AAPL KNN 2024-01-15` · `GOTO 2024-01-15` · `NEW LOOKALIKE` | Historical lookalikes: nearest past conditions, per-horizon counts, jump to neighbor dates |
+| `EXPORT` · `EXPORT SCAN` · `EXPORT JOURNAL` · `EXPORT HIST` · `EXPORT STATS` · `EXPORT BACKTEST` · `EXPORT LOOKALIKE` · `BACKUP` · `RESTORE path` | Export scans/history/journal/stats/backtests/lookalikes; workspace backup/restore (no credentials) |
 | `PORT` · `ACCT` · `POS` · `ORD` · `ACTV` · `AAPL POS` · `AAPL ORD` | brokerage portfolio · accounts and balances · positions · orders · activity · one security |
 | `PORT REFRESH` · `PORT CONNECT` · `PORT SETUP` (`BROKER`) | reload accounts · connect a broker in the browser · SnapTrade keys |
 | `BUY AAPL 10` · `SELL ALL TSLA` · `SELL MSFT 5 LMT 410` · `SELL TSLA 3 STP 250 LMT 245` · `BUY NVDA $500` · `TRADE` | order ticket, prefilled (demo: one click; live: review and confirm) |

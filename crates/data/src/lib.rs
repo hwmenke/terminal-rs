@@ -18,6 +18,7 @@ pub mod cache;
 pub mod crypto;
 pub mod history;
 pub mod journal;
+pub mod lookalike;
 pub mod markets;
 pub mod news;
 pub mod portable;
@@ -526,7 +527,7 @@ mod tests {
     #[tokio::test]
     async fn analysis_entry_points_reject_sample_and_unverified_history() {
         let fallback = Fallback::new(Broken);
-        for operation in ["Research", "Scan", "Backtest"] {
+        for operation in ["Research", "Scan", "Backtest", "Lookalikes"] {
             let err = fallback.history_for_analysis("X", Timeframe::D1, None, 30, operation).await.unwrap_err();
             assert!(err.to_string().contains("SAMPLE DATA"));
             assert!(err.to_string().contains(operation));

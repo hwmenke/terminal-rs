@@ -34,6 +34,7 @@ impl TerminalApp {
             ExportKind::History => self.export_history(path),
             ExportKind::Stats => self.export_stats(path),
             ExportKind::Backtest => self.export_backtest(path),
+            ExportKind::Lookalike => self.export_lookalike(path),
             ExportKind::Workspace => self.backup_workspace(path),
         }
     }
@@ -45,6 +46,7 @@ impl TerminalApp {
             Some(PaneKind::Journal(_)) => Some(ExportKind::Journal),
             Some(PaneKind::Stats(_)) => Some(ExportKind::Stats),
             Some(PaneKind::Backtest(_)) => Some(ExportKind::Backtest),
+            Some(PaneKind::Lookalike(_)) => Some(ExportKind::Lookalike),
             Some(PaneKind::Settings) => Some(ExportKind::Workspace),
             _ => None,
         }
@@ -129,6 +131,31 @@ impl TerminalApp {
         }
     }
 
+    fn export_lookalike(&mut self, path: &str) {
+        let pane = self.panes.iter().find(|p| p.id == self.focus).and_then(|p| match &p.kind {
+            PaneKind::Lookalike(l) => Some(l),
+            _ => None,
+        });
+        let pane = pane.or_else(|| {
+            self.panes.iter().find_map(|p| match &p.kind {
+                PaneKind::Lookalike(l) => Some(l),
+                _ => None,
+            })
+        });
+        let Some(pane) = pane else {
+            self.status = "EXPORT LOOKALIKE needs an open LOOKALIKE pane with results".into();
+            return;
+        };
+        let Some(report) = &pane.report else {
+            self.status = "LOOKALIKE has no results to export yet".into();
+            return;
+        };
+        match env::lookalike_document(report, env::now_rfc3339()) {
+            Ok(doc) => self.finish_write(&doc, path, "Exported lookalikes"),
+            Err(e) => self.status = e,
+        }
+    }
+
     fn export_journal(&mut self, path: &str) {
         let doc = env::journal_document(&self.journal, env::now_rfc3339());
         self.finish_write(&doc, path, "Exported journal");
@@ -202,6 +229,11 @@ impl TerminalApp {
             Kind::Backtest => {
                 self.status =
                     "Backtest exports are snapshots and are not restored into BACKTEST. Open the JSON file instead."
+                        .into();
+            }
+            Kind::Lookalike => {
+                self.status =
+                    "Lookalike exports are snapshots and are not restored into LOOKALIKE. Open the JSON file instead."
                         .into();
             }
         }

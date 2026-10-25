@@ -73,6 +73,6 @@ named `SAMPLE` and is not restored into the archive or this pane.
 
 ## Out of scope
 
-Strategy backtests are documented in [BACKTEST.md](BACKTEST.md). Lookalike
-search is a later step. Adaptive Trend overlays are documented in
-[ADAPTIVE_TREND.md](ADAPTIVE_TREND.md).
+Strategy backtests are documented in [BACKTEST.md](BACKTEST.md). Historical
+lookalikes are documented in [LOOKALIKE.md](LOOKALIKE.md). Adaptive Trend
+overlays are documented in [ADAPTIVE_TREND.md](ADAPTIVE_TREND.md).

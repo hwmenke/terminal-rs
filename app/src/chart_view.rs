@@ -142,6 +142,7 @@ pub struct ChartState {
     pub controls_in_strip: bool,
     review: Option<tr_data::whats_news::ReviewContext>,
     pending_latest: bool,
+    pending_jump_ts: Option<i64>,
 }
 
 impl ChartState {
@@ -209,6 +210,7 @@ impl ChartState {
             controls_in_strip: false,
             review: None,
             pending_latest: false,
+            pending_jump_ts: None,
         }
     }
 
@@ -433,9 +435,53 @@ impl ChartState {
     }
 
     pub fn request_jump_latest(&mut self) {
+        self.pending_jump_ts = None;
         self.pending_latest = true;
         if !self.bars.is_empty() {
             self.jump_latest();
+        }
+    }
+
+    /// Keep the current zoom and pan so session `ts` sits near the right edge.
+    pub fn request_jump_to_ts(&mut self, ts: i64) {
+        self.pending_latest = false;
+        self.pending_jump_ts = Some(ts);
+        if !self.bars.is_empty() {
+            self.jump_to_ts(ts);
+        }
+    }
+
+    pub fn jump_to_ts(&mut self, ts: i64) {
+        if self.bars.is_empty() {
+            self.pending_jump_ts = Some(ts);
+            return;
+        }
+        let found = self.bars.partition_point(|b| b.ts <= ts).checked_sub(1);
+        match found {
+            Some(idx) => {
+                self.glide(|s| {
+                    if let Some(v) = s.viewport.as_mut() {
+                        v.right = idx as f64 + 3.0;
+                        v.clamp(s.bars.len());
+                    }
+                });
+                // Older than the first loaded bar: keep the pending jump so left-edge
+                // paging can prepend archive history and retry.
+                if idx == 0 && self.bars[0].ts > ts && self.archive && !self.exhausted {
+                    self.pending_jump_ts = Some(ts);
+                } else {
+                    self.pending_jump_ts = None;
+                }
+            }
+            None => {
+                self.pending_jump_ts = Some(ts);
+                self.glide(|s| {
+                    if let Some(v) = s.viewport.as_mut() {
+                        v.right = v.visible_bars() * 0.25;
+                        v.clamp(s.bars.len());
+                    }
+                });
+            }
         }
     }
 
@@ -588,7 +634,9 @@ impl ChartState {
             self.request_compare(w);
         }
         self.review = tr_data::whats_news::ReviewContext::from_bars(&self.bars, self.tf).ok();
-        if self.pending_latest {
+        if let Some(ts) = self.pending_jump_ts {
+            self.jump_to_ts(ts);
+        } else if self.pending_latest {
             self.jump_latest();
         }
     }
@@ -2226,6 +2274,21 @@ mod tests {
         assert_eq!(g.from, shown);
         assert!((g.to.bar_px - 6.0).abs() < 1e-9, "zoom is unchanged");
         assert!((g.to.right - 503.0).abs() < 1e-9, "right edge sits just past the last bar");
+    }
+
+    #[test]
+    fn jump_to_ts_keeps_zoom_and_moves_to_that_session() {
+        let mut c = ChartState::new(1, "AAPL", Timeframe::D1);
+        let bars = tr_core::sample::generate("AAPL", Timeframe::D1, 200, 1_790_000_000);
+        let target = bars[80].ts;
+        c.bars = Arc::new(bars);
+        let shown = Viewport { right: 180.0, bar_px: 6.0, width_px: 800.0 };
+        c.viewport = Some(shown);
+        c.jump_to_ts(target);
+        let g = c.glide.expect("gliding to the neighbor date");
+        assert!((g.to.bar_px - 6.0).abs() < 1e-9, "zoom is unchanged");
+        assert!((g.to.right - 83.0).abs() < 1e-9, "right edge sits just past the neighbor");
+        assert!(c.pending_jump_ts.is_none());
     }
 
     #[test]

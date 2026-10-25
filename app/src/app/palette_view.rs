@@ -65,6 +65,16 @@ const COMMANDS: &[(&str, &str, &str, Option<Action>)] = &[
     ("AAPL BT ADTREND", "AAPL Adaptive Trend vs buy-and-hold on the evaluate window", "adaptive trend backtest", None),
     ("EXPORT BACKTEST", "Export backtest settings, costs, holdout and metrics", "paper research provenance", None),
     (
+        "LOOKALIKE",
+        "Historical lookalikes: nearest past conditions and subsequent returns",
+        "knn analog neighbor overlap horizon",
+        None,
+    ),
+    ("AAPL LOOKALIKE", "AAPL historical lookalikes from the research archive", "knn analog neighbors", None),
+    ("AAPL KNN 2024-01-15", "AAPL lookalikes as-of 2024-01-15", "nearest neighbor date", None),
+    ("GOTO 2024-01-15", "Jump the archive chart to that session", "lookalike neighbor date jump", None),
+    ("EXPORT LOOKALIKE", "Export lookalikes with source, counts and overlap", "knn provenance horizons", None),
+    (
         "JOURNAL",
         "Trade journal: setups, checklist, $ and R outcomes",
         "checklist tradelog notes",
@@ -253,6 +263,10 @@ pub(super) fn static_items() -> Vec<Item> {
     v.push(
         Item::new(Kind::Panel, "New Backtest pane", "NEW BACKTEST", Target::Run("NEW BACKTEST".into()))
             .keywords("panel pane backtest strategy buy hold holdout costs"),
+    );
+    v.push(
+        Item::new(Kind::Panel, "New Lookalikes pane", "NEW LOOKALIKE", Target::Run("NEW LOOKALIKE".into()))
+            .keywords("panel pane lookalike knn analog neighbor"),
     );
     v.push(
         Item::new(
