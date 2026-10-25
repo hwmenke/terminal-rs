@@ -62,5 +62,6 @@ LB 40/2/120, min-hold 10 bars).
 
 ## Out of scope
 
-Step 14 backtests and Step 15 lookalikes are later. This study does not place
-orders or change STATS / SCAN.
+`BACKTEST` / `AAPL BT ADTREND` can compare this study to buy-and-hold on an
+unseen holdout; see [BACKTEST.md](BACKTEST.md). Step 15 lookalikes are later.
+This study does not place live orders or change STATS / SCAN.

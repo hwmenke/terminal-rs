@@ -13,6 +13,7 @@
 //! unreachable, so the terminal always has something to draw.
 
 pub mod alpaca;
+pub mod backtest;
 pub mod cache;
 pub mod crypto;
 pub mod history;
@@ -226,8 +227,8 @@ pub trait MarketData: Send + Sync {
     /// oldest bar already held.
     async fn history(&self, symbol: &str, tf: Timeframe, end: Option<i64>, limit: usize) -> Result<Vec<Bar>>;
 
-    /// Entry point for research, scans and backtests: never compute with fallback or
-    /// unverified prices. Display the returned error instead of analysis results.
+    /// Entry point for research, scans, statistics and backtests: never compute with
+    /// fallback or unverified prices. Display the returned error instead of analysis results.
     async fn history_for_analysis(
         &self,
         symbol: &str,

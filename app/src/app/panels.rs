@@ -132,7 +132,8 @@ impl TerminalApp {
             | PaneKind::Chart(_)
             | PaneKind::Desk(_)
             | PaneKind::Journal(_)
-            | PaneKind::Stats(_) => {}
+            | PaneKind::Stats(_)
+            | PaneKind::Backtest(_) => {}
         }
         if matches!(self.panes[i].kind, PaneKind::Desk(_)) {
             actions.extend(self.desk(ui, id));
@@ -142,6 +143,9 @@ impl TerminalApp {
         }
         if matches!(self.panes[i].kind, PaneKind::Stats(_)) {
             actions.extend(self.stats_pane(ui, id));
+        }
+        if matches!(self.panes[i].kind, PaneKind::Backtest(_)) {
+            actions.extend(self.backtest_pane(ui, id));
         }
         match self.panes[i].kind {
             PaneKind::Watchlist => actions.extend(self.watchlist(ui)),
