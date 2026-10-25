@@ -72,3 +72,7 @@ Explicit sample/unverified provenance remains a hard refusal, including short or
 invalid histories and supplementary service fields. Numeric/date failures and
 insufficient verified history produce named skip reasons. Nothing writes to the
 Whats-News archive or changes its ingestion/schema.
+
+`EXPORT SCAN` writes the current results (source, last-bar dates, provenance, filters).
+Sample snapshots are named `SAMPLE` and must stay isolated. Scan JSON is not restored
+into SCAN. See [Export and recovery](EXPORT_RECOVERY.md).

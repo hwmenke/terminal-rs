@@ -293,11 +293,29 @@ pub enum Function {
     /// Trade journal / checklist (`JOURNAL`, `AAPL JOURNAL`, `AAPL JOURNAL 2026-10-24`).
     Journal(String),
     /// Attach a note to a historical chart date (`NOTE`, `AAPL NOTE 2026-10-24 text`).
-    JournalNote { date: String, text: String },
+    JournalNote {
+        date: String,
+        text: String,
+    },
     /// Pan the focused chart to the latest candle without changing zoom.
     Latest,
     /// Toggle a persisted review overlay on the focused chart.
     ReviewOverlay(ReviewOverlay),
+    /// `EXPORT SCAN|JOURNAL|HIST|WORKSPACE [path]`.
+    Export(ExportKind, String),
+    /// `BACKUP [path]` — portable workspace backup (no credentials).
+    Backup(String),
+    /// `RESTORE path` — workspace, journal, or price-history file.
+    Restore(String),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExportKind {
+    Auto,
+    Scan,
+    Journal,
+    History,
+    Workspace,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -318,9 +336,7 @@ fn parse_setup_name(s: &str) -> Option<String> {
 /// `2026-10-24 held 3 days` → date + text; otherwise the whole remainder is the note.
 fn split_note_args(rest: &[&str]) -> (String, String) {
     match rest.split_first() {
-        Some((first, tail)) if tr_data::journal::parse_chart_date(first).is_ok() => {
-            (first.to_string(), tail.join(" "))
-        }
+        Some((first, tail)) if tr_data::journal::parse_chart_date(first).is_ok() => (first.to_string(), tail.join(" ")),
         _ => (String::new(), rest.join(" ")),
     }
 }
@@ -460,6 +476,19 @@ fn parse_function(head: &str, rest: &[&str]) -> Option<Function> {
         "BOX" => Function::ReviewOverlay(ReviewOverlay::BoxLevels),
         "RS" | "STRENGTH" => Function::ReviewOverlay(ReviewOverlay::Strength),
         "VCTX" | "VOLCTX" => Function::ReviewOverlay(ReviewOverlay::Volume),
+        "EXPORT" => {
+            let w = words();
+            let (kind, path) = match w.first().map(String::as_str) {
+                Some("SCAN" | "UNIV") => (ExportKind::Scan, rest.get(1..).unwrap_or(&[]).join(" ")),
+                Some("JOURNAL" | "JRNL" | "CHECKLIST") => (ExportKind::Journal, rest.get(1..).unwrap_or(&[]).join(" ")),
+                Some("HIST" | "HISTORY") => (ExportKind::History, rest.get(1..).unwrap_or(&[]).join(" ")),
+                Some("WORKSPACE" | "BACKUP" | "WS") => (ExportKind::Workspace, rest.get(1..).unwrap_or(&[]).join(" ")),
+                _ => (ExportKind::Auto, joined()),
+            };
+            Function::Export(kind, path)
+        }
+        "BACKUP" => Function::Backup(joined()),
+        "RESTORE" => Function::Restore(joined()),
         "RANGE" => Function::Range(Range::parse(rest.first()?)?),
         // Timeframes win where spellings overlap (`1D`, `1M`); otherwise try a range (`5D`, `YTD`),
         // then the indicator catalog (`RSI`, `BB 20 2.5`).
@@ -589,7 +618,7 @@ fn describe(f: &Function) -> String {
         Function::Options => "Option chain: calls and puts by strike, IV and greeks".into(),
         Function::Sidebar(s) if s.is_empty() => "Toggle the sidebar".into(),
         Function::Sidebar(s) => format!("Sidebar {}", s.to_lowercase()),
-        Function::Settings => "Settings: theme, fonts, density, hotkeys, panels, layouts".into(),
+        Function::Settings => "Settings: theme, fonts, density, hotkeys, panels, layouts, backup".into(),
         Function::Update => "Check for updates".into(),
         Function::Theme(t) => format!("Theme {t}"),
         Function::Title(t) => format!("Rename tab to {t:?}"),
@@ -663,6 +692,28 @@ fn describe(f: &Function) -> String {
         Function::ReviewOverlay(ReviewOverlay::Volume) => {
             "Toggle volume context (this bar / prior 20, plus 5/20)".into()
         }
+        Function::Export(ExportKind::Auto, p) if p.is_empty() => {
+            "Export the focused scan, history or journal (or open Backup settings)".into()
+        }
+        Function::Export(ExportKind::Auto, p) => format!("Export the focused pane to {p}"),
+        Function::Export(ExportKind::Scan, p) if p.is_empty() => {
+            "Export scan / universe results with source and date".into()
+        }
+        Function::Export(ExportKind::Scan, p) => format!("Export scan results to {p}"),
+        Function::Export(ExportKind::Journal, p) if p.is_empty() => "Export trade journal entries".into(),
+        Function::Export(ExportKind::Journal, p) => format!("Export journal to {p}"),
+        Function::Export(ExportKind::History, p) if p.is_empty() => {
+            "Export archived daily price history with source and dates".into()
+        }
+        Function::Export(ExportKind::History, p) => format!("Export price history to {p}"),
+        Function::Export(ExportKind::Workspace, p) if p.is_empty() => {
+            "Back up personal workspace data (credentials excluded)".into()
+        }
+        Function::Export(ExportKind::Workspace, p) => format!("Back up workspace to {p}"),
+        Function::Backup(p) if p.is_empty() => "Back up personal workspace data (credentials excluded)".into(),
+        Function::Backup(p) => format!("Back up workspace to {p}"),
+        Function::Restore(p) if p.is_empty() => "Restore a workspace, journal or history export".into(),
+        Function::Restore(p) => format!("Restore {p}"),
     }
 }
 
@@ -743,6 +794,21 @@ mod tests {
         assert_eq!(parse("BOX"), Some(Command::Function(Function::ReviewOverlay(ReviewOverlay::BoxLevels))));
         assert_eq!(parse("RS"), Some(Command::Function(Function::ReviewOverlay(ReviewOverlay::Strength))));
         assert_eq!(parse("VCTX"), Some(Command::Function(Function::ReviewOverlay(ReviewOverlay::Volume))));
+        assert_eq!(parse("EXPORT"), Some(Command::Function(Function::Export(ExportKind::Auto, String::new()))));
+        assert_eq!(
+            parse("EXPORT SCAN ~/Downloads/scan.json"),
+            Some(Command::Function(Function::Export(ExportKind::Scan, "~/Downloads/scan.json".into())))
+        );
+        assert_eq!(
+            parse("EXPORT JOURNAL"),
+            Some(Command::Function(Function::Export(ExportKind::Journal, String::new())))
+        );
+        assert_eq!(parse("EXPORT HIST"), Some(Command::Function(Function::Export(ExportKind::History, String::new()))));
+        assert_eq!(parse("BACKUP"), Some(Command::Function(Function::Backup(String::new()))));
+        assert_eq!(
+            parse("RESTORE ~/Downloads/workspace.json"),
+            Some(Command::Function(Function::Restore("~/Downloads/workspace.json".into())))
+        );
     }
 
     #[test]

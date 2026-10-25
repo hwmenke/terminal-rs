@@ -3,8 +3,8 @@
 `JOURNAL` (aliases `JRNL`, `CHECKLIST`, `TRADELOG`; `AAPL JOURNAL` filters to a name;
 `AAPL JOURNAL 2026-10-24` also prefills the chart date) opens a **local trade journal**.
 It is not the brokerage `PORT` blotter and not the PM Desk planner. `DESK` can hand a
-name, last bar date and planned dollar risk into a journal draft. Step 11 export /
-backup is not included.
+name, last bar date and planned dollar risk into a journal draft. `EXPORT JOURNAL` and
+workspace `BACKUP` / `RESTORE` are in [Export and recovery](EXPORT_RECOVERY.md).
 
 Entries persist in `trade_journal.json` under the terminal data directory.
 
@@ -50,5 +50,7 @@ is labelled SAMPLE; you still type the outcome. PM Desk still refuses sample row
 | `AAPL JOURNAL 2026-10-24` | Also set the chart date |
 | `NOTE` / `AAPL NOTE 2026-10-24 text` | Attach a note to that date |
 | `NEW JOURNAL` / `SPLIT JOURNAL` | Add a journal pane |
+| `EXPORT JOURNAL [path]` | Write setups and notes with dates and provenance |
 
-Layouts remember the filter, not the entries. F11 opens the journal.
+Layouts remember the filter, not the entries. F11 opens the journal. Sample-tagged setups
+label the export `SAMPLE`.

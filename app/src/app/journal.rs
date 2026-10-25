@@ -74,13 +74,7 @@ impl TerminalApp {
         let date = journal::parse_chart_date(extra).ok();
         let filter = symbol
             .map(|s| tr_data::security(s).key())
-            .or_else(|| {
-                if extra.is_empty() || date.is_some() {
-                    None
-                } else {
-                    Some(tr_data::security(extra).key())
-                }
-            })
+            .or_else(|| if extra.is_empty() || date.is_some() { None } else { Some(tr_data::security(extra).key()) })
             .unwrap_or_default();
         let mut pane = JournalPane::new(filter);
         pane.prefill(symbol.or((date.is_none() && !extra.is_empty()).then_some(extra)), date.as_deref(), &self.journal);
@@ -111,15 +105,9 @@ impl TerminalApp {
     }
 
     pub(super) fn add_journal_note(&mut self, symbol: Option<&str>, date: &str, text: &str) {
-        let symbol = symbol
-            .map(|s| tr_data::security(s).key())
-            .or_else(|| self.focused_symbol())
-            .unwrap_or_default();
-        let date = if date.trim().is_empty() {
-            self.focused_chart_date().unwrap_or_default()
-        } else {
-            date.to_string()
-        };
+        let symbol = symbol.map(|s| tr_data::security(s).key()).or_else(|| self.focused_symbol()).unwrap_or_default();
+        let date =
+            if date.trim().is_empty() { self.focused_chart_date().unwrap_or_default() } else { date.to_string() };
         match self.journal.add_note(&symbol, &date, text, now_ts()) {
             Ok(n) => {
                 self.persist_journal();
@@ -207,6 +195,13 @@ impl TerminalApp {
                 } else {
                     muted()
                 }));
+                if ui
+                    .small_button("Export")
+                    .on_hover_text("Write journal JSON with dates and provenance (EXPORT JOURNAL)")
+                    .clicked()
+                {
+                    actions.push(Action::Command("EXPORT JOURNAL".into()));
+                }
             });
             ui.label(
                 RichText::new(
@@ -261,9 +256,7 @@ impl TerminalApp {
                     ui.horizontal_wrapped(|ui| {
                         ui.label(RichText::new("Date").color(muted()));
                         ui.add(
-                            egui::TextEdit::singleline(&mut pane.note_date)
-                                .desired_width(92.0)
-                                .hint_text("YYYY-MM-DD"),
+                            egui::TextEdit::singleline(&mut pane.note_date).desired_width(92.0).hint_text("YYYY-MM-DD"),
                         );
                         ui.add(
                             egui::TextEdit::singleline(&mut pane.note_text)
@@ -275,23 +268,22 @@ impl TerminalApp {
                         }
                     });
                     ui.label(
-                        RichText::new("AAPL NOTE 2026-10-24 wait for the 20-day  ·  notes stay on that historical date")
-                            .font(ui_font(11.0))
-                            .color(muted()),
+                        RichText::new(
+                            "AAPL NOTE 2026-10-24 wait for the 20-day  ·  notes stay on that historical date",
+                        )
+                        .font(ui_font(11.0))
+                        .color(muted()),
                     );
                     ui.add_space(4.0);
                     ui.label(RichText::new("NOTES").font(mono(11.0)).color(muted()));
                     if notes.is_empty() {
                         ui.label(RichText::new("No date notes yet.").font(mono(12.0)).color(muted()));
                     } else {
-                        ScrollArea::vertical()
-                            .id_salt("journal-notes")
-                            .auto_shrink([false, false])
-                            .show(ui, |ui| {
-                                for n in &notes {
-                                    note_row(ui, n, &mut actions, &mut drop_note);
-                                }
-                            });
+                        ScrollArea::vertical().id_salt("journal-notes").auto_shrink([false, false]).show(ui, |ui| {
+                            for n in &notes {
+                                note_row(ui, n, &mut actions, &mut drop_note);
+                            }
+                        });
                     }
                 }
             }
@@ -305,7 +297,8 @@ impl TerminalApp {
                         pane.draft.reasoning.clear();
                         pane.draft.checklist = self.journal.blank_checklist();
                         persist = true;
-                        status = Some(format!("{} {}: setup saved (1R = ${:.2})", s.ticker(), s.chart_date, s.planned_risk));
+                        status =
+                            Some(format!("{} {}: setup saved (1R = ${:.2})", s.ticker(), s.chart_date, s.planned_risk));
                     }
                     Err(e) => status = Some(e),
                 }
@@ -341,7 +334,8 @@ impl TerminalApp {
         }
         if save_note {
             if let PaneKind::Journal(pane) = &self.panes[i].kind {
-                let symbol = if pane.filter.trim().is_empty() { pane.draft.symbol.clone() } else { pane.filter.clone() };
+                let symbol =
+                    if pane.filter.trim().is_empty() { pane.draft.symbol.clone() } else { pane.filter.clone() };
                 match self.journal.add_note(&symbol, &pane.note_date, &pane.note_text, now_ts()) {
                     Ok(n) => {
                         persist = true;
@@ -392,9 +386,12 @@ fn setup_form(ui: &mut Ui, pane: &mut JournalPane, save: &mut bool) {
                 .max_decimals(2),
         );
     });
-    ui.add(egui::TextEdit::multiline(&mut pane.draft.reasoning).desired_width(f32::INFINITY).desired_rows(2).hint_text(
-        "Reasoning: why this date, what has to hold, what invalidates",
-    ));
+    ui.add(
+        egui::TextEdit::multiline(&mut pane.draft.reasoning)
+            .desired_width(f32::INFINITY)
+            .desired_rows(2)
+            .hint_text("Reasoning: why this date, what has to hold, what invalidates"),
+    );
     ui.horizontal_wrapped(|ui| {
         ui.label(RichText::new("Checklist").color(muted()));
         for item in &mut pane.draft.checklist {
@@ -493,7 +490,10 @@ fn outcome_form(ui: &mut Ui, pane: &mut JournalPane, s: &Setup, record: &mut Opt
             s.ticker(),
             s.chart_date,
             s.planned_risk,
-            s.outcome.as_ref().map(|o| format!(" · last ${:.2} ({:+.2}R)", o.dollars, o.r_multiple)).unwrap_or_default()
+            s.outcome
+                .as_ref()
+                .map(|o| format!(" · last ${:.2} ({:+.2}R)", o.dollars, o.r_multiple))
+                .unwrap_or_default()
         ))
         .color(text()),
     );

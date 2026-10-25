@@ -137,11 +137,7 @@ pub struct Store {
 
 impl Store {
     pub fn load(path: &Path) -> Self {
-        std::fs::read(path)
-            .ok()
-            .and_then(|b| serde_json::from_slice(&b).ok())
-            .map(Self::normalized)
-            .unwrap_or_default()
+        std::fs::read(path).ok().and_then(|b| serde_json::from_slice(&b).ok()).map(Self::normalized).unwrap_or_default()
     }
 
     pub fn save(&self, path: &Path) {

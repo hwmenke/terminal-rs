@@ -22,10 +22,11 @@ pub enum SettingsTab {
     Brokerage,
     Trading,
     WhatsNews,
+    Backup,
 }
 
 impl SettingsTab {
-    pub(super) const ALL: [SettingsTab; 8] = [
+    pub(super) const ALL: [SettingsTab; 9] = [
         SettingsTab::Appearance,
         SettingsTab::Themes,
         SettingsTab::Hotkeys,
@@ -34,6 +35,7 @@ impl SettingsTab {
         SettingsTab::Brokerage,
         SettingsTab::Trading,
         SettingsTab::WhatsNews,
+        SettingsTab::Backup,
     ];
 
     pub(super) fn label(self) -> &'static str {
@@ -46,6 +48,7 @@ impl SettingsTab {
             SettingsTab::Brokerage => "Brokerage",
             SettingsTab::Trading => "Trading",
             SettingsTab::WhatsNews => "Whats-News",
+            SettingsTab::Backup => "Backup",
         }
     }
 }
@@ -135,6 +138,7 @@ impl TerminalApp {
                 SettingsTab::Brokerage => self.brokerage_tab(ui),
                 SettingsTab::Trading => self.trading_tab(ui, &mut cmds),
                 SettingsTab::WhatsNews => self.whats_news_tab(ui),
+                SettingsTab::Backup => self.backup_tab(ui),
             }
         });
         cmds
@@ -802,6 +806,64 @@ impl TerminalApp {
             RichText::new(
                 "Export writes to the path given, or ~/Downloads. Imported layouts are copied into the layouts folder.",
             )
+            .font(ui_font(11.5))
+            .color(muted()),
+        );
+    }
+
+    fn backup_tab(&mut self, ui: &mut Ui) {
+        section(ui, "Export and recovery");
+        ui.label(
+            RichText::new(
+                "Export scan results, archived daily prices and the trade journal with source and date metadata. \
+                 Back up or restore personal workspace data (layouts, themes, prefs, watchlists, journal, alerts). \
+                 SnapTrade keys and other credentials are never written into a portable file.",
+            )
+            .font(ui_font(11.5))
+            .color(muted()),
+        );
+        ui.add_space(6.0);
+        ui.horizontal(|ui| {
+            ui.add(
+                egui::TextEdit::singleline(&mut self.io_path)
+                    .hint_text("~/Downloads/terminal-rs-workspace.json")
+                    .desired_width(360.0),
+            );
+        });
+        ui.horizontal_wrapped(|ui| {
+            if ui.button("Export scan").clicked() {
+                self.run_export(crate::command::ExportKind::Scan, &self.io_path.clone());
+            }
+            if ui.button("Export journal").clicked() {
+                self.run_export(crate::command::ExportKind::Journal, &self.io_path.clone());
+            }
+            if ui.button("Export price history").clicked() {
+                self.run_export(crate::command::ExportKind::History, &self.io_path.clone());
+            }
+        });
+        ui.horizontal_wrapped(|ui| {
+            if ui.button("Back up workspace").clicked() {
+                self.backup_workspace(&self.io_path.clone());
+            }
+            if ui.button("Restore…").clicked() && !self.io_path.trim().is_empty() {
+                self.restore_portable(&self.io_path.clone());
+            }
+        });
+        ui.label(
+            RichText::new(
+                "Empty path writes to ~/Downloads (or the exports folder). Sample-tagged journal or scan rows \
+                 produce a file named *SAMPLE*. RESTORE accepts a workspace backup, a journal export, or a history export. \
+                 Scan JSON is a snapshot only.",
+            )
+            .font(ui_font(11.5))
+            .color(muted()),
+        );
+        ui.add_space(8.0);
+        ui.label(
+            RichText::new(format!(
+                "Commands: EXPORT · EXPORT SCAN · EXPORT JOURNAL · EXPORT HIST · BACKUP · RESTORE <path>. Files stay out of {}/secrets.",
+                crate::worker::data_dir().display()
+            ))
             .font(ui_font(11.5))
             .color(muted()),
         );
