@@ -251,8 +251,10 @@ pub enum Function {
     PopOut,
     /// Put the focused pane in a colour link group (`None` = unlink).
     Link(Option<crate::layouts::Link>),
-    /// Headlines (for a security when used after one).
+    /// Watchlist / symbol headlines (`NEWS`, `AAPL CN`).
     News,
+    /// General market headlines (`TOP`).
+    TopNews,
     /// Order book depth (levels).
     OrderBook(Option<usize>),
     /// Option chain monitor (Bloomberg OMON).
@@ -359,7 +361,8 @@ fn parse_function(head: &str, rest: &[&str]) -> Option<Function> {
             None | Some("OFF" | "NONE" | "0") => None,
             Some(c) => Some(crate::layouts::Link::ALL.into_iter().find(|l| l.label().eq_ignore_ascii_case(c))?),
         }),
-        "N" | "CN" | "NEWS" | "TOP" => Function::News,
+        "N" | "CN" | "NEWS" => Function::News,
+        "TOP" => Function::TopNews,
         "OB" | "BOOK" | "DEPTH" | "DOM" => Function::OrderBook(num(rest.first())),
         "OMON" | "OMST" | "OPT" | "OPTIONS" | "CHAIN" => Function::Options,
         "SIDEBAR" | "SB" => Function::Sidebar(words().join(" ")),
@@ -463,20 +466,17 @@ pub fn hint(input: &str) -> String {
 
 fn describe(f: &Function) -> String {
     match f {
-        Function::Timeframe(tf) => format!(
-            "Interval {}",
-            match tf {
-                Timeframe::M1 => "1 minute",
-                Timeframe::M5 => "5 minutes",
-                Timeframe::M15 => "15 minutes",
-                Timeframe::M30 => "30 minutes",
-                Timeframe::H1 => "1 hour",
-                Timeframe::H4 => "4 hours",
-                Timeframe::D1 => "1 day",
-                Timeframe::W1 => "1 week",
-                Timeframe::MN1 => "1 month",
-            }
-        ),
+        Function::Timeframe(tf) => format!("Interval {}", match tf {
+            Timeframe::M1 => "1 minute",
+            Timeframe::M5 => "5 minutes",
+            Timeframe::M15 => "15 minutes",
+            Timeframe::M30 => "30 minutes",
+            Timeframe::H1 => "1 hour",
+            Timeframe::H4 => "4 hours",
+            Timeframe::D1 => "1 day",
+            Timeframe::W1 => "1 week",
+            Timeframe::MN1 => "1 month",
+        }),
         Function::ChartType(c) => format!("Chart type {}", c.label()),
         Function::Indicator(i) => format!("Toggle {} — {}", i.label(), i.name()),
         Function::IndicatorPicker(q) if q.is_empty() => "Browse indicators".into(),
@@ -515,7 +515,8 @@ fn describe(f: &Function) -> String {
         Function::PopOut => "Pop the focused pane out into its own window".into(),
         Function::Link(Some(l)) => format!("Link focused pane to the {} group", l.label()),
         Function::Link(None) => "Unlink focused pane".into(),
-        Function::News => "News headlines".into(),
+        Function::News => "Watchlist news (AAPL CN for one name)".into(),
+        Function::TopNews => "Top market headlines".into(),
         Function::OrderBook(_) => "Order book (depth)".into(),
         Function::Options => "Option chain: calls and puts by strike, IV and greeks".into(),
         Function::Sidebar(s) if s.is_empty() => "Toggle the sidebar".into(),
@@ -680,6 +681,8 @@ mod tests {
         assert_eq!(parse("LINK OFF"), Some(Command::Function(Function::Link(None))));
         assert_eq!(parse("LINK PINK"), None);
         assert_eq!(parse("AAPL CN"), Some(Command::SymbolFunction("AAPL US Equity".into(), Function::News)));
+        assert_eq!(parse("NEWS"), Some(Command::Function(Function::News)));
+        assert_eq!(parse("TOP"), Some(Command::Function(Function::TopNews)));
         assert_eq!(
             parse("BTCUSD CRNCY OB 50"),
             Some(Command::SymbolFunction("BTCUSD Curncy".into(), Function::OrderBook(Some(50))))

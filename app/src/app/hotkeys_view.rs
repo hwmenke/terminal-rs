@@ -260,7 +260,7 @@ impl TerminalApp {
                     ),
                     (&["WEI"], "World markets overview"),
                     (&["GC"], "US Treasury yield curve"),
-                    (&["N", "AAPL CN"], "News headlines (for a security)"),
+                    (&["N", "AAPL CN", "TOP"], "Watchlist / scanner-leader news; AAPL CN for one name; TOP for the market"),
                     (&["OB", "BTCUSD CRNCY OB 50"], "Order book depth"),
                     (&["OMON", "AAPL OMON", "SPX INDEX OMON"], "Option chain: calls/puts by strike, IV, greeks"),
                     (&["CONG", "NVDA CONG"], "Congress trades feed / who traded a ticker"),

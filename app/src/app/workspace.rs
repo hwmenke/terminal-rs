@@ -489,8 +489,8 @@ impl TerminalApp {
                 }
             }
             PaneKind::News(n) => {
-                if n.symbol.as_deref() != Some(key.as_str()) {
-                    **n = NewsPane::new(Some(key));
+                if n.symbol.as_deref() != Some(key.as_str()) || n.scope != tr_data::news::NewsScope::Symbol {
+                    **n = NewsPane::for_symbol(key);
                 }
             }
             PaneKind::OrderBook(b) => {
@@ -757,7 +757,11 @@ impl TerminalApp {
                 words[1..].join(" ").to_ascii_uppercase(),
             )))),
             "WL" | "WATCHLIST" | "W" => PaneKind::Watchlist,
-            "NEWS" | "N" | "CN" | "TOP" => PaneKind::News(Box::new(NewsPane::new(current))),
+            "TOP" => PaneKind::News(Box::new(NewsPane::top())),
+            "NEWS" | "N" | "CN" => PaneKind::News(Box::new(match current {
+                Some(s) if head == "CN" => NewsPane::for_symbol(s),
+                _ => NewsPane::watchlist(),
+            })),
             "BOOK" | "OB" | "DEPTH" | "DOM" => {
                 // Default to a market with a public book.
                 let sym = given

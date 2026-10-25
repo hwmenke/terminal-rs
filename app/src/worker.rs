@@ -79,10 +79,10 @@ pub enum Request {
         symbol: String,
         expiration: Option<i64>,
     },
-    /// Headlines for a market key (`None` = general market news).
+    /// Headlines for bounded market keys (`None` = one top-market query).
     News {
         pane: PaneId,
-        symbol: Option<String>,
+        symbols: Option<Vec<String>>,
     },
     OrderBook {
         pane: PaneId,
@@ -266,8 +266,8 @@ pub enum Response {
     },
     News {
         pane: PaneId,
-        symbol: Option<String>,
-        items: Result<Vec<tr_data::NewsItem>, String>,
+        symbols: Option<Vec<String>>,
+        batch: tr_data::news::NewsBatch,
     },
     OrderBook {
         pane: PaneId,
@@ -354,6 +354,7 @@ struct Shared {
     /// combined window instead of stitching broken week boundaries.
     archive_daily: std::sync::Mutex<SeriesMap>,
     cache: std::sync::Mutex<Option<BarCache>>,
+    news: std::sync::Mutex<tr_data::news::NewsCache>,
     db: Mutex<Db>,
     out: mpsc::Sender<Response>,
     ctx: egui::Context,
@@ -411,6 +412,7 @@ impl Worker {
             series: Default::default(),
             archive_daily: Default::default(),
             cache: std::sync::Mutex::new(cache),
+            news: Default::default(),
             db: Mutex::new(db),
             out,
             ctx,
@@ -1136,9 +1138,9 @@ async fn handle(s: &Arc<Shared>, req: Request) {
             let chain = s.provider.options(&symbol, expiration).await.map(Box::new).map_err(|e| format!("{e:#}"));
             s.send(Response::Options { pane, symbol, chain });
         }
-        Request::News { pane, symbol } => {
-            let items = s.provider.news(symbol.as_deref()).await.map_err(|e| format!("{e:#}"));
-            s.send(Response::News { pane, symbol, items });
+        Request::News { pane, symbols } => {
+            let batch = fetch_news(s, symbols.clone()).await;
+            s.send(Response::News { pane, symbols, batch });
         }
         Request::OrderBook { pane, symbol, depth } => {
             let book = s.provider.order_book(&symbol, depth).await.map_err(|e| format!("{e:#}"));
@@ -1374,6 +1376,126 @@ async fn profile(s: &Shared, query: &str) -> Option<Profile> {
     Some(Profile { politician, trades, perf, returns, tracked, price_warnings })
 }
 
+async fn fetch_news(s: &Arc<Shared>, symbols: Option<Vec<String>>) -> tr_data::news::NewsBatch {
+    use tr_data::news::{
+        NewsBatch, NewsFailure, TOP_CACHE_KEY, assemble_batch, bound_symbols, dedup_headlines, is_stale,
+    };
+    let now = chrono::Utc::now().timestamp();
+    if s.provider.name() == "sample" {
+        return NewsBatch::sample_isolated(now);
+    }
+    match symbols {
+        None => {
+            if let Some(items) = s.news.lock().expect("news cache").fresh(TOP_CACHE_KEY, now).map(|i| i.to_vec()) {
+                let stale = s
+                    .news
+                    .lock()
+                    .expect("news cache")
+                    .get(TOP_CACHE_KEY, now)
+                    .is_some_and(|(_, at, _)| is_stale(at, now));
+                return NewsBatch {
+                    items: dedup_headlines(items),
+                    failures: Vec::new(),
+                    queried: Vec::new(),
+                    fetched_at: now,
+                    stale,
+                    sample: false,
+                };
+            }
+            match s.provider.news(None).await {
+                Ok(items) => {
+                    let items = dedup_headlines(items);
+                    s.news.lock().expect("news cache").store(TOP_CACHE_KEY, items.clone(), now);
+                    NewsBatch {
+                        items,
+                        failures: Vec::new(),
+                        queried: Vec::new(),
+                        fetched_at: now,
+                        stale: false,
+                        sample: false,
+                    }
+                }
+                Err(e) => {
+                    let err = format!("{e:#}");
+                    let mut cache = s.news.lock().expect("news cache");
+                    let cached = cache.get(TOP_CACHE_KEY, now).map(|(items, at, _)| (items.to_vec(), at));
+                    cache.store_error(TOP_CACHE_KEY, err.clone(), now);
+                    match cached {
+                        Some((items, fetched_at)) => NewsBatch {
+                            items,
+                            failures: vec![NewsFailure { symbol: "Top market".into(), error: err }],
+                            queried: Vec::new(),
+                            fetched_at,
+                            stale: true,
+                            sample: false,
+                        },
+                        None => NewsBatch {
+                            items: Vec::new(),
+                            failures: vec![NewsFailure { symbol: "Top market".into(), error: err }],
+                            queried: Vec::new(),
+                            fetched_at: now,
+                            stale: false,
+                            sample: false,
+                        },
+                    }
+                }
+            }
+        }
+        Some(raw) => {
+            let queried = bound_symbols(raw);
+            let mut ready = Vec::new();
+            let mut pending = Vec::new();
+            let mut stale = false;
+            {
+                let cache = s.news.lock().expect("news cache");
+                for key in &queried {
+                    if let Some(items) = cache.fresh(key, now) {
+                        stale |= cache.get(key, now).is_some_and(|(_, at, _)| is_stale(at, now));
+                        ready.push((key.clone(), Ok(items.to_vec())));
+                    } else {
+                        pending.push(key.clone());
+                    }
+                }
+            }
+            let fetched = {
+                use futures::StreamExt;
+                futures::stream::iter(pending.into_iter().map(|key| {
+                    let s = s.clone();
+                    async move {
+                        let result = s.provider.news(Some(&key)).await.map_err(|e| format!("{e:#}"));
+                        (key, result)
+                    }
+                }))
+                .buffered(tr_data::news::FETCH_CONCURRENCY)
+                .collect::<Vec<_>>()
+                .await
+            };
+            {
+                let mut cache = s.news.lock().expect("news cache");
+                for (key, result) in fetched {
+                    match result {
+                        Ok(items) => {
+                            cache.store(&key, items.clone(), now);
+                            ready.push((key, Ok(items)));
+                        }
+                        Err(err) => {
+                            if let Some((items, at, _)) = cache.get(&key, now) {
+                                ready.push((key.clone(), Ok(items.to_vec())));
+                                stale = true;
+                                let _ = at;
+                            } else {
+                                ready.push((key.clone(), Err(err.clone())));
+                            }
+                            cache.store_error(key, err, now);
+                        }
+                    }
+                }
+            }
+            assemble_batch(queried, ready, now, stale)
+        }
+    }
+}
+
 /// Run futures concurrently, at most 6 in flight (keeps data providers happy).
 async fn futures_join<F, T>(futs: impl Iterator<Item = F>) -> Vec<T>
 where
@@ -1418,6 +1540,7 @@ mod tests {
                 series: Default::default(),
                 archive_daily: Default::default(),
                 cache: std::sync::Mutex::new(cache),
+                news: Default::default(),
                 db: Mutex::new(Db::open_in_memory().unwrap()),
                 out,
                 ctx: egui::Context::default(),
@@ -1515,15 +1638,12 @@ mod tests {
         drop(c);
         let before = std::fs::read(&path).unwrap();
         let (s, rx) = shared(Arc::new(tr_data::sample::SampleProvider::at(0, 10)), None);
-        s.whats_news.send_replace((
-            0,
-            tr_data::whats_news::Config {
-                enabled: true,
-                archive_path: path.to_string_lossy().into(),
-                http_url: String::new(),
-                prefer_http: false,
-            },
-        ));
+        s.whats_news.send_replace((0, tr_data::whats_news::Config {
+            enabled: true,
+            archive_path: path.to_string_lossy().into(),
+            http_url: String::new(),
+            prefer_http: false,
+        }));
         let req = Request::ArchiveHistory {
             pane: 1,
             generation: 1,
@@ -1727,6 +1847,7 @@ mod tests {
             series: Default::default(),
             archive_daily: Default::default(),
             cache: std::sync::Mutex::new(None),
+            news: Default::default(),
             db: Mutex::new(Db::open_in_memory().unwrap()),
             out,
             ctx: egui::Context::default(),
@@ -1738,6 +1859,61 @@ mod tests {
         assert!(store_series(&s, 1, 2, Arc::new(vec![Bar::new(0, 1.0, 1.0, 1.0, 1.0, 1.0)])));
         assert_eq!(current_series(&s, 1, 2).unwrap().len(), 1);
         assert!(current_series(&s, 1, 1).is_none());
+    }
+
+    struct NewsStub {
+        calls: std::sync::atomic::AtomicUsize,
+        fail: std::sync::Mutex<Vec<String>>,
+    }
+    #[async_trait::async_trait]
+    impl tr_data::MarketData for NewsStub {
+        fn name(&self) -> &str {
+            "yahoo-test"
+        }
+        async fn history(&self, _: &str, _: Timeframe, _: Option<i64>, _: usize) -> anyhow::Result<Vec<Bar>> {
+            anyhow::bail!("unused")
+        }
+        async fn news(&self, symbol: Option<&str>) -> anyhow::Result<Vec<tr_data::NewsItem>> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let key = symbol.unwrap_or("*").to_string();
+            if self.fail.lock().unwrap().iter().any(|s| s == &key) {
+                anyhow::bail!("HTTP 429");
+            }
+            Ok(vec![tr_data::NewsItem {
+                title: format!("{key} story"),
+                publisher: "T".into(),
+                link: format!("https://n/{key}"),
+                ts: 1_700_000_000,
+                tickers: vec![],
+            }])
+        }
+    }
+
+    #[tokio::test]
+    async fn news_is_bounded_cached_and_partial() {
+        let stub = std::sync::Arc::new(NewsStub {
+            calls: Default::default(),
+            fail: std::sync::Mutex::new(vec!["MSFT US Equity".into()]),
+        });
+        let (s, _rx) = shared(stub.clone(), None);
+        let many: Vec<String> = (0..20).map(|i| format!("S{i} US Equity")).collect();
+        let batch = fetch_news(&s, Some(many)).await;
+        assert_eq!(batch.queried.len(), tr_data::news::MAX_SCOPED_SYMBOLS);
+        assert_eq!(stub.calls.load(std::sync::atomic::Ordering::SeqCst), tr_data::news::MAX_SCOPED_SYMBOLS);
+        let again = fetch_news(&s, Some(vec!["S0 US Equity".into()])).await;
+        assert_eq!(stub.calls.load(std::sync::atomic::Ordering::SeqCst), tr_data::news::MAX_SCOPED_SYMBOLS);
+        assert_eq!(again.items.len(), 1);
+        let mixed = fetch_news(&s, Some(vec!["AAPL US Equity".into(), "MSFT US Equity".into()])).await;
+        assert!(mixed.is_partial());
+        assert_eq!(mixed.failures[0].symbol, "MSFT US Equity");
+        assert!(!mixed.items.is_empty());
+    }
+
+    #[tokio::test]
+    async fn sample_news_is_isolated() {
+        let (s, _rx) = shared(std::sync::Arc::new(tr_data::sample::SampleProvider::at(0, 10)), None);
+        let batch = fetch_news(&s, Some(vec!["AAPL US Equity".into()])).await;
+        assert!(batch.sample && batch.items.is_empty());
     }
 
     #[test]
