@@ -292,6 +292,11 @@ pub enum Function {
     Desk,
     /// Trade journal / checklist (`JOURNAL`, `AAPL JOURNAL`, `AAPL JOURNAL 2026-10-24`).
     Journal(String),
+    /// Historical risk/return and conditional forward returns (`STATS`, `AAPL COND RSI < 30`).
+    Stats {
+        condition: String,
+        conditional: bool,
+    },
     /// Attach a note to a historical chart date (`NOTE`, `AAPL NOTE 2026-10-24 text`).
     JournalNote {
         date: String,
@@ -301,7 +306,7 @@ pub enum Function {
     Latest,
     /// Toggle a persisted review overlay on the focused chart.
     ReviewOverlay(ReviewOverlay),
-    /// `EXPORT SCAN|JOURNAL|HIST|WORKSPACE [path]`.
+    /// `EXPORT SCAN|JOURNAL|HIST|STATS|WORKSPACE [path]`.
     Export(ExportKind, String),
     /// `BACKUP [path]` — portable workspace backup (no credentials).
     Backup(String),
@@ -316,6 +321,7 @@ pub enum ExportKind {
     Journal,
     History,
     Workspace,
+    Stats,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -468,6 +474,8 @@ fn parse_function(head: &str, rest: &[&str]) -> Option<Function> {
         "REVIEW" | "REV" => Function::Review,
         "DESK" | "PMDESK" | "RISK" => Function::Desk,
         "JOURNAL" | "JRNL" | "CHECKLIST" | "TRADELOG" => Function::Journal(joined()),
+        "STATS" | "STAT" | "STATISTICS" => Function::Stats { condition: joined(), conditional: !rest.is_empty() },
+        "COND" | "CDIST" | "CONDRET" => Function::Stats { condition: joined(), conditional: true },
         "NOTE" | "JNOTE" => {
             let (date, text) = split_note_args(rest);
             Function::JournalNote { date, text }
@@ -482,6 +490,9 @@ fn parse_function(head: &str, rest: &[&str]) -> Option<Function> {
                 Some("SCAN" | "UNIV") => (ExportKind::Scan, rest.get(1..).unwrap_or(&[]).join(" ")),
                 Some("JOURNAL" | "JRNL" | "CHECKLIST") => (ExportKind::Journal, rest.get(1..).unwrap_or(&[]).join(" ")),
                 Some("HIST" | "HISTORY") => (ExportKind::History, rest.get(1..).unwrap_or(&[]).join(" ")),
+                Some("STATS" | "STAT" | "COND" | "CDIST") => {
+                    (ExportKind::Stats, rest.get(1..).unwrap_or(&[]).join(" "))
+                }
                 Some("WORKSPACE" | "BACKUP" | "WS") => (ExportKind::Workspace, rest.get(1..).unwrap_or(&[]).join(" ")),
                 _ => (ExportKind::Auto, joined()),
             };
@@ -676,6 +687,14 @@ fn describe(f: &Function) -> String {
             "Trade journal: setups, checklist, planned risk, outcomes in $ and R".into()
         }
         Function::Journal(q) => format!("Trade journal: {q}"),
+        Function::Stats { condition, conditional } if condition.is_empty() => {
+            if *conditional {
+                "Conditional returns: what followed a filter vs the unconditional baseline".into()
+            } else {
+                "Statistics: historical risk, returns, RSI/KAMA bins and seasonality".into()
+            }
+        }
+        Function::Stats { condition, .. } => format!("Conditional returns after {condition}"),
         Function::JournalNote { date, text } if date.is_empty() && text.is_empty() => {
             "Attach a note to the focused chart date".into()
         }
@@ -706,6 +725,10 @@ fn describe(f: &Function) -> String {
             "Export archived daily price history with source and dates".into()
         }
         Function::Export(ExportKind::History, p) => format!("Export price history to {p}"),
+        Function::Export(ExportKind::Stats, p) if p.is_empty() => {
+            "Export statistics and conditional returns with source, as-of and provenance".into()
+        }
+        Function::Export(ExportKind::Stats, p) => format!("Export statistics to {p}"),
         Function::Export(ExportKind::Workspace, p) if p.is_empty() => {
             "Back up personal workspace data (credentials excluded)".into()
         }
@@ -804,6 +827,22 @@ mod tests {
             Some(Command::Function(Function::Export(ExportKind::Journal, String::new())))
         );
         assert_eq!(parse("EXPORT HIST"), Some(Command::Function(Function::Export(ExportKind::History, String::new()))));
+        assert_eq!(
+            parse("STATS"),
+            Some(Command::Function(Function::Stats { condition: String::new(), conditional: false }))
+        );
+        assert_eq!(
+            parse("AAPL STATS"),
+            Some(Command::SymbolFunction(
+                "AAPL US Equity".into(),
+                Function::Stats { condition: String::new(), conditional: false }
+            ))
+        );
+        assert_eq!(
+            parse("COND RSI(14) < 30"),
+            Some(Command::Function(Function::Stats { condition: "RSI(14) < 30".into(), conditional: true }))
+        );
+        assert_eq!(parse("EXPORT STATS"), Some(Command::Function(Function::Export(ExportKind::Stats, String::new()))));
         assert_eq!(parse("BACKUP"), Some(Command::Function(Function::Backup(String::new()))));
         assert_eq!(
             parse("RESTORE ~/Downloads/workspace.json"),

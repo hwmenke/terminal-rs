@@ -129,6 +129,15 @@ pub enum PaneSettings {
         #[serde(default)]
         filter: String,
     },
+    /// Statistics / conditional returns for one research symbol.
+    Stats {
+        #[serde(default)]
+        symbol: String,
+        #[serde(default)]
+        condition: String,
+        #[serde(default)]
+        conditional: bool,
+    },
     /// Brokerage portfolio view (credentials are never stored in layouts).
     Portfolio {
         #[serde(default)]

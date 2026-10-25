@@ -646,6 +646,21 @@ impl TerminalApp {
             }
             if nav_row(
                 ui,
+                Icon::Gauge,
+                "Statistics",
+                Some("STATS"),
+                is_focused(&PaneKind::Stats(Box::new(super::stats::StatsPane::new(
+                    String::new(),
+                    String::new(),
+                    false,
+                )))),
+            )
+            .clicked()
+            {
+                out.push(SidebarCmd::Function(Function::Stats { condition: String::new(), conditional: false }));
+            }
+            if nav_row(
+                ui,
                 Icon::Grid,
                 "PM Desk",
                 Some("DESK"),

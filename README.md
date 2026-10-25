@@ -217,7 +217,15 @@ gets the native title bar with traffic lights, window vibrancy behind the sideba
   attaches a note to a historical date; cyan **J** pins mark those dates on the chart.
   Rows persist in `trade_journal.json`. Sample bars never invent P&L. See
   [Trade journal](docs/TRADE_JOURNAL.md).
-- **Export and recovery** — `EXPORT SCAN`, `EXPORT JOURNAL` and `EXPORT HIST` write JSON
+- **Statistics and conditional returns** — `STATS` (or `AAPL STATS`) shows historical
+  risk and returns from the research archive: annualised volatility, Sharpe, max
+  drawdown, win rate, daily-return distribution, RSI/vol/KAMA deciles and
+  seasonality. `COND` (or `AAPL COND RSI(14) < 30`) compares what followed a
+  filter to the unconditional baseline. Only completed outcomes count; overlapping
+  windows report effective N = N / H. Sample bars are refused. See
+  [Statistics](docs/STATS.md).
+- **Export and recovery** — `EXPORT SCAN`, `EXPORT JOURNAL`, `EXPORT HIST` and
+  `EXPORT STATS` write JSON
   with source, as-of date and provenance. Sample-tagged rows name the file `SAMPLE`.
   `BACKUP` / `RESTORE` copy personal workspace data (layouts, themes, prefs, watchlists,
   journal, alerts) and **exclude credentials**. See

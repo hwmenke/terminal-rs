@@ -49,6 +49,12 @@ const COMMANDS: &[(&str, &str, &str, Option<Action>)] = &[
     ("EXPORT HIST", "Export archived daily prices with source and dates", "yahoo archive backup", None),
     ("BACKUP", "Back up personal workspace (credentials excluded)", "restore export layouts journal", None),
     ("RESTORE", "Restore a workspace, journal or history export", "backup import recovery", None),
+    ("STATS", "Historical risk, returns and what followed a condition", "conditional returns sma baseline", None),
+    ("AAPL STATS", "AAPL historical risk and returns", "statistics research archive", None),
+    ("COND", "Conditional forward returns vs baseline", "sma distribution overlap", None),
+    ("AAPL COND RSI(14) < 30", "What followed oversold RSI on AAPL", "conditional returns", None),
+    ("CDIST", "Conditional returns (alias)", "distribution baseline", None),
+    ("EXPORT STATS", "Export statistics with source and date", "conditional returns provenance", None),
     (
         "JOURNAL",
         "Trade journal: setups, checklist, $ and R outcomes",
@@ -229,6 +235,10 @@ pub(super) fn static_items() -> Vec<Item> {
     v.push(
         Item::new(Kind::Panel, "New Journal pane", "NEW JOURNAL", Target::Run("NEW JOURNAL".into()))
             .keywords("panel pane journal checklist notes"),
+    );
+    v.push(
+        Item::new(Kind::Panel, "New Statistics pane", "NEW STATS", Target::Run("NEW STATS".into()))
+            .keywords("panel pane statistics conditional returns"),
     );
     v.push(
         Item::new(

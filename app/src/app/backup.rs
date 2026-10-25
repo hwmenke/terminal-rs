@@ -32,6 +32,7 @@ impl TerminalApp {
             ExportKind::Scan => self.export_scan(path),
             ExportKind::Journal => self.export_journal(path),
             ExportKind::History => self.export_history(path),
+            ExportKind::Stats => self.export_stats(path),
             ExportKind::Workspace => self.backup_workspace(path),
         }
     }
@@ -41,6 +42,7 @@ impl TerminalApp {
             Some(PaneKind::Research(r)) if r.history => Some(ExportKind::History),
             Some(PaneKind::Research(_)) => Some(ExportKind::Scan),
             Some(PaneKind::Journal(_)) => Some(ExportKind::Journal),
+            Some(PaneKind::Stats(_)) => Some(ExportKind::Stats),
             Some(PaneKind::Settings) => Some(ExportKind::Workspace),
             _ => None,
         }
@@ -71,6 +73,31 @@ impl TerminalApp {
         };
         match doc {
             Ok(doc) => self.finish_write(&doc, path, "Exported scan"),
+            Err(e) => self.status = e,
+        }
+    }
+
+    fn export_stats(&mut self, path: &str) {
+        let pane = self.panes.iter().find(|p| p.id == self.focus).and_then(|p| match &p.kind {
+            PaneKind::Stats(s) => Some(s),
+            _ => None,
+        });
+        let pane = pane.or_else(|| {
+            self.panes.iter().find_map(|p| match &p.kind {
+                PaneKind::Stats(s) => Some(s),
+                _ => None,
+            })
+        });
+        let Some(pane) = pane else {
+            self.status = "EXPORT STATS needs an open STATS pane with results".into();
+            return;
+        };
+        let Some(snapshot) = &pane.snapshot else {
+            self.status = "STATS has no results to export yet".into();
+            return;
+        };
+        match env::stats_document(snapshot, env::now_rfc3339()) {
+            Ok(doc) => self.finish_write(&doc, path, "Exported statistics"),
             Err(e) => self.status = e,
         }
     }
@@ -139,6 +166,11 @@ impl TerminalApp {
             Kind::Scan => {
                 self.status =
                     "Scan exports are snapshots and are not restored into SCAN. Open the JSON file instead.".into();
+            }
+            Kind::Stats => {
+                self.status =
+                    "Statistics exports are snapshots and are not restored into STATS. Open the JSON file instead."
+                        .into();
             }
         }
     }

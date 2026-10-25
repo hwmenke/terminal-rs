@@ -2,7 +2,7 @@
 
 use std::time::Instant;
 
-use egui::{pos2, vec2, Align2, Color32, Rect, RichText, Sense, Stroke, Ui, UiBuilder};
+use egui::{Align2, Color32, Rect, RichText, Sense, Stroke, Ui, UiBuilder, pos2, vec2};
 use tr_data::OrderBook;
 
 use super::{PaneKind, TerminalApp};
@@ -131,13 +131,17 @@ impl TerminalApp {
             | PaneKind::Help
             | PaneKind::Chart(_)
             | PaneKind::Desk(_)
-            | PaneKind::Journal(_) => {}
+            | PaneKind::Journal(_)
+            | PaneKind::Stats(_) => {}
         }
         if matches!(self.panes[i].kind, PaneKind::Desk(_)) {
             actions.extend(self.desk(ui, id));
         }
         if matches!(self.panes[i].kind, PaneKind::Journal(_)) {
             actions.extend(self.journal_pane(ui, id));
+        }
+        if matches!(self.panes[i].kind, PaneKind::Stats(_)) {
+            actions.extend(self.stats_pane(ui, id));
         }
         match self.panes[i].kind {
             PaneKind::Watchlist => actions.extend(self.watchlist(ui)),
@@ -154,7 +158,7 @@ impl TerminalApp {
 
 /// Headlines list. Returns `Some(_)` when a refresh was requested.
 fn news(ui: &mut Ui, n: &mut super::NewsPane, offline: bool, has_leaders: bool) -> Option<bool> {
-    use tr_data::news::{format_freshness, format_pub, NewsScope};
+    use tr_data::news::{NewsScope, format_freshness, format_pub};
     let mut refresh = None;
     let set_scope = |n: &mut super::NewsPane, scope: NewsScope, refresh: &mut Option<bool>| {
         if n.scope != scope {

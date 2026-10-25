@@ -46,6 +46,7 @@ pub enum Kind {
     History,
     Journal,
     Workspace,
+    Stats,
 }
 
 impl Kind {
@@ -55,6 +56,7 @@ impl Kind {
             Self::History => "history",
             Self::Journal => "journal",
             Self::Workspace => "workspace",
+            Self::Stats => "stats",
         }
     }
 }
@@ -471,6 +473,36 @@ pub fn import_history(archive: &mut Archive, doc: &Document) -> Result<usize, St
     Ok(imported)
 }
 
+/// Statistics / conditional-return snapshot. Sample-tagged reports stay labelled.
+pub fn stats_document(
+    snapshot: &crate::stats::ResearchSnapshot,
+    exported_at: impl Into<String>,
+) -> Result<Document, String> {
+    let sample = snapshot.stats.provenance == Provenance::Sample
+        || snapshot.conditional.provenance == Provenance::Sample
+        || !snapshot.stats.provenance.is_verified()
+        || !snapshot.conditional.provenance.is_verified();
+    if !sample {
+        snapshot.stats.provenance.require_verified("export STATS")?;
+        snapshot.conditional.provenance.require_verified("export STATS")?;
+    }
+    let provenance = snapshot.stats.provenance.combine(snapshot.conditional.provenance);
+    let payload = serde_json::to_value(snapshot).map_err(|e| format!("stats payload: {e}"))?;
+    let (sample, sample_label) = sample_fields(sample || provenance == Provenance::Sample);
+    Ok(Document {
+        format: FORMAT,
+        kind: Kind::Stats,
+        exported_at: exported_at.into(),
+        source: snapshot.stats.source.clone(),
+        as_of_date: Some(snapshot.stats.as_of.clone()).filter(|s| !s.is_empty()),
+        provenance,
+        sample,
+        sample_label,
+        credentials_excluded: true,
+        payload,
+    })
+}
+
 /// Workspace-shaped payload helper used by the app. Credentials are stripped here too.
 pub fn workspace_document(
     source: impl Into<String>,
@@ -642,5 +674,40 @@ mod tests {
         assert!(doc.credentials_excluded);
         assert!(doc.payload.get("api_key").is_none());
         assert_eq!(doc.kind, Kind::Workspace);
+    }
+
+    #[test]
+    fn stats_export_keeps_source_as_of_and_provenance() {
+        let ts = |d: &str| {
+            chrono::NaiveDate::parse_from_str(d, "%Y-%m-%d")
+                .unwrap()
+                .and_hms_opt(0, 0, 0)
+                .unwrap()
+                .and_utc()
+                .timestamp()
+        };
+        let bars: Vec<Bar> = (0..40)
+            .map(|i| {
+                let c = 100.0 + i as f64;
+                Bar::new(ts("2026-01-01") + i * 86_400, c, c, c, c, 1_000.0).with_provenance(Provenance::Real)
+            })
+            .collect();
+        let snap = crate::stats::compute_snapshot(
+            "AAPL US Equity",
+            "AAPL",
+            &bars,
+            "RSI(14) < 30",
+            &[5],
+            "Local Yahoo daily research archive",
+        )
+        .unwrap();
+        let doc = stats_document(&snap, "2026-10-25T00:00:00Z").unwrap();
+        assert_eq!(doc.kind, Kind::Stats);
+        assert!(!doc.sample);
+        assert_eq!(doc.source, "Local Yahoo daily research archive");
+        assert_eq!(doc.as_of_date.as_deref(), Some(snap.stats.as_of.as_str()));
+        assert_eq!(doc.provenance, Provenance::Real);
+        assert_eq!(doc.payload["stats"]["ticker"], "AAPL");
+        assert!(doc.filename().starts_with("terminal-rs-stats-"));
     }
 }

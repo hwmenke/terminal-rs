@@ -280,6 +280,10 @@ impl TerminalApp {
                         "Trade journal: setup + checklist + planned $ risk; record $ and R; notes on chart dates",
                     ),
                     (
+                        &["STATS", "AAPL STATS", "AAPL COND RSI(14) < 30"],
+                        "Historical risk/returns; what followed low RSI or price above a moving average",
+                    ),
+                    (
                         &["EXPORT", "EXPORT SCAN", "EXPORT JOURNAL", "EXPORT HIST", "BACKUP", "RESTORE"],
                         "Export scans/history/journal with source and date; back up or restore workspace (no credentials)",
                     ),

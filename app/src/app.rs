@@ -20,6 +20,7 @@ mod portfolio_view;
 mod research;
 mod settings_view;
 mod settings_writer;
+mod stats;
 mod theming;
 mod trading;
 mod watchlists;
@@ -86,6 +87,8 @@ pub enum PaneKind {
     Desk(Box<desk::DeskPane>),
     /// Trade journal / checklist (`JOURNAL`).
     Journal(Box<journal::JournalPane>),
+    /// Historical risk/return and conditional forward returns (`STATS` / `COND`).
+    Stats(Box<stats::StatsPane>),
     Settings,
 }
 
@@ -269,6 +272,13 @@ impl PaneKind {
                     format!("{} Journal", tr_data::security(&j.filter).ticker)
                 }
             }
+            PaneKind::Stats(s) => {
+                if s.symbol.trim().is_empty() {
+                    "Stats".into()
+                } else {
+                    format!("{} Stats", tr_data::security(&s.symbol).ticker)
+                }
+            }
             PaneKind::Settings => "Settings".into(),
         }
     }
@@ -300,6 +310,7 @@ impl PaneKind {
             PaneKind::Portfolio(p) => p.view.code(),
             PaneKind::Desk(_) => "DESK",
             PaneKind::Journal(_) => "JRNL",
+            PaneKind::Stats(_) => "STATS",
             PaneKind::Settings => "PDF",
         }
     }
@@ -379,6 +390,11 @@ impl PaneKind {
             },
             PaneKind::Desk(d) => PaneSettings::Desk { group: d.group.clone(), selected: d.selected.clone() },
             PaneKind::Journal(j) => PaneSettings::Journal { filter: j.filter.clone() },
+            PaneKind::Stats(s) => PaneSettings::Stats {
+                symbol: s.symbol.clone(),
+                condition: s.condition.clone(),
+                conditional: s.tab == stats::StatsTab::Conditional,
+            },
         }
     }
 
@@ -450,6 +466,9 @@ impl PaneKind {
                 PaneKind::Desk(Box::new(d))
             }
             PaneSettings::Journal { filter } => PaneKind::Journal(Box::new(journal::JournalPane::new(filter))),
+            PaneSettings::Stats { symbol, condition, conditional } => {
+                PaneKind::Stats(Box::new(stats::StatsPane::new(symbol, condition, conditional)))
+            }
         }
     }
 }
@@ -949,6 +968,9 @@ impl TerminalApp {
             Command::SymbolFunction(s, Function::Review) => self.open_review(Some(&s)),
             Command::SymbolFunction(s, Function::Desk) => self.open_desk(Some(&s)),
             Command::SymbolFunction(s, Function::Journal(extra)) => self.open_journal(Some(&s), &extra),
+            Command::SymbolFunction(s, Function::Stats { condition, conditional }) => {
+                self.open_stats(Some(&s), &condition, conditional)
+            }
             Command::SymbolFunction(s, Function::JournalNote { date, text }) => {
                 self.add_journal_note(Some(&s), &date, &text)
             }
@@ -1028,7 +1050,7 @@ impl TerminalApp {
                     }
                     None => {
                         self.status = format!(
-                            "Unknown panel {spec:?}; try CHART, NEWS, BOOK, WEI, GC, CONG, WL, DESK, JOURNAL, PORT"
+                            "Unknown panel {spec:?}; try CHART, NEWS, BOOK, WEI, GC, CONG, WL, DESK, JOURNAL, STATS, PORT"
                         )
                     }
                 }
@@ -1119,6 +1141,7 @@ impl TerminalApp {
             Function::Review => self.open_review(symbol.as_deref()),
             Function::Desk => self.open_desk(symbol.as_deref()),
             Function::Journal(extra) => self.open_journal(symbol.as_deref(), &extra),
+            Function::Stats { condition, conditional } => self.open_stats(symbol.as_deref(), &condition, conditional),
             Function::JournalNote { date, text } => self.add_journal_note(symbol.as_deref(), &date, &text),
             Function::Latest => self.with_chart(|c, _| c.jump_latest()),
             Function::ReviewOverlay(which) => self.with_chart(|c, _| match which {
@@ -1185,6 +1208,7 @@ impl TerminalApp {
                         match &mut pane.kind {
                             PaneKind::Research(r) => r.request(pane.id, &self.worker),
                             PaneKind::Chart(c) if c.archive => c.load(&self.worker),
+                            PaneKind::Stats(s) => s.request(pane.id, &self.worker),
                             _ => {}
                         }
                     }
@@ -1220,6 +1244,12 @@ impl TerminalApp {
                 Response::Desk { pane, generation, result } => {
                     if let Some(PaneKind::Desk(d)) = self.panes.iter_mut().find(|p| p.id == pane).map(|p| &mut p.kind) {
                         d.accept(generation, result);
+                    }
+                }
+                Response::Stats { pane, generation, result } => {
+                    if let Some(PaneKind::Stats(s)) = self.panes.iter_mut().find(|p| p.id == pane).map(|p| &mut p.kind)
+                    {
+                        s.accept(generation, result);
                     }
                 }
                 Response::History {
