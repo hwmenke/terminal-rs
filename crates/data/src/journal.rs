@@ -213,10 +213,7 @@ impl Store {
     }
 
     pub fn add_setup(&mut self, draft: SetupDraft, now: i64) -> Result<Setup, String> {
-        let symbol = crate::security(&draft.symbol).key();
-        if symbol.is_empty() {
-            return Err("setup needs a ticker".into());
-        }
+        let symbol = require_symbol(&draft.symbol)?;
         let chart_date = parse_chart_date(&draft.chart_date)?;
         let reasoning = draft.reasoning.trim();
         if reasoning.is_empty() {
@@ -295,10 +292,7 @@ impl Store {
         text: impl Into<String>,
         now: i64,
     ) -> Result<DateNote, String> {
-        let symbol = crate::security(&symbol.into()).key();
-        if symbol.is_empty() {
-            return Err("note needs a ticker".into());
-        }
+        let symbol = require_symbol(&symbol.into())?;
         let chart_date = parse_chart_date(chart_date)?;
         let text = text.into();
         let text = text.trim();
@@ -416,7 +410,19 @@ fn filter_key(filter: &str) -> Option<String> {
     if t.is_empty() {
         return None;
     }
-    Some(crate::security(t).key())
+    require_symbol(t).ok()
+}
+
+fn require_symbol(raw: &str) -> Result<String, String> {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return Err("needs a ticker".into());
+    }
+    let sec = crate::security(raw);
+    if sec.ticker.trim().is_empty() {
+        return Err("needs a ticker".into());
+    }
+    Ok(sec.key())
 }
 
 fn truncate(s: String, max: usize) -> String {
