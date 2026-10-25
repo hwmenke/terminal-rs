@@ -20,7 +20,7 @@ use crate::widgets::{self, Icon};
 use crate::worker::{Request, Worker};
 
 /// Panels offered by the + menus: label and command word.
-pub const PANELS: [(&str, &str); 14] = [
+pub const PANELS: [(&str, &str); 15] = [
     ("Chart", "CHART"),
     ("Watchlist", "WL"),
     ("News", "NEWS"),
@@ -32,6 +32,7 @@ pub const PANELS: [(&str, &str); 14] = [
     ("Congress Feed", "CONG"),
     ("Politicians", "POL"),
     ("Alerts", "ALRT"),
+    ("Journal", "JOURNAL"),
     ("Security Search", "SECF"),
     ("Settings", "PREFS"),
     ("Help", "HELP"),
@@ -772,6 +773,10 @@ impl TerminalApp {
             "OMON" | "OPT" | "OPTIONS" | "CHAIN" => {
                 let sym = given.unwrap_or_else(|| self.optionable_symbol());
                 PaneKind::Options(Box::new(super::OptionsPane::new(&sym, 12, true)))
+            }
+            "JOURNAL" | "JRNL" | "CHECKLIST" | "TRADELOG" => {
+                let filter = given.clone().or(current.clone()).unwrap_or_default();
+                PaneKind::Journal(Box::new(super::journal::JournalPane::new(filter)))
             }
             "DESK" | "PM" | "PMDESK" | "RISK" => {
                 let group = words.get(1).cloned().unwrap_or(self.watch_ui.selected_group.as_str()).to_string();

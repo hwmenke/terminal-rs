@@ -11,6 +11,7 @@ mod command_bar;
 mod demo;
 mod desk;
 mod hotkeys_view;
+mod journal;
 mod options_view;
 mod palette_view;
 mod panels;
@@ -82,6 +83,8 @@ pub enum PaneKind {
     Portfolio(Box<broker::PortfolioPane>),
     /// Watchlist-scoped PM Desk (`DESK` / `PM`): leaders, group performance, position size.
     Desk(Box<desk::DeskPane>),
+    /// Trade journal / checklist (`JOURNAL`).
+    Journal(Box<journal::JournalPane>),
     Settings,
 }
 
@@ -258,6 +261,13 @@ impl PaneKind {
                     format!("Desk: {}", d.group)
                 }
             }
+            PaneKind::Journal(j) => {
+                if j.filter.is_empty() {
+                    "Journal".into()
+                } else {
+                    format!("{} Journal", tr_data::security(&j.filter).ticker)
+                }
+            }
             PaneKind::Settings => "Settings".into(),
         }
     }
@@ -288,6 +298,7 @@ impl PaneKind {
             PaneKind::Options(_) => "OMON",
             PaneKind::Portfolio(p) => p.view.code(),
             PaneKind::Desk(_) => "DESK",
+            PaneKind::Journal(_) => "JRNL",
             PaneKind::Settings => "PDF",
         }
     }
@@ -325,6 +336,7 @@ impl PaneKind {
                 show_volume: c.show_volume,
                 show_congress: c.show_congress,
                 show_news: c.show_news,
+                show_journal: c.show_journal,
                 magnet: c.magnet,
                 show_box: c.show_box,
                 show_rs: c.show_rs,
@@ -365,6 +377,7 @@ impl PaneKind {
                 open_only: p.open_only,
             },
             PaneKind::Desk(d) => PaneSettings::Desk { group: d.group.clone(), selected: d.selected.clone() },
+            PaneKind::Journal(j) => PaneSettings::Journal { filter: j.filter.clone() },
         }
     }
 
@@ -383,6 +396,7 @@ impl PaneKind {
                 show_volume,
                 show_congress,
                 show_news,
+                show_journal,
                 magnet,
                 show_box,
                 show_rs,
@@ -399,6 +413,7 @@ impl PaneKind {
                 c.show_volume = show_volume;
                 c.show_congress = show_congress;
                 c.show_news = show_news;
+                c.show_journal = show_journal;
                 c.magnet = magnet;
                 c.show_box = show_box;
                 c.show_rs = show_rs;
@@ -433,6 +448,7 @@ impl PaneKind {
                 d.selected = selected;
                 PaneKind::Desk(Box::new(d))
             }
+            PaneSettings::Journal { filter } => PaneKind::Journal(Box::new(journal::JournalPane::new(filter))),
         }
     }
 }
@@ -598,6 +614,7 @@ pub struct TerminalApp {
     price_alerts: tr_data::price_alerts::AlertBatch,
     alert_draft: alerts::AlertDraft,
     last_price_alerts: Option<Instant>,
+    journal: tr_data::journal::Store,
     congress_status: String,
     /// When the last Congress ingest finished.
     congress_checked: Option<chrono::DateTime<chrono::Local>>,
@@ -769,6 +786,7 @@ impl TerminalApp {
             price_alerts: tr_data::price_alerts::AlertBatch::empty(0),
             alert_draft: alerts::AlertDraft::default(),
             last_price_alerts: None,
+            journal: tr_data::journal::Store::load(&tr_data::journal::store_path(data_dir())),
             congress_status: String::new(),
             congress_checked: None,
             watchlist: DEFAULT_WATCHLIST.map(String::from).to_vec(),
@@ -929,6 +947,10 @@ impl TerminalApp {
             }
             Command::SymbolFunction(s, Function::Review) => self.open_review(Some(&s)),
             Command::SymbolFunction(s, Function::Desk) => self.open_desk(Some(&s)),
+            Command::SymbolFunction(s, Function::Journal(extra)) => self.open_journal(Some(&s), &extra),
+            Command::SymbolFunction(s, Function::JournalNote { date, text }) => {
+                self.add_journal_note(Some(&s), &date, &text)
+            }
             Command::SymbolFunction(s, Function::SetPriceAlert(kind)) => self.set_price_alert(Some(s), kind),
             Command::SymbolFunction(s, Function::ClearPriceAlert(_)) => self.clear_price_alert(&s),
             Command::SymbolFunction(s, f) => {
@@ -1005,7 +1027,9 @@ impl TerminalApp {
                     }
                     None => {
                         self.status =
-                            format!("Unknown panel {spec:?}; try CHART, NEWS, BOOK, WEI, GC, CONG, WL, DESK, PORT")
+                            format!(
+                                "Unknown panel {spec:?}; try CHART, NEWS, BOOK, WEI, GC, CONG, WL, DESK, JOURNAL, PORT"
+                            )
                     }
                 }
             }
@@ -1094,6 +1118,8 @@ impl TerminalApp {
             }
             Function::Review => self.open_review(symbol.as_deref()),
             Function::Desk => self.open_desk(symbol.as_deref()),
+            Function::Journal(extra) => self.open_journal(symbol.as_deref(), &extra),
+            Function::JournalNote { date, text } => self.add_journal_note(symbol.as_deref(), &date, &text),
             Function::Latest => self.with_chart(|c, _| c.jump_latest()),
             Function::ReviewOverlay(which) => self.with_chart(|c, _| match which {
                 command::ReviewOverlay::BoxLevels => c.show_box = !c.show_box,
@@ -1640,6 +1666,7 @@ impl TerminalApp {
             A::Alerts => self.apply(Function::Alerts),
             A::Watchlist => self.apply(Function::Watchlist),
             A::Desk => self.apply(Function::Desk),
+            A::Journal => self.apply(Function::Journal(String::new())),
             A::Refresh => self.apply(Function::Refresh),
             A::FrameTiming => self.show_perf = !self.show_perf,
             A::Portfolio => self.apply(Function::Portfolio(command::PortView::Summary, String::new())),
@@ -1781,6 +1808,7 @@ impl TerminalApp {
             self.last_price_alerts = Some(Instant::now());
         }
         self.sync_chart_alerts();
+        self.sync_chart_journal();
         self.save_dirty_themes(false);
         if self.last_save.elapsed() > Duration::from_secs(10) {
             self.autosave();
@@ -2085,6 +2113,7 @@ mod tests {
             price_alerts: tr_data::price_alerts::AlertBatch::empty(0),
             alert_draft: alerts::AlertDraft::default(),
             last_price_alerts: None,
+            journal: Default::default(),
             congress_status: String::new(),
             congress_checked: None,
             watchlist: DEFAULT_WATCHLIST.map(String::from).to_vec(),

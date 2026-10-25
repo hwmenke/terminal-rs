@@ -229,6 +229,7 @@ pub enum Action {
     Alerts,
     Watchlist,
     Desk,
+    Journal,
     Refresh,
     FrameTiming,
     Portfolio,
@@ -280,13 +281,14 @@ pub enum Action {
 }
 
 impl Action {
-    pub const ALL: [Action; 54] = [
+    pub const ALL: [Action; 55] = [
         Action::Help,
         Action::Congress,
         Action::Politicians,
         Action::Alerts,
         Action::Watchlist,
         Action::Desk,
+        Action::Journal,
         Action::Refresh,
         Action::FrameTiming,
         Action::Portfolio,
@@ -345,6 +347,7 @@ impl Action {
             Action::Alerts => "Alerts".into(),
             Action::Watchlist => "Watchlist".into(),
             Action::Desk => "PM Desk".into(),
+            Action::Journal => "Trade journal".into(),
             Action::Refresh => "Refresh Congress filings".into(),
             Action::FrameTiming => "Frame timing readout".into(),
             Action::Portfolio => "Brokerage portfolio".into(),
@@ -587,6 +590,7 @@ impl Default for Keymap {
         bind(Action::Alerts, "F4");
         bind(Action::Watchlist, "F5");
         bind(Action::Desk, "F10");
+        bind(Action::Journal, "F11");
         bind(Action::Refresh, "F6");
         bind(Action::FrameTiming, "F12");
         bind(Action::Portfolio, "F7");

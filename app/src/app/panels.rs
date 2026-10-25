@@ -126,10 +126,18 @@ impl TerminalApp {
                     }
                 }
             }
-            PaneKind::Watchlist | PaneKind::Settings | PaneKind::Help | PaneKind::Chart(_) | PaneKind::Desk(_) => {}
+            PaneKind::Watchlist
+            | PaneKind::Settings
+            | PaneKind::Help
+            | PaneKind::Chart(_)
+            | PaneKind::Desk(_)
+            | PaneKind::Journal(_) => {}
         }
         if matches!(self.panes[i].kind, PaneKind::Desk(_)) {
             actions.extend(self.desk(ui, id));
+        }
+        if matches!(self.panes[i].kind, PaneKind::Journal(_)) {
+            actions.extend(self.journal_pane(ui, id));
         }
         match self.panes[i].kind {
             PaneKind::Watchlist => actions.extend(self.watchlist(ui)),

@@ -211,6 +211,12 @@ gets the native title bar with traffic lights, window vibrancy behind the sideba
   entry, stop, target and dollar risk. Stops prefer a typed level or chart horizontal
   line, then the SCAN box, then 2 × ATR(14). Ranks are labelled as watchlist-relative,
   not SCAN universe RS. Brokerage `PORT` is unchanged. See [PM Desk](docs/PM_DESK.md).
+- **Trade journal** — `JOURNAL` (or `AAPL JOURNAL`, `AAPL JOURNAL 2026-10-24`) saves a
+  setup with its chart date, reasoning, planned dollar risk and a pre-trade checklist,
+  then records the outcome in dollars and R-multiples of that risk. `AAPL NOTE 2026-10-24 …`
+  attaches a note to a historical date; cyan **J** pins mark those dates on the chart.
+  Rows persist in `trade_journal.json`. Sample bars never invent P&L. See
+  [Trade journal](docs/TRADE_JOURNAL.md).
 - **Command palette** — ⌘⇧K (Ctrl+Shift+K on Linux and Windows) opens a centred, theme-matched palette
   that fuzzy-searches every function code (`PORT`, `POS`, `ORD`, `OMON`, `THEME`, …), tickers
   (load the quote and chart), new panels, layout presets and saved layouts, themes, Settings tabs
@@ -335,7 +341,7 @@ Settings › Hotkeys. On Linux and Windows ⌘ is Ctrl and ⌥ is Alt.
 | / · : · Ctrl+K | focus the ticker / command bar |
 | ⌘⇧K (Ctrl+Shift+K) | command palette: fuzzy search over commands, tickers, panels, layouts, themes, settings and actions |
 | F1 · F2 · F3 · F4 · F5 · F6 · F12 | help · Congress feed · politicians · alerts · watchlist · refresh filings · frame timing |
-| F7 · F8 · F9 · F10 | brokerage portfolio · positions · orders · PM Desk |
+| F7 · F8 · F9 · F10 · F11 | brokerage portfolio · positions · orders · PM Desk · trade journal |
 | Tab · ⇧Tab | next · previous pane |
 | ⌘1 … ⌘0 · ⌘⇧O | new chart, watchlist, news, order book, world markets, yield curve, Congress, politicians, alerts, search pane · options chain |
 | ⌘D · ⌘⇧D · ⌘T · ⌘W · ⌘⇧P | split right · split down · new tab · close pane · pop out |
@@ -360,6 +366,7 @@ Settings › Hotkeys. On Linux and Windows ⌘ is Ctrl and ⌥ is Alt.
 | `LAYOUT 4` · `LAYOUT SAVE Macro` · `LAYOUT Macro` · `LAYOUT RENAME Rates` · `LAYOUT DUP` · `LAYOUT DEL` · `LAYOUT EXPORT` | grid preset · saved layouts |
 | `THEME BLOOMBERG` · `THEME NEXT` · `THEME SYSTEM` · `THEME EDIT` · `THEME COMPACT` · `LAYOUT THEME ON` | themes |
 | `DESK` · `AAPL DESK` · `NEW DESK` | PM Desk: watchlist leaders, group performance, position size |
+| `JOURNAL` · `AAPL JOURNAL` · `AAPL NOTE 2026-10-24 wait` · `NEW JOURNAL` | Trade journal: setup, checklist, $ risk, $ and R outcome, date notes |
 | `PORT` · `ACCT` · `POS` · `ORD` · `ACTV` · `AAPL POS` · `AAPL ORD` | brokerage portfolio · accounts and balances · positions · orders · activity · one security |
 | `PORT REFRESH` · `PORT CONNECT` · `PORT SETUP` (`BROKER`) | reload accounts · connect a broker in the browser · SnapTrade keys |
 | `BUY AAPL 10` · `SELL ALL TSLA` · `SELL MSFT 5 LMT 410` · `SELL TSLA 3 STP 250 LMT 245` · `BUY NVDA $500` · `TRADE` | order ticket, prefilled (demo: one click; live: review and confirm) |

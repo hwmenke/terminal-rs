@@ -290,6 +290,10 @@ pub enum Function {
     Review,
     /// Watchlist-scoped PM Desk: leaders, group performance, position size.
     Desk,
+    /// Trade journal / checklist (`JOURNAL`, `AAPL JOURNAL`, `AAPL JOURNAL 2026-10-24`).
+    Journal(String),
+    /// Attach a note to a historical chart date (`NOTE`, `AAPL NOTE 2026-10-24 text`).
+    JournalNote { date: String, text: String },
     /// Pan the focused chart to the latest candle without changing zoom.
     Latest,
     /// Toggle a persisted review overlay on the focused chart.
@@ -309,6 +313,16 @@ fn num<T: std::str::FromStr>(t: Option<&&str>) -> Option<T> {
 
 fn parse_setup_name(s: &str) -> Option<String> {
     tr_data::price_alerts::normalize_setup(s)
+}
+
+/// `2026-10-24 held 3 days` → date + text; otherwise the whole remainder is the note.
+fn split_note_args(rest: &[&str]) -> (String, String) {
+    match rest.split_first() {
+        Some((first, tail)) if tr_data::journal::parse_chart_date(first).is_ok() => {
+            (first.to_string(), tail.join(" "))
+        }
+        _ => (String::new(), rest.join(" ")),
+    }
 }
 
 /// `150` · `ABOVE 150` · `BELOW 150` · `NEAR_HIGH` · `SETUP NEAR_HIGH EXIT`.
@@ -437,6 +451,11 @@ fn parse_function(head: &str, rest: &[&str]) -> Option<Function> {
         },
         "REVIEW" | "REV" => Function::Review,
         "DESK" | "PMDESK" | "RISK" => Function::Desk,
+        "JOURNAL" | "JRNL" | "CHECKLIST" | "TRADELOG" => Function::Journal(joined()),
+        "NOTE" | "JNOTE" => {
+            let (date, text) = split_note_args(rest);
+            Function::JournalNote { date, text }
+        }
         "LATEST" | "END" => Function::Latest,
         "BOX" => Function::ReviewOverlay(ReviewOverlay::BoxLevels),
         "RS" | "STRENGTH" => Function::ReviewOverlay(ReviewOverlay::Strength),
@@ -624,6 +643,16 @@ fn describe(f: &Function) -> String {
         Function::Desk => {
             "PM Desk: watchlist leaders, group performance, and position size from entry/stop/target/$ risk".into()
         }
+        Function::Journal(q) if q.is_empty() => {
+            "Trade journal: setups, checklist, planned risk, outcomes in $ and R".into()
+        }
+        Function::Journal(q) => format!("Trade journal: {q}"),
+        Function::JournalNote { date, text } if date.is_empty() && text.is_empty() => {
+            "Attach a note to the focused chart date".into()
+        }
+        Function::JournalNote { date, text } if date.is_empty() => format!("Note on the focused chart date: {text}"),
+        Function::JournalNote { date, text } if text.is_empty() => format!("Open journal notes for {date}"),
+        Function::JournalNote { date, text } => format!("Note on {date}: {text}"),
         Function::Latest => "Jump the focused chart to the latest candle".into(),
         Function::ReviewOverlay(ReviewOverlay::BoxLevels) => {
             "Toggle box levels (20-bar / 3-bar confirmation on this interval)".into()
@@ -686,6 +715,28 @@ mod tests {
         assert_eq!(parse("DESK"), Some(Command::Function(Function::Desk)));
         assert_eq!(parse("PMDESK"), Some(Command::Function(Function::Desk)));
         assert_eq!(parse("AAPL DESK"), Some(Command::SymbolFunction("AAPL US Equity".into(), Function::Desk)));
+        assert_eq!(parse("JOURNAL"), Some(Command::Function(Function::Journal(String::new()))));
+        assert_eq!(parse("JRNL"), Some(Command::Function(Function::Journal(String::new()))));
+        assert_eq!(parse("CHECKLIST"), Some(Command::Function(Function::Journal(String::new()))));
+        assert_eq!(
+            parse("AAPL JOURNAL"),
+            Some(Command::SymbolFunction("AAPL US Equity".into(), Function::Journal(String::new())))
+        );
+        assert_eq!(
+            parse("AAPL JOURNAL 2026-10-24"),
+            Some(Command::SymbolFunction("AAPL US Equity".into(), Function::Journal("2026-10-24".into())))
+        );
+        assert_eq!(
+            parse("NOTE 2026-10-24 gap and go"),
+            Some(Command::Function(Function::JournalNote { date: "2026-10-24".into(), text: "gap and go".into() }))
+        );
+        assert_eq!(
+            parse("AAPL NOTE 2026-03-15 wait for 20-day"),
+            Some(Command::SymbolFunction(
+                "AAPL US Equity".into(),
+                Function::JournalNote { date: "2026-03-15".into(), text: "wait for 20-day".into() }
+            ))
+        );
         assert_eq!(parse("LATEST"), Some(Command::Function(Function::Latest)));
         assert_eq!(parse("END"), Some(Command::Function(Function::Latest)));
         assert_eq!(parse("AAPL REVIEW"), Some(Command::SymbolFunction("AAPL US Equity".into(), Function::Review)));
