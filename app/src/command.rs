@@ -860,6 +860,9 @@ mod tests {
         assert_eq!(parse("bb 20 2.5"), ind("BB", &[20.0, 2.5]));
         assert_eq!(parse("MACD"), ind("MACD", &[12.0, 26.0, 9.0]));
         assert_eq!(parse("ichimoku"), ind("ICHIMOKU", &[]));
+        assert_eq!(parse("ADTREND"), ind("ADTREND", &[]));
+        assert_eq!(parse("ATREND"), ind("ADTREND", &[]));
+        assert_eq!(parse("ADAPTIVE"), ind("ADTREND", &[]));
         assert_eq!(parse("IND STOCH 5 3 3"), ind("STOCH", &[5.0, 3.0, 3.0]));
         assert_eq!(parse("IND"), Some(Command::Function(Function::IndicatorPicker(String::new()))));
         assert_eq!(parse("study volume"), Some(Command::Function(Function::IndicatorPicker("volume".into()))));

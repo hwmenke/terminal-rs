@@ -129,6 +129,7 @@ const COMMANDS: &[(&str, &str, &str, Option<Action>)] = &[
     ("BOX", "Toggle box levels on this interval", "darvas review overlay", None),
     ("RS", "Toggle 21-bar close return (not SPY-relative)", "strength review overlay", None),
     ("VCTX", "Toggle volume context", "volume review overlay", None),
+    ("ADTREND", "Adaptive Trend bands, states and trailing stops", "adaptive trend overlay kama mrt", None),
     ("CLEAR DRAW", "", "drawings remove", None),
     ("1", "", "interval timeframe minute", None),
     ("5", "", "interval timeframe minutes", None),
@@ -782,6 +783,7 @@ mod tests {
         assert_eq!(top("psar"), "Parabolic SAR");
         assert_eq!(top("ichimoku"), "Ichimoku Cloud");
         assert_eq!(top("supertrend"), "SuperTrend");
+        assert_eq!(top("adtrend"), "Adaptive Trend");
         assert_eq!(top("on balance volume"), "On-Balance Volume");
         assert_eq!(top("ind"), "IND");
         let rsi = items.iter().find(|i| i.title == "Relative Strength Index").unwrap();
