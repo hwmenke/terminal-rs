@@ -249,9 +249,33 @@ impl TerminalApp {
         self.watch_ui.picker = self.selected_member();
         self.watch_ui.picker_index = self.watchlists.index(&self.watchlists.last_used).unwrap_or(0);
     }
+    fn review_daily_id(&self) -> Option<PaneId> {
+        let mut daily = None;
+        let mut weekly_link = None;
+        for p in &self.panes {
+            if let PaneKind::Chart(c) = &p.kind
+                && c.archive
+            {
+                if c.tf == tr_core::Timeframe::D1 {
+                    daily = Some((p.id, p.link));
+                }
+                if c.tf == tr_core::Timeframe::W1 {
+                    weekly_link = p.link;
+                }
+            }
+        }
+        daily.and_then(|(id, link)| match (link, weekly_link) {
+            (Some(a), Some(b)) if a == b => Some(id),
+            _ => None,
+        })
+    }
+
     pub(super) fn active_chart_target(&mut self) -> PaneId {
         if self.focused_is_chart() {
             return self.focus;
+        }
+        if let Some(id) = self.review_daily_id() {
+            return id;
         }
         let linked = self.idx(self.focus).and_then(|i| self.panes[i].link);
         if let Some(id) = self.watch_ui.active_chart
@@ -281,6 +305,9 @@ impl TerminalApp {
             // Configure the archive path before the first load, even without an existing chart.
             let mut c = crate::chart_view::ChartState::new(0, symbol, tr_core::Timeframe::D1);
             c.archive = archive;
+            if archive {
+                c.enable_review_overlays();
+            }
             let target = self.focused_visible();
             let link = self.idx(focus).and_then(|i| self.panes[i].link);
             let id = self.new_pane(PaneKind::Chart(Box::new(c)));
@@ -295,7 +322,11 @@ impl TerminalApp {
         if let Some(i) = self.idx(id) {
             if let PaneKind::Chart(c) = &mut self.panes[i].kind {
                 if archive {
+                    if !c.archive {
+                        c.enable_review_overlays();
+                    }
                     c.archive = true;
+                    c.request_jump_latest();
                 }
                 if !created {
                     c.set_symbol(symbol, &self.worker);
@@ -320,7 +351,11 @@ impl TerminalApp {
                             && let PaneKind::Chart(c) = &mut p.kind
                         {
                             let reload = !c.archive && c.symbol == key;
+                            if !c.archive {
+                                c.enable_review_overlays();
+                            }
                             c.archive = true;
+                            c.request_jump_latest();
                             if reload {
                                 c.set_symbol(&key, &self.worker);
                             }

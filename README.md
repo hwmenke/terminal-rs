@@ -197,6 +197,12 @@ gets the native title bar with traffic lights, window vibrancy behind the sideba
   **] / [** or **Alt+Down / Alt+Up** step forward/back through the group with wrapping.
   The status bar shows the group and position (for example `Winners 3/12`); chart links save
   with the layout.
+- **Daily / weekly chart review** — `REVIEW` (or `AAPL REVIEW`) opens linked daily and weekly
+  archive charts. `LATEST` / `End` jumps to the latest candle without changing zoom. `BOX`,
+  `RS` and `VCTX` toggle box levels, 21-bar close return (this series, not SPY-relative) and
+  volume context; those overlays persist in the layout. Archive charts load a bounded daily
+  page and page older history. Daily-bar VWAP is labelled **Monthly VWAP**. See
+  [Chart review](docs/CHART_REVIEW.md).
 - **Command palette** — ⌘⇧K (Ctrl+Shift+K on Linux and Windows) opens a centred, theme-matched palette
   that fuzzy-searches every function code (`PORT`, `POS`, `ORD`, `OMON`, `THEME`, …), tickers
   (load the quote and chart), new panels, layout presets and saved layouts, themes, Settings tabs

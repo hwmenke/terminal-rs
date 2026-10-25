@@ -92,6 +92,11 @@ const COMMANDS: &[(&str, &str, &str, Option<Action>)] = &[
     ("VL", "", "vertical line draw", Some(Action::DrawVertical)),
     ("FIB", "", "fibonacci retracement draw", Some(Action::DrawFib)),
     ("MAGNET", "", "snap ohlc drawings", Some(Action::Magnet)),
+    ("REVIEW", "Linked daily and weekly archive charts", "candidate review darvas", None),
+    ("LATEST", "Jump to the latest candle", "end newest last", Some(Action::JumpLatest)),
+    ("BOX", "Toggle box levels on this interval", "darvas review overlay", None),
+    ("RS", "Toggle 21-bar close return (not SPY-relative)", "strength review overlay", None),
+    ("VCTX", "Toggle volume context", "volume review overlay", None),
     ("CLEAR DRAW", "", "drawings remove", None),
     ("1", "", "interval timeframe minute", None),
     ("5", "", "interval timeframe minutes", None),
@@ -152,6 +157,7 @@ const ACTIONS: &[(Action, &str)] = &[
     (Action::NewTab, "chart tab"),
     (Action::SaveLayout, "layout workspace"),
     (Action::ResetView, "chart zoom fit"),
+    (Action::JumpLatest, "latest candle end"),
     (Action::FrameTiming, "fps performance perf"),
 ];
 

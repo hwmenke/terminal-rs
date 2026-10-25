@@ -71,8 +71,10 @@ parity remains outside this item; RSI-only scans still require the Whats-News se
 
 Research tables visibly mark and color stale rows. Clicking a result opens an archive chart, which
 bypasses display samples/live feeds and supports `1D`, `1W`, and `1M`. Weekly and monthly candles
-always aggregate **all stored daily rows**; Whats-News weekly rows are never read. Weeks begin Monday,
-months begin on the first, and partial current weeks/months contain only completed daily sessions.
+always aggregate **daily rows** (Whats-News weekly rows are never read). Scans still use every
+stored daily row. Chart panes load a bounded page and page older history; see
+[Chart review](CHART_REVIEW.md). Weeks begin Monday, months begin on the first, and partial current
+weeks/months contain only completed daily sessions.
 
 ## WHATS-NEWS WEEKLY BUG:
 

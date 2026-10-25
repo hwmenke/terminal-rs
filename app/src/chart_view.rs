@@ -20,7 +20,7 @@ use crate::command::{IndicatorSpec, Range};
 use crate::congress_view::Action;
 use crate::theme::{self, amber, amber_dim, mono, muted, text, ui_font};
 use crate::widgets;
-use crate::worker::{BuiltIndicator, PaneId, Request, Worker, initial_limit};
+use crate::worker::{BuiltIndicator, PaneId, Request, Worker, archive_page, initial_limit};
 
 const AXIS_W: f32 = 66.0;
 const TIME_H: f32 = 16.0;
@@ -80,6 +80,12 @@ pub struct ChartState {
     pub magnet: bool,
     pub show_volume: bool,
     pub show_congress: bool,
+    /// Darvas box levels from the loaded series (persisted in layouts).
+    pub show_box: bool,
+    /// 21-bar return HUD; labelled as this interval, never SPY-relative.
+    pub show_rs: bool,
+    /// Volume-ratio HUD (this bar / prior 20, plus 5/20).
+    pub show_volume_ctx: bool,
     pub indicators: Vec<IndicatorSpec>,
     pub drawings: Vec<Drawing>,
     pub compare: Option<String>,
@@ -119,6 +125,8 @@ pub struct ChartState {
     /// The workspace drew this chart's controls in the pane's tab strip, so skip the
     /// header row and give the plot the space.
     pub controls_in_strip: bool,
+    review: Option<tr_data::whats_news::ReviewContext>,
+    pending_latest: bool,
 }
 
 impl ChartState {
@@ -141,6 +149,9 @@ impl ChartState {
             magnet: false,
             show_volume: true,
             show_congress: true,
+            show_box: false,
+            show_rs: false,
+            show_volume_ctx: false,
             indicators: crate::command::default_indicators(),
             drawings: Vec::new(),
             compare: None,
@@ -171,7 +182,15 @@ impl ChartState {
             actions: Vec::new(),
             hover_enabled: true,
             controls_in_strip: false,
+            review: None,
+            pending_latest: false,
         }
+    }
+
+    pub fn enable_review_overlays(&mut self) {
+        self.show_box = true;
+        self.show_rs = true;
+        self.show_volume_ctx = true;
     }
 
     pub fn is_empty(&self) -> bool {
@@ -200,6 +219,7 @@ impl ChartState {
         self.gpu = None;
         self.built.clear();
         self.last_live = None;
+        self.review = None;
         if Security::parse(&self.symbol).is_none() {
             self.loading = false;
             self.exhausted = true;
@@ -216,6 +236,8 @@ impl ChartState {
                 generation: self.generation,
                 symbol: self.symbol.clone(),
                 tf: self.tf,
+                limit: archive_page(self.tf),
+                before: None,
             });
             return;
         }
@@ -366,6 +388,28 @@ impl ChartState {
         });
     }
 
+    pub fn request_jump_latest(&mut self) {
+        self.pending_latest = true;
+        if !self.bars.is_empty() {
+            self.jump_latest();
+        }
+    }
+
+    /// Keep the current zoom and pan so the latest candle sits at the right edge.
+    pub fn jump_latest(&mut self) {
+        if self.bars.is_empty() {
+            self.pending_latest = true;
+            return;
+        }
+        self.glide(|s| {
+            if let Some(v) = s.viewport.as_mut() {
+                v.right = s.bars.len() as f64 + 3.0;
+                v.clamp(s.bars.len());
+            }
+        });
+        self.pending_latest = false;
+    }
+
     pub fn pan_bars(&mut self, n: f64) {
         self.glide(|s| {
             if let Some(v) = s.viewport.as_mut() {
@@ -498,6 +542,10 @@ impl ChartState {
         }
         if !live {
             self.request_compare(w);
+        }
+        self.review = tr_data::whats_news::ReviewContext::from_bars(&self.bars, self.tf).ok();
+        if self.pending_latest {
+            self.jump_latest();
         }
     }
 
@@ -813,14 +861,25 @@ impl ChartState {
         // Page older history when the left edge approaches loaded data.
         if !self.paging && !self.loading && !self.exhausted && v.left() < v.visible_bars() * 0.3 {
             self.paging = true;
-            w.send(Request::MoreHistory {
-                pane: self.id,
-                generation: self.generation,
-                symbol: self.symbol.clone(),
-                tf: self.tf,
-                existing: self.bars.clone(),
-                limit: initial_limit(self.tf),
-            });
+            if self.archive {
+                w.send(Request::ArchiveHistory {
+                    pane: self.id,
+                    generation: self.generation,
+                    symbol: self.symbol.clone(),
+                    tf: self.tf,
+                    limit: archive_page(self.tf),
+                    before: self.bars.first().map(|b| b.ts),
+                });
+            } else {
+                w.send(Request::MoreHistory {
+                    pane: self.id,
+                    generation: self.generation,
+                    symbol: self.symbol.clone(),
+                    tf: self.tf,
+                    existing: self.bars.clone(),
+                    limit: initial_limit(self.tf),
+                });
+            }
         }
 
         // ---- price pane GPU frame ----
@@ -1007,6 +1066,7 @@ impl ChartState {
         }
 
         // ---- drawings ----
+        self.paint_review_levels(ui, price_rect, &scale);
         self.paint_drawings(ui, price_rect, &v, &scale, hover, &plot_resp);
 
         // ---- congress markers ----
@@ -1100,6 +1160,10 @@ impl ChartState {
             self.reset_view();
             ui.close();
         }
+        if ui.button("Jump to latest candle").on_hover_text("End or LATEST · keeps the current zoom").clicked() {
+            self.jump_latest();
+            ui.close();
+        }
         ui.menu_button("Chart Type", |ui| {
             for ct in ChartType::ALL {
                 if ui.radio(self.chart_type == ct, ct.label()).clicked() {
@@ -1167,6 +1231,14 @@ impl ChartState {
         ui.checkbox(&mut self.magnet, "Magnet");
         ui.checkbox(&mut self.show_volume, "Volume");
         ui.separator();
+        ui.label(RichText::new("Review overlays").small().color(muted()));
+        ui.checkbox(&mut self.show_box, "Box levels")
+            .on_hover_text("20-bar / 3-bar confirmation on this interval (same rule as SCAN)");
+        ui.checkbox(&mut self.show_rs, "Relative strength")
+            .on_hover_text("21-bar close return of this series — not SPY-relative");
+        ui.checkbox(&mut self.show_volume_ctx, "Volume context")
+            .on_hover_text("This bar versus the prior 20, plus 5/20");
+        ui.separator();
         if ui.button("Add to Watchlist").clicked() {
             self.actions.push(Action::AddToWatchlist(self.symbol.clone()));
             ui.close();
@@ -1211,10 +1283,15 @@ impl ChartState {
                 .filter_map(|(_, o)| value_at(&o.line).map(|v| format!("{v:.prec$}", prec = dec.min(4))))
                 .collect();
             let c = bi.overlays.get(bi.overlays.len() / 2).map_or(text(), |o| opaque(&o.1));
+            let title = if bi.spec.code == "VWAP" {
+                bi.overlays.first().map(|(n, _)| n.clone()).unwrap_or_else(|| bi.spec.label())
+            } else {
+                bi.spec.label()
+            };
             p.text(
                 pos2(price_rect.left() + 6.0, ly),
                 Align2::LEFT_TOP,
-                format!("{}  {}", bi.spec.label(), vals.join(" ")),
+                format!("{}  {}", title, vals.join(" ")),
                 mono(11.0),
                 c,
             );
@@ -1238,6 +1315,7 @@ impl ChartState {
             p.text(pos2(price_rect.left() + 6.0, ly), Align2::LEFT_TOP, text, mono(11.0), theme::series(5));
             ly += 14.0;
         }
+        ly = self.paint_review_hud(&p, price_rect, ly);
         if let Some(tool) = self.draw.tool {
             let msg = if self.draw.pending.is_some() {
                 "click second point (Esc cancels)"
@@ -1265,6 +1343,59 @@ impl ChartState {
                 painter.galley(pos2(x, r.top() + 3.0), g, color);
                 x += w + 10.0;
             }
+        }
+    }
+
+    fn paint_review_hud(&self, p: &egui::Painter, price_rect: Rect, mut ly: f32) -> f32 {
+        let Some(ctx) = &self.review else { return ly };
+        let put = |ly: f32, text: String, color: Color32| {
+            p.text(pos2(price_rect.left() + 6.0, ly), Align2::LEFT_TOP, text, mono(11.0), color);
+        };
+        if self.show_box {
+            let levels = match (ctx.box_state, ctx.box_top, ctx.box_bottom) {
+                (Some(state), Some(top), Some(bot)) => {
+                    format!("{state}  top {top:.2}  bot {bot:.2}  · {}", ctx.box_note)
+                }
+                _ => ctx.box_note.to_string(),
+            };
+            put(ly, format!("BOX  {levels}"), amber());
+            ly += 14.0;
+        }
+        if self.show_rs {
+            let value = ctx.return_pct.map(|v| format!("{v:+.2}%")).unwrap_or_else(|| "—".into());
+            put(ly, format!("RS  {value}  {}", ctx.return_label), theme::series(3));
+            ly += 14.0;
+        }
+        if self.show_volume_ctx {
+            let ratio = ctx.volume_ratio.map(|v| format!("{v:.2}× prior 20")).unwrap_or_else(|| "—".into());
+            let five = ctx.vol_ratio_5_20.map(|v| format!("5/20 {v:.2}")).unwrap_or_else(|| "5/20 —".into());
+            put(ly, format!("VOL  {ratio}  · {five}  · {}", ctx.volume_note), muted());
+            ly += 14.0;
+        }
+        ly
+    }
+
+    fn paint_review_levels(&self, ui: &Ui, rect: Rect, scale: &PriceScale) {
+        if !self.show_box {
+            return;
+        }
+        let Some(ctx) = &self.review else { return };
+        let p = ui.painter_at(rect);
+        for (price, label, color) in [(ctx.box_top, "box top", theme::up()), (ctx.box_bottom, "box bot", theme::down())]
+        {
+            let Some(price) = price else { continue };
+            let y = rect.top() + scale.y_of(price) as f32;
+            if !rect.y_range().contains(y) {
+                continue;
+            }
+            p.hline(rect.x_range(), y, Stroke::new(1.0, color.gamma_multiply(0.75)));
+            p.text(
+                pos2(rect.left() + 6.0, y - 12.0),
+                Align2::LEFT_TOP,
+                format!("{label} {price:.2}"),
+                mono(10.0),
+                color,
+            );
         }
     }
 
@@ -1701,6 +1832,40 @@ mod tests {
             requests.try_recv().is_err(),
             "Timeframes, ranges and comparisons cannot fall back to market providers"
         );
+        let bars: Vec<Bar> = (0..80)
+            .map(|i| Bar::new(i * 86_400, 10.0, 11.0, 9.0, 10.0, 1.0).with_provenance(Provenance::Real))
+            .collect();
+        let bars = Arc::new(bars);
+        chart.on_history(chart.generation, bars.clone(), SeriesGpu::build(&bars), 0, false, false, false, &worker);
+        while requests.try_recv().is_ok() {}
+        chart.exhausted = false;
+        chart.paging = false;
+        chart.loading = false;
+        chart.viewport = Some(Viewport { right: 10.0, bar_px: 8.0, width_px: 800.0 });
+        let ctx = egui::Context::default();
+        let _ = chart_frame(&ctx, &mut chart, &worker, vec![]);
+        let page = requests.try_recv();
+        assert!(
+            matches!(page, Ok(Request::ArchiveHistory { before: Some(_), .. })),
+            "Archive paging must stay on the archive path"
+        );
+        assert!(
+            !matches!(requests.try_recv(), Ok(Request::MoreHistory { .. })),
+            "Paging must not request market MoreHistory"
+        );
+    }
+
+    #[test]
+    fn jump_latest_keeps_zoom_and_moves_to_the_right_edge() {
+        let mut c = ChartState::new(1, "AAPL", Timeframe::D1);
+        c.bars = Arc::new(tr_core::sample::generate("AAPL", Timeframe::D1, 500, 1_790_000_000));
+        let shown = Viewport { right: 80.0, bar_px: 6.0, width_px: 800.0 };
+        c.viewport = Some(shown);
+        c.jump_latest();
+        let g = c.glide.expect("gliding to the latest candle");
+        assert_eq!(g.from, shown);
+        assert!((g.to.bar_px - 6.0).abs() < 1e-9, "zoom is unchanged");
+        assert!((g.to.right - 503.0).abs() < 1e-9, "right edge sits just past the last bar");
     }
 
     #[test]

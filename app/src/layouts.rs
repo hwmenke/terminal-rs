@@ -74,6 +74,12 @@ pub enum PaneSettings {
         show_congress: bool,
         #[serde(default)]
         magnet: bool,
+        #[serde(default)]
+        show_box: bool,
+        #[serde(default)]
+        show_rs: bool,
+        #[serde(default)]
+        show_volume_ctx: bool,
     },
     /// Congress feed with its filter (`None` = unfiltered).
     Feed(Option<FeedSettings>),
@@ -281,6 +287,9 @@ pub fn chart_settings(symbol: &str, d: &crate::prefs::PanelDefaults) -> PaneSett
         show_volume: d.show_volume,
         show_congress: d.congress_markers,
         magnet: false,
+        show_box: false,
+        show_rs: false,
+        show_volume_ctx: false,
     }
 }
 
@@ -521,8 +530,11 @@ mod tests {
             {"id":2,"Feed":null}]}"#;
         let doc = LayoutDoc::from_json(raw.as_bytes()).unwrap();
         match &doc.panes[0].settings {
-            PaneSettings::Chart { show_volume, show_congress, magnet, log, .. } => {
-                assert!(*show_volume && *show_congress && !*magnet && *log)
+            PaneSettings::Chart {
+                show_volume, show_congress, magnet, log, show_box, show_rs, show_volume_ctx, ..
+            } => {
+                assert!(*show_volume && *show_congress && !*magnet && *log);
+                assert!(!*show_box && !*show_rs && !*show_volume_ctx);
             }
             other => panic!("{other:?}"),
         }

@@ -526,6 +526,66 @@ impl TerminalApp {
         };
     }
 
+    /// Open or focus a linked daily + weekly archive pair for candidate review.
+    pub(super) fn open_review(&mut self, symbol: Option<&str>) {
+        let key = symbol
+            .map(|s| tr_data::security(s).key())
+            .or_else(|| self.focused_symbol())
+            .unwrap_or_else(|| "AAPL US Equity".into());
+        let mut daily = None;
+        let mut weekly = None;
+        for p in &self.panes {
+            if let PaneKind::Chart(c) = &p.kind
+                && c.archive
+            {
+                if c.tf == tr_core::Timeframe::D1 {
+                    daily = Some(p.id);
+                }
+                if c.tf == tr_core::Timeframe::W1 {
+                    weekly = Some(p.id);
+                }
+            }
+        }
+        let link = daily
+            .and_then(|id| self.idx(id).and_then(|i| self.panes[i].link))
+            .or_else(|| weekly.and_then(|id| self.idx(id).and_then(|i| self.panes[i].link)))
+            .unwrap_or(crate::layouts::Link::Blue);
+        let daily = daily.unwrap_or_else(|| {
+            let mut c = crate::chart_view::ChartState::new(0, &key, tr_core::Timeframe::D1);
+            c.archive = true;
+            c.enable_review_overlays();
+            let id = self.new_pane(PaneKind::Chart(Box::new(c)));
+            self.dock_pane(id, self.focused_visible(), crate::dock::Zone::Right);
+            id
+        });
+        let weekly = weekly.unwrap_or_else(|| {
+            let mut c = crate::chart_view::ChartState::new(0, &key, tr_core::Timeframe::W1);
+            c.archive = true;
+            c.enable_review_overlays();
+            let id = self.new_pane(PaneKind::Chart(Box::new(c)));
+            self.dock_pane(id, Some(daily), crate::dock::Zone::Right);
+            id
+        });
+        self.set_link(daily, Some(link));
+        self.set_link(weekly, Some(link));
+        for id in [daily, weekly] {
+            if let Some(i) = self.idx(id)
+                && let PaneKind::Chart(c) = &mut self.panes[i].kind
+            {
+                c.archive = true;
+                c.enable_review_overlays();
+                if c.symbol != key {
+                    c.request_jump_latest();
+                    c.set_symbol(&key, &self.worker);
+                } else {
+                    c.request_jump_latest();
+                }
+            }
+        }
+        self.watch_ui.active_chart = Some(daily);
+        self.status = format!("{key} · daily + weekly archive review ({})", link.label());
+    }
+
     /// Load a security: into the focused pane when it follows symbols (and its link group),
     /// else into the focused pane's link group, else into a chart.
     pub(super) fn open_security(&mut self, symbol: &str) {
