@@ -28,6 +28,7 @@ impl TerminalApp {
             return (actions, clicked);
         }
         let freshness = self.congress_freshness();
+        let has_leaders = self.panes.iter().any(|p| matches!(&p.kind, PaneKind::Research(r) if r.results.is_some()));
         let inner = rect.shrink2(vec2(dp(8.0), dp(4.0)));
         let mut child = ui.new_child(UiBuilder::new().max_rect(inner).id_salt(("pane", id)));
         child.set_clip_rect(inner.intersect(ui.clip_rect()));
@@ -73,7 +74,7 @@ impl TerminalApp {
             }
             PaneKind::News(n) => {
                 let offline = self.provider.eq_ignore_ascii_case("sample");
-                if let Some(refresh) = news(ui, n, offline) {
+                if let Some(refresh) = news(ui, n, offline, has_leaders) {
                     n.fetched = None;
                     n.loading = refresh;
                 }
@@ -144,57 +145,138 @@ impl TerminalApp {
 }
 
 /// Headlines list. Returns `Some(_)` when a refresh was requested.
-fn news(ui: &mut Ui, n: &mut super::NewsPane, offline: bool) -> Option<bool> {
+fn news(ui: &mut Ui, n: &mut super::NewsPane, offline: bool, has_leaders: bool) -> Option<bool> {
+    use tr_data::news::{NewsScope, format_freshness, format_pub};
     let mut refresh = None;
+    let set_scope = |n: &mut super::NewsPane, scope: NewsScope, refresh: &mut Option<bool>| {
+        if n.scope != scope {
+            n.scope = scope;
+            n.batch = None;
+            *refresh = Some(true);
+        }
+    };
     ui.horizontal_wrapped(|ui| {
-        let title = match &n.symbol {
-            Some(s) => format!("{} headlines", tr_data::security(s).key()),
-            None => "Top market headlines".into(),
+        let title = match n.scope {
+            NewsScope::Symbol => n
+                .symbol
+                .as_deref()
+                .map(|s| format!("{} headlines", tr_data::security(s).key()))
+                .unwrap_or_else(|| "Headlines".into()),
+            NewsScope::Watchlist => "Watchlist headlines".into(),
+            NewsScope::Leaders => "Scanner-leader headlines".into(),
+            NewsScope::Top => "Top market headlines".into(),
         };
         ui.label(RichText::new(title).font(ui_font(12.5)).color(text()));
         if n.loading {
             ui.add(egui::Spinner::new().size(12.0));
         }
-        if n.symbol.is_some() && ui.small_button("Top News").on_hover_text("General market headlines").clicked() {
-            n.symbol = None;
-            n.items.clear();
-            refresh = Some(true);
+        if ui
+            .small_button("Watchlist")
+            .on_hover_text("Deduplicated headlines for the selected watchlist group")
+            .clicked()
+        {
+            set_scope(n, NewsScope::Watchlist, &mut refresh);
+        }
+        if has_leaders
+            && ui
+                .small_button("Leaders")
+                .on_hover_text("Top names from the open SCAN pane — not the whole archive")
+                .clicked()
+        {
+            set_scope(n, NewsScope::Leaders, &mut refresh);
+        }
+        if n.symbol.is_some()
+            && ui.small_button("This name").on_hover_text("Headlines for the linked security").clicked()
+        {
+            set_scope(n, NewsScope::Symbol, &mut refresh);
+        }
+        if ui.small_button("Top News").on_hover_text("One general market query").clicked() {
+            set_scope(n, NewsScope::Top, &mut refresh);
         }
         if ui.small_button("Refresh").clicked() {
             refresh = Some(true);
         }
     });
     ui.add_space(2.0);
-    if let Some(e) = &n.error {
-        ui.label(RichText::new(format!("Could not load news: {e}")).font(ui_font(12.0)).color(theme::down()));
+    let now = chrono::Utc::now().timestamp();
+    if let Some(batch) = &n.batch {
+        let mut meta = vec![format_freshness(batch.fetched_at, now)];
+        if !batch.queried.is_empty() {
+            meta.push(format!("{} name{}", batch.queried.len(), if batch.queried.len() == 1 { "" } else { "s" }));
+        }
+        meta.push(format!("{} headline{}", batch.items.len(), if batch.items.len() == 1 { "" } else { "s" }));
+        ui.label(RichText::new(meta.join(" · ")).font(ui_font(11.0)).color(muted()));
+        if batch.sample || offline {
+            ui.label(
+                RichText::new("Sample / offline mode: headlines are not invented and never enter research.")
+                    .font(ui_font(12.0))
+                    .color(theme::down()),
+            );
+        }
+        if batch.is_stale_at(now) {
+            ui.label(
+                RichText::new(format!(
+                    "Stale feed — last successful fetch {}.",
+                    format_freshness(batch.fetched_at, now)
+                ))
+                .font(ui_font(12.0))
+                .color(amber()),
+            );
+        }
+        if batch.is_partial() {
+            let failed = batch
+                .failures
+                .iter()
+                .map(|f| format!("{} ({})", tr_data::security(&f.symbol).ticker, f.error))
+                .collect::<Vec<_>>()
+                .join(" · ");
+            ui.label(
+                RichText::new(format!(
+                    "Partial: {} of {} names failed. {failed}",
+                    batch.failures.len(),
+                    batch.queried.len()
+                ))
+                .font(ui_font(12.0))
+                .color(amber()),
+            );
+        } else if batch.items.is_empty() && !batch.failures.is_empty() {
+            ui.label(
+                RichText::new(format!("Could not load news: {}", batch.failures[0].error))
+                    .font(ui_font(12.0))
+                    .color(theme::down()),
+            );
+        }
     }
-    if n.items.is_empty() && !n.loading {
-        let msg = if offline {
+    let items = n.batch.as_ref().map(|b| b.items.as_slice()).unwrap_or(&[]);
+    if items.is_empty() && !n.loading {
+        let msg = if offline || n.batch.as_ref().is_some_and(|b| b.sample) {
             "No headlines in offline sample mode (TR_PROVIDER=sample)."
+        } else if n.scope == NewsScope::Watchlist {
+            "No headlines for this watchlist. Add names with WL ADD, or Refresh."
+        } else if n.scope == NewsScope::Leaders {
+            "No scanner leaders yet. Run SCAN, then open Leaders."
         } else {
             "No headlines for this security right now."
         };
         ui.label(RichText::new(msg).font(ui_font(12.0)).color(muted()));
     }
-    let now = chrono::Utc::now().timestamp();
+    let show_ticker = matches!(n.scope, NewsScope::Watchlist | NewsScope::Leaders);
     egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
         let w = ui.available_width();
-        for item in &n.items {
-            let age = (now - item.ts).max(0);
-            let when = if age < 3600 {
-                format!("{}m", age / 60)
-            } else if age < 86_400 {
-                format!("{}h", age / 3600)
-            } else {
-                chrono::DateTime::from_timestamp(item.ts, 0).map(|d| d.format("%b %d").to_string()).unwrap_or_default()
-            };
-            let title = ui.painter().layout(item.title.clone(), ui_font(13.0), text(), (w - 70.0).max(80.0));
+        for item in items {
+            let when = format_pub(item.ts, now);
+            let extra = if show_ticker { item.tickers.first().cloned().unwrap_or_default() } else { String::new() };
+            let left = if extra.is_empty() { 60.0 } else { 108.0 };
+            let title = ui.painter().layout(item.title.clone(), ui_font(13.0), text(), (w - left - 10.0).max(80.0));
             let h = title.size().y + dp(20.0);
             let (r, resp) = ui.allocate_exact_size(vec2(w, h), Sense::click());
             widgets::hover_wash(ui, r, &resp, false);
             let p = ui.painter();
             p.text(pos2(r.left() + 6.0, r.top() + 4.0), Align2::LEFT_TOP, &when, mono(11.0), amber());
-            let tpos = pos2(r.left() + 60.0, r.top() + 3.0);
+            if !extra.is_empty() {
+                p.text(pos2(r.left() + 56.0, r.top() + 4.0), Align2::LEFT_TOP, &extra, mono(11.0), theme::up());
+            }
+            let tpos = pos2(r.left() + left, r.top() + 3.0);
             let th = title.size().y;
             p.galley(tpos, title, text());
             p.text(pos2(tpos.x, tpos.y + th + 2.0), Align2::LEFT_TOP, &item.publisher, ui_font(11.0), muted());

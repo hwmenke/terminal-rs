@@ -32,7 +32,7 @@ use serde::{Deserialize, Serialize};
 use tr_chart::drawings::Tool;
 use tr_congress::Trade;
 use tr_congress::db::{Alert, PoliticianSummary};
-use tr_data::{NewsItem, OrderBook, Quote, SearchHit, YieldCurves};
+use tr_data::{OrderBook, Quote, SearchHit, YieldCurves};
 
 use crate::anim;
 use crate::chart_view::ChartState;
@@ -140,17 +140,55 @@ impl OptionsPane {
 }
 
 pub struct NewsPane {
-    /// `None` = general market headlines.
+    pub scope: tr_data::news::NewsScope,
+    /// Set when [`NewsScope::Symbol`] (and kept when switching away so Symbol can restore).
     pub symbol: Option<String>,
-    pub items: Vec<NewsItem>,
-    pub error: Option<String>,
+    pub batch: Option<tr_data::news::NewsBatch>,
     pub loading: bool,
     pub fetched: Option<Instant>,
 }
 
 impl NewsPane {
     pub fn new(symbol: Option<String>) -> Self {
-        Self { symbol, items: Vec::new(), error: None, loading: true, fetched: None }
+        match symbol {
+            Some(s) => Self::for_symbol(s),
+            None => Self::watchlist(),
+        }
+    }
+
+    pub fn watchlist() -> Self {
+        Self::with_scope(tr_data::news::NewsScope::Watchlist, None)
+    }
+
+    pub fn leaders() -> Self {
+        Self::with_scope(tr_data::news::NewsScope::Leaders, None)
+    }
+
+    pub fn top() -> Self {
+        Self::with_scope(tr_data::news::NewsScope::Top, None)
+    }
+
+    pub fn for_symbol(symbol: impl Into<String>) -> Self {
+        Self::with_scope(tr_data::news::NewsScope::Symbol, Some(symbol.into()))
+    }
+
+    fn with_scope(scope: tr_data::news::NewsScope, symbol: Option<String>) -> Self {
+        Self { scope, symbol, batch: None, loading: true, fetched: None }
+    }
+
+    pub fn accept(&mut self, batch: tr_data::news::NewsBatch) {
+        self.loading = false;
+        if batch.items.is_empty()
+            && !batch.failures.is_empty()
+            && self.batch.as_ref().is_some_and(|b| !b.items.is_empty())
+        {
+            if let Some(prev) = &mut self.batch {
+                prev.stale = true;
+                prev.failures = batch.failures;
+            }
+            return;
+        }
+        self.batch = Some(batch);
     }
 }
 
@@ -201,9 +239,13 @@ impl PaneKind {
             PaneKind::Curve => "Yield Curve".into(),
             PaneKind::Search { query } if query.is_empty() => "Search".into(),
             PaneKind::Search { query } => format!("Search: {query}"),
-            PaneKind::News(n) => match &n.symbol {
-                Some(s) => format!("{} News", short(s)),
-                None => "Top News".into(),
+            PaneKind::News(n) => match n.scope {
+                tr_data::news::NewsScope::Symbol => {
+                    n.symbol.as_deref().map(|s| format!("{} News", short(s))).unwrap_or_else(|| "News".into())
+                }
+                tr_data::news::NewsScope::Watchlist => "Watchlist News".into(),
+                tr_data::news::NewsScope::Leaders => "Leaders News".into(),
+                tr_data::news::NewsScope::Top => "Top News".into(),
             },
             PaneKind::OrderBook(b) => format!("{} Depth", short(&b.symbol)),
             PaneKind::Options(o) => format!("{} Options", short(&o.symbol)),
@@ -254,7 +296,8 @@ impl PaneKind {
         match self {
             PaneKind::Chart(c) => Some(&c.symbol),
             PaneKind::Ticker { symbol, .. } => Some(symbol),
-            PaneKind::News(n) => n.symbol.as_deref(),
+            PaneKind::News(n) if n.scope == tr_data::news::NewsScope::Symbol => n.symbol.as_deref(),
+            PaneKind::News(_) => None,
             PaneKind::OrderBook(b) => Some(&b.symbol),
             PaneKind::Options(o) => Some(&o.symbol),
             _ => None,
@@ -262,14 +305,8 @@ impl PaneKind {
     }
 
     fn follows_symbol(&self) -> bool {
-        matches!(
-            self,
-            PaneKind::Chart(_)
-                | PaneKind::Ticker { .. }
-                | PaneKind::News(_)
-                | PaneKind::OrderBook(_)
-                | PaneKind::Options(_)
-        )
+        matches!(self, PaneKind::Chart(_) | PaneKind::Ticker { .. } | PaneKind::OrderBook(_) | PaneKind::Options(_))
+            || matches!(self, PaneKind::News(n) if n.scope == tr_data::news::NewsScope::Symbol)
     }
 
     fn settings(&self) -> PaneSettings {
@@ -286,6 +323,7 @@ impl PaneKind {
                 compare: c.compare.clone(),
                 show_volume: c.show_volume,
                 show_congress: c.show_congress,
+                show_news: c.show_news,
                 magnet: c.magnet,
                 show_box: c.show_box,
                 show_rs: c.show_rs,
@@ -310,7 +348,7 @@ impl PaneKind {
             PaneKind::Wei => PaneSettings::Wei,
             PaneKind::Curve => PaneSettings::Curve,
             PaneKind::Search { query } => PaneSettings::Search(query.clone()),
-            PaneKind::News(n) => PaneSettings::News(n.symbol.clone()),
+            PaneKind::News(n) => PaneSettings::News(crate::layouts::NewsSettings::from_pane(n)),
             PaneKind::OrderBook(b) => {
                 PaneSettings::OrderBook { symbol: b.symbol.clone(), depth: b.depth, group: b.group }
             }
@@ -343,6 +381,7 @@ impl PaneKind {
                 compare,
                 show_volume,
                 show_congress,
+                show_news,
                 magnet,
                 show_box,
                 show_rs,
@@ -358,6 +397,7 @@ impl PaneKind {
                 c.compare = compare;
                 c.show_volume = show_volume;
                 c.show_congress = show_congress;
+                c.show_news = show_news;
                 c.magnet = magnet;
                 c.show_box = show_box;
                 c.show_rs = show_rs;
@@ -376,7 +416,7 @@ impl PaneKind {
             PaneSettings::Wei => PaneKind::Wei,
             PaneSettings::Curve => PaneKind::Curve,
             PaneSettings::Search(q) => PaneKind::Search { query: q },
-            PaneSettings::News(s) => PaneKind::News(Box::new(NewsPane::new(s))),
+            PaneSettings::News(s) => PaneKind::News(Box::new(s.into_pane())),
             PaneSettings::OrderBook { symbol, depth, group } => {
                 PaneKind::OrderBook(Box::new(BookPane::new(&symbol, depth, group)))
             }
@@ -860,7 +900,7 @@ impl TerminalApp {
                 self.status = format!("{s}: congressional trades");
             }
             Command::SymbolFunction(s, Function::News) => {
-                self.open_panel(PaneKind::News(Box::new(NewsPane::new(Some(s.clone())))));
+                self.open_panel(PaneKind::News(Box::new(NewsPane::for_symbol(s.clone()))));
                 self.status = format!("{s}: news");
             }
             Command::SymbolFunction(s, Function::OrderBook(depth)) => {
@@ -964,7 +1004,8 @@ impl TerminalApp {
                 let focus = self.focus;
                 self.set_link(focus, link);
             }
-            Function::News => self.open_panel(PaneKind::News(Box::new(NewsPane::new(self.focused_symbol())))),
+            Function::News => self.open_panel(PaneKind::News(Box::new(NewsPane::new(None)))),
+            Function::TopNews => self.open_panel(PaneKind::News(Box::new(NewsPane::top()))),
             Function::OrderBook(depth) => {
                 let sym = self.focused_symbol().unwrap_or_else(|| "BTCUSD Curncy".into());
                 let depth = depth.unwrap_or(self.prefs.panels.book_depth).clamp(5, 200);
@@ -1220,18 +1261,24 @@ impl TerminalApp {
                         }
                     }
                 }
-                Response::News { pane, symbol, items } => {
-                    if let Some(p) = self.panes.iter_mut().find(|p| p.id == pane)
-                        && let PaneKind::News(n) = &mut p.kind
-                        && n.symbol == symbol
-                    {
-                        n.loading = false;
-                        match items {
-                            Ok(items) => {
-                                n.items = items;
-                                n.error = None;
+                Response::News { pane, symbols, batch } => {
+                    if let Some(p) = self.panes.iter_mut().find(|p| p.id == pane) {
+                        match &mut p.kind {
+                            PaneKind::News(n) => n.accept(batch.clone()),
+                            PaneKind::Chart(c) => c.on_news(&batch),
+                            _ => {}
+                        }
+                    }
+                    for p in &mut self.panes {
+                        if p.id == pane {
+                            continue;
+                        }
+                        if let PaneKind::Chart(c) = &mut p.kind {
+                            let ours = symbols.as_ref().is_some_and(|s| s.iter().any(|k| k == &c.symbol))
+                                || batch.queried.iter().any(|k| k == &c.symbol);
+                            if ours {
+                                c.on_news(&batch);
                             }
-                            Err(e) => n.error = Some(e),
                         }
                     }
                 }
@@ -1574,6 +1621,26 @@ impl TerminalApp {
         }
     }
 
+    fn news_watchlist_keys(&self) -> Vec<String> {
+        self.watchlists
+            .group(&self.watch_ui.selected_group)
+            .or_else(|| self.watchlists.group(&self.watchlists.last_used))
+            .map(|g| g.members.iter().map(|m| m.symbol.clone()).collect())
+            .unwrap_or_else(|| self.watchlist.clone())
+    }
+
+    fn news_leader_keys(&self) -> Vec<String> {
+        self.panes
+            .iter()
+            .find_map(|p| match &p.kind {
+                PaneKind::Research(r) => {
+                    r.results.as_ref().map(|s| s.data.results.iter().map(|row| row.symbol.clone()).collect())
+                }
+                _ => None,
+            })
+            .unwrap_or_default()
+    }
+
     fn periodic(&mut self) {
         let visible = self.visible_panes();
         let shown = |f: &dyn Fn(&PaneKind) -> bool| visible.iter().any(|&i| f(&self.panes[i].kind));
@@ -1593,13 +1660,28 @@ impl TerminalApp {
             self.worker.send(Request::YieldCurves);
             self.last_curve = Some(Instant::now());
         }
+        let watch_news = tr_data::news::bound_symbols(self.news_watchlist_keys());
+        let leader_news = tr_data::news::bound_symbols(self.news_leader_keys());
         // News every 5 minutes and order books every second, while visible.
         for &i in &visible {
             let p = &mut self.panes[i];
             match &mut p.kind {
                 PaneKind::News(n) if n.fetched.is_none_or(|t| t.elapsed() > Duration::from_secs(300)) => {
                     n.fetched = Some(Instant::now());
-                    self.worker.send(Request::News { pane: p.id, symbol: n.symbol.clone() });
+                    n.loading = true;
+                    let symbols = match n.scope {
+                        tr_data::news::NewsScope::Watchlist => Some(watch_news.clone()),
+                        tr_data::news::NewsScope::Leaders => Some(leader_news.clone()),
+                        tr_data::news::NewsScope::Symbol => n.symbol.clone().map(|s| vec![s]),
+                        tr_data::news::NewsScope::Top => None,
+                    };
+                    self.worker.send(Request::News { pane: p.id, symbols });
+                }
+                PaneKind::Chart(c)
+                    if c.show_news && c.news_fetched.is_none_or(|t| t.elapsed() > Duration::from_secs(300)) =>
+                {
+                    c.news_fetched = Some(Instant::now());
+                    self.worker.send(Request::News { pane: p.id, symbols: Some(vec![c.symbol.clone()]) });
                 }
                 PaneKind::Options(o) if o.fetched.is_none_or(|t| t.elapsed() > Duration::from_secs(30)) => {
                     o.fetched = Some(Instant::now());
@@ -2002,8 +2084,18 @@ mod tests {
         for s in [
             crate::layouts::chart_settings("BTCUSD Curncy", &d),
             PaneSettings::Feed(Some(crate::layouts::FeedSettings { buys: Some(true), ..Default::default() })),
-            PaneSettings::News(Some("AAPL US Equity".into())),
-            PaneSettings::News(None),
+            PaneSettings::News(crate::layouts::NewsSettings::Full {
+                symbol: Some("AAPL US Equity".into()),
+                scope: tr_data::news::NewsScope::Symbol,
+            }),
+            PaneSettings::News(crate::layouts::NewsSettings::Full {
+                symbol: None,
+                scope: tr_data::news::NewsScope::Top,
+            }),
+            PaneSettings::News(crate::layouts::NewsSettings::Full {
+                symbol: None,
+                scope: tr_data::news::NewsScope::Watchlist,
+            }),
             PaneSettings::OrderBook { symbol: "ETHUSD Curncy".into(), depth: 50, group: 1.0 },
             PaneSettings::Search("gold".into()),
             PaneSettings::Settings,

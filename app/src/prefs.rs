@@ -179,6 +179,7 @@ pub struct PanelDefaults {
     pub timeframe: Timeframe,
     pub show_volume: bool,
     pub congress_markers: bool,
+    pub news_markers: bool,
     pub book_depth: usize,
 }
 
@@ -189,6 +190,7 @@ impl Default for PanelDefaults {
             timeframe: Timeframe::D1,
             show_volume: true,
             congress_markers: true,
+            news_markers: true,
             book_depth: 20,
         }
     }

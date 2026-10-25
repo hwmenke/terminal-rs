@@ -72,6 +72,8 @@ pub enum PaneSettings {
         show_volume: bool,
         #[serde(default = "yes")]
         show_congress: bool,
+        #[serde(default = "yes")]
+        show_news: bool,
         #[serde(default)]
         magnet: bool,
         #[serde(default)]
@@ -94,8 +96,8 @@ pub enum PaneSettings {
     Wei,
     Curve,
     Search(String),
-    /// Headlines for a security (`None` = general market news).
-    News(Option<String>),
+    /// Headlines. Legacy `null` / `"AAPL US Equity"` still load.
+    News(NewsSettings),
     OrderBook {
         symbol: String,
         depth: usize,
@@ -137,6 +139,46 @@ pub enum PaneSettings {
 
 fn yes() -> bool {
     true
+}
+
+/// Persisted news-pane scope. Older layouts stored `null` (top market) or a market key.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum NewsSettings {
+    Legacy(Option<String>),
+    Full {
+        #[serde(default)]
+        symbol: Option<String>,
+        #[serde(default)]
+        scope: tr_data::news::NewsScope,
+    },
+}
+
+impl NewsSettings {
+    pub fn from_pane(n: &crate::app::NewsPane) -> Self {
+        Self::Full { symbol: n.symbol.clone(), scope: n.scope }
+    }
+
+    pub fn into_pane(self) -> crate::app::NewsPane {
+        match self {
+            Self::Legacy(Some(s)) => crate::app::NewsPane::for_symbol(s),
+            Self::Legacy(None) => crate::app::NewsPane::top(),
+            Self::Full { symbol, scope } => {
+                let mut pane = match scope {
+                    tr_data::news::NewsScope::Symbol => {
+                        symbol.clone().map(crate::app::NewsPane::for_symbol).unwrap_or_else(crate::app::NewsPane::top)
+                    }
+                    tr_data::news::NewsScope::Watchlist => crate::app::NewsPane::watchlist(),
+                    tr_data::news::NewsScope::Leaders => crate::app::NewsPane::leaders(),
+                    tr_data::news::NewsScope::Top => crate::app::NewsPane::top(),
+                };
+                if pane.symbol.is_none() {
+                    pane.symbol = symbol;
+                }
+                pane
+            }
+        }
+    }
 }
 
 /// Serializable mirror of the Congress feed filter.
@@ -293,6 +335,7 @@ pub fn chart_settings(symbol: &str, d: &crate::prefs::PanelDefaults) -> PaneSett
         compare: None,
         show_volume: d.show_volume,
         show_congress: d.congress_markers,
+        show_news: d.news_markers,
         magnet: false,
         show_box: false,
         show_rs: false,
@@ -477,7 +520,7 @@ mod tests {
         });
         doc.panes.push(SavedPane {
             id: 6,
-            settings: PaneSettings::News(Some("BTCUSD Curncy".into())),
+            settings: PaneSettings::News(NewsSettings::Legacy(Some("BTCUSD Curncy".into()))),
             link: Some(Link::Blue),
             title: None,
             window: Some(WindowGeometry { x: 40.0, y: 60.0, w: 640.0, h: 480.0 }),
@@ -538,9 +581,17 @@ mod tests {
         let doc = LayoutDoc::from_json(raw.as_bytes()).unwrap();
         match &doc.panes[0].settings {
             PaneSettings::Chart {
-                show_volume, show_congress, magnet, log, show_box, show_rs, show_volume_ctx, ..
+                show_volume,
+                show_congress,
+                show_news,
+                magnet,
+                log,
+                show_box,
+                show_rs,
+                show_volume_ctx,
+                ..
             } => {
-                assert!(*show_volume && *show_congress && !*magnet && *log);
+                assert!(*show_volume && *show_congress && *show_news && !*magnet && *log);
                 assert!(!*show_box && !*show_rs && !*show_volume_ctx);
             }
             other => panic!("{other:?}"),
@@ -588,6 +639,22 @@ mod tests {
         assert!(store.load("Trading").is_err());
         assert!(store.delete("Trading").is_err());
         std::fs::remove_dir_all(&store.dir).unwrap();
+    }
+
+    #[test]
+    fn news_settings_keep_legacy_null_as_top_and_persist_watchlist() {
+        let raw = r#"{"name":"N","dock":{"type":"tabs","panes":[1,2]},"panes":[
+            {"id":1,"News":null},
+            {"id":2,"News":{"scope":"Watchlist","symbol":null}}]}"#;
+        let doc = LayoutDoc::from_json(raw.as_bytes()).unwrap();
+        match &doc.panes[0].settings {
+            PaneSettings::News(s) => assert_eq!(s.clone().into_pane().scope, tr_data::news::NewsScope::Top),
+            other => panic!("{other:?}"),
+        }
+        match &doc.panes[1].settings {
+            PaneSettings::News(s) => assert_eq!(s.clone().into_pane().scope, tr_data::news::NewsScope::Watchlist),
+            other => panic!("{other:?}"),
+        }
     }
 
     #[test]

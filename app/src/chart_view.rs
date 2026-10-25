@@ -80,6 +80,8 @@ pub struct ChartState {
     pub magnet: bool,
     pub show_volume: bool,
     pub show_congress: bool,
+    /// Headline pins on bars whose time range contains the publication time.
+    pub show_news: bool,
     /// Darvas box levels from the loaded series (persisted in layouts).
     pub show_box: bool,
     /// 21-bar return HUD; labelled as this interval, never SPY-relative.
@@ -111,9 +113,14 @@ pub struct ChartState {
     compare_line: Option<LineRef>,
     compare_scale: f64,
     markers: Vec<Trade>,
+    news: Vec<tr_data::NewsItem>,
+    news_stale: bool,
+    pub news_fetched: Option<std::time::Instant>,
+    news_key: u64,
     pending_range: Option<Range>,
     draw: DrawState,
     hover_marker: Option<usize>,
+    hover_news: Option<usize>,
     /// Resolved security for `symbol`.
     sec: Security,
     last_live: Option<std::time::Instant>,
@@ -149,6 +156,7 @@ impl ChartState {
             magnet: false,
             show_volume: true,
             show_congress: true,
+            show_news: true,
             show_box: false,
             show_rs: false,
             show_volume_ctx: false,
@@ -173,9 +181,14 @@ impl ChartState {
             compare_line: None,
             compare_scale: 1.0,
             markers: Vec::new(),
+            news: Vec::new(),
+            news_stale: false,
+            news_fetched: None,
+            news_key: 0,
             pending_range: None,
             draw: DrawState::default(),
             hover_marker: None,
+            hover_news: None,
             sec: tr_data::security(symbol),
             last_live: None,
             last_indicator_req: None,
@@ -209,10 +222,14 @@ impl ChartState {
         self.glide = None;
         self.shown_scale = None;
         self.hover_marker = None;
+        self.hover_news = None;
         self.last_indicator_req = None;
         self.compare_scale = 1.0;
         self.compare_line = None;
         self.markers.clear();
+        self.news.clear();
+        self.news_stale = false;
+        self.news_fetched = None;
         // Never show the previous symbol's bars under the new title.
         self.bars = Arc::new(Vec::new());
         self.provenance = Provenance::Missing;
@@ -582,6 +599,36 @@ impl ChartState {
             }
             self.markers = trades;
         }
+    }
+
+    pub fn on_news(&mut self, batch: &tr_data::news::NewsBatch) {
+        if batch.sample {
+            self.news.clear();
+            self.news_stale = false;
+            return;
+        }
+        let ticker = self.sec.ticker.clone();
+        let key = self.symbol.clone();
+        let ours = batch.queried.is_empty()
+            || batch.queried.iter().any(|q| q == &key || tr_data::security(q).ticker.eq_ignore_ascii_case(&ticker));
+        if !ours {
+            return;
+        }
+        let items: Vec<_> = batch
+            .items
+            .iter()
+            .filter(|n| {
+                n.tickers.is_empty()
+                    || n.tickers.iter().any(|t| t.eq_ignore_ascii_case(&ticker) || tr_data::security(t).key() == key)
+            })
+            .cloned()
+            .collect();
+        if self.news.is_empty() && !items.is_empty() {
+            self.news_key = crate::anim::fresh_key();
+        }
+        self.news = items;
+        self.news_stale = batch.stale;
+        self.news_fetched = Some(std::time::Instant::now());
     }
 
     // ---- coordinate helpers -----------------------------------------------------------
@@ -1074,6 +1121,10 @@ impl ChartState {
         if self.show_congress {
             self.paint_markers(ui, price_rect, &v, &scale, hover, &reveal);
         }
+        self.hover_news = None;
+        if self.show_news {
+            self.paint_news(ui, price_rect, &v, hover, &reveal, &plot_resp);
+        }
 
         // ---- crosshair + legend ----
         let hovered_bar = hover.and_then(|p| v.bar_at((p.x - price_rect.left()) as f64, len));
@@ -1243,6 +1294,8 @@ impl ChartState {
             self.actions.push(Action::AddToWatchlist(self.symbol.clone()));
             ui.close();
         }
+        ui.checkbox(&mut self.show_news, "News catalyst markers")
+            .on_hover_text("Headlines whose publication time falls on a loaded bar — click to open");
         if self.sec.has_congress_trades() {
             ui.checkbox(&mut self.show_congress, "Congress Trade Markers");
             if ui.button("Who in Congress Traded This…").clicked() {
@@ -1588,6 +1641,70 @@ impl ChartState {
             hover_card(ui, c, t);
         }
     }
+
+    /// Amber pins at the top of the plot (WN news_markers.js: click a date-aligned story).
+    fn paint_news(
+        &mut self,
+        ui: &Ui,
+        rect: Rect,
+        v: &Viewport,
+        hover: Option<Pos2>,
+        reveal: &Reveal,
+        plot_resp: &egui::Response,
+    ) {
+        if self.news.is_empty() || self.bars.is_empty() {
+            return;
+        }
+        let hits = tr_data::news::align_to_bars(&self.news, &self.bars, self.tf);
+        if hits.is_empty() {
+            return;
+        }
+        let arrive = crate::anim::progress(ui.ctx(), egui::Id::new(("chart-news", self.id)), self.news_key, 0.5);
+        let p = ui.painter_at(rect);
+        let len = self.bars.len();
+        let (lo, hi) = v.visible_range(len);
+        let mut stack: std::collections::HashMap<usize, u32> = std::collections::HashMap::new();
+        let full_r = (v.bar_px as f32 * 0.4).clamp(3.5, 6.0);
+        let mut best: Option<(f32, usize, Pos2)> = None;
+        for (hi_i, hit) in hits.iter().enumerate() {
+            let idx = self.index_of_ts(hit.bar_ts).floor();
+            if idx < lo as f64 || idx >= hi as f64 || idx < 0.0 || idx >= len as f64 {
+                continue;
+            }
+            let i = idx as usize;
+            let n = stack.entry(i).or_insert(0);
+            let x = rect.left() + v.x_center(i) as f32;
+            let swept = ((reveal.front - (i as f64 + 0.5)) / reveal.ramp as f64).clamp(0.0, 1.0) as f32;
+            let lead = 0.5 * (x - rect.left()) / rect.width().max(1.0);
+            let pop = crate::anim::ease_out_back(swept.min(crate::anim::span(arrive, lead, lead + 0.45)));
+            if pop <= 0.01 {
+                *n += 1;
+                continue;
+            }
+            let r = full_r * pop;
+            let y = rect.top() + 7.0 + *n as f32 * (2.0 * full_r + 1.0);
+            *n += 1;
+            let c = Pos2::new(x, y);
+            let col = if self.news_stale { amber().gamma_multiply(0.65) } else { amber() };
+            p.rect_filled(Rect::from_center_size(c, vec2(r * 1.7, r * 1.7)), 0.0, col);
+            if full_r >= 4.5 {
+                p.text(c, Align2::CENTER_CENTER, "N", mono(full_r * 1.45), Color32::BLACK.gamma_multiply(pop));
+            }
+            if let Some(h) = hover {
+                let d = h.distance(c);
+                if d <= r + 4.0 && best.is_none_or(|b| d < b.0) {
+                    best = Some((d, hi_i, c));
+                }
+            }
+        }
+        if let Some((_, mi, c)) = best {
+            self.hover_news = Some(mi);
+            news_hover_card(ui, c, &hits[mi].item);
+            if plot_resp.clicked() {
+                ui.ctx().open_url(egui::OpenUrl::new_tab(&hits[mi].item.link));
+            }
+        }
+    }
 }
 
 fn opaque(o: &Overlay) -> Color32 {
@@ -1608,6 +1725,43 @@ fn dashed_v(p: &egui::Painter, x: f32, y: egui::Rangef, s: Stroke) {
     while a < y.max {
         p.vline(x, a..=(a + 4.0).min(y.max), s);
         a += 7.0;
+    }
+}
+
+fn news_hover_card(ui: &Ui, at: Pos2, item: &tr_data::NewsItem) {
+    let when = tr_data::news::format_pub(item.ts, chrono::Utc::now().timestamp());
+    let tickers = if item.tickers.is_empty() { String::new() } else { item.tickers.join(" ") };
+    let lines = [
+        (item.title.clone(), text()),
+        (
+            format!(
+                "{} · {}{}",
+                item.publisher,
+                when,
+                if tickers.is_empty() { String::new() } else { format!(" · {tickers}") }
+            ),
+            muted(),
+        ),
+        ("Click to open story".into(), amber()),
+    ];
+    let w = lines.iter().map(|(l, _)| l.len().min(72)).max().unwrap_or(10) as f32 * 7.0 + 14.0;
+    let h = 8.0 + lines.len() as f32 * 14.0;
+    let screen = ui.ctx().content_rect();
+    let mut min = at + vec2(12.0, 12.0);
+    if min.x + w > screen.right() {
+        min.x = at.x - w - 12.0;
+    }
+    if min.y + h > screen.bottom() {
+        min.y = at.y - h - 12.0;
+    }
+    let card = Rect::from_min_size(min, vec2(w.min(420.0), h));
+    let layer = egui::LayerId::new(egui::Order::Tooltip, egui::Id::new("news-card"));
+    let p = ui.ctx().layer_painter(layer);
+    p.rect_filled(card, 0.0, Color32::from_rgb(16, 16, 16));
+    p.rect_stroke(card, 0.0, Stroke::new(1.0, amber_dim()), StrokeKind::Inside);
+    for (k, (l, c)) in lines.iter().enumerate() {
+        let shown = if l.len() > 72 { format!("{}…", &l[..71]) } else { l.clone() };
+        p.text(card.left_top() + vec2(7.0, 4.0 + k as f32 * 14.0), Align2::LEFT_TOP, shown, mono(11.5), *c);
     }
 }
 
@@ -1713,30 +1867,24 @@ mod tests {
         chart.built = crate::worker::build_indicators(&bars, chart.tf, &chart.indicators, &theme::palette());
         chart_frame(&ctx, &mut chart, &worker, vec![]);
         let pos = pos2(500.0, 300.0);
-        chart_frame(
-            &ctx,
-            &mut chart,
-            &worker,
-            vec![egui::Event::PointerMoved(pos), pointer(pos, egui::PointerButton::Secondary, true)],
-        );
+        chart_frame(&ctx, &mut chart, &worker, vec![
+            egui::Event::PointerMoved(pos),
+            pointer(pos, egui::PointerButton::Secondary, true),
+        ]);
         chart_frame(&ctx, &mut chart, &worker, vec![pointer(pos, egui::PointerButton::Secondary, false)]);
         let output = chart_frame(&ctx, &mut chart, &worker, vec![]);
         let pos = text_position(&output.shapes, "Indicators");
-        chart_frame(
-            &ctx,
-            &mut chart,
-            &worker,
-            vec![egui::Event::PointerMoved(pos), pointer(pos, egui::PointerButton::Primary, true)],
-        );
+        chart_frame(&ctx, &mut chart, &worker, vec![
+            egui::Event::PointerMoved(pos),
+            pointer(pos, egui::PointerButton::Primary, true),
+        ]);
         chart_frame(&ctx, &mut chart, &worker, vec![pointer(pos, egui::PointerButton::Primary, false)]);
         let output = chart_frame(&ctx, &mut chart, &worker, vec![]);
         let pos = text_position(&output.shapes, "Remove All");
-        chart_frame(
-            &ctx,
-            &mut chart,
-            &worker,
-            vec![egui::Event::PointerMoved(pos), pointer(pos, egui::PointerButton::Primary, true)],
-        );
+        chart_frame(&ctx, &mut chart, &worker, vec![
+            egui::Event::PointerMoved(pos),
+            pointer(pos, egui::PointerButton::Primary, true),
+        ]);
         chart_frame(&ctx, &mut chart, &worker, vec![pointer(pos, egui::PointerButton::Primary, false)]);
         assert!(chart.built.is_empty());
         assert!(chart.indicators.is_empty());
@@ -1760,7 +1908,10 @@ mod tests {
         assert_eq!(c.sec.class, AssetClass::Fx);
         assert_eq!(c.sec.decimals(5.03), 4);
         assert!(c.bars.is_empty() && c.gpu.is_none() && c.built.is_empty());
-        assert!(c.drawings.is_empty() && c.hover_marker.is_none() && c.pending_range.is_none());
+        assert!(
+            c.drawings.is_empty() && c.hover_marker.is_none() && c.hover_news.is_none() && c.pending_range.is_none()
+        );
+        assert!(c.news.is_empty() && c.news_fetched.is_none());
         assert!(c.shown_scale.is_none() && c.manual_scale.is_none() && c.glide.is_none());
         c.clear_indicators();
         c.on_indicators(
@@ -1917,5 +2068,42 @@ mod tests {
         assert!(chart.loading);
         chart.on_history(generation, bars.clone(), SeriesGpu::build(&bars), 0, false, true, false, &worker);
         assert!(chart.is_empty(), "A response from before the disconnect cannot restore bars");
+    }
+
+    #[test]
+    fn news_catalysts_attach_to_aligned_bars_and_ignore_other_names() {
+        let mut c = ChartState::new(1, "AAPL", Timeframe::D1);
+        let day = 1_700_000_000i64 / 86_400 * 86_400;
+        let bars = Arc::new(vec![Bar::new(day, 1.0, 1.0, 1.0, 1.0, 1.0).with_provenance(Provenance::Real)]);
+        let (worker, _) = Worker::test_channel();
+        c.on_history(c.generation, bars.clone(), SeriesGpu::build(&bars), 0, false, true, false, &worker);
+        let item = tr_data::NewsItem {
+            title: "Apple event".into(),
+            publisher: "Yahoo".into(),
+            link: "https://n/aapl".into(),
+            ts: day + 3_600,
+            tickers: vec!["AAPL".into()],
+        };
+        c.on_news(&tr_data::news::NewsBatch {
+            items: vec![item.clone()],
+            failures: vec![],
+            queried: vec!["AAPL US Equity".into()],
+            fetched_at: day,
+            stale: false,
+            sample: false,
+        });
+        assert_eq!(c.news.len(), 1);
+        assert_eq!(tr_data::news::align_to_bars(&c.news, &c.bars, Timeframe::D1)[0].bar_ts, day);
+        c.on_news(&tr_data::news::NewsBatch {
+            items: vec![item],
+            failures: vec![],
+            queried: vec!["MSFT US Equity".into()],
+            fetched_at: day,
+            stale: false,
+            sample: false,
+        });
+        assert_eq!(c.news.len(), 1, "a batch for another name must not replace these markers");
+        c.on_news(&tr_data::news::NewsBatch::sample_isolated(day));
+        assert!(c.news.is_empty());
     }
 }
