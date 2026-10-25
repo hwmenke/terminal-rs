@@ -376,6 +376,18 @@ impl TerminalApp {
                 c.load(&self.worker);
                 PaneKind::Chart(c)
             }
+            PaneKind::Desk(mut d) => {
+                if self.watchlists.index(&d.group).is_none() {
+                    d.group = self.watchlists.last_used.clone();
+                }
+                let symbols = self
+                    .watchlists
+                    .group(&d.group)
+                    .map(|g| g.members.iter().map(|m| m.symbol.clone()).collect())
+                    .unwrap_or_default();
+                d.request(id, &self.worker, symbols);
+                PaneKind::Desk(d)
+            }
             PaneKind::Ticker { symbol, .. } => {
                 self.worker.send(Request::TickerTrades { pane: id, symbol: symbol.clone() });
                 PaneKind::Ticker { symbol, trades: Vec::new(), loading: true }
@@ -756,6 +768,15 @@ impl TerminalApp {
             "OMON" | "OPT" | "OPTIONS" | "CHAIN" => {
                 let sym = given.unwrap_or_else(|| self.optionable_symbol());
                 PaneKind::Options(Box::new(super::OptionsPane::new(&sym, 12, true)))
+            }
+            "DESK" | "PM" | "PMDESK" | "RISK" => {
+                let group = words.get(1).cloned().unwrap_or(self.watch_ui.selected_group.as_str()).to_string();
+                let group = if self.watchlists.index(&group).is_some() {
+                    self.watchlists.groups[self.watchlists.index(&group).unwrap()].name.clone()
+                } else {
+                    self.watchlists.last_used.clone()
+                };
+                PaneKind::Desk(Box::new(super::desk::DeskPane::new(group)))
             }
             "PORT" | "PORTFOLIO" | "ACCT" | "POS" | "POSITIONS" | "ORD" | "ORDERS" | "ACTV" | "ACTIVITY" => {
                 let view = match head.as_str() {

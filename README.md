@@ -203,6 +203,11 @@ gets the native title bar with traffic lights, window vibrancy behind the sideba
   volume context; those overlays persist in the layout. Archive charts load a bounded daily
   page and page older history. Daily-bar VWAP is labelled **Monthly VWAP**. See
   [Chart review](docs/CHART_REVIEW.md).
+- **PM Desk and risk planning** — `DESK` (or `AAPL DESK`) shows watchlist leaders and
+  group 21-bar performance for the **selected group only**, then sizes a position from
+  entry, stop, target and dollar risk. Stops prefer a typed level or chart horizontal
+  line, then the SCAN box, then 2 × ATR(14). Ranks are labelled as watchlist-relative,
+  not SCAN universe RS. Brokerage `PORT` is unchanged. See [PM Desk](docs/PM_DESK.md).
 - **Command palette** — ⌘⇧K (Ctrl+Shift+K on Linux and Windows) opens a centred, theme-matched palette
   that fuzzy-searches every function code (`PORT`, `POS`, `ORD`, `OMON`, `THEME`, …), tickers
   (load the quote and chart), new panels, layout presets and saved layouts, themes, Settings tabs
@@ -327,7 +332,7 @@ Settings › Hotkeys. On Linux and Windows ⌘ is Ctrl and ⌥ is Alt.
 | / · : · Ctrl+K | focus the ticker / command bar |
 | ⌘⇧K (Ctrl+Shift+K) | command palette: fuzzy search over commands, tickers, panels, layouts, themes, settings and actions |
 | F1 · F2 · F3 · F4 · F5 · F6 · F12 | help · Congress feed · politicians · alerts · watchlist · refresh filings · frame timing |
-| F7 · F8 · F9 | brokerage portfolio · positions · orders |
+| F7 · F8 · F9 · F10 | brokerage portfolio · positions · orders · PM Desk |
 | Tab · ⇧Tab | next · previous pane |
 | ⌘1 … ⌘0 · ⌘⇧O | new chart, watchlist, news, order book, world markets, yield curve, Congress, politicians, alerts, search pane · options chain |
 | ⌘D · ⌘⇧D · ⌘T · ⌘W · ⌘⇧P | split right · split down · new tab · close pane · pop out |
@@ -350,6 +355,7 @@ Settings › Hotkeys. On Linux and Windows ⌘ is Ctrl and ⌥ is Alt.
 | `NEW BOOK` · `SPLIT DOWN NEWS` · `POP` · `LINK GREEN` · `TITLE Desk` · `CLOSE` | add, split, pop out, link, rename, close panes |
 | `LAYOUT 4` · `LAYOUT SAVE Macro` · `LAYOUT Macro` · `LAYOUT RENAME Rates` · `LAYOUT DUP` · `LAYOUT DEL` · `LAYOUT EXPORT` | grid preset · saved layouts |
 | `THEME BLOOMBERG` · `THEME NEXT` · `THEME SYSTEM` · `THEME EDIT` · `THEME COMPACT` · `LAYOUT THEME ON` | themes |
+| `DESK` · `AAPL DESK` · `NEW DESK` | PM Desk: watchlist leaders, group performance, position size |
 | `PORT` · `ACCT` · `POS` · `ORD` · `ACTV` · `AAPL POS` · `AAPL ORD` | brokerage portfolio · accounts and balances · positions · orders · activity · one security |
 | `PORT REFRESH` · `PORT CONNECT` · `PORT SETUP` (`BROKER`) | reload accounts · connect a broker in the browser · SnapTrade keys |
 | `BUY AAPL 10` · `SELL ALL TSLA` · `SELL MSFT 5 LMT 410` · `SELL TSLA 3 STP 250 LMT 245` · `BUY NVDA $500` · `TRADE` | order ticket, prefilled (demo: one click; live: review and confirm) |

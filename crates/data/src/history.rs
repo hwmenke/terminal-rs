@@ -285,6 +285,29 @@ impl Archive {
         tx.commit()?;
         Ok(histories)
     }
+    /// Daily history for an explicit ticker list. Does not scan every registered symbol.
+    pub fn histories_for(&self, symbols: &[String]) -> Result<BTreeMap<String, Vec<Bar>>> {
+        let mut out = BTreeMap::new();
+        for raw in symbols {
+            let ticker = universe::normalize(raw).unwrap_or_else(|_| raw.trim().to_ascii_uppercase());
+            match self.daily(&ticker) {
+                Ok(bars) if !bars.is_empty() => {
+                    out.insert(ticker, bars);
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    let msg = format!("{e:#}");
+                    if msg.to_ascii_lowercase().contains("sample")
+                        || msg.to_ascii_lowercase().contains("unverified")
+                        || msg.to_ascii_lowercase().contains("refused")
+                    {
+                        return Err(e);
+                    }
+                }
+            }
+        }
+        Ok(out)
+    }
     pub fn scan(&self, name: &str) -> Result<Snapshot<Scan>> {
         let histories = self.histories()?.into_iter().collect();
         let data = crate::whats_news::scan_histories(name, histories, Provenance::Cached)?;

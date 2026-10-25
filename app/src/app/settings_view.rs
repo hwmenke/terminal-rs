@@ -207,11 +207,29 @@ impl TerminalApp {
 
     pub(super) fn refresh_whats_news_panes(&mut self) {
         self.command_catalogue = Default::default();
+        let desk: Vec<(crate::dock::PaneId, String)> = self
+            .panes
+            .iter()
+            .filter_map(|p| match &p.kind {
+                super::PaneKind::Desk(d) => Some((p.id, d.group.clone())),
+                _ => None,
+            })
+            .collect();
         for pane in &mut self.panes {
             match &mut pane.kind {
                 super::PaneKind::Research(r) => r.request(pane.id, &self.worker),
                 super::PaneKind::Chart(c) if c.archive => c.load(&self.worker),
                 _ => {}
+            }
+        }
+        for (id, group) in desk {
+            let symbols = self
+                .watchlists
+                .group(&group)
+                .map(|g| g.members.iter().map(|m| m.symbol.clone()).collect())
+                .unwrap_or_default();
+            if let Some(super::PaneKind::Desk(d)) = self.panes.iter_mut().find(|p| p.id == id).map(|p| &mut p.kind) {
+                d.request(id, &self.worker, symbols);
             }
         }
     }

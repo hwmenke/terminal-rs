@@ -39,6 +39,12 @@ pub enum Request {
         generation: u64,
         scan: Option<String>,
     },
+    /// Watchlist-scoped PM Desk snapshot. `symbols` are market keys, not the universe.
+    Desk {
+        pane: PaneId,
+        generation: u64,
+        symbols: Vec<String>,
+    },
     ArchiveHistory {
         pane: PaneId,
         generation: u64,
@@ -241,6 +247,11 @@ pub enum Response {
         pane: PaneId,
         generation: u64,
         result: Result<tr_data::whats_news::Snapshot<tr_data::whats_news::Scan>, String>,
+    },
+    Desk {
+        pane: PaneId,
+        generation: u64,
+        result: Result<tr_data::whats_news::Snapshot<Vec<tr_data::whats_news::MemberRow>>, String>,
     },
     Portfolio(Result<Box<tr_broker::Portfolio>, String>),
     /// `(userId, userSecret)` for a newly registered SnapTrade user.
@@ -693,6 +704,86 @@ async fn research_scan(
     Ok(tr_data::whats_news::Snapshot { data, provenance: tr_core::Provenance::Cached, source })
 }
 
+/// Load only the requested watchlist tickers. Sample/unverified history is refused.
+async fn research_desk(
+    s: &Shared,
+    bridge: &tr_data::whats_news::Bridge,
+    keys: &[String],
+) -> anyhow::Result<tr_data::whats_news::Snapshot<Vec<tr_data::whats_news::MemberRow>>> {
+    use tr_data::whats_news::{MemberRow, archive_ticker};
+    let mut wanted = Vec::new();
+    let mut rows = Vec::new();
+    for key in keys {
+        let ticker = archive_ticker(key);
+        if ticker.is_empty() {
+            rows.push(MemberRow::skipped(key, key, tr_core::Provenance::Missing, "invalid security"));
+            continue;
+        }
+        wanted.push((key.clone(), ticker));
+    }
+    let tickers: Vec<String> = wanted.iter().map(|(_, t)| t.clone()).collect();
+    let mut local = if tickers.is_empty() {
+        Default::default()
+    } else {
+        s.history.db(move |db| db.histories_for(&tickers)).await?
+    };
+    let mut source = "Local Yahoo daily research archive (watchlist only)".to_string();
+    let mut wn_skipped = vec![];
+    if bridge.enabled && !wanted.is_empty() {
+        let missing: Vec<String> = wanted
+            .iter()
+            .filter(|(_, t)| !local.get(t).is_some_and(|b| !b.is_empty()))
+            .map(|(_, t)| t.clone())
+            .collect();
+        if !missing.is_empty() {
+            match bridge.histories_for(&missing).await {
+                Ok(external) => {
+                    external.provenance.require_verified("PM Desk archive").map_err(anyhow::Error::msg)?;
+                    source.push_str(&format!(" + {}", external.source));
+                    wn_skipped = external.data.skipped;
+                    for (symbol, bars) in external.data.bars {
+                        if !local.get(&symbol).is_some_and(|b| !b.is_empty()) {
+                            local.insert(symbol, bars);
+                        }
+                    }
+                }
+                Err(e) if tr_data::whats_news::is_unverified(&e) => return Err(e),
+                Err(e) => source.push_str(&format!(" · Whats-News unavailable: {e}")),
+            }
+        }
+    } else if !bridge.enabled {
+        source.push_str(" · Whats-News disabled");
+    }
+    for (key, ticker) in wanted {
+        if let Some(bars) = local.remove(&ticker) {
+            match MemberRow::from_bars(&key, &ticker, &bars) {
+                Ok(row) => rows.push(row),
+                Err(e) => return Err(anyhow::anyhow!(e)),
+            }
+        } else {
+            let reason = wn_skipped
+                .iter()
+                .find(|s| s.symbol == ticker)
+                .map(|s| s.reason.clone())
+                .unwrap_or_else(|| "no daily history in the watchlist-scoped archive read".into());
+            rows.push(MemberRow::skipped(&key, &ticker, tr_core::Provenance::Missing, reason));
+        }
+    }
+    tr_data::whats_news::rank_watchlist(&mut rows);
+    for row in &rows {
+        if row.skip.is_none() {
+            row.provenance.require_verified("PM Desk").map_err(anyhow::Error::msg)?;
+        }
+    }
+    let provenance = rows
+        .iter()
+        .filter(|r| r.skip.is_none())
+        .map(|r| r.provenance)
+        .reduce(tr_core::Provenance::combine)
+        .unwrap_or(tr_core::Provenance::Cached);
+    Ok(tr_data::whats_news::Snapshot { data: rows, provenance, source })
+}
+
 async fn handle(s: &Arc<Shared>, req: Request) {
     let (epoch, config) = s.whats_news.borrow().clone();
     let send = |response| s.send(Response::WhatsNews { epoch, response: Box::new(response) });
@@ -758,6 +849,14 @@ async fn handle(s: &Arc<Shared>, req: Request) {
                     result: research_universe(s, &bridge).await.map_err(|e| format!("{e:#}")),
                 });
             }
+        }
+        Request::Desk { pane, generation, symbols } => {
+            let bridge = config.bridge();
+            send(Response::Desk {
+                pane,
+                generation,
+                result: research_desk(s, &bridge, &symbols).await.map_err(|e| format!("{e:#}")),
+            });
         }
         Request::ArchiveHistory { pane, generation, symbol, tf, limit, before } => {
             let bridge = config.bridge();

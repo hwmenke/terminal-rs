@@ -8,6 +8,7 @@ mod broker;
 mod chrome;
 mod command_bar;
 mod demo;
+mod desk;
 mod hotkeys_view;
 mod options_view;
 mod palette_view;
@@ -78,6 +79,8 @@ pub enum PaneKind {
     Options(Box<OptionsPane>),
     /// Brokerage accounts through SnapTrade (`PORT`, `ACCT`, `POS`, `ORD`, `ACTV`).
     Portfolio(Box<broker::PortfolioPane>),
+    /// Watchlist-scoped PM Desk (`DESK` / `PM`): leaders, group performance, position size.
+    Desk(Box<desk::DeskPane>),
     Settings,
 }
 
@@ -205,6 +208,13 @@ impl PaneKind {
             PaneKind::OrderBook(b) => format!("{} Depth", short(&b.symbol)),
             PaneKind::Options(o) => format!("{} Options", short(&o.symbol)),
             PaneKind::Portfolio(p) => p.title(),
+            PaneKind::Desk(d) => {
+                if d.group.is_empty() {
+                    "PM Desk".into()
+                } else {
+                    format!("Desk: {}", d.group)
+                }
+            }
             PaneKind::Settings => "Settings".into(),
         }
     }
@@ -234,6 +244,7 @@ impl PaneKind {
             PaneKind::OrderBook(_) => "OB",
             PaneKind::Options(_) => "OMON",
             PaneKind::Portfolio(p) => p.view.code(),
+            PaneKind::Desk(_) => "DESK",
             PaneKind::Settings => "PDF",
         }
     }
@@ -314,6 +325,7 @@ impl PaneKind {
                 sort: p.sort,
                 open_only: p.open_only,
             },
+            PaneKind::Desk(d) => PaneSettings::Desk { group: d.group.clone(), selected: d.selected.clone() },
         }
     }
 
@@ -374,6 +386,11 @@ impl PaneKind {
             }
             PaneSettings::Portfolio { view, account, symbol, sort, open_only } => {
                 PaneKind::Portfolio(Box::new(broker::PortfolioPane { view, account, symbol, sort, open_only }))
+            }
+            PaneSettings::Desk { group, selected } => {
+                let mut d = desk::DeskPane::new(group);
+                d.selected = selected;
+                PaneKind::Desk(Box::new(d))
             }
         }
     }
@@ -864,6 +881,7 @@ impl TerminalApp {
                 self.apply_with_symbol(f, Some(s));
             }
             Command::SymbolFunction(s, Function::Review) => self.open_review(Some(&s)),
+            Command::SymbolFunction(s, Function::Desk) => self.open_desk(Some(&s)),
             Command::SymbolFunction(s, f) => {
                 self.open_security(&s);
                 self.apply(f);
@@ -925,7 +943,10 @@ impl TerminalApp {
                         let id = self.new_pane(kind);
                         self.dock_pane(id, target, crate::dock::Zone::Right);
                     }
-                    None => self.status = format!("Unknown panel {spec:?}; try CHART, NEWS, BOOK, WEI, GC, CONG, WL"),
+                    None => {
+                        self.status =
+                            format!("Unknown panel {spec:?}; try CHART, NEWS, BOOK, WEI, GC, CONG, WL, DESK, PORT")
+                    }
                 }
             }
             Function::Split { down, panel } => match self.panel_from_spec(&panel, symbol.as_deref()) {
@@ -1011,6 +1032,7 @@ impl TerminalApp {
                 self.set_account_mode(mode, false);
             }
             Function::Review => self.open_review(symbol.as_deref()),
+            Function::Desk => self.open_desk(symbol.as_deref()),
             Function::Latest => self.with_chart(|c, _| c.jump_latest()),
             Function::ReviewOverlay(which) => self.with_chart(|c, _| match which {
                 command::ReviewOverlay::BoxLevels => c.show_box = !c.show_box,
@@ -1061,11 +1083,30 @@ impl TerminalApp {
                 }
                 Response::HistoryChanged => {
                     self.command_catalogue = Default::default();
+                    let desk: Vec<(crate::dock::PaneId, String)> = self
+                        .panes
+                        .iter()
+                        .filter_map(|p| match &p.kind {
+                            PaneKind::Desk(d) => Some((p.id, d.group.clone())),
+                            _ => None,
+                        })
+                        .collect();
                     for pane in &mut self.panes {
                         match &mut pane.kind {
                             PaneKind::Research(r) => r.request(pane.id, &self.worker),
                             PaneKind::Chart(c) if c.archive => c.load(&self.worker),
                             _ => {}
+                        }
+                    }
+                    for (id, group) in desk {
+                        let symbols = self
+                            .watchlists
+                            .group(&group)
+                            .map(|g| g.members.iter().map(|m| m.symbol.clone()).collect())
+                            .unwrap_or_default();
+                        if let Some(PaneKind::Desk(d)) = self.panes.iter_mut().find(|p| p.id == id).map(|p| &mut p.kind)
+                        {
+                            d.request(id, &self.worker, symbols);
                         }
                     }
                 }
@@ -1084,6 +1125,11 @@ impl TerminalApp {
                         && r.generation == generation
                     {
                         r.accept_scan(result);
+                    }
+                }
+                Response::Desk { pane, generation, result } => {
+                    if let Some(PaneKind::Desk(d)) = self.panes.iter_mut().find(|p| p.id == pane).map(|p| &mut p.kind) {
+                        d.accept(generation, result);
                     }
                 }
                 Response::History {
@@ -1481,6 +1527,7 @@ impl TerminalApp {
             A::Politicians => self.apply(Function::Politician(String::new())),
             A::Alerts => self.apply(Function::Alerts),
             A::Watchlist => self.apply(Function::Watchlist),
+            A::Desk => self.apply(Function::Desk),
             A::Refresh => self.apply(Function::Refresh),
             A::FrameTiming => self.show_perf = !self.show_perf,
             A::Portfolio => self.apply(Function::Portfolio(command::PortView::Summary, String::new())),
@@ -1964,6 +2011,7 @@ mod tests {
             PaneSettings::PriceHistory,
             PaneSettings::Research(None),
             PaneSettings::Research(Some("DARVAS_BREAKOUT".into())),
+            PaneSettings::Desk { group: "Growth".into(), selected: Some("AAPL US Equity".into()) },
             {
                 let mut c = ChartState::new(0, "AAPL", tr_core::Timeframe::D1);
                 c.archive = true;

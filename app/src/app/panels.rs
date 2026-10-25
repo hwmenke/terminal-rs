@@ -125,7 +125,10 @@ impl TerminalApp {
                     }
                 }
             }
-            PaneKind::Watchlist | PaneKind::Settings | PaneKind::Help | PaneKind::Chart(_) => {}
+            PaneKind::Watchlist | PaneKind::Settings | PaneKind::Help | PaneKind::Chart(_) | PaneKind::Desk(_) => {}
+        }
+        if matches!(self.panes[i].kind, PaneKind::Desk(_)) {
+            actions.extend(self.desk(ui, id));
         }
         match self.panes[i].kind {
             PaneKind::Watchlist => actions.extend(self.watchlist(ui)),
