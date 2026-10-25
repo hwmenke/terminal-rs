@@ -264,16 +264,22 @@ pub fn align_to_bars(items: &[NewsItem], bars: &[Bar], tf: Timeframe) -> Vec<New
 }
 
 fn bar_for_ts(bars: &[Bar], tf: Timeframe, ts: i64) -> Option<&Bar> {
-    let bucket = tf.bucket_start(ts);
-    if let Some(bar) = bars.iter().find(|b| b.ts == bucket || tf.bucket_start(b.ts) == bucket) {
-        return Some(bar);
-    }
-    let i = bars.partition_point(|b| b.ts <= ts);
-    if i == 0 {
+    if bars.is_empty() || ts <= 0 {
         return None;
     }
+    // Last bar whose open is at or before the headline, if the next bar (or the
+    // nominal interval) is still ahead. Headlines before the first loaded bar
+    // only match when that bar is the interval bucket start (typical daily midnight).
+    let i = bars.partition_point(|b| b.ts <= ts);
+    if i == 0 {
+        let first = &bars[0];
+        return (tf.bucket_start(ts) == first.ts).then_some(first);
+    }
     let bar = &bars[i - 1];
-    let end = bars.get(i).map(|b| b.ts).unwrap_or_else(|| bar.ts.saturating_add(tf.seconds()));
+    let end = bars.get(i).map(|b| b.ts).unwrap_or_else(|| {
+        let span = tf.seconds();
+        bar.ts.saturating_add(span).max(tf.bucket_start(ts).saturating_add(span))
+    });
     (ts < end).then_some(bar)
 }
 
@@ -401,20 +407,21 @@ mod tests {
 
     #[test]
     fn catalysts_align_when_timestamp_falls_in_bar() {
+        let day = 86_400i64;
         let bars = vec![
-            Bar::new(1_000, 1.0, 1.0, 1.0, 1.0, 1.0).with_provenance(Provenance::Real),
-            Bar::new(1_000 + 86_400, 1.0, 1.0, 1.0, 1.0, 1.0).with_provenance(Provenance::Real),
+            Bar::new(day, 1.0, 1.0, 1.0, 1.0, 1.0).with_provenance(Provenance::Real),
+            Bar::new(day * 2, 1.0, 1.0, 1.0, 1.0, 1.0).with_provenance(Provenance::Real),
         ];
         let items = vec![
-            item("In first day", "https://a/1", 1_000 + 3_600),
-            item("In second day", "https://a/2", 1_000 + 86_400 + 10),
+            item("In first day", "https://a/1", day + 3_600),
+            item("In second day", "https://a/2", day * 2 + 10),
             item("Before range", "https://a/3", 10),
             item("No time", "https://a/4", 0),
         ];
         let hits = align_to_bars(&items, &bars, Timeframe::D1);
         assert_eq!(hits.len(), 2);
-        assert_eq!(hits[0].bar_ts, 1_000);
-        assert_eq!(hits[1].bar_ts, 1_000 + 86_400);
+        assert_eq!(hits[0].bar_ts, day);
+        assert_eq!(hits[1].bar_ts, day * 2);
     }
 
     #[test]
