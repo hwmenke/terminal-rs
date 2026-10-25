@@ -23,6 +23,7 @@ pub mod portable;
 pub mod price_alerts;
 pub mod rss;
 pub mod sample;
+pub mod stats;
 pub mod treasury;
 pub mod whats_news;
 pub mod yahoo;

@@ -47,6 +47,14 @@ pub enum Request {
         generation: u64,
         symbols: Vec<String>,
     },
+    /// Historical statistics and conditional forward returns for one archive symbol.
+    Stats {
+        pane: PaneId,
+        generation: u64,
+        symbol: String,
+        condition: String,
+        horizons: Vec<usize>,
+    },
     ArchiveHistory {
         pane: PaneId,
         generation: u64,
@@ -280,6 +288,11 @@ pub enum Response {
         pane: PaneId,
         generation: u64,
         result: Result<tr_data::whats_news::Snapshot<Vec<tr_data::whats_news::MemberRow>>, String>,
+    },
+    Stats {
+        pane: PaneId,
+        generation: u64,
+        result: Result<tr_data::stats::ResearchSnapshot, String>,
     },
     Portfolio(Result<Box<tr_broker::Portfolio>, String>),
     /// `(userId, userSecret)` for a newly registered SnapTrade user.
@@ -771,6 +784,66 @@ async fn research_scan(
     Ok(tr_data::whats_news::Snapshot { data, provenance: tr_core::Provenance::Cached, source })
 }
 
+/// Load one name from the local archive, then Whats-News. Sample/display bars never enter.
+async fn research_stats(
+    s: &Shared,
+    bridge: &tr_data::whats_news::Bridge,
+    key: &str,
+    condition: &str,
+    horizons: &[usize],
+) -> anyhow::Result<tr_data::stats::ResearchSnapshot> {
+    use tr_data::whats_news::archive_ticker;
+    let ticker = archive_ticker(key);
+    if ticker.is_empty() {
+        anyhow::bail!("Statistics refused: invalid security");
+    }
+    let wanted = ticker.clone();
+    let local = s.history.db(move |db| db.daily(&wanted)).await?;
+    let mut source = "Local Yahoo daily research archive".to_string();
+    let bars = if !local.is_empty() {
+        tr_data::stats::require_research_bars(&local, "Statistics").map_err(anyhow::Error::msg)?;
+        local
+    } else if bridge.enabled {
+        match bridge.histories_for(std::slice::from_ref(&ticker)).await {
+            Ok(external) => {
+                external.provenance.require_verified("Statistics archive").map_err(anyhow::Error::msg)?;
+                source = format!("{} + {}", source, external.source);
+                if let Some(skip) = external.data.skipped.iter().find(|s| s.symbol.eq_ignore_ascii_case(&ticker)) {
+                    anyhow::bail!("Statistics refused: {}: {}", skip.symbol, skip.reason);
+                }
+                let bars = external
+                    .data
+                    .bars
+                    .into_iter()
+                    .find(|(s, _)| s.eq_ignore_ascii_case(&ticker))
+                    .map(|(_, b)| b)
+                    .unwrap_or_default();
+                tr_data::stats::require_research_bars(&bars, "Statistics").map_err(anyhow::Error::msg)?;
+                bars
+            }
+            Err(e) if tr_data::whats_news::is_unverified(&e) => return Err(e),
+            Err(e) => anyhow::bail!(
+                "Statistics refused: no daily history in the local research archive, and Whats-News is unavailable ({e:#}). Sample/display prices are never used."
+            ),
+        }
+    } else {
+        anyhow::bail!(
+            "Statistics refused: no daily history for {ticker} in the local research archive. Sample/display prices are never used."
+        );
+    };
+    let key = tr_data::security(key).key();
+    let snapshot = tokio::task::spawn_blocking({
+        let condition = condition.to_string();
+        let horizons = horizons.to_vec();
+        let source = source.clone();
+        let ticker = ticker.clone();
+        move || tr_data::stats::compute_snapshot(&key, &ticker, &bars, &condition, &horizons, &source)
+    })
+    .await?
+    .map_err(anyhow::Error::msg)?;
+    Ok(snapshot)
+}
+
 /// Load only the requested watchlist tickers. Sample/unverified history is refused.
 async fn research_desk(
     s: &Shared,
@@ -968,6 +1041,14 @@ async fn handle(s: &Arc<Shared>, req: Request) {
                 pane,
                 generation,
                 result: research_desk(s, &bridge, &symbols).await.map_err(|e| format!("{e:#}")),
+            });
+        }
+        Request::Stats { pane, generation, symbol, condition, horizons } => {
+            let bridge = config.bridge();
+            send(Response::Stats {
+                pane,
+                generation,
+                result: research_stats(s, &bridge, &symbol, &condition, &horizons).await.map_err(|e| format!("{e:#}")),
             });
         }
         Request::ArchiveHistory { pane, generation, symbol, tf, limit, before } => {
@@ -1896,6 +1977,33 @@ mod tests {
                 assert_eq!(bars[1].volume, 20.0);
             }
         }
+    }
+
+    #[tokio::test]
+    async fn statistics_use_the_research_archive_and_never_sample_fallback() {
+        let (s, _) = shared(Arc::new(tr_data::sample::SampleProvider::at(0, 10)), None);
+        let config = tr_data::whats_news::Config { enabled: false, ..Default::default() };
+        s.whats_news.send_replace((0, config.clone()));
+        let err = research_stats(&s, &config.bridge(), "AAPL US Equity", "RSI(14) < 30", &[5]).await.unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("refused") || msg.contains("no daily history"), "{msg}");
+        assert!(!msg.to_ascii_lowercase().contains("fallback"));
+
+        let (mut s, _) = shared(Arc::new(tr_data::sample::SampleProvider::at(0, 10)), None);
+        Arc::get_mut(&mut s).unwrap().history = Arc::new(tr_data::history::Service::new(
+            tr_data::history::Archive::memory().unwrap(),
+            Arc::new(ArchivePrices),
+            tr_data::history::Policy { spacing: Duration::ZERO, ..Default::default() },
+        ));
+        s.whats_news.send_replace((0, config.clone()));
+        s.history.run("ADD", tr_data::history::universe::resolve("AAPL").unwrap(), |_| {}).await.unwrap();
+        s.history.run("REFRESH", vec![], |_| {}).await.unwrap();
+        let snap = research_stats(&s, &config.bridge(), "AAPL US Equity", "", &[5]).await.unwrap();
+        assert!(snap.stats.provenance.is_verified());
+        assert!(snap.conditional.provenance.is_verified());
+        assert!(snap.stats.source.contains("Local Yahoo"));
+        assert_eq!(snap.stats.ticker, "AAPL");
+        assert_eq!(snap.conditional.by_horizon[0].baseline.count, snap.stats.bars.saturating_sub(5));
     }
     #[tokio::test]
     async fn whats_news_weekly_rows_are_ignored_in_favor_of_all_daily_rows() {

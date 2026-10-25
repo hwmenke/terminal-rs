@@ -223,6 +223,7 @@ impl TerminalApp {
             match &mut pane.kind {
                 super::PaneKind::Research(r) => r.request(pane.id, &self.worker),
                 super::PaneKind::Chart(c) if c.archive => c.load(&self.worker),
+                super::PaneKind::Stats(s) => s.request(pane.id, &self.worker),
                 _ => {}
             }
         }
@@ -815,7 +816,7 @@ impl TerminalApp {
         section(ui, "Export and recovery");
         ui.label(
             RichText::new(
-                "Export scan results, archived daily prices and the trade journal with source and date metadata. \
+                "Export scan results, archived daily prices, the trade journal and statistics with source and date metadata. \
                  Back up or restore personal workspace data (layouts, themes, prefs, watchlists, journal, alerts). \
                  SnapTrade keys and other credentials are never written into a portable file.",
             )
@@ -840,6 +841,9 @@ impl TerminalApp {
             if ui.button("Export price history").clicked() {
                 self.run_export(crate::command::ExportKind::History, &self.io_path.clone());
             }
+            if ui.button("Export statistics").clicked() {
+                self.run_export(crate::command::ExportKind::Stats, &self.io_path.clone());
+            }
         });
         ui.horizontal_wrapped(|ui| {
             if ui.button("Back up workspace").clicked() {
@@ -861,7 +865,7 @@ impl TerminalApp {
         ui.add_space(8.0);
         ui.label(
             RichText::new(format!(
-                "Commands: EXPORT · EXPORT SCAN · EXPORT JOURNAL · EXPORT HIST · BACKUP · RESTORE <path>. Files stay out of {}/secrets.",
+                "Commands: EXPORT · EXPORT SCAN · EXPORT JOURNAL · EXPORT HIST · EXPORT STATS · BACKUP · RESTORE <path>. Files stay out of {}/secrets.",
                 crate::worker::data_dir().display()
             ))
             .font(ui_font(11.5))

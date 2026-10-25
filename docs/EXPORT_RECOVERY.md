@@ -15,7 +15,8 @@ import/export.
 | `EXPORT SCAN` | Current SCAN or UNIV snapshot: setup name, source string, last-bar dates, metrics, skipped rows, active filters |
 | `EXPORT JOURNAL` | Setups, outcomes, date notes, checklist template |
 | `EXPORT HIST` | Local Yahoo research archive: per-symbol source (`yahoo`), session dates, provenance and daily OHLCV |
-| `EXPORT` | The focused scan / history / journal pane, or Settings › Backup |
+| `EXPORT STATS` | Statistics / conditional-return snapshot: source, as-of, provenance, baselines, completed N |
+| `EXPORT` | The focused scan / history / journal / stats pane, or Settings › Backup |
 | `BACKUP` | Personal workspace (see below) |
 
 SCAN / UNIV / HIST / JOURNAL panes also have an **Export** button.
@@ -45,6 +46,7 @@ or the Congress database.
 | `journal` | Merge setups/notes by id (no overwrite of existing ids) |
 | `history` | Import **verified Real** Yahoo bars into the research archive. SAMPLE / unverified files are refused. |
 | `scan` | Refused — open the JSON yourself |
+| `stats` | Refused — open the JSON yourself |
 
 ## Sample-data isolation
 
@@ -53,8 +55,8 @@ A sample chart date on a journal setup, or a sample scan snapshot, labels the wh
 `WARNING: SAMPLE DATA — labelled sample export; isolate from live research`
 
 Those files are named `terminal-rs-<kind>-SAMPLE-<date>.json`. History restore still refuses
-sample bars so they cannot enter the research archive. Step 12 statistics / backtests are out of
-scope.
+sample bars so they cannot enter the research archive. Statistics exports are snapshots
+and are not loaded back into `STATS`.
 
 ## Commands
 
@@ -64,5 +66,6 @@ scope.
 | `EXPORT SCAN [path]` | Scan / universe JSON |
 | `EXPORT JOURNAL [path]` | Journal JSON |
 | `EXPORT HIST [path]` | Archive daily history JSON |
+| `EXPORT STATS [path]` | Statistics / conditional-return JSON |
 | `BACKUP [path]` | Workspace backup |
 | `RESTORE <path>` | Restore workspace, journal, or history |

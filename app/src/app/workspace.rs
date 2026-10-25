@@ -389,6 +389,15 @@ impl TerminalApp {
                 d.request(id, &self.worker, symbols);
                 PaneKind::Desk(d)
             }
+            PaneKind::Stats(mut s) => {
+                if s.symbol.trim().is_empty() {
+                    if let Some(sym) = self.focused_symbol() {
+                        s.symbol = sym;
+                    }
+                }
+                s.request(id, &self.worker);
+                PaneKind::Stats(s)
+            }
             PaneKind::Ticker { symbol, .. } => {
                 self.worker.send(Request::TickerTrades { pane: id, symbol: symbol.clone() });
                 PaneKind::Ticker { symbol, trades: Vec::new(), loading: true }
@@ -777,6 +786,19 @@ impl TerminalApp {
             "JOURNAL" | "JRNL" | "CHECKLIST" | "TRADELOG" => {
                 let filter = given.clone().or(current.clone()).unwrap_or_default();
                 PaneKind::Journal(Box::new(super::journal::JournalPane::new(filter)))
+            }
+            "STATS" | "STAT" | "STATISTICS" | "COND" | "CDIST" | "CONDRET" => {
+                let symbol = given.or(current).unwrap_or_default();
+                let condition = if matches!(head.as_str(), "COND" | "CDIST" | "CONDRET") {
+                    words.get(1..).unwrap_or(&[]).join(" ")
+                } else {
+                    String::new()
+                };
+                PaneKind::Stats(Box::new(super::stats::StatsPane::new(
+                    symbol,
+                    condition,
+                    matches!(head.as_str(), "COND" | "CDIST" | "CONDRET"),
+                )))
             }
             "DESK" | "PM" | "PMDESK" | "RISK" => {
                 let group = words.get(1).cloned().unwrap_or(self.watch_ui.selected_group.as_str()).to_string();
