@@ -108,7 +108,9 @@ gets the native title bar with traffic lights, window vibrancy behind the sideba
   - **Chart overlay**: B/S markers at transaction dates coloured by party (blue D, red R, purple
     I); hover for a card with politician, amount, owner, traded/filed dates and the disclosure lag.
   - **Alerts**: `TRACK <name>` (or ☆ in the directory/profile); when a tracked politician files a
-    new PTR you get a toast, an `ALERTS n` badge and an entry in `ALERTS`.
+    new PTR you get a toast, an `ALERTS n` badge and an entry in `ALERTS`. Price and setup rules
+    (`AAPL ALERT 150`, `NVDA ALERT SETUP NEAR_HIGH`) persist, dedupe, and jump to the chart; sample
+    bars never invent them.
 
 - **Dockable workspace and saved layouts**
   - Any panel (chart, watchlist, news, order book, world markets, yield curve, options, Congress
@@ -353,6 +355,7 @@ Settings › Hotkeys. On Linux and Windows ⌘ is Ctrl and ⌥ is Alt.
 | `CMP MSFT` · `LOG` · `CANDLE` `BAR` `LINE` `AREA` | compare · log scale · chart type |
 | `NEWS` · `AAPL CN` · `TOP` · `BTCUSD CRNCY OB` · `WEI` · `GC` | watchlist news · one name · top headlines · order book · markets · curve |
 | `CONG` · `NVDA CONG` · `POL PELOSI` · `TRACK PELOSI` · `ALERTS` · `REFRESH` | Congress feed · who traded it · profile · track · alerts · refresh |
+| `AAPL ALERT 150` · `AAPL ALERT BELOW 140` · `NVDA ALERT SETUP NEAR_HIGH` · `UNALERT AAPL` | Price/setup alerts (click a fired row to open the chart) |
 | `NEW BOOK` · `SPLIT DOWN NEWS` · `POP` · `LINK GREEN` · `TITLE Desk` · `CLOSE` | add, split, pop out, link, rename, close panes |
 | `LAYOUT 4` · `LAYOUT SAVE Macro` · `LAYOUT Macro` · `LAYOUT RENAME Rates` · `LAYOUT DUP` · `LAYOUT DEL` · `LAYOUT EXPORT` | grid preset · saved layouts |
 | `THEME BLOOMBERG` · `THEME NEXT` · `THEME SYSTEM` · `THEME EDIT` · `THEME COMPACT` · `LAYOUT THEME ON` | themes |

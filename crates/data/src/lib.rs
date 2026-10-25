@@ -18,6 +18,7 @@ pub mod crypto;
 pub mod history;
 pub mod markets;
 pub mod news;
+pub mod price_alerts;
 pub mod rss;
 pub mod sample;
 pub mod treasury;

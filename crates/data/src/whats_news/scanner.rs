@@ -223,6 +223,16 @@ pub(super) fn cached_calculate(bars: &[Bar]) -> std::result::Result<Metrics, Str
     static CACHE: OnceLock<Mutex<CalculationCache>> = OnceLock::new();
     CACHE.get_or_init(|| Mutex::new(CalculationCache::default())).lock().unwrap().get(bars)
 }
+/// Whether `name` is active on verified daily bars. Sample / unverified history is refused.
+pub fn setup_active(name: &str, bars: &[Bar]) -> std::result::Result<bool, String> {
+    if !super::SETUPS.contains(&name) {
+        return Err(format!("unknown setup {name}"));
+    }
+    Bar::require_verified(bars, "price/setup alert")?;
+    let m = cached_calculate(bars)?;
+    Ok(matches_setup(name, bars, &m))
+}
+
 fn matches_setup(name: &str, b: &[Bar], m: &Metrics) -> bool {
     let near = m.dist_20d_high_pct >= -5.0;
     let surge = m.volume_ratio.is_some_and(|v| v >= 1.5);
@@ -757,6 +767,12 @@ mod tests {
         revised[0].1[0].provenance = Provenance::Sample;
         assert!(cache.scan("NEAR_HIGH", revised, Provenance::Cached).unwrap_err().to_string().contains("refused"));
         assert!(cache.scan("NEAR_HIGH", input.clone(), Provenance::Sample).is_err());
+        let mut sample = bars(30);
+        for b in &mut sample {
+            b.provenance = Provenance::Sample;
+        }
+        assert!(setup_active("NEAR_HIGH", &sample).unwrap_err().contains("SAMPLE"));
+        assert!(setup_active("NEAR_HIGH", &bars(30)).unwrap());
         assert!(cache.scan("TYPO", input, Provenance::Cached).is_err());
         let mut cache = CalculationCache::default();
         let mut b = bars(30);

@@ -4,8 +4,8 @@
 use std::sync::Arc;
 
 use egui::{
-    Align2, Color32, CornerRadius, CursorIcon, Pos2, Rect, RichText, Sense, Stroke, StrokeKind, Ui, UiBuilder, pos2,
-    vec2,
+    pos2, vec2, Align2, Color32, CornerRadius, CursorIcon, Pos2, Rect, RichText, Sense, Stroke, StrokeKind, Ui,
+    UiBuilder,
 };
 use tr_chart::drawings::{self, Anchor, Drawing, Shape, Tool};
 use tr_chart::gpu::{ChartCallback, Frame, LineKind, LineRef, Reveal, Style};
@@ -20,7 +20,7 @@ use crate::command::{IndicatorSpec, Range};
 use crate::congress_view::Action;
 use crate::theme::{self, amber, amber_dim, mono, muted, text, ui_font};
 use crate::widgets;
-use crate::worker::{BuiltIndicator, PaneId, Request, Worker, archive_page, initial_limit};
+use crate::worker::{archive_page, initial_limit, BuiltIndicator, PaneId, Request, Worker};
 
 const AXIS_W: f32 = 66.0;
 const TIME_H: f32 = 16.0;
@@ -115,6 +115,8 @@ pub struct ChartState {
     markers: Vec<Trade>,
     news: Vec<tr_data::NewsItem>,
     news_stale: bool,
+    /// Enabled price-level rules for this symbol (not persisted; filled from the alert store).
+    alert_rules: Vec<tr_data::price_alerts::AlertRule>,
     pub news_fetched: Option<std::time::Instant>,
     news_key: u64,
     pending_range: Option<Range>,
@@ -183,6 +185,7 @@ impl ChartState {
             markers: Vec::new(),
             news: Vec::new(),
             news_stale: false,
+            alert_rules: Vec::new(),
             news_fetched: None,
             news_key: 0,
             pending_range: None,
@@ -204,6 +207,10 @@ impl ChartState {
         self.show_box = true;
         self.show_rs = true;
         self.show_volume_ctx = true;
+    }
+
+    pub fn set_alert_rules(&mut self, rules: Vec<tr_data::price_alerts::AlertRule>) {
+        self.alert_rules = rules;
     }
 
     pub fn is_empty(&self) -> bool {
@@ -229,6 +236,7 @@ impl ChartState {
         self.markers.clear();
         self.news.clear();
         self.news_stale = false;
+        self.alert_rules.clear();
         self.news_fetched = None;
         // Never show the previous symbol's bars under the new title.
         self.bars = Arc::new(Vec::new());
@@ -1114,6 +1122,7 @@ impl ChartState {
 
         // ---- drawings ----
         self.paint_review_levels(ui, price_rect, &scale);
+        self.paint_alert_levels(ui, price_rect, &scale);
         self.paint_drawings(ui, price_rect, &v, &scale, hover, &plot_resp);
 
         // ---- congress markers ----
@@ -1294,6 +1303,35 @@ impl ChartState {
             self.actions.push(Action::AddToWatchlist(self.symbol.clone()));
             ui.close();
         }
+        ui.separator();
+        ui.label(RichText::new("Price / setup alerts").small().color(muted()));
+        if let Some(last) = self.bars.last() {
+            let px = last.close;
+            if ui
+                .button(format!("Alert above last close ({px:.2})"))
+                .on_hover_text("Persistent rule — fires on a verified cross, never from sample bars")
+                .clicked()
+            {
+                self.actions.push(Action::Command(format!("{} ALERT ABOVE {px}", self.symbol)));
+                ui.close();
+            }
+            if ui.button(format!("Alert below last close ({px:.2})")).clicked() {
+                self.actions.push(Action::Command(format!("{} ALERT BELOW {px}", self.symbol)));
+                ui.close();
+            }
+        }
+        ui.menu_button("Watch setup change", |ui| {
+            for name in tr_data::whats_news::SETUPS {
+                if ui.button(*name).clicked() {
+                    self.actions.push(Action::Command(format!("{} ALERT SETUP {name}", self.symbol)));
+                    ui.close();
+                }
+            }
+        });
+        if ui.button("Open alerts…").clicked() {
+            self.actions.push(Action::Command("ALERTS".into()));
+            ui.close();
+        }
         ui.checkbox(&mut self.show_news, "News catalyst markers")
             .on_hover_text("Headlines whose publication time falls on a loaded bar — click to open");
         if self.sec.has_congress_trades() {
@@ -1426,6 +1464,28 @@ impl ChartState {
             ly += 14.0;
         }
         ly
+    }
+
+    fn paint_alert_levels(&self, ui: &Ui, rect: Rect, scale: &PriceScale) {
+        if self.alert_rules.is_empty() {
+            return;
+        }
+        let p = ui.painter_at(rect);
+        for rule in &self.alert_rules {
+            let tr_data::price_alerts::AlertKind::Price { side, level } = rule.kind else { continue };
+            let y = rect.top() + scale.y_of(level) as f32;
+            if !rect.y_range().contains(y) {
+                continue;
+            }
+            dashed_h(&p, rect.x_range(), y, Stroke::new(1.0, amber().gamma_multiply(0.85)));
+            p.text(
+                pos2(rect.left() + 6.0, y - 12.0),
+                Align2::LEFT_TOP,
+                format!("alert {} {level:.2}", side.label()),
+                mono(10.0),
+                amber(),
+            );
+        }
     }
 
     fn paint_review_levels(&self, ui: &Ui, rect: Rect, scale: &PriceScale) {
@@ -1867,24 +1927,30 @@ mod tests {
         chart.built = crate::worker::build_indicators(&bars, chart.tf, &chart.indicators, &theme::palette());
         chart_frame(&ctx, &mut chart, &worker, vec![]);
         let pos = pos2(500.0, 300.0);
-        chart_frame(&ctx, &mut chart, &worker, vec![
-            egui::Event::PointerMoved(pos),
-            pointer(pos, egui::PointerButton::Secondary, true),
-        ]);
+        chart_frame(
+            &ctx,
+            &mut chart,
+            &worker,
+            vec![egui::Event::PointerMoved(pos), pointer(pos, egui::PointerButton::Secondary, true)],
+        );
         chart_frame(&ctx, &mut chart, &worker, vec![pointer(pos, egui::PointerButton::Secondary, false)]);
         let output = chart_frame(&ctx, &mut chart, &worker, vec![]);
         let pos = text_position(&output.shapes, "Indicators");
-        chart_frame(&ctx, &mut chart, &worker, vec![
-            egui::Event::PointerMoved(pos),
-            pointer(pos, egui::PointerButton::Primary, true),
-        ]);
+        chart_frame(
+            &ctx,
+            &mut chart,
+            &worker,
+            vec![egui::Event::PointerMoved(pos), pointer(pos, egui::PointerButton::Primary, true)],
+        );
         chart_frame(&ctx, &mut chart, &worker, vec![pointer(pos, egui::PointerButton::Primary, false)]);
         let output = chart_frame(&ctx, &mut chart, &worker, vec![]);
         let pos = text_position(&output.shapes, "Remove All");
-        chart_frame(&ctx, &mut chart, &worker, vec![
-            egui::Event::PointerMoved(pos),
-            pointer(pos, egui::PointerButton::Primary, true),
-        ]);
+        chart_frame(
+            &ctx,
+            &mut chart,
+            &worker,
+            vec![egui::Event::PointerMoved(pos), pointer(pos, egui::PointerButton::Primary, true)],
+        );
         chart_frame(&ctx, &mut chart, &worker, vec![pointer(pos, egui::PointerButton::Primary, false)]);
         assert!(chart.built.is_empty());
         assert!(chart.indicators.is_empty());

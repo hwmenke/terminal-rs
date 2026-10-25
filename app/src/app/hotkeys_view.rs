@@ -1,6 +1,6 @@
 //! Native keyboard-shortcut table (click a binding to record a new one) and the Help pane.
 
-use egui::{Align2, Color32, Id, Rect, RichText, Sense, Stroke, StrokeKind, Ui, pos2, vec2};
+use egui::{pos2, vec2, Align2, Color32, Id, Rect, RichText, Sense, Stroke, StrokeKind, Ui};
 use tr_core::indicators::registry::{self, Category};
 
 use super::TerminalApp;
@@ -265,6 +265,11 @@ impl TerminalApp {
                     (&["OMON", "AAPL OMON", "SPX INDEX OMON"], "Option chain: calls/puts by strike, IV, greeks"),
                     (&["CONG", "NVDA CONG"], "Congress trades feed / who traded a ticker"),
                     (&["POL", "POL PELOSI", "TRACK PELOSI"], "Politicians, profiles and alerts"),
+                    (
+                        &["ALERTS", "AAPL ALERT 150", "NVDA ALERT SETUP NEAR_HIGH"],
+                        "Price/setup alerts (timestamped; click a row to open the chart)",
+                    ),
+                    (&["UNALERT AAPL"], "Remove price/setup alerts for a name"),
                     (&["WL", "WL ADD SOLUSD CRNCY"], "Watchlist"),
                     (
                         &["DESK", "AAPL DESK", "NEW DESK"],

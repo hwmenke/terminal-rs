@@ -1,11 +1,11 @@
 //! Command palette overlay (⌘⇧K, Ctrl+Shift+K elsewhere): the live catalogue of items built
 //! from the app's state, the centred search card, and running the picked item.
 
-use egui::{Color32, Id, Key, Modifiers, Rect, Sense, Stroke, StrokeKind, Ui, UiBuilder, pos2, vec2};
+use egui::{pos2, vec2, Color32, Id, Key, Modifiers, Rect, Sense, Stroke, StrokeKind, Ui, UiBuilder};
 use tr_core::indicators::registry;
 
-use super::TerminalApp;
 use super::settings_view::SettingsTab;
+use super::TerminalApp;
 use crate::anim;
 use crate::command::{self, Function, IndicatorSpec};
 use crate::layout::Layout;
@@ -32,7 +32,12 @@ const COMMANDS: &[(&str, &str, &str, Option<Action>)] = &[
     ("OMON", "", "options chain calls puts greeks", Some(Action::NewOptions)),
     ("CONG", "Congressional trades feed", "congress disclosures", Some(Action::Congress)),
     ("POL", "Politicians", "congress members profile", Some(Action::Politicians)),
-    ("ALRT", "", "alerts tracked filings", Some(Action::Alerts)),
+    ("ALRT", "", "alerts price setup tracked filings", Some(Action::Alerts)),
+    ("ALERTS", "Price, setup and congressional alerts", "price level crossing setup change", Some(Action::Alerts)),
+    ("AAPL ALERT 150", "Watch AAPL crossing above 150", "price alert above", None),
+    ("AAPL ALERT BELOW 140", "Watch AAPL crossing below 140", "price alert below", None),
+    ("NVDA ALERT SETUP NEAR_HIGH", "Watch NVDA entering NEAR_HIGH", "setup alert scan", None),
+    ("UNALERT", "Remove price/setup alerts: UNALERT <ticker>", "price setup remove", None),
     ("REFRESH", "", "congress disclosures sync", Some(Action::Refresh)),
     ("WL", "", "watchlist monitor", Some(Action::Watchlist)),
     ("DESK", "PM Desk: watchlist leaders and position size", "pm risk planner watchlist rank", Some(Action::Desk)),
@@ -127,6 +132,8 @@ pub(super) fn bar_items() -> Vec<Item> {
         ("SCAN", "Scan Whats-News archive setups", "research setups", None),
         ("TRACK", "Track a politician: TRACK <name>", "congress alerts", None),
         ("UNTRACK", "Stop tracking a politician: UNTRACK <name>", "congress alerts", None),
+        ("ALERT", "Set a price/setup alert: ALERT <level|SETUP name>", "price setup", None),
+        ("UNALERT", "Remove price/setup alerts: UNALERT <ticker>", "price setup remove", None),
         ("LAYOUT", "Switch or manage layouts: LAYOUT <name|preset|subcommand>", "workspace", None),
         ("NEW", "Add a panel: NEW <panel> [ticker]", "pane chart", None),
         ("LINK", "Link a pane: LINK <colour|OFF>", "group", None),
