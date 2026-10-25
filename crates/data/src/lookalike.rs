@@ -381,9 +381,8 @@ fn resolve_query_index(bars: &[Bar], as_of: Option<&str>) -> Result<usize, Strin
         return Ok(bars.len() - 1);
     };
     let date = journal::parse_chart_date(as_of)?;
-    let ts = date_to_ts(&date)?;
     bars.iter()
-        .rposition(|b| b.ts <= ts)
+        .rposition(|b| bar_date(b.ts) <= date)
         .ok_or_else(|| format!("{OPERATION} refused: no archived session on or before {date}."))
 }
 
@@ -648,11 +647,15 @@ mod tests {
         let a = compute_report("X", "X", &bars, &tight, "t").unwrap();
         let b = compute_report("X", "X", &bars, &spaced, "t").unwrap();
         assert!(a.discarded_overlap < b.discarded_overlap || a.selected_n >= b.selected_n);
-        for w in a.neighbors.windows(2) {
-            assert!(w[1].index - w[0].index >= 1);
+        for (i, n) in a.neighbors.iter().enumerate() {
+            assert!(a.neighbors.iter().enumerate().all(|(j, o)| i == j || n.index.abs_diff(o.index) >= 1));
         }
-        for w in b.neighbors.windows(2) {
-            assert!(w[1].index.abs_diff(w[0].index) >= 10, "{} vs {}", w[0].index, w[1].index);
+        for (i, n) in b.neighbors.iter().enumerate() {
+            assert!(
+                b.neighbors.iter().enumerate().all(|(j, o)| i == j || n.index.abs_diff(o.index) >= 10),
+                "{} vs another neighbor closer than the gap",
+                n.index
+            );
         }
         let h = &b.by_horizon[0];
         assert_eq!(h.requested_n, b.selected_n);
