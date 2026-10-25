@@ -266,6 +266,10 @@ impl TerminalApp {
                     (&["CONG", "NVDA CONG"], "Congress trades feed / who traded a ticker"),
                     (&["POL", "POL PELOSI", "TRACK PELOSI"], "Politicians, profiles and alerts"),
                     (&["WL", "WL ADD SOLUSD CRNCY"], "Watchlist"),
+                    (
+                        &["DESK", "AAPL DESK", "NEW DESK"],
+                        "PM Desk: watchlist leaders, group performance, position size (not PORT)",
+                    ),
                     (&["PREFS"], "Settings: theme, fonts, density, hotkeys, layouts"),
                     (&["UPDATE"], "Check for updates"),
                 ],

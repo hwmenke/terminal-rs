@@ -113,6 +113,13 @@ pub enum PaneSettings {
         #[serde(default = "yes")]
         greeks: bool,
     },
+    /// PM Desk for a watchlist group (brokerage credentials are never stored).
+    Desk {
+        #[serde(default)]
+        group: String,
+        #[serde(default)]
+        selected: Option<String>,
+    },
     /// Brokerage portfolio view (credentials are never stored in layouts).
     Portfolio {
         #[serde(default)]

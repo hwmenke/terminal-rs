@@ -35,6 +35,8 @@ const COMMANDS: &[(&str, &str, &str, Option<Action>)] = &[
     ("ALRT", "", "alerts tracked filings", Some(Action::Alerts)),
     ("REFRESH", "", "congress disclosures sync", Some(Action::Refresh)),
     ("WL", "", "watchlist monitor", Some(Action::Watchlist)),
+    ("DESK", "PM Desk: watchlist leaders and position size", "pm risk planner watchlist rank", Some(Action::Desk)),
+    ("PMDESK", "PM Desk (alias)", "pm risk planner", None),
     ("WL NEW", "Create a named watchlist group: WL NEW <group>", "watchlist group create", None),
     ("WL ADD", "Save symbols: WL ADD <group> <symbols…> · w picker / W last-used", "watchlist group scan save", None),
     ("WL DEL", "Remove symbols (alias): WL DEL <group> <symbols…>", "watchlist remove", None),
@@ -192,6 +194,10 @@ pub(super) fn static_items() -> Vec<Item> {
     v.push(
         Item::new(Kind::Panel, "New Portfolio pane", "NEW PORT", Target::Run("NEW PORT".into()))
             .keywords("panel pane brokerage"),
+    );
+    v.push(
+        Item::new(Kind::Panel, "New PM Desk pane", "NEW DESK", Target::Run("NEW DESK".into()))
+            .keywords("panel pane watchlist risk size"),
     );
     v.push(
         Item::new(

@@ -282,6 +282,8 @@ pub enum Function {
     AccountMode(bool),
     /// Open linked daily + weekly archive charts for candidate review.
     Review,
+    /// Watchlist-scoped PM Desk: leaders, group performance, position size.
+    Desk,
     /// Pan the focused chart to the latest candle without changing zoom.
     Latest,
     /// Toggle a persisted review overlay on the focused chart.
@@ -388,6 +390,7 @@ fn parse_function(head: &str, rest: &[&str]) -> Option<Function> {
             _ => return None,
         },
         "REVIEW" | "REV" => Function::Review,
+        "DESK" | "PMDESK" | "RISK" => Function::Desk,
         "LATEST" | "END" => Function::Latest,
         "BOX" => Function::ReviewOverlay(ReviewOverlay::BoxLevels),
         "RS" | "STRENGTH" => Function::ReviewOverlay(ReviewOverlay::Strength),
@@ -568,6 +571,9 @@ fn describe(f: &Function) -> String {
         Function::AccountMode(false) => "Switch to the DEMO account (paper trading)".into(),
         Function::AccountMode(true) => "Switch to LIVE brokerage accounts (asks first)".into(),
         Function::Review => "Linked daily and weekly archive charts for candidate review".into(),
+        Function::Desk => {
+            "PM Desk: watchlist leaders, group performance, and position size from entry/stop/target/$ risk".into()
+        }
         Function::Latest => "Jump the focused chart to the latest candle".into(),
         Function::ReviewOverlay(ReviewOverlay::BoxLevels) => {
             "Toggle box levels (20-bar / 3-bar confirmation on this interval)".into()
@@ -627,6 +633,9 @@ mod tests {
         assert_eq!(parse("scan darvas_breakout"), Some(Command::Function(Function::Scan("DARVAS_BREAKOUT".into()))));
         assert_eq!(parse("SCAN"), Some(Command::Function(Function::Scan(String::new()))));
         assert_eq!(parse("REVIEW"), Some(Command::Function(Function::Review)));
+        assert_eq!(parse("DESK"), Some(Command::Function(Function::Desk)));
+        assert_eq!(parse("PMDESK"), Some(Command::Function(Function::Desk)));
+        assert_eq!(parse("AAPL DESK"), Some(Command::SymbolFunction("AAPL US Equity".into(), Function::Desk)));
         assert_eq!(parse("LATEST"), Some(Command::Function(Function::Latest)));
         assert_eq!(parse("END"), Some(Command::Function(Function::Latest)));
         assert_eq!(parse("AAPL REVIEW"), Some(Command::SymbolFunction("AAPL US Equity".into(), Function::Review)));

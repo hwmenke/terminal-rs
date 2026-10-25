@@ -2,9 +2,14 @@
 //! Whats-News stores real Yahoo Finance downloads without provenance metadata, so
 //! absent metadata means Real here. Explicit unverified/sample provenance is refused.
 use std::{path::PathBuf, time::Duration};
+mod desk;
 mod link;
 mod review;
 mod scanner;
+pub use desk::{
+    ATR_LEN, ATR_MULT, GroupSummary, MemberRow, RETURN_BARS, RiskPlan, StopSource, archive_ticker, box_stop,
+    drawing_stops, last_atr, rank_watchlist, resolve_stop, size_position,
+};
 pub use link::{Config, DEFAULT_URL, Health, LinkState, detect_archive, retry_delay};
 pub use review::ReviewContext;
 pub use scanner::{Condition, Conditions, Metrics, ScanCache, ScanFilter, Skipped, Sort};
@@ -402,6 +407,63 @@ impl Bridge {
         }
         Ok(histories)
     }
+    /// Daily history for an explicit ticker list only. Never reads the registered universe.
+    pub async fn histories_for(&self, tickers: &[String]) -> Result<Snapshot<Histories>> {
+        self.check()?;
+        if tickers.is_empty() {
+            return Ok(Snapshot {
+                data: Histories { bars: vec![], skipped: vec![] },
+                provenance: Provenance::Cached,
+                source: "watchlist (empty)".into(),
+            });
+        }
+        let wanted = tickers.to_vec();
+        if !self.prefer_http || self.url.is_none() {
+            match self.sql(move |c| read_histories_for_sql(c, &wanted)).await {
+                Ok(snapshot) => return Ok(snapshot),
+                Err(e) if e.is::<Unverified>() || self.url.is_none() => return Err(e),
+                Err(_) => {}
+            }
+        }
+        let http = tokio::time::timeout(Duration::from_secs(20), self.http_histories_for(tickers))
+            .await
+            .unwrap_or_else(|_| Err(anyhow::anyhow!("Whats-News timed out reading watchlist histories")));
+        match http {
+            Ok(data) => Ok(Snapshot {
+                data,
+                provenance: Provenance::Real,
+                source: format!("Whats-News HTTP archive: {}", self.url.as_deref().unwrap_or_default()),
+            }),
+            Err(e) if e.is::<Unverified>() => Err(e),
+            Err(http) => {
+                let wanted = tickers.to_vec();
+                self.sql(move |c| read_histories_for_sql(c, &wanted))
+                    .await
+                    .map_err(|db| anyhow::anyhow!("Whats-News unavailable: HTTP: {http}; SQLite: {db:#}"))
+            }
+        }
+    }
+    async fn http_histories_for(&self, tickers: &[String]) -> Result<Histories> {
+        let rows: Vec<_> = stream::iter(tickers.iter().cloned().map(|symbol| async move {
+            match self.http_bars(&symbol, 1_000_000).await {
+                Ok(bars) => Ok((symbol, Ok(bars))),
+                Err(e) if e.is::<Unverified>() || e.downcast_ref::<reqwest::Error>().is_some() => Err(e),
+                Err(e) => Ok((symbol, Err(format!("invalid archived history: {e}")))),
+            }
+        }))
+        .buffered(12)
+        .try_collect::<Vec<_>>()
+        .await?;
+        let mut histories = Histories { bars: vec![], skipped: vec![] };
+        for (symbol, bars) in rows {
+            match bars {
+                Ok(bars) if !bars.is_empty() => histories.bars.push((symbol, bars)),
+                Ok(_) => histories.skipped.push(Skipped { symbol, reason: "no daily history".into() }),
+                Err(reason) => histories.skipped.push(Skipped { symbol, reason }),
+            }
+        }
+        Ok(histories)
+    }
     /// Original service fields are supplementary. Setup membership and all user
     /// filters use the shared Rust calculation contract over verified history.
     pub async fn service_scan(&self) -> Result<Option<Scan>> {
@@ -642,6 +704,77 @@ fn histories_sql(c: &Connection, symbols: &[Symbol]) -> Result<(Vec<(String, Vec
 }
 fn read_histories_sql(c: Connection) -> Result<Histories> {
     read_histories_conn(&c)
+}
+fn read_histories_for_sql(c: Connection, tickers: &[String]) -> Result<Histories> {
+    if tickers.is_empty() {
+        return Ok(Histories { bars: vec![], skipped: vec![] });
+    }
+    let symbols: Vec<Symbol> =
+        tickers.iter().map(|s| Symbol { symbol: s.clone(), name: None, group_tag: None, last_date: None }).collect();
+    let tx = c.unchecked_transaction()?;
+    let (bars, mut skipped) = histories_sql_filtered(&tx, &symbols)?;
+    let have: std::collections::HashSet<_> = bars.iter().map(|(s, _)| s.as_str()).collect();
+    for s in tickers {
+        if !have.contains(s.as_str()) && !skipped.iter().any(|k| k.symbol == *s) {
+            skipped.push(Skipped { symbol: s.clone(), reason: "no daily history".into() });
+        }
+    }
+    tx.commit()?;
+    Ok(Histories { bars, skipped })
+}
+/// Same batch conversion as [`histories_sql`], but only the requested tickers.
+fn histories_sql_filtered(c: &Connection, symbols: &[Symbol]) -> Result<(Vec<(String, Vec<Bar>)>, Vec<Skipped>)> {
+    use rusqlite::params_from_iter;
+    use std::collections::BTreeMap;
+    if symbols.is_empty() {
+        return Ok((vec![], vec![]));
+    }
+    let provenance = if c.prepare("SELECT provenance FROM ohlcv LIMIT 0").is_ok() { "o.provenance" } else { "'Real'" };
+    let placeholders = vec!["?"; symbols.len()].join(",");
+    let sql = format!(
+        "SELECT o.symbol,o.date,o.open,o.high,o.low,o.close,o.volume,{provenance} FROM ohlcv o WHERE o.freq='daily' AND o.symbol IN ({placeholders}) ORDER BY o.symbol,o.date"
+    );
+    let mut stmt = c.prepare(&sql)?;
+    let names: Vec<String> = symbols.iter().map(|s| s.symbol.clone()).collect();
+    let raw = stmt
+        .query_map(params_from_iter(names.iter()), |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                StoredBar {
+                    date: r.get(1)?,
+                    open: r.get(2)?,
+                    high: r.get(3)?,
+                    low: r.get(4)?,
+                    close: r.get(5)?,
+                    volume: r.get(6)?,
+                    provenance: r
+                        .get::<_, Option<String>>(7)?
+                        .map(|s| serde_json::from_value(serde_json::Value::String(s)).unwrap_or_default())
+                        .unwrap_or_default(),
+                },
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let mut grouped: BTreeMap<String, Vec<StoredBar>> = symbols.iter().map(|s| (s.symbol.clone(), vec![])).collect();
+    for (symbol, bar) in raw {
+        grouped.entry(symbol).or_default().push(bar);
+    }
+    let mut histories = vec![];
+    let mut skipped = vec![];
+    for (symbol, rows) in grouped {
+        if rows.is_empty() {
+            continue;
+        }
+        for row in &rows {
+            verify(row.provenance, "Whats-News PM Desk")?;
+        }
+        match convert(rows) {
+            Ok(bars) => histories.push((symbol, bars)),
+            Err(e) if e.is::<Unverified>() => return Err(e),
+            Err(e) => skipped.push(Skipped { symbol, reason: format!("invalid archived history: {e}") }),
+        }
+    }
+    Ok((histories, skipped))
 }
 fn read_histories_conn(c: &Connection) -> Result<Histories> {
     let tx = c.unchecked_transaction()?;

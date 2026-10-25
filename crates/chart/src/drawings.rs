@@ -54,6 +54,11 @@ impl Drawing {
     pub fn fib_levels(&self) -> Vec<(f64, f64)> {
         FIB_LEVELS.iter().map(|&r| (r, self.b.price + (self.a.price - self.b.price) * r)).collect()
     }
+
+    /// Price of a horizontal line, for PM Desk user-stop candidates.
+    pub fn horizontal_price(&self) -> Option<f64> {
+        (self.tool == Tool::Horizontal && self.a.price.is_finite() && self.a.price > 0.0).then_some(self.a.price)
+    }
 }
 
 /// Screen-space geometry of a drawing, produced by the chart for hit testing.
@@ -110,5 +115,13 @@ mod tests {
     fn magnet_snaps() {
         assert_eq!(magnet(10.4, [10.0, 12.0, 9.0, 11.0]), 10.0);
         assert_eq!(magnet(11.7, [10.0, 12.0, 9.0, 11.0]), 12.0);
+    }
+
+    #[test]
+    fn horizontal_price_is_the_line_level() {
+        let h = Drawing::new(Tool::Horizontal, Anchor { ts: 1, price: 42.5 }, Anchor { ts: 1, price: 42.5 });
+        assert_eq!(h.horizontal_price(), Some(42.5));
+        let t = Drawing::new(Tool::Trendline, Anchor { ts: 0, price: 10.0 }, Anchor { ts: 1, price: 20.0 });
+        assert_eq!(t.horizontal_price(), None);
     }
 }

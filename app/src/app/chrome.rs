@@ -644,6 +644,17 @@ impl TerminalApp {
             if nav_row(ui, Icon::List, "Open Watchlist Pane", None, is_focused(&PaneKind::Watchlist)).clicked() {
                 out.push(SidebarCmd::Function(Function::Watchlist));
             }
+            if nav_row(
+                ui,
+                Icon::Grid,
+                "PM Desk",
+                Some("DESK"),
+                is_focused(&PaneKind::Desk(Box::new(super::desk::DeskPane::new(String::new())))),
+            )
+            .clicked()
+            {
+                out.push(SidebarCmd::Function(Function::Desk));
+            }
 
             section(ui, "Markets");
             let items = [
