@@ -572,9 +572,11 @@ fn catalog() -> Vec<Def> {
         .int("Length", 21.0, 3.0, MAX_LENGTH)
         .n("Smoothing", 3.0)
         .real("StdErr", 2.0, 0.1, 10.0),
-        overlay("VWAPB", "VWAP Bands", bnd, |i, p| bands(vwap_bands(&i.d, session_key(i.tf), p[0]), "VWAP"))
-            .alias(&["VWAPBANDS"])
-            .real("StdDev", 1.0, 0.1, 10.0),
+        overlay("VWAPB", "VWAP Bands", bnd, |i, p| {
+            bands(vwap_bands(&i.d, session_key(i.tf), p[0]), vwap_anchor_label(i.tf))
+        })
+        .alias(&["VWAPBANDS"])
+        .real("StdDev", 1.0, 0.1, 10.0),
         // Momentum.
         pane("RSI", "Relative Strength Index", mom, |i, p| one("RSI", rsi(i.c(), n(p, 0))))
             .n("Length", 14.0)
@@ -1040,7 +1042,9 @@ fn catalog() -> Vec<Def> {
         .int("KC Length", 20.0, 2.0, MAX_LENGTH)
         .real("KC Multiplier", 1.5, 0.1, 10.0),
         // Volume.
-        overlay("VWAP", "Volume-Weighted Average Price", vlm, |i, _| one("VWAP", vwap_by(i.bars, session_key(i.tf)))),
+        overlay("VWAP", "Volume-Weighted Average Price", vlm, |i, _| {
+            one(vwap_anchor_label(i.tf), vwap_by(i.bars, session_key(i.tf)))
+        }),
         pane("OBV", "On-Balance Volume", vlm, |i, _| one("OBV", obv(&i.d))),
         pane("AD", "Accumulation/Distribution", vlm, |i, _| one("A/D", adl(&i.d))).alias(&["ADL", "ACCDIST"]),
         pane("CMF", "Chaikin Money Flow", vlm, |i, p| one("CMF", cmf(&i.d, n(p, 0)))).n("Length", 20.0).levels(&[0.0]),
@@ -1326,6 +1330,10 @@ mod tests {
         assert_eq!(Spec::parse("NOPE", &[]), None);
         assert_eq!(Spec::parse("BB", &["20", "2.5"]).unwrap().label(), "BB 20 2.5");
         assert_eq!(Spec::parse("VWAP", &[]).unwrap().label(), "VWAP");
+        let vwap = Spec::parse("VWAP", &[]).unwrap();
+        assert_eq!(vwap.compute(&Input::new(&[], Timeframe::D1))[0].name, "Monthly VWAP");
+        assert_eq!(vwap.compute(&Input::new(&[], Timeframe::M5))[0].name, "Session VWAP");
+        assert_eq!(vwap.compute(&Input::new(&[], Timeframe::W1))[0].name, "Yearly VWAP");
         assert_eq!(Spec::parse("psar", &[]).unwrap().label(), "PSAR 0.02 0.02 0.2");
     }
 

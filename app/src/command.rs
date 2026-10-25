@@ -280,6 +280,19 @@ pub enum Function {
     Trade(TradeArgs),
     /// Switch between the demo account and live accounts (`DEMO`, `MODE LIVE`); `true` = live.
     AccountMode(bool),
+    /// Open linked daily + weekly archive charts for candidate review.
+    Review,
+    /// Pan the focused chart to the latest candle without changing zoom.
+    Latest,
+    /// Toggle a persisted review overlay on the focused chart.
+    ReviewOverlay(ReviewOverlay),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReviewOverlay {
+    BoxLevels,
+    Strength,
+    Volume,
 }
 
 fn num<T: std::str::FromStr>(t: Option<&&str>) -> Option<T> {
@@ -374,6 +387,11 @@ fn parse_function(head: &str, rest: &[&str]) -> Option<Function> {
             "LIVE" | "REAL" => Function::AccountMode(true),
             _ => return None,
         },
+        "REVIEW" | "REV" => Function::Review,
+        "LATEST" | "END" => Function::Latest,
+        "BOX" => Function::ReviewOverlay(ReviewOverlay::BoxLevels),
+        "RS" | "STRENGTH" => Function::ReviewOverlay(ReviewOverlay::Strength),
+        "VCTX" | "VOLCTX" => Function::ReviewOverlay(ReviewOverlay::Volume),
         "RANGE" => Function::Range(Range::parse(rest.first()?)?),
         // Timeframes win where spellings overlap (`1D`, `1M`); otherwise try a range (`5D`, `YTD`),
         // then the indicator catalog (`RSI`, `BB 20 2.5`).
@@ -549,6 +567,17 @@ fn describe(f: &Function) -> String {
         }
         Function::AccountMode(false) => "Switch to the DEMO account (paper trading)".into(),
         Function::AccountMode(true) => "Switch to LIVE brokerage accounts (asks first)".into(),
+        Function::Review => "Linked daily and weekly archive charts for candidate review".into(),
+        Function::Latest => "Jump the focused chart to the latest candle".into(),
+        Function::ReviewOverlay(ReviewOverlay::BoxLevels) => {
+            "Toggle box levels (20-bar / 3-bar confirmation on this interval)".into()
+        }
+        Function::ReviewOverlay(ReviewOverlay::Strength) => {
+            "Toggle 21-bar close return (this series, not SPY-relative)".into()
+        }
+        Function::ReviewOverlay(ReviewOverlay::Volume) => {
+            "Toggle volume context (this bar / prior 20, plus 5/20)".into()
+        }
     }
 }
 
@@ -597,6 +626,13 @@ mod tests {
         assert_eq!(parse("UNIV <GO>"), Some(Command::Function(Function::Universe)));
         assert_eq!(parse("scan darvas_breakout"), Some(Command::Function(Function::Scan("DARVAS_BREAKOUT".into()))));
         assert_eq!(parse("SCAN"), Some(Command::Function(Function::Scan(String::new()))));
+        assert_eq!(parse("REVIEW"), Some(Command::Function(Function::Review)));
+        assert_eq!(parse("LATEST"), Some(Command::Function(Function::Latest)));
+        assert_eq!(parse("END"), Some(Command::Function(Function::Latest)));
+        assert_eq!(parse("AAPL REVIEW"), Some(Command::SymbolFunction("AAPL US Equity".into(), Function::Review)));
+        assert_eq!(parse("BOX"), Some(Command::Function(Function::ReviewOverlay(ReviewOverlay::BoxLevels))));
+        assert_eq!(parse("RS"), Some(Command::Function(Function::ReviewOverlay(ReviewOverlay::Strength))));
+        assert_eq!(parse("VCTX"), Some(Command::Function(Function::ReviewOverlay(ReviewOverlay::Volume))));
     }
 
     #[test]

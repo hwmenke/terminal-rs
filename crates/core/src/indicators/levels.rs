@@ -19,6 +19,17 @@ pub fn session_key(tf: Timeframe) -> impl Fn(i64) -> i64 {
     }
 }
 
+/// Honest VWAP label for the session [`session_key`] actually uses on `tf`.
+/// Daily bars reset each calendar month, not each session; weekly and monthly
+/// bars reset each calendar year. This is not a session-anchored daily VWAP.
+pub fn vwap_anchor_label(tf: Timeframe) -> &'static str {
+    match tf {
+        t if t.is_intraday() => "Session VWAP",
+        Timeframe::D1 => "Monthly VWAP",
+        _ => "Yearly VWAP",
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PivotKind {
     Classic,
@@ -143,6 +154,10 @@ mod tests {
         let m = session_key(Timeframe::D1);
         assert_ne!(m(1_769_817_600), m(1_769_904_000));
         assert_eq!(session_key(Timeframe::W1)(1_769_817_600), 2026);
+        assert_eq!(vwap_anchor_label(Timeframe::M5), "Session VWAP");
+        assert_eq!(vwap_anchor_label(Timeframe::D1), "Monthly VWAP");
+        assert_eq!(vwap_anchor_label(Timeframe::W1), "Yearly VWAP");
+        assert_eq!(vwap_anchor_label(Timeframe::MN1), "Yearly VWAP");
     }
 
     #[test]

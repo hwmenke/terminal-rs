@@ -3,8 +3,10 @@
 //! absent metadata means Real here. Explicit unverified/sample provenance is refused.
 use std::{path::PathBuf, time::Duration};
 mod link;
+mod review;
 mod scanner;
 pub use link::{Config, DEFAULT_URL, Health, LinkState, detect_archive, retry_delay};
+pub use review::ReviewContext;
 pub use scanner::{Condition, Conditions, Metrics, ScanCache, ScanFilter, Skipped, Sort};
 
 use crate::history::calendar::is_session;
@@ -279,6 +281,14 @@ impl Bridge {
             provenance: Provenance::Real,
         })
     }
+    async fn http_bars_window(&self, symbol: &str, before: Option<i64>, limit: usize) -> Result<Vec<Bar>> {
+        let bars = self.http_bars(symbol, limit).await?;
+        Ok(match before {
+            Some(ts) => bars.into_iter().filter(|b| b.ts < ts).collect(),
+            None => bars,
+        })
+    }
+
     async fn http_bars(&self, symbol: &str, limit: usize) -> Result<Vec<Bar>> {
         // Validate before placing symbols in URL paths (archive tickers include '.', '-', '^').
         if symbol.is_empty() || !symbol.chars().all(|c| c.is_ascii_alphanumeric() || ".-^=_".contains(c)) {
@@ -298,10 +308,17 @@ impl Bridge {
         }
     }
     pub async fn bars(&self, symbol: &str) -> Result<Snapshot<Vec<Bar>>> {
+        self.bars_window(symbol, None, 1_000_000).await
+    }
+
+    /// Latest `limit` verified daily bars, or the page immediately before `before`.
+    /// HTTP uses the existing `/api/ohlcv?freq=daily&limit=` latest-N route; it does
+    /// not invent a new Whats-News endpoint. Scans still call [`Self::bars`].
+    pub async fn bars_window(&self, symbol: &str, before: Option<i64>, limit: usize) -> Result<Snapshot<Vec<Bar>>> {
         self.check()?;
         if !self.prefer_http || self.url.is_none() {
             let ticker = symbol.to_owned();
-            match self.sql(move |c| bars_sql(&c, &ticker, 1_000_000)).await {
+            match self.sql(move |c| bars_sql(&c, &ticker, before, limit)).await {
                 Ok(s) if !s.data.is_empty() => return Ok(s),
                 Err(e) if e.is::<Unverified>() || self.url.is_none() => return Err(e),
                 _ if self.url.is_none() => {
@@ -310,7 +327,7 @@ impl Bridge {
                 _ => {}
             }
         }
-        match self.http_bars(symbol, 1_000_000).await {
+        match self.http_bars_window(symbol, before, limit).await {
             Ok(data) if !data.is_empty() => Ok(Snapshot {
                 provenance: Bar::provenance(&data),
                 source: format!("Whats-News HTTP archive: {}", self.url.as_deref().unwrap_or_default()),
@@ -324,7 +341,7 @@ impl Bridge {
                     .unwrap_or_else(|| "No daily history for this ticker. Load it in Whats-News.".into());
                 let symbol = symbol.to_owned();
                 let result = self
-                    .sql(move |c| bars_sql(&c, &symbol, 1_000_000))
+                    .sql(move |c| bars_sql(&c, &symbol, before, limit))
                     .await
                     .map_err(|e| anyhow::anyhow!("Whats-News unavailable: {http}; archive file: {e:#}"))?;
                 if result.data.is_empty() {
@@ -527,11 +544,13 @@ fn universe_sql(c: &Connection) -> Result<Vec<Symbol>> {
     tx.commit()?;
     Ok(rows)
 }
-fn bars_sql(c: &Connection, symbol: &str, limit: usize) -> Result<Vec<Bar>> {
+fn bars_sql(c: &Connection, symbol: &str, before: Option<i64>, limit: usize) -> Result<Vec<Bar>> {
     let provenance = if c.prepare("SELECT provenance FROM ohlcv LIMIT 0").is_ok() { "provenance" } else { "'Real'" };
-    let mut stmt = c.prepare(&format!("SELECT date, open, high, low, close, volume, {provenance} FROM ohlcv WHERE symbol=? AND freq='daily' ORDER BY date DESC LIMIT ?"))?;
+    let before_date =
+        before.and_then(|ts| chrono::DateTime::from_timestamp(ts, 0).map(|d| d.format("%Y-%m-%d").to_string()));
+    let mut stmt = c.prepare(&format!("SELECT date, open, high, low, close, volume, {provenance} FROM ohlcv WHERE symbol=? AND freq='daily' AND (? IS NULL OR date < ?) ORDER BY date DESC LIMIT ?"))?;
     let rows = stmt
-        .query_map(rusqlite::params![symbol, limit as i64], |r| {
+        .query_map(rusqlite::params![symbol, before_date, before_date, limit as i64], |r| {
             Ok(StoredBar {
                 provenance: r
                     .get::<_, Option<String>>(6)?
@@ -550,7 +569,7 @@ fn bars_sql(c: &Connection, symbol: &str, limit: usize) -> Result<Vec<Bar>> {
 }
 /// 20-bar high / three-bar confirmation. Reserve the latest bar for the
 /// outcome so a fresh low cannot redefine its own box and hide a failure.
-fn darvas(b: &[Bar]) -> Option<(f64, f64, &'static str)> {
+pub(crate) fn darvas(b: &[Bar]) -> Option<(f64, f64, &'static str)> {
     if b.len() < 25 {
         return None;
     }
@@ -744,6 +763,31 @@ mod tests {
         }
         assert_eq!(darvas(&bars), None); // no three-bar hold
     }
+    #[test]
+    fn bars_sql_respects_limit_and_before_and_ignores_weekly_rows() {
+        let dir = std::env::temp_dir().join(format!("tr-bars-window-{}-{}", std::process::id(), 6));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("finance.db");
+        let c = rusqlite::Connection::open(&path).unwrap();
+        c.execute_batch("CREATE TABLE symbols(symbol TEXT PRIMARY KEY,name TEXT,group_tag TEXT); CREATE TABLE ohlcv(symbol TEXT,freq TEXT,date TEXT,open REAL,high REAL,low REAL,close REAL,volume REAL); INSERT INTO symbols VALUES('AAPL','Apple',''); INSERT INTO ohlcv VALUES('AAPL','daily','2026-09-01',10,12,9,11,5),('AAPL','daily','2026-09-02',10,12,9,11,5),('AAPL','daily','2026-09-03',10,12,9,11,5),('AAPL','weekly','2026-09-04',999,999,999,999,999);").unwrap();
+        drop(c);
+        let c = rusqlite::Connection::open(&path).unwrap();
+        let latest = bars_sql(&c, "AAPL", None, 2).unwrap();
+        assert_eq!(latest.len(), 2);
+        assert_eq!(
+            latest
+                .iter()
+                .map(|b| chrono::DateTime::from_timestamp(b.ts, 0).unwrap().format("%Y-%m-%d").to_string())
+                .collect::<Vec<_>>(),
+            ["2026-09-02", "2026-09-03"]
+        );
+        let older = bars_sql(&c, "AAPL", Some(latest[0].ts), 10).unwrap();
+        assert_eq!(older.len(), 1);
+        assert!(older[0].ts < latest[0].ts);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     #[test]
     fn rejects_invalid_bars_and_sorts_archive() {
         let rows: Vec<StoredBar> = serde_json::from_str(r#"[{"date":"2026-10-20","open":10,"high":12,"low":9,"close":11,"volume":2},{"date":"2026-10-19","open":10,"high":12,"low":9,"close":11,"volume":2}]"#).unwrap();

@@ -276,6 +276,9 @@ impl PaneKind {
                 show_volume: c.show_volume,
                 show_congress: c.show_congress,
                 magnet: c.magnet,
+                show_box: c.show_box,
+                show_rs: c.show_rs,
+                show_volume_ctx: c.show_volume_ctx,
             },
             PaneKind::Feed { filter } => {
                 PaneSettings::Feed((*filter != FeedFilter::default()).then(|| (*filter).into()))
@@ -329,6 +332,9 @@ impl PaneKind {
                 show_volume,
                 show_congress,
                 magnet,
+                show_box,
+                show_rs,
+                show_volume_ctx,
             } => {
                 let mut c = ChartState::new(0, &symbol, tf);
                 c.archive = archive;
@@ -341,6 +347,9 @@ impl PaneKind {
                 c.show_volume = show_volume;
                 c.show_congress = show_congress;
                 c.magnet = magnet;
+                c.show_box = show_box;
+                c.show_rs = show_rs;
+                c.show_volume_ctx = show_volume_ctx;
                 PaneKind::Chart(Box::new(c))
             }
             PaneSettings::Feed(f) => PaneKind::Feed { filter: f.map(Into::into).unwrap_or_default() },
@@ -854,6 +863,7 @@ impl TerminalApp {
             Command::SymbolFunction(s, f @ (Function::NewPanel(_) | Function::Split { .. })) => {
                 self.apply_with_symbol(f, Some(s));
             }
+            Command::SymbolFunction(s, Function::Review) => self.open_review(Some(&s)),
             Command::SymbolFunction(s, f) => {
                 self.open_security(&s);
                 self.apply(f);
@@ -1000,6 +1010,13 @@ impl TerminalApp {
                 }
                 self.set_account_mode(mode, false);
             }
+            Function::Review => self.open_review(symbol.as_deref()),
+            Function::Latest => self.with_chart(|c, _| c.jump_latest()),
+            Function::ReviewOverlay(which) => self.with_chart(|c, _| match which {
+                command::ReviewOverlay::BoxLevels => c.show_box = !c.show_box,
+                command::ReviewOverlay::Strength => c.show_rs = !c.show_rs,
+                command::ReviewOverlay::Volume => c.show_volume_ctx = !c.show_volume_ctx,
+            }),
         }
     }
 
@@ -1449,6 +1466,7 @@ impl TerminalApp {
             | A::DrawVertical
             | A::DrawFib
             | A::ResetView
+            | A::JumpLatest
             | A::LogScale
             | A::Magnet => self.focused_is_chart(),
             a => a.layout_slot().is_none_or(|i| i < self.layout_names.len()),
@@ -1496,6 +1514,7 @@ impl TerminalApp {
             A::DrawVertical => self.with_chart(|c, _| c.start_tool(Tool::Vertical)),
             A::DrawFib => self.with_chart(|c, _| c.start_tool(Tool::Fib)),
             A::ResetView => self.with_chart(|c, _| c.reset_view()),
+            A::JumpLatest => self.with_chart(|c, _| c.jump_latest()),
             A::LogScale => self.with_chart(|c, _| c.log = !c.log),
             A::Magnet => self.with_chart(|c, _| c.magnet = !c.magnet),
             a => {
@@ -1948,11 +1967,38 @@ mod tests {
             {
                 let mut c = ChartState::new(0, "AAPL", tr_core::Timeframe::D1);
                 c.archive = true;
+                c.enable_review_overlays();
                 PaneKind::Chart(Box::new(c)).settings()
             },
         ] {
             assert_eq!(PaneKind::from_settings(s.clone()).settings(), s);
         }
+    }
+
+    #[test]
+    fn review_opens_linked_daily_and_weekly_archive_charts() {
+        let mut app = test_app();
+        let (worker, mut requests) = Worker::test_channel();
+        app.worker = worker;
+        app.apply(Function::Review);
+        let charts: Vec<_> = app
+            .panes
+            .iter()
+            .filter_map(|p| match &p.kind {
+                PaneKind::Chart(c) => Some((c.archive, c.tf, c.show_box, c.show_rs, c.show_volume_ctx, p.link)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(charts.len(), 2);
+        assert!(charts.iter().any(|c| c.0 && c.1 == tr_core::Timeframe::D1 && c.2 && c.3 && c.4));
+        assert!(charts.iter().any(|c| c.0 && c.1 == tr_core::Timeframe::W1 && c.2 && c.3 && c.4));
+        assert_eq!(charts[0].5, charts[1].5);
+        assert!(charts[0].5.is_some());
+        let reqs: Vec<_> = std::iter::from_fn(|| requests.try_recv().ok()).collect();
+        let archive: Vec<_> = reqs.iter().filter(|r| matches!(r, Request::ArchiveHistory { .. })).collect();
+        assert_eq!(archive.len(), 2);
+        assert!(archive.iter().all(|r| matches!(r, Request::ArchiveHistory { before: None, .. })));
+        assert!(!reqs.iter().any(|r| matches!(r, Request::History { .. })));
     }
 }
 

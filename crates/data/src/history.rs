@@ -145,6 +145,34 @@ impl Archive {
         validate(&rows).map_err(|e| anyhow::anyhow!(e.reason()))?;
         Ok(rows)
     }
+
+    /// Latest `limit` daily bars, or the page immediately before `before`.
+    /// Full-history [`Self::daily`] remains the scan/research path.
+    pub fn daily_window(&self, symbol: &str, before: Option<i64>, limit: usize) -> Result<Vec<Bar>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let mut st = self.conn.prepare(
+            "SELECT ts,o,h,l,c,v,source,provenance FROM history_daily WHERE symbol=? AND (? IS NULL OR ts < ?) ORDER BY ts DESC LIMIT ?",
+        )?;
+        let mut rows: Vec<_> = st
+            .query_map(params![symbol, before, before, limit as i64], |r| {
+                let source: String = r.get(6)?;
+                let provenance: String = r.get(7)?;
+                Ok(Bar::new(r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?).with_provenance(
+                    if source == "yahoo" && provenance == "Real" { Provenance::Real } else { Provenance::Missing },
+                ))
+            })?
+            .collect::<rusqlite::Result<_>>()?;
+        rows.reverse();
+        if rows.is_empty() {
+            return Ok(rows);
+        }
+        Bar::require_verified(&rows, "Research archive").map_err(anyhow::Error::msg)?;
+        validate(&rows).map_err(|e| anyhow::anyhow!(e.reason()))?;
+        Ok(rows)
+    }
+
     pub fn candles(&self, symbol: &str, tf: Timeframe) -> Result<Vec<Bar>> {
         if !matches!(tf, Timeframe::D1 | Timeframe::W1 | Timeframe::MN1) {
             bail!("Archive supports daily, weekly and monthly candles");
@@ -629,6 +657,13 @@ mod tests {
             .db(move |db| {
                 let daily = db.daily("AAPL")?;
                 assert_eq!(daily.len(), 10);
+                let tail = db.daily_window("AAPL", None, 4)?;
+                assert_eq!(tail.len(), 4);
+                assert_eq!(tail[0].ts, daily[6].ts);
+                assert_eq!(tail.last().map(|b| b.ts), daily.last().map(|b| b.ts));
+                let older = db.daily_window("AAPL", Some(tail[0].ts), 10)?;
+                assert_eq!(older.len(), 6);
+                assert!(older.last().unwrap().ts < tail[0].ts);
                 let weekly = db.candles("AAPL", Timeframe::W1)?;
                 assert_eq!(weekly.len(), 3);
                 assert_eq!(weekly[0].open, 10.0);

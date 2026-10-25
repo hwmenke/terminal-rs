@@ -67,6 +67,16 @@ impl Timeframe {
         self < Timeframe::D1
     }
 
+    /// Unit name for a single bar of this interval, used in review HUD copy.
+    pub fn bar_unit(self) -> &'static str {
+        match self {
+            Timeframe::D1 => "day",
+            Timeframe::W1 => "week",
+            Timeframe::MN1 => "month",
+            _ => "bar",
+        }
+    }
+
     /// Start of the bucket containing `ts` (weeks start Monday, months on the 1st, UTC).
     pub fn bucket_start(self, ts: i64) -> i64 {
         match self {

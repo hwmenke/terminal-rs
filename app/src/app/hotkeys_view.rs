@@ -256,7 +256,7 @@ impl TerminalApp {
                     (&["UNIV"], "Whats-News archive: last bar date, STALE and MISSING coverage"),
                     (
                         &["SCAN DARVAS_BREAKOUT", "SCAN NEAR_HIGH"],
-                        "Scan archived bars; click a result for its archived chart",
+                        "Scan archived bars; Enter opens the linked archive chart (REVIEW for daily+weekly)",
                     ),
                     (&["WEI"], "World markets overview"),
                     (&["GC"], "US Treasury yield curve"),
@@ -312,11 +312,14 @@ impl TerminalApp {
                     (&["SMA 50", "RSI", "IND"], "Indicators (see below)"),
                     (&["CMP MSFT"], "Compare, rebased to the main symbol"),
                     (&["TL", "HL", "VL", "FIB", "MAGNET"], "Drawing tools and snapping"),
+                    (&["REVIEW", "AAPL REVIEW"], "Linked daily + weekly archive charts for candidate review"),
+                    (&["LATEST", "END"], "Jump to the latest candle (keeps zoom)"),
+                    (&["BOX", "RS", "VCTX"], "Toggle box levels, 21-bar return, volume context"),
                 ],
             );
             para(
                 ui,
-                "Wheel zooms, drag pans, drag an axis to stretch, double-click resets. Right-click for the chart menu.",
+                "Wheel zooms, drag pans, drag an axis to stretch, double-click resets, End jumps to the latest candle. Right-click for the chart menu. Daily VWAP is labelled Monthly VWAP because it resets each calendar month.",
             );
 
             section(ui, &format!("Indicators ({})", registry::all().len()));

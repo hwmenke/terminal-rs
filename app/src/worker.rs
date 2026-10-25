@@ -44,6 +44,10 @@ pub enum Request {
         generation: u64,
         symbol: String,
         tf: Timeframe,
+        /// Displayed candles to keep; daily rows fetched are a multiple of this.
+        limit: usize,
+        /// Page older daily history ending before this timestamp (chart left-edge paging).
+        before: Option<i64>,
     },
     /// Load the brokerage portfolio through SnapTrade (`None` = the simulated sample).
     Portfolio(Option<tr_broker::Credentials>),
@@ -335,6 +339,9 @@ struct Shared {
     /// Authoritative bars per chart pane (history, paging and live ticks all merge here),
     /// tagged with the pane's load generation.
     series: std::sync::Mutex<SeriesMap>,
+    /// Daily source rows for archive panes so weekly/monthly paging can resample the
+    /// combined window instead of stitching broken week boundaries.
+    archive_daily: std::sync::Mutex<SeriesMap>,
     cache: std::sync::Mutex<Option<BarCache>>,
     db: Mutex<Db>,
     out: mpsc::Sender<Response>,
@@ -391,6 +398,7 @@ impl Worker {
             whats_news,
             provider,
             series: Default::default(),
+            archive_daily: Default::default(),
             cache: std::sync::Mutex::new(cache),
             db: Mutex::new(db),
             out,
@@ -577,6 +585,26 @@ pub fn initial_limit(tf: Timeframe) -> usize {
     std::env::var("TR_HISTORY_LIMIT").ok().and_then(|v| v.parse().ok()).unwrap_or_else(|| default_limit(tf))
 }
 
+/// Displayed archive candles requested per load/page. Daily rows fetched are
+/// `archive_daily_needed` of this. `TR_ARCHIVE_LIMIT` overrides the candle count.
+pub fn archive_page(tf: Timeframe) -> usize {
+    std::env::var("TR_ARCHIVE_LIMIT").ok().and_then(|v| v.parse().ok()).unwrap_or_else(|| match tf {
+        Timeframe::D1 => 800,
+        Timeframe::W1 => 400,
+        Timeframe::MN1 => 240,
+        _ => 800,
+    })
+}
+
+/// Daily rows needed to form `candles` of `tf` without inventing missing weeks/months.
+pub fn archive_daily_needed(tf: Timeframe, candles: usize) -> usize {
+    match tf {
+        Timeframe::W1 => candles.saturating_mul(5).saturating_add(10),
+        Timeframe::MN1 => candles.saturating_mul(23).saturating_add(10),
+        _ => candles,
+    }
+}
+
 async fn research_universe(
     s: &Shared,
     bridge: &tr_data::whats_news::Bridge,
@@ -731,26 +759,55 @@ async fn handle(s: &Arc<Shared>, req: Request) {
                 });
             }
         }
-        Request::ArchiveHistory { pane, generation, symbol, tf } => {
+        Request::ArchiveHistory { pane, generation, symbol, tf, limit, before } => {
             let bridge = config.bridge();
             if current_series(s, pane, generation).is_none() {
                 return;
             }
+            let page = limit.max(1);
+            let daily_page = archive_daily_needed(tf, page);
+            let have = current_daily(s, pane, generation).map(|d| d.len()).unwrap_or(0);
+            let fetch = if before.is_some() { have.saturating_add(daily_page).max(daily_page) } else { daily_page };
             let ticker = tr_data::yahoo::yahoo_symbol(&tr_data::security(&symbol));
             let remote = ticker.clone();
-            let local = s.history.db(move |db| db.daily(&ticker)).await;
+            let before_local = before;
+            let local = s.history.db(move |db| db.daily_window(&ticker, before_local, daily_page)).await;
             let result = match local {
                 Ok(data) if !data.is_empty() => Ok(tr_data::whats_news::Snapshot {
                     data,
                     provenance: tr_core::Provenance::Cached,
                     source: "Local Yahoo archive".into(),
                 }),
-                Ok(_) => bridge.bars(&remote).await,
+                Ok(_) => bridge.bars_window(&remote, before, fetch).await,
                 Err(e) => Err(e),
             };
             match result {
                 Ok(snapshot) => {
-                    let bars = Arc::new(tf.resample(&snapshot.data));
+                    if let Err(error) = Bar::require_verified(&snapshot.data, "Archive chart") {
+                        send(Response::HistoryError { pane, generation, error });
+                        return;
+                    }
+                    let older = match before {
+                        Some(ts) => snapshot.data.into_iter().filter(|b| b.ts < ts).collect::<Vec<_>>(),
+                        None => snapshot.data,
+                    };
+                    let fetched = older.len();
+                    let daily = if let Some(ts) = before {
+                        let mut merged = older;
+                        if let Some(have) = current_daily(s, pane, generation) {
+                            merged.extend(have.iter().copied().filter(|b| b.ts >= ts));
+                        }
+                        merged.sort_by_key(|b| b.ts);
+                        merged.dedup_by_key(|b| b.ts);
+                        merged
+                    } else {
+                        older
+                    };
+                    let daily = Arc::new(daily);
+                    store_daily(s, pane, generation, daily.clone());
+                    let old_len = current_series(s, pane, generation).map(|b| b.len()).unwrap_or(0);
+                    let bars = Arc::new(tf.resample(&daily));
+                    let prepended = if before.is_some() { bars.len().saturating_sub(old_len) } else { 0 };
                     if !store_series(s, pane, generation, bars.clone()) {
                         return;
                     }
@@ -762,9 +819,9 @@ async fn handle(s: &Arc<Shared>, req: Request) {
                         tf,
                         bars,
                         gpu,
-                        prepended: 0,
+                        prepended,
                         from_cache: false,
-                        exhausted: true,
+                        exhausted: fetched < daily_page,
                         live: false,
                     });
                 }
@@ -939,6 +996,7 @@ async fn handle(s: &Arc<Shared>, req: Request) {
         Request::RefreshCongress => congress_refresh(s).await,
         Request::Forget(pane) => {
             s.series.lock().expect("series lock").remove(&pane);
+            s.archive_daily.lock().expect("archive daily lock").remove(&pane);
         }
         Request::YieldCurves => match s.provider.yield_curves().await {
             Ok(c) => s.send(Response::Curves(Box::new(c))),
@@ -1047,6 +1105,7 @@ fn begin_request(s: &Shared, req: &Request) -> bool {
         }
         Request::Forget(pane) => {
             s.series.lock().expect("series lock").remove(pane);
+            s.archive_daily.lock().expect("archive daily lock").remove(pane);
             false
         }
         _ => true,
@@ -1081,6 +1140,22 @@ fn store_series(s: &Shared, pane: PaneId, generation: u64, bars: Arc<Vec<Bar>>) 
 
 fn current_series(s: &Shared, pane: PaneId, generation: u64) -> Option<Arc<Vec<Bar>>> {
     s.series.lock().expect("series lock").get(&pane).filter(|(g, _)| *g == generation).map(|(_, b)| b.clone())
+}
+
+fn store_daily(s: &Shared, pane: PaneId, generation: u64, bars: Arc<Vec<Bar>>) {
+    let mut map = s.archive_daily.lock().expect("archive daily lock");
+    if map.get(&pane).is_none_or(|(g, _)| *g <= generation) {
+        map.insert(pane, (generation, bars));
+    }
+}
+
+fn current_daily(s: &Shared, pane: PaneId, generation: u64) -> Option<Arc<Vec<Bar>>> {
+    s.archive_daily
+        .lock()
+        .expect("archive daily lock")
+        .get(&pane)
+        .filter(|(g, _)| *g == generation)
+        .map(|(_, b)| b.clone())
 }
 
 /// Merge the provider's live feed (if any) into the pane's series, publishing at most
@@ -1242,6 +1317,7 @@ mod tests {
                 whats_news: tokio::sync::watch::channel((0, Default::default())).0,
                 provider,
                 series: Default::default(),
+                archive_daily: Default::default(),
                 cache: std::sync::Mutex::new(cache),
                 db: Mutex::new(Db::open_in_memory().unwrap()),
                 out,
@@ -1299,7 +1375,14 @@ mod tests {
         let scan = research_scan(&s, &config.bridge(), "NEAR_HIGH").await.unwrap();
         assert!(scan.provenance.is_verified());
         for tf in [Timeframe::W1, Timeframe::MN1] {
-            let req = Request::ArchiveHistory { pane: 1, generation: 1, symbol: "AAPL US Equity".into(), tf };
+            let req = Request::ArchiveHistory {
+                pane: 1,
+                generation: 1,
+                symbol: "AAPL US Equity".into(),
+                tf,
+                limit: archive_page(tf),
+                before: None,
+            };
             assert!(begin_request(&s, &req));
             handle(&s, req).await;
             let Response::WhatsNews { response, .. } = rx.try_recv().unwrap() else {
@@ -1342,8 +1425,14 @@ mod tests {
                 prefer_http: false,
             },
         ));
-        let req =
-            Request::ArchiveHistory { pane: 1, generation: 1, symbol: "AAPL US Equity".into(), tf: Timeframe::W1 };
+        let req = Request::ArchiveHistory {
+            pane: 1,
+            generation: 1,
+            symbol: "AAPL US Equity".into(),
+            tf: Timeframe::W1,
+            limit: archive_page(Timeframe::W1),
+            before: None,
+        };
         assert!(begin_request(&s, &req));
         handle(&s, req).await;
         let Response::WhatsNews { response, .. } = rx.try_recv().unwrap() else { panic!() };
@@ -1393,6 +1482,71 @@ mod tests {
                 assert_eq!(cached.len(), 1);
             }
         }
+    }
+
+    #[tokio::test]
+    async fn archive_charts_load_a_bounded_daily_page_and_page_older_without_the_market_provider() {
+        struct LongArchive;
+        #[async_trait::async_trait]
+        impl tr_data::history::DailyHistory for LongArchive {
+            async fn daily(
+                &self,
+                _: &str,
+                _: Option<chrono::NaiveDate>,
+                _: chrono::NaiveDate,
+            ) -> Result<Vec<Bar>, tr_data::history::Failure> {
+                Ok((0..200)
+                    .map(|i| {
+                        let d = chrono::NaiveDate::from_ymd_opt(2025, 1, 2).unwrap() + chrono::Days::new(i);
+                        Bar::new(d.and_hms_opt(0, 0, 0).unwrap().and_utc().timestamp(), 10.0, 11.0, 9.0, 10.5, 100.0)
+                            .with_provenance(tr_core::Provenance::Real)
+                    })
+                    .collect())
+            }
+        }
+        let (mut s, rx) = shared(Arc::new(tr_data::sample::SampleProvider::at(0, 10)), None);
+        Arc::get_mut(&mut s).unwrap().history = Arc::new(tr_data::history::Service::new(
+            tr_data::history::Archive::memory().unwrap(),
+            Arc::new(LongArchive),
+            tr_data::history::Policy { spacing: Duration::ZERO, ..Default::default() },
+        ));
+        s.whats_news.send_replace((0, tr_data::whats_news::Config { enabled: false, ..Default::default() }));
+        s.history.run("ADD", tr_data::history::universe::resolve("AAPL").unwrap(), |_| {}).await.unwrap();
+        s.history.run("REFRESH", vec![], |_| {}).await.unwrap();
+        let req = Request::ArchiveHistory {
+            pane: 1,
+            generation: 1,
+            symbol: "AAPL US Equity".into(),
+            tf: Timeframe::D1,
+            limit: 40,
+            before: None,
+        };
+        assert!(begin_request(&s, &req));
+        handle(&s, req).await;
+        let Response::WhatsNews { response, .. } = rx.try_recv().unwrap() else { panic!() };
+        let Response::History { bars, exhausted, prepended, live, .. } = *response else { panic!() };
+        assert_eq!(bars.len(), 40);
+        assert!(!exhausted);
+        assert_eq!(prepended, 0);
+        assert!(!live);
+        assert!(bars.iter().all(|b| b.provenance.is_verified()));
+        let first = bars[0].ts;
+        let page = Request::ArchiveHistory {
+            pane: 1,
+            generation: 1,
+            symbol: "AAPL US Equity".into(),
+            tf: Timeframe::D1,
+            limit: 40,
+            before: Some(first),
+        };
+        assert!(begin_request(&s, &page));
+        handle(&s, page).await;
+        let Response::WhatsNews { response, .. } = rx.try_recv().unwrap() else { panic!() };
+        let Response::History { bars, exhausted, prepended, .. } = *response else { panic!() };
+        assert_eq!(prepended, 40);
+        assert_eq!(bars.len(), 80);
+        assert!(bars[40].ts == first);
+        assert!(!exhausted);
     }
 
     #[tokio::test]
@@ -1472,6 +1626,7 @@ mod tests {
             whats_news: tokio::sync::watch::channel((0, Default::default())).0,
             provider: std::sync::Arc::new(tr_data::sample::SampleProvider::at(0, 10)),
             series: Default::default(),
+            archive_daily: Default::default(),
             cache: std::sync::Mutex::new(None),
             db: Mutex::new(Db::open_in_memory().unwrap()),
             out,

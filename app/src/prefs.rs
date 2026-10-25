@@ -262,6 +262,7 @@ pub enum Action {
     DrawVertical,
     DrawFib,
     ResetView,
+    JumpLatest,
     LogScale,
     Magnet,
     Layout1,
@@ -276,7 +277,7 @@ pub enum Action {
 }
 
 impl Action {
-    pub const ALL: [Action; 52] = [
+    pub const ALL: [Action; 53] = [
         Action::Help,
         Action::Congress,
         Action::Politicians,
@@ -318,6 +319,7 @@ impl Action {
         Action::DrawVertical,
         Action::DrawFib,
         Action::ResetView,
+        Action::JumpLatest,
         Action::LogScale,
         Action::Magnet,
         Action::Layout1,
@@ -375,6 +377,7 @@ impl Action {
             Action::DrawVertical => "Draw vertical line".into(),
             Action::DrawFib => "Draw Fibonacci retracement".into(),
             Action::ResetView => "Reset chart view".into(),
+            Action::JumpLatest => "Jump to the latest candle".into(),
             Action::LogScale => "Toggle log scale".into(),
             Action::Magnet => "Toggle magnet".into(),
             a => format!("Switch to layout {}", a.layout_slot().unwrap_or(0) + 1),
@@ -404,6 +407,7 @@ impl Action {
             | A::DrawVertical
             | A::DrawFib
             | A::ResetView
+            | A::JumpLatest
             | A::LogScale
             | A::Magnet => "Chart",
             A::Buy | A::Sell => "Trading",
@@ -602,6 +606,7 @@ impl Default for Keymap {
         bind(Action::DrawVertical, "Alt+V");
         bind(Action::DrawFib, "Alt+F");
         bind(Action::ResetView, "Alt+R");
+        bind(Action::JumpLatest, "End");
         bind(Action::LogScale, "Alt+L");
         bind(Action::Magnet, "Alt+M");
         // ⌘1…⌘9, ⌘0 open panels; ⌥1…⌥9 switch saved layouts.
