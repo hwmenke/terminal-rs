@@ -2,7 +2,7 @@
 
 use std::time::Instant;
 
-use egui::{Align2, Color32, Rect, RichText, Sense, Stroke, Ui, UiBuilder, pos2, vec2};
+use egui::{pos2, vec2, Align2, Color32, Rect, RichText, Sense, Stroke, Ui, UiBuilder};
 use tr_data::OrderBook;
 
 use super::{PaneKind, TerminalApp};
@@ -49,7 +49,7 @@ impl TerminalApp {
                 actions.extend(congress_view::politicians(ui, &self.politicians, &mut self.pol_search))
             }
             PaneKind::Alerts => {
-                let (a, seen) = congress_view::alerts(ui, &self.alerts);
+                let (a, seen) = self.alerts_pane(ui);
                 actions.extend(a);
                 if seen {
                     self.worker.send(Request::MarkAlertsSeen);
@@ -146,7 +146,7 @@ impl TerminalApp {
 
 /// Headlines list. Returns `Some(_)` when a refresh was requested.
 fn news(ui: &mut Ui, n: &mut super::NewsPane, offline: bool, has_leaders: bool) -> Option<bool> {
-    use tr_data::news::{NewsScope, format_freshness, format_pub};
+    use tr_data::news::{format_freshness, format_pub, NewsScope};
     let mut refresh = None;
     let set_scope = |n: &mut super::NewsPane, scope: NewsScope, refresh: &mut Option<bool>| {
         if n.scope != scope {

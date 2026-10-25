@@ -4,12 +4,12 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::{Arc, mpsc};
+use std::sync::{mpsc, Arc};
 use std::time::Duration;
 
 use tokio::sync::Mutex;
 use tr_chart::gpu::{LineKind, LineRef};
-use tr_chart::scene::{Overlay, SeriesGpu, line_ref, marker_ref};
+use tr_chart::scene::{line_ref, marker_ref, Overlay, SeriesGpu};
 use tr_congress::db::{Alert, PoliticianSummary};
 use tr_congress::performance::{self, Performance, TradeReturn};
 use tr_congress::refresh::{self, HttpSource, NewTradeAlert, RefreshConfig};
@@ -25,6 +25,8 @@ pub type PaneId = u64;
 
 /// Minutes between Congress disclosure checks (`TR_CONGRESS_REFRESH_MIN`; 0 disables).
 pub const CONGRESS_REFRESH_MIN: u64 = 30;
+/// Seconds between price/setup rule evaluations (`TR_PRICE_ALERT_SECS`; 0 disables).
+pub const PRICE_ALERT_EVAL_SECS: u64 = 20;
 
 pub enum Request {
     HistoryStatus,
@@ -144,6 +146,21 @@ pub enum Request {
     },
     Alerts,
     MarkAlertsSeen,
+    /// Snapshot of persistent price/setup rules and fired events.
+    PriceAlerts,
+    AddPriceAlert {
+        symbol: String,
+        kind: tr_data::price_alerts::AlertKind,
+    },
+    RemovePriceAlert {
+        query: String,
+    },
+    SetPriceAlertEnabled {
+        id: String,
+        enabled: bool,
+    },
+    MarkPriceAlertsSeen,
+    EvaluatePriceAlerts,
     RefreshCongress,
     /// A pane closed or changed: stop its live feed and drop its series.
     Forget(PaneId),
@@ -324,6 +341,8 @@ pub enum Response {
     Politicians(Vec<PoliticianSummary>),
     Alerts(Vec<Alert>),
     NewAlerts(Vec<NewTradeAlert>),
+    PriceAlertFeed(tr_data::price_alerts::AlertBatch),
+    NewPriceAlerts(Vec<tr_data::price_alerts::FiredAlert>),
     Status(String),
     CongressRefreshed(String),
     Curves(Box<YieldCurves>),
@@ -355,6 +374,8 @@ struct Shared {
     archive_daily: std::sync::Mutex<SeriesMap>,
     cache: std::sync::Mutex<Option<BarCache>>,
     news: std::sync::Mutex<tr_data::news::NewsCache>,
+    price_alerts: std::sync::Mutex<tr_data::price_alerts::Store>,
+    price_alerts_path: PathBuf,
     db: Mutex<Db>,
     out: mpsc::Sender<Response>,
     ctx: egui::Context,
@@ -364,6 +385,19 @@ impl Shared {
     fn send(&self, r: Response) {
         let _ = self.out.send(r);
         self.ctx.request_repaint();
+    }
+
+    fn persist_price_alerts(&self) {
+        self.price_alerts.lock().expect("price alerts").save(&self.price_alerts_path);
+    }
+
+    fn price_alert_snapshot(&self, now: i64) -> tr_data::price_alerts::AlertBatch {
+        self.price_alerts.lock().expect("price alerts").snapshot(
+            now,
+            false,
+            self.provider.name() == "sample",
+            Vec::new(),
+        )
     }
 }
 
@@ -413,6 +447,8 @@ impl Worker {
             archive_daily: Default::default(),
             cache: std::sync::Mutex::new(cache),
             news: Default::default(),
+            price_alerts: std::sync::Mutex::new(tr_data::price_alerts::Store::load(&dir.join("price_alerts.json"))),
+            price_alerts_path: dir.join("price_alerts.json"),
             db: Mutex::new(db),
             out,
             ctx,
@@ -460,6 +496,22 @@ impl Worker {
             }
         });
 
+        // Price / setup rules: evaluate on a short interval so a crossing is not missed.
+        let s = shared.clone();
+        rt.spawn(async move {
+            let secs: u64 =
+                std::env::var("TR_PRICE_ALERT_SECS").ok().and_then(|v| v.parse().ok()).unwrap_or(PRICE_ALERT_EVAL_SECS);
+            if secs == 0 {
+                return;
+            }
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            let mut tick = tokio::time::interval(Duration::from_secs(secs));
+            loop {
+                tick.tick().await;
+                evaluate_price_alerts(&s).await;
+            }
+        });
+
         // Scheduled congressional disclosure refresh.
         let s = shared.clone();
         rt.spawn(async move {
@@ -487,8 +539,8 @@ impl Worker {
     }
 
     #[cfg(test)]
-    pub(crate) fn test_channel_with_responses()
-    -> (Self, tokio::sync::mpsc::UnboundedReceiver<Request>, mpsc::Sender<Response>) {
+    pub(crate) fn test_channel_with_responses(
+    ) -> (Self, tokio::sync::mpsc::UnboundedReceiver<Request>, mpsc::Sender<Response>) {
         let (tx, requests) = tokio::sync::mpsc::unbounded_channel();
         let (out, rx) = mpsc::channel();
         let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
@@ -712,7 +764,7 @@ async fn research_desk(
     bridge: &tr_data::whats_news::Bridge,
     keys: &[String],
 ) -> anyhow::Result<tr_data::whats_news::Snapshot<Vec<tr_data::whats_news::MemberRow>>> {
-    use tr_data::whats_news::{MemberRow, archive_ticker};
+    use tr_data::whats_news::{archive_ticker, MemberRow};
     let mut wanted = Vec::new();
     let mut rows = Vec::new();
     for key in keys {
@@ -1094,6 +1146,53 @@ async fn handle(s: &Arc<Shared>, req: Request) {
             let _ = db.mark_alerts_seen();
             s.send(Response::Alerts(db.alerts(false, 200).unwrap_or_default()));
         }
+        Request::PriceAlerts => {
+            s.send(Response::PriceAlertFeed(s.price_alert_snapshot(chrono::Utc::now().timestamp())));
+        }
+        Request::AddPriceAlert { symbol, kind } => {
+            let now = chrono::Utc::now().timestamp();
+            let result = s.price_alerts.lock().expect("price alerts").add_rule(&symbol, kind, now);
+            s.persist_price_alerts();
+            match result {
+                Ok(rule) => {
+                    s.send(Response::Status(format!(
+                        "Watching {} {}",
+                        tr_data::security(&rule.symbol).ticker,
+                        rule.kind.label()
+                    )));
+                    evaluate_price_alerts(s).await;
+                }
+                Err(e) => {
+                    s.send(Response::Status(format!("Alert not added: {e}")));
+                    s.send(Response::PriceAlertFeed(s.price_alert_snapshot(now)));
+                }
+            }
+        }
+        Request::RemovePriceAlert { query } => {
+            let n = s.price_alerts.lock().expect("price alerts").remove(&query);
+            s.persist_price_alerts();
+            s.send(Response::Status(if n == 0 {
+                format!("No price/setup alert matches {query}")
+            } else {
+                format!("Removed {n} price/setup alert{}", if n == 1 { "" } else { "s" })
+            }));
+            s.send(Response::PriceAlertFeed(s.price_alert_snapshot(chrono::Utc::now().timestamp())));
+        }
+        Request::SetPriceAlertEnabled { id, enabled } => {
+            let ok = s.price_alerts.lock().expect("price alerts").set_enabled(&id, enabled);
+            s.persist_price_alerts();
+            if ok {
+                evaluate_price_alerts(s).await;
+            } else {
+                s.send(Response::PriceAlertFeed(s.price_alert_snapshot(chrono::Utc::now().timestamp())));
+            }
+        }
+        Request::MarkPriceAlertsSeen => {
+            s.price_alerts.lock().expect("price alerts").mark_seen();
+            s.persist_price_alerts();
+            s.send(Response::PriceAlertFeed(s.price_alert_snapshot(chrono::Utc::now().timestamp())));
+        }
+        Request::EvaluatePriceAlerts => evaluate_price_alerts(s).await,
         Request::RefreshCongress => congress_refresh(s).await,
         Request::Forget(pane) => {
             s.series.lock().expect("series lock").remove(&pane);
@@ -1376,9 +1475,119 @@ async fn profile(s: &Shared, query: &str) -> Option<Profile> {
     Some(Profile { politician, trades, perf, returns, tracked, price_warnings })
 }
 
+async fn evaluate_price_alerts(s: &Shared) {
+    use tr_data::price_alerts::{evaluate, setup_tick, AlertFailure, AlertKind, EvalInput, PriceTick};
+    use tr_data::whats_news::archive_ticker;
+    let now = chrono::Utc::now().timestamp();
+    let sample = s.provider.name() == "sample";
+    let rules = s.price_alerts.lock().expect("price alerts").rules.clone();
+    if sample {
+        let outcome = evaluate(
+            &mut s.price_alerts.lock().expect("price alerts"),
+            EvalInput { now, sample_provider: true, prices: Vec::new(), setups: Vec::new(), failures: Vec::new() },
+        );
+        s.send(Response::PriceAlertFeed(outcome.batch));
+        return;
+    }
+    if !rules.iter().any(|r| r.enabled) {
+        s.send(Response::PriceAlertFeed(s.price_alert_snapshot(now)));
+        return;
+    }
+    let mut price_keys = Vec::new();
+    let mut setup_keys: Vec<(String, String)> = Vec::new();
+    for r in rules.iter().filter(|r| r.enabled) {
+        match &r.kind {
+            AlertKind::Price { .. } => {
+                if !price_keys.iter().any(|s| s == &r.symbol) {
+                    price_keys.push(r.symbol.clone());
+                }
+            }
+            AlertKind::Setup { setup, .. } => setup_keys.push((r.symbol.clone(), setup.clone())),
+        }
+    }
+    let mut failures = Vec::new();
+    let mut prices = Vec::new();
+    if !price_keys.is_empty() {
+        match s.provider.quotes(&price_keys).await {
+            Ok(quotes) => {
+                for key in &price_keys {
+                    if let Some(q) =
+                        quotes.iter().find(|q| q.symbol == *key || tr_data::security(&q.symbol).key() == *key)
+                    {
+                        prices.push(PriceTick {
+                            symbol: key.clone(),
+                            price: q.last,
+                            ts: q.ts,
+                            provenance: q.provenance,
+                        });
+                    } else {
+                        failures.push(AlertFailure { symbol: key.clone(), error: "no quote for this name".into() });
+                    }
+                }
+            }
+            Err(e) => {
+                for key in &price_keys {
+                    failures.push(AlertFailure { symbol: key.clone(), error: format!("{e:#}") });
+                }
+            }
+        }
+    }
+    let mut setups = Vec::new();
+    if !setup_keys.is_empty() {
+        let mut wanted: Vec<String> = Vec::new();
+        let mut pairs: Vec<(String, String, Vec<String>)> = Vec::new();
+        for (symbol, setup) in setup_keys {
+            let ticker = archive_ticker(&symbol);
+            if let Some((_, _, names)) = pairs.iter_mut().find(|(k, _, _)| *k == symbol) {
+                if !names.contains(&setup) {
+                    names.push(setup);
+                }
+            } else {
+                if !ticker.is_empty() && !wanted.contains(&ticker) {
+                    wanted.push(ticker.clone());
+                }
+                pairs.push((symbol, ticker, vec![setup]));
+            }
+        }
+        let local = if wanted.is_empty() {
+            Ok(Default::default())
+        } else {
+            s.history.db(move |db| db.histories_for(&wanted)).await
+        };
+        match local {
+            Ok(map) => {
+                for (symbol, ticker, names) in pairs {
+                    match map.get(&ticker) {
+                        Some(bars) => match setup_tick(&symbol, bars, &names, now) {
+                            Ok(tick) => setups.push(tick),
+                            Err(error) => failures.push(AlertFailure { symbol, error }),
+                        },
+                        None => failures
+                            .push(AlertFailure { symbol, error: "no daily history in the research archive".into() }),
+                    }
+                }
+            }
+            Err(e) => {
+                for (symbol, _, _) in pairs {
+                    failures.push(AlertFailure { symbol, error: format!("{e:#}") });
+                }
+            }
+        }
+    }
+    let outcome = evaluate(
+        &mut s.price_alerts.lock().expect("price alerts"),
+        EvalInput { now, sample_provider: false, prices, setups, failures },
+    );
+    s.persist_price_alerts();
+    if !outcome.fired.is_empty() {
+        s.send(Response::NewPriceAlerts(outcome.fired));
+    }
+    s.send(Response::PriceAlertFeed(outcome.batch));
+}
+
 async fn fetch_news(s: &Arc<Shared>, symbols: Option<Vec<String>>) -> tr_data::news::NewsBatch {
     use tr_data::news::{
-        NewsBatch, NewsFailure, TOP_CACHE_KEY, assemble_batch, bound_symbols, dedup_headlines, is_stale,
+        assemble_batch, bound_symbols, dedup_headlines, is_stale, NewsBatch, NewsFailure, TOP_CACHE_KEY,
     };
     let now = chrono::Utc::now().timestamp();
     if s.provider.name() == "sample" {
@@ -1541,6 +1750,8 @@ mod tests {
                 archive_daily: Default::default(),
                 cache: std::sync::Mutex::new(cache),
                 news: Default::default(),
+                price_alerts: Default::default(),
+                price_alerts_path: PathBuf::new(),
                 db: Mutex::new(Db::open_in_memory().unwrap()),
                 out,
                 ctx: egui::Context::default(),
@@ -1638,12 +1849,15 @@ mod tests {
         drop(c);
         let before = std::fs::read(&path).unwrap();
         let (s, rx) = shared(Arc::new(tr_data::sample::SampleProvider::at(0, 10)), None);
-        s.whats_news.send_replace((0, tr_data::whats_news::Config {
-            enabled: true,
-            archive_path: path.to_string_lossy().into(),
-            http_url: String::new(),
-            prefer_http: false,
-        }));
+        s.whats_news.send_replace((
+            0,
+            tr_data::whats_news::Config {
+                enabled: true,
+                archive_path: path.to_string_lossy().into(),
+                http_url: String::new(),
+                prefer_http: false,
+            },
+        ));
         let req = Request::ArchiveHistory {
             pane: 1,
             generation: 1,
@@ -1779,9 +1993,15 @@ mod tests {
         assert!(
             matches!(rx.try_recv(), Ok(Response::History { bars, from_cache: false, .. }) if Bar::provenance(&bars) == tr_core::Provenance::Sample)
         );
-        assert!(
-            s.cache.lock().unwrap().as_ref().unwrap().load("USDBRL Curncy", Timeframe::D1, 6000).unwrap().is_empty()
-        );
+        assert!(s
+            .cache
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .load("USDBRL Curncy", Timeframe::D1, 6000)
+            .unwrap()
+            .is_empty());
     }
 
     #[test]
@@ -1848,6 +2068,8 @@ mod tests {
             archive_daily: Default::default(),
             cache: std::sync::Mutex::new(None),
             news: Default::default(),
+            price_alerts: Default::default(),
+            price_alerts_path: PathBuf::new(),
             db: Mutex::new(Db::open_in_memory().unwrap()),
             out,
             ctx: egui::Context::default(),
@@ -1914,6 +2136,34 @@ mod tests {
         let (s, _rx) = shared(std::sync::Arc::new(tr_data::sample::SampleProvider::at(0, 10)), None);
         let batch = fetch_news(&s, Some(vec!["AAPL US Equity".into()])).await;
         assert!(batch.sample && batch.items.is_empty());
+    }
+
+    #[tokio::test]
+    async fn sample_price_alerts_are_not_invented() {
+        let (s, rx) = shared(std::sync::Arc::new(tr_data::sample::SampleProvider::at(0, 10)), None);
+        handle(
+            &s,
+            Request::AddPriceAlert {
+                symbol: "AAPL US Equity".into(),
+                kind: tr_data::price_alerts::AlertKind::Price {
+                    side: tr_data::price_alerts::PriceSide::Above,
+                    level: 1.0,
+                },
+            },
+        )
+        .await;
+        let mut feed = None;
+        while let Ok(r) = rx.try_recv() {
+            match r {
+                Response::PriceAlertFeed(batch) => feed = Some(batch),
+                Response::NewPriceAlerts(_) => panic!("sample must not invent price alerts"),
+                _ => {}
+            }
+        }
+        let batch = feed.expect("sample eval still publishes a feed");
+        assert!(batch.sample);
+        assert!(batch.events.is_empty());
+        assert_eq!(batch.rules.len(), 1);
     }
 
     #[test]

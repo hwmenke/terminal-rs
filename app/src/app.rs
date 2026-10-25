@@ -4,6 +4,7 @@
 //! drag and drop, pop-out windows, link groups, saved layouts), `panels` (per-kind pane
 //! content) and `settings_view` (preferences UI).
 
+mod alerts;
 mod broker;
 mod chrome;
 mod command_bar;
@@ -27,11 +28,11 @@ pub use broker::PosSort;
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
-use egui::{Color32, Event, Key, Modifiers, Rect, Ui, UiBuilder, pos2, vec2};
+use egui::{pos2, vec2, Color32, Event, Key, Modifiers, Rect, Ui, UiBuilder};
 use serde::{Deserialize, Serialize};
 use tr_chart::drawings::Tool;
-use tr_congress::Trade;
 use tr_congress::db::{Alert, PoliticianSummary};
+use tr_congress::Trade;
 use tr_data::{OrderBook, Quote, SearchHit, YieldCurves};
 
 use crate::anim;
@@ -44,9 +45,9 @@ use crate::layouts::{LayoutDoc, Link, PaneSettings, Store, WindowGeometry};
 use crate::markets_view;
 use crate::prefs::{self, Prefs};
 use crate::theme;
-use crate::worker::{Profile, Request, Response, Worker, data_dir};
+use crate::worker::{data_dir, Profile, Request, Response, Worker};
 
-use chrome::{SIDEBAR_W, STATUS_H, SidebarCmd};
+use chrome::{SidebarCmd, SIDEBAR_W, STATUS_H};
 use settings_view::SettingsTab;
 
 pub enum PaneKind {
@@ -594,6 +595,9 @@ pub struct TerminalApp {
     politicians: Vec<PoliticianSummary>,
     pol_search: String,
     alerts: Vec<Alert>,
+    price_alerts: tr_data::price_alerts::AlertBatch,
+    alert_draft: alerts::AlertDraft,
+    last_price_alerts: Option<Instant>,
     congress_status: String,
     /// When the last Congress ingest finished.
     congress_checked: Option<chrono::DateTime<chrono::Local>>,
@@ -762,6 +766,9 @@ impl TerminalApp {
             politicians: Vec::new(),
             pol_search: String::new(),
             alerts: Vec::new(),
+            price_alerts: tr_data::price_alerts::AlertBatch::empty(0),
+            alert_draft: alerts::AlertDraft::default(),
+            last_price_alerts: None,
             congress_status: String::new(),
             congress_checked: None,
             watchlist: DEFAULT_WATCHLIST.map(String::from).to_vec(),
@@ -922,6 +929,8 @@ impl TerminalApp {
             }
             Command::SymbolFunction(s, Function::Review) => self.open_review(Some(&s)),
             Command::SymbolFunction(s, Function::Desk) => self.open_desk(Some(&s)),
+            Command::SymbolFunction(s, Function::SetPriceAlert(kind)) => self.set_price_alert(Some(s), kind),
+            Command::SymbolFunction(s, Function::ClearPriceAlert(_)) => self.clear_price_alert(&s),
             Command::SymbolFunction(s, f) => {
                 self.open_security(&s);
                 self.apply(f);
@@ -954,7 +963,18 @@ impl TerminalApp {
             Function::Untrack(q) => self.worker.send(Request::Track { query: q, on: false }),
             Function::Alerts => {
                 self.worker.send(Request::Alerts);
+                self.worker.send(Request::PriceAlerts);
+                self.worker.send(Request::EvaluatePriceAlerts);
                 self.open_panel(PaneKind::Alerts);
+            }
+            Function::SetPriceAlert(kind) => self.set_price_alert(symbol, kind),
+            Function::ClearPriceAlert(q) => {
+                let q = if q.trim().is_empty() {
+                    symbol.unwrap_or_else(|| self.focused_symbol().unwrap_or_default())
+                } else {
+                    q
+                };
+                self.clear_price_alert(&q);
             }
             Function::Refresh => self.worker.send(Request::RefreshCongress),
             Function::History(command) => {
@@ -1312,6 +1332,17 @@ impl TerminalApp {
                     }
                     self.worker.send(Request::Alerts);
                 }
+                Response::PriceAlertFeed(batch) => {
+                    self.price_alerts = batch;
+                    self.sync_chart_alerts();
+                }
+                Response::NewPriceAlerts(new) => {
+                    for a in new {
+                        tracing::info!("ALERT: {}", a.message);
+                        self.toasts.push((a.message, Instant::now()));
+                    }
+                    self.worker.send(Request::PriceAlerts);
+                }
                 Response::Status(s) => self.status = s,
                 Response::Curves(c) => self.curves = Some(c),
                 Response::SearchHits { query, hits } => self.net_hits = (query, hits),
@@ -1324,6 +1355,40 @@ impl TerminalApp {
                 }
             }
         }
+    }
+
+    fn set_price_alert(&mut self, symbol: Option<String>, kind: tr_data::price_alerts::AlertKind) {
+        let Some(symbol) = symbol.or_else(|| self.focused_symbol()) else {
+            self.status = "ALERT needs a ticker (AAPL ALERT 150 or AAPL ALERT SETUP NEAR_HIGH)".into();
+            return;
+        };
+        let symbol = tr_data::security(&symbol).key();
+        self.worker.send(Request::AddPriceAlert { symbol, kind });
+        self.worker.send(Request::Alerts);
+        self.open_panel(PaneKind::Alerts);
+    }
+
+    fn clear_price_alert(&mut self, query: &str) {
+        if query.trim().is_empty() {
+            self.status = "UNALERT needs a ticker or rule".into();
+            return;
+        }
+        self.worker.send(Request::RemovePriceAlert { query: query.to_string() });
+        self.open_panel(PaneKind::Alerts);
+    }
+
+    fn sync_chart_alerts(&mut self) {
+        for pane in &mut self.panes {
+            if let PaneKind::Chart(c) = &mut pane.kind {
+                c.set_alert_rules(
+                    self.price_alerts.rules.iter().filter(|r| r.enabled && r.symbol == c.symbol).cloned().collect(),
+                );
+            }
+        }
+    }
+
+    fn unread_alerts(&self) -> usize {
+        self.alerts.iter().filter(|a| !a.seen).count() + self.price_alerts.unread()
     }
 
     /// Freshness line for the Congress feed: last check, newest filing, next check.
@@ -1709,6 +1774,13 @@ impl TerminalApp {
             self.worker.send(Request::Latest { limit: 2_000 });
             self.last_feed = Some(Instant::now());
         }
+        if self.price_alerts.rules.iter().any(|r| r.enabled)
+            && self.last_price_alerts.is_none_or(|t| t.elapsed() > Duration::from_secs(20))
+        {
+            self.worker.send(Request::EvaluatePriceAlerts);
+            self.last_price_alerts = Some(Instant::now());
+        }
+        self.sync_chart_alerts();
         self.save_dirty_themes(false);
         if self.last_save.elapsed() > Duration::from_secs(10) {
             self.autosave();
@@ -1764,7 +1836,11 @@ fn native_chrome(_frame: &eframe::Frame) -> Option<tr_macos::Chrome> {
 
 impl eframe::App for TerminalApp {
     fn clear_color(&self, visuals: &egui::Visuals) -> [f32; 4] {
-        if self.vibrancy { [0.0; 4] } else { visuals.window_fill.to_normalized_gamma_f32() }
+        if self.vibrancy {
+            [0.0; 4]
+        } else {
+            visuals.window_fill.to_normalized_gamma_f32()
+        }
     }
 
     fn ui(&mut self, ui: &mut Ui, frame: &mut eframe::Frame) {
@@ -2006,6 +2082,9 @@ mod tests {
             politicians: Vec::new(),
             pol_search: String::new(),
             alerts: Vec::new(),
+            price_alerts: tr_data::price_alerts::AlertBatch::empty(0),
+            alert_draft: alerts::AlertDraft::default(),
+            last_price_alerts: None,
             congress_status: String::new(),
             congress_checked: None,
             watchlist: DEFAULT_WATCHLIST.map(String::from).to_vec(),

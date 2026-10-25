@@ -230,6 +230,10 @@ pub enum Function {
     Track(String),
     Untrack(String),
     Alerts,
+    /// `AAPL ALERT 150` / `AAPL ALERT SETUP NEAR_HIGH`.
+    SetPriceAlert(tr_data::price_alerts::AlertKind),
+    /// `UNALERT` / `UNALERT AAPL` — drop price/setup rules.
+    ClearPriceAlert(String),
     Refresh,
     History(String),
     Universe,
@@ -303,6 +307,42 @@ fn num<T: std::str::FromStr>(t: Option<&&str>) -> Option<T> {
     t.and_then(|s| s.parse().ok())
 }
 
+fn parse_setup_name(s: &str) -> Option<String> {
+    tr_data::price_alerts::normalize_setup(s)
+}
+
+/// `150` · `ABOVE 150` · `BELOW 150` · `NEAR_HIGH` · `SETUP NEAR_HIGH EXIT`.
+fn parse_alert_kind(rest: &[&str]) -> Option<tr_data::price_alerts::AlertKind> {
+    use tr_data::price_alerts::{AlertKind, PriceSide, SetupChange};
+    if rest.is_empty() {
+        return None;
+    }
+    let up: Vec<String> = rest.iter().map(|s| s.to_ascii_uppercase()).collect();
+    let first = up[0].as_str();
+    let change = |i: usize| match up.get(i).map(String::as_str) {
+        Some("EXIT" | "LEAVE" | "OFF") => SetupChange::Exit,
+        Some("EITHER" | "CHANGE" | "FLIP") => SetupChange::Either,
+        _ => SetupChange::Enter,
+    };
+    if first == "SETUP" {
+        let setup = parse_setup_name(up.get(1)?)?;
+        return Some(AlertKind::Setup { setup, change: change(2) });
+    }
+    if matches!(first, "ABOVE" | "OVER" | "GT") {
+        let level: f64 = rest.get(1)?.parse().ok()?;
+        return Some(AlertKind::Price { side: PriceSide::Above, level });
+    }
+    if matches!(first, "BELOW" | "UNDER" | "LT") {
+        let level: f64 = rest.get(1)?.parse().ok()?;
+        return Some(AlertKind::Price { side: PriceSide::Below, level });
+    }
+    if let Some(setup) = parse_setup_name(first) {
+        return Some(AlertKind::Setup { setup, change: change(1) });
+    }
+    let level: f64 = first.parse().ok()?;
+    (level.is_finite() && level > 0.0).then_some(AlertKind::Price { side: PriceSide::Above, level })
+}
+
 fn parse_function(head: &str, rest: &[&str]) -> Option<Function> {
     let up = head.to_ascii_uppercase();
     let words = || rest.iter().map(|s| s.to_ascii_uppercase()).collect::<Vec<_>>();
@@ -337,7 +377,10 @@ fn parse_function(head: &str, rest: &[&str]) -> Option<Function> {
         "POL" | "PROFILE" => Function::Politician(joined()),
         "TRACK" => Function::Track(joined()),
         "UNTRACK" => Function::Untrack(joined()),
-        "ALRT" | "ALERTS" | "ALERT" => Function::Alerts,
+        "ALRT" | "ALERTS" => Function::Alerts,
+        "ALERT" if rest.is_empty() => Function::Alerts,
+        "ALERT" => Function::SetPriceAlert(parse_alert_kind(rest)?),
+        "UNALERT" | "RMALERT" | "DELALERT" => Function::ClearPriceAlert(joined()),
         "REFRESH" | "SYNC" => Function::Refresh,
         "W" | "WL" | "WATCH" | "WATCHLIST" | "MON" => {
             if rest.is_empty() {
@@ -466,17 +509,20 @@ pub fn hint(input: &str) -> String {
 
 fn describe(f: &Function) -> String {
     match f {
-        Function::Timeframe(tf) => format!("Interval {}", match tf {
-            Timeframe::M1 => "1 minute",
-            Timeframe::M5 => "5 minutes",
-            Timeframe::M15 => "15 minutes",
-            Timeframe::M30 => "30 minutes",
-            Timeframe::H1 => "1 hour",
-            Timeframe::H4 => "4 hours",
-            Timeframe::D1 => "1 day",
-            Timeframe::W1 => "1 week",
-            Timeframe::MN1 => "1 month",
-        }),
+        Function::Timeframe(tf) => format!(
+            "Interval {}",
+            match tf {
+                Timeframe::M1 => "1 minute",
+                Timeframe::M5 => "5 minutes",
+                Timeframe::M15 => "15 minutes",
+                Timeframe::M30 => "30 minutes",
+                Timeframe::H1 => "1 hour",
+                Timeframe::H4 => "4 hours",
+                Timeframe::D1 => "1 day",
+                Timeframe::W1 => "1 week",
+                Timeframe::MN1 => "1 month",
+            }
+        ),
         Function::ChartType(c) => format!("Chart type {}", c.label()),
         Function::Indicator(i) => format!("Toggle {} — {}", i.label(), i.name()),
         Function::IndicatorPicker(q) if q.is_empty() => "Browse indicators".into(),
@@ -493,7 +539,10 @@ fn describe(f: &Function) -> String {
         Function::Politician(n) => format!("Politician profile: {n}"),
         Function::Track(n) => format!("Track {n} (alert on new filings)"),
         Function::Untrack(n) => format!("Stop tracking {n}"),
-        Function::Alerts => "Alerts".into(),
+        Function::Alerts => "Alerts: price levels, setup changes, and tracked filings".into(),
+        Function::SetPriceAlert(kind) => format!("Watch {}", kind.label()),
+        Function::ClearPriceAlert(q) if q.is_empty() => "Remove price/setup alerts for the focused name".into(),
+        Function::ClearPriceAlert(q) => format!("Remove price/setup alerts for {q}"),
         Function::Refresh => "Refresh congressional disclosures now".into(),
         Function::History(args) => format!("Price history {args}"),
         Function::Universe => "Browse Whats-News archive coverage".into(),
@@ -682,6 +731,39 @@ mod tests {
         assert_eq!(parse("LINK PINK"), None);
         assert_eq!(parse("AAPL CN"), Some(Command::SymbolFunction("AAPL US Equity".into(), Function::News)));
         assert_eq!(parse("NEWS"), Some(Command::Function(Function::News)));
+        assert_eq!(parse("ALERTS"), Some(Command::Function(Function::Alerts)));
+        assert_eq!(parse("ALERT"), Some(Command::Function(Function::Alerts)));
+        assert_eq!(
+            parse("AAPL ALERT 150"),
+            Some(Command::SymbolFunction(
+                "AAPL US Equity".into(),
+                Function::SetPriceAlert(tr_data::price_alerts::AlertKind::Price {
+                    side: tr_data::price_alerts::PriceSide::Above,
+                    level: 150.0,
+                })
+            ))
+        );
+        assert_eq!(
+            parse("AAPL ALERT BELOW 140"),
+            Some(Command::SymbolFunction(
+                "AAPL US Equity".into(),
+                Function::SetPriceAlert(tr_data::price_alerts::AlertKind::Price {
+                    side: tr_data::price_alerts::PriceSide::Below,
+                    level: 140.0,
+                })
+            ))
+        );
+        assert_eq!(
+            parse("NVDA ALERT SETUP NEAR_HIGH EXIT"),
+            Some(Command::SymbolFunction(
+                "NVDA US Equity".into(),
+                Function::SetPriceAlert(tr_data::price_alerts::AlertKind::Setup {
+                    setup: "NEAR_HIGH".into(),
+                    change: tr_data::price_alerts::SetupChange::Exit,
+                })
+            ))
+        );
+        assert_eq!(parse("UNALERT AAPL"), Some(Command::Function(Function::ClearPriceAlert("AAPL".into()))));
         assert_eq!(parse("TOP"), Some(Command::Function(Function::TopNews)));
         assert_eq!(
             parse("BTCUSD CRNCY OB 50"),
