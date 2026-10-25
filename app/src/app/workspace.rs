@@ -20,7 +20,7 @@ use crate::widgets::{self, Icon};
 use crate::worker::{Request, Worker};
 
 /// Panels offered by the + menus: label and command word.
-pub const PANELS: [(&str, &str); 16] = [
+pub const PANELS: [(&str, &str); 17] = [
     ("Chart", "CHART"),
     ("Watchlist", "WL"),
     ("News", "NEWS"),
@@ -34,6 +34,7 @@ pub const PANELS: [(&str, &str); 16] = [
     ("Alerts", "ALRT"),
     ("Journal", "JOURNAL"),
     ("Backtest", "BACKTEST"),
+    ("Lookalikes", "LOOKALIKE"),
     ("Security Search", "SECF"),
     ("Settings", "PREFS"),
     ("Help", "HELP"),
@@ -407,6 +408,15 @@ impl TerminalApp {
                 }
                 b.request(id, &self.worker);
                 PaneKind::Backtest(b)
+            }
+            PaneKind::Lookalike(mut l) => {
+                if l.symbol.trim().is_empty() {
+                    if let Some(sym) = self.focused_symbol() {
+                        l.symbol = sym;
+                    }
+                }
+                l.request(id, &self.worker);
+                PaneKind::Lookalike(l)
             }
             PaneKind::Ticker { symbol, .. } => {
                 self.worker.send(Request::TickerTrades { pane: id, symbol: symbol.clone() });
@@ -814,6 +824,11 @@ impl TerminalApp {
                 let symbol = given.or(current).unwrap_or_default();
                 let spec = words.get(1..).unwrap_or(&[]).join(" ");
                 PaneKind::Backtest(Box::new(super::backtest::BacktestPane::new(symbol, spec)))
+            }
+            "LOOKALIKE" | "LOOKALIKES" | "KNN" | "ANALOG" | "ANALOGUE" | "NN" => {
+                let symbol = given.or(current).unwrap_or_default();
+                let spec = words.get(1..).unwrap_or(&[]).join(" ");
+                PaneKind::Lookalike(Box::new(super::lookalike::LookalikePane::new(symbol, spec)))
             }
             "DESK" | "PM" | "PMDESK" | "RISK" => {
                 let group = words.get(1).cloned().unwrap_or(self.watch_ui.selected_group.as_str()).to_string();

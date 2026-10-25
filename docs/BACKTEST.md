@@ -101,5 +101,5 @@ the archive or this pane.
 
 ## Out of scope
 
-Step 15 historical lookalikes. Live order routing. SnapTrade / credentials.
-Parameter search on the evaluate window.
+Historical lookalikes are documented in [LOOKALIKE.md](LOOKALIKE.md). Live
+order routing. SnapTrade / credentials. Parameter search on the evaluate window.

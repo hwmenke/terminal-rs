@@ -14,6 +14,7 @@ mod demo;
 mod desk;
 mod hotkeys_view;
 mod journal;
+mod lookalike;
 mod options_view;
 mod palette_view;
 mod panels;
@@ -92,6 +93,8 @@ pub enum PaneKind {
     Stats(Box<stats::StatsPane>),
     /// Strategy vs buy-and-hold paper backtest (`BACKTEST` / `BT`).
     Backtest(Box<backtest::BacktestPane>),
+    /// Historical lookalikes / nearest neighbors (`LOOKALIKE` / `KNN`).
+    Lookalike(Box<lookalike::LookalikePane>),
     Settings,
 }
 
@@ -289,6 +292,13 @@ impl PaneKind {
                     format!("{} Backtest", tr_data::security(&b.symbol).ticker)
                 }
             }
+            PaneKind::Lookalike(l) => {
+                if l.symbol.trim().is_empty() {
+                    "Lookalikes".into()
+                } else {
+                    format!("{} Lookalikes", tr_data::security(&l.symbol).ticker)
+                }
+            }
             PaneKind::Settings => "Settings".into(),
         }
     }
@@ -322,6 +332,7 @@ impl PaneKind {
             PaneKind::Journal(_) => "JRNL",
             PaneKind::Stats(_) => "STATS",
             PaneKind::Backtest(_) => "BT",
+            PaneKind::Lookalike(_) => "KNN",
             PaneKind::Settings => "PDF",
         }
     }
@@ -414,6 +425,14 @@ impl PaneKind {
                 slippage: b.slippage.clone(),
                 shorts: b.allow_short,
             },
+            PaneKind::Lookalike(l) => PaneSettings::Lookalike {
+                symbol: l.symbol.clone(),
+                spec: l.spec.clone(),
+                as_of: l.as_of.clone(),
+                k: l.k.clone(),
+                gap: l.gap.clone(),
+                horizons: l.horizons.clone(),
+            },
         }
     }
 
@@ -495,6 +514,22 @@ impl PaneKind {
                 pane.slippage = slippage;
                 pane.allow_short = shorts;
                 PaneKind::Backtest(Box::new(pane))
+            }
+            PaneSettings::Lookalike { symbol, spec, as_of, k, gap, horizons } => {
+                let mut pane = lookalike::LookalikePane::new(symbol, spec);
+                if !as_of.is_empty() {
+                    pane.as_of = as_of;
+                }
+                if !k.is_empty() {
+                    pane.k = k;
+                }
+                if !gap.is_empty() {
+                    pane.gap = gap;
+                }
+                if !horizons.is_empty() {
+                    pane.horizons = horizons;
+                }
+                PaneKind::Lookalike(Box::new(pane))
             }
         }
     }
@@ -923,6 +958,7 @@ impl TerminalApp {
         for a in actions {
             match a {
                 Action::OpenArchiveChart(s) => self.open_list_symbol(&s, true, None),
+                Action::OpenArchiveAt { symbol, ts } => self.open_archive_at(&symbol, ts),
                 Action::WatchChart(group, symbol, archive) => self.open_list_symbol(&symbol, archive, Some(group)),
                 Action::OpenChart(s) => self.open_security(&s),
                 Action::OpenTicker(s) => {
@@ -999,6 +1035,8 @@ impl TerminalApp {
                 self.open_stats(Some(&s), &condition, conditional)
             }
             Command::SymbolFunction(s, Function::Backtest { spec }) => self.open_backtest(Some(&s), &spec),
+            Command::SymbolFunction(s, Function::Lookalike { spec }) => self.open_lookalike(Some(&s), &spec),
+            Command::SymbolFunction(s, Function::Goto { date }) => self.goto_chart_date(Some(&s), &date),
             Command::SymbolFunction(s, Function::JournalNote { date, text }) => {
                 self.add_journal_note(Some(&s), &date, &text)
             }
@@ -1078,7 +1116,7 @@ impl TerminalApp {
                     }
                     None => {
                         self.status = format!(
-                            "Unknown panel {spec:?}; try CHART, NEWS, BOOK, WEI, GC, CONG, WL, DESK, JOURNAL, STATS, BACKTEST, PORT"
+                            "Unknown panel {spec:?}; try CHART, NEWS, BOOK, WEI, GC, CONG, WL, DESK, JOURNAL, STATS, BACKTEST, LOOKALIKE, PORT"
                         )
                     }
                 }
@@ -1171,6 +1209,8 @@ impl TerminalApp {
             Function::Journal(extra) => self.open_journal(symbol.as_deref(), &extra),
             Function::Stats { condition, conditional } => self.open_stats(symbol.as_deref(), &condition, conditional),
             Function::Backtest { spec } => self.open_backtest(symbol.as_deref(), &spec),
+            Function::Lookalike { spec } => self.open_lookalike(symbol.as_deref(), &spec),
+            Function::Goto { date } => self.goto_chart_date(symbol.as_deref(), &date),
             Function::JournalNote { date, text } => self.add_journal_note(symbol.as_deref(), &date, &text),
             Function::Latest => self.with_chart(|c, _| c.jump_latest()),
             Function::ReviewOverlay(which) => self.with_chart(|c, _| match which {
@@ -1239,6 +1279,7 @@ impl TerminalApp {
                             PaneKind::Chart(c) if c.archive => c.load(&self.worker),
                             PaneKind::Stats(s) => s.request(pane.id, &self.worker),
                             PaneKind::Backtest(b) => b.request(pane.id, &self.worker),
+                            PaneKind::Lookalike(l) => l.request(pane.id, &self.worker),
                             _ => {}
                         }
                     }
@@ -1287,6 +1328,13 @@ impl TerminalApp {
                         self.panes.iter_mut().find(|p| p.id == pane).map(|p| &mut p.kind)
                     {
                         b.accept(generation, result);
+                    }
+                }
+                Response::Lookalike { pane, generation, result } => {
+                    if let Some(PaneKind::Lookalike(l)) =
+                        self.panes.iter_mut().find(|p| p.id == pane).map(|p| &mut p.kind)
+                    {
+                        l.accept(generation, result);
                     }
                 }
                 Response::History {

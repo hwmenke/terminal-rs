@@ -66,6 +66,13 @@ pub enum Request {
         slippage_bps: f64,
         allow_short: bool,
     },
+    /// Historical lookalikes / nearest neighbors for one archive symbol.
+    Lookalike {
+        pane: PaneId,
+        generation: u64,
+        symbol: String,
+        query: tr_data::lookalike::LookalikeQuery,
+    },
     ArchiveHistory {
         pane: PaneId,
         generation: u64,
@@ -313,6 +320,11 @@ pub enum Response {
         pane: PaneId,
         generation: u64,
         result: Result<tr_data::backtest::BacktestReport, String>,
+    },
+    Lookalike {
+        pane: PaneId,
+        generation: u64,
+        result: Result<tr_data::lookalike::LookalikeReport, String>,
     },
     Portfolio(Result<Box<tr_broker::Portfolio>, String>),
     /// `(userId, userSecret)` for a newly registered SnapTrade user.
@@ -951,6 +963,64 @@ async fn research_backtest(
     Ok(report)
 }
 
+/// Load one name from the local archive, then Whats-News. Sample/display bars never enter.
+async fn research_lookalike(
+    s: &Shared,
+    bridge: &tr_data::whats_news::Bridge,
+    key: &str,
+    query: &tr_data::lookalike::LookalikeQuery,
+) -> anyhow::Result<tr_data::lookalike::LookalikeReport> {
+    use tr_data::whats_news::archive_ticker;
+    let ticker = archive_ticker(key);
+    if ticker.is_empty() {
+        anyhow::bail!("Lookalikes refused: invalid security");
+    }
+    let wanted = ticker.clone();
+    let local = s.history.db(move |db| db.daily(&wanted)).await?;
+    let mut source = "Local Yahoo daily research archive".to_string();
+    let bars = if !local.is_empty() {
+        tr_data::lookalike::require_lookalike_bars(&local, "Lookalikes").map_err(anyhow::Error::msg)?;
+        local
+    } else if bridge.enabled {
+        match bridge.histories_for(std::slice::from_ref(&ticker)).await {
+            Ok(external) => {
+                external.provenance.require_verified("Lookalike archive").map_err(anyhow::Error::msg)?;
+                source = format!("{} + {}", source, external.source);
+                if let Some(skip) = external.data.skipped.iter().find(|s| s.symbol.eq_ignore_ascii_case(&ticker)) {
+                    anyhow::bail!("Lookalikes refused: {}: {}", skip.symbol, skip.reason);
+                }
+                let bars = external
+                    .data
+                    .bars
+                    .into_iter()
+                    .find(|(s, _)| s.eq_ignore_ascii_case(&ticker))
+                    .map(|(_, b)| b)
+                    .unwrap_or_default();
+                tr_data::lookalike::require_lookalike_bars(&bars, "Lookalikes").map_err(anyhow::Error::msg)?;
+                bars
+            }
+            Err(e) if tr_data::whats_news::is_unverified(&e) => return Err(e),
+            Err(e) => anyhow::bail!(
+                "Lookalikes refused: no daily history in the local research archive, and Whats-News is unavailable ({e:#}). Sample/display prices are never used."
+            ),
+        }
+    } else {
+        anyhow::bail!(
+            "Lookalikes refused: no daily history for {ticker} in the local research archive. Sample/display prices are never used."
+        );
+    };
+    let key = tr_data::security(key).key();
+    let report = tokio::task::spawn_blocking({
+        let source = source.clone();
+        let ticker = ticker.clone();
+        let query = query.clone();
+        move || tr_data::lookalike::compute_report(&key, &ticker, &bars, &query, &source)
+    })
+    .await?
+    .map_err(anyhow::Error::msg)?;
+    Ok(report)
+}
+
 /// Load only the requested watchlist tickers. Sample/unverified history is refused.
 async fn research_desk(
     s: &Shared,
@@ -1175,6 +1245,14 @@ async fn handle(s: &Arc<Shared>, req: Request) {
                 )
                 .await
                 .map_err(|e| format!("{e:#}")),
+            });
+        }
+        Request::Lookalike { pane, generation, symbol, query } => {
+            let bridge = config.bridge();
+            send(Response::Lookalike {
+                pane,
+                generation,
+                result: research_lookalike(s, &bridge, &symbol, &query).await.map_err(|e| format!("{e:#}")),
             });
         }
         Request::ArchiveHistory { pane, generation, symbol, tf, limit, before } => {
@@ -2130,6 +2208,53 @@ mod tests {
         assert!(snap.stats.source.contains("Local Yahoo"));
         assert_eq!(snap.stats.ticker, "AAPL");
         assert_eq!(snap.conditional.by_horizon[0].baseline.count, snap.stats.bars.saturating_sub(5));
+    }
+
+    #[tokio::test]
+    async fn lookalikes_use_the_research_archive_and_never_sample_fallback() {
+        let (s, _) = shared(Arc::new(tr_data::sample::SampleProvider::at(0, 10)), None);
+        let config = tr_data::whats_news::Config { enabled: false, ..Default::default() };
+        s.whats_news.send_replace((0, config.clone()));
+        let query = tr_data::lookalike::LookalikeQuery { k: 5, horizons: vec![5], as_of: None, gap: 5 };
+        let err = research_lookalike(&s, &config.bridge(), "AAPL US Equity", &query).await.unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("refused") || msg.contains("no daily history"), "{msg}");
+        assert!(!msg.to_ascii_lowercase().contains("fallback"));
+
+        struct LongArchive;
+        #[async_trait::async_trait]
+        impl tr_data::history::DailyHistory for LongArchive {
+            async fn daily(
+                &self,
+                _: &str,
+                _: Option<chrono::NaiveDate>,
+                _: chrono::NaiveDate,
+            ) -> Result<Vec<Bar>, tr_data::history::Failure> {
+                let start = chrono::NaiveDate::from_ymd_opt(2024, 1, 2).unwrap();
+                Ok((0..180)
+                    .map(|i| {
+                        let d = start + chrono::Duration::days(i);
+                        let c = 80.0 + i as f64 * 0.15;
+                        Bar::new(d.and_hms_opt(0, 0, 0).unwrap().and_utc().timestamp(), c, c + 1.0, c - 1.0, c, 1_000.0)
+                            .with_provenance(tr_core::Provenance::Real)
+                    })
+                    .collect())
+            }
+        }
+        let (mut s, _) = shared(Arc::new(tr_data::sample::SampleProvider::at(0, 10)), None);
+        Arc::get_mut(&mut s).unwrap().history = Arc::new(tr_data::history::Service::new(
+            tr_data::history::Archive::memory().unwrap(),
+            Arc::new(LongArchive),
+            tr_data::history::Policy { spacing: Duration::ZERO, ..Default::default() },
+        ));
+        s.whats_news.send_replace((0, config.clone()));
+        s.history.run("ADD", tr_data::history::universe::resolve("AAPL").unwrap(), |_| {}).await.unwrap();
+        s.history.run("REFRESH", vec![], |_| {}).await.unwrap();
+        let report = research_lookalike(&s, &config.bridge(), "AAPL US Equity", &query).await.unwrap();
+        assert!(report.provenance.is_verified());
+        assert!(report.source.contains("Local Yahoo"));
+        assert_eq!(report.ticker, "AAPL");
+        assert_eq!(report.by_horizon[0].completed_n + report.by_horizon[0].incomplete_n, report.selected_n);
     }
     #[tokio::test]
     async fn whats_news_weekly_rows_are_ignored_in_favor_of_all_daily_rows() {

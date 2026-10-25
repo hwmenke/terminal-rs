@@ -17,7 +17,8 @@ import/export.
 | `EXPORT HIST` | Local Yahoo research archive: per-symbol source (`yahoo`), session dates, provenance and daily OHLCV |
 | `EXPORT STATS` | Statistics / conditional-return snapshot: source, as-of, provenance, baselines, completed N |
 | `EXPORT BACKTEST` | Paper backtest: source, as-of, costs, fill rule, holdout dates, completed-trade metrics |
-| `EXPORT` | The focused scan / history / journal / stats / backtest pane, or Settings › Backup |
+| `EXPORT LOOKALIKE` | Lookalikes: source, as-of, requested K, selected N, discarded overlap, per-horizon completed / incomplete counts, neighbors |
+| `EXPORT` | The focused scan / history / journal / stats / backtest / lookalike pane, or Settings › Backup |
 | `BACKUP` | Personal workspace (see below) |
 
 SCAN / UNIV / HIST / JOURNAL panes also have an **Export** button.
@@ -49,6 +50,7 @@ or the Congress database.
 | `scan` | Refused — open the JSON yourself |
 | `stats` | Refused — open the JSON yourself |
 | `backtest` | Refused — open the JSON yourself |
+| `lookalike` | Refused — open the JSON yourself |
 
 ## Sample-data isolation
 
@@ -58,7 +60,7 @@ A sample chart date on a journal setup, or a sample scan snapshot, labels the wh
 
 Those files are named `terminal-rs-<kind>-SAMPLE-<date>.json`. History restore still refuses
 sample bars so they cannot enter the research archive. Statistics and backtest exports
-are snapshots and are not loaded back into `STATS` / `BACKTEST`.
+are snapshots and are not loaded back into `STATS` / `BACKTEST` / `LOOKALIKE`.
 
 ## Commands
 
@@ -70,5 +72,6 @@ are snapshots and are not loaded back into `STATS` / `BACKTEST`.
 | `EXPORT HIST [path]` | Archive daily history JSON |
 | `EXPORT STATS [path]` | Statistics / conditional-return JSON |
 | `EXPORT BACKTEST [path]` | Paper backtest JSON (costs, holdout, execution) |
+| `EXPORT LOOKALIKE [path]` | Lookalike JSON (counts, overlap, neighbors) |
 | `BACKUP [path]` | Workspace backup |
 | `RESTORE <path>` | Restore workspace, journal, or history |

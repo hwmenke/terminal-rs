@@ -153,6 +153,21 @@ pub enum PaneSettings {
         #[serde(default)]
         shorts: bool,
     },
+    /// Historical lookalikes for one research symbol.
+    Lookalike {
+        #[serde(default)]
+        symbol: String,
+        #[serde(default)]
+        spec: String,
+        #[serde(default)]
+        as_of: String,
+        #[serde(default)]
+        k: String,
+        #[serde(default)]
+        gap: String,
+        #[serde(default)]
+        horizons: String,
+    },
     /// Brokerage portfolio view (credentials are never stored in layouts).
     Portfolio {
         #[serde(default)]

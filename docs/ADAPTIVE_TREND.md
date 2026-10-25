@@ -63,5 +63,6 @@ LB 40/2/120, min-hold 10 bars).
 ## Out of scope
 
 `BACKTEST` / `AAPL BT ADTREND` can compare this study to buy-and-hold on an
-unseen holdout; see [BACKTEST.md](BACKTEST.md). Step 15 lookalikes are later.
+unseen holdout; see [BACKTEST.md](BACKTEST.md). Historical lookalikes are
+documented in [LOOKALIKE.md](LOOKALIKE.md).
 This study does not place live orders or change STATS / SCAN.
