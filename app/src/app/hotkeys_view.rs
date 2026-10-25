@@ -336,6 +336,7 @@ impl TerminalApp {
                     (&["REVIEW", "AAPL REVIEW"], "Linked daily + weekly archive charts for candidate review"),
                     (&["LATEST", "END"], "Jump to the latest candle (keeps zoom)"),
                     (&["BOX", "RS", "VCTX"], "Toggle box levels, 21-bar return, volume context"),
+                    (&["ADTREND", "ATREND"], "Adaptive Trend bands, regime flips, MRT/LRT stops (verified bars)"),
                 ],
             );
             para(

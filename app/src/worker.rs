@@ -251,6 +251,10 @@ pub struct CapsError {
 pub struct BuiltIndicator {
     pub spec: IndicatorSpec,
     pub overlays: Vec<(String, Overlay)>,
+    /// Set when a research overlay refused sample / unverified bars.
+    pub refused: Option<String>,
+    /// Last-bar HUD for research overlays (regimes and trailing stops).
+    pub note: Option<String>,
 }
 
 pub struct Profile {
@@ -615,6 +619,16 @@ pub fn build_indicators(
         .iter()
         .enumerate()
         .map(|(i, spec)| {
+            if spec.def().is_some_and(|d| d.research) {
+                if let Err(error) = tr_core::indicators::require_adaptive_bars(bars, spec.name()) {
+                    return BuiltIndicator {
+                        spec: spec.clone(),
+                        overlays: Vec::new(),
+                        refused: Some(error),
+                        note: None,
+                    };
+                }
+            }
             let main = palette.series[i % colors];
             let mut outputs = spec.compute(&input);
             // Columns first, so lines and markers draw over them.
@@ -640,7 +654,14 @@ pub fn build_indicators(
                     (o.name.to_string(), overlay(&o.values, color, kind))
                 })
                 .collect();
-            BuiltIndicator { spec: spec.clone(), overlays }
+            let note = (spec.code == "ADTREND").then(|| {
+                tr_core::indicators::adaptive_trend(
+                    &input.d,
+                    tr_core::indicators::AdaptiveTrendParams::from_registry(&spec.params),
+                )
+                .hud()
+            });
+            BuiltIndicator { spec: spec.clone(), overlays, refused: None, note }
         })
         .collect()
 }
@@ -2211,6 +2232,34 @@ mod tests {
         let pairs = up.data[..up.offsets[1]].chunks(2).filter(|c| c.iter().any(|p| p[1].is_finite())).count();
         assert_eq!(up.data[up.offsets[1]..up.offsets[2]].iter().filter(|p| p[1].is_finite()).count(), pairs);
         assert!(built[4].overlays.iter().all(|(_, o)| o.kind == LineKind::Steps));
+    }
+
+    #[test]
+    fn adaptive_trend_overlays_refuse_sample_and_draw_on_verified() {
+        let sample = tr_core::sample::generate("X", Timeframe::D1, 300, 1_790_000_000);
+        assert!(sample.iter().all(|b| b.provenance == tr_core::Provenance::Sample));
+        let palette = crate::themes::terminal_light().palette(theme::DEFAULT_ACCENT);
+        let spec = IndicatorSpec::new("ADTREND", &[]).unwrap();
+        let refused = build_indicators(&sample, Timeframe::D1, std::slice::from_ref(&spec), &palette);
+        assert!(refused[0].overlays.is_empty(), "sample bars must not draw Adaptive Trend");
+        let msg = refused[0].refused.as_deref().unwrap_or("");
+        assert!(msg.contains("SAMPLE"), "{msg}");
+        assert!(msg.contains("never drive") || msg.contains("refused"), "{msg}");
+        assert!(refused[0].note.is_none());
+
+        let verified: Vec<Bar> = sample
+            .iter()
+            .map(|b| {
+                Bar::new(b.ts, b.open, b.high, b.low, b.close, b.volume).with_provenance(tr_core::Provenance::Real)
+            })
+            .collect();
+        let drawn = build_indicators(&verified, Timeframe::D1, &[spec], &palette);
+        assert!(drawn[0].refused.is_none());
+        assert!(drawn[0].overlays.len() >= 8, "baselines, bands, stops and flips");
+        assert!(drawn[0].note.as_deref().unwrap_or("").contains("AT"));
+        assert!(drawn[0].overlays.iter().any(|(n, _)| n == "SB"));
+        assert!(drawn[0].overlays.iter().any(|(n, o)| n == "MRT" && o.kind == LineKind::Line));
+        assert!(drawn[0].overlays.iter().any(|(n, o)| n == "Long flip" && o.kind == LineKind::Dots));
     }
 
     #[test]

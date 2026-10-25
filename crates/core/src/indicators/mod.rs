@@ -14,6 +14,7 @@
 
 use crate::Bar;
 
+mod adaptive;
 mod levels;
 mod ma;
 mod momentum;
@@ -23,6 +24,7 @@ mod trend;
 mod volatility;
 mod volume;
 
+pub use adaptive::*;
 pub use levels::*;
 pub use ma::*;
 pub use momentum::*;

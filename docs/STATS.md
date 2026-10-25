@@ -73,4 +73,5 @@ named `SAMPLE` and is not restored into the archive or this pane.
 
 ## Out of scope
 
-Adaptive Trend overlays, backtests and lookalike search are later steps.
+Backtests and lookalike search are later steps. Adaptive Trend overlays are
+documented in [ADAPTIVE_TREND.md](ADAPTIVE_TREND.md).

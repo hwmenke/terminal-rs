@@ -48,15 +48,15 @@ gets the native title bar with traffic lights, window vibrancy behind the sideba
   matches across all asset classes (catalog instantly, plus Yahoo search after a short pause);
   ↑/↓, Tab, Enter; history with ↑/↓. `SECF gold cmdty` opens a full search panel.
 - **Charts** — GPU-rendered candles, OHLC bars, line and area; 1m, 5m, 15m, 30m, 1H, 4H, 1D, 1W,
-  1M plus quick ranges (1D … ALL); volume; 151 indicators; `CMP <SYM>` compare; log scale;
+  1M plus quick ranges (1D … ALL); volume; 152 indicators; `CMP <SYM>` compare; log scale;
   crosshair with OHLC legend; smooth pan and zoom over a million bars. Live crypto bars from the
   Binance websocket (Coinbase fallback).
-- **Indicators** — 151 built-in studies: 23 moving averages (SMA, EMA, WMA, Hull, DEMA/TEMA, KAMA,
+- **Indicators** — 152 built-in studies: 23 moving averages (SMA, EMA, WMA, Hull, DEMA/TEMA, KAMA,
   ALMA, T3, McGinley, VIDYA, FRAMA, MAMA/FAMA, Ehlers filters, GMMA…), 8 bands and channels
   (Bollinger, Keltner, Donchian, STARC, standard-error and VWAP bands…), 43 momentum oscillators
   (RSI, MACD, Stochastic, StochRSI, CCI, Williams %R, TSI, KST, Fisher, Schaff, QQE, WaveTrend,
-  Connors RSI…), 22 trend tools (ADX/DMI, Aroon, Vortex, Parabolic SAR, SuperTrend, Ichimoku,
-  Alligator, ZigZag, fractals, Chandelier and Chande Kroll stops…), 16 volatility measures (ATR,
+  Connors RSI…), 23 trend tools (ADX/DMI, Aroon, Vortex, Parabolic SAR, SuperTrend, Ichimoku,
+  Alligator, ZigZag, fractals, Chandelier, Chande Kroll and Adaptive Trend…), 16 volatility measures (ATR,
   close-to-close and Parkinson, Garman-Klass, Rogers-Satchell and Yang-Zhang estimators, Ulcer,
   Mass index, squeeze momentum…), 23 volume studies (OBV, A/D, CMF, MFI, Klinger, NVI/PVI, VZO…),
   11 rolling statistics and five pivot-point families. Type a code with optional parameters
@@ -224,6 +224,10 @@ gets the native title bar with traffic lights, window vibrancy behind the sideba
   filter to the unconditional baseline. Only completed outcomes count; overlapping
   windows report effective N = N / H. Sample bars are refused. See
   [Statistics](docs/STATS.md).
+- **Adaptive Trend overlays** — `ADTREND` (or `ATREND`) draws Whats-News Adaptive
+  Trend on the chart: SB/MB/LB baselines, destination bands, medium-regime flips
+  and MRT/LRT trailing-stop guides. Sample / unverified bars are refused. See
+  [Adaptive Trend](docs/ADAPTIVE_TREND.md).
 - **Export and recovery** — `EXPORT SCAN`, `EXPORT JOURNAL`, `EXPORT HIST` and
   `EXPORT STATS` write JSON
   with source, as-of date and provenance. Sample-tagged rows name the file `SAMPLE`.
@@ -370,7 +374,7 @@ Settings › Hotkeys. On Linux and Windows ⌘ is Ctrl and ⌥ is Alt.
 | `AAPL` · `AAPL US EQUITY <GO>` | load a security in the focused chart |
 | `BTCUSD <CRNCY>` · `EURUSD <CRNCY>` · `US10Y <GOVT>` · `CL1 <CMDTY>` · `SPX <INDEX>` | other asset classes |
 | `5` `1H` `D` `1W` `1M` · `YTD` `5Y` `ALL` | interval · quick range |
-| `RSI` `MACD` `SMA 200` `BB 20 2.5` · `IND` `IND VOLUME` · `CLEAR` | toggle any of the 151 indicators (optional parameters) · indicator picker · remove all |
+| `RSI` `MACD` `SMA 200` `BB 20 2.5` `ADTREND` · `IND` `IND VOLUME` · `CLEAR` | toggle any of the 152 indicators (optional parameters) · indicator picker · remove all |
 | `CMP MSFT` · `LOG` · `CANDLE` `BAR` `LINE` `AREA` | compare · log scale · chart type |
 | `NEWS` · `AAPL CN` · `TOP` · `BTCUSD CRNCY OB` · `WEI` · `GC` | watchlist news · one name · top headlines · order book · markets · curve |
 | `CONG` · `NVDA CONG` · `POL PELOSI` · `TRACK PELOSI` · `ALERTS` · `REFRESH` | Congress feed · who traded it · profile · track · alerts · refresh |
@@ -449,7 +453,7 @@ Measured on Linux with Mesa **llvmpipe (a CPU software rasterizer)** — a real 
   is the benchmark above).
 - **Indicators over 1M bars** (`cargo bench -p tr-core`): SMA 1.8 ms, EMA 2.2 ms, VWAP 7.0 ms,
   Bollinger 29 ms; RSI and MACD are single-pass (≈ 12 ms and 26 ms including first-touch of their
-  output memory). The whole 151-indicator catalogue at default parameters over 100k one-minute
+  output memory). The whole 152-indicator catalogue at default parameters over 100k one-minute
   bars takes ≈ 134 ms on macOS (Ichimoku, the slowest, 6.6 ms).
 
 ## Tests

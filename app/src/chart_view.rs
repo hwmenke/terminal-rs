@@ -4,8 +4,8 @@
 use std::sync::Arc;
 
 use egui::{
-    pos2, vec2, Align2, Color32, CornerRadius, CursorIcon, Pos2, Rect, RichText, Sense, Stroke, StrokeKind, Ui,
-    UiBuilder,
+    Align2, Color32, CornerRadius, CursorIcon, Pos2, Rect, RichText, Sense, Stroke, StrokeKind, Ui, UiBuilder, pos2,
+    vec2,
 };
 use tr_chart::drawings::{self, Anchor, Drawing, Shape, Tool};
 use tr_chart::gpu::{ChartCallback, Frame, LineKind, LineRef, Reveal, Style};
@@ -20,7 +20,7 @@ use crate::command::{IndicatorSpec, Range};
 use crate::congress_view::Action;
 use crate::theme::{self, amber, amber_dim, mono, muted, text, ui_font};
 use crate::widgets;
-use crate::worker::{archive_page, initial_limit, BuiltIndicator, PaneId, Request, Worker};
+use crate::worker::{BuiltIndicator, PaneId, Request, Worker, archive_page, initial_limit};
 
 const AXIS_W: f32 = 66.0;
 const TIME_H: f32 = 16.0;
@@ -1321,6 +1321,16 @@ impl ChartState {
             .on_hover_text("21-bar close return of this series — not SPY-relative");
         ui.checkbox(&mut self.show_volume_ctx, "Volume context")
             .on_hover_text("This bar versus the prior 20, plus 5/20");
+        let adaptive_on = self.indicators.iter().any(|s| s.code == "ADTREND");
+        if ui
+            .checkbox(&mut adaptive_on.clone(), "Adaptive Trend")
+            .on_hover_text("SB/MB/LB bands, regime flips, MRT/LRT stops — verified bars only; saved with the layout")
+            .clicked()
+        {
+            if let Some(spec) = IndicatorSpec::new("ADTREND", &[]) {
+                self.toggle_indicator(spec, w);
+            }
+        }
         ui.separator();
         if ui.button("Add to Watchlist").clicked() {
             self.actions.push(Action::AddToWatchlist(self.symbol.clone()));
@@ -1372,11 +1382,8 @@ impl ChartState {
             ui.close();
         }
         if ui.button(if date.is_empty() { "Note this date…".into() } else { format!("Note {date}…") }).clicked() {
-            let cmd = if date.is_empty() {
-                format!("{} NOTE", self.symbol)
-            } else {
-                format!("{} NOTE {date}", self.symbol)
-            };
+            let cmd =
+                if date.is_empty() { format!("{} NOTE", self.symbol) } else { format!("{} NOTE {date}", self.symbol) };
             self.actions.push(Action::Command(cmd));
             ui.close();
         }
@@ -1461,6 +1468,7 @@ impl ChartState {
             ly += 14.0;
         }
         ly = self.paint_review_hud(&p, price_rect, ly);
+        ly = self.paint_adaptive_hud(&p, price_rect, ly);
         if let Some(tool) = self.draw.tool {
             let msg = if self.draw.pending.is_some() {
                 "click second point (Esc cancels)"
@@ -1516,6 +1524,25 @@ impl ChartState {
             let five = ctx.vol_ratio_5_20.map(|v| format!("5/20 {v:.2}")).unwrap_or_else(|| "5/20 —".into());
             put(ly, format!("VOL  {ratio}  · {five}  · {}", ctx.volume_note), muted());
             ly += 14.0;
+        }
+        ly
+    }
+
+    fn paint_adaptive_hud(&self, p: &egui::Painter, price_rect: Rect, mut ly: f32) -> f32 {
+        for bi in self.built.iter().filter(|b| b.spec.code == "ADTREND") {
+            if let Some(msg) = &bi.refused {
+                p.text(
+                    pos2(price_rect.left() + 6.0, ly),
+                    Align2::LEFT_TOP,
+                    format!("ADTREND  {msg}"),
+                    mono(11.0),
+                    theme::down(),
+                );
+                ly += 14.0;
+            } else if let Some(note) = &bi.note {
+                p.text(pos2(price_rect.left() + 6.0, ly), Align2::LEFT_TOP, note, mono(11.0), amber());
+                ly += 14.0;
+            }
         }
         ly
     }
@@ -2119,6 +2146,25 @@ mod tests {
         let out = chart_frame(&ctx, &mut c, &worker, vec![]);
         let pos = text_position(&out.shapes, "SAMPLE DATA · SYNTHETIC PRICES");
         assert!(pos.y < 80.0, "prominent banner above the plot");
+    }
+
+    #[test]
+    fn adaptive_trend_sample_bars_are_hard_labelled_not_drawn() {
+        let ctx = egui::Context::default();
+        let (worker, _) = Worker::test_channel();
+        let mut c = ChartState::new(1, "AAPL", Timeframe::D1);
+        let bars = Arc::new(tr_core::sample::generate("AAPL", Timeframe::D1, 200, 1_790_000_000));
+        c.on_history(c.generation, bars.clone(), SeriesGpu::build(&bars), 0, false, true, false, &worker);
+        c.indicators = vec![IndicatorSpec::new("ADTREND", &[]).unwrap()];
+        c.on_indicators(
+            c.generation,
+            crate::worker::build_indicators(&bars, Timeframe::D1, &c.indicators, &theme::palette()),
+        );
+        assert!(c.built[0].overlays.is_empty());
+        assert!(c.built[0].refused.as_deref().unwrap_or("").contains("SAMPLE"));
+        let out = chart_frame(&ctx, &mut c, &worker, vec![]);
+        let msg = c.built[0].refused.as_deref().unwrap();
+        let _ = text_position(&out.shapes, &format!("ADTREND  {msg}"));
     }
 
     #[test]

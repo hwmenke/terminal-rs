@@ -133,6 +133,9 @@ pub struct Def {
     pub levels: &'static [f64],
     /// Several instances with different parameters can share a chart.
     pub multi: bool,
+    /// Research overlay: the worker refuses sample / unverified bars instead of
+    /// drawing bands that would look like live archive analysis.
+    pub research: bool,
     compute: Compute,
 }
 
@@ -148,6 +151,7 @@ impl Def {
             range: None,
             levels: &[],
             multi: false,
+            research: false,
             compute,
         }
     }
@@ -188,6 +192,11 @@ impl Def {
 
     fn multi(mut self) -> Self {
         self.multi = true;
+        self
+    }
+
+    fn research(mut self) -> Self {
+        self.research = true;
         self
     }
 
@@ -968,6 +977,27 @@ fn catalog() -> Vec<Def> {
         .alias(&["CE", "CHEXIT"])
         .n("Length", 22.0)
         .real("Multiplier", 3.0, 0.1, 20.0),
+        overlay("ADTREND", "Adaptive Trend", trd, |i, p| {
+            let t = adaptive_trend(&i.d, AdaptiveTrendParams::from_registry(p));
+            let (lng, sht) = t.flip_dots(&i.d.close);
+            vec![
+                nth("SB", t.sb, 0),
+                nth("MB", t.mb, 1),
+                nth("LB", t.lb, 2),
+                out("SDB", t.sdb, Plot::Line, Tone::Dim),
+                out("MDB", t.mdb, Plot::Line, Tone::Dim),
+                out("LDB", t.ldb, Plot::Line, Tone::Dim),
+                signal("MRT", t.mrt),
+                nth("LRT", t.lrt, 3),
+                out("Long flip", lng, Plot::Dots, Tone::Up),
+                out("Short flip", sht, Plot::Dots, Tone::Down),
+            ]
+        })
+        .alias(&["ATREND", "ADAPTIVE"])
+        .n("ATR Length", 20.0)
+        .real("Confirm", 0.25, 0.0, 2.0)
+        .int("Method", 0.0, 0.0, 1.0)
+        .research(),
         // Volatility.
         pane("ATR", "Average True Range", vol, |i, p| one("ATR", atr(&i.d, n(p, 0)))).n("Length", 14.0),
         pane("NATR", "Normalized Average True Range", vol, |i, p| one("NATR", natr(&i.d, n(p, 0)))).n("Length", 14.0),
@@ -1240,6 +1270,8 @@ mod tests {
             assert!(d.range.is_none() || d.pane, "{} has a range but draws over prices", d.code);
             assert!(d.levels.is_empty() || d.pane, "{} has levels but draws over prices", d.code);
         }
+        assert!(find("ADTREND").is_some_and(|d| d.research), "Adaptive Trend is a research overlay");
+        assert!(!find("SMA").unwrap().research);
     }
 
     #[test]
@@ -1254,7 +1286,11 @@ mod tests {
                     assert!(o.values.len() >= bars.len(), "{} {} is short", d.code, o.name);
                     let finite: Vec<f64> = o.values.iter().copied().filter(|v| v.is_finite()).collect();
                     assert!(
-                        !finite.is_empty() || d.code == "FRACTALS" || o.name.starts_with("Squeeze"),
+                        !finite.is_empty()
+                            || d.code == "FRACTALS"
+                            || d.code == "ADTREND"
+                            || o.name.starts_with("Squeeze")
+                            || o.name.ends_with("flip"),
                         "{} {} is blank",
                         d.code,
                         o.name
@@ -1335,6 +1371,8 @@ mod tests {
         assert_eq!(vwap.compute(&Input::new(&[], Timeframe::M5))[0].name, "Session VWAP");
         assert_eq!(vwap.compute(&Input::new(&[], Timeframe::W1))[0].name, "Yearly VWAP");
         assert_eq!(Spec::parse("psar", &[]).unwrap().label(), "PSAR 0.02 0.02 0.2");
+        assert_eq!(Spec::parse("ADTREND", &[]).unwrap().label(), "ADTREND 20 0.25 0");
+        assert!(Spec::parse("ADTREND", &[]).unwrap().def().is_some_and(|d| d.research));
     }
 
     #[test]
