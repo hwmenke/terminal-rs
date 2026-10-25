@@ -2,7 +2,9 @@
 
 Open **Markets → Price history** or enter `HIST`. The panel adds named bundled lists or individual
 Yahoo tickers to terminal-rs's own research archive, shows latest dates and freshness, and manages
-background downloads. `NEW HIST` adds another panel. It persists in saved layouts.
+background downloads. `NEW HIST` adds another panel. It persists in saved layouts. `EXPORT HIST`
+writes daily bars with Yahoo source, session dates and provenance; `RESTORE` of that file imports
+only verified Real bars. See [Export and recovery](EXPORT_RECOVERY.md).
 
 | Command | Behavior |
 | --- | --- |
@@ -16,6 +18,7 @@ background downloads. `NEW HIST` adds another panel. It persists in saved layout
 | `HIST CANCEL` | Cancel queued/in-flight requests and retry waits; retain completed symbols |
 | `HIST RESUME` | Resume unfinished symbols, including after an application restart |
 | `HIST RETRY` | Retry only failed symbols |
+| `EXPORT HIST [path]` | Write archived daily bars (source + dates) |
 
 Lists can be combined with symbols in one ADD command. The catalogue is bundled in TSV files with
 security names, deduplicated by Yahoo symbol. It is a curated static research universe, **not live

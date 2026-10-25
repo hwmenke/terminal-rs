@@ -5,6 +5,7 @@
 //! content) and `settings_view` (preferences UI).
 
 mod alerts;
+mod backup;
 mod broker;
 mod chrome;
 mod command_bar;
@@ -29,11 +30,11 @@ pub use broker::PosSort;
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
-use egui::{pos2, vec2, Color32, Event, Key, Modifiers, Rect, Ui, UiBuilder};
+use egui::{Color32, Event, Key, Modifiers, Rect, Ui, UiBuilder, pos2, vec2};
 use serde::{Deserialize, Serialize};
 use tr_chart::drawings::Tool;
-use tr_congress::db::{Alert, PoliticianSummary};
 use tr_congress::Trade;
+use tr_congress::db::{Alert, PoliticianSummary};
 use tr_data::{OrderBook, Quote, SearchHit, YieldCurves};
 
 use crate::anim;
@@ -46,9 +47,9 @@ use crate::layouts::{LayoutDoc, Link, PaneSettings, Store, WindowGeometry};
 use crate::markets_view;
 use crate::prefs::{self, Prefs};
 use crate::theme;
-use crate::worker::{data_dir, Profile, Request, Response, Worker};
+use crate::worker::{Profile, Request, Response, Worker, data_dir};
 
-use chrome::{SidebarCmd, SIDEBAR_W, STATUS_H};
+use chrome::{SIDEBAR_W, STATUS_H, SidebarCmd};
 use settings_view::SettingsTab;
 
 pub enum PaneKind {
@@ -470,7 +471,7 @@ impl Pane {
 }
 
 /// App-wide state persisted in `settings.json` (layouts live in their own files).
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 struct Settings {
     #[serde(default)]
     watchlist: Vec<String>,
@@ -1026,10 +1027,9 @@ impl TerminalApp {
                         self.dock_pane(id, target, crate::dock::Zone::Right);
                     }
                     None => {
-                        self.status =
-                            format!(
-                                "Unknown panel {spec:?}; try CHART, NEWS, BOOK, WEI, GC, CONG, WL, DESK, JOURNAL, PORT"
-                            )
+                        self.status = format!(
+                            "Unknown panel {spec:?}; try CHART, NEWS, BOOK, WEI, GC, CONG, WL, DESK, JOURNAL, PORT"
+                        )
                     }
                 }
             }
@@ -1126,6 +1126,9 @@ impl TerminalApp {
                 command::ReviewOverlay::Strength => c.show_rs = !c.show_rs,
                 command::ReviewOverlay::Volume => c.show_volume_ctx = !c.show_volume_ctx,
             }),
+            Function::Export(kind, path) => self.run_export(kind, &path),
+            Function::Backup(path) => self.backup_workspace(&path),
+            Function::Restore(path) => self.restore_portable(&path),
         }
     }
 
@@ -1361,6 +1364,12 @@ impl TerminalApp {
                 Response::PriceAlertFeed(batch) => {
                     self.price_alerts = batch;
                     self.sync_chart_alerts();
+                }
+                Response::Portable(result) => {
+                    self.status = match result {
+                        Ok(s) => s,
+                        Err(e) => format!("Export / restore: {e}"),
+                    };
                 }
                 Response::NewPriceAlerts(new) => {
                     for a in new {
@@ -1864,11 +1873,7 @@ fn native_chrome(_frame: &eframe::Frame) -> Option<tr_macos::Chrome> {
 
 impl eframe::App for TerminalApp {
     fn clear_color(&self, visuals: &egui::Visuals) -> [f32; 4] {
-        if self.vibrancy {
-            [0.0; 4]
-        } else {
-            visuals.window_fill.to_normalized_gamma_f32()
-        }
+        if self.vibrancy { [0.0; 4] } else { visuals.window_fill.to_normalized_gamma_f32() }
     }
 
     fn ui(&mut self, ui: &mut Ui, frame: &mut eframe::Frame) {

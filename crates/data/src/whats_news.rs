@@ -19,7 +19,7 @@ use anyhow::{Context, Result, bail};
 use chrono::{Local, NaiveDate};
 use futures::{StreamExt, TryStreamExt, stream};
 use rusqlite::{Connection, OpenFlags};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use tr_core::{Bar, Provenance};
 
 #[derive(Debug)]
@@ -53,7 +53,7 @@ pub const SETUPS: &[&str] = &[
     "RSI_OS",
 ];
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Symbol {
     pub symbol: String,
     #[serde(default)]
@@ -80,7 +80,7 @@ impl Symbol {
         }
     }
 }
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ScanRow {
     #[serde(default = "archive_provenance")]
     pub provenance: Provenance,
@@ -103,7 +103,7 @@ pub struct ScanRow {
 }
 /// Original HTTP service fields retain their names and meanings. Rust metrics
 /// are separate: service RSI/regimes/ranks can use different seeds or universes.
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ServiceFields {
     pub ready: Option<bool>,
@@ -122,7 +122,7 @@ pub struct ServiceFields {
     pub ret_21d_pct: Option<f64>,
     pub darvas_state: Option<String>,
 }
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Scan {
     #[serde(default = "archive_provenance")]
     pub provenance: Provenance,

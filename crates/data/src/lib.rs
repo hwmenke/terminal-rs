@@ -19,6 +19,7 @@ pub mod history;
 pub mod journal;
 pub mod markets;
 pub mod news;
+pub mod portable;
 pub mod price_alerts;
 pub mod rss;
 pub mod sample;

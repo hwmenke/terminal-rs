@@ -15,14 +15,14 @@ use std::{
 };
 use tr_core::Timeframe;
 
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Conditions {
     pub bars: usize,
     pub rsi: Option<f64>,
     pub above_sma20: Option<bool>,
     pub unavailable: Option<String>,
 }
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Metrics {
     pub change_pct: f64,
     pub ret_21d_pct: f64,
@@ -40,7 +40,7 @@ pub struct Metrics {
     pub weekly: Conditions,
     pub monthly: Conditions,
 }
-#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Skipped {
     pub symbol: String,
     pub reason: String,
@@ -349,7 +349,7 @@ pub(super) fn scan_cached(name: &str, histories: Vec<(String, Vec<Bar>)>, proven
         .map(|(s, _)| s)
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum Condition {
     #[default]
     Any,
@@ -379,7 +379,7 @@ impl Condition {
         }
     }
 }
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum Sort {
     Symbol,
     #[default]
@@ -417,7 +417,7 @@ impl Sort {
         }
     }
 }
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ScanFilter {
     pub include_stale: bool,
     pub min_score: Option<f64>,

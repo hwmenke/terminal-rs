@@ -313,6 +313,26 @@ impl Archive {
         let data = crate::whats_news::scan_histories(name, histories, Provenance::Cached)?;
         Ok(Snapshot { data, provenance: Provenance::Cached, source: "Local Yahoo daily research archive".into() })
     }
+
+    /// Restore a previously exported daily series. Sample / unverified bars are refused.
+    pub fn import_verified(&mut self, symbol: &str, name: &str, bars: &[tr_core::Bar]) -> Result<()> {
+        for b in bars {
+            if b.provenance != Provenance::Real {
+                anyhow::bail!(
+                    "history import refused: {}. Only verified real Yahoo bars can be restored.",
+                    b.provenance.label()
+                );
+            }
+        }
+        let symbol = universe::normalize(symbol).unwrap_or_else(|_| symbol.trim().to_ascii_uppercase());
+        self.add(&[Symbol {
+            symbol: symbol.clone(),
+            name: Some(name.trim().to_string()),
+            group_tag: Some("imported history".into()),
+            last_date: None,
+        }])?;
+        self.store(&symbol, bars, true)
+    }
 }
 
 fn validate(bars: &[Bar]) -> Result<(), Failure> {

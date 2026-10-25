@@ -62,7 +62,7 @@ pub struct ResearchPane {
     pub loading: bool,
     pub error: Option<String>,
     search: String,
-    filter: ScanFilter,
+    pub filter: ScanFilter,
     selected: usize,
     scroll_selected: bool,
     page_rows: usize,
@@ -244,6 +244,7 @@ impl ResearchPane {
             return (self.show_history(ui, worker), false);
         }
         let mut actions = Vec::new();
+        let mut export = false;
         let refresh = ui
             .horizontal(|ui| {
                 let refresh = ui.add_enabled(!self.loading, egui::Button::new("Refresh")).clicked();
@@ -251,6 +252,13 @@ impl ResearchPane {
                 if ui.text_edit_singleline(&mut self.search).changed() {
                     self.selected = 0;
                     self.scroll_selected = true;
+                }
+                if ui
+                    .add_enabled(self.results.is_some() || self.universe.is_some(), egui::Button::new("Export"))
+                    .on_hover_text("Write scan/universe JSON with source and date (EXPORT SCAN)")
+                    .clicked()
+                {
+                    export = true;
                 }
                 refresh
             })
@@ -344,6 +352,9 @@ impl ResearchPane {
                 }
             }
         });
+        if export {
+            actions.push(Action::Command("EXPORT SCAN".into()));
+        }
         (actions, refresh)
     }
     fn scan_controls(&mut self, ui: &mut Ui) {
@@ -461,6 +472,9 @@ impl ResearchPane {
             }
             if ui.button("Update status").clicked() {
                 worker.send(Request::HistoryStatus);
+            }
+            if ui.button("Export").on_hover_text("Write daily bars with source and dates (EXPORT HIST)").clicked() {
+                actions.push(Action::Command("EXPORT HIST".into()));
             }
         });
         if let Some(command) = command {

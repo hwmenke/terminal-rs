@@ -1,6 +1,6 @@
 //! Native keyboard-shortcut table (click a binding to record a new one) and the Help pane.
 
-use egui::{pos2, vec2, Align2, Color32, Id, Rect, RichText, Sense, Stroke, StrokeKind, Ui};
+use egui::{Align2, Color32, Id, Rect, RichText, Sense, Stroke, StrokeKind, Ui, pos2, vec2};
 use tr_core::indicators::registry::{self, Category};
 
 use super::TerminalApp;
@@ -279,7 +279,11 @@ impl TerminalApp {
                         &["JOURNAL", "AAPL JOURNAL", "AAPL NOTE 2026-10-24"],
                         "Trade journal: setup + checklist + planned $ risk; record $ and R; notes on chart dates",
                     ),
-                    (&["PREFS"], "Settings: theme, fonts, density, hotkeys, layouts"),
+                    (
+                        &["EXPORT", "EXPORT SCAN", "EXPORT JOURNAL", "EXPORT HIST", "BACKUP", "RESTORE"],
+                        "Export scans/history/journal with source and date; back up or restore workspace (no credentials)",
+                    ),
+                    (&["PREFS"], "Settings: theme, fonts, density, hotkeys, layouts, backup"),
                     (&["UPDATE"], "Check for updates"),
                 ],
             );

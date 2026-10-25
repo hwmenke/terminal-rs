@@ -1,11 +1,11 @@
 //! Command palette overlay (⌘⇧K, Ctrl+Shift+K elsewhere): the live catalogue of items built
 //! from the app's state, the centred search card, and running the picked item.
 
-use egui::{pos2, vec2, Color32, Id, Key, Modifiers, Rect, Sense, Stroke, StrokeKind, Ui, UiBuilder};
+use egui::{Color32, Id, Key, Modifiers, Rect, Sense, Stroke, StrokeKind, Ui, UiBuilder, pos2, vec2};
 use tr_core::indicators::registry;
 
-use super::settings_view::SettingsTab;
 use super::TerminalApp;
+use super::settings_view::SettingsTab;
 use crate::anim;
 use crate::command::{self, Function, IndicatorSpec};
 use crate::layout::Layout;
@@ -43,7 +43,18 @@ const COMMANDS: &[(&str, &str, &str, Option<Action>)] = &[
     ("DESK", "PM Desk: watchlist leaders and position size", "pm risk planner watchlist rank", Some(Action::Desk)),
     ("PMDESK", "PM Desk (alias)", "pm risk planner", None),
     ("RISK", "PM Desk (alias)", "pm position size planner", None),
-    ("JOURNAL", "Trade journal: setups, checklist, $ and R outcomes", "checklist tradelog notes", Some(Action::Journal)),
+    ("EXPORT", "Export focused scan, history or journal", "backup restore portable", None),
+    ("EXPORT SCAN", "Export scan results with source and date", "research snapshot", None),
+    ("EXPORT JOURNAL", "Export trade journal entries", "setups notes backup", None),
+    ("EXPORT HIST", "Export archived daily prices with source and dates", "yahoo archive backup", None),
+    ("BACKUP", "Back up personal workspace (credentials excluded)", "restore export layouts journal", None),
+    ("RESTORE", "Restore a workspace, journal or history export", "backup import recovery", None),
+    (
+        "JOURNAL",
+        "Trade journal: setups, checklist, $ and R outcomes",
+        "checklist tradelog notes",
+        Some(Action::Journal),
+    ),
     ("JRNL", "Trade journal (alias)", "checklist notes", None),
     ("CHECKLIST", "Trade journal checklist (alias)", "journal setup", None),
     ("AAPL JOURNAL", "Journal for AAPL, prefilled from the chart date", "setup checklist", None),
@@ -188,6 +199,7 @@ fn settings_blurb(tab: SettingsTab) -> &'static str {
         SettingsTab::Brokerage => "SnapTrade keys and connected brokerages",
         SettingsTab::Trading => "Enable trading, order limits and confirmations",
         SettingsTab::WhatsNews => "Archive path, local HTTP connection, status and test connection",
+        SettingsTab::Backup => "Export scans, history and journal; back up or restore the workspace",
     }
 }
 

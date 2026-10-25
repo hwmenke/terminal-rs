@@ -217,6 +217,11 @@ gets the native title bar with traffic lights, window vibrancy behind the sideba
   attaches a note to a historical date; cyan **J** pins mark those dates on the chart.
   Rows persist in `trade_journal.json`. Sample bars never invent P&L. See
   [Trade journal](docs/TRADE_JOURNAL.md).
+- **Export and recovery** — `EXPORT SCAN`, `EXPORT JOURNAL` and `EXPORT HIST` write JSON
+  with source, as-of date and provenance. Sample-tagged rows name the file `SAMPLE`.
+  `BACKUP` / `RESTORE` copy personal workspace data (layouts, themes, prefs, watchlists,
+  journal, alerts) and **exclude credentials**. See
+  [Export and recovery](docs/EXPORT_RECOVERY.md).
 - **Command palette** — ⌘⇧K (Ctrl+Shift+K on Linux and Windows) opens a centred, theme-matched palette
   that fuzzy-searches every function code (`PORT`, `POS`, `ORD`, `OMON`, `THEME`, …), tickers
   (load the quote and chart), new panels, layout presets and saved layouts, themes, Settings tabs
@@ -367,6 +372,7 @@ Settings › Hotkeys. On Linux and Windows ⌘ is Ctrl and ⌥ is Alt.
 | `THEME BLOOMBERG` · `THEME NEXT` · `THEME SYSTEM` · `THEME EDIT` · `THEME COMPACT` · `LAYOUT THEME ON` | themes |
 | `DESK` · `AAPL DESK` · `NEW DESK` | PM Desk: watchlist leaders, group performance, position size |
 | `JOURNAL` · `AAPL JOURNAL` · `AAPL NOTE 2026-10-24 wait` · `NEW JOURNAL` | Trade journal: setup, checklist, $ risk, $ and R outcome, date notes |
+| `EXPORT` · `EXPORT SCAN` · `EXPORT JOURNAL` · `EXPORT HIST` · `BACKUP` · `RESTORE path` | Export scans/history/journal; workspace backup/restore (no credentials) |
 | `PORT` · `ACCT` · `POS` · `ORD` · `ACTV` · `AAPL POS` · `AAPL ORD` | brokerage portfolio · accounts and balances · positions · orders · activity · one security |
 | `PORT REFRESH` · `PORT CONNECT` · `PORT SETUP` (`BROKER`) | reload accounts · connect a broker in the browser · SnapTrade keys |
 | `BUY AAPL 10` · `SELL ALL TSLA` · `SELL MSFT 5 LMT 410` · `SELL TSLA 3 STP 250 LMT 245` · `BUY NVDA $500` · `TRADE` | order ticket, prefilled (demo: one click; live: review and confirm) |

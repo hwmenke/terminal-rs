@@ -4,12 +4,12 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::{mpsc, Arc};
+use std::sync::{Arc, mpsc};
 use std::time::Duration;
 
 use tokio::sync::Mutex;
 use tr_chart::gpu::{LineKind, LineRef};
-use tr_chart::scene::{line_ref, marker_ref, Overlay, SeriesGpu};
+use tr_chart::scene::{Overlay, SeriesGpu, line_ref, marker_ref};
 use tr_congress::db::{Alert, PoliticianSummary};
 use tr_congress::performance::{self, Performance, TradeReturn};
 use tr_congress::refresh::{self, HttpSource, NewTradeAlert, RefreshConfig};
@@ -162,6 +162,17 @@ pub enum Request {
     MarkPriceAlertsSeen,
     EvaluatePriceAlerts,
     RefreshCongress,
+    /// Write archived daily bars to a portable JSON file (source + dates).
+    ExportHistory {
+        path: PathBuf,
+        symbols: Vec<String>,
+    },
+    /// Restore verified Real bars from a portable history export.
+    ImportHistory {
+        path: PathBuf,
+    },
+    /// Replace in-memory price/setup rules from a workspace restore.
+    ReplacePriceAlerts(tr_data::price_alerts::Store),
     /// A pane closed or changed: stop its live feed and drop its series.
     Forget(PaneId),
     YieldCurves,
@@ -343,6 +354,8 @@ pub enum Response {
     NewAlerts(Vec<NewTradeAlert>),
     PriceAlertFeed(tr_data::price_alerts::AlertBatch),
     NewPriceAlerts(Vec<tr_data::price_alerts::FiredAlert>),
+    /// Result of EXPORT HIST / RESTORE history / price-alert replace.
+    Portable(Result<String, String>),
     Status(String),
     CongressRefreshed(String),
     Curves(Box<YieldCurves>),
@@ -539,8 +552,8 @@ impl Worker {
     }
 
     #[cfg(test)]
-    pub(crate) fn test_channel_with_responses(
-    ) -> (Self, tokio::sync::mpsc::UnboundedReceiver<Request>, mpsc::Sender<Response>) {
+    pub(crate) fn test_channel_with_responses()
+    -> (Self, tokio::sync::mpsc::UnboundedReceiver<Request>, mpsc::Sender<Response>) {
         let (tx, requests) = tokio::sync::mpsc::unbounded_channel();
         let (out, rx) = mpsc::channel();
         let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
@@ -764,7 +777,7 @@ async fn research_desk(
     bridge: &tr_data::whats_news::Bridge,
     keys: &[String],
 ) -> anyhow::Result<tr_data::whats_news::Snapshot<Vec<tr_data::whats_news::MemberRow>>> {
-    use tr_data::whats_news::{archive_ticker, MemberRow};
+    use tr_data::whats_news::{MemberRow, archive_ticker};
     let mut wanted = Vec::new();
     let mut rows = Vec::new();
     for key in keys {
@@ -845,6 +858,51 @@ async fn handle(s: &Arc<Shared>, req: Request) {
         Request::ConfigureWhatsNews { .. } => unreachable!("configured in dispatcher"),
         Request::HistoryStatus => {
             s.send(Response::HistoryStatus(s.history.status().await.map_err(|e| format!("{e:#}"))))
+        }
+        Request::ExportHistory { path, symbols } => {
+            let result = s
+                .history
+                .db({
+                    let path = path.clone();
+                    let symbols = symbols.clone();
+                    move |db| {
+                        let doc = tr_data::portable::history_document(
+                            db,
+                            (!symbols.is_empty()).then_some(symbols.as_slice()),
+                            tr_data::portable::now_rfc3339(),
+                        )
+                        .map_err(|e| anyhow::anyhow!(e))?;
+                        tr_data::portable::write_json(&path, &doc).map_err(|e| anyhow::anyhow!(e))?;
+                        let label = if doc.sample { "SAMPLE price history" } else { "price history" };
+                        Ok(format!("Exported {label} to {}", path.display()))
+                    }
+                })
+                .await;
+            s.send(Response::Portable(result.map_err(|e| format!("{e:#}"))));
+        }
+        Request::ImportHistory { path } => {
+            let result = s
+                .history
+                .db({
+                    let path = path.clone();
+                    move |db| {
+                        let doc = tr_data::portable::Document::read(&path).map_err(|e| anyhow::anyhow!(e))?;
+                        let n = tr_data::portable::import_history(db, &doc).map_err(|e| anyhow::anyhow!(e))?;
+                        Ok(format!("Restored {n} price-history series from {}", path.display()))
+                    }
+                })
+                .await;
+            s.send(Response::Portable(result.map_err(|e| format!("{e:#}"))));
+            s.send(Response::HistoryChanged);
+        }
+        Request::ReplacePriceAlerts(store) => {
+            {
+                let mut lock = s.price_alerts.lock().expect("price alerts");
+                *lock = store;
+            }
+            s.persist_price_alerts();
+            s.send(Response::PriceAlertFeed(s.price_alert_snapshot(chrono::Utc::now().timestamp())));
+            s.send(Response::Portable(Ok("Restored price/setup alerts".into())));
         }
         Request::HistoryTask(command) => {
             let (action, args) = command.trim().split_once(' ').unwrap_or((command.trim(), ""));
@@ -1476,7 +1534,7 @@ async fn profile(s: &Shared, query: &str) -> Option<Profile> {
 }
 
 async fn evaluate_price_alerts(s: &Shared) {
-    use tr_data::price_alerts::{evaluate, setup_tick, AlertFailure, AlertKind, EvalInput, PriceTick};
+    use tr_data::price_alerts::{AlertFailure, AlertKind, EvalInput, PriceTick, evaluate, setup_tick};
     use tr_data::whats_news::archive_ticker;
     let now = chrono::Utc::now().timestamp();
     let sample = s.provider.name() == "sample";
@@ -1587,7 +1645,7 @@ async fn evaluate_price_alerts(s: &Shared) {
 
 async fn fetch_news(s: &Arc<Shared>, symbols: Option<Vec<String>>) -> tr_data::news::NewsBatch {
     use tr_data::news::{
-        assemble_batch, bound_symbols, dedup_headlines, is_stale, NewsBatch, NewsFailure, TOP_CACHE_KEY,
+        NewsBatch, NewsFailure, TOP_CACHE_KEY, assemble_batch, bound_symbols, dedup_headlines, is_stale,
     };
     let now = chrono::Utc::now().timestamp();
     if s.provider.name() == "sample" {
@@ -1993,15 +2051,9 @@ mod tests {
         assert!(
             matches!(rx.try_recv(), Ok(Response::History { bars, from_cache: false, .. }) if Bar::provenance(&bars) == tr_core::Provenance::Sample)
         );
-        assert!(s
-            .cache
-            .lock()
-            .unwrap()
-            .as_ref()
-            .unwrap()
-            .load("USDBRL Curncy", Timeframe::D1, 6000)
-            .unwrap()
-            .is_empty());
+        assert!(
+            s.cache.lock().unwrap().as_ref().unwrap().load("USDBRL Curncy", Timeframe::D1, 6000).unwrap().is_empty()
+        );
     }
 
     #[test]
