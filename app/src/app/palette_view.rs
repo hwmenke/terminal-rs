@@ -37,6 +37,7 @@ const COMMANDS: &[(&str, &str, &str, Option<Action>)] = &[
     ("WL", "", "watchlist monitor", Some(Action::Watchlist)),
     ("DESK", "PM Desk: watchlist leaders and position size", "pm risk planner watchlist rank", Some(Action::Desk)),
     ("PMDESK", "PM Desk (alias)", "pm risk planner", None),
+    ("RISK", "PM Desk (alias)", "pm position size planner", None),
     ("WL NEW", "Create a named watchlist group: WL NEW <group>", "watchlist group create", None),
     ("WL ADD", "Save symbols: WL ADD <group> <symbols…> · w picker / W last-used", "watchlist group scan save", None),
     ("WL DEL", "Remove symbols (alias): WL DEL <group> <symbols…>", "watchlist remove", None),
