@@ -74,6 +74,8 @@ pub enum PaneSettings {
         show_congress: bool,
         #[serde(default = "yes")]
         show_news: bool,
+        #[serde(default = "yes")]
+        show_journal: bool,
         #[serde(default)]
         magnet: bool,
         #[serde(default)]
@@ -121,6 +123,11 @@ pub enum PaneSettings {
         group: String,
         #[serde(default)]
         selected: Option<String>,
+    },
+    /// Trade journal (entries live in `trade_journal.json`, not the layout).
+    Journal {
+        #[serde(default)]
+        filter: String,
     },
     /// Brokerage portfolio view (credentials are never stored in layouts).
     Portfolio {
@@ -336,6 +343,7 @@ pub fn chart_settings(symbol: &str, d: &crate::prefs::PanelDefaults) -> PaneSett
         show_volume: d.show_volume,
         show_congress: d.congress_markers,
         show_news: d.news_markers,
+        show_journal: true,
         magnet: false,
         show_box: false,
         show_rs: false,
@@ -584,6 +592,7 @@ mod tests {
                 show_volume,
                 show_congress,
                 show_news,
+                show_journal,
                 magnet,
                 log,
                 show_box,
@@ -591,7 +600,7 @@ mod tests {
                 show_volume_ctx,
                 ..
             } => {
-                assert!(*show_volume && *show_congress && *show_news && !*magnet && *log);
+                assert!(*show_volume && *show_congress && *show_news && *show_journal && !*magnet && *log);
                 assert!(!*show_box && !*show_rs && !*show_volume_ctx);
             }
             other => panic!("{other:?}"),

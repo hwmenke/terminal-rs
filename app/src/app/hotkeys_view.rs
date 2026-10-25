@@ -275,6 +275,10 @@ impl TerminalApp {
                         &["DESK", "AAPL DESK", "NEW DESK"],
                         "PM Desk: watchlist leaders, group performance, position size (not PORT)",
                     ),
+                    (
+                        &["JOURNAL", "AAPL JOURNAL", "AAPL NOTE 2026-10-24"],
+                        "Trade journal: setup + checklist + planned $ risk; record $ and R; notes on chart dates",
+                    ),
                     (&["PREFS"], "Settings: theme, fonts, density, hotkeys, layouts"),
                     (&["UPDATE"], "Check for updates"),
                 ],

@@ -82,6 +82,8 @@ pub struct ChartState {
     pub show_congress: bool,
     /// Headline pins on bars whose time range contains the publication time.
     pub show_news: bool,
+    /// Journal setup / date-note pins on historical calendar dates.
+    pub show_journal: bool,
     /// Darvas box levels from the loaded series (persisted in layouts).
     pub show_box: bool,
     /// 21-bar return HUD; labelled as this interval, never SPY-relative.
@@ -117,6 +119,10 @@ pub struct ChartState {
     news_stale: bool,
     /// Enabled price-level rules for this symbol (not persisted; filled from the alert store).
     alert_rules: Vec<tr_data::price_alerts::AlertRule>,
+    /// Calendar dates (`YYYY-MM-DD`) with a journal setup or note for this symbol.
+    journal_marks: Vec<String>,
+    /// Last hovered bar, used for journal date capture.
+    hover_bar: Option<usize>,
     pub news_fetched: Option<std::time::Instant>,
     news_key: u64,
     pending_range: Option<Range>,
@@ -159,6 +165,7 @@ impl ChartState {
             show_volume: true,
             show_congress: true,
             show_news: true,
+            show_journal: true,
             show_box: false,
             show_rs: false,
             show_volume_ctx: false,
@@ -186,6 +193,8 @@ impl ChartState {
             news: Vec::new(),
             news_stale: false,
             alert_rules: Vec::new(),
+            journal_marks: Vec::new(),
+            hover_bar: None,
             news_fetched: None,
             news_key: 0,
             pending_range: None,
@@ -211,6 +220,16 @@ impl ChartState {
 
     pub fn set_alert_rules(&mut self, rules: Vec<tr_data::price_alerts::AlertRule>) {
         self.alert_rules = rules;
+    }
+
+    pub fn set_journal_marks(&mut self, dates: Vec<String>) {
+        self.journal_marks = dates;
+    }
+
+    /// Hovered bar date, else the last loaded bar (`YYYY-MM-DD`).
+    pub fn journal_date(&self) -> Option<String> {
+        let i = self.hover_bar.or_else(|| self.bars.len().checked_sub(1))?;
+        tr_data::journal::date_from_ts(self.bars.get(i)?.ts)
     }
 
     pub fn is_empty(&self) -> bool {
@@ -1134,9 +1153,13 @@ impl ChartState {
         if self.show_news {
             self.paint_news(ui, price_rect, &v, hover, &reveal, &plot_resp);
         }
+        if self.show_journal {
+            self.paint_journal(ui, price_rect, &v, hover, &reveal);
+        }
 
         // ---- crosshair + legend ----
         let hovered_bar = hover.and_then(|p| v.bar_at((p.x - price_rect.left()) as f64, len));
+        self.hover_bar = hovered_bar;
         if let Some(p) = hover {
             let ch = Stroke::new(1.0, Color32::from_gray(110));
             let plot_painter = ui.painter_at(plot_all);
@@ -1332,6 +1355,37 @@ impl ChartState {
             self.actions.push(Action::Command("ALERTS".into()));
             ui.close();
         }
+        ui.separator();
+        ui.label(RichText::new("Journal").small().color(muted()));
+        let date = self.journal_date().unwrap_or_default();
+        if ui
+            .button(if date.is_empty() { "Save setup…".into() } else { format!("Save setup on {date}…") })
+            .on_hover_text("Open the journal with this name and chart date")
+            .clicked()
+        {
+            let cmd = if date.is_empty() {
+                format!("{} JOURNAL", self.symbol)
+            } else {
+                format!("{} JOURNAL {date}", self.symbol)
+            };
+            self.actions.push(Action::Command(cmd));
+            ui.close();
+        }
+        if ui.button(if date.is_empty() { "Note this date…".into() } else { format!("Note {date}…") }).clicked() {
+            let cmd = if date.is_empty() {
+                format!("{} NOTE", self.symbol)
+            } else {
+                format!("{} NOTE {date}", self.symbol)
+            };
+            self.actions.push(Action::Command(cmd));
+            ui.close();
+        }
+        if ui.button("Open journal…").clicked() {
+            self.actions.push(Action::Command(format!("{} JOURNAL", self.symbol)));
+            ui.close();
+        }
+        ui.checkbox(&mut self.show_journal, "Journal date markers")
+            .on_hover_text("Pins on dates with a saved setup or a date note");
         ui.checkbox(&mut self.show_news, "News catalyst markers")
             .on_hover_text("Headlines whose publication time falls on a loaded bar — click to open");
         if self.sec.has_congress_trades() {
@@ -1763,6 +1817,49 @@ impl ChartState {
             if plot_resp.clicked() {
                 ui.ctx().open_url(egui::OpenUrl::new_tab(&hits[mi].item.link));
             }
+        }
+    }
+
+    /// Pins on calendar dates that have a journal setup or a date note.
+    fn paint_journal(&self, ui: &Ui, rect: Rect, v: &Viewport, hover: Option<Pos2>, reveal: &Reveal) {
+        if self.journal_marks.is_empty() || self.bars.is_empty() {
+            return;
+        }
+        let marks: std::collections::HashSet<&str> = self.journal_marks.iter().map(String::as_str).collect();
+        let p = ui.painter_at(rect);
+        let len = self.bars.len();
+        let (lo, hi) = v.visible_range(len);
+        let full_r = (v.bar_px as f32 * 0.4).clamp(3.5, 6.0);
+        let mut tip: Option<(Pos2, String)> = None;
+        for i in lo..hi.min(len) {
+            let Some(date) = tr_data::journal::date_from_ts(self.bars[i].ts) else { continue };
+            if !marks.contains(date.as_str()) {
+                continue;
+            }
+            let x = rect.left() + v.x_center(i) as f32;
+            let swept = ((reveal.front - (i as f64 + 0.5)) / reveal.ramp as f64).clamp(0.0, 1.0) as f32;
+            if swept <= 0.01 {
+                continue;
+            }
+            let r = full_r * swept;
+            let c = Pos2::new(x, rect.bottom() - 8.0);
+            p.circle_filled(c, r, Color32::from_rgb(90, 200, 250).gamma_multiply(swept));
+            if full_r >= 4.5 {
+                p.text(c, Align2::CENTER_CENTER, "J", mono(full_r * 1.45), Color32::BLACK.gamma_multiply(swept));
+            }
+            if let Some(h) = hover
+                && h.distance(c) <= r + 4.0
+            {
+                tip = Some((c, date));
+            }
+        }
+        if let Some((c, date)) = tip {
+            let card = format!("{} journal · {date}", self.sec.ticker);
+            let galley = ui.painter().layout_no_wrap(card, ui_font(12.0), text());
+            let pos = pos2(c.x + 8.0, c.y - galley.size().y - 6.0);
+            let bg = Rect::from_min_size(pos, galley.size() + vec2(8.0, 6.0));
+            ui.painter().rect_filled(bg, 2.0, Color32::from_black_alpha(200));
+            ui.painter().galley(pos + vec2(4.0, 3.0), galley, text());
         }
     }
 }

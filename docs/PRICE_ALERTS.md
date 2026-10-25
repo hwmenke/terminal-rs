@@ -37,4 +37,4 @@ are read.
 Setup names are the SCAN list: `DARVAS_BREAKOUT`, `DARVAS_BOX`, `DARVAS_FAIL`,
 `NEAR_HIGH`, `VOL_SURGE`, `EP`, `BREAKOUT_QUEUE`, `RSI_OB`, `RSI_OS`.
 
-Step 10 journal and Step 11 export are out of scope.
+Step 10 journal lives in [`TRADE_JOURNAL.md`](TRADE_JOURNAL.md). Step 11 export is out of scope.

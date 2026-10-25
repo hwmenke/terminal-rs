@@ -655,6 +655,18 @@ impl TerminalApp {
             {
                 out.push(SidebarCmd::Function(Function::Desk));
             }
+            let journal_badge = (self.journal.open_count() > 0).then(|| self.journal.open_count().to_string());
+            if nav_row(
+                ui,
+                Icon::List,
+                "Journal",
+                journal_badge.as_deref().or(Some("JRNL")),
+                is_focused(&PaneKind::Journal(Box::new(super::journal::JournalPane::new(String::new())))),
+            )
+            .clicked()
+            {
+                out.push(SidebarCmd::Function(Function::Journal(String::new())));
+            }
 
             section(ui, "Markets");
             let items = [

@@ -43,6 +43,12 @@ const COMMANDS: &[(&str, &str, &str, Option<Action>)] = &[
     ("DESK", "PM Desk: watchlist leaders and position size", "pm risk planner watchlist rank", Some(Action::Desk)),
     ("PMDESK", "PM Desk (alias)", "pm risk planner", None),
     ("RISK", "PM Desk (alias)", "pm position size planner", None),
+    ("JOURNAL", "Trade journal: setups, checklist, $ and R outcomes", "checklist tradelog notes", Some(Action::Journal)),
+    ("JRNL", "Trade journal (alias)", "checklist notes", None),
+    ("CHECKLIST", "Trade journal checklist (alias)", "journal setup", None),
+    ("AAPL JOURNAL", "Journal for AAPL, prefilled from the chart date", "setup checklist", None),
+    ("AAPL NOTE 2026-10-24", "Note on AAPL's 2026-10-24 chart date", "journal historical note", None),
+    ("NOTE", "Attach a note to the focused chart date", "journal historical", None),
     ("WL NEW", "Create a named watchlist group: WL NEW <group>", "watchlist group create", None),
     ("WL ADD", "Save symbols: WL ADD <group> <symbols…> · w picker / W last-used", "watchlist group scan save", None),
     ("WL DEL", "Remove symbols (alias): WL DEL <group> <symbols…>", "watchlist remove", None),
@@ -207,6 +213,10 @@ pub(super) fn static_items() -> Vec<Item> {
     v.push(
         Item::new(Kind::Panel, "New PM Desk pane", "NEW DESK", Target::Run("NEW DESK".into()))
             .keywords("panel pane watchlist risk size"),
+    );
+    v.push(
+        Item::new(Kind::Panel, "New Journal pane", "NEW JOURNAL", Target::Run("NEW JOURNAL".into()))
+            .keywords("panel pane journal checklist notes"),
     );
     v.push(
         Item::new(

@@ -301,6 +301,19 @@ impl TerminalApp {
                             )));
                         }
                     }
+                    if ui
+                        .small_button("Journal")
+                        .on_hover_text("Open a journal draft with this name, last bar date, and planned $ risk")
+                        .clicked()
+                    {
+                        let date = row.last_date.clone().unwrap_or_default();
+                        let cmd = if date.is_empty() {
+                            format!("{} JOURNAL", row.key)
+                        } else {
+                            format!("{} JOURNAL {date}", row.key)
+                        };
+                        actions.push(Action::Command(cmd));
+                    }
                 });
                 match pane.plan() {
                     Ok(plan) => {
