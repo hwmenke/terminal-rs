@@ -760,21 +760,10 @@ mod tests {
             "drawings":[{"tool":"Horizontal","a":{"ts":0,"price":188.5},"b":{"ts":0,"price":188.5}}],
             "compare":null}}]}"#;
         let loaded = LayoutDoc::from_json(legacy.as_bytes()).unwrap();
-        let kind = crate::app::PaneKind::from_settings(loaded.panes[0].settings.clone());
-        match kind {
-            crate::app::PaneKind::Chart(c) => {
-                assert_eq!(c.drawings.len(), 1);
-                assert_eq!(c.drawings[0].horizontal_price(), Some(188.5));
-                assert_eq!(c.drawing_store.get("AAPL").len(), 1);
-                let saved = crate::app::PaneKind::Chart(c).settings();
-                let again = crate::app::PaneKind::from_settings(saved);
-                match again {
-                    crate::app::PaneKind::Chart(c) => {
-                        assert_eq!(c.drawing_store.get("MSFT").len(), 0);
-                        assert_eq!(c.drawing_store.get("AAPL")[0].horizontal_price(), Some(188.5));
-                    }
-                    other => panic!("{other:?}"),
-                }
+        match &loaded.panes[0].settings {
+            PaneSettings::Chart { drawings, drawing_store, .. } => {
+                assert_eq!(drawings[0].horizontal_price(), Some(188.5));
+                assert!(drawing_store.is_empty(), "legacy files have no store; seed happens on pane load");
             }
             other => panic!("{other:?}"),
         }

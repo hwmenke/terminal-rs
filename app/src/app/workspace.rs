@@ -552,8 +552,7 @@ impl TerminalApp {
     /// Daily/weekly linked archive panes share horizontal levels for the same name.
     /// Trendlines, verticals and fibs stay on the pane that drew them.
     pub(super) fn sync_linked_review_levels(&mut self) {
-        use std::collections::BTreeMap;
-        let mut groups: BTreeMap<(Link, String), Vec<usize>> = BTreeMap::new();
+        let mut groups: HashMap<(Link, String), Vec<usize>> = HashMap::new();
         for (i, p) in self.panes.iter().enumerate() {
             if let (Some(link), PaneKind::Chart(c)) = (p.link, &p.kind)
                 && c.archive

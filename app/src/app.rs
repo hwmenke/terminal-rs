@@ -2420,7 +2420,8 @@ mod tests {
                 _ => None,
             })
             .unwrap();
-        if let PaneKind::Chart(c) = &mut app.panes[app.idx(daily).unwrap()].kind {
+        let daily_i = app.idx(daily).unwrap();
+        if let PaneKind::Chart(c) = &mut app.panes[daily_i].kind {
             c.drawings.push(hline(188.5));
             c.commit_drawings();
         }
@@ -2430,7 +2431,7 @@ mod tests {
                 assert_eq!(c.drawings.len(), 1, "weekly review inherits the daily horizontal");
                 assert_eq!(c.drawings[0].horizontal_price(), Some(188.5));
             }
-            other => panic!("{other:?}"),
+            _ => panic!("expected weekly chart"),
         }
         app.open_security("MSFT");
         for id in [daily, weekly] {
@@ -2439,7 +2440,7 @@ mod tests {
                     assert_eq!(c.symbol, "MSFT US Equity");
                     assert!(c.drawings.is_empty(), "MSFT must not show AAPL's drawings");
                 }
-                other => panic!("{other:?}"),
+                _ => panic!("expected chart pane"),
             }
         }
         app.open_security("AAPL");
@@ -2449,7 +2450,7 @@ mod tests {
                     assert_eq!(c.symbol, "AAPL US Equity");
                     assert_eq!(c.drawings[0].horizontal_price(), Some(188.5));
                 }
-                other => panic!("{other:?}"),
+                _ => panic!("expected chart pane"),
             }
         }
 
@@ -2472,6 +2473,32 @@ mod tests {
         assert_eq!(restored.len(), 2);
         assert!(restored.iter().all(|r| r.1 == "AAPL US Equity" && r.2[0].horizontal_price() == Some(188.5)));
         assert!(restored.iter().all(|r| r.3[0].horizontal_price() == Some(188.5)));
+    }
+
+    #[test]
+    fn legacy_layout_drawings_seed_the_per_symbol_store() {
+        let raw = r#"{"name":"OldMarks","dock":{"type":"tabs","panes":[1]},"panes":[{"id":1,"Chart":{
+            "symbol":"AAPL US Equity","tf":"D1","chart_type":"Candles","log":false,"indicators":[],
+            "drawings":[{"tool":"Horizontal","a":{"ts":0,"price":188.5},"b":{"ts":0,"price":188.5}}],
+            "compare":null}}]}"#;
+        let loaded = LayoutDoc::from_json(raw.as_bytes()).unwrap();
+        let kind = PaneKind::from_settings(loaded.panes[0].settings.clone());
+        match kind {
+            PaneKind::Chart(c) => {
+                assert_eq!(c.drawings.len(), 1);
+                assert_eq!(c.drawings[0].horizontal_price(), Some(188.5));
+                assert_eq!(c.drawing_store.get("AAPL").len(), 1);
+                let saved = PaneKind::Chart(c).settings();
+                match PaneKind::from_settings(saved) {
+                    PaneKind::Chart(c) => {
+                        assert!(c.drawing_store.get("MSFT").is_empty());
+                        assert_eq!(c.drawing_store.get("AAPL")[0].horizontal_price(), Some(188.5));
+                    }
+                    _ => panic!("expected chart after save/load"),
+                }
+            }
+            _ => panic!("expected chart from legacy layout"),
+        }
     }
 }
 
