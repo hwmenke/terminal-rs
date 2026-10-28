@@ -3,7 +3,8 @@ use super::{PaneKind, TerminalApp};
 use crate::{congress_view::Action, dock::PaneId, worker::Request};
 use egui::{RichText, Ui};
 use tr_data::whats_news::{
-    ATR_MULT, GroupSummary, MemberRow, RiskPlan, StopSource, box_stop, drawing_stops, resolve_stop, size_position,
+    ATR_MULT, GroupSummary, HandoffBlock, MemberRow, RiskPlan, StopSource, box_stop, drawing_stops, resolve_stop,
+    size_position,
 };
 
 pub struct DeskPane {
@@ -292,13 +293,24 @@ impl TerminalApp {
                     if ui.small_button("Chart").clicked() {
                         actions.push(Action::OpenArchiveChart(row.key.clone()));
                     }
-                    if ui.small_button("Buy…").clicked() {
-                        if let Ok(plan) = pane.plan() {
-                            actions.push(Action::Command(format!(
-                                "BUY {} {}",
-                                row.key,
-                                plan.whole_shares.max(1.0) as u64
-                            )));
+                    match pane.plan() {
+                        Ok(plan) => match risk_plan_ticket(&row.key, &plan) {
+                            Ok(action) => {
+                                let qty = plan_ticket_quantity(&action).unwrap_or(0);
+                                if ui.small_button(format!("Buy {qty}…")).clicked() {
+                                    actions.push(action);
+                                }
+                            }
+                            // A short plan has no buy ticket. The explanation is shown with the size.
+                            Err(HandoffBlock::Short) => {}
+                            Err(block) => {
+                                let _ = ui
+                                    .add_enabled(false, egui::Button::new("Buy…"))
+                                    .on_disabled_hover_text(block.explain());
+                            }
+                        },
+                        Err(reason) => {
+                            let _ = ui.add_enabled(false, egui::Button::new("Buy…")).on_disabled_hover_text(reason);
                         }
                     }
                     if ui
@@ -330,6 +342,20 @@ impl TerminalApp {
                             ))
                             .color(crate::theme::text()),
                         );
+                        match plan.handoff() {
+                            Ok(ctx) => {
+                                ui.label(
+                                    RichText::new(format!(
+                                        "Ticket will buy {} shares at market. Entry, stop, target, and the risk budget stay planning context and are not sent as orders.",
+                                        ctx.quantity
+                                    ))
+                                    .color(crate::theme::muted()),
+                                );
+                            }
+                            Err(block) => {
+                                ui.label(RichText::new(block.explain()).color(crate::theme::amber()));
+                            }
+                        }
                     }
                     Err(e) => {
                         ui.label(RichText::new(e).color(crate::theme::amber()));
@@ -454,6 +480,18 @@ fn leader_row(ui: &mut Ui, row: &MemberRow, selected: bool) -> egui::Response {
     ui.selectable_label(selected, RichText::new(text).monospace().color(color)).on_hover_text(row.rank_label())
 }
 
+/// The typed handoff for a reviewed plan. Callers must not turn this into `BUY … 1`.
+fn risk_plan_ticket(symbol: &str, plan: &RiskPlan) -> Result<Action, HandoffBlock> {
+    Ok(Action::RiskPlanTicket { symbol: symbol.to_string(), plan: plan.handoff()? })
+}
+
+fn plan_ticket_quantity(action: &Action) -> Option<u64> {
+    match action {
+        Action::RiskPlanTicket { plan, .. } => Some(plan.quantity),
+        _ => None,
+    }
+}
+
 fn field(ui: &mut Ui, label: &str, value: &mut f64) {
     ui.horizontal(|ui| {
         ui.label(RichText::new(label).color(crate::theme::muted()));
@@ -550,5 +588,77 @@ mod tests {
             crate::command::parse("PORT"),
             Some(Command::Function(Function::Portfolio(crate::command::PortView::Summary, "".into())))
         );
+    }
+
+    #[test]
+    fn long_plan_opens_a_buy_ticket_for_the_exact_share_count() {
+        let mut pane = DeskPane::new("Growth");
+        pane.entry = 100.0;
+        pane.stop = 95.0;
+        pane.dollar_risk = 250.0;
+        pane.has_target = true;
+        pane.target = 110.0;
+        let plan = pane.plan().unwrap();
+        let action = risk_plan_ticket("AAPL US Equity", &plan).unwrap();
+        assert!(matches!(action, Action::RiskPlanTicket { plan: ref ctx, .. } if ctx.quantity == 50));
+
+        let mut app = test_app();
+        app.run_actions(vec![action]);
+        let ticket = app.trading.ticket.as_ref().expect("ticket");
+        assert_eq!(ticket.symbol, "AAPL");
+        assert_eq!(ticket.side, tr_broker::trading::Side::Buy);
+        assert_eq!(ticket.qty, "50");
+        assert_eq!(ticket.order_type, tr_broker::trading::OrderType::Market);
+        assert!(ticket.stop.is_empty(), "plan stop is not an order");
+        assert!(ticket.limit.is_empty(), "plan target is not a limit");
+        let ctx = ticket.plan_context().expect("planning context");
+        assert!((ctx.entry - 100.0).abs() < 1e-12);
+        assert!((ctx.stop - 95.0).abs() < 1e-12);
+        assert_eq!(ctx.target, Some(110.0));
+        assert!((ctx.dollar_risk - 250.0).abs() < 1e-12);
+        assert_eq!(ctx.quantity, 50);
+        let note = super::super::trading::plan_review_text(ctx);
+        assert!(note.contains("100.00"));
+        assert!(note.contains("95.00"));
+        assert!(note.contains("110.00"));
+        assert!(note.contains("$250.00"));
+        assert!(note.contains("not a submitted order"));
+        assert!(note.contains("not a bracket"));
+        let req = ticket.request().unwrap();
+        assert_eq!(req.amount, tr_broker::trading::Amount::Units(50.0));
+        assert_eq!(req.stop, None);
+        assert_eq!(req.limit, None);
+        assert_eq!(req.side, tr_broker::trading::Side::Buy);
+    }
+
+    #[test]
+    fn short_plans_and_sub_one_share_budgets_do_not_hand_off() {
+        let mut pane = DeskPane::new("Growth");
+        pane.entry = 50.0;
+        pane.stop = 55.0;
+        pane.dollar_risk = 100.0;
+        pane.has_target = true;
+        pane.target = 40.0;
+        let short = pane.plan().unwrap();
+        assert!(!short.long);
+        let blocked = risk_plan_ticket("AAPL US Equity", &short).unwrap_err();
+        assert_eq!(blocked, HandoffBlock::Short);
+        assert!(blocked.explain().contains("does not open a short"));
+
+        pane.entry = 100.0;
+        pane.stop = 95.0;
+        pane.dollar_risk = 1.0;
+        pane.has_target = false;
+        let tiny = pane.plan().unwrap();
+        assert_eq!(tiny.whole_shares, 0.0);
+        assert_eq!(risk_plan_ticket("AAPL US Equity", &tiny).unwrap_err(), HandoffBlock::ZeroShares);
+
+        pane.has_target = true;
+        pane.target = 100.0;
+        assert!(pane.plan().unwrap_err().contains("differ from entry"));
+        pane.target = 90.0;
+        assert!(pane.plan().unwrap_err().contains("above entry"));
+        pane.entry = f64::NAN;
+        assert!(pane.plan().is_err());
     }
 }

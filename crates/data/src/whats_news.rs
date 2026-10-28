@@ -7,8 +7,8 @@ mod link;
 mod review;
 mod scanner;
 pub use desk::{
-    ATR_LEN, ATR_MULT, GroupSummary, MemberRow, RETURN_BARS, RiskPlan, StopSource, archive_ticker, box_stop,
-    drawing_stops, last_atr, rank_watchlist, resolve_stop, size_position,
+    ATR_LEN, ATR_MULT, GroupSummary, HandoffBlock, MemberRow, PlanContext, RETURN_BARS, RiskPlan, StopSource,
+    archive_ticker, box_stop, drawing_stops, last_atr, rank_watchlist, resolve_stop, size_position,
 };
 pub use link::{Config, DEFAULT_URL, Health, LinkState, detect_archive, retry_delay};
 pub use review::ReviewContext;
