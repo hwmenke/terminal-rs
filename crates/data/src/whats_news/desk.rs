@@ -286,7 +286,100 @@ pub struct RiskPlan {
     pub r_multiple: Option<f64>,
 }
 
-/// Shares = dollar risk / |entry − stop|. Fractional shares are kept; `whole_shares` floors.
+/// Desk prices copied onto an order ticket. They describe the plan that was reviewed.
+/// They are not a stop order, a limit, or a bracket, and nothing here is submitted by itself.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PlanContext {
+    pub entry: f64,
+    pub stop: f64,
+    pub target: Option<f64>,
+    pub dollar_risk: f64,
+    /// Exact whole shares for a long ticket. This is `floor(shares)`, never raised to 1.
+    pub quantity: u64,
+}
+
+/// Why a reviewed plan cannot open an order ticket.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HandoffBlock {
+    /// A short plan would need short-opening. A sell ticket only closes shares already held.
+    Short,
+    /// `floor(shares)` is 0, so there is no whole share to send.
+    ZeroShares,
+    /// Share count is non-finite, negative, or not the plan's floored quantity.
+    InvalidQuantity,
+    /// Prices or the reward side are not a plan that can be shown as context.
+    InvalidPlan,
+}
+
+impl HandoffBlock {
+    pub fn explain(self) -> &'static str {
+        match self {
+            Self::Short => {
+                "Short plans cannot open an order ticket. A sell order closes shares you already hold; it does not open a short. Short-opening is not supported yet."
+            }
+            Self::ZeroShares => {
+                "Handoff disabled: whole-share quantity is 0. Increase dollar risk or tighten the stop before opening a ticket."
+            }
+            Self::InvalidQuantity => "Handoff disabled: whole-share quantity is invalid.",
+            Self::InvalidPlan => "Handoff disabled: the plan prices are invalid.",
+        }
+    }
+}
+
+impl RiskPlan {
+    /// Long ticket for this plan's exact whole-share quantity, or why handoff is disabled.
+    ///
+    /// Short plans are refused: the ticket's sell side closes a long and does not open a short.
+    /// A sub-one-share budget stays a plan (the size is still shown) but does not become a ticket.
+    pub fn handoff(&self) -> Result<PlanContext, HandoffBlock> {
+        if !self.long {
+            return Err(HandoffBlock::Short);
+        }
+        if !self.shares.is_finite() || self.shares < 0.0 || !self.whole_shares.is_finite() || self.whole_shares < 0.0 {
+            return Err(HandoffBlock::InvalidQuantity);
+        }
+        if !self.entry.is_finite()
+            || self.entry <= 0.0
+            || !self.stop.is_finite()
+            || self.stop >= self.entry
+            || !self.dollar_risk.is_finite()
+            || self.dollar_risk <= 0.0
+            || !self.risk_per_share.is_finite()
+            || self.risk_per_share <= 0.0
+            || !self.position_value.is_finite()
+            || self.target.is_some_and(|t| !t.is_finite() || t <= self.entry)
+            || self.r_multiple.is_some_and(|r| !r.is_finite() || r <= 0.0)
+        {
+            return Err(HandoffBlock::InvalidPlan);
+        }
+        let whole = self.shares.floor();
+        if !whole.is_finite() || (self.whole_shares - whole).abs() > 1e-6 {
+            return Err(HandoffBlock::InvalidQuantity);
+        }
+        if whole < 1.0 {
+            return Err(HandoffBlock::ZeroShares);
+        }
+        if whole > u64::MAX as f64 {
+            return Err(HandoffBlock::InvalidQuantity);
+        }
+        let quantity = whole as u64;
+        if (quantity as f64 - whole).abs() > 1e-6 {
+            return Err(HandoffBlock::InvalidQuantity);
+        }
+        Ok(PlanContext {
+            entry: self.entry,
+            stop: self.stop,
+            target: self.target,
+            dollar_risk: self.dollar_risk,
+            quantity,
+        })
+    }
+}
+
+/// Shares = dollar risk / |entry − stop|. Fractional shares are kept; `whole_shares` floors
+/// and is not raised to 1. A target, when given, must be a positive finite price strictly on
+/// the profitable side of entry (above a long entry, below a short entry). Equal-entry and
+/// wrong-side targets are rejected, so a losing target is never reported as a positive R.
 pub fn size_position(
     entry: f64,
     stop: f64,
@@ -308,21 +401,59 @@ pub fn size_position(
     }
     let long = stop < entry;
     let risk_per_share = (entry - stop).abs();
+    if !risk_per_share.is_finite() || risk_per_share <= 0.0 {
+        return Err("stop distance is invalid".into());
+    }
     let shares = dollar_risk / risk_per_share;
-    let r_multiple = target
-        .filter(|t| t.is_finite() && *t > 0.0 && (*t - entry).abs() > 1e-9)
-        .map(|t| (t - entry).abs() / risk_per_share);
+    let whole_shares = shares.floor();
+    let position_value = shares * entry;
+    if !shares.is_finite() || !whole_shares.is_finite() || shares < 0.0 {
+        return Err("share quantity is invalid".into());
+    }
+    if !position_value.is_finite() {
+        return Err("position value is invalid".into());
+    }
+    let (target, r_multiple) = match target {
+        None => (None, None),
+        Some(t) => {
+            if !t.is_finite() {
+                return Err("target must be a finite price".into());
+            }
+            if t <= 0.0 {
+                return Err("target must be a positive price".into());
+            }
+            if (t - entry).abs() < 1e-9 {
+                return Err("target must differ from entry".into());
+            }
+            let reward = if long { t - entry } else { entry - t };
+            if !reward.is_finite() {
+                return Err("reward multiple is invalid".into());
+            }
+            if reward <= 0.0 {
+                return Err(if long {
+                    "long target must be above entry".into()
+                } else {
+                    "short target must be below entry".into()
+                });
+            }
+            let r_multiple = reward / risk_per_share;
+            if !r_multiple.is_finite() || r_multiple <= 0.0 {
+                return Err("reward multiple is invalid".into());
+            }
+            (Some(t), Some(r_multiple))
+        }
+    };
     Ok(RiskPlan {
         entry,
         stop,
-        target: target.filter(|t| t.is_finite() && *t > 0.0),
+        target,
         dollar_risk,
         stop_source,
         long,
         risk_per_share,
         shares,
-        whole_shares: shares.floor(),
-        position_value: shares * entry,
+        whole_shares,
+        position_value,
         r_multiple,
     })
 }
@@ -448,8 +579,86 @@ mod tests {
         let short = size_position(50.0, 55.0, Some(40.0), 100.0, StopSource::User).unwrap();
         assert!(!short.long);
         assert!((short.shares - 20.0).abs() < 1e-12);
+        assert!((short.r_multiple.unwrap() - 2.0).abs() < 1e-12);
         assert!(size_position(100.0, 100.0, None, 100.0, StopSource::User).is_err());
         assert!(size_position(100.0, 95.0, None, 0.0, StopSource::User).is_err());
+    }
+
+    #[test]
+    fn wrong_side_and_equal_entry_targets_are_rejected() {
+        let long_wrong = size_position(100.0, 95.0, Some(90.0), 250.0, StopSource::User).unwrap_err();
+        assert!(long_wrong.contains("above entry"), "{long_wrong}");
+        let equal = size_position(100.0, 95.0, Some(100.0), 250.0, StopSource::User).unwrap_err();
+        assert!(equal.contains("differ from entry"), "{equal}");
+        let almost = size_position(100.0, 95.0, Some(100.0 + 1e-12), 250.0, StopSource::User).unwrap_err();
+        assert!(almost.contains("differ from entry"), "{almost}");
+        let short_wrong = size_position(50.0, 55.0, Some(60.0), 100.0, StopSource::User).unwrap_err();
+        assert!(short_wrong.contains("below entry"), "{short_wrong}");
+        // A correct-side short target still sizes, and its R is the reward, not the absolute distance to a loser.
+        let short = size_position(50.0, 55.0, Some(40.0), 100.0, StopSource::User).unwrap();
+        assert!((short.r_multiple.unwrap() - 2.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn nonfinite_inputs_and_derived_quantities_are_rejected() {
+        assert!(size_position(f64::NAN, 95.0, None, 100.0, StopSource::User).unwrap_err().contains("entry"));
+        assert!(size_position(f64::INFINITY, 95.0, None, 100.0, StopSource::User).unwrap_err().contains("entry"));
+        assert!(size_position(100.0, f64::NAN, None, 100.0, StopSource::User).unwrap_err().contains("stop"));
+        assert!(size_position(100.0, f64::INFINITY, None, 100.0, StopSource::User).unwrap_err().contains("stop"));
+        assert!(size_position(100.0, 95.0, None, f64::NAN, StopSource::User).unwrap_err().contains("dollar risk"));
+        assert!(size_position(100.0, 95.0, None, f64::INFINITY, StopSource::User).unwrap_err().contains("dollar risk"));
+        assert!(size_position(100.0, 95.0, Some(f64::NAN), 100.0, StopSource::User).unwrap_err().contains("finite"));
+        assert!(
+            size_position(100.0, 95.0, Some(f64::NEG_INFINITY), 100.0, StopSource::User)
+                .unwrap_err()
+                .contains("finite")
+        );
+        assert!(size_position(100.0, 95.0, Some(0.0), 100.0, StopSource::User).unwrap_err().contains("positive"));
+        assert!(size_position(100.0, 95.0, Some(-5.0), 100.0, StopSource::User).unwrap_err().contains("positive"));
+        // dollar risk / a tiny stop distance overflows; that quantity is not a plan.
+        let overflow = size_position(1.0, 1.0 - 1e-8, None, f64::MAX, StopSource::User).unwrap_err();
+        assert!(overflow.contains("invalid"), "{overflow}");
+    }
+
+    #[test]
+    fn handoff_keeps_exact_long_quantity_and_blocks_zero_and_shorts() {
+        let plan = size_position(100.0, 95.0, Some(110.0), 250.0, StopSource::Box).unwrap();
+        let ctx = plan.handoff().unwrap();
+        assert_eq!(ctx.quantity, 50);
+        assert!((ctx.entry - 100.0).abs() < 1e-12);
+        assert!((ctx.stop - 95.0).abs() < 1e-12);
+        assert_eq!(ctx.target, Some(110.0));
+        assert!((ctx.dollar_risk - 250.0).abs() < 1e-12);
+
+        let two = size_position(100.0, 95.0, None, 10.0, StopSource::User).unwrap();
+        assert!(two.target.is_none());
+        assert!(two.r_multiple.is_none());
+        assert_eq!(two.handoff().unwrap().quantity, 2);
+
+        // 1.9 shares floors to 1. A budget under one share does not get promoted to 1.
+        let floored = size_position(100.0, 90.0, None, 19.0, StopSource::User).unwrap();
+        assert!((floored.shares - 1.9).abs() < 1e-12);
+        assert_eq!(floored.handoff().unwrap().quantity, 1);
+        let tiny = size_position(100.0, 99.0, None, 0.5, StopSource::User).unwrap();
+        assert!(tiny.shares < 1.0);
+        assert_eq!(tiny.whole_shares, 0.0);
+        assert_eq!(tiny.handoff(), Err(HandoffBlock::ZeroShares));
+        assert!(tiny.handoff().unwrap_err().explain().contains("whole-share quantity is 0"));
+
+        let short = size_position(50.0, 55.0, Some(40.0), 100.0, StopSource::User).unwrap();
+        assert_eq!(short.handoff(), Err(HandoffBlock::Short));
+        let why = short.handoff().unwrap_err().explain();
+        assert!(why.contains("does not open a short"));
+        assert!(why.contains("not supported"));
+
+        let mut broken = plan.clone();
+        broken.whole_shares = f64::NAN;
+        assert_eq!(broken.handoff(), Err(HandoffBlock::InvalidQuantity));
+        broken.whole_shares = 1.0;
+        assert_eq!(broken.handoff(), Err(HandoffBlock::InvalidQuantity));
+        broken.whole_shares = plan.whole_shares;
+        broken.entry = f64::NAN;
+        assert_eq!(broken.handoff(), Err(HandoffBlock::InvalidPlan));
     }
 
     #[test]

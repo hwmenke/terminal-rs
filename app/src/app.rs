@@ -983,6 +983,7 @@ impl TerminalApp {
                     Some(cmd) => self.dispatch(cmd),
                     None => tracing::warn!("internal command did not parse: {line}"),
                 },
+                Action::RiskPlanTicket { symbol, plan } => self.open_plan_ticket(&symbol, plan),
                 Action::Track(q, on) => {
                     self.worker.send(Request::Track { query: q.clone(), on });
                     // Refresh any open profile so the star updates.

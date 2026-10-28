@@ -31,6 +31,7 @@ use tr_broker::trading::{
     self, Amount, Capability, OrderPreview, OrderRequest, OrderType, PlaceError, Side, TimeInForce,
 };
 use tr_broker::{Account, InstrumentKind, Order, demo};
+use tr_data::whats_news::{HandoffBlock, PlanContext};
 
 use super::TerminalApp;
 use super::broker::{BrokerMode, open_external};
@@ -80,6 +81,17 @@ pub struct Ticket {
     pub error: Option<String>,
     /// Result of the last placement.
     pub done: Option<String>,
+    /// Desk risk-plan snapshot for this symbol. Planning context only — not an order.
+    plan: Option<AttachedPlan>,
+}
+
+/// Immutable plan copied onto the ticket when Desk opens it.
+/// Cleared when the ticket symbol is no longer the one the plan was reviewed for.
+#[derive(Debug, Clone, PartialEq)]
+struct AttachedPlan {
+    /// Broker ticker (`AAPL`), matched against [`Ticket::symbol`].
+    symbol: String,
+    context: PlanContext,
 }
 
 fn parse_num(s: &str) -> Option<f64> {
@@ -115,6 +127,7 @@ impl Ticket {
             placing: false,
             error: None,
             done: None,
+            plan: None,
         }
     }
 
@@ -155,6 +168,21 @@ impl Ticket {
         self.review = false;
         self.error = None;
         self.done = None;
+        self.clear_stale_plan();
+    }
+
+    /// Drop planning context once the ticket is for a different symbol.
+    /// Quantity, side, and order type edits keep the snapshot: it is not the order.
+    fn clear_stale_plan(&mut self) {
+        let current = self.symbol.trim();
+        if self.plan.as_ref().is_some_and(|p| !p.symbol.eq_ignore_ascii_case(current)) {
+            self.plan = None;
+        }
+    }
+
+    /// Planning context for the current symbol, when Desk attached one.
+    pub(super) fn plan_context(&self) -> Option<&PlanContext> {
+        self.plan.as_ref().map(|p| &p.context)
     }
 
     /// The order the ticket describes, or why it is incomplete.
@@ -488,6 +516,50 @@ impl TerminalApp {
         if !self.demo_mode() && self.broker.portfolio.is_none() && !self.broker.loading {
             self.refresh_portfolio();
         }
+    }
+
+    /// Open a market ticket from a reviewed long plan.
+    ///
+    /// The quantity is the plan's whole-share count. Entry, stop, target, and dollar risk
+    /// are attached as planning context and are not copied into the order's stop or limit.
+    pub(super) fn open_plan_ticket(&mut self, symbol: &str, context: PlanContext) {
+        if context.quantity == 0 {
+            self.status = HandoffBlock::ZeroShares.explain().into();
+            return;
+        }
+        if !context.entry.is_finite()
+            || context.entry <= 0.0
+            || !context.stop.is_finite()
+            || context.stop <= 0.0
+            || context.stop >= context.entry
+            || !context.dollar_risk.is_finite()
+            || context.dollar_risk <= 0.0
+            || context.target.is_some_and(|t| !t.is_finite() || t <= context.entry)
+        {
+            self.status = HandoffBlock::InvalidPlan.explain().into();
+            return;
+        }
+        self.open_ticket(
+            TradeArgs {
+                buy: Some(true),
+                symbol: Some(symbol.to_string()),
+                units: Some(context.quantity as f64),
+                ..Default::default()
+            },
+            None,
+        );
+        let Some(ticket) = self.trading.ticket.as_mut() else { return };
+        // A market buy of the planned shares. Stop and target stay off the order.
+        ticket.side = Side::Buy;
+        ticket.dollars = false;
+        ticket.all = false;
+        ticket.order_type = OrderType::Market;
+        ticket.limit.clear();
+        ticket.stop.clear();
+        ticket.advanced = false;
+        ticket.qty = fmt_input(context.quantity as f64);
+        ticket.plan = Some(AttachedPlan { symbol: ticket.symbol.clone(), context });
+        ticket.clear_stale_plan();
     }
 
     /// Keep a `SELL ALL` ticket's quantity equal to the chosen account's whole position. Any
@@ -1110,6 +1182,7 @@ impl TerminalApp {
             );
             if r.changed() {
                 t.symbol = t.symbol.to_ascii_uppercase();
+                t.clear_stale_plan();
             }
             enter |= r.lost_focus() && fresh_enter(ui);
             match quote {
@@ -1364,6 +1437,10 @@ impl TerminalApp {
             ui.label(RichText::new(d).font(ui_font(12.0)).color(theme::up()));
         }
 
+        if let Some(plan) = t.plan_context() {
+            show_plan_context(ui, plan);
+        }
+
         // The one button.
         let fill = if t.side == Side::Buy { theme::up() } else { theme::down() };
         let label = match (&ready, demo_mode) {
@@ -1424,7 +1501,11 @@ impl TerminalApp {
     }
 
     fn confirm_dialog(&mut self, ctx: &egui::Context) {
+        if let Some(t) = self.trading.ticket.as_mut() {
+            t.clear_stale_plan();
+        }
         let Some(t) = self.trading.ticket.as_ref() else { return };
+        let plan_note = t.plan_context().map(plan_review_text);
         let Some(p) = t.current_preview().cloned() else {
             if let Some(t) = self.trading.ticket.as_mut() {
                 t.confirming = false;
@@ -1490,6 +1571,10 @@ impl TerminalApp {
                     row(ui, "Cash after", RichText::new(money(c, &p.currency)).font(mono(12.5)).color(text()));
                 }
             });
+            if let Some(note) = &plan_note {
+                ui.add_space(dp(6.0));
+                ui.label(RichText::new(note).font(ui_font(11.5)).color(amber()));
+            }
             ui.add_space(dp(6.0));
             let warn = if p.simulated {
                 "Simulated: the order is recorded in the sample portfolio only.".to_string()
@@ -1981,6 +2066,22 @@ enum TicketAct {
     Mode(AccountMode),
 }
 
+/// One line for the ticket and the confirmation. Prices here are the reviewed plan, not the order.
+pub(super) fn plan_review_text(plan: &PlanContext) -> String {
+    let target = plan.target.map(price).unwrap_or_else(|| "none".into());
+    format!(
+        "Planning context only — not a submitted order and not a bracket: entry {} · stop {} · target {target} · risk budget {}.",
+        price(plan.entry),
+        price(plan.stop),
+        money(plan.dollar_risk, "USD"),
+    )
+}
+
+fn show_plan_context(ui: &mut Ui, plan: &PlanContext) {
+    ui.add_space(dp(4.0));
+    ui.label(RichText::new(plan_review_text(plan)).font(ui_font(11.5)).color(amber()));
+}
+
 /// Enter was pressed this frame (not an auto-repeat of a held key).
 fn fresh_enter(ui: &Ui) -> bool {
     ui.input(|i| {
@@ -2022,6 +2123,7 @@ fn account_line(a: &Account) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::app::tests::test_app;
 
     fn ticket() -> Ticket {
         let mut t = Ticket::new(1);
@@ -2119,5 +2221,83 @@ mod tests {
         let c = CapsCache { fetched: Some(chrono::Utc::now()), caps };
         let back: CapsCache = serde_json::from_slice(&serde_json::to_vec(&c).unwrap()).unwrap();
         assert_eq!(back, c);
+    }
+
+    fn reviewed_plan() -> PlanContext {
+        PlanContext { entry: 100.0, stop: 95.0, target: Some(110.0), dollar_risk: 250.0, quantity: 50 }
+    }
+
+    #[test]
+    fn plan_review_names_the_planning_prices_and_not_an_order() {
+        let note = plan_review_text(&reviewed_plan());
+        assert!(note.contains("entry 100.00"));
+        assert!(note.contains("stop 95.00"));
+        assert!(note.contains("target 110.00"));
+        assert!(note.contains("risk budget $250.00"));
+        assert!(note.contains("not a submitted order"));
+        assert!(note.contains("not a bracket"));
+        assert!(!note.contains("BUY"), "the note is context, not an order command");
+        let mut no_target = reviewed_plan();
+        no_target.target = None;
+        assert!(plan_review_text(&no_target).contains("target none"));
+    }
+
+    #[test]
+    fn plan_context_stays_until_the_ticket_symbol_changes() {
+        let mut app = test_app();
+        app.open_plan_ticket("AAPL US Equity", reviewed_plan());
+        let ticket = app.trading.ticket.as_ref().unwrap();
+        assert_eq!(ticket.plan_context().map(|p| p.quantity), Some(50));
+        assert!(ticket.stop.is_empty());
+        assert!(ticket.limit.is_empty());
+
+        // Editing the quantity or the side keeps the reviewed plan. It is not the order.
+        let ticket = app.trading.ticket.as_mut().unwrap();
+        ticket.qty = "7".into();
+        ticket.side = Side::Sell;
+        ticket.clear_stale_plan();
+        assert_eq!(ticket.plan_context().unwrap().quantity, 50);
+        assert_eq!(ticket.qty, "7");
+        assert_eq!(ticket.side, Side::Sell);
+        assert!(ticket.stop.is_empty() && ticket.limit.is_empty());
+
+        // A later ticket for the same symbol keeps the snapshot.
+        app.open_ticket(
+            TradeArgs {
+                buy: Some(true),
+                symbol: Some("AAPL US Equity".into()),
+                units: Some(4.0),
+                ..Default::default()
+            },
+            None,
+        );
+        let ticket = app.trading.ticket.as_ref().unwrap();
+        assert_eq!(ticket.symbol, "AAPL");
+        assert_eq!(ticket.qty, "4");
+        assert_eq!(ticket.plan_context().map(|p| p.entry), Some(100.0));
+        assert!(ticket.stop.is_empty());
+
+        // Reusing the ticket for another symbol drops the stale plan.
+        app.open_ticket(
+            TradeArgs {
+                buy: Some(true),
+                symbol: Some("MSFT US Equity".into()),
+                units: Some(3.0),
+                ..Default::default()
+            },
+            None,
+        );
+        let ticket = app.trading.ticket.as_ref().unwrap();
+        assert_eq!(ticket.symbol, "MSFT");
+        assert_eq!(ticket.qty, "3");
+        assert!(ticket.plan_context().is_none());
+
+        app.open_plan_ticket("NVDA US Equity", reviewed_plan());
+        let ticket = app.trading.ticket.as_mut().unwrap();
+        assert_eq!(ticket.symbol, "NVDA");
+        assert!(ticket.plan_context().is_some());
+        ticket.symbol = "AMD".into();
+        ticket.clear_stale_plan();
+        assert!(ticket.plan_context().is_none());
     }
 }
