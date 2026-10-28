@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
-use tr_chart::drawings::Drawing;
+use tr_chart::drawings::{AnnotationStore, Drawing};
 use tr_chart::scene::ChartType;
 use tr_core::Timeframe;
 
@@ -67,6 +67,10 @@ pub enum PaneSettings {
         log: bool,
         indicators: Vec<IndicatorSpec>,
         drawings: Vec<Drawing>,
+        /// Per-security drawings for names this pane has visited. The live `drawings`
+        /// field stays the current symbol so older builds still load.
+        #[serde(default, skip_serializing_if = "AnnotationStore::is_empty")]
+        drawing_store: AnnotationStore,
         compare: Option<String>,
         #[serde(default = "yes")]
         show_volume: bool,
@@ -378,6 +382,7 @@ pub fn chart_settings(symbol: &str, d: &crate::prefs::PanelDefaults) -> PaneSett
         log: false,
         indicators: crate::command::default_indicators(),
         drawings: Vec::new(),
+        drawing_store: AnnotationStore::new(),
         compare: None,
         show_volume: d.show_volume,
         show_congress: d.congress_markers,
@@ -701,6 +706,65 @@ mod tests {
         }
         match &doc.panes[1].settings {
             PaneSettings::News(s) => assert_eq!(s.clone().into_pane().scope, tr_data::news::NewsScope::Watchlist),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    fn hline(price: f64) -> Drawing {
+        Drawing::new(
+            tr_chart::drawings::Tool::Horizontal,
+            tr_chart::drawings::Anchor { ts: 0, price },
+            tr_chart::drawings::Anchor { ts: 0, price },
+        )
+    }
+
+    #[test]
+    fn drawing_store_round_trips_and_legacy_drawings_seed_the_current_symbol() {
+        let mut store = AnnotationStore::new();
+        store.stash("AAPL", &[hline(150.0)]);
+        store.stash("MSFT", &[hline(400.0)]);
+        let doc = LayoutDoc::preset("Marks", Layout::One, vec![PaneSettings::Chart {
+            archive: false,
+            watch_group: None,
+            symbol: "AAPL US Equity".into(),
+            tf: Timeframe::D1,
+            chart_type: ChartType::Candles,
+            log: false,
+            indicators: vec![],
+            drawings: vec![hline(150.0)],
+            drawing_store: store,
+            compare: None,
+            show_volume: true,
+            show_congress: true,
+            show_news: true,
+            show_journal: true,
+            magnet: false,
+            show_box: false,
+            show_rs: false,
+            show_volume_ctx: false,
+        }]);
+        let back = LayoutDoc::from_json(&doc.to_json()).unwrap();
+        match &back.panes[0].settings {
+            PaneSettings::Chart { symbol, drawings, drawing_store, .. } => {
+                assert_eq!(symbol, "AAPL US Equity");
+                assert_eq!(drawings[0].horizontal_price(), Some(150.0));
+                assert_eq!(drawing_store.get("AAPL").len(), 1);
+                assert_eq!(drawing_store.get("MSFT")[0].horizontal_price(), Some(400.0));
+                assert!(drawing_store.get("NVDA").is_empty());
+            }
+            other => panic!("{other:?}"),
+        }
+
+        let legacy = r#"{"name":"OldMarks","dock":{"type":"tabs","panes":[1]},"panes":[{"id":1,"Chart":{
+            "symbol":"AAPL US Equity","tf":"D1","chart_type":"Candles","log":false,"indicators":[],
+            "drawings":[{"tool":"Horizontal","a":{"ts":0,"price":188.5},"b":{"ts":0,"price":188.5}}],
+            "compare":null}}]}"#;
+        let loaded = LayoutDoc::from_json(legacy.as_bytes()).unwrap();
+        match &loaded.panes[0].settings {
+            PaneSettings::Chart { drawings, drawing_store, .. } => {
+                assert_eq!(drawings[0].horizontal_price(), Some(188.5));
+                assert!(drawing_store.is_empty(), "legacy files have no store; seed happens on pane load");
+            }
             other => panic!("{other:?}"),
         }
     }

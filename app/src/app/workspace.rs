@@ -546,6 +546,36 @@ impl TerminalApp {
             }
         }
         self.status = format!("{} ({} link)", tr_data::security(symbol).key(), link.label());
+        self.sync_linked_review_levels();
+    }
+
+    /// Daily/weekly linked archive panes share horizontal levels for the same name.
+    /// Trendlines, verticals and fibs stay on the pane that drew them.
+    pub(super) fn sync_linked_review_levels(&mut self) {
+        let mut groups: HashMap<(Link, String), Vec<usize>> = HashMap::new();
+        for (i, p) in self.panes.iter().enumerate() {
+            if let (Some(link), PaneKind::Chart(c)) = (p.link, &p.kind)
+                && c.archive
+            {
+                groups.entry((link, c.symbol.clone())).or_default().push(i);
+            }
+        }
+        for idxs in groups.into_values() {
+            if idxs.len() < 2 {
+                continue;
+            }
+            let mut levels = Vec::new();
+            for &i in &idxs {
+                if let PaneKind::Chart(c) = &self.panes[i].kind {
+                    levels.extend(c.compatible_levels());
+                }
+            }
+            for &i in &idxs {
+                if let PaneKind::Chart(c) = &mut self.panes[i].kind {
+                    c.merge_compatible_levels(&levels);
+                }
+            }
+        }
     }
 
     pub(super) fn set_link(&mut self, id: PaneId, link: Option<Link>) {
@@ -625,6 +655,7 @@ impl TerminalApp {
             }
         }
         self.watch_ui.active_chart = Some(daily);
+        self.sync_linked_review_levels();
         self.status = format!("{key} · daily + weekly archive review ({})", link.label());
     }
 

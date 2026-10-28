@@ -150,6 +150,7 @@ const COMMANDS: &[(&str, &str, &str, Option<Action>)] = &[
     ("VCTX", "Toggle volume context", "volume review overlay", None),
     ("ADTREND", "Adaptive Trend bands, states and trailing stops", "adaptive trend overlay kama mrt", None),
     ("CLEAR DRAW", "", "drawings remove", None),
+    ("UNDO DRAW", "Restore the last deleted drawings on this symbol", "drawings undo", None),
     ("1", "", "interval timeframe minute", None),
     ("5", "", "interval timeframe minutes", None),
     ("15", "", "interval timeframe minutes", None),

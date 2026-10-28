@@ -5,6 +5,18 @@ results and watchlist stepping keep both charts on the same name. `LATEST` or
 `End` jumps to the latest candle without changing zoom. `BOX`, `RS` and `VCTX`
 toggle the review overlays; they are saved with the layout.
 
+## Annotations
+
+User drawings (trendline, horizontal, vertical, fib) are stored **per canonical
+security** on each chart pane. Stepping AAPL → MSFT → AAPL keeps AAPL's marks
+and does not show them on MSFT. Layout save/load writes the per-name store, not
+only the live pane. Linked daily and weekly archive charts share **horizontal**
+levels (price-only); trendlines, verticals and fibs stay on the pane that drew
+them. `CLEAR DRAW` clears the current name; `UNDO DRAW` restores the last delete
+or clear on that name. Drawings are user marks, never invented prices — sample
+or unverified bars still show the existing sample banner and are not a source
+of levels.
+
 Archive charts stay on the research path: no market-display cache, live feed or
 sample fallback. Weekly and monthly candles are still resampled from **daily**
 rows. Whats-News stored weekly rows are never read.

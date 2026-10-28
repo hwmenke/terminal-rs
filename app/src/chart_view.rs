@@ -7,7 +7,7 @@ use egui::{
     Align2, Color32, CornerRadius, CursorIcon, Pos2, Rect, RichText, Sense, Stroke, StrokeKind, Ui, UiBuilder, pos2,
     vec2,
 };
-use tr_chart::drawings::{self, Anchor, Drawing, Shape, Tool};
+use tr_chart::drawings::{self, Anchor, AnnotationStore, Drawing, Shape, Tool};
 use tr_chart::gpu::{ChartCallback, Frame, LineKind, LineRef, Reveal, Style};
 use tr_chart::scale;
 use tr_chart::scene::{self, ChartType, Overlay, PricePane, SeriesGpu};
@@ -92,6 +92,10 @@ pub struct ChartState {
     pub show_volume_ctx: bool,
     pub indicators: Vec<IndicatorSpec>,
     pub drawings: Vec<Drawing>,
+    /// Drawings for names this pane has visited, keyed by canonical security.
+    pub drawing_store: AnnotationStore,
+    /// Last delete/clear of the current symbol, for a one-step undo.
+    drawing_undo: Option<Vec<Drawing>>,
     pub compare: Option<String>,
 
     bars: Arc<Vec<Bar>>,
@@ -172,6 +176,8 @@ impl ChartState {
             show_volume_ctx: false,
             indicators: crate::command::default_indicators(),
             drawings: Vec::new(),
+            drawing_store: AnnotationStore::new(),
+            drawing_undo: None,
             compare: None,
             bars: Arc::new(Vec::new()),
             provenance: Provenance::Missing,
@@ -304,17 +310,69 @@ impl ChartState {
             self.error = Some("Invalid security".into());
             return;
         };
+        let same = sec.key() == self.sec.key();
         if sec.class == AssetClass::Govt {
             self.chart_type = ChartType::Line;
         } else if self.sec.class == AssetClass::Govt {
             self.chart_type = ChartType::Candles;
         }
-        self.symbol = sec.key();
-        self.sec = sec;
-        self.draw = DrawState::default();
-        self.drawings.clear();
+        if !same {
+            self.commit_drawings();
+            self.drawing_undo = None;
+            self.symbol = sec.key();
+            self.sec = sec;
+            self.draw = DrawState::default();
+            self.drawings = self.drawing_store.get(&self.symbol);
+        } else {
+            self.symbol = sec.key();
+            self.sec = sec;
+        }
         self.pending_range = None;
         self.load(w);
+    }
+
+    /// Write the live pane's drawings into the per-symbol store.
+    pub fn commit_drawings(&mut self) {
+        self.drawing_store.stash(&self.symbol, &self.drawings);
+    }
+
+    pub fn clear_drawings(&mut self) {
+        if self.drawings.is_empty() {
+            return;
+        }
+        self.drawing_undo = Some(std::mem::take(&mut self.drawings));
+        self.draw.selected = None;
+        self.commit_drawings();
+    }
+
+    /// Restore the last delete or clear for this symbol.
+    pub fn undo_drawings(&mut self) -> bool {
+        let Some(prev) = self.drawing_undo.take() else {
+            return false;
+        };
+        self.drawings = prev;
+        self.draw.selected = None;
+        self.commit_drawings();
+        true
+    }
+
+    pub fn compatible_levels(&self) -> Vec<Drawing> {
+        self.drawings.iter().filter(|d| d.is_compatible_level()).cloned().collect()
+    }
+
+    pub fn merge_compatible_levels(&mut self, incoming: &[Drawing]) {
+        let before = self.drawings.len();
+        for d in incoming.iter().filter(|d| d.is_compatible_level()) {
+            if !self.drawings.iter().any(|e| match (e.horizontal_price(), d.horizontal_price()) {
+                (Some(a), Some(b)) => (a - b).abs() < 1e-9,
+                _ => false,
+            }) {
+                self.drawings.push(d.clone());
+            }
+        }
+        if self.drawings.len() != before {
+            self.commit_drawings();
+        }
     }
 
     pub fn set_timeframe(&mut self, tf: Timeframe, w: &Worker) {
@@ -418,7 +476,9 @@ impl ChartState {
     pub fn delete_selected(&mut self) -> bool {
         match self.draw.selected.take() {
             Some(i) if i < self.drawings.len() => {
+                self.drawing_undo = Some(self.drawings.clone());
                 self.drawings.remove(i);
+                self.commit_drawings();
                 true
             }
             _ => false,
@@ -1354,7 +1414,11 @@ impl ChartState {
                 }
             }
             if ui.button("Remove All Drawings").clicked() {
-                self.drawings.clear();
+                self.clear_drawings();
+                ui.close();
+            }
+            if self.drawing_undo.is_some() && ui.button("Undo Last Delete").clicked() {
+                self.undo_drawings();
                 ui.close();
             }
         });
@@ -2099,30 +2163,24 @@ mod tests {
         chart.built = crate::worker::build_indicators(&bars, chart.tf, &chart.indicators, &theme::palette());
         chart_frame(&ctx, &mut chart, &worker, vec![]);
         let pos = pos2(500.0, 300.0);
-        chart_frame(
-            &ctx,
-            &mut chart,
-            &worker,
-            vec![egui::Event::PointerMoved(pos), pointer(pos, egui::PointerButton::Secondary, true)],
-        );
+        chart_frame(&ctx, &mut chart, &worker, vec![
+            egui::Event::PointerMoved(pos),
+            pointer(pos, egui::PointerButton::Secondary, true),
+        ]);
         chart_frame(&ctx, &mut chart, &worker, vec![pointer(pos, egui::PointerButton::Secondary, false)]);
         let output = chart_frame(&ctx, &mut chart, &worker, vec![]);
         let pos = text_position(&output.shapes, "Indicators");
-        chart_frame(
-            &ctx,
-            &mut chart,
-            &worker,
-            vec![egui::Event::PointerMoved(pos), pointer(pos, egui::PointerButton::Primary, true)],
-        );
+        chart_frame(&ctx, &mut chart, &worker, vec![
+            egui::Event::PointerMoved(pos),
+            pointer(pos, egui::PointerButton::Primary, true),
+        ]);
         chart_frame(&ctx, &mut chart, &worker, vec![pointer(pos, egui::PointerButton::Primary, false)]);
         let output = chart_frame(&ctx, &mut chart, &worker, vec![]);
         let pos = text_position(&output.shapes, "Remove All");
-        chart_frame(
-            &ctx,
-            &mut chart,
-            &worker,
-            vec![egui::Event::PointerMoved(pos), pointer(pos, egui::PointerButton::Primary, true)],
-        );
+        chart_frame(&ctx, &mut chart, &worker, vec![
+            egui::Event::PointerMoved(pos),
+            pointer(pos, egui::PointerButton::Primary, true),
+        ]);
         chart_frame(&ctx, &mut chart, &worker, vec![pointer(pos, egui::PointerButton::Primary, false)]);
         assert!(chart.built.is_empty());
         assert!(chart.indicators.is_empty());
@@ -2175,6 +2233,51 @@ mod tests {
         c.set_symbol("BTC", &worker);
         assert_eq!(c.chart_type, ChartType::Candles);
         assert_eq!(c.sec.class, AssetClass::Crypto);
+    }
+
+    fn hline(price: f64) -> Drawing {
+        Drawing::new(Tool::Horizontal, Anchor { ts: 0, price }, Anchor { ts: 0, price })
+    }
+
+    fn trend() -> Drawing {
+        Drawing::new(Tool::Trendline, Anchor { ts: 1, price: 10.0 }, Anchor { ts: 2, price: 20.0 })
+    }
+
+    #[test]
+    fn drawings_survive_a_to_b_to_a_and_stay_off_b() {
+        let (worker, _) = Worker::test_channel();
+        let mut c = ChartState::new(1, "AAPL", Timeframe::D1);
+        c.drawings.push(hline(150.0));
+        c.drawings.push(trend());
+        c.set_symbol("MSFT", &worker);
+        assert!(c.drawings.is_empty(), "B must not show A's drawings");
+        assert_eq!(c.symbol, "MSFT US Equity");
+        c.drawings.push(hline(400.0));
+        c.set_symbol("AAPL US Equity", &worker);
+        assert_eq!(c.drawings.len(), 2);
+        assert_eq!(c.drawings[0].horizontal_price(), Some(150.0));
+        assert_eq!(c.drawings[1].tool, Tool::Trendline);
+        c.set_symbol("MSFT", &worker);
+        assert_eq!(c.drawings.len(), 1);
+        assert_eq!(c.drawings[0].horizontal_price(), Some(400.0));
+    }
+
+    #[test]
+    fn undo_restores_last_delete_and_clear_for_current_symbol() {
+        let (worker, _) = Worker::test_channel();
+        let mut c = ChartState::new(1, "AAPL", Timeframe::D1);
+        c.drawings = vec![hline(10.0), hline(20.0)];
+        c.draw.selected = Some(0);
+        assert!(c.delete_selected());
+        assert_eq!(c.drawings.len(), 1);
+        assert!(c.undo_drawings());
+        assert_eq!(c.drawings.len(), 2);
+        c.clear_drawings();
+        assert!(c.drawings.is_empty());
+        assert!(c.undo_drawings());
+        assert_eq!(c.drawings.len(), 2);
+        c.set_symbol("MSFT", &worker);
+        assert!(!c.undo_drawings(), "undo is per current symbol");
     }
 
     #[test]
