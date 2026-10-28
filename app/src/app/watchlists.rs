@@ -374,6 +374,7 @@ impl TerminalApp {
                 self.status = tr_data::security(symbol).key();
             }
         }
+        self.sync_linked_review_levels();
         self.focus = focus;
     }
     fn link_watch_group(&mut self, id: PaneId, group: Option<String>) {

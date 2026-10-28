@@ -341,6 +341,7 @@ impl TerminalApp {
                     (&["SMA 50", "RSI", "IND"], "Indicators (see below)"),
                     (&["CMP MSFT"], "Compare, rebased to the main symbol"),
                     (&["TL", "HL", "VL", "FIB", "MAGNET"], "Drawing tools and snapping"),
+                    (&["CLEAR DRAW", "UNDO DRAW"], "Remove all drawings on this name, or undo the last delete"),
                     (&["REVIEW", "AAPL REVIEW"], "Linked daily + weekly archive charts for candidate review"),
                     (&["LATEST", "END"], "Jump to the latest candle (keeps zoom)"),
                     (&["BOX", "RS", "VCTX"], "Toggle box levels, 21-bar return, volume context"),

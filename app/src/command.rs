@@ -223,6 +223,8 @@ pub enum Function {
     Range(Range),
     Draw(Tool),
     ClearDrawings,
+    /// Restore the last deleted or cleared drawings for the current symbol.
+    UndoDrawings,
     Magnet,
     /// Congress trades: feed when used alone, per-ticker list after a symbol.
     Congress,
@@ -413,6 +415,11 @@ fn parse_function(head: &str, rest: &[&str]) -> Option<Function> {
             Some("DRAW") | Some("DRAWINGS") => Function::ClearDrawings,
             _ => Function::ClearIndicators,
         },
+        "UNDO" => match words().first().map(String::as_str) {
+            Some("DRAW") | Some("DRAWINGS") | None => Function::UndoDrawings,
+            _ => return None,
+        },
+        "UNDODRAW" | "UNDODRAWS" => Function::UndoDrawings,
         "CMP" | "COMPARE" | "COMP" => Function::Compare(rest.first().map(|s| s.to_ascii_uppercase())),
         "LOG" => Function::LogScale,
         "TL" | "TREND" | "TRENDLINE" => Function::Draw(Tool::Trendline),
@@ -614,6 +621,7 @@ fn describe(f: &Function) -> String {
         Function::Range(r) => format!("Show {} at {}", r.label(), r.timeframe()),
         Function::Draw(t) => format!("Draw {}", t.label()),
         Function::ClearDrawings => "Remove all drawings".into(),
+        Function::UndoDrawings => "Undo the last drawing delete or clear on this symbol".into(),
         Function::Magnet => "Toggle magnet (snap to OHLC)".into(),
         Function::Congress => "Congressional trades".into(),
         Function::Politician(n) => format!("Politician profile: {n}"),
@@ -933,6 +941,8 @@ mod tests {
         assert_eq!(parse("CMP"), Some(Command::Function(Function::Compare(None))));
         assert_eq!(parse("FIB"), Some(Command::Function(Function::Draw(Tool::Fib))));
         assert_eq!(parse("CLEAR DRAW"), Some(Command::Function(Function::ClearDrawings)));
+        assert_eq!(parse("UNDO DRAW"), Some(Command::Function(Function::UndoDrawings)));
+        assert_eq!(parse("UNDO"), Some(Command::Function(Function::UndoDrawings)));
         assert_eq!(parse("POL Nancy Pelosi"), Some(Command::Function(Function::Politician("Nancy Pelosi".into()))));
         assert_eq!(parse("WL ADD msft nvda"), Some(Command::Function(Function::WatchCommand("ADD msft nvda".into()))));
         assert_eq!(parse("LAYOUT 4"), Some(Command::Function(Function::Layout("4".into()))));

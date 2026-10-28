@@ -366,6 +366,11 @@ impl PaneKind {
                 log: c.log,
                 indicators: c.indicators.clone(),
                 drawings: c.drawings.clone(),
+                drawing_store: {
+                    let mut store = c.drawing_store.clone();
+                    store.stash(&c.symbol, &c.drawings);
+                    store
+                },
                 compare: c.compare.clone(),
                 show_volume: c.show_volume,
                 show_congress: c.show_congress,
@@ -447,6 +452,7 @@ impl PaneKind {
                 log,
                 indicators,
                 drawings,
+                drawing_store,
                 compare,
                 show_volume,
                 show_congress,
@@ -463,7 +469,10 @@ impl PaneKind {
                 c.chart_type = chart_type;
                 c.log = log;
                 c.indicators = indicators;
-                c.drawings = drawings;
+                c.drawing_store = drawing_store;
+                c.drawing_store.seed_if_absent(&c.symbol, &drawings);
+                let stored = c.drawing_store.get(&c.symbol);
+                c.drawings = if stored.is_empty() { drawings } else { stored };
                 c.compare = compare;
                 c.show_volume = show_volume;
                 c.show_congress = show_congress;
@@ -1065,7 +1074,10 @@ impl TerminalApp {
             Function::LogScale => self.with_chart(|c, _| c.log = !c.log),
             Function::Range(r) => self.with_chart(|c, w| c.set_range(r, w)),
             Function::Draw(t) => self.with_chart(|c, _| c.start_tool(t)),
-            Function::ClearDrawings => self.with_chart(|c, _| c.drawings.clear()),
+            Function::ClearDrawings => self.with_chart(|c, _| c.clear_drawings()),
+            Function::UndoDrawings => self.with_chart(|c, _| {
+                c.undo_drawings();
+            }),
             Function::Magnet => self.with_chart(|c, _| c.magnet = !c.magnet),
             Function::Congress => self.open_panel(PaneKind::Feed { filter: FeedFilter::default() }),
             Function::Politician(q) if q.trim().is_empty() => self.open_panel(PaneKind::Politicians),
@@ -2092,6 +2104,7 @@ impl eframe::App for TerminalApp {
         actions.extend(self.render_dock(ui, area, gap));
         actions.extend(self.render_windows(&ctx));
         self.run_actions(actions);
+        self.sync_linked_review_levels();
         self.trading_windows(&ctx);
         self.toasts(&ctx);
 
@@ -2375,6 +2388,90 @@ mod tests {
         assert_eq!(archive.len(), 2);
         assert!(archive.iter().all(|r| matches!(r, Request::ArchiveHistory { before: None, .. })));
         assert!(!reqs.iter().any(|r| matches!(r, Request::History { .. })));
+    }
+
+    fn hline(price: f64) -> tr_chart::drawings::Drawing {
+        tr_chart::drawings::Drawing::new(
+            Tool::Horizontal,
+            tr_chart::drawings::Anchor { ts: 0, price },
+            tr_chart::drawings::Anchor { ts: 0, price },
+        )
+    }
+
+    #[test]
+    fn review_step_through_keeps_per_symbol_drawings_and_shares_horizontals() {
+        let mut app = test_app();
+        let (worker, _) = Worker::test_channel();
+        app.worker = worker;
+        app.apply(Function::Review);
+        let daily = app
+            .panes
+            .iter()
+            .find_map(|p| match &p.kind {
+                PaneKind::Chart(c) if c.archive && c.tf == tr_core::Timeframe::D1 => Some(p.id),
+                _ => None,
+            })
+            .unwrap();
+        let weekly = app
+            .panes
+            .iter()
+            .find_map(|p| match &p.kind {
+                PaneKind::Chart(c) if c.archive && c.tf == tr_core::Timeframe::W1 => Some(p.id),
+                _ => None,
+            })
+            .unwrap();
+        if let PaneKind::Chart(c) = &mut app.panes[app.idx(daily).unwrap()].kind {
+            c.drawings.push(hline(188.5));
+            c.commit_drawings();
+        }
+        app.sync_linked_review_levels();
+        match &app.panes[app.idx(weekly).unwrap()].kind {
+            PaneKind::Chart(c) => {
+                assert_eq!(c.drawings.len(), 1, "weekly review inherits the daily horizontal");
+                assert_eq!(c.drawings[0].horizontal_price(), Some(188.5));
+            }
+            other => panic!("{other:?}"),
+        }
+        app.open_security("MSFT");
+        for id in [daily, weekly] {
+            match &app.panes[app.idx(id).unwrap()].kind {
+                PaneKind::Chart(c) => {
+                    assert_eq!(c.symbol, "MSFT US Equity");
+                    assert!(c.drawings.is_empty(), "MSFT must not show AAPL's drawings");
+                }
+                other => panic!("{other:?}"),
+            }
+        }
+        app.open_security("AAPL");
+        for id in [daily, weekly] {
+            match &app.panes[app.idx(id).unwrap()].kind {
+                PaneKind::Chart(c) => {
+                    assert_eq!(c.symbol, "AAPL US Equity");
+                    assert_eq!(c.drawings[0].horizontal_price(), Some(188.5));
+                }
+                other => panic!("{other:?}"),
+            }
+        }
+
+        let doc = app.current_doc();
+        let json = doc.to_json();
+        let text = String::from_utf8(json.clone()).unwrap();
+        assert!(text.contains("drawing_store") || text.contains("AAPL US Equity"));
+        let loaded = LayoutDoc::from_json(&json).unwrap();
+        app.apply_doc(loaded);
+        let restored: Vec<_> = app
+            .panes
+            .iter()
+            .filter_map(|p| match &p.kind {
+                PaneKind::Chart(c) if c.archive => {
+                    Some((c.tf, c.symbol.clone(), c.drawings.clone(), c.drawing_store.get("AAPL")))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(restored.len(), 2);
+        assert!(restored.iter().all(|r| r.1 == "AAPL US Equity" && r.2[0].horizontal_price() == Some(188.5)));
+        assert!(restored.iter().all(|r| r.3[0].horizontal_price() == Some(188.5)));
     }
 }
 

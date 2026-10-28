@@ -1,5 +1,11 @@
 //! User drawings. Anchors are stored as (timestamp, price) so they survive pan, zoom and
 //! timeframe changes; they are mapped to bar indices only when drawn.
+//!
+//! Live drawings sit on the current pane; the rest of a review session lives in
+//! [`AnnotationStore`], keyed by canonical security so stepping AAPL → MSFT → AAPL
+//! does not throw the first name's levels away.
+
+use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
@@ -58,6 +64,96 @@ impl Drawing {
     /// Price of a horizontal line, for PM Desk user-stop candidates.
     pub fn horizontal_price(&self) -> Option<f64> {
         (self.tool == Tool::Horizontal && self.a.price.is_finite() && self.a.price > 0.0).then_some(self.a.price)
+    }
+
+    /// Price-only drawings that stay meaningful on another interval of the same name
+    /// (daily ↔ weekly review). Trendlines, verticals and fibs stay on the pane that
+    /// drew them — their timestamps are interval-specific.
+    pub fn is_compatible_level(&self) -> bool {
+        self.horizontal_price().is_some()
+    }
+
+    fn same_compatible_level(&self, other: &Drawing) -> bool {
+        match (self.horizontal_price(), other.horizontal_price()) {
+            (Some(a), Some(b)) => (a - b).abs() < 1e-9,
+            _ => false,
+        }
+    }
+}
+
+/// Canonical store key for a security (`AAPL` and `AAPL US Equity` collapse).
+/// The chart crate has no split/dividend basis toggle — one price series per name.
+pub fn store_key(symbol: &str) -> String {
+    tr_core::Security::parse(symbol).map(|s| s.key()).unwrap_or_else(|| symbol.trim().to_ascii_uppercase())
+}
+
+/// Per-security drawings that outlive the live pane. Empty keys are dropped so a
+/// layout does not grow a hole for every name the user merely passed through.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct AnnotationStore {
+    entries: BTreeMap<String, Vec<Drawing>>,
+}
+
+impl AnnotationStore {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    pub fn get(&self, symbol: &str) -> Vec<Drawing> {
+        self.entries.get(&store_key(symbol)).cloned().unwrap_or_default()
+    }
+
+    /// Remember `drawings` for `symbol`. An empty list forgets the name.
+    pub fn stash(&mut self, symbol: &str, drawings: &[Drawing]) {
+        let key = store_key(symbol);
+        if key.is_empty() {
+            return;
+        }
+        if drawings.is_empty() {
+            self.entries.remove(&key);
+        } else {
+            self.entries.insert(key, drawings.to_vec());
+        }
+    }
+
+    /// Legacy layouts only stored the live pane's drawings. Fold those into the
+    /// store when this name has no entry yet.
+    pub fn seed_if_absent(&mut self, symbol: &str, drawings: &[Drawing]) {
+        let key = store_key(symbol);
+        if key.is_empty() || drawings.is_empty() || self.entries.contains_key(&key) {
+            return;
+        }
+        self.entries.insert(key, drawings.to_vec());
+    }
+
+    pub fn compatible_levels(&self, symbol: &str) -> Vec<Drawing> {
+        self.get(symbol).into_iter().filter(|d| d.is_compatible_level()).collect()
+    }
+
+    /// Add incoming horizontals that this name does not already have (same price).
+    pub fn merge_compatible_levels(&mut self, symbol: &str, incoming: &[Drawing]) {
+        let key = store_key(symbol);
+        if key.is_empty() {
+            return;
+        }
+        let dest = self.entries.entry(key).or_default();
+        for d in incoming.iter().filter(|d| d.is_compatible_level()) {
+            if !dest.iter().any(|e| e.same_compatible_level(d)) {
+                dest.push(d.clone());
+            }
+        }
+        if dest.is_empty() {
+            self.entries.remove(&store_key(symbol));
+        }
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = (&String, &Vec<Drawing>)> {
+        self.entries.iter()
     }
 }
 
@@ -123,5 +219,46 @@ mod tests {
         assert_eq!(h.horizontal_price(), Some(42.5));
         let t = Drawing::new(Tool::Trendline, Anchor { ts: 0, price: 10.0 }, Anchor { ts: 1, price: 20.0 });
         assert_eq!(t.horizontal_price(), None);
+    }
+
+    fn hline(price: f64) -> Drawing {
+        Drawing::new(Tool::Horizontal, Anchor { ts: 0, price }, Anchor { ts: 0, price })
+    }
+
+    fn trend(ts: i64) -> Drawing {
+        Drawing::new(Tool::Trendline, Anchor { ts, price: 10.0 }, Anchor { ts: ts + 1, price: 20.0 })
+    }
+
+    #[test]
+    fn store_survives_a_to_b_to_a_and_keeps_b_empty() {
+        let mut store = AnnotationStore::new();
+        let aapl = hline(150.0);
+        store.stash("AAPL", &[aapl.clone()]);
+        assert_eq!(store.get("AAPL US Equity"), vec![aapl.clone()]);
+        assert!(store.get("MSFT").is_empty(), "B must not inherit A's drawings");
+        store.stash("MSFT", &[]);
+        assert!(store.get("MSFT US Equity").is_empty());
+        assert_eq!(store.get("aapl"), vec![aapl], "returning to A restores its levels");
+    }
+
+    #[test]
+    fn store_merges_horizontals_but_not_trendlines() {
+        let mut store = AnnotationStore::new();
+        store.stash("AAPL", &[hline(100.0), trend(1)]);
+        store.merge_compatible_levels("AAPL US Equity", &[hline(100.0), hline(110.0), trend(9)]);
+        let got = store.get("AAPL");
+        assert_eq!(got.iter().filter(|d| d.is_compatible_level()).count(), 2);
+        assert!(got.iter().any(|d| d.horizontal_price() == Some(110.0)));
+        assert_eq!(got.iter().filter(|d| d.tool == Tool::Trendline).count(), 1);
+    }
+
+    #[test]
+    fn seed_if_absent_does_not_overwrite_and_empty_stash_forgets() {
+        let mut store = AnnotationStore::new();
+        store.seed_if_absent("AAPL", &[hline(1.0)]);
+        store.seed_if_absent("AAPL", &[hline(2.0)]);
+        assert_eq!(store.get("AAPL")[0].horizontal_price(), Some(1.0));
+        store.stash("AAPL", &[]);
+        assert!(store.is_empty());
     }
 }

@@ -318,6 +318,7 @@ mod tests {
             "FIB",
             "MAGNET",
             "CLEAR DRAW",
+            "UNDO DRAW",
             "30",
             "RANGE 5Y",
             "YTD",
