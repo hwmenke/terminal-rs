@@ -151,6 +151,17 @@ fn profile_line(tf: Timeframe, sec: &Security, bars: &[Bar]) -> Option<String> {
     Some(format!("VP {}  peak {:.prec$}  {share}", profile.len(), peak.price))
 }
 
+/// Value area of the latest regular session's verified profile.
+fn value_line(tf: Timeframe, sec: &Security, bars: &[Bar]) -> Option<String> {
+    if !tf.is_intraday() || !matches!(sec.class, AssetClass::Equity | AssetClass::Etf | AssetClass::Index) {
+        return None;
+    }
+    let area = tr_data::intraday::value_area(tf, bars, 24)?;
+    let share = profile_share(area.share, 1.0)?;
+    let prec = sec.decimals(area.high).max(sec.decimals(area.low));
+    Some(format!("VAH {high:.prec$}  VAL {low:.prec$}  {share}", high = area.high, low = area.low))
+}
+
 /// Length of the load-in sweep across the visible bars.
 const REVEAL_SECS: f32 = 0.7;
 /// Length of an eased jump (quick ranges, reset, keyboard zoom and pan).
@@ -1430,6 +1441,7 @@ impl ChartState {
 
         // ---- drawings ----
         self.paint_volume_profile(ui, price_rect, &scale);
+        self.paint_value_area(ui, price_rect, &scale);
         self.paint_review_levels(ui, price_rect, &scale);
         self.paint_alert_levels(ui, price_rect, &scale);
         self.paint_opening_range(ui, price_rect, &scale);
@@ -1783,6 +1795,10 @@ impl ChartState {
             p.text(pos2(price_rect.left() + 6.0, ly), Align2::LEFT_TOP, line, mono(11.0), theme::series(2));
             ly += 14.0;
         }
+        if let Some(line) = value_line(self.tf, &self.sec, &self.bars) {
+            p.text(pos2(price_rect.left() + 6.0, ly), Align2::LEFT_TOP, line, mono(11.0), theme::accent());
+            ly += 14.0;
+        }
         if self.extended && self.offers_extended() {
             let line = tr_data::intraday::extended_summary(&self.bars);
             p.text(pos2(price_rect.left() + 6.0, ly), Align2::LEFT_TOP, line, mono(11.0), amber());
@@ -1973,6 +1989,31 @@ impl ChartState {
             {
                 p.text(pos2(bar.left() - 4.0, y), Align2::RIGHT_CENTER, share, mono(10.0), theme::series(2));
             }
+        }
+    }
+
+    fn paint_value_area(&self, ui: &Ui, rect: Rect, scale: &PriceScale) {
+        if !self.tf.is_intraday() || !matches!(self.sec.class, AssetClass::Equity | AssetClass::Etf | AssetClass::Index)
+        {
+            return;
+        }
+        let Some(area) = tr_data::intraday::value_area(self.tf, &self.bars, 24) else { return };
+        let p = ui.painter_at(rect);
+        let color = theme::accent();
+        for (price, tag) in [(area.high, "VAH"), (area.low, "VAL")] {
+            let y = rect.top() + scale.y_of(price) as f32;
+            if !rect.y_range().contains(y) {
+                continue;
+            }
+            dashed_h(&p, rect.x_range(), y, Stroke::new(1.0, color.gamma_multiply(0.85)));
+            let prec = self.sec.decimals(price);
+            p.text(
+                pos2(rect.left() + 6.0, y - 12.0),
+                Align2::LEFT_TOP,
+                format!("{tag} {price:.prec$}"),
+                mono(10.0),
+                color,
+            );
         }
     }
 
@@ -2814,6 +2855,49 @@ mod tests {
         assert_eq!(fx.sec.class, AssetClass::Fx);
         assert!(!contains_text(&output.shapes, "VP 2  peak 18.96  75%"));
         assert!(!contains_text(&output.shapes, "75%"));
+    }
+
+    #[test]
+    fn value_area_lines_cover_only_the_heavy_bin() {
+        fn wall(y: i32, m: u32, d: u32, h: u32, min: u32) -> i64 {
+            tr_core::ny::to_utc(chrono::NaiveDate::from_ymd_opt(y, m, d).unwrap().and_hms_opt(h, min, 0).unwrap())
+        }
+        let bar = |h: u32, m: u32, high: f64, low: f64, close: f64, volume: f64| {
+            tr_core::Bar::new(wall(2026, 3, 9, h, m), close, high, low, close, volume)
+                .with_provenance(tr_core::Provenance::Real)
+        };
+        let bars = std::sync::Arc::new(vec![bar(9, 30, 12.0, 10.0, 11.0, 100.0), bar(9, 35, 20.0, 18.0, 19.0, 300.0)]);
+        let ctx = egui::Context::default();
+        let (worker, _) = Worker::test_channel();
+        let mut chart = ChartState::new(17, "AAPL", Timeframe::M5);
+        chart.on_history(chart.generation, bars.clone(), SeriesGpu::build(&bars), 0, false, true, false, &worker);
+        let output = chart_frame(&ctx, &mut chart, &worker, vec![]);
+        assert!(contains_text(&output.shapes, "VAH 19.17  VAL 18.75  75%"));
+        assert!(contains_text(&output.shapes, "VAH 19.17"));
+        assert!(contains_text(&output.shapes, "VAL 18.75"));
+
+        let sample = std::sync::Arc::new(
+            bars.iter()
+                .map(|b| {
+                    let mut b = *b;
+                    b.provenance = tr_core::Provenance::Sample;
+                    b
+                })
+                .collect::<Vec<_>>(),
+        );
+        chart.on_history(chart.generation, sample.clone(), SeriesGpu::build(&sample), 0, false, true, false, &worker);
+        let output = chart_frame(&ctx, &mut chart, &worker, vec![]);
+        assert!(!contains_text(&output.shapes, "VAH 19.17  VAL 18.75  75%"));
+        assert!(!contains_text(&output.shapes, "VAH 19.17"));
+        assert!(!contains_text(&output.shapes, "VAL 18.75"));
+
+        let mut fx = ChartState::new(18, "EURUSD", Timeframe::M5);
+        fx.on_history(fx.generation, bars.clone(), SeriesGpu::build(&bars), 0, false, true, false, &worker);
+        let output = chart_frame(&ctx, &mut fx, &worker, vec![]);
+        assert_eq!(fx.sec.class, AssetClass::Fx);
+        assert!(!contains_text(&output.shapes, "VAH 19.17  VAL 18.75  75%"));
+        assert!(!contains_text(&output.shapes, "VAH 19.17"));
+        assert!(!contains_text(&output.shapes, "VAL 18.75"));
     }
 
     #[test]
