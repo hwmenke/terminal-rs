@@ -99,6 +99,14 @@ pub enum Request {
         spec: String,
         timeframe: String,
     },
+    /// Today's open versus the prior cash close.
+    GapFill {
+        pane: PaneId,
+        generation: u64,
+        symbol: String,
+        spec: String,
+        timeframe: String,
+    },
     /// Paper VWAP / opening-range backtest on verified regular-session bars.
     IntradayBacktest {
         pane: PaneId,
@@ -407,6 +415,11 @@ pub enum Response {
         pane: PaneId,
         generation: u64,
         result: Result<tr_data::volume_pace::VolumePace, String>,
+    },
+    GapFill {
+        pane: PaneId,
+        generation: u64,
+        result: Result<tr_data::gap_fill::GapFill, String>,
     },
     Lookalike {
         pane: PaneId,
@@ -1199,6 +1212,33 @@ async fn research_volume_pace(
     tr_data::volume_pace::build_pace(&sec.key(), &bars, &query, &source).map_err(anyhow::Error::msg)
 }
 
+/// Verified regular-session bars for one cash name. Sample substitution is refused.
+async fn research_gap_fill(
+    s: &Shared,
+    symbol: &str,
+    spec: &str,
+    timeframe: &str,
+) -> anyhow::Result<tr_data::gap_fill::GapFill> {
+    if s.provider.name() == "sample" {
+        anyhow::bail!(
+            "Gap fill refused: sample / offline display mode does not feed this pane. Sample prices are never used."
+        );
+    }
+    let sec = tr_data::security(symbol);
+    if !matches!(sec.class, tr_core::AssetClass::Equity | tr_core::AssetClass::Etf | tr_core::AssetClass::Index) {
+        anyhow::bail!("{} has no US cash session. The gap is the regular session from 09:30.", sec.ticker);
+    }
+    let query = tr_data::gap_fill::parse_query(spec, timeframe).map_err(anyhow::Error::msg)?;
+    let limit = tr_data::gap_fill::fetch_limit(query.timeframe);
+    let bars = s.provider.history(&sec.key(), query.timeframe, None, limit).await?;
+    if bars.is_empty() {
+        anyhow::bail!("Gap fill refused: no regular-session bars were returned. Sample prices are never used.");
+    }
+    Bar::require_verified(&bars, "Gap fill").map_err(anyhow::Error::msg)?;
+    let source = format!("{} {} regular session", s.provider.name(), query.timeframe.label());
+    tr_data::gap_fill::build_gap(&sec.key(), &bars, &query, &source).map_err(anyhow::Error::msg)
+}
+
 /// Verified regular-session bars for a list of cash names. Sample substitution is refused.
 async fn research_breadth(
     s: &Shared,
@@ -1545,6 +1585,13 @@ async fn handle(s: &Arc<Shared>, req: Request) {
                 pane,
                 generation,
                 result: research_volume_pace(s, &symbol, &spec, &timeframe).await.map_err(|e| format!("{e:#}")),
+            });
+        }
+        Request::GapFill { pane, generation, symbol, spec, timeframe } => {
+            send(Response::GapFill {
+                pane,
+                generation,
+                result: research_gap_fill(s, &symbol, &spec, &timeframe).await.map_err(|e| format!("{e:#}")),
             });
         }
         Request::Breadth { pane, generation, spec, timeframe, symbols } => {

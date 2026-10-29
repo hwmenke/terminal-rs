@@ -327,6 +327,10 @@ pub enum Function {
     VolumePace {
         spec: String,
     },
+    /// Open versus the prior cash close, and how often that gap had filled (`GFILL`).
+    GapFill {
+        spec: String,
+    },
     /// Historical lookalikes / nearest neighbors (`LOOKALIKE`, `AAPL KNN 2024-01-15 K=15`).
     Lookalike {
         spec: String,
@@ -545,6 +549,7 @@ fn parse_function(head: &str, rest: &[&str]) -> Option<Function> {
         "SPATH" | "SESSIONPATH" | "TPATH" => Function::SessionPath { spec: joined() },
         "BRD" | "BREADTH" | "SBREADTH" => Function::Breadth { spec: joined() },
         "VPACE" | "VOLPACE" | "CUMVOL" => Function::VolumePace { spec: joined() },
+        "GFILL" | "GAPFILL" => Function::GapFill { spec: joined() },
         "GOTO" | "JUMP" | "GTO" => Function::Goto { date: joined() },
         "NOTE" | "JNOTE" => {
             let (date, text) = split_note_args(rest);
@@ -800,6 +805,11 @@ fn describe(f: &Function) -> String {
             "Volume pace: today's cumulative shares versus the mean of prior sessions".into()
         }
         Function::VolumePace { spec } => format!("Volume pace versus prior sessions ({spec})"),
+        Function::GapFill { spec } if spec.is_empty() => {
+            "Gap fill: today's 09:30 open versus the prior cash close, and how often same-direction gaps had filled"
+                .into()
+        }
+        Function::GapFill { spec } => format!("Gap fill versus the prior cash close ({spec})"),
         Function::Lookalike { spec } if spec.is_empty() => {
             "Historical lookalikes: nearest past conditions, per-horizon counts, jump to neighbor dates".into()
         }

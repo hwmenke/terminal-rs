@@ -20,7 +20,7 @@ use crate::widgets::{self, Icon};
 use crate::worker::{Request, Worker};
 
 /// Panels offered by the + menus: label and command word.
-pub const PANELS: [(&str, &str); 22] = [
+pub const PANELS: [(&str, &str); 23] = [
     ("Chart", "CHART"),
     ("Watchlist", "WL"),
     ("News", "NEWS"),
@@ -39,6 +39,7 @@ pub const PANELS: [(&str, &str); 22] = [
     ("Session path", "SPATH"),
     ("Session breadth", "BRD"),
     ("Volume pace", "VPACE"),
+    ("Gap fill", "GFILL"),
     ("Lookalikes", "LOOKALIKE"),
     ("Security Search", "SECF"),
     ("Settings", "PREFS"),
@@ -449,6 +450,15 @@ impl TerminalApp {
                 }
                 p.request(id, &self.worker);
                 PaneKind::VolumePace(p)
+            }
+            PaneKind::GapFill(mut p) => {
+                if p.symbol.trim().is_empty() {
+                    if let Some(sym) = self.focused_symbol() {
+                        p.symbol = sym;
+                    }
+                }
+                p.request(id, &self.worker);
+                PaneKind::GapFill(p)
             }
             PaneKind::Lookalike(mut l) => {
                 if l.symbol.trim().is_empty() {
@@ -919,6 +929,12 @@ impl TerminalApp {
                 let symbol = symbol.map(|s| tr_data::security(s).key()).or(current).unwrap_or_default();
                 let spec = words.get(1..).unwrap_or(&[]).join(" ");
                 PaneKind::VolumePace(Box::new(super::volume_pace::VolumePacePane::new(symbol, spec)))
+            }
+            "GFILL" | "GAPFILL" => {
+                // A count and a bar size stay in the spec. They are not tickers.
+                let symbol = symbol.map(|s| tr_data::security(s).key()).or(current).unwrap_or_default();
+                let spec = words.get(1..).unwrap_or(&[]).join(" ");
+                PaneKind::GapFill(Box::new(super::gap_fill::GapFillPane::new(symbol, spec)))
             }
             "IBT" | "IBACKTEST" | "SETUPBT" => {
                 // VWAP and OR are setup names, not tickers.

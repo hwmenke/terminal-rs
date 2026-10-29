@@ -17,6 +17,7 @@ pub mod backtest;
 pub mod cache;
 pub mod crypto;
 pub mod earnings;
+pub mod gap_fill;
 pub mod history;
 pub mod intraday;
 pub mod intraday_backtest;

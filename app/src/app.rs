@@ -13,6 +13,7 @@ mod command_bar;
 mod compare;
 mod demo;
 mod desk;
+mod gap_fill;
 mod hotkeys_view;
 mod journal;
 mod lookalike;
@@ -107,6 +108,8 @@ pub enum PaneKind {
     Breadth(Box<session_breadth::BreadthPane>),
     /// Cumulative volume versus the usual pace of prior sessions (`VPACE`).
     VolumePace(Box<volume_pace::VolumePacePane>),
+    /// Today's open versus the prior cash close (`GFILL`).
+    GapFill(Box<gap_fill::GapFillPane>),
     Settings,
 }
 
@@ -339,6 +342,13 @@ impl PaneKind {
                     format!("{} Pace", tr_data::security(&p.symbol).ticker)
                 }
             }
+            PaneKind::GapFill(p) => {
+                if p.symbol.trim().is_empty() {
+                    "Gap".into()
+                } else {
+                    format!("{} Gap", tr_data::security(&p.symbol).ticker)
+                }
+            }
             PaneKind::Settings => "Settings".into(),
         }
     }
@@ -378,6 +388,7 @@ impl PaneKind {
             PaneKind::SessionPath(_) => "SPATH",
             PaneKind::Breadth(_) => "BRD",
             PaneKind::VolumePace(_) => "VPACE",
+            PaneKind::GapFill(_) => "GFILL",
             PaneKind::Settings => "PDF",
         }
     }
@@ -486,6 +497,9 @@ impl PaneKind {
             PaneKind::Breadth(b) => PaneSettings::Breadth { spec: b.spec.clone(), tf: b.tf.clone() },
             PaneKind::VolumePace(p) => {
                 PaneSettings::VolumePace { symbol: p.symbol.clone(), spec: p.spec.clone(), tf: p.tf.clone() }
+            }
+            PaneKind::GapFill(p) => {
+                PaneSettings::GapFill { symbol: p.symbol.clone(), spec: p.spec.clone(), tf: p.tf.clone() }
             }
             PaneKind::Lookalike(l) => PaneSettings::Lookalike {
                 symbol: l.symbol.clone(),
@@ -624,6 +638,13 @@ impl PaneKind {
                     pane.tf = tf;
                 }
                 PaneKind::VolumePace(Box::new(pane))
+            }
+            PaneSettings::GapFill { symbol, spec, tf } => {
+                let mut pane = gap_fill::GapFillPane::new(symbol, spec);
+                if !tf.is_empty() {
+                    pane.tf = tf;
+                }
+                PaneKind::GapFill(Box::new(pane))
             }
             PaneSettings::IntradayCompare { symbol, peers, tf } => {
                 let mut pane = compare::ComparePane::new(symbol, peers);
@@ -1150,6 +1171,7 @@ impl TerminalApp {
             Command::SymbolFunction(s, Function::SessionPath { spec }) => self.open_session_path(Some(&s), &spec),
             Command::SymbolFunction(s, Function::Breadth { spec }) => self.open_breadth(Some(&s), &spec),
             Command::SymbolFunction(s, Function::VolumePace { spec }) => self.open_volume_pace(Some(&s), &spec),
+            Command::SymbolFunction(s, Function::GapFill { spec }) => self.open_gap_fill(Some(&s), &spec),
             Command::SymbolFunction(s, Function::Goto { date }) => self.goto_chart_date(Some(&s), &date),
             Command::SymbolFunction(s, Function::JournalNote { date, text }) => {
                 self.add_journal_note(Some(&s), &date, &text)
@@ -1236,7 +1258,7 @@ impl TerminalApp {
                     }
                     None => {
                         self.status = format!(
-                            "Unknown panel {spec:?}; try CHART, NEWS, BOOK, WEI, GC, CONG, WL, DESK, JOURNAL, STATS, BACKTEST, IBT, ICMP, SPATH, BRD, VPACE, LOOKALIKE, PORT"
+                            "Unknown panel {spec:?}; try CHART, NEWS, BOOK, WEI, GC, CONG, WL, DESK, JOURNAL, STATS, BACKTEST, IBT, ICMP, SPATH, BRD, VPACE, GFILL, LOOKALIKE, PORT"
                         )
                     }
                 }
@@ -1338,6 +1360,7 @@ impl TerminalApp {
             Function::SessionPath { spec } => self.open_session_path(symbol.as_deref(), &spec),
             Function::Breadth { spec } => self.open_breadth(symbol.as_deref(), &spec),
             Function::VolumePace { spec } => self.open_volume_pace(symbol.as_deref(), &spec),
+            Function::GapFill { spec } => self.open_gap_fill(symbol.as_deref(), &spec),
             Function::Goto { date } => self.goto_chart_date(symbol.as_deref(), &date),
             Function::JournalNote { date, text } => self.add_journal_note(symbol.as_deref(), &date, &text),
             Function::Latest => self.with_chart(|c, _| c.jump_latest()),
@@ -1504,6 +1527,13 @@ impl TerminalApp {
                 }
                 Response::VolumePace { pane, generation, result } => {
                     if let Some(PaneKind::VolumePace(p)) =
+                        self.panes.iter_mut().find(|p| p.id == pane).map(|p| &mut p.kind)
+                    {
+                        p.accept(generation, result);
+                    }
+                }
+                Response::GapFill { pane, generation, result } => {
+                    if let Some(PaneKind::GapFill(p)) =
                         self.panes.iter_mut().find(|p| p.id == pane).map(|p| &mut p.kind)
                     {
                         p.accept(generation, result);
