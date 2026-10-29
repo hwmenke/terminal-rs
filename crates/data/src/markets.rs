@@ -109,6 +109,11 @@ impl MarketData for Markets {
         Ok(out)
     }
 
+    fn has_live_feed(&self, symbol: &str, _tf: Timeframe) -> bool {
+        // Crypto is the only class with a websocket. Do not call `live` to discover that.
+        security(symbol).class == AssetClass::Crypto
+    }
+
     fn live(&self, symbol: &str, tf: Timeframe) -> Option<LiveFeed> {
         let sec = security(symbol);
         (sec.class == AssetClass::Crypto).then(|| CryptoProvider::live(&sec, tf))
@@ -161,4 +166,19 @@ impl MarketData for Markets {
 /// Market key for a security (convenience for callers holding a [`Security`]).
 pub fn key(sec: &Security) -> String {
     sec.key()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn equity_has_no_live_feed_and_crypto_does() {
+        let markets = Markets::new(None).unwrap();
+        assert!(!markets.has_live_feed("AAPL US Equity", Timeframe::M5));
+        assert!(!markets.has_live_feed("SPY US Equity", Timeframe::M1));
+        assert!(!markets.has_live_feed("EURUSD Curncy", Timeframe::M5));
+        assert!(!markets.has_live_feed("CL1 Comdty", Timeframe::H1));
+        assert!(markets.has_live_feed("BTCUSD Curncy", Timeframe::M1));
+    }
 }

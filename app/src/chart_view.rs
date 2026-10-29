@@ -34,6 +34,40 @@ const DEFAULT_VISIBLE: usize = 160;
 /// chart has room for at most seven.
 const MAX_SUB_PANES: usize = 6;
 
+/// Corner label for the loaded series. A stale or closed session changes the words
+/// only — the bars underneath stay the ones the provider sent.
+fn corner_mark(
+    archive: bool,
+    tf: Timeframe,
+    class: AssetClass,
+    provenance: Provenance,
+    last_ts: Option<i64>,
+    now: i64,
+) -> (String, Color32, f32) {
+    if archive {
+        return (
+            format!("{} · RESEARCH ARCHIVE · {}", provenance.label(), tf.label()),
+            if provenance.is_verified() { amber() } else { theme::down() },
+            if provenance.is_verified() { 10.0 } else { 13.0 },
+        );
+    }
+    let fresh = last_ts
+        .and_then(|ts| tr_data::intraday::freshness(tr_data::intraday::MarketClock::for_class(class), tf, ts, now));
+    match fresh {
+        Some(tr_data::intraday::Freshness::Stale { .. }) => {
+            (format!("STALE · {}", provenance.label()), theme::down(), 11.0)
+        }
+        Some(tr_data::intraday::Freshness::Closed) => {
+            (format!("{} · SESSION CLOSED", provenance.label()), amber(), 10.0)
+        }
+        _ => (
+            provenance.label().to_string(),
+            if provenance.is_verified() { amber() } else { theme::down() },
+            if provenance.is_verified() { 10.0 } else { 13.0 },
+        ),
+    }
+}
+
 /// Session stats for an intraday equity/ETF/index series whose bars match `tf`.
 /// Missing VWAP or relative volume is an em dash, not a made-up number.
 fn session_line(tf: Timeframe, sec: &Security, bars: &[Bar]) -> Option<String> {
@@ -1336,17 +1370,23 @@ impl ChartState {
         }
 
         {
-            let label = if self.archive {
-                format!("{} · RESEARCH ARCHIVE · {}", provenance.label(), self.tf.label())
-            } else {
-                provenance.label().to_string()
-            };
+            let (label, color, size) = corner_mark(
+                self.archive,
+                self.tf,
+                self.sec.class,
+                provenance,
+                self.bars.last().map(|b| b.ts),
+                chrono::Utc::now().timestamp(),
+            );
+            if !self.archive && self.tf.is_intraday() {
+                ui.ctx().request_repaint_after(std::time::Duration::from_secs(1));
+            }
             painter.text(
                 pos2(rect.right() - AXIS_W - 8.0, header.bottom() + 35.0),
                 Align2::RIGHT_TOP,
                 label,
-                mono(if provenance.is_verified() { 10.0 } else { 13.0 }),
-                if provenance.is_verified() { amber() } else { theme::down() },
+                mono(size),
+                color,
             );
         }
         let _ = focused; // the surrounding card shows focus
@@ -2583,5 +2623,64 @@ mod tests {
         let text = shape_text(&output.shapes);
         assert!(text.contains("VWAP") && text.contains("RVOL —"), "{text}");
         assert!(!text.contains("gap"), "adjacent session bars are not reported as gaps");
+    }
+
+    #[test]
+    fn corner_mark_names_stale_and_closed_sessions_without_inventing_a_bar() {
+        let ny = |m, d, h, min| {
+            tr_core::ny::to_utc(chrono::NaiveDate::from_ymd_opt(2026, m, d).unwrap().and_hms_opt(h, min, 0).unwrap())
+        };
+        let real = Provenance::Real;
+        let (text, color, _) =
+            corner_mark(false, Timeframe::M5, AssetClass::Equity, real, Some(ny(3, 6, 15, 55)), ny(3, 7, 12, 0));
+        assert_eq!(text, "REAL · SESSION CLOSED");
+        assert_eq!(color, amber());
+
+        let (text, color, _) =
+            corner_mark(false, Timeframe::M5, AssetClass::Equity, real, Some(ny(3, 9, 9, 30)), ny(3, 9, 10, 7));
+        assert_eq!(text, "STALE · REAL");
+        assert_eq!(color, theme::down());
+        let (text, _, _) =
+            corner_mark(false, Timeframe::M5, AssetClass::Equity, real, Some(ny(3, 9, 10, 0)), ny(3, 9, 10, 7));
+        assert_eq!(text, "REAL");
+
+        let (text, _, _) = corner_mark(false, Timeframe::D1, AssetClass::Equity, real, Some(0), ny(3, 7, 12, 0));
+        assert_eq!(text, "REAL");
+        let (text, _, _) = corner_mark(true, Timeframe::M5, AssetClass::Equity, real, Some(0), ny(3, 7, 12, 0));
+        assert!(text.contains("RESEARCH ARCHIVE"));
+        assert!(!text.contains("STALE") && !text.contains("SESSION CLOSED"));
+
+        let saturday = ny(3, 7, 12, 0);
+        let (text, color, _) =
+            corner_mark(false, Timeframe::M5, AssetClass::Crypto, real, Some(saturday - 86_400), saturday);
+        assert_eq!(text, "STALE · REAL");
+        assert_eq!(color, theme::down());
+        assert!(!text.contains("SESSION CLOSED"));
+    }
+
+    #[test]
+    fn stale_intraday_badge_is_painted_and_a_current_bar_is_not() {
+        let (worker, _) = Worker::test_channel();
+        let ctx = egui::Context::default();
+        let paint = |chart: &mut ChartState| shape_text(&chart_frame(&ctx, chart, &worker, vec![]).shapes);
+        let mut stale = ChartState::new(1, "AAPL", Timeframe::M5);
+        let old = Arc::new(vec![Bar::new(0, 10.0, 11.0, 9.0, 10.0, 1.0).with_provenance(Provenance::Real)]);
+        stale.on_history(stale.generation, old.clone(), SeriesGpu::build(&old), 0, false, true, false, &worker);
+        let text = paint(&mut stale);
+        assert!(text.contains("STALE · REAL"), "{text}");
+
+        let mut daily = ChartState::new(2, "AAPL", Timeframe::D1);
+        daily.on_history(daily.generation, old.clone(), SeriesGpu::build(&old), 0, false, true, false, &worker);
+        let text = paint(&mut daily);
+        assert!(!text.contains("STALE"), "{text}");
+        assert!(!text.contains("SESSION CLOSED"), "{text}");
+
+        let mut current = ChartState::new(3, "BTCUSD Curncy", Timeframe::M5);
+        let ts = Timeframe::M5.bucket_start(chrono::Utc::now().timestamp());
+        let bars = Arc::new(vec![Bar::new(ts, 10.0, 11.0, 9.0, 10.0, 1.0).with_provenance(Provenance::Real)]);
+        current.on_history(current.generation, bars.clone(), SeriesGpu::build(&bars), 0, false, true, false, &worker);
+        let text = paint(&mut current);
+        assert!(!text.contains("STALE"), "{text}");
+        assert!(!text.contains("SESSION CLOSED"), "{text}");
     }
 }
