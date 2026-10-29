@@ -212,7 +212,15 @@ impl TerminalApp {
         let Some(req) = self.demo.book.close_request(symbol) else {
             return self.trade_toast(format!("No {symbol} shares to close (check open sell orders)"), false);
         };
-        let quote = market_key(symbol).and_then(|k| self.quotes.get(&k)).map(|q| q.last);
+        let quote = match market_key(symbol) {
+            Some(k) => {
+                if let Some(block) = self.market_print_block(&k) {
+                    return self.trade_toast(block.explain(), false);
+                }
+                self.quotes.get(&k).map(|q| q.last)
+            }
+            None => None,
+        };
         let _ = self.demo_submit(&req, quote);
     }
 

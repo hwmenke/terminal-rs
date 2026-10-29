@@ -11,7 +11,7 @@ use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 
 use chrono::{Datelike, NaiveDate, Timelike, Weekday};
-use tr_core::{AssetClass, Bar, Timeframe};
+use tr_core::{AssetClass, Bar, Provenance, Timeframe};
 
 use crate::history::calendar::{is_session, previous_session};
 
@@ -362,6 +362,50 @@ pub fn freshness(clock: MarketClock, tf: Timeframe, last_bar_ts: i64, now: i64) 
     })
 }
 
+/// Why a market order must not use this print. Limit and stop prices are the user's.
+/// Sample and missing quotes are not judged here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MarketBlock {
+    Stale { lag_secs: i64 },
+    Closed,
+}
+
+impl MarketBlock {
+    pub fn badge(self) -> &'static str {
+        match self {
+            Self::Stale { .. } => "STALE",
+            Self::Closed => "SESSION CLOSED",
+        }
+    }
+
+    pub fn explain(self) -> &'static str {
+        match self {
+            Self::Stale { .. } => {
+                "Market order blocked: the last print is stale. A market order needs a current price."
+            }
+            Self::Closed => {
+                "Market order blocked: the session is closed. The last print is the close, not a live market."
+            }
+        }
+    }
+}
+
+/// `None` when a market order may use the print: it is current, or it is not a verified quote.
+/// The clock is the 1-minute intraday clock, the same one the chart uses for a last trade.
+pub fn market_order_block(class: AssetClass, provenance: Provenance, quote_ts: i64, now: i64) -> Option<MarketBlock> {
+    if !provenance.is_verified() {
+        return None;
+    }
+    if quote_ts <= 0 {
+        return Some(MarketBlock::Stale { lag_secs: 0 });
+    }
+    match freshness(MarketClock::for_class(class), Timeframe::M1, quote_ts, now)? {
+        Freshness::Current => None,
+        Freshness::Closed => Some(MarketBlock::Closed),
+        Freshness::Stale { lag_secs } => Some(MarketBlock::Stale { lag_secs }),
+    }
+}
+
 fn continuous_freshness(tf: Timeframe, last_bar_ts: i64, now: i64) -> Freshness {
     let limit = tf.seconds().saturating_mul(2);
     let age = now.saturating_sub(last_bar_ts);
@@ -676,5 +720,57 @@ mod tests {
             Some(Freshness::Stale { lag_secs }) if lag_secs > 0
         ));
         assert!(!matches!(freshness(always, Timeframe::M5, now - 86_400, now), Some(Freshness::Closed)));
+    }
+
+    #[test]
+    fn market_orders_require_a_current_verified_print() {
+        let cash = AssetClass::Equity;
+        let monday = wall(2026, 3, 9, 10, 7);
+        assert_eq!(
+            market_order_block(cash, Provenance::Real, wall(2026, 3, 9, 10, 7), monday),
+            None,
+            "the forming minute is a live market"
+        );
+        assert_eq!(
+            market_order_block(cash, Provenance::Real, wall(2026, 3, 9, 10, 6), monday),
+            None,
+            "the previous minute may still be printing"
+        );
+        let behind = market_order_block(cash, Provenance::Cached, wall(2026, 3, 9, 10, 5), monday).unwrap();
+        assert!(matches!(behind, MarketBlock::Stale { lag_secs: 60 }));
+        assert_eq!(behind.badge(), "STALE");
+        assert!(behind.explain().contains("stale"));
+
+        let saturday = wall(2026, 3, 7, 12, 0);
+        let closed = market_order_block(cash, Provenance::Real, wall(2026, 3, 6, 15, 59), saturday).unwrap();
+        assert_eq!(closed, MarketBlock::Closed);
+        assert_eq!(closed.badge(), "SESSION CLOSED");
+        assert!(closed.explain().contains("session is closed"));
+        assert!(matches!(
+            market_order_block(cash, Provenance::Real, wall(2026, 3, 6, 15, 58), saturday),
+            Some(MarketBlock::Stale { .. })
+        ));
+
+        let bell = wall(2026, 3, 9, 16, 0);
+        assert_eq!(
+            market_order_block(cash, Provenance::Real, wall(2026, 3, 9, 15, 58), bell + 20),
+            Some(MarketBlock::Closed),
+            "just after the bell the prior minute is the close, not a live market"
+        );
+
+        assert_eq!(market_order_block(cash, Provenance::Sample, wall(2026, 3, 6, 9, 30), saturday), None);
+        assert_eq!(market_order_block(cash, Provenance::Missing, monday, monday), None);
+        assert_eq!(market_order_block(cash, Provenance::Real, 0, monday), Some(MarketBlock::Stale { lag_secs: 0 }));
+
+        let now = 1_700_000_000;
+        assert_eq!(market_order_block(AssetClass::Crypto, Provenance::Real, now - 120, now), None);
+        assert!(matches!(
+            market_order_block(AssetClass::Fx, Provenance::Real, now - 121, now),
+            Some(MarketBlock::Stale { lag_secs: 1 })
+        ));
+        assert!(!matches!(
+            market_order_block(AssetClass::Cmdty, Provenance::Real, now - 86_400, now),
+            Some(MarketBlock::Closed)
+        ));
     }
 }
