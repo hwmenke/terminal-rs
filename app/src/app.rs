@@ -424,13 +424,20 @@ impl PaneKind {
             PaneKind::News(_) => None,
             PaneKind::OrderBook(b) => Some(&b.symbol),
             PaneKind::Options(o) => Some(&o.symbol),
+            PaneKind::VolumePace(p) => Some(&p.symbol),
             _ => None,
         }
     }
 
     fn follows_symbol(&self) -> bool {
-        matches!(self, PaneKind::Chart(_) | PaneKind::Ticker { .. } | PaneKind::OrderBook(_) | PaneKind::Options(_))
-            || matches!(self, PaneKind::News(n) if n.scope == tr_data::news::NewsScope::Symbol)
+        matches!(
+            self,
+            PaneKind::Chart(_)
+                | PaneKind::Ticker { .. }
+                | PaneKind::OrderBook(_)
+                | PaneKind::Options(_)
+                | PaneKind::VolumePace(_)
+        ) || matches!(self, PaneKind::News(n) if n.scope == tr_data::news::NewsScope::Symbol)
     }
 
     fn settings(&self) -> PaneSettings {
@@ -590,7 +597,7 @@ impl PaneKind {
             PaneSettings::Alerts => PaneKind::Alerts,
             PaneSettings::PriceHistory => PaneKind::Research(Box::new(research::ResearchPane::price_history())),
             PaneSettings::Research(scan) => PaneKind::Research(Box::new(research::ResearchPane::new(scan))),
-            PaneSettings::Watchlist => PaneKind::Watchlist,
+            PaneSettings::Watchlist | PaneSettings::IntradayScan => PaneKind::Watchlist,
             PaneSettings::Help => PaneKind::Help,
             PaneSettings::Wei => PaneKind::Wei,
             PaneSettings::Curve => PaneKind::Curve,
@@ -1213,6 +1220,7 @@ impl TerminalApp {
             Command::SymbolFunction(s, Function::SessionPath { spec }) => self.open_session_path(Some(&s), &spec),
             Command::SymbolFunction(s, Function::Breadth { spec }) => self.open_breadth(Some(&s), &spec),
             Command::SymbolFunction(s, Function::VolumePace { spec }) => self.open_volume_pace(Some(&s), &spec),
+            Command::SymbolFunction(s, Function::IntradayDesk) => self.open_intraday_desk(Some(&s)),
             Command::SymbolFunction(s, Function::GapFill { spec }) => self.open_gap_fill(Some(&s), &spec),
             Command::SymbolFunction(s, Function::SessionExtreme { spec }) => self.open_session_extreme(Some(&s), &spec),
             Command::SymbolFunction(s, Function::RelativePath { spec }) => self.open_relative_path(Some(&s), &spec),
@@ -1284,6 +1292,7 @@ impl TerminalApp {
             Function::Watchlist => self.open_watchlist(false),
             Function::Earnings => self.open_watchlist(true),
             Function::Intraday => self.open_intraday(),
+            Function::IntradayDesk => self.open_intraday_desk(symbol.as_deref()),
             Function::WatchCommand(line) => self.watch_command(&line),
             Function::Layout(arg) => self.layout_command(&arg),
             Function::Layouts => {

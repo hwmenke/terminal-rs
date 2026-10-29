@@ -98,6 +98,8 @@ pub enum PaneSettings {
     Research(Option<String>),
     PriceHistory,
     Watchlist,
+    /// Watchlist pane showing the intraday scan. Older layouts store plain `Watchlist`.
+    IntradayScan,
     Help,
     Wei,
     Curve,
@@ -621,6 +623,16 @@ mod tests {
     use super::*;
     use crate::dock::Zone;
     use crate::prefs::PanelDefaults;
+
+    #[test]
+    fn intraday_scan_is_its_own_layout_pane_and_watchlist_still_loads() {
+        let watch: PaneSettings = serde_json::from_str("\"Watchlist\"").unwrap();
+        assert_eq!(watch, PaneSettings::Watchlist);
+        let raw = serde_json::to_string(&PaneSettings::IntradayScan).unwrap();
+        assert_eq!(raw, "\"IntradayScan\"");
+        let back: PaneSettings = serde_json::from_str(&raw).unwrap();
+        assert_eq!(back, PaneSettings::IntradayScan);
+    }
 
     fn temp_store(tag: &str) -> Store {
         let dir = std::env::temp_dir().join(format!("tr-layouts-{tag}-{}", std::process::id()));

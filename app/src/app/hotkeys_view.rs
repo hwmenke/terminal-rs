@@ -291,6 +291,10 @@ impl TerminalApp {
                         "Intraday scan of the selected watchlist: session RVOL, close versus VWAP, and return versus SPY from verified 5-minute bars",
                     ),
                     (
+                        &["IDESK", "IDASH", "AAPL IDESK"],
+                        "Intraday desk: 5-minute chart, ISCAN, breadth, and volume pace for one name, saved as the Intraday layout",
+                    ),
+                    (
                         &["DESK", "AAPL DESK", "NEW DESK"],
                         "PM Desk: watchlist leaders, group performance, position size (not PORT)",
                     ),

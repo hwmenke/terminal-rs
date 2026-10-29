@@ -14,7 +14,10 @@ use crate::anim;
 use crate::congress_view::{Action, FeedFilter};
 use crate::dock::{Dir, Node, PaneId, Zone};
 use crate::layout::Layout;
-use crate::layouts::{LayoutDoc, Link, SavedPane, WindowGeometry};
+use crate::layouts::{LayoutDoc, Link, PaneSettings, SavedPane, WindowGeometry};
+
+/// Saved name of the 2×2 intraday desk (`IDESK`).
+const INTRADAY_DESK: &str = "Intraday";
 use crate::theme::{self, amber, dp, mono, muted, text, ui_font};
 use crate::widgets::{self, Icon};
 use crate::worker::{Request, Worker};
@@ -604,6 +607,15 @@ impl TerminalApp {
                     **o = super::OptionsPane::new(&key, o.strikes, o.show_greeks);
                 }
             }
+            PaneKind::VolumePace(p) => {
+                if p.symbol != key {
+                    p.symbol = key.clone();
+                    p.pace = None;
+                    p.error = None;
+                    p.loading = false;
+                    p.request(id, &self.worker);
+                }
+            }
             _ => return false,
         }
         true
@@ -1045,6 +1057,54 @@ impl TerminalApp {
         self.ensure_focus();
     }
 
+    /// Replace the workspace with the saved Intraday desk: 5-minute chart, ISCAN, watchlist
+    /// breadth, and volume pace. The previous layout is kept under its own name.
+    pub(super) fn open_intraday_desk(&mut self, symbol: Option<&str>) {
+        let key = symbol
+            .map(|s| tr_data::security(s).key())
+            .filter(|s| !s.is_empty())
+            .or_else(|| self.focused_symbol())
+            .unwrap_or_else(|| tr_data::security("AAPL").key());
+        if !self.layout_name.eq_ignore_ascii_case(INTRADAY_DESK) {
+            self.save_layout();
+        }
+        for p in std::mem::take(&mut self.panes) {
+            self.worker.send(Request::Forget(p.id));
+        }
+        self.dock = Node::default();
+        if self.watchlists.index(&self.watch_ui.selected_group).is_none() {
+            self.watch_ui.selected_group = self.watchlists.last_used.clone();
+        }
+        let mut chart = crate::layouts::chart_settings(&key, &self.prefs.panels);
+        if let PaneSettings::Chart { tf, .. } = &mut chart {
+            *tf = tr_core::Timeframe::M5;
+        }
+        let ids = [
+            self.new_pane(PaneKind::from_settings(chart)),
+            self.new_pane(PaneKind::Watchlist),
+            self.new_pane(PaneKind::Breadth(Box::new(super::session_breadth::BreadthPane::new("")))),
+            self.new_pane(PaneKind::VolumePace(Box::new(super::volume_pace::VolumePacePane::new(&key, "")))),
+        ];
+        if let Some(p) = self.pane_mut(ids[0]) {
+            p.link = Some(Link::Blue);
+        }
+        if let Some(p) = self.pane_mut(ids[3]) {
+            p.link = Some(Link::Blue);
+        }
+        self.dock = Node::preset(Layout::Grid2x2, &ids);
+        self.preset = Some(Layout::Grid2x2);
+        self.focus = ids[0];
+        self.last_opened = Some(ids[3]);
+        self.watch_ui.calendar = false;
+        self.watch_ui.intraday = true;
+        self.reload_intraday_scan();
+        self.layout_name = INTRADAY_DESK.into();
+        self.save_layout();
+        self.save_settings();
+        let ticker = tr_data::security(&key).ticker;
+        self.status = format!("{ticker}: intraday desk — 5-minute chart, scan, breadth, and volume pace");
+    }
+
     // ---- saved layouts -------------------------------------------------------------------
 
     pub(super) fn current_doc(&self) -> LayoutDoc {
@@ -1057,7 +1117,10 @@ impl TerminalApp {
                 .iter()
                 .map(|p| SavedPane {
                     id: p.id,
-                    settings: p.kind.settings(),
+                    settings: match p.kind.settings() {
+                        PaneSettings::Watchlist if self.watch_ui.intraday => PaneSettings::IntradayScan,
+                        other => other,
+                    },
                     link: p.link,
                     title: p.title.clone(),
                     window: p.window,
@@ -1075,6 +1138,10 @@ impl TerminalApp {
         doc.repair();
         for p in std::mem::take(&mut self.panes) {
             self.worker.send(Request::Forget(p.id));
+        }
+        let scan = doc.panes.iter().any(|sp| matches!(sp.settings, PaneSettings::IntradayScan));
+        if scan && self.watchlists.index(&self.watch_ui.selected_group).is_none() {
+            self.watch_ui.selected_group = self.watchlists.last_used.clone();
         }
         let mut map = HashMap::new();
         for sp in doc.panes {
@@ -1104,6 +1171,11 @@ impl TerminalApp {
         self.focus = doc.focus.and_then(|f| map.get(&f).copied()).unwrap_or(0);
         self.ensure_focus();
         self.layout_name = doc.name;
+        self.watch_ui.intraday = scan;
+        if scan {
+            self.watch_ui.calendar = false;
+            self.reload_intraday_scan();
+        }
         self.preset = None;
         self.drag = None;
         self.renaming_tab = None;
@@ -1953,5 +2025,83 @@ mod tests {
         let dragged = Node::split_with(Dir::Column, vec![Node::leaf(2), Node::leaf(1)], vec![0.3, 0.7]);
         let (shown, target, _) = step(&dragged, 6.1, 900.0);
         assert_eq!(shown, target);
+    }
+
+    #[test]
+    fn intraday_desk_saves_the_previous_layout_and_restores_the_scan() {
+        use crate::app::tests::test_app;
+
+        let mut app = test_app();
+        app.layout_name = "Scratch".into();
+        let help = app.new_pane(PaneKind::Help);
+        app.dock = Node::leaf(help);
+        app.focus = help;
+        app.save_layout();
+
+        app.execute("IDESK");
+        assert_eq!(app.layout_name, "Intraday");
+        assert!(app.store.exists("Scratch") && app.store.exists("Intraday"));
+        assert!(app.watch_ui.intraday);
+        assert!(!app.watch_ui.calendar);
+        assert_eq!(app.dock.visible().len(), 4);
+        assert!(app.status.contains("intraday desk"));
+        let chart = app.panes.iter().find_map(|p| match &p.kind {
+            PaneKind::Chart(c) => Some((p.link, c.symbol.clone(), c.tf)),
+            _ => None,
+        });
+        assert_eq!(chart, Some((Some(Link::Blue), "AAPL US Equity".into(), tr_core::Timeframe::M5)));
+        let pace = app.panes.iter().find_map(|p| match &p.kind {
+            PaneKind::VolumePace(v) => Some((p.link, v.symbol.clone(), v.spec.clone())),
+            _ => None,
+        });
+        assert_eq!(pace, Some((Some(Link::Blue), "AAPL US Equity".into(), String::new())));
+        let breadth = app.panes.iter().find_map(|p| match &p.kind {
+            PaneKind::Breadth(b) => Some(b.spec.clone()),
+            _ => None,
+        });
+        assert_eq!(breadth, Some(String::new()));
+        assert!(app.panes.iter().any(|p| matches!(p.kind, PaneKind::Watchlist)));
+        let saved = app.store.load("Intraday").unwrap();
+        assert!(saved.panes.iter().any(|p| matches!(p.settings, PaneSettings::IntradayScan)));
+        assert!(saved.panes.iter().any(|p| {
+            matches!(&p.settings, PaneSettings::Chart { symbol, tf, .. } if symbol == "AAPL US Equity" && *tf == tr_core::Timeframe::M5)
+        }));
+        let scratch = app.store.load("Scratch").unwrap();
+        assert!(scratch.panes.iter().all(|p| !matches!(p.settings, PaneSettings::IntradayScan)));
+        assert!(scratch.panes.iter().any(|p| matches!(p.settings, PaneSettings::Help)));
+
+        app.open_security("NVDA");
+        let symbols: Vec<_> = app
+            .panes
+            .iter()
+            .filter_map(|p| match &p.kind {
+                PaneKind::Chart(c) => Some(c.symbol.clone()),
+                PaneKind::VolumePace(v) => Some(v.symbol.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(symbols, vec!["NVDA US Equity".to_string(), "NVDA US Equity".to_string()]);
+        assert_eq!(app.panes.len(), 4);
+        assert!(app.watch_ui.intraday);
+
+        app.execute("MSFT IDESK");
+        assert_eq!(app.layout_name, "Intraday");
+        assert_eq!(app.panes.len(), 4);
+        assert!(app.panes.iter().any(
+            |p| matches!(&p.kind, PaneKind::Chart(c) if c.symbol == "MSFT US Equity" && c.tf == tr_core::Timeframe::M5)
+        ));
+        assert!(app.panes.iter().any(|p| matches!(&p.kind, PaneKind::VolumePace(v) if v.symbol == "MSFT US Equity")));
+
+        app.switch_layout("Scratch");
+        assert!(!app.watch_ui.intraday);
+        assert_eq!(app.panes.len(), 1);
+        assert!(app.panes.iter().any(|p| matches!(p.kind, PaneKind::Help)));
+
+        app.switch_layout("Intraday");
+        assert!(app.watch_ui.intraday);
+        assert_eq!(app.dock.visible().len(), 4);
+        assert!(app.panes.iter().any(|p| matches!(&p.kind, PaneKind::Chart(c) if c.symbol == "MSFT US Equity")));
+        assert!(app.panes.iter().any(|p| matches!(&p.kind, PaneKind::VolumePace(v) if v.symbol == "MSFT US Equity")));
+        assert!(app.panes.iter().any(|p| matches!(&p.kind, PaneKind::Breadth(b) if b.spec.is_empty())));
     }
 }
