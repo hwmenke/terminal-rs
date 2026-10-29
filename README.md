@@ -252,6 +252,11 @@ gets the native title bar with traffic lights, window vibrancy behind the sideba
   above each name's session VWAP. The rate stays blank below five names. A
   hole does not vote. Sample bars are refused. See
   [Session breadth](docs/SESSION_BREADTH.md).
+- **Volume pace** — `VPACE` (or `AAPL VPACE 20 15m`) draws today's cumulative
+  regular-session volume against the mean and the 25th–75th band of prior
+  sessions. A hole ends that session's total. Pace is today's total divided
+  by the typical total at the same minute. Sample bars are refused. See
+  [Volume pace](docs/VOLUME_PACE.md).
 - **Historical lookalikes** — `LOOKALIKE` (or `AAPL LOOKALIKE`, `AAPL KNN
   2024-01-15`) finds past sessions whose backward-looking features match the
   query date (standardized Euclidean distance), shows **per-horizon completed /
@@ -410,6 +415,7 @@ Settings › Hotkeys. On Linux and Windows ⌘ is Ctrl and ⌥ is Alt.
 | `ICMP` · `AAPL ICMP MSFT NVDA` · `AAPL ICMP 1m` · `NEW ICMP` | Intraday compare: percent from each 09:30 open, SPY on the same clock |
 | `SPATH` · `AAPL SPATH 20 15m` · `NEW SPATH` | Today versus the typical path of prior sessions, percent from each 09:30 open |
 | `BRD` · `AAPL BRD MSFT NVDA` · `BRD 15m` · `NEW BRD` | Share of a list at or above each 09:30 open and session VWAP |
+| `VPACE` · `AAPL VPACE 20 15m` · `NEW VPACE` | Cumulative volume versus the usual pace of prior sessions |
 | `NEWS` · `AAPL CN` · `TOP` · `BTCUSD CRNCY OB` · `WEI` · `GC` | watchlist news · one name · top headlines · order book · markets · curve |
 | `CONG` · `NVDA CONG` · `POL PELOSI` · `TRACK PELOSI` · `ALERTS` · `REFRESH` | Congress feed · who traded it · profile · track · alerts · refresh |
 | `AAPL ALERT 150` · `AAPL ALERT BELOW 140` · `NVDA ALERT SETUP NEAR_HIGH` · `UNALERT AAPL` | Price/setup alerts (click a fired row to open the chart) |

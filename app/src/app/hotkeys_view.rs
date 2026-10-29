@@ -364,6 +364,10 @@ impl TerminalApp {
                         &["BRD", "AAPL BRD MSFT NVDA"],
                         "Share of the list at or above each 09:30 open and session VWAP",
                     ),
+                    (
+                        &["VPACE", "AAPL VPACE 20 15m"],
+                        "Cumulative volume versus the usual pace of prior sessions",
+                    ),
                     (&["TL", "HL", "VL", "FIB", "MAGNET"], "Drawing tools and snapping"),
                     (&["CLEAR DRAW", "UNDO DRAW"], "Remove all drawings on this name, or undo the last delete"),
                     (&["REVIEW", "AAPL REVIEW"], "Linked daily + weekly archive charts for candidate review"),

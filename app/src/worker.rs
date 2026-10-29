@@ -91,6 +91,14 @@ pub enum Request {
         /// Selected watchlist, used when `spec` names no ticker.
         symbols: Vec<String>,
     },
+    /// Cumulative volume versus the usual pace of prior sessions.
+    VolumePace {
+        pane: PaneId,
+        generation: u64,
+        symbol: String,
+        spec: String,
+        timeframe: String,
+    },
     /// Paper VWAP / opening-range backtest on verified regular-session bars.
     IntradayBacktest {
         pane: PaneId,
@@ -394,6 +402,11 @@ pub enum Response {
         pane: PaneId,
         generation: u64,
         result: Result<tr_data::session_breadth::Breadth, String>,
+    },
+    VolumePace {
+        pane: PaneId,
+        generation: u64,
+        result: Result<tr_data::volume_pace::VolumePace, String>,
     },
     Lookalike {
         pane: PaneId,
@@ -1159,6 +1172,33 @@ async fn research_session_path(
     tr_data::session_path::build_path(&sec.key(), &bars, &query, &source).map_err(anyhow::Error::msg)
 }
 
+/// Verified regular-session bars for one cash name. Sample substitution is refused.
+async fn research_volume_pace(
+    s: &Shared,
+    symbol: &str,
+    spec: &str,
+    timeframe: &str,
+) -> anyhow::Result<tr_data::volume_pace::VolumePace> {
+    if s.provider.name() == "sample" {
+        anyhow::bail!(
+            "Volume pace refused: sample / offline display mode does not feed this pane. Sample prices are never used."
+        );
+    }
+    let sec = tr_data::security(symbol);
+    if !matches!(sec.class, tr_core::AssetClass::Equity | tr_core::AssetClass::Etf | tr_core::AssetClass::Index) {
+        anyhow::bail!("{} has no US cash session. The pace is the regular session from 09:30.", sec.ticker);
+    }
+    let query = tr_data::volume_pace::parse_query(spec, timeframe).map_err(anyhow::Error::msg)?;
+    let limit = tr_data::volume_pace::fetch_limit(query.timeframe);
+    let bars = s.provider.history(&sec.key(), query.timeframe, None, limit).await?;
+    if bars.is_empty() {
+        anyhow::bail!("Volume pace refused: no regular-session bars were returned. Sample prices are never used.");
+    }
+    Bar::require_verified(&bars, "Volume pace").map_err(anyhow::Error::msg)?;
+    let source = format!("{} {} regular session", s.provider.name(), query.timeframe.label());
+    tr_data::volume_pace::build_pace(&sec.key(), &bars, &query, &source).map_err(anyhow::Error::msg)
+}
+
 /// Verified regular-session bars for a list of cash names. Sample substitution is refused.
 async fn research_breadth(
     s: &Shared,
@@ -1498,6 +1538,13 @@ async fn handle(s: &Arc<Shared>, req: Request) {
                 pane,
                 generation,
                 result: research_session_path(s, &symbol, &spec, &timeframe).await.map_err(|e| format!("{e:#}")),
+            });
+        }
+        Request::VolumePace { pane, generation, symbol, spec, timeframe } => {
+            send(Response::VolumePace {
+                pane,
+                generation,
+                result: research_volume_pace(s, &symbol, &spec, &timeframe).await.map_err(|e| format!("{e:#}")),
             });
         }
         Request::Breadth { pane, generation, spec, timeframe, symbols } => {
