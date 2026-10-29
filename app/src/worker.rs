@@ -25,7 +25,7 @@ pub type PaneId = u64;
 
 /// Minutes between Congress disclosure checks (`TR_CONGRESS_REFRESH_MIN`; 0 disables).
 pub const CONGRESS_REFRESH_MIN: u64 = 30;
-/// Seconds between price, session-VWAP, and setup rule evaluations (`TR_PRICE_ALERT_SECS`; 0 disables).
+/// Seconds between price, session-VWAP, session-signal, and setup rule evaluations (`TR_PRICE_ALERT_SECS`; 0 disables).
 pub const PRICE_ALERT_EVAL_SECS: u64 = 20;
 
 pub enum Request {
@@ -2561,6 +2561,7 @@ async fn evaluate_price_alerts(s: &Shared) {
     use tr_data::price_alerts::{
         AlertFailure, AlertKind, EvalInput, PriceTick, evaluate, rvol_tick, setup_tick, vwap_tick,
     };
+    use tr_data::session_alerts::{self, SessionSignal};
     use tr_data::whats_news::archive_ticker;
     let now = chrono::Utc::now().timestamp();
     let sample = s.provider.name() == "sample";
@@ -2575,6 +2576,7 @@ async fn evaluate_price_alerts(s: &Shared) {
                 setups: Vec::new(),
                 vwaps: Vec::new(),
                 rvols: Vec::new(),
+                sessions: Vec::new(),
                 failures: Vec::new(),
             },
         );
@@ -2589,6 +2591,7 @@ async fn evaluate_price_alerts(s: &Shared) {
     let mut vwap_keys = Vec::new();
     let mut rvol_keys = Vec::new();
     let mut setup_keys: Vec<(String, String)> = Vec::new();
+    let mut session_rules: Vec<(String, SessionSignal)> = Vec::new();
     for r in rules.iter().filter(|r| r.enabled) {
         match &r.kind {
             AlertKind::Price { .. } => {
@@ -2607,6 +2610,7 @@ async fn evaluate_price_alerts(s: &Shared) {
                 }
             }
             AlertKind::Setup { setup, .. } => setup_keys.push((r.symbol.clone(), setup.clone())),
+            AlertKind::Session { signal } => session_rules.push((r.symbol.clone(), *signal)),
         }
     }
     let mut failures = Vec::new();
@@ -2700,9 +2704,61 @@ async fn evaluate_price_alerts(s: &Shared) {
             Err(e) => failures.push(AlertFailure { symbol: key, error: format!("{e:#}") }),
         }
     }
+    // Session alerts share one verified 5-minute read per name. Relative also needs SPY.
+    let mut sessions = Vec::new();
+    if !session_rules.is_empty() {
+        let limit = session_alerts::fetch_limit();
+        let mut symbols = Vec::new();
+        let mut needs_spy = false;
+        for (symbol, signal) in &session_rules {
+            if *signal == SessionSignal::Relative {
+                needs_spy = true;
+            }
+            if !symbols.iter().any(|s| s == symbol) {
+                symbols.push(symbol.clone());
+            }
+        }
+        let mut bars_by = std::collections::BTreeMap::new();
+        for key in symbols {
+            match s.provider.history(&key, Timeframe::M5, None, limit).await {
+                Ok(bars) => {
+                    bars_by.insert(key, bars);
+                }
+                Err(e) => failures.push(AlertFailure { symbol: key, error: format!("{e:#}") }),
+            }
+        }
+        let spy_key = tr_data::relative_path::benchmark_key();
+        let spy_bars = if needs_spy {
+            if let Some(bars) = bars_by.get(&spy_key) {
+                Some(bars.clone())
+            } else {
+                match s.provider.history(&spy_key, Timeframe::M5, None, limit).await {
+                    Ok(bars) => Some(bars),
+                    Err(e) => {
+                        failures.push(AlertFailure { symbol: spy_key, error: format!("{e:#}") });
+                        None
+                    }
+                }
+            }
+        } else {
+            None
+        };
+        let mut seen = Vec::new();
+        for (symbol, signal) in session_rules {
+            if seen.iter().any(|pair: &(String, SessionSignal)| pair.0 == symbol && pair.1 == signal) {
+                continue;
+            }
+            seen.push((symbol.clone(), signal));
+            let Some(bars) = bars_by.get(&symbol) else { continue };
+            match session_alerts::read(signal, &symbol, Timeframe::M5, bars, spy_bars.as_deref(), now) {
+                Ok(tick) => sessions.push(tick),
+                Err(error) => failures.push(AlertFailure { symbol, error }),
+            }
+        }
+    }
     let outcome = evaluate(
         &mut s.price_alerts.lock().expect("price alerts"),
-        EvalInput { now, sample_provider: false, prices, setups, vwaps, rvols, failures },
+        EvalInput { now, sample_provider: false, prices, setups, vwaps, rvols, sessions, failures },
     );
     s.persist_price_alerts();
     if !outcome.fired.is_empty() {

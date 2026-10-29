@@ -12,6 +12,7 @@ use serde::{Deserialize, Serialize};
 use tr_core::Provenance;
 
 use crate::history::calendar::last_expected_session;
+use crate::session_alerts::{SessionSignal, SessionTick};
 use crate::whats_news::SETUPS;
 
 /// Same 15-minute stale banner as watchlist news.
@@ -89,6 +90,10 @@ pub enum AlertKind {
         setup: String,
         change: SetupChange,
     },
+    /// A cash-session condition from the research panes, on verified intraday bars.
+    Session {
+        signal: SessionSignal,
+    },
 }
 
 impl AlertKind {
@@ -98,6 +103,7 @@ impl AlertKind {
             Self::Vwap { side } => format!("vwap:{}", side.as_str()),
             Self::Rvol { multiple } => format!("rvol:{multiple:.4}"),
             Self::Setup { setup, change } => format!("setup:{setup}:{}", change.as_str()),
+            Self::Session { signal } => format!("session:{}", signal.as_str()),
         }
     }
 
@@ -111,6 +117,7 @@ impl AlertKind {
                 x.is_finite() && y.is_finite() && (x - y).abs() < 1e-6
             }
             (Self::Setup { setup: a, change: c }, Self::Setup { setup: b, change: d }) => a == b && c == d,
+            (Self::Session { signal: a }, Self::Session { signal: b }) => a == b,
             _ => false,
         }
     }
@@ -121,6 +128,7 @@ impl AlertKind {
             Self::Vwap { side } => format!("{} session VWAP", side.label()),
             Self::Rvol { multiple } => format!("session RVOL {multiple:.2}×"),
             Self::Setup { setup, change } => format!("{setup} {}", change.label()),
+            Self::Session { signal } => signal.label().to_string(),
         }
     }
 }
@@ -202,7 +210,10 @@ impl AlertBatch {
             .filter(|r| r.enabled && r.symbol == symbol)
             .filter_map(|r| match r.kind {
                 AlertKind::Price { side, level } => Some((level, side)),
-                AlertKind::Vwap { .. } | AlertKind::Rvol { .. } | AlertKind::Setup { .. } => None,
+                AlertKind::Vwap { .. }
+                | AlertKind::Rvol { .. }
+                | AlertKind::Setup { .. }
+                | AlertKind::Session { .. } => None,
             })
             .collect()
     }
@@ -284,7 +295,7 @@ impl Store {
             return Ok(existing.clone());
         }
         if self.rules.len() >= MAX_RULES {
-            return Err(format!("at most {MAX_RULES} price, VWAP, RVOL, or setup rules"));
+            return Err(format!("at most {MAX_RULES} price, VWAP, RVOL, setup, or session rules"));
         }
         let rule = AlertRule {
             id: format!("{symbol}:{}:{now}", kind.fingerprint()),
@@ -441,6 +452,7 @@ pub struct EvalInput {
     pub setups: Vec<SetupTick>,
     pub vwaps: Vec<VwapTick>,
     pub rvols: Vec<RvolTick>,
+    pub sessions: Vec<SessionTick>,
     pub failures: Vec<AlertFailure>,
 }
 
@@ -492,6 +504,7 @@ pub fn evaluate(store: &mut Store, input: EvalInput) -> EvalOutcome {
     let setups: BTreeMap<_, _> = input.setups.into_iter().map(|t| (t.symbol.clone(), t)).collect();
     let vwaps: BTreeMap<_, _> = input.vwaps.into_iter().map(|t| (t.symbol.clone(), t)).collect();
     let rvols: BTreeMap<_, _> = input.rvols.into_iter().map(|t| (t.symbol.clone(), t)).collect();
+    let sessions = input.sessions;
     let rules = store.rules.clone();
     for rule in rules.iter().filter(|r| r.enabled) {
         match &rule.kind {
@@ -669,6 +682,44 @@ pub fn evaluate(store: &mut Store, input: EvalInput) -> EvalOutcome {
                 state.last_bar_ts = Some(tick.bar_ts);
                 state.last_eval_at = input.now;
             }
+            AlertKind::Session { signal } => {
+                let Some(tick) = sessions.iter().find(|tick| tick.symbol == rule.symbol && tick.signal == *signal)
+                else {
+                    if !failures.iter().any(|failure| failure.symbol == rule.symbol) {
+                        failures.push(AlertFailure {
+                            symbol: rule.symbol.clone(),
+                            error: format!("no session {} for this name", signal.as_str()),
+                        });
+                    }
+                    continue;
+                };
+                if !tick.provenance.is_verified() {
+                    failures.push(AlertFailure {
+                        symbol: rule.symbol.clone(),
+                        error: format!("refused {}: session alerts need verified real bars", tick.provenance.label()),
+                    });
+                    continue;
+                }
+                if !tick.fresh {
+                    stale = true;
+                    continue;
+                }
+                let prev = store.states.get(&rule.id).and_then(|s| s.last_match);
+                if let Some(false) = prev
+                    && tick.active
+                {
+                    let key = format!("{}:{}:{}:{}", rule.id, signal.as_str(), tick.session_date, tick.bar_ts);
+                    let ticker = crate::security(&rule.symbol).ticker;
+                    let message = format!("{ticker} {}", tick.detail);
+                    if let Some(event) = store.try_fire(rule, message, key, input.now) {
+                        fired.push(event);
+                    }
+                }
+                let state = store.states.entry(rule.id.clone()).or_default();
+                state.last_match = Some(tick.active);
+                state.last_bar_ts = Some(tick.bar_ts);
+                state.last_eval_at = input.now;
+            }
         }
     }
     EvalOutcome { batch: store.snapshot(input.now, stale, false, failures), fired }
@@ -728,6 +779,7 @@ mod tests {
                 setups,
                 vwaps: Vec::new(),
                 rvols: Vec::new(),
+                sessions: Vec::new(),
                 failures: Vec::new(),
             },
         )
@@ -754,6 +806,7 @@ mod tests {
                 setups: vec![],
                 vwaps,
                 rvols: vec![],
+                sessions: vec![],
                 failures: vec![],
             },
         )
@@ -830,6 +883,7 @@ mod tests {
                 setups: vec![],
                 vwaps: vec![],
                 rvols: vec![],
+                sessions: vec![],
                 failures: vec![],
             },
         );
@@ -1028,6 +1082,7 @@ mod tests {
                 setups: vec![],
                 vwaps: vec![],
                 rvols,
+                sessions: vec![],
                 failures: vec![],
             },
         )
@@ -1130,5 +1185,65 @@ mod tests {
         assert!(err.contains("SAMPLE"), "{err}");
         let err = rvol_tick("EURUSD", &monday, wall(2026, 3, 9, 9, 36)).unwrap_err();
         assert!(err.contains("no US cash session"), "{err}");
+    }
+
+    fn session_tick(active: bool, bar_ts: i64, fresh: bool, provenance: Provenance) -> SessionTick {
+        SessionTick {
+            symbol: crate::security("AAPL").key(),
+            signal: SessionSignal::Path,
+            active,
+            detail: "left the usual session path at +10.00% (band +1.00% to +2.00%)".into(),
+            bar_ts,
+            session_date: chrono::NaiveDate::from_ymd_opt(2026, 1, 5).unwrap(),
+            provenance,
+            fresh,
+        }
+    }
+
+    fn eval_session(store: &mut Store, now: i64, sessions: Vec<SessionTick>) -> EvalOutcome {
+        evaluate(
+            store,
+            EvalInput {
+                now,
+                sample_provider: false,
+                prices: vec![],
+                setups: vec![],
+                vwaps: vec![],
+                rvols: vec![],
+                sessions,
+                failures: vec![],
+            },
+        )
+    }
+
+    #[test]
+    fn a_session_signal_fires_when_it_turns_on_and_stays_quiet_while_it_holds() {
+        let mut s = Store::default();
+        let rule = s.add_rule("aapl", AlertKind::Session { signal: SessionSignal::Path }, 1).unwrap();
+        let again = s.add_rule("AAPL US Equity", AlertKind::Session { signal: SessionSignal::Path }, 2).unwrap();
+        assert_eq!(rule.id, again.id);
+        assert_eq!(rule.kind.label(), "outside the usual session path");
+
+        let seed = eval_session(&mut s, 10, vec![session_tick(false, 10, true, Provenance::Real)]);
+        assert!(seed.fired.is_empty(), "the first read only seeds");
+        let fire = eval_session(&mut s, 20, vec![session_tick(true, 20, true, Provenance::Real)]);
+        assert_eq!(fire.fired.len(), 1);
+        assert!(fire.fired[0].message.contains("AAPL"));
+        assert!(fire.fired[0].message.contains("usual session path"));
+        let held = eval_session(&mut s, 30, vec![session_tick(true, 30, true, Provenance::Real)]);
+        assert!(held.fired.is_empty(), "staying outside does not fire again");
+        let back = eval_session(&mut s, 40, vec![session_tick(false, 40, true, Provenance::Real)]);
+        assert!(back.fired.is_empty());
+        let again_on = eval_session(&mut s, 50, vec![session_tick(true, 50, true, Provenance::Real)]);
+        assert_eq!(again_on.fired.len(), 1, "leaving the band a second time fires");
+
+        let stale = eval_session(&mut s, 60, vec![session_tick(false, 60, false, Provenance::Real)]);
+        assert!(stale.fired.is_empty());
+        assert!(stale.batch.stale);
+        assert_eq!(s.states[&rule.id].last_match, Some(true), "a stale read does not move the seed");
+
+        let sample = eval_session(&mut s, 70, vec![session_tick(true, 70, true, Provenance::Sample)]);
+        assert!(sample.fired.is_empty());
+        assert!(sample.batch.failures[0].error.contains("SAMPLE"));
     }
 }

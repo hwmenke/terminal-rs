@@ -431,6 +431,12 @@ fn parse_alert_kind(rest: &[&str]) -> Option<tr_data::price_alerts::AlertKind> {
         }
         return Some(AlertKind::Rvol { multiple });
     }
+    if let Some(signal) = tr_data::session_alerts::SessionSignal::parse(first) {
+        if up.len() != 1 {
+            return None;
+        }
+        return Some(AlertKind::Session { signal });
+    }
     if matches!(first, "ABOVE" | "OVER" | "GT") {
         let level: f64 = rest.get(1)?.parse().ok()?;
         return Some(AlertKind::Price { side: PriceSide::Above, level });
@@ -689,7 +695,7 @@ fn describe(f: &Function) -> String {
         Function::Track(n) => format!("Track {n} (alert on new filings)"),
         Function::Untrack(n) => format!("Stop tracking {n}"),
         Function::Alerts => {
-            "Alerts: price levels, session VWAP crosses, session RVOL, setup changes, and tracked filings".into()
+            "Alerts: price levels, session VWAP crosses, session RVOL, session path/pace/gap/extreme/relative, setup changes, and tracked filings".into()
         }
         Function::SetPriceAlert(kind) => format!("Watch {}", kind.label()),
         Function::ClearPriceAlert(q) if q.is_empty() => "Remove price/setup alerts for the focused name".into(),
@@ -1136,6 +1142,42 @@ mod tests {
         assert_eq!(parse("AAPL ALERT RVOL 0"), None);
         assert_eq!(parse("AAPL ALERT RVOL 2 BELOW"), None);
         assert!(hint("AAPL ALERT RVOL 2").contains("session RVOL 2.00×"));
+        assert_eq!(
+            parse("AAPL ALERT PATH"),
+            Some(Command::SymbolFunction(
+                "AAPL US Equity".into(),
+                Function::SetPriceAlert(tr_data::price_alerts::AlertKind::Session {
+                    signal: tr_data::session_alerts::SessionSignal::Path,
+                })
+            ))
+        );
+        assert_eq!(
+            parse("AAPL ALERT VPACE"),
+            Some(Command::SymbolFunction(
+                "AAPL US Equity".into(),
+                Function::SetPriceAlert(tr_data::price_alerts::AlertKind::Session {
+                    signal: tr_data::session_alerts::SessionSignal::Pace,
+                })
+            ))
+        );
+        assert!(matches!(
+            parse("NVDA ALERT GFILL"),
+            Some(Command::SymbolFunction(_, Function::SetPriceAlert(tr_data::price_alerts::AlertKind::Session { signal })))
+                if signal == tr_data::session_alerts::SessionSignal::Gap
+        ));
+        assert!(matches!(
+            parse("AAPL ALERT XTRM"),
+            Some(Command::SymbolFunction(_, Function::SetPriceAlert(tr_data::price_alerts::AlertKind::Session { signal })))
+                if signal == tr_data::session_alerts::SessionSignal::Extreme
+        ));
+        assert!(matches!(
+            parse("MSFT ALERT RELPATH"),
+            Some(Command::SymbolFunction(_, Function::SetPriceAlert(tr_data::price_alerts::AlertKind::Session { signal })))
+                if signal == tr_data::session_alerts::SessionSignal::Relative
+        ));
+        assert_eq!(parse("AAPL ALERT PATH 5"), None);
+        assert_eq!(parse("AAPL ALERT HILO"), None);
+        assert!(hint("AAPL ALERT PATH").contains("usual session path"));
         assert!(matches!(
             parse("AAPL RVOL"),
             Some(Command::SymbolFunction(_, Function::Indicator(ref spec))) if spec.code == "RVOL"

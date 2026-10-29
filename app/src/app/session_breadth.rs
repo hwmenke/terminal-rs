@@ -1,11 +1,10 @@
 //! Session breadth (`BRD`): share of a list at or above the open and VWAP.
-use std::str::FromStr;
-
 use super::{PaneKind, TerminalApp};
 use crate::theme::{self, amber, mono, muted, text, ui_font};
 use crate::{congress_view::Action, dock::PaneId, worker::Request};
 use egui::{Align2, Color32, Rect, RichText, ScrollArea, Sense, Stroke, Ui, pos2, vec2};
 use tr_core::Timeframe;
+use tr_data::cash_session::{parsed_bar_token, without_parsed_bar_tokens};
 use tr_data::session_breadth::{self, Breadth, BreadthPoint, Member};
 
 pub struct BreadthPane {
@@ -132,7 +131,7 @@ impl TerminalApp {
                 }
                 if ui.button("Watchlist").on_hover_text("Drop typed tickers and read the selected watchlist").clicked()
                 {
-                    pane.spec = spec_bar_size(&pane.spec).unwrap_or("").into();
+                    pane.spec = parsed_bar_token(&pane.spec).unwrap_or("").into();
                     reload = true;
                 }
             });
@@ -140,7 +139,7 @@ impl TerminalApp {
                 for label in ["1m", "5m", "15m", "30m", "1H"] {
                     if ui.selectable_label(pane.tf.eq_ignore_ascii_case(label), label).clicked() {
                         pane.tf = label.into();
-                        pane.spec = drop_bar_sizes(&pane.spec);
+                        pane.spec = without_parsed_bar_tokens(&pane.spec);
                         reload = true;
                     }
                 }
@@ -319,14 +318,6 @@ fn member_line(member: &Member) -> String {
     };
     let when = member.last_ts.map(session_breadth::clock_label).unwrap_or_else(|| "—".into());
     format!("{:<6}  {vs:>8}  {open:<14}  {vwap:<14}  {when}", member.ticker)
-}
-
-fn spec_bar_size(spec: &str) -> Option<&str> {
-    spec.split_whitespace().find(|token| Timeframe::from_str(token).is_ok())
-}
-
-fn drop_bar_sizes(spec: &str) -> String {
-    spec.split_whitespace().filter(|token| Timeframe::from_str(token).is_err()).collect::<Vec<_>>().join(" ")
 }
 
 #[cfg(test)]

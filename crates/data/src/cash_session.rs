@@ -396,6 +396,35 @@ pub fn open_unusable(date: NaiveDate) -> String {
     format!("{date}: 09:30 open is not a positive finite price.")
 }
 
+fn is_letter_bar_token(token: &str) -> bool {
+    token.chars().any(|c| c.is_ascii_digit()) && token.chars().any(|c| c.is_ascii_alphabetic())
+}
+
+/// First all-digit token. The window panes treat it as a session count (`60` is sixty sessions).
+pub fn window_count_token(spec: &str) -> Option<&str> {
+    spec.split_whitespace().find(|token| !token.is_empty() && token.chars().all(|c| c.is_ascii_digit()))
+}
+
+/// First token with both a digit and a letter (`15m`, `1h`). A bare `5` is not one of these.
+pub fn letter_bar_token(spec: &str) -> Option<&str> {
+    spec.split_whitespace().find(|token| is_letter_bar_token(token))
+}
+
+/// Spec text with letter-and-digit bar tokens removed. Bare counts and tickers stay.
+pub fn without_letter_bar_tokens(spec: &str) -> String {
+    spec.split_whitespace().filter(|token| !is_letter_bar_token(token)).collect::<Vec<_>>().join(" ")
+}
+
+/// First token [`Timeframe::from_str`] accepts. Breadth reads `5` and `60` as bar sizes.
+pub fn parsed_bar_token(spec: &str) -> Option<&str> {
+    spec.split_whitespace().find(|token| Timeframe::from_str(token).is_ok())
+}
+
+/// Spec text with tokens [`Timeframe::from_str`] accepts removed. Tickers stay, including a bare count's absence.
+pub fn without_parsed_bar_tokens(spec: &str) -> String {
+    spec.split_whitespace().filter(|token| Timeframe::from_str(token).is_err()).collect::<Vec<_>>().join(" ")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -549,5 +578,21 @@ mod tests {
         assert!(open_ambiguous(date).contains("more than one print"));
         assert!(open_unusable(date).contains("positive finite"));
         assert!(no_cash_grid(date).contains("no cash grid"));
+    }
+
+    #[test]
+    fn pane_buttons_split_a_count_from_a_bar_token_and_breadth_keeps_bare_integers() {
+        assert_eq!(window_count_token("20 15m extra"), Some("20"));
+        assert_eq!(letter_bar_token("20 15m extra"), Some("15m"));
+        assert_eq!(without_letter_bar_tokens("20 15m extra"), "20 extra");
+        assert_eq!(letter_bar_token("5"), None);
+        assert_eq!(window_count_token("5"), Some("5"));
+        assert_eq!(parsed_bar_token("AAPL 60 MSFT"), Some("60"));
+        assert_eq!(without_parsed_bar_tokens("AAPL 60 MSFT"), "AAPL MSFT");
+        assert_eq!(parsed_bar_token("2m"), None);
+        assert_eq!(letter_bar_token("2m"), Some("2m"));
+        assert_eq!(parsed_bar_token("NVDA 4h"), Some("4h"));
+        assert_eq!(without_parsed_bar_tokens("NVDA 4h"), "NVDA");
+        assert_eq!(without_letter_bar_tokens("AAPL 15m MSFT"), "AAPL MSFT");
     }
 }
