@@ -471,6 +471,105 @@ pub fn verified_profile(tf: Timeframe, bars: &[Bar], bins: usize) -> Vec<VolumeB
     volume_profile(tf, &kept, bins)
 }
 
+/// Stopping share for the value area. The area can contain more once a whole bin is included.
+pub const VALUE_AREA: f64 = 0.70;
+
+/// High and low of the prices that hold the bulk of one session's verified volume.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ValueArea {
+    pub high: f64,
+    pub low: f64,
+    /// Included volume divided by the session total, from 0 to 1.
+    pub share: f64,
+}
+
+/// Value area of the latest regular session, verified bars only.
+///
+/// Starts at the heaviest bin (the higher bin when two tie) and adds the heavier
+/// neighboring bin that has volume until [`VALUE_AREA`] of the session is inside.
+/// A tie between neighbors adds the lower bin only. Empty bins are not steps.
+/// `None` when that session has no verified positive volume.
+pub fn value_area(tf: Timeframe, bars: &[Bar], bins: usize) -> Option<ValueArea> {
+    let kept: Vec<Bar> = bars.iter().copied().filter(|b| b.provenance.is_verified()).collect();
+    let session: Vec<&Bar> = latest_regular(tf, &kept)
+        .into_iter()
+        .filter(|b| b.high.is_finite() && b.low.is_finite() && b.volume.is_finite() && b.volume > 0.0)
+        .collect();
+    if session.is_empty() {
+        return None;
+    }
+    let lo = session.iter().map(|b| b.low).fold(f64::INFINITY, f64::min);
+    let hi = session.iter().map(|b| b.high).fold(f64::NEG_INFINITY, f64::max);
+    if !lo.is_finite() || !hi.is_finite() || hi < lo {
+        return None;
+    }
+    let mut total = 0.0;
+    if (hi - lo).abs() < 1e-9 {
+        for b in &session {
+            if b.hlc3().is_finite() {
+                total += b.volume;
+            }
+        }
+        return (total.is_finite() && total > 0.0).then_some(ValueArea { high: lo, low: lo, share: 1.0 });
+    }
+    let slots = bins.clamp(1, 48);
+    let mut acc = vec![0.0; slots];
+    let width = (hi - lo) / slots as f64;
+    for b in &session {
+        let px = b.hlc3();
+        if !px.is_finite() {
+            continue;
+        }
+        let mut i = ((px - lo) / width).floor() as usize;
+        if i >= slots {
+            i = slots - 1;
+        }
+        acc[i] += b.volume;
+        total += b.volume;
+    }
+    if !(total.is_finite() && total > 0.0) {
+        return None;
+    }
+    let poc = acc
+        .iter()
+        .enumerate()
+        .filter(|(_, v)| **v > 0.0)
+        .max_by(|(i, a), (j, b)| a.total_cmp(b).then(i.cmp(j)))
+        .map(|(i, _)| i)?;
+    let filled: Vec<usize> = acc.iter().enumerate().filter(|(_, v)| **v > 0.0).map(|(i, _)| i).collect();
+    let start = filled.iter().position(|&i| i == poc)?;
+    let (mut left, mut right) = (start, start);
+    let mut cum = acc[poc];
+    let target = total * VALUE_AREA;
+    while cum < target {
+        let down = (left > 0).then(|| filled[left - 1]);
+        let up = (right + 1 < filled.len()).then(|| filled[right + 1]);
+        match (down, up) {
+            (None, None) => break,
+            (Some(i), None) => {
+                cum += acc[i];
+                left -= 1;
+            }
+            (None, Some(i)) => {
+                cum += acc[i];
+                right += 1;
+            }
+            (Some(d), Some(u)) => {
+                if acc[u] > acc[d] {
+                    cum += acc[u];
+                    right += 1;
+                } else {
+                    cum += acc[d];
+                    left -= 1;
+                }
+            }
+        }
+    }
+    let low_i = filled[left];
+    let high_i = filled[right];
+    Some(ValueArea { low: lo + low_i as f64 * width, high: lo + (high_i as f64 + 1.0) * width, share: cum / total })
+}
+
 /// Derived intraday stats. Every field stays empty when the inputs do not support it.
 #[derive(Debug, Clone, PartialEq)]
 pub struct BarStats {
@@ -894,6 +993,87 @@ mod tests {
         assert!(verified_profile(Timeframe::H4, &bars, 24).is_empty());
         let flat = [bar(2026, 3, 9, 9, 30, 11.0, 11.0, 11.0, 0.0, Provenance::Real)];
         assert!(verified_profile(Timeframe::M5, &flat, 24).is_empty());
+    }
+
+    #[test]
+    fn value_area_stops_at_the_heavy_bin_and_expands_toward_volume() {
+        let bar = |y, m, d, h, min, high, low, close, volume, provenance| {
+            Bar::new(wall(y, m, d, h, min), close, high, low, close, volume).with_provenance(provenance)
+        };
+        let monday = [
+            bar(2026, 3, 9, 9, 30, 12.0, 10.0, 11.0, 100.0, Provenance::Real),
+            bar(2026, 3, 9, 9, 35, 20.0, 18.0, 19.0, 300.0, Provenance::Real),
+        ];
+        let mut bars = vec![
+            bar(2026, 3, 6, 9, 30, 30.0, 1.0, 15.0, 5_000.0, Provenance::Real),
+            bar(2026, 3, 9, 8, 0, 40.0, 1.0, 20.0, 9_000.0, Provenance::Real),
+        ];
+        bars.extend(monday);
+        let area = value_area(Timeframe::M5, &bars, 24).unwrap();
+        let width = 10.0 / 24.0;
+        assert!((area.low - (10.0 + 21.0 * width)).abs() < 1e-9);
+        assert!((area.high - (10.0 + 22.0 * width)).abs() < 1e-9);
+        assert!((area.share - 0.75).abs() < 1e-9);
+        let light = 10.0 + 2.5 * width;
+        assert!(light < area.low, "the light bin stays outside the value area");
+        assert_eq!(value_area(Timeframe::M5, &monday, 24), Some(area));
+
+        let mut cached = monday;
+        cached[0].provenance = Provenance::Cached;
+        cached[1].provenance = Provenance::Cached;
+        assert_eq!(value_area(Timeframe::M5, &cached, 24), Some(area));
+
+        let sample: Vec<_> = monday
+            .into_iter()
+            .map(|mut b| {
+                b.provenance = Provenance::Sample;
+                b
+            })
+            .collect();
+        assert!(value_area(Timeframe::M5, &sample, 24).is_none());
+        assert!(value_area(Timeframe::D1, &bars, 24).is_none());
+        assert!(value_area(Timeframe::H4, &bars, 24).is_none());
+        let flat = [bar(2026, 3, 9, 9, 30, 11.0, 11.0, 11.0, 0.0, Provenance::Real)];
+        assert!(value_area(Timeframe::M5, &flat, 24).is_none());
+        let same = [bar(2026, 3, 9, 9, 30, 11.0, 11.0, 11.0, 40.0, Provenance::Real)];
+        let pinned = value_area(Timeframe::M5, &same, 24).unwrap();
+        assert!((pinned.high - 11.0).abs() < 1e-9 && (pinned.low - 11.0).abs() < 1e-9);
+        assert!((pinned.share - 1.0).abs() < 1e-9);
+
+        // Bins 0/1/3 have volume; bin 2 is empty. The heavier neighbor is below the POC.
+        let spread = [
+            bar(2026, 3, 9, 9, 30, 12.0, 10.0, 10.7, 40.0, Provenance::Real),
+            bar(2026, 3, 9, 9, 35, 14.0, 12.0, 13.0, 100.0, Provenance::Real),
+            bar(2026, 3, 9, 9, 40, 18.0, 16.0, 17.2, 30.0, Provenance::Real),
+        ];
+        let grown = value_area(Timeframe::M5, &spread, 4).unwrap();
+        assert!((grown.low - 10.0).abs() < 1e-9);
+        assert!((grown.high - 14.0).abs() < 1e-9);
+        assert!((grown.share - 140.0 / 170.0).abs() < 1e-9);
+
+        // Equal neighbors: expand one bin down and leave the upper bin out.
+        let tied = [
+            bar(2026, 3, 9, 9, 30, 12.0, 10.0, 11.0, 50.0, Provenance::Real),
+            bar(2026, 3, 9, 9, 35, 14.0, 12.0, 13.0, 100.0, Provenance::Real),
+            bar(2026, 3, 9, 9, 40, 16.0, 14.0, 15.0, 50.0, Provenance::Real),
+        ];
+        let down = value_area(Timeframe::M5, &tied, 3).unwrap();
+        assert!((down.low - 10.0).abs() < 1e-9);
+        assert!((down.high - 14.0).abs() < 1e-9);
+        assert!((down.share - 0.75).abs() < 1e-9);
+        assert!((down.high - 16.0).abs() > 1.0);
+
+        // Four equal bins: the point of control is the highest, so the area grows downward.
+        let even = [
+            bar(2026, 3, 9, 9, 30, 12.0, 10.0, 11.0, 25.0, Provenance::Real),
+            bar(2026, 3, 9, 9, 35, 14.0, 12.0, 13.0, 25.0, Provenance::Real),
+            bar(2026, 3, 9, 9, 40, 16.0, 14.0, 15.0, 25.0, Provenance::Real),
+            bar(2026, 3, 9, 9, 45, 18.0, 16.0, 17.0, 25.0, Provenance::Real),
+        ];
+        let from_top = value_area(Timeframe::M5, &even, 4).unwrap();
+        assert!((from_top.low - 12.0).abs() < 1e-9);
+        assert!((from_top.high - 18.0).abs() < 1e-9);
+        assert!((from_top.share - 0.75).abs() < 1e-9);
     }
 
     #[test]
