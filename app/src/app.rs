@@ -1111,7 +1111,8 @@ impl TerminalApp {
             Function::Scan(name) => {
                 self.open_panel(PaneKind::Research(Box::new(research::ResearchPane::new(Some(name)))))
             }
-            Function::Watchlist => self.open_panel(PaneKind::Watchlist),
+            Function::Watchlist => self.open_watchlist(false),
+            Function::Earnings => self.open_watchlist(true),
             Function::WatchCommand(line) => self.watch_command(&line),
             Function::Layout(arg) => self.layout_command(&arg),
             Function::Layouts => {
@@ -1120,6 +1121,7 @@ impl TerminalApp {
                 self.status = format!("Layouts: {}", self.layout_names.join(" · "));
             }
             Function::NewPanel(spec) => {
+                self.apply_watchlist_spec(&spec);
                 let kind = self.panel_from_spec(&spec, symbol.as_deref());
                 match kind {
                     Some(kind) => {
@@ -1134,15 +1136,18 @@ impl TerminalApp {
                     }
                 }
             }
-            Function::Split { down, panel } => match self.panel_from_spec(&panel, symbol.as_deref()) {
-                Some(kind) => {
-                    let target = self.focused_visible();
-                    let id = self.new_pane(kind);
-                    let zone = if down { crate::dock::Zone::Bottom } else { crate::dock::Zone::Right };
-                    self.dock_pane(id, target, zone);
+            Function::Split { down, panel } => {
+                self.apply_watchlist_spec(&panel);
+                match self.panel_from_spec(&panel, symbol.as_deref()) {
+                    Some(kind) => {
+                        let target = self.focused_visible();
+                        let id = self.new_pane(kind);
+                        let zone = if down { crate::dock::Zone::Bottom } else { crate::dock::Zone::Right };
+                        self.dock_pane(id, target, zone);
+                    }
+                    None => self.status = format!("Unknown panel {panel:?}"),
                 }
-                None => self.status = format!("Unknown panel {panel:?}"),
-            },
+            }
             Function::ClosePane => self.close_pane(self.focus),
             Function::PopOut => self.pop_out(self.focus),
             Function::Link(link) => {
