@@ -213,6 +213,25 @@ pub fn session_vwap(tf: Timeframe, bars: &[Bar]) -> Option<f64> {
     (vol > 0.0 && pv.is_finite()).then_some(pv / vol)
 }
 
+/// Last regular-session print and its session VWAP. `None` when that session has no VWAP.
+/// The close is the last regular bar, so a pre-market print cannot stand in for it.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SessionPrint {
+    pub close: f64,
+    pub vwap: f64,
+    pub bar_ts: i64,
+}
+
+/// How many 5-minute bars a VWAP alert reads. One cash session is 78 bars; this covers that session.
+pub const VWAP_ALERT_BARS: usize = 120;
+
+pub fn session_print(tf: Timeframe, bars: &[Bar]) -> Option<SessionPrint> {
+    let session = latest_regular(tf, bars);
+    let last = *session.last()?;
+    let vwap = session_vwap(tf, bars)?;
+    (last.close.is_finite() && last.close > 0.0).then_some(SessionPrint { close: last.close, vwap, bar_ts: last.ts })
+}
+
 /// Today's regular-session volume through the last bar's offset from the open,
 /// divided by the mean of earlier sessions at the same offset.
 /// `None` until a prior session has volume at that offset.
@@ -569,6 +588,10 @@ mod tests {
         let later = (22.0 + 18.0 + 21.0) / 3.0;
         let vwap = session_vwap(Timeframe::M5, &bars).unwrap();
         assert!((vwap - (typical * 300.0 + later * 100.0) / 400.0).abs() < 1e-9);
+        let print = session_print(Timeframe::M5, &bars).unwrap();
+        assert_eq!(print.bar_ts, wall(2026, 3, 9, 9, 35));
+        assert!((print.close - 21.0).abs() < 1e-9);
+        assert!((print.vwap - vwap).abs() < 1e-9);
         // Prior session at this offset is 200; today is 400.
         assert!((relative_volume(Timeframe::M5, &bars).unwrap() - 2.0).abs() < 1e-9);
         let only_today = &bars[2..4];

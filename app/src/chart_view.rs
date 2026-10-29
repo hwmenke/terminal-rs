@@ -184,7 +184,7 @@ pub struct ChartState {
     markers: Vec<Trade>,
     news: Vec<tr_data::NewsItem>,
     news_stale: bool,
-    /// Enabled price-level rules for this symbol (not persisted; filled from the alert store).
+    /// Enabled price-level rules for this symbol. VWAP rules are not drawn; the level moves.
     alert_rules: Vec<tr_data::price_alerts::AlertRule>,
     /// Calendar dates (`YYYY-MM-DD`) with a journal setup or note for this symbol.
     journal_marks: Vec<String>,
@@ -1535,7 +1535,7 @@ impl ChartState {
             ui.close();
         }
         ui.separator();
-        ui.label(RichText::new("Price / setup alerts").small().color(muted()));
+        ui.label(RichText::new("Price / VWAP / setup alerts").small().color(muted()));
         if let Some(last) = self.bars.last() {
             let px = last.close;
             if ui
@@ -1548,6 +1548,22 @@ impl ChartState {
             }
             if ui.button(format!("Alert below last close ({px:.2})")).clicked() {
                 self.actions.push(Action::Command(format!("{} ALERT BELOW {px}", self.symbol)));
+                ui.close();
+            }
+        }
+        if matches!(self.sec.class, AssetClass::Equity | AssetClass::Etf | AssetClass::Index) {
+            if ui
+                .button("Alert above session VWAP")
+                .on_hover_text(
+                    "Fires when a verified 5-minute close crosses above this session's VWAP. A stale or closed bar does not fire.",
+                )
+                .clicked()
+            {
+                self.actions.push(Action::Command(format!("{} ALERT VWAP", self.symbol)));
+                ui.close();
+            }
+            if ui.button("Alert below session VWAP").clicked() {
+                self.actions.push(Action::Command(format!("{} ALERT VWAP BELOW", self.symbol)));
                 ui.close();
             }
         }
@@ -2285,6 +2301,58 @@ mod tests {
         assert!(chart.built.is_empty());
         assert!(chart.indicators.is_empty());
         chart_frame(&ctx, &mut chart, &worker, vec![]);
+    }
+
+    fn contains_text(shapes: &[egui::epaint::ClippedShape], needle: &str) -> bool {
+        fn find(shape: &egui::Shape, needle: &str) -> bool {
+            match shape {
+                egui::Shape::Text(t) if t.galley.job.text == needle => true,
+                egui::Shape::Vec(v) => v.iter().any(|s| find(s, needle)),
+                _ => false,
+            }
+        }
+        shapes.iter().any(|s| find(&s.shape, needle))
+    }
+
+    fn open_plot_menu(ctx: &egui::Context, chart: &mut ChartState, worker: &Worker) -> egui::FullOutput {
+        let bars = Arc::new(tr_core::sample::generate(&chart.symbol, chart.tf, 80, 1_790_000_000));
+        chart.load(worker);
+        chart.on_history(chart.generation, bars.clone(), SeriesGpu::build(&bars), 0, false, true, false, worker);
+        chart_frame(ctx, chart, worker, vec![]);
+        let pos = pos2(400.0, 180.0);
+        chart_frame(
+            ctx,
+            chart,
+            worker,
+            vec![egui::Event::PointerMoved(pos), pointer(pos, egui::PointerButton::Secondary, true)],
+        );
+        chart_frame(ctx, chart, worker, vec![pointer(pos, egui::PointerButton::Secondary, false)]);
+        chart_frame(ctx, chart, worker, vec![])
+    }
+
+    #[test]
+    fn equity_context_menu_sets_a_session_vwap_alert_and_fx_does_not_offer_one() {
+        let ctx = egui::Context::default();
+        let (worker, _) = Worker::test_channel();
+        let mut chart = ChartState::new(1, "AAPL", Timeframe::D1);
+        let output = open_plot_menu(&ctx, &mut chart, &worker);
+        assert!(contains_text(&output.shapes, "Alert above session VWAP"));
+        assert!(contains_text(&output.shapes, "Alert below session VWAP"));
+        let pos = text_position(&output.shapes, "Alert above session VWAP");
+        chart_frame(
+            &ctx,
+            &mut chart,
+            &worker,
+            vec![egui::Event::PointerMoved(pos), pointer(pos, egui::PointerButton::Primary, true)],
+        );
+        chart_frame(&ctx, &mut chart, &worker, vec![pointer(pos, egui::PointerButton::Primary, false)]);
+        assert!(chart.actions.iter().any(|a| matches!(a, Action::Command(c) if c == "AAPL US Equity ALERT VWAP")));
+
+        let mut fx = ChartState::new(2, "EURUSD", Timeframe::D1);
+        let output = open_plot_menu(&ctx, &mut fx, &worker);
+        assert_eq!(fx.sec.class, AssetClass::Fx);
+        assert!(!contains_text(&output.shapes, "Alert above session VWAP"));
+        assert!(!contains_text(&output.shapes, "Alert below session VWAP"));
     }
 
     #[test]
