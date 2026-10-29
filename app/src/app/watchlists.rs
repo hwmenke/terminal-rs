@@ -151,6 +151,8 @@ pub struct UiState {
     pub delete: Option<String>,
     pub edit: Option<String>, // empty = new group
     pub name: String,
+    /// Quotes list, or the earnings calendar for the selected group.
+    pub calendar: bool,
 }
 
 /// A single display path used by the panel and tested for provenance/freshness.
@@ -440,11 +442,20 @@ impl TerminalApp {
                 self.link_watch_group(id, Some(self.watch_ui.selected_group.clone()));
                 self.status = format!("Chart linked to {}", self.watch_ui.selected_group);
             }
+            if ui.selectable_label(!self.watch_ui.calendar, "Quotes").clicked() {
+                self.watch_ui.calendar = false;
+            }
+            if ui.selectable_label(self.watch_ui.calendar, "Earnings").clicked() {
+                self.watch_ui.calendar = true;
+            }
         });
+        let group = self.watch_ui.selected_group.clone();
+        if self.watch_ui.calendar {
+            return self.earnings_calendar(ui, &group);
+        }
         ui.label("Security · Last · Change % · Provenance · Freshness");
         ui.small("w: save symbol to group · W: save to last-used · right-click to remove");
         let mut remove = None;
-        let group = self.watch_ui.selected_group.clone();
         if let Some(g) = self.watchlists.group(&group) {
             egui::ScrollArea::both().show_rows(ui, 22.0, g.members.len(), |ui, range| {
                 for m in &g.members[range] {
@@ -513,6 +524,100 @@ impl TerminalApp {
         }
         out
     }
+
+    /// Earnings dates for the selected group. Dates come from quotes already in hand.
+    fn earnings_calendar(&mut self, ui: &mut egui::Ui, group: &str) -> Vec<Action> {
+        let mut out = Vec::new();
+        let Some(g) = self.watchlists.group(group) else {
+            return out;
+        };
+        if g.members.is_empty() {
+            ui.label("Empty group · WL ADD <group> <symbol…>");
+            return out;
+        }
+        let archive: HashMap<String, bool> =
+            g.members.iter().map(|m| (m.symbol.clone(), !m.origins.is_empty())).collect();
+        let listed: Vec<(String, String)> = g
+            .members
+            .iter()
+            .map(|m| {
+                let ticker = tr_data::security(&m.symbol).ticker;
+                (m.symbol.clone(), ticker)
+            })
+            .collect();
+        let names: Vec<tr_data::earnings::Listed<'_>> =
+            listed.iter().map(|(symbol, ticker)| tr_data::earnings::Listed { symbol, ticker }).collect();
+        let cal = tr_data::earnings::calendar(&names, &self.quotes, Utc::now().timestamp());
+        ui.label(
+            RichText::new(format!("Earnings · {group} · {}", cal.summary())).monospace().color(crate::theme::text()),
+        );
+        ui.small("Dates are the New York calendar dates on the quote. A blank row was not given a date.");
+        let mut row = |ui: &mut egui::Ui, symbol: &str, line: String| {
+            let response = ui.selectable_label(false, RichText::new(line).monospace().color(crate::theme::text()));
+            if response.clicked() {
+                let archive = archive.get(symbol).copied().unwrap_or(false);
+                out.push(Action::WatchChart(group.to_string(), symbol.to_string(), archive));
+            }
+            response.context_menu(|ui| {
+                if ui.button("Open chart").clicked() {
+                    let archive = archive.get(symbol).copied().unwrap_or(false);
+                    out.push(Action::WatchChart(group.to_string(), symbol.to_string(), archive));
+                    ui.close();
+                }
+            });
+        };
+        egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+            for (title, days) in [(tr_data::earnings::AHEAD, &cal.ahead), (tr_data::earnings::PASSED, &cal.passed)] {
+                if days.is_empty() {
+                    continue;
+                }
+                ui.add_space(4.0);
+                ui.label(RichText::new(title).monospace().color(crate::theme::amber()));
+                for day in days {
+                    ui.label(RichText::new(day.heading()).monospace().color(crate::theme::muted()));
+                    for r in &day.rows {
+                        row(ui, &r.symbol, r.line());
+                    }
+                }
+            }
+            if !cal.undated.is_empty() {
+                ui.add_space(4.0);
+                ui.label(RichText::new(tr_data::earnings::UNDATED).monospace().color(crate::theme::amber()));
+                for h in &cal.undated {
+                    row(ui, &h.symbol, h.line());
+                }
+            }
+            if !cal.awaiting.is_empty() {
+                ui.add_space(4.0);
+                ui.label(RichText::new(tr_data::earnings::AWAITING).monospace().color(crate::theme::amber()));
+                for h in &cal.awaiting {
+                    row(ui, &h.symbol, h.line());
+                }
+            }
+        });
+        out
+    }
+
+    pub(super) fn open_watchlist(&mut self, calendar: bool) {
+        if self.watchlists.index(&self.watch_ui.selected_group).is_none() {
+            self.watch_ui.selected_group = self.watchlists.last_used.clone();
+        }
+        self.watch_ui.calendar = calendar;
+        self.open_panel(PaneKind::Watchlist);
+        let group = &self.watch_ui.selected_group;
+        self.status = if calendar { format!("Earnings calendar · {group}") } else { "Watchlist".into() };
+    }
+
+    /// `EARNINGS` turns the watchlist calendar on. `WL` turns it off.
+    pub(super) fn apply_watchlist_spec(&mut self, spec: &str) {
+        let head = spec.split_whitespace().next().unwrap_or("").to_ascii_uppercase();
+        match head.as_str() {
+            "EARN" | "EARNINGS" | "ECAL" => self.watch_ui.calendar = true,
+            "WL" | "WATCHLIST" | "W" | "MON" | "WATCH" => self.watch_ui.calendar = false,
+            _ => {}
+        }
+    }
+
     pub(super) fn watchlist_dialogs(&mut self, ctx: &egui::Context) {
         if let Some(item) = self.watch_ui.picker.clone() {
             let n = self.watchlists.groups.len();
@@ -1116,6 +1221,62 @@ mod tests {
         assert_eq!(app.panes[0].kind.symbol(), Some("NVDA US Equity"));
         assert!(matches!(&app.panes[0].kind, PaneKind::Chart(c) if c.watch_group.as_deref() == Some("Default")));
     }
+    #[test]
+    fn earnings_calendar_paints_provider_dates_and_opens_the_chart() {
+        let mut app = test_app();
+        let chart = app.new_pane(PaneKind::Chart(Box::new(ChartState::new(0, "SPY", tr_core::Timeframe::D1))));
+        app.new_pane(PaneKind::Watchlist);
+        app.watch_ui.active_chart = Some(chart);
+        app.focus_cmd = false;
+        app.watchlists = Watchlists::migrate(&[]);
+        app.watchlists.add("Default", Member::new("AAPL")).unwrap();
+        app.watchlists.add("Default", Member::new("AMD")).unwrap();
+        app.watchlists.add("Default", Member::new("TSLA")).unwrap();
+        let stamp =
+            tr_core::ny::to_utc(chrono::NaiveDate::from_ymd_opt(2026, 10, 29).unwrap().and_hms_opt(16, 0, 0).unwrap());
+        let key = tr_data::security("AAPL").key();
+        app.quotes.insert(
+            key.clone(),
+            tr_data::Quote {
+                symbol: key,
+                provenance: Provenance::Real,
+                last: 10.0,
+                prev_close: 9.0,
+                ts: 1,
+                spark: vec![],
+                stats: tr_data::QuoteStats { earnings_ts: Some(stamp), ..tr_data::QuoteStats::default() },
+            },
+        );
+        let amd = tr_data::security("AMD").key();
+        app.quotes.insert(
+            amd.clone(),
+            tr_data::Quote {
+                symbol: amd,
+                provenance: Provenance::Sample,
+                last: 10.0,
+                prev_close: 9.0,
+                ts: 1,
+                spark: vec![],
+                stats: tr_data::QuoteStats::default(),
+            },
+        );
+        app.execute("EARNINGS");
+        app.focus_cmd = false;
+        assert!(app.watch_ui.calendar);
+        assert!(app.status.starts_with("Earnings calendar"));
+        let ctx = egui::Context::default();
+        let shapes = frame(&ctx, &mut app, vec![]);
+        text_position(&shapes, "ERN 2026-10-29");
+        text_position(&shapes, "Ahead");
+        text_position(&shapes, "no earnings date on the quote");
+        text_position(&shapes, "no quote yet");
+        let pos = text_position(&shapes, "AAPL   ERN 2026-10-29");
+        click(&ctx, &mut app, pos);
+        assert_eq!(app.panes[0].kind.symbol(), Some("AAPL US Equity"));
+        app.execute("WL");
+        assert!(!app.watch_ui.calendar);
+    }
+
     #[test]
     fn quoted_group_commands_show_remove_and_preserve_source() {
         let (mut app, _, _, _) = fixture();

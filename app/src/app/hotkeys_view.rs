@@ -272,6 +272,10 @@ impl TerminalApp {
                     (&["UNALERT AAPL"], "Remove price/setup alerts for a name"),
                     (&["WL", "WL ADD SOLUSD CRNCY"], "Watchlist"),
                     (
+                        &["EARNINGS", "EARN", "ECAL"],
+                        "Earnings calendar for the selected watchlist: provider dates only, click a row to open the chart",
+                    ),
+                    (
                         &["DESK", "AAPL DESK", "NEW DESK"],
                         "PM Desk: watchlist leaders, group performance, position size (not PORT)",
                     ),

@@ -40,6 +40,7 @@ const COMMANDS: &[(&str, &str, &str, Option<Action>)] = &[
     ("UNALERT", "Remove price/setup alerts: UNALERT <ticker>", "price setup remove", None),
     ("REFRESH", "", "congress disclosures sync", Some(Action::Refresh)),
     ("WL", "", "watchlist monitor", Some(Action::Watchlist)),
+    ("EARNINGS", "Earnings dates across the selected watchlist", "calendar ern report quote", None),
     ("DESK", "PM Desk: watchlist leaders and position size", "pm risk planner watchlist rank", Some(Action::Desk)),
     ("PMDESK", "PM Desk (alias)", "pm risk planner", None),
     ("RISK", "PM Desk (alias)", "pm position size planner", None),

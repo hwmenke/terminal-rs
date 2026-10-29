@@ -241,6 +241,8 @@ pub enum Function {
     Universe,
     Scan(String),
     Watchlist,
+    /// Earnings dates for the selected watchlist group (`EARNINGS`).
+    Earnings,
     WatchCommand(String),
     /// `LAYOUT 1|2|2H|3|4|6` preset, `LAYOUT <name>` switch, or a layout subcommand
     /// (`SAVE`, `SAVEAS`, `NEW`, `RENAME`, `DUP`, `DEL`, `EXPORT`, `IMPORT`).
@@ -439,6 +441,7 @@ fn parse_function(head: &str, rest: &[&str]) -> Option<Function> {
         "ALERT" => Function::SetPriceAlert(parse_alert_kind(rest)?),
         "UNALERT" | "RMALERT" | "DELALERT" => Function::ClearPriceAlert(joined()),
         "REFRESH" | "SYNC" => Function::Refresh,
+        "EARN" | "EARNINGS" | "ECAL" => Function::Earnings,
         "W" | "WL" | "WATCH" | "WATCHLIST" | "MON" => {
             if rest.is_empty() {
                 Function::Watchlist
@@ -636,6 +639,7 @@ fn describe(f: &Function) -> String {
         Function::Universe => "Browse Whats-News archive coverage".into(),
         Function::Scan(name) => format!("Scan Whats-News archive: {name}"),
         Function::Watchlist => "Watchlist".into(),
+        Function::Earnings => "Earnings calendar for the selected watchlist".into(),
         Function::WatchCommand(s) => format!("Watchlists: {s}"),
         Function::Layout(l) if l.trim().is_empty() => "Saved layouts".into(),
         Function::Layout(l) => format!("Layout {l}"),
@@ -962,6 +966,9 @@ mod tests {
         assert_eq!(parse("AAPL CN"), Some(Command::SymbolFunction("AAPL US Equity".into(), Function::News)));
         assert_eq!(parse("NEWS"), Some(Command::Function(Function::News)));
         assert_eq!(parse("ALERTS"), Some(Command::Function(Function::Alerts)));
+        assert_eq!(parse("EARNINGS"), Some(Command::Function(Function::Earnings)));
+        assert_eq!(parse("ECAL"), Some(Command::Function(Function::Earnings)));
+        assert_eq!(parse("EARN"), Some(Command::Function(Function::Earnings)));
         assert_eq!(parse("ALERT"), Some(Command::Function(Function::Alerts)));
         assert_eq!(
             parse("AAPL ALERT 150"),

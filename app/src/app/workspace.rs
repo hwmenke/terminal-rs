@@ -817,7 +817,7 @@ impl TerminalApp {
             "SCAN" => PaneKind::Research(Box::new(super::research::ResearchPane::new(Some(
                 words[1..].join(" ").to_ascii_uppercase(),
             )))),
-            "WL" | "WATCHLIST" | "W" => PaneKind::Watchlist,
+            "WL" | "WATCHLIST" | "W" | "EARN" | "EARNINGS" | "ECAL" => PaneKind::Watchlist,
             "TOP" => PaneKind::News(Box::new(NewsPane::top())),
             "NEWS" | "N" | "CN" => PaneKind::News(Box::new(match current {
                 Some(s) if head == "CN" => NewsPane::for_symbol(s),

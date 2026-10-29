@@ -16,6 +16,7 @@ pub mod alpaca;
 pub mod backtest;
 pub mod cache;
 pub mod crypto;
+pub mod earnings;
 pub mod history;
 pub mod intraday;
 pub mod journal;
@@ -94,11 +95,11 @@ impl QuoteStats {
         v.filter(|t| *t > 0)
     }
 
-    /// New York calendar date of an earnings instant the provider sent.
+    /// New York dates of an earnings instant the provider sent.
     /// A start and end on different dates is the window; a single instant is one date.
     /// Nothing is filled in when the payload omitted the field.
-    pub fn earnings_label(&self) -> Option<String> {
-        let date = |ts: i64| tr_core::ny::civil(ts).date().format("%Y-%m-%d").to_string();
+    pub fn earnings_window(&self) -> Option<(chrono::NaiveDate, chrono::NaiveDate)> {
+        let date = |ts: i64| tr_core::ny::civil(ts).date();
         let shown = match (self.earnings_start.filter(|t| *t > 0), self.earnings_end.filter(|t| *t > 0)) {
             (Some(start), Some(end)) => Some((start.min(end), start.max(end))),
             (Some(start), None) => Some((start, start)),
@@ -106,7 +107,18 @@ impl QuoteStats {
             (None, None) => self.earnings_ts.filter(|t| *t > 0).map(|t| (t, t)),
         }?;
         let (left, right) = (date(shown.0), date(shown.1));
-        if left == right { Some(format!("ERN {left}")) } else { Some(format!("ERN {left}–{right}")) }
+        if left <= right { Some((left, right)) } else { Some((right, left)) }
+    }
+
+    /// `ERN YYYY-MM-DD`, or a window when the provider's start and end fall on different New York dates.
+    pub fn earnings_label(&self) -> Option<String> {
+        let (left, right) = self.earnings_window()?;
+        let start = left.format("%Y-%m-%d");
+        if left == right {
+            Some(format!("ERN {start}"))
+        } else {
+            Some(format!("ERN {start}–{}", right.format("%Y-%m-%d")))
+        }
     }
 }
 
