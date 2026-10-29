@@ -232,9 +232,9 @@ pub enum Function {
     Track(String),
     Untrack(String),
     Alerts,
-    /// `AAPL ALERT 150` / `AAPL ALERT SETUP NEAR_HIGH`.
+    /// `AAPL ALERT 150` / `AAPL ALERT VWAP` / `AAPL ALERT SETUP NEAR_HIGH`.
     SetPriceAlert(tr_data::price_alerts::AlertKind),
-    /// `UNALERT` / `UNALERT AAPL` — drop price/setup rules.
+    /// `UNALERT` / `UNALERT AAPL` — drop price, VWAP, and setup rules.
     ClearPriceAlert(String),
     Refresh,
     History(String),
@@ -365,7 +365,7 @@ fn split_note_args(rest: &[&str]) -> (String, String) {
     }
 }
 
-/// `150` · `ABOVE 150` · `BELOW 150` · `NEAR_HIGH` · `SETUP NEAR_HIGH EXIT`.
+/// `150` · `ABOVE 150` · `BELOW 150` · `VWAP` · `VWAP BELOW` · `NEAR_HIGH` · `SETUP NEAR_HIGH EXIT`.
 fn parse_alert_kind(rest: &[&str]) -> Option<tr_data::price_alerts::AlertKind> {
     use tr_data::price_alerts::{AlertKind, PriceSide, SetupChange};
     if rest.is_empty() {
@@ -381,6 +381,14 @@ fn parse_alert_kind(rest: &[&str]) -> Option<tr_data::price_alerts::AlertKind> {
     if first == "SETUP" {
         let setup = parse_setup_name(up.get(1)?)?;
         return Some(AlertKind::Setup { setup, change: change(2) });
+    }
+    if first == "VWAP" {
+        let side = match up.get(1).map(String::as_str) {
+            Some("BELOW" | "UNDER" | "LT") => PriceSide::Below,
+            Some("ABOVE" | "OVER" | "GT") | None => PriceSide::Above,
+            Some(_) => return None,
+        };
+        return Some(AlertKind::Vwap { side });
     }
     if matches!(first, "ABOVE" | "OVER" | "GT") {
         let level: f64 = rest.get(1)?.parse().ok()?;
@@ -630,7 +638,7 @@ fn describe(f: &Function) -> String {
         Function::Politician(n) => format!("Politician profile: {n}"),
         Function::Track(n) => format!("Track {n} (alert on new filings)"),
         Function::Untrack(n) => format!("Stop tracking {n}"),
-        Function::Alerts => "Alerts: price levels, setup changes, and tracked filings".into(),
+        Function::Alerts => "Alerts: price levels, session VWAP crosses, setup changes, and tracked filings".into(),
         Function::SetPriceAlert(kind) => format!("Watch {}", kind.label()),
         Function::ClearPriceAlert(q) if q.is_empty() => "Remove price/setup alerts for the focused name".into(),
         Function::ClearPriceAlert(q) => format!("Remove price/setup alerts for {q}"),
@@ -990,6 +998,39 @@ mod tests {
                 })
             ))
         );
+        assert_eq!(
+            parse("AAPL ALERT VWAP"),
+            Some(Command::SymbolFunction(
+                "AAPL US Equity".into(),
+                Function::SetPriceAlert(tr_data::price_alerts::AlertKind::Vwap {
+                    side: tr_data::price_alerts::PriceSide::Above,
+                })
+            ))
+        );
+        assert_eq!(
+            parse("AAPL US Equity ALERT VWAP BELOW"),
+            Some(Command::SymbolFunction(
+                "AAPL US Equity".into(),
+                Function::SetPriceAlert(tr_data::price_alerts::AlertKind::Vwap {
+                    side: tr_data::price_alerts::PriceSide::Below,
+                })
+            ))
+        );
+        assert_eq!(
+            parse("AAPL ALERT VWAP ABOVE"),
+            Some(Command::SymbolFunction(
+                "AAPL US Equity".into(),
+                Function::SetPriceAlert(tr_data::price_alerts::AlertKind::Vwap {
+                    side: tr_data::price_alerts::PriceSide::Above,
+                })
+            ))
+        );
+        assert_eq!(parse("AAPL ALERT VWAP NOPE"), None);
+        assert!(hint("AAPL ALERT VWAP").contains("above session VWAP"));
+        assert!(matches!(
+            parse("AAPL VWAP"),
+            Some(Command::SymbolFunction(_, Function::Indicator(ref spec))) if spec.code == "VWAP"
+        ));
         assert_eq!(
             parse("NVDA ALERT SETUP NEAR_HIGH EXIT"),
             Some(Command::SymbolFunction(

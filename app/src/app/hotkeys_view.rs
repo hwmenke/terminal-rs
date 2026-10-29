@@ -266,8 +266,8 @@ impl TerminalApp {
                     (&["CONG", "NVDA CONG"], "Congress trades feed / who traded a ticker"),
                     (&["POL", "POL PELOSI", "TRACK PELOSI"], "Politicians, profiles and alerts"),
                     (
-                        &["ALERTS", "AAPL ALERT 150", "NVDA ALERT SETUP NEAR_HIGH"],
-                        "Price/setup alerts (timestamped; click a row to open the chart)",
+                        &["ALERTS", "AAPL ALERT 150", "AAPL ALERT VWAP", "NVDA ALERT SETUP NEAR_HIGH"],
+                        "Price, session-VWAP, and setup alerts (timestamped; click a row to open the chart)",
                     ),
                     (&["UNALERT AAPL"], "Remove price/setup alerts for a name"),
                     (&["WL", "WL ADD SOLUSD CRNCY"], "Watchlist"),

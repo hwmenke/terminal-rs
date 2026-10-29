@@ -25,7 +25,7 @@ pub type PaneId = u64;
 
 /// Minutes between Congress disclosure checks (`TR_CONGRESS_REFRESH_MIN`; 0 disables).
 pub const CONGRESS_REFRESH_MIN: u64 = 30;
-/// Seconds between price/setup rule evaluations (`TR_PRICE_ALERT_SECS`; 0 disables).
+/// Seconds between price, session-VWAP, and setup rule evaluations (`TR_PRICE_ALERT_SECS`; 0 disables).
 pub const PRICE_ALERT_EVAL_SECS: u64 = 20;
 
 pub enum Request {
@@ -1959,7 +1959,7 @@ async fn profile(s: &Shared, query: &str) -> Option<Profile> {
 }
 
 async fn evaluate_price_alerts(s: &Shared) {
-    use tr_data::price_alerts::{AlertFailure, AlertKind, EvalInput, PriceTick, evaluate, setup_tick};
+    use tr_data::price_alerts::{AlertFailure, AlertKind, EvalInput, PriceTick, evaluate, setup_tick, vwap_tick};
     use tr_data::whats_news::archive_ticker;
     let now = chrono::Utc::now().timestamp();
     let sample = s.provider.name() == "sample";
@@ -1967,7 +1967,14 @@ async fn evaluate_price_alerts(s: &Shared) {
     if sample {
         let outcome = evaluate(
             &mut s.price_alerts.lock().expect("price alerts"),
-            EvalInput { now, sample_provider: true, prices: Vec::new(), setups: Vec::new(), failures: Vec::new() },
+            EvalInput {
+                now,
+                sample_provider: true,
+                prices: Vec::new(),
+                setups: Vec::new(),
+                vwaps: Vec::new(),
+                failures: Vec::new(),
+            },
         );
         s.send(Response::PriceAlertFeed(outcome.batch));
         return;
@@ -1977,12 +1984,18 @@ async fn evaluate_price_alerts(s: &Shared) {
         return;
     }
     let mut price_keys = Vec::new();
+    let mut vwap_keys = Vec::new();
     let mut setup_keys: Vec<(String, String)> = Vec::new();
     for r in rules.iter().filter(|r| r.enabled) {
         match &r.kind {
             AlertKind::Price { .. } => {
                 if !price_keys.iter().any(|s| s == &r.symbol) {
                     price_keys.push(r.symbol.clone());
+                }
+            }
+            AlertKind::Vwap { .. } => {
+                if !vwap_keys.iter().any(|s| s == &r.symbol) {
+                    vwap_keys.push(r.symbol.clone());
                 }
             }
             AlertKind::Setup { setup, .. } => setup_keys.push((r.symbol.clone(), setup.clone())),
@@ -2057,9 +2070,20 @@ async fn evaluate_price_alerts(s: &Shared) {
             }
         }
     }
+    // One name at a time: a VWAP rule reads verified 5-minute bars, never a made-up level.
+    let mut vwaps = Vec::new();
+    for key in vwap_keys {
+        match s.provider.history(&key, Timeframe::M5, None, tr_data::intraday::VWAP_ALERT_BARS).await {
+            Ok(bars) => match vwap_tick(&key, &bars, now) {
+                Ok(tick) => vwaps.push(tick),
+                Err(error) => failures.push(AlertFailure { symbol: key, error }),
+            },
+            Err(e) => failures.push(AlertFailure { symbol: key, error: format!("{e:#}") }),
+        }
+    }
     let outcome = evaluate(
         &mut s.price_alerts.lock().expect("price alerts"),
-        EvalInput { now, sample_provider: false, prices, setups, failures },
+        EvalInput { now, sample_provider: false, prices, setups, vwaps, failures },
     );
     s.persist_price_alerts();
     if !outcome.fired.is_empty() {
