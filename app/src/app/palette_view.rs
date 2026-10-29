@@ -49,7 +49,7 @@ const COMMANDS: &[(&str, &str, &str, Option<Action>)] = &[
     ("REFRESH", "", "congress disclosures sync", Some(Action::Refresh)),
     ("WL", "", "watchlist monitor", Some(Action::Watchlist)),
     ("EARNINGS", "Earnings dates across the selected watchlist", "calendar ern report quote", None),
-    ("ISCAN", "Intraday scan of the selected watchlist", "rvol vwap session relative volume", None),
+    ("ISCAN", "Intraday scan of the selected watchlist", "rvol vwap spy relative strength session", None),
     ("DESK", "PM Desk: watchlist leaders and position size", "pm risk planner watchlist rank", Some(Action::Desk)),
     ("PMDESK", "PM Desk (alias)", "pm risk planner", None),
     ("RISK", "PM Desk (alias)", "pm position size planner", None),

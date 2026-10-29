@@ -736,7 +736,7 @@ impl TerminalApp {
                 .color(crate::theme::text()),
         );
         ui.small(
-            "RVOL and VWAP come from verified 5-minute bars. A dash means those bars did not support a number. A closed or stale session is not ranked as live.",
+            "RVOL, VWAP, and the session return versus SPY come from verified 5-minute bars. A dash means those bars did not support a number. A closed or stale session is not ranked as live.",
         );
         ui.small(tr_data::iscan::pace_line(&scan.board, Utc::now().timestamp()));
         if scan.board.sample {
@@ -1638,9 +1638,11 @@ mod tests {
         let today = session.iter().copied().filter(|b| b.ts >= wall(2026, 3, 9, 0, 0)).collect::<Vec<_>>();
         let closed = vec![bar(wall(2026, 3, 5, 15, 55), 10.0, 100.0), bar(wall(2026, 3, 6, 15, 55), 12.0, 200.0)];
         let live_at = wall(2026, 3, 9, 9, 36);
+        let spy = vec![bar(wall(2026, 3, 9, 9, 30), 400.0, 100.0), bar(wall(2026, 3, 9, 9, 35), 400.0, 100.0)];
+        let bench = tr_data::iscan::benchmark_span(&spy).unwrap();
         let board = tr_data::iscan::build(
             vec![
-                ("AAPL".into(), tr_data::iscan::read_bars("AAPL", &session, live_at)),
+                ("AAPL".into(), tr_data::iscan::read_against("AAPL", &session, live_at, Some(bench))),
                 ("MSFT".into(), tr_data::iscan::read_bars("MSFT", &today, live_at)),
                 ("NVDA".into(), tr_data::iscan::read_bars("NVDA", &session, wall(2026, 3, 9, 10, 7))),
                 ("JPM".into(), tr_data::iscan::read_bars("JPM", &closed, wall(2026, 3, 7, 12, 0))),
@@ -1649,7 +1651,9 @@ mod tests {
             false,
         );
         assert!(board.live.iter().any(|r| r.ticker == "AAPL" && r.line().contains("RVOL 2.00×")));
+        assert!(board.live.iter().any(|r| r.ticker == "AAPL" && r.line().contains("RS +90.91")));
         assert!(board.live.iter().any(|r| r.line().contains("RVOL —")));
+        assert!(board.live.iter().any(|r| r.line().contains("RS —")));
         assert_eq!(board.stale.len(), 1);
         assert_eq!(board.closed.len(), 1);
         assert!(board.holes.iter().all(|h| !h.line().contains("RVOL")));
@@ -1673,7 +1677,9 @@ mod tests {
         let shapes = frame(&ctx, &mut app, vec![]);
         text_position(&shapes, tr_data::iscan::pace_line(&board, chrono::Utc::now().timestamp()));
         text_position(&shapes, "RVOL 2.00×");
+        text_position(&shapes, "RS +90.91");
         text_position(&shapes, "RVOL —");
+        text_position(&shapes, "RS —");
         text_position(&shapes, "Live");
         text_position(&shapes, "Session closed");
         text_position(&shapes, "Last bar is stale");
@@ -1706,6 +1712,7 @@ mod tests {
                     close: 21.0,
                     vwap: 15.0,
                     rvol: Some(2.0),
+                    rs: None,
                     bar_ts: open,
                     freshness: tr_data::intraday::Freshness::Current,
                     provenance: Provenance::Real,

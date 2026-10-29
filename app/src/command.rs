@@ -243,7 +243,7 @@ pub enum Function {
     Watchlist,
     /// Earnings dates for the selected watchlist group (`EARNINGS`).
     Earnings,
-    /// Session RVOL and VWAP for the selected watchlist group (`ISCAN`).
+    /// Session RVOL, VWAP, and return versus SPY for the selected watchlist group (`ISCAN`).
     Intraday,
     WatchCommand(String),
     /// `LAYOUT 1|2|2H|3|4|6` preset, `LAYOUT <name>` switch, or a layout subcommand
@@ -660,7 +660,9 @@ fn describe(f: &Function) -> String {
         Function::Scan(name) => format!("Scan Whats-News archive: {name}"),
         Function::Watchlist => "Watchlist".into(),
         Function::Earnings => "Earnings calendar for the selected watchlist".into(),
-        Function::Intraday => "Intraday scan of the selected watchlist: session RVOL and close versus VWAP".into(),
+        Function::Intraday => {
+            "Intraday scan of the selected watchlist: session RVOL, close versus VWAP, and return versus SPY".into()
+        }
         Function::WatchCommand(s) => format!("Watchlists: {s}"),
         Function::Layout(l) if l.trim().is_empty() => "Saved layouts".into(),
         Function::Layout(l) => format!("Layout {l}"),

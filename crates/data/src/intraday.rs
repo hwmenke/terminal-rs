@@ -379,6 +379,50 @@ pub fn session_print(tf: Timeframe, bars: &[Bar]) -> Option<SessionPrint> {
     (last.close.is_finite() && last.close > 0.0).then_some(SessionPrint { close: last.close, vwap, bar_ts: last.ts })
 }
 
+/// Open and last close of the latest regular session, when that session includes its open.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SessionSpan {
+    pub date: NaiveDate,
+    pub open: f64,
+    pub close: f64,
+    /// Regular-session bucket of the last bar.
+    pub last: i64,
+}
+
+/// Latest regular session from its opening bucket through the last bar present.
+/// `None` when the open bucket is missing, the open or close is not a positive finite price,
+/// or the timeframe has no cash grid. Premarket, after-hours, and earlier sessions stay out.
+pub fn session_span(tf: Timeframe, bars: &[Bar]) -> Option<SessionSpan> {
+    let session = latest_regular(tf, bars);
+    let first = session.iter().copied().min_by_key(|b| b.ts)?;
+    let last = session.iter().copied().max_by_key(|b| b.ts)?;
+    let (date, _) = minute_of(last.ts);
+    if minute_of(first.ts).0 != date {
+        return None;
+    }
+    let open_bucket = regular_opens(date, tf).into_iter().next()?;
+    if regular_bucket(tf, first.ts) != Some(open_bucket) {
+        return None;
+    }
+    let last_bucket = regular_bucket(tf, last.ts)?;
+    if !(first.open.is_finite() && first.open > 0.0 && last.close.is_finite() && last.close > 0.0) {
+        return None;
+    }
+    Some(SessionSpan { date, open: first.open, close: last.close, last: last_bucket })
+}
+
+/// Symbol return minus benchmark return, in percentage points.
+/// `None` when the spans are not the same session date and the same last bucket.
+pub fn session_relative(symbol: SessionSpan, bench: SessionSpan) -> Option<f64> {
+    if symbol.date != bench.date || symbol.last != bench.last {
+        return None;
+    }
+    let symbol_ret = (symbol.close - symbol.open) / symbol.open;
+    let bench_ret = (bench.close - bench.open) / bench.open;
+    let pts = (symbol_ret - bench_ret) * 100.0;
+    pts.is_finite().then_some(pts)
+}
+
 /// Today's regular-session volume through the last bar's offset from the open,
 /// divided by the mean of earlier sessions at the same offset.
 /// `None` until a prior session has volume at that offset.
@@ -1074,6 +1118,47 @@ mod tests {
         assert!((from_top.low - 12.0).abs() < 1e-9);
         assert!((from_top.high - 18.0).abs() < 1e-9);
         assert!((from_top.share - 0.75).abs() < 1e-9);
+    }
+
+    #[test]
+    fn session_span_starts_at_the_open_and_relative_strength_needs_the_same_window() {
+        let bar = |y, m, d, h, min, open, close| {
+            Bar::new(wall(y, m, d, h, min), open, close + 1.0, open.min(close) - 1.0, close, 100.0)
+                .with_provenance(Provenance::Real)
+        };
+        let monday = vec![
+            bar(2026, 3, 9, 8, 0, 1.0, 1.0),
+            bar(2026, 3, 6, 9, 30, 50.0, 50.0),
+            bar(2026, 3, 9, 9, 30, 10.0, 11.0),
+            bar(2026, 3, 9, 9, 35, 11.0, 12.0),
+            bar(2026, 3, 9, 16, 0, 1.0, 99.0),
+        ];
+        let span = session_span(Timeframe::M5, &monday).unwrap();
+        assert_eq!(span.date, NaiveDate::from_ymd_opt(2026, 3, 9).unwrap());
+        assert!((span.open - 10.0).abs() < 1e-9);
+        assert!((span.close - 12.0).abs() < 1e-9);
+        assert_eq!(span.last, wall(2026, 3, 9, 9, 35));
+
+        let late = [bar(2026, 3, 9, 9, 35, 11.0, 12.0)];
+        assert!(session_span(Timeframe::M5, &late).is_none(), "a session missing the open stays blank");
+        assert!(session_span(Timeframe::D1, &monday).is_none());
+        assert!(session_span(Timeframe::H4, &monday).is_none());
+        let zero = [bar(2026, 3, 9, 9, 30, 0.0, 1.0)];
+        assert!(session_span(Timeframe::M5, &zero).is_none());
+
+        let spy = [bar(2026, 3, 9, 9, 30, 400.0, 400.0), bar(2026, 3, 9, 9, 35, 400.0, 404.0)];
+        let bench = session_span(Timeframe::M5, &spy).unwrap();
+        let rs = session_relative(span, bench).unwrap();
+        assert!((rs - 19.0).abs() < 1e-9, "20% minus 1% is 19 percentage points");
+
+        let mut longer = monday.clone();
+        longer.push(bar(2026, 3, 9, 9, 40, 12.0, 13.0));
+        let ahead = session_span(Timeframe::M5, &longer).unwrap();
+        assert!(session_relative(ahead, bench).is_none(), "a later bucket is not compared to an earlier SPY bar");
+
+        let friday = session_span(Timeframe::M5, &[bar(2026, 3, 6, 9, 30, 50.0, 55.0)]).unwrap();
+        assert!(session_relative(friday, bench).is_none());
+        assert!(session_relative(bench, bench).unwrap().abs() < 1e-9);
     }
 
     #[test]
