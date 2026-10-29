@@ -21,6 +21,7 @@ mod palette_view;
 mod panels;
 mod portfolio_view;
 mod research;
+mod session_breadth;
 mod session_path;
 mod settings_view;
 mod settings_writer;
@@ -101,6 +102,8 @@ pub enum PaneKind {
     IntradayCompare(Box<compare::ComparePane>),
     /// Today versus the typical intraday path (`SPATH`).
     SessionPath(Box<session_path::SessionPathPane>),
+    /// Share of a list at or above the 09:30 open and session VWAP (`BRD`).
+    Breadth(Box<session_breadth::BreadthPane>),
     Settings,
 }
 
@@ -325,6 +328,7 @@ impl PaneKind {
                     format!("{} Path", tr_data::security(&p.symbol).ticker)
                 }
             }
+            PaneKind::Breadth(_) => "Breadth".into(),
             PaneKind::Settings => "Settings".into(),
         }
     }
@@ -362,6 +366,7 @@ impl PaneKind {
             PaneKind::Lookalike(_) => "KNN",
             PaneKind::IntradayCompare(_) => "ICMP",
             PaneKind::SessionPath(_) => "SPATH",
+            PaneKind::Breadth(_) => "BRD",
             PaneKind::Settings => "PDF",
         }
     }
@@ -467,6 +472,7 @@ impl PaneKind {
             PaneKind::SessionPath(p) => {
                 PaneSettings::SessionPath { symbol: p.symbol.clone(), spec: p.spec.clone(), tf: p.tf.clone() }
             }
+            PaneKind::Breadth(b) => PaneSettings::Breadth { spec: b.spec.clone(), tf: b.tf.clone() },
             PaneKind::Lookalike(l) => PaneSettings::Lookalike {
                 symbol: l.symbol.clone(),
                 spec: l.spec.clone(),
@@ -590,6 +596,13 @@ impl PaneKind {
                     pane.tf = tf;
                 }
                 PaneKind::SessionPath(Box::new(pane))
+            }
+            PaneSettings::Breadth { spec, tf } => {
+                let mut pane = session_breadth::BreadthPane::new(spec);
+                if !tf.is_empty() {
+                    pane.tf = tf;
+                }
+                PaneKind::Breadth(Box::new(pane))
             }
             PaneSettings::IntradayCompare { symbol, peers, tf } => {
                 let mut pane = compare::ComparePane::new(symbol, peers);
@@ -1114,6 +1127,7 @@ impl TerminalApp {
                 self.open_intraday_compare(Some(&s), &spec)
             }
             Command::SymbolFunction(s, Function::SessionPath { spec }) => self.open_session_path(Some(&s), &spec),
+            Command::SymbolFunction(s, Function::Breadth { spec }) => self.open_breadth(Some(&s), &spec),
             Command::SymbolFunction(s, Function::Goto { date }) => self.goto_chart_date(Some(&s), &date),
             Command::SymbolFunction(s, Function::JournalNote { date, text }) => {
                 self.add_journal_note(Some(&s), &date, &text)
@@ -1200,7 +1214,7 @@ impl TerminalApp {
                     }
                     None => {
                         self.status = format!(
-                            "Unknown panel {spec:?}; try CHART, NEWS, BOOK, WEI, GC, CONG, WL, DESK, JOURNAL, STATS, BACKTEST, IBT, ICMP, SPATH, LOOKALIKE, PORT"
+                            "Unknown panel {spec:?}; try CHART, NEWS, BOOK, WEI, GC, CONG, WL, DESK, JOURNAL, STATS, BACKTEST, IBT, ICMP, SPATH, BRD, LOOKALIKE, PORT"
                         )
                     }
                 }
@@ -1300,6 +1314,7 @@ impl TerminalApp {
             Function::Lookalike { spec } => self.open_lookalike(symbol.as_deref(), &spec),
             Function::IntradayCompare { spec } => self.open_intraday_compare(symbol.as_deref(), &spec),
             Function::SessionPath { spec } => self.open_session_path(symbol.as_deref(), &spec),
+            Function::Breadth { spec } => self.open_breadth(symbol.as_deref(), &spec),
             Function::Goto { date } => self.goto_chart_date(symbol.as_deref(), &date),
             Function::JournalNote { date, text } => self.add_journal_note(symbol.as_deref(), &date, &text),
             Function::Latest => self.with_chart(|c, _| c.jump_latest()),
@@ -1455,6 +1470,13 @@ impl TerminalApp {
                         self.panes.iter_mut().find(|p| p.id == pane).map(|p| &mut p.kind)
                     {
                         p.accept(generation, result);
+                    }
+                }
+                Response::Breadth { pane, generation, result } => {
+                    if let Some(PaneKind::Breadth(b)) =
+                        self.panes.iter_mut().find(|p| p.id == pane).map(|p| &mut p.kind)
+                    {
+                        b.accept(generation, result);
                     }
                 }
                 Response::IntradayCompare { pane, generation, result } => {

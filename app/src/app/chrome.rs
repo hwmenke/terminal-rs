@@ -717,6 +717,17 @@ impl TerminalApp {
             }
             if nav_row(
                 ui,
+                Icon::Chart,
+                "Session breadth",
+                Some("BRD"),
+                is_focused(&PaneKind::Breadth(Box::new(super::session_breadth::BreadthPane::new(String::new())))),
+            )
+            .clicked()
+            {
+                out.push(SidebarCmd::Function(Function::Breadth { spec: String::new() }));
+            }
+            if nav_row(
+                ui,
                 Icon::Search,
                 "Lookalikes",
                 Some("KNN"),

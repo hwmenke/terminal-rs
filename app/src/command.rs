@@ -319,6 +319,10 @@ pub enum Function {
     SessionPath {
         spec: String,
     },
+    /// Share of a list at or above the open and session VWAP (`BRD`, `AAPL BRD MSFT`).
+    Breadth {
+        spec: String,
+    },
     /// Historical lookalikes / nearest neighbors (`LOOKALIKE`, `AAPL KNN 2024-01-15 K=15`).
     Lookalike {
         spec: String,
@@ -535,6 +539,7 @@ fn parse_function(head: &str, rest: &[&str]) -> Option<Function> {
         "LOOKALIKE" | "LOOKALIKES" | "KNN" | "ANALOG" | "ANALOGUE" | "NN" => Function::Lookalike { spec: joined() },
         "ICMP" | "ICOMPARE" | "ICOMP" => Function::IntradayCompare { spec: joined() },
         "SPATH" | "SESSIONPATH" | "TPATH" => Function::SessionPath { spec: joined() },
+        "BRD" | "BREADTH" | "SBREADTH" => Function::Breadth { spec: joined() },
         "GOTO" | "JUMP" | "GTO" => Function::Goto { date: joined() },
         "NOTE" | "JNOTE" => {
             let (date, text) = split_note_args(rest);
@@ -782,6 +787,10 @@ fn describe(f: &Function) -> String {
             "Session path: today versus the mean of prior sessions, each percent from its own 09:30 open".into()
         }
         Function::SessionPath { spec } => format!("Session path versus prior 09:30 opens ({spec})"),
+        Function::Breadth { spec } if spec.is_empty() => {
+            "Session breadth: share of the watchlist at or above the 09:30 open and session VWAP".into()
+        }
+        Function::Breadth { spec } => format!("Session breadth at or above the open and VWAP ({spec})"),
         Function::Lookalike { spec } if spec.is_empty() => {
             "Historical lookalikes: nearest past conditions, per-horizon counts, jump to neighbor dates".into()
         }

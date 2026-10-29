@@ -20,7 +20,7 @@ use crate::widgets::{self, Icon};
 use crate::worker::{Request, Worker};
 
 /// Panels offered by the + menus: label and command word.
-pub const PANELS: [(&str, &str); 20] = [
+pub const PANELS: [(&str, &str); 21] = [
     ("Chart", "CHART"),
     ("Watchlist", "WL"),
     ("News", "NEWS"),
@@ -37,6 +37,7 @@ pub const PANELS: [(&str, &str); 20] = [
     ("Intraday BT", "IBT"),
     ("Session compare", "ICMP"),
     ("Session path", "SPATH"),
+    ("Session breadth", "BRD"),
     ("Lookalikes", "LOOKALIKE"),
     ("Security Search", "SECF"),
     ("Settings", "PREFS"),
@@ -429,6 +430,15 @@ impl TerminalApp {
                 }
                 p.request(id, &self.worker);
                 PaneKind::SessionPath(p)
+            }
+            PaneKind::Breadth(mut b) => {
+                let symbols: Vec<String> = self
+                    .watchlists
+                    .group(&self.watch_ui.selected_group)
+                    .map(|g| g.members.iter().map(|m| m.symbol.clone()).collect())
+                    .unwrap_or_default();
+                b.request(id, &self.worker, &symbols);
+                PaneKind::Breadth(b)
             }
             PaneKind::Lookalike(mut l) => {
                 if l.symbol.trim().is_empty() {
@@ -888,6 +898,11 @@ impl TerminalApp {
                 let symbol = symbol.map(|s| tr_data::security(s).key()).or(current).unwrap_or_default();
                 let spec = words.get(1..).unwrap_or(&[]).join(" ");
                 PaneKind::SessionPath(Box::new(super::session_path::SessionPathPane::new(symbol, spec)))
+            }
+            "BRD" | "BREADTH" | "SBREADTH" => {
+                // Tickers and a bar size stay in the spec. They are not a single focused name.
+                let spec = words.get(1..).unwrap_or(&[]).join(" ");
+                PaneKind::Breadth(Box::new(super::session_breadth::BreadthPane::new(spec)))
             }
             "IBT" | "IBACKTEST" | "SETUPBT" => {
                 // VWAP and OR are setup names, not tickers.

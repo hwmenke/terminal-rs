@@ -360,6 +360,10 @@ impl TerminalApp {
                         &["SPATH", "AAPL SPATH 20 15m"],
                         "Today versus the typical path of prior sessions, percent from each 09:30 open",
                     ),
+                    (
+                        &["BRD", "AAPL BRD MSFT NVDA"],
+                        "Share of the list at or above each 09:30 open and session VWAP",
+                    ),
                     (&["TL", "HL", "VL", "FIB", "MAGNET"], "Drawing tools and snapping"),
                     (&["CLEAR DRAW", "UNDO DRAW"], "Remove all drawings on this name, or undo the last delete"),
                     (&["REVIEW", "AAPL REVIEW"], "Linked daily + weekly archive charts for candidate review"),

@@ -82,6 +82,15 @@ pub enum Request {
         spec: String,
         timeframe: String,
     },
+    /// Share of a list at or above the 09:30 open and session VWAP.
+    Breadth {
+        pane: PaneId,
+        generation: u64,
+        spec: String,
+        timeframe: String,
+        /// Selected watchlist, used when `spec` names no ticker.
+        symbols: Vec<String>,
+    },
     /// Paper VWAP / opening-range backtest on verified regular-session bars.
     IntradayBacktest {
         pane: PaneId,
@@ -380,6 +389,11 @@ pub enum Response {
         pane: PaneId,
         generation: u64,
         result: Result<tr_data::session_path::SessionPath, String>,
+    },
+    Breadth {
+        pane: PaneId,
+        generation: u64,
+        result: Result<tr_data::session_breadth::Breadth, String>,
     },
     Lookalike {
         pane: PaneId,
@@ -1145,6 +1159,49 @@ async fn research_session_path(
     tr_data::session_path::build_path(&sec.key(), &bars, &query, &source).map_err(anyhow::Error::msg)
 }
 
+/// Verified regular-session bars for a list of cash names. Sample substitution is refused.
+async fn research_breadth(
+    s: &Shared,
+    spec: &str,
+    timeframe: &str,
+    watchlist: &[String],
+) -> anyhow::Result<tr_data::session_breadth::Breadth> {
+    if s.provider.name() == "sample" {
+        anyhow::bail!(
+            "Session breadth refused: sample / offline display mode does not feed this pane. Sample prices are never used."
+        );
+    }
+    let query = tr_data::session_breadth::parse_query(spec, timeframe, watchlist).map_err(anyhow::Error::msg)?;
+    let limit = tr_data::session_breadth::fetch_limit(query.timeframe);
+    let mut rows = Vec::with_capacity(query.symbols.len());
+    for symbol in &query.symbols {
+        let sec = tr_data::security(symbol);
+        if !matches!(sec.class, tr_core::AssetClass::Equity | tr_core::AssetClass::Etf | tr_core::AssetClass::Index) {
+            rows.push(tr_data::session_breadth::NamedBars {
+                symbol: sec.key(),
+                bars: Vec::new(),
+                error: Some(format!("{} has no US cash session.", sec.ticker)),
+            });
+            continue;
+        }
+        match s.provider.history(&sec.key(), query.timeframe, None, limit).await {
+            Ok(bars) if bars.is_empty() => rows.push(tr_data::session_breadth::NamedBars {
+                symbol: sec.key(),
+                bars,
+                error: Some(format!("{} returned no regular-session bars. Sample prices are never used.", sec.ticker)),
+            }),
+            Ok(bars) => rows.push(tr_data::session_breadth::NamedBars { symbol: sec.key(), bars, error: None }),
+            Err(e) => rows.push(tr_data::session_breadth::NamedBars {
+                symbol: sec.key(),
+                bars: Vec::new(),
+                error: Some(format!("{e:#}")),
+            }),
+        }
+    }
+    let source = format!("{} {} regular session", s.provider.name(), query.timeframe.label());
+    tr_data::session_breadth::build_breadth(&rows, &query, &source).map_err(anyhow::Error::msg)
+}
+
 /// Load one name from the local archive, then Whats-News. Sample/display bars never enter.
 async fn research_lookalike(
     s: &Shared,
@@ -1441,6 +1498,13 @@ async fn handle(s: &Arc<Shared>, req: Request) {
                 pane,
                 generation,
                 result: research_session_path(s, &symbol, &spec, &timeframe).await.map_err(|e| format!("{e:#}")),
+            });
+        }
+        Request::Breadth { pane, generation, spec, timeframe, symbols } => {
+            send(Response::Breadth {
+                pane,
+                generation,
+                result: research_breadth(s, &spec, &timeframe, &symbols).await.map_err(|e| format!("{e:#}")),
             });
         }
         Request::IntradayBacktest {
