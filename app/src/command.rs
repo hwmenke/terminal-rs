@@ -343,6 +343,8 @@ pub enum Function {
     },
     /// Path, pace, gap, extreme, and versus SPY for one name (`BRIEF`, `AAPL BRIEF`).
     SessionBrief,
+    /// Prior close, open, opening range, and VWAP drawn on the chart (`MARKS`).
+    CashLevels,
     /// Historical lookalikes / nearest neighbors (`LOOKALIKE`, `AAPL KNN 2024-01-15 K=15`).
     Lookalike {
         spec: String,
@@ -572,6 +574,7 @@ fn parse_function(head: &str, rest: &[&str]) -> Option<Function> {
         "XTRM" | "EXTREME" => Function::SessionExtreme { spec: joined() },
         "RPATH" | "RELPATH" => Function::RelativePath { spec: joined() },
         "BRIEF" | "SBRIEF" if rest.is_empty() => Function::SessionBrief,
+        "MARKS" | "SMARKS" if rest.is_empty() => Function::CashLevels,
         "GOTO" | "JUMP" | "GTO" => Function::Goto { date: joined() },
         "NOTE" | "JNOTE" => {
             let (date, text) = split_note_args(rest);
@@ -845,6 +848,9 @@ fn describe(f: &Function) -> String {
         Function::RelativePath { spec } => format!("Relative path versus SPY ({spec})"),
         Function::SessionBrief => {
             "Session brief: path, pace, gap, extreme, and versus SPY for one name, on verified 5-minute bars".into()
+        }
+        Function::CashLevels => {
+            "Chart levels: prior cash close, 09:30 open, opening-range high and low, and session VWAP".into()
         }
         Function::Lookalike { spec } if spec.is_empty() => {
             "Historical lookalikes: nearest past conditions, per-horizon counts, jump to neighbor dates".into()

@@ -129,6 +129,11 @@ pub enum Request {
         generation: u64,
         symbol: String,
     },
+    /// Prior close, open, opening range, and VWAP for the named chart.
+    CashLevels {
+        pane: PaneId,
+        symbol: String,
+    },
     /// Paper VWAP / opening-range backtest on verified regular-session bars.
     IntradayBacktest {
         pane: PaneId,
@@ -457,6 +462,10 @@ pub enum Response {
         pane: PaneId,
         generation: u64,
         result: Result<tr_data::session_brief::SessionBrief, String>,
+    },
+    CashLevels {
+        pane: PaneId,
+        result: Result<tr_data::cash_levels::CashLevels, String>,
     },
     Lookalike {
         pane: PaneId,
@@ -1370,6 +1379,25 @@ async fn research_session_brief(s: &Shared, symbol: &str) -> anyhow::Result<tr_d
     tr_data::session_brief::build(&sec.key(), Timeframe::M5, &bars, spy.as_deref(), now).map_err(anyhow::Error::msg)
 }
 
+/// Verified 5-minute bars for the chart's cash levels. Sample substitution is refused.
+async fn research_cash_levels(s: &Shared, symbol: &str) -> anyhow::Result<tr_data::cash_levels::CashLevels> {
+    if s.provider.name() == "sample" {
+        anyhow::bail!(
+            "Cash levels refused: sample / offline display mode does not feed this chart. Sample prices are never used."
+        );
+    }
+    let sec = tr_data::security(symbol);
+    if !matches!(sec.class, tr_core::AssetClass::Equity | tr_core::AssetClass::Etf | tr_core::AssetClass::Index) {
+        anyhow::bail!("{} has no US cash session.", sec.ticker);
+    }
+    let bars = s.provider.history(&sec.key(), Timeframe::M5, None, tr_data::cash_levels::fetch_limit()).await?;
+    if bars.is_empty() {
+        anyhow::bail!("{} has no regular-session bars. A premarket print is not the open.", sec.ticker);
+    }
+    Bar::require_verified(&bars, "Cash levels").map_err(anyhow::Error::msg)?;
+    tr_data::cash_levels::build(&sec.key(), Timeframe::M5, &bars).map_err(anyhow::Error::msg)
+}
+
 /// Verified regular-session bars for a list of cash names. Sample substitution is refused.
 async fn research_breadth(
     s: &Shared,
@@ -1744,6 +1772,12 @@ async fn handle(s: &Arc<Shared>, req: Request) {
                 pane,
                 generation,
                 result: research_session_brief(s, &symbol).await.map_err(|e| format!("{e:#}")),
+            });
+        }
+        Request::CashLevels { pane, symbol } => {
+            send(Response::CashLevels {
+                pane,
+                result: research_cash_levels(s, &symbol).await.map_err(|e| format!("{e:#}")),
             });
         }
         Request::Breadth { pane, generation, spec, timeframe, symbols } => {

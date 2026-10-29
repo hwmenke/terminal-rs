@@ -52,6 +52,24 @@ pub const PANELS: [(&str, &str); 26] = [
     ("Help", "HELP"),
 ];
 
+fn cash_level_status(levels: &tr_data::cash_levels::CashLevels) -> String {
+    let px = |name: &str| levels.price(name).map(|price| format!("{price:.2}")).unwrap_or_else(|| "off".into());
+    let mut line = format!(
+        "{}: prior close {}, open {}, OR {}–{}, VWAP {}",
+        levels.ticker,
+        px(tr_data::cash_levels::PRIOR_CLOSE),
+        px(tr_data::cash_levels::OPEN),
+        px(tr_data::cash_levels::OR_LOW),
+        px(tr_data::cash_levels::OR_HIGH),
+        px(tr_data::cash_levels::VWAP)
+    );
+    if let Some(note) = levels.notes.first() {
+        line.push_str(" · ");
+        line.push_str(note);
+    }
+    line
+}
+
 /// Length of a dock transition (panes added, closed, moved, or a layout switch).
 const DOCK_SECS: f32 = 0.42;
 
@@ -1130,6 +1148,65 @@ impl TerminalApp {
         self.save_settings();
         let ticker = tr_data::security(&key).ticker;
         self.status = format!("{ticker}: intraday desk — 5-minute chart, scan, breadth, and volume pace");
+    }
+
+    /// Draw the prior close, open, opening range, and VWAP on this name's chart.
+    pub(super) fn open_cash_levels(&mut self, symbol: Option<&str>) {
+        let key = symbol
+            .map(|s| tr_data::security(s).key())
+            .filter(|s| !s.is_empty())
+            .or_else(|| self.focused_symbol())
+            .unwrap_or_else(|| tr_data::security("AAPL").key());
+        let existing = self
+            .idx(self.focus)
+            .and_then(|i| match &self.panes[i].kind {
+                PaneKind::Chart(c) if c.symbol == key => Some(self.panes[i].id),
+                _ => None,
+            })
+            .or_else(|| {
+                self.panes.iter().find_map(|pane| match &pane.kind {
+                    PaneKind::Chart(c) if c.symbol == key => Some(pane.id),
+                    _ => None,
+                })
+            });
+        let id = match existing {
+            Some(id) => {
+                self.reveal(id);
+                self.focus = id;
+                id
+            }
+            None => {
+                let mut chart = crate::layouts::chart_settings(&key, &self.prefs.panels);
+                if let PaneSettings::Chart { tf, .. } = &mut chart {
+                    *tf = tr_core::Timeframe::M5;
+                }
+                let id = self.new_pane(PaneKind::from_settings(chart));
+                self.dock_pane(id, self.focused_visible(), Zone::Right);
+                id
+            }
+        };
+        self.worker.send(Request::CashLevels { pane: id, symbol: key.clone() });
+        let ticker = tr_data::security(&key).ticker;
+        self.status = format!("{ticker}: reading prior close, open, opening range, and VWAP");
+    }
+
+    pub(super) fn accept_cash_levels(
+        &mut self,
+        pane: PaneId,
+        result: Result<tr_data::cash_levels::CashLevels, String>,
+    ) {
+        match result {
+            Ok(levels) => {
+                let Some(i) = self.idx(pane) else { return };
+                let PaneKind::Chart(chart) = &mut self.panes[i].kind else { return };
+                if chart.symbol != levels.symbol {
+                    return;
+                }
+                chart.apply_cash_levels(&levels);
+                self.status = cash_level_status(&levels);
+            }
+            Err(err) => self.status = err,
+        }
     }
 
     // ---- saved layouts -------------------------------------------------------------------

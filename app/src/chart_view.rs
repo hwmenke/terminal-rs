@@ -499,6 +499,18 @@ impl ChartState {
     }
 
     /// Write the live pane's drawings into the store for this symbol and timeframe.
+    /// Replace the cash-session level lines and leave every other drawing where it is.
+    pub fn apply_cash_levels(&mut self, levels: &tr_data::cash_levels::CashLevels) {
+        self.drawings.retain(|drawing| {
+            drawing.label.as_deref().is_none_or(|label| !tr_data::cash_levels::LEVEL_NAMES.contains(&label))
+        });
+        for level in &levels.levels {
+            let anchor = Anchor { ts: 0, price: level.price };
+            self.drawings.push(Drawing::new(Tool::Horizontal, anchor, anchor).labeled(level.name));
+        }
+        self.commit_drawings();
+    }
+
     pub fn commit_drawings(&mut self) {
         self.drawing_store.stash_view(&self.symbol, self.tf, &self.drawings);
     }
@@ -2094,7 +2106,13 @@ impl ChartState {
             |a: &Anchor| [rect.left() as f64 + v.x_of(self.index_of_ts(a.ts)), rect.top() as f64 + s.y_of(a.price)];
         match d.tool {
             Tool::Trendline => vec![(Shape::Segment(px(&d.a), px(&d.b)), None)],
-            Tool::Horizontal => vec![(Shape::HLine(px(&d.a)[1]), Some(format!("{:.2}", d.a.price)))],
+            Tool::Horizontal => {
+                let text = match &d.label {
+                    Some(label) => format!("{label} {:.2}", d.a.price),
+                    None => format!("{:.2}", d.a.price),
+                };
+                vec![(Shape::HLine(px(&d.a)[1]), Some(text))]
+            }
             Tool::Vertical => vec![(Shape::VLine(px(&d.a)[0]), None)],
             Tool::Fib => {
                 let (xa, xb) = (px(&d.a)[0], px(&d.b)[0]);
@@ -2954,6 +2972,36 @@ mod tests {
 
     fn trend() -> Drawing {
         Drawing::new(Tool::Trendline, Anchor { ts: 1, price: 10.0 }, Anchor { ts: 2, price: 20.0 })
+    }
+
+    #[test]
+    fn cash_levels_replace_their_own_lines_and_keep_other_drawings() {
+        use tr_data::cash_levels::{CashLevels, Level, OPEN, PRIOR_CLOSE, VWAP};
+        let mut chart = ChartState::new(1, "AAPL", Timeframe::D1);
+        chart.drawings.push(trend());
+        chart.drawings.push(hline(10.0).labeled(PRIOR_CLOSE));
+        let levels = CashLevels {
+            symbol: "AAPL US Equity".into(),
+            ticker: "AAPL".into(),
+            date: chrono::NaiveDate::from_ymd_opt(2026, 1, 5).unwrap(),
+            timeframe: Timeframe::M5,
+            provenance: Provenance::Real,
+            levels: vec![
+                Level { name: PRIOR_CLOSE, price: 90.0 },
+                Level { name: OPEN, price: 100.0 },
+                Level { name: VWAP, price: 101.5 },
+            ],
+            notes: Vec::new(),
+        };
+        chart.apply_cash_levels(&levels);
+        chart.apply_cash_levels(&levels);
+        let prices: Vec<_> = chart
+            .drawings
+            .iter()
+            .filter_map(|drawing| drawing.label.as_deref().map(|label| (label, drawing.horizontal_price())))
+            .collect();
+        assert_eq!(prices, vec![(PRIOR_CLOSE, Some(90.0)), (OPEN, Some(100.0)), (VWAP, Some(101.5))]);
+        assert_eq!(chart.drawings.iter().filter(|drawing| drawing.tool == Tool::Trendline).count(), 1);
     }
 
     #[test]

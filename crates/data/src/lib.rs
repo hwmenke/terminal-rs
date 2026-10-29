@@ -15,6 +15,7 @@
 pub mod alpaca;
 pub mod backtest;
 pub mod cache;
+pub mod cash_levels;
 pub mod cash_session;
 pub mod crypto;
 pub mod earnings;

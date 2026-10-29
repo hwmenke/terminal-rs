@@ -135,6 +135,9 @@ const COMMANDS: &[(&str, &str, &str, Option<Action>)] = &[
     ("BRIEF", "Session brief: path, pace, gap, extreme, and versus SPY", "dashboard reads signals", None),
     ("SBRIEF", "Session brief (alias)", "path pace gap extreme spy", None),
     ("AAPL BRIEF", "Open the session brief for AAPL", "path pace gap extreme relative", None),
+    ("MARKS", "Prior close, open, opening range, and VWAP on the chart", "levels horizontal lines", None),
+    ("SMARKS", "Chart cash levels (alias)", "prior close open vwap", None),
+    ("AAPL MARKS", "Draw AAPL cash levels on the chart", "opening range prior close vwap", None),
     (
         "LOOKALIKE",
         "Historical lookalikes: nearest past conditions and subsequent returns",
