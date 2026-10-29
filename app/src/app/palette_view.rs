@@ -87,6 +87,14 @@ const COMMANDS: &[(&str, &str, &str, Option<Action>)] = &[
     ("AAPL ICMP MSFT NVDA", "AAPL, MSFT, NVDA and SPY from each 09:30 open", "intraday compare 5m", None),
     ("AAPL ICMP 1m", "AAPL and SPY on 1-minute bars, percent from the open", "session compare 1m", None),
     (
+        "SPATH",
+        "Today versus the typical path of prior sessions, percent from each 09:30 open",
+        "session path mean band prior sessions",
+        None,
+    ),
+    ("AAPL SPATH 20", "AAPL today versus the last 20 sessions from the 09:30 open", "typical path 20", None),
+    ("AAPL SPATH 15m", "AAPL session path on 15-minute bars", "typical path 15m", None),
+    (
         "LOOKALIKE",
         "Historical lookalikes: nearest past conditions and subsequent returns",
         "knn analog neighbor overlap horizon",
@@ -294,6 +302,10 @@ pub(super) fn static_items() -> Vec<Item> {
     v.push(
         Item::new(Kind::Panel, "New session compare", "NEW ICMP", Target::Run("NEW ICMP".into()))
             .keywords("panel pane icmp intraday compare session open spy"),
+    );
+    v.push(
+        Item::new(Kind::Panel, "New session path", "NEW SPATH", Target::Run("NEW SPATH".into()))
+            .keywords("panel pane spath typical session path mean band"),
     );
     v.push(
         Item::new(Kind::Panel, "New Lookalikes pane", "NEW LOOKALIKE", Target::Run("NEW LOOKALIKE".into()))

@@ -703,6 +703,20 @@ impl TerminalApp {
             }
             if nav_row(
                 ui,
+                Icon::Chart,
+                "Session path",
+                Some("SPATH"),
+                is_focused(&PaneKind::SessionPath(Box::new(super::session_path::SessionPathPane::new(
+                    String::new(),
+                    String::new(),
+                )))),
+            )
+            .clicked()
+            {
+                out.push(SidebarCmd::Function(Function::SessionPath { spec: String::new() }));
+            }
+            if nav_row(
+                ui,
                 Icon::Search,
                 "Lookalikes",
                 Some("KNN"),
