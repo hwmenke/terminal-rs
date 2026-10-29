@@ -1547,7 +1547,8 @@ impl TerminalApp {
     fn set_price_alert(&mut self, symbol: Option<String>, kind: tr_data::price_alerts::AlertKind) {
         let Some(symbol) = symbol.or_else(|| self.focused_symbol()) else {
             self.status =
-                "ALERT needs a ticker (AAPL ALERT 150, AAPL ALERT VWAP, or AAPL ALERT SETUP NEAR_HIGH)".into();
+                "ALERT needs a ticker (AAPL ALERT 150, AAPL ALERT VWAP, AAPL ALERT RVOL 2, or AAPL ALERT SETUP NEAR_HIGH)"
+                    .into();
             return;
         };
         let symbol = tr_data::security(&symbol).key();

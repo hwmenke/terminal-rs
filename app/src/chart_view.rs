@@ -1535,7 +1535,7 @@ impl ChartState {
             ui.close();
         }
         ui.separator();
-        ui.label(RichText::new("Price / VWAP / setup alerts").small().color(muted()));
+        ui.label(RichText::new("Price / VWAP / RVOL / setup alerts").small().color(muted()));
         if let Some(last) = self.bars.last() {
             let px = last.close;
             if ui
@@ -1564,6 +1564,16 @@ impl ChartState {
             }
             if ui.button("Alert below session VWAP").clicked() {
                 self.actions.push(Action::Command(format!("{} ALERT VWAP BELOW", self.symbol)));
+                ui.close();
+            }
+            if ui
+                .button("Alert at 2× session RVOL")
+                .on_hover_text(
+                    "Fires when session relative volume crosses up through 2× on verified 5-minute bars. A stale or closed bar does not fire, and a missing prior session is not zero.",
+                )
+                .clicked()
+            {
+                self.actions.push(Action::Command(format!("{} ALERT RVOL 2", self.symbol)));
                 ui.close();
             }
         }
@@ -2338,6 +2348,7 @@ mod tests {
         let output = open_plot_menu(&ctx, &mut chart, &worker);
         assert!(contains_text(&output.shapes, "Alert above session VWAP"));
         assert!(contains_text(&output.shapes, "Alert below session VWAP"));
+        assert!(contains_text(&output.shapes, "Alert at 2× session RVOL"));
         let pos = text_position(&output.shapes, "Alert above session VWAP");
         chart_frame(
             &ctx,
@@ -2347,12 +2358,23 @@ mod tests {
         );
         chart_frame(&ctx, &mut chart, &worker, vec![pointer(pos, egui::PointerButton::Primary, false)]);
         assert!(chart.actions.iter().any(|a| matches!(a, Action::Command(c) if c == "AAPL US Equity ALERT VWAP")));
+        let output = open_plot_menu(&ctx, &mut chart, &worker);
+        let pos = text_position(&output.shapes, "Alert at 2× session RVOL");
+        chart_frame(
+            &ctx,
+            &mut chart,
+            &worker,
+            vec![egui::Event::PointerMoved(pos), pointer(pos, egui::PointerButton::Primary, true)],
+        );
+        chart_frame(&ctx, &mut chart, &worker, vec![pointer(pos, egui::PointerButton::Primary, false)]);
+        assert!(chart.actions.iter().any(|a| matches!(a, Action::Command(c) if c == "AAPL US Equity ALERT RVOL 2")));
 
         let mut fx = ChartState::new(2, "EURUSD", Timeframe::D1);
         let output = open_plot_menu(&ctx, &mut fx, &worker);
         assert_eq!(fx.sec.class, AssetClass::Fx);
         assert!(!contains_text(&output.shapes, "Alert above session VWAP"));
         assert!(!contains_text(&output.shapes, "Alert below session VWAP"));
+        assert!(!contains_text(&output.shapes, "Alert at 2× session RVOL"));
     }
 
     #[test]

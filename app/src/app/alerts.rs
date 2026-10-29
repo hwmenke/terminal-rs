@@ -13,6 +13,7 @@ use crate::worker::Request;
 pub enum AlertDraftMode {
     Price,
     Vwap,
+    Rvol,
     Setup,
 }
 
@@ -94,6 +95,9 @@ impl TerminalApp {
             if ui.selectable_label(self.alert_draft.mode == AlertDraftMode::Vwap, "VWAP").clicked() {
                 self.alert_draft.mode = AlertDraftMode::Vwap;
             }
+            if ui.selectable_label(self.alert_draft.mode == AlertDraftMode::Rvol, "RVOL").clicked() {
+                self.alert_draft.mode = AlertDraftMode::Rvol;
+            }
             if ui.selectable_label(self.alert_draft.mode == AlertDraftMode::Setup, "Setup").clicked() {
                 self.alert_draft.mode = AlertDraftMode::Setup;
             }
@@ -116,6 +120,13 @@ impl TerminalApp {
                     if ui.selectable_label(self.alert_draft.side == PriceSide::Below, "below").clicked() {
                         self.alert_draft.side = PriceSide::Below;
                     }
+                }
+                AlertDraftMode::Rvol => {
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.alert_draft.level)
+                            .desired_width(72.0)
+                            .hint_text("multiple"),
+                    );
                 }
                 AlertDraftMode::Setup => {
                     egui::ComboBox::from_id_salt("alert-setup").selected_text(&self.alert_draft.setup).show_ui(
@@ -147,7 +158,7 @@ impl TerminalApp {
         });
         ui.label(
             RichText::new(
-                "AAPL ALERT 150 · AAPL ALERT VWAP · AAPL ALERT VWAP BELOW · NVDA ALERT SETUP NEAR_HIGH · click a fired row for the chart",
+                "AAPL ALERT 150 · AAPL ALERT VWAP · AAPL ALERT RVOL 2 · NVDA ALERT SETUP NEAR_HIGH · click a fired row for the chart",
             )
             .font(ui_font(11.0))
             .color(muted()),
@@ -164,6 +175,14 @@ impl TerminalApp {
                 Ok(AlertKind::Price { side: self.alert_draft.side, level })
             }
             AlertDraftMode::Vwap => Ok(AlertKind::Vwap { side: self.alert_draft.side }),
+            AlertDraftMode::Rvol => {
+                let multiple: f64 =
+                    self.alert_draft.level.trim().parse().map_err(|_| "Type an RVOL multiple".to_string())?;
+                if !multiple.is_finite() || multiple <= 0.0 {
+                    return Err("RVOL multiple must be a positive number".into());
+                }
+                Ok(AlertKind::Rvol { multiple })
+            }
             AlertDraftMode::Setup => {
                 let setup = tr_data::price_alerts::normalize_setup(&self.alert_draft.setup)
                     .ok_or_else(|| "Pick a SCAN setup".to_string())?;
@@ -174,7 +193,7 @@ impl TerminalApp {
 
     fn alert_rules(&mut self, ui: &mut Ui) {
         if self.price_alerts.rules.is_empty() {
-            ui.label(RichText::new("No price, VWAP, or setup rules yet.").font(mono(12.0)).color(muted()));
+            ui.label(RichText::new("No price, VWAP, RVOL, or setup rules yet.").font(mono(12.0)).color(muted()));
             return;
         }
         let rules = self.price_alerts.rules.clone();
@@ -206,7 +225,7 @@ impl TerminalApp {
     fn alert_events(&mut self, ui: &mut Ui, out: &mut Vec<Action>) {
         if self.price_alerts.events.is_empty() {
             ui.label(
-                RichText::new("No price, VWAP, or setup alerts have fired. Sample bars never invent them.")
+                RichText::new("No price, VWAP, RVOL, or setup alerts have fired. Sample bars never invent them.")
                     .font(mono(12.0))
                     .color(muted()),
             );
@@ -264,7 +283,7 @@ fn banners(ui: &mut Ui, batch: &tr_data::price_alerts::AlertBatch, offline: bool
     if batch.sample || offline {
         ui.label(
             RichText::new(
-                "Sample / offline mode: price, VWAP, and setup alerts are not invented and never enter research.",
+                "Sample / offline mode: price, VWAP, RVOL, and setup alerts are not invented and never enter research.",
             )
             .font(ui_font(12.0))
             .color(theme::down()),
@@ -383,5 +402,23 @@ mod tests {
             "watching a VWAP cross opens the alerts pane"
         );
         assert!(!app.status.contains("price level"));
+    }
+
+    #[test]
+    fn rvol_form_watches_a_multiple_without_inventing_one() {
+        let ctx = egui::Context::default();
+        let mut app = test_app();
+        app.alert_draft.symbol = "AAPL".into();
+        let shapes = paint(&ctx, &mut app, vec![]);
+        assert!(galley_contains(&shapes, "AAPL ALERT RVOL 2"));
+        click(&ctx, &mut app, &shapes, "RVOL");
+        assert_eq!(app.alert_draft.mode, AlertDraftMode::Rvol);
+        assert!(app.draft_kind().is_err(), "an empty multiple is not a default of 2");
+        app.alert_draft.level = "2".into();
+        assert_eq!(app.draft_kind().unwrap(), AlertKind::Rvol { multiple: 2.0 });
+        let shapes = paint(&ctx, &mut app, vec![]);
+        click(&ctx, &mut app, &shapes, "WATCH");
+        assert!(app.panes.iter().any(|p| matches!(p.kind, super::super::PaneKind::Alerts)));
+        assert!(!app.status.contains("multiple"));
     }
 }
