@@ -2,6 +2,7 @@
 
 use egui::{RichText, ScrollArea, Sense, Ui};
 use tr_data::price_alerts::{AlertKind, PriceSide, SetupChange};
+use tr_data::session_alerts::SessionSignal;
 use tr_data::whats_news::SETUPS;
 
 use super::TerminalApp;
@@ -15,6 +16,7 @@ pub enum AlertDraftMode {
     Vwap,
     Rvol,
     Setup,
+    Session,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -25,6 +27,7 @@ pub struct AlertDraft {
     pub level: String,
     pub setup: String,
     pub change: SetupChange,
+    pub signal: SessionSignal,
 }
 
 impl Default for AlertDraft {
@@ -36,6 +39,7 @@ impl Default for AlertDraft {
             level: String::new(),
             setup: "NEAR_HIGH".into(),
             change: SetupChange::Enter,
+            signal: SessionSignal::Path,
         }
     }
 }
@@ -101,6 +105,9 @@ impl TerminalApp {
             if ui.selectable_label(self.alert_draft.mode == AlertDraftMode::Setup, "Setup").clicked() {
                 self.alert_draft.mode = AlertDraftMode::Setup;
             }
+            if ui.selectable_label(self.alert_draft.mode == AlertDraftMode::Session, "Session").clicked() {
+                self.alert_draft.mode = AlertDraftMode::Session;
+            }
             match self.alert_draft.mode {
                 AlertDraftMode::Price => {
                     if ui.selectable_label(self.alert_draft.side == PriceSide::Above, "above").clicked() {
@@ -145,6 +152,19 @@ impl TerminalApp {
                         }
                     }
                 }
+                AlertDraftMode::Session => {
+                    for (signal, label) in [
+                        (SessionSignal::Path, "Path"),
+                        (SessionSignal::Pace, "Pace"),
+                        (SessionSignal::Gap, "Gap"),
+                        (SessionSignal::Extreme, "Extreme"),
+                        (SessionSignal::Relative, "vs SPY"),
+                    ] {
+                        if ui.selectable_label(self.alert_draft.signal == signal, label).clicked() {
+                            self.alert_draft.signal = signal;
+                        }
+                    }
+                }
             }
             if ui.button(RichText::new("WATCH").font(mono(11.5))).clicked() {
                 match self.draft_kind() {
@@ -158,7 +178,7 @@ impl TerminalApp {
         });
         ui.label(
             RichText::new(
-                "AAPL ALERT 150 · AAPL ALERT VWAP · AAPL ALERT RVOL 2 · NVDA ALERT SETUP NEAR_HIGH · click a fired row for the chart",
+                "AAPL ALERT 150 · AAPL ALERT VWAP · AAPL ALERT RVOL 2 · AAPL ALERT PATH · AAPL ALERT PACE · AAPL ALERT GAP · AAPL ALERT XTRM · AAPL ALERT RPATH · NVDA ALERT SETUP NEAR_HIGH · click a fired row for the chart",
             )
             .font(ui_font(11.0))
             .color(muted()),
@@ -188,12 +208,15 @@ impl TerminalApp {
                     .ok_or_else(|| "Pick a SCAN setup".to_string())?;
                 Ok(AlertKind::Setup { setup, change: self.alert_draft.change })
             }
+            AlertDraftMode::Session => Ok(AlertKind::Session { signal: self.alert_draft.signal }),
         }
     }
 
     fn alert_rules(&mut self, ui: &mut Ui) {
         if self.price_alerts.rules.is_empty() {
-            ui.label(RichText::new("No price, VWAP, RVOL, or setup rules yet.").font(mono(12.0)).color(muted()));
+            ui.label(
+                RichText::new("No price, VWAP, RVOL, session, or setup rules yet.").font(mono(12.0)).color(muted()),
+            );
             return;
         }
         let rules = self.price_alerts.rules.clone();
@@ -225,9 +248,11 @@ impl TerminalApp {
     fn alert_events(&mut self, ui: &mut Ui, out: &mut Vec<Action>) {
         if self.price_alerts.events.is_empty() {
             ui.label(
-                RichText::new("No price, VWAP, RVOL, or setup alerts have fired. Sample bars never invent them.")
-                    .font(mono(12.0))
-                    .color(muted()),
+                RichText::new(
+                    "No price, VWAP, RVOL, session, or setup alerts have fired. Sample bars never invent them.",
+                )
+                .font(mono(12.0))
+                .color(muted()),
             );
             return;
         }
@@ -420,5 +445,25 @@ mod tests {
         click(&ctx, &mut app, &shapes, "WATCH");
         assert!(app.panes.iter().any(|p| matches!(p.kind, super::super::PaneKind::Alerts)));
         assert!(!app.status.contains("multiple"));
+    }
+
+    #[test]
+    fn session_form_watches_pace_without_a_level() {
+        let ctx = egui::Context::default();
+        let mut app = test_app();
+        app.alert_draft.symbol = "AAPL".into();
+        let shapes = paint(&ctx, &mut app, vec![]);
+        assert!(galley_contains(&shapes, "AAPL ALERT PATH"));
+        click(&ctx, &mut app, &shapes, "Session");
+        assert_eq!(app.alert_draft.mode, AlertDraftMode::Session);
+        let shapes = paint(&ctx, &mut app, vec![]);
+        click(&ctx, &mut app, &shapes, "Pace");
+        assert_eq!(
+            app.draft_kind().unwrap(),
+            AlertKind::Session { signal: tr_data::session_alerts::SessionSignal::Pace }
+        );
+        let shapes = paint(&ctx, &mut app, vec![]);
+        click(&ctx, &mut app, &shapes, "WATCH");
+        assert!(app.panes.iter().any(|p| matches!(p.kind, super::super::PaneKind::Alerts)));
     }
 }

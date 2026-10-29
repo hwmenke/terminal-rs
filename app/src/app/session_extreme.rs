@@ -3,6 +3,7 @@ use super::{PaneKind, TerminalApp};
 use crate::theme::{self, amber, mono, muted, text, ui_font};
 use crate::{congress_view::Action, dock::PaneId, worker::Request};
 use egui::{Align2, Color32, Rect, RichText, Sense, Stroke, Ui, pos2, vec2};
+use tr_data::cash_session::{letter_bar_token, window_count_token, without_letter_bar_tokens};
 use tr_data::session_extreme::{self, ExtremePoint, SessionExtreme};
 
 pub struct SessionExtremePane {
@@ -136,8 +137,8 @@ impl TerminalApp {
             });
             ui.horizontal_wrapped(|ui| {
                 for (label, line) in [("10", "10"), ("20", "20"), ("40", "40"), ("60", "60")] {
-                    if ui.selectable_label(spec_count(&pane.spec) == Some(line), label).clicked() {
-                        pane.spec = match spec_bar_size(&pane.spec) {
+                    if ui.selectable_label(window_count_token(&pane.spec) == Some(line), label).clicked() {
+                        pane.spec = match letter_bar_token(&pane.spec) {
                             Some(tf) => format!("{line} {tf}"),
                             None => line.into(),
                         };
@@ -147,7 +148,7 @@ impl TerminalApp {
                 for label in ["1m", "5m", "15m", "30m", "1H"] {
                     if ui.selectable_label(pane.tf.eq_ignore_ascii_case(label), label).clicked() {
                         pane.tf = label.into();
-                        pane.spec = drop_bar_sizes(&pane.spec);
+                        pane.spec = without_letter_bar_tokens(&pane.spec);
                         reload = true;
                     }
                 }
@@ -337,22 +338,6 @@ fn summary_line(extreme: &SessionExtreme) -> String {
 
 fn rate_pct(value: f64) -> String {
     format!("{:.0}%", value * 100.0)
-}
-
-fn spec_count(spec: &str) -> Option<&str> {
-    spec.split_whitespace().find(|token| token.chars().all(|c| c.is_ascii_digit()))
-}
-
-fn spec_bar_size(spec: &str) -> Option<&str> {
-    spec.split_whitespace()
-        .find(|token| token.chars().any(|c| c.is_ascii_digit()) && token.chars().any(|c| c.is_ascii_alphabetic()))
-}
-
-fn drop_bar_sizes(spec: &str) -> String {
-    spec.split_whitespace()
-        .filter(|token| !(token.chars().any(|c| c.is_ascii_digit()) && token.chars().any(|c| c.is_ascii_alphabetic())))
-        .collect::<Vec<_>>()
-        .join(" ")
 }
 
 #[cfg(test)]
