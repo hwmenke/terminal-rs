@@ -153,6 +153,8 @@ pub struct ChartState {
     pub show_rs: bool,
     /// Volume-ratio HUD (this bar / prior 20, plus 5/20).
     pub show_volume_ctx: bool,
+    /// Pre-market and after-hours bars for a US cash intraday chart. Session-only.
+    pub extended: bool,
     pub indicators: Vec<IndicatorSpec>,
     pub drawings: Vec<Drawing>,
     /// Drawings for names this pane has visited, keyed by canonical security.
@@ -239,6 +241,7 @@ impl ChartState {
             show_box: false,
             show_rs: false,
             show_volume_ctx: false,
+            extended: false,
             indicators: crate::command::default_indicators(),
             drawings: Vec::new(),
             drawing_store: AnnotationStore::new(),
@@ -368,13 +371,23 @@ impl ChartState {
             });
             return;
         }
-        w.send(Request::History {
-            pane: self.id,
-            generation: self.generation,
-            symbol: self.symbol.clone(),
-            tf: self.tf,
-            limit: initial_limit(self.tf),
-        });
+        if self.extended && self.offers_extended() {
+            w.send(Request::ExtendedHistory {
+                pane: self.id,
+                generation: self.generation,
+                symbol: self.symbol.clone(),
+                tf: self.tf,
+                limit: initial_limit(self.tf),
+            });
+        } else {
+            w.send(Request::History {
+                pane: self.id,
+                generation: self.generation,
+                symbol: self.symbol.clone(),
+                tf: self.tf,
+                limit: initial_limit(self.tf),
+            });
+        }
         if self.sec.has_congress_trades() {
             w.send(Request::Markers { pane: self.id, symbol: self.symbol.clone() });
         }
@@ -902,7 +915,27 @@ impl ChartState {
             self.chart_type = ChartType::ALL[i];
             clicked = true;
         }
+        if self.offers_extended() {
+            ui.add_space(8.0);
+            if ui
+                .checkbox(&mut self.extended, "Ext")
+                .on_hover_text(
+                    "Pre-market and after-hours bars from the provider. Regular-session VWAP and the scan stay on the cash session. A missing print is not filled in.",
+                )
+                .changed()
+            {
+                self.load(w);
+                clicked = true;
+            }
+        }
         clicked
+    }
+
+    /// US cash names on a native intraday interval. 4h is aggregated, so it stays on the regular session.
+    fn offers_extended(&self) -> bool {
+        !self.archive
+            && matches!(self.tf, Timeframe::M1 | Timeframe::M5 | Timeframe::M15 | Timeframe::M30 | Timeframe::H1)
+            && matches!(self.sec.class, AssetClass::Equity | AssetClass::Etf | AssetClass::Index)
     }
 
     pub fn show(&mut self, ui: &mut Ui, rect: Rect, focused: bool, w: &Worker) -> bool {
@@ -1140,6 +1173,7 @@ impl ChartState {
                     tf: self.tf,
                     existing: self.bars.clone(),
                     limit: initial_limit(self.tf),
+                    extended: self.extended && self.offers_extended(),
                 });
             }
         }
@@ -1511,6 +1545,18 @@ impl ChartState {
         ui.checkbox(&mut self.log, "Log Scale");
         ui.checkbox(&mut self.magnet, "Magnet");
         ui.checkbox(&mut self.show_volume, "Volume");
+        if self.offers_extended() {
+            if ui
+                .checkbox(&mut self.extended, "Extended hours")
+                .on_hover_text(
+                    "Pre-market and after-hours bars from the provider. The regular-session cache is not used, and sample bars are not substituted.",
+                )
+                .changed()
+            {
+                self.load(w);
+                ui.close();
+            }
+        }
         ui.separator();
         ui.label(RichText::new("Review overlays").small().color(muted()));
         ui.checkbox(&mut self.show_box, "Box levels")
@@ -1653,6 +1699,11 @@ impl ChartState {
         let mut ly = y + 16.0;
         if let Some(line) = session_line(self.tf, &self.sec, &self.bars) {
             p.text(pos2(price_rect.left() + 6.0, ly), Align2::LEFT_TOP, line, mono(11.0), muted());
+            ly += 14.0;
+        }
+        if self.extended && self.offers_extended() {
+            let line = tr_data::intraday::extended_summary(&self.bars);
+            p.text(pos2(price_rect.left() + 6.0, ly), Align2::LEFT_TOP, line, mono(11.0), amber());
             ly += 14.0;
         }
         if let Some(line) = &self.earnings {
@@ -2375,6 +2426,55 @@ mod tests {
         assert!(!contains_text(&output.shapes, "Alert above session VWAP"));
         assert!(!contains_text(&output.shapes, "Alert below session VWAP"));
         assert!(!contains_text(&output.shapes, "Alert at 2× session RVOL"));
+    }
+
+    #[test]
+    fn extended_hours_toggle_asks_for_pre_and_post_and_names_the_bars() {
+        fn wall(y: i32, m: u32, d: u32, h: u32, min: u32) -> i64 {
+            tr_core::ny::to_utc(chrono::NaiveDate::from_ymd_opt(y, m, d).unwrap().and_hms_opt(h, min, 0).unwrap())
+        }
+        let ctx = egui::Context::default();
+        let (worker, mut requests) = Worker::test_channel();
+        let mut chart = ChartState::new(7, "AAPL", Timeframe::M5);
+        let output = chart_frame(&ctx, &mut chart, &worker, vec![]);
+        assert!(contains_text(&output.shapes, "Ext"));
+        let pos = text_position(&output.shapes, "Ext");
+        chart_frame(
+            &ctx,
+            &mut chart,
+            &worker,
+            vec![egui::Event::PointerMoved(pos), pointer(pos, egui::PointerButton::Primary, true)],
+        );
+        chart_frame(&ctx, &mut chart, &worker, vec![pointer(pos, egui::PointerButton::Primary, false)]);
+        assert!(chart.extended);
+        assert!(matches!(
+            requests.try_recv(),
+            Ok(crate::worker::Request::ExtendedHistory { ref symbol, tf, .. })
+                if symbol == "AAPL US Equity" && tf == Timeframe::M5
+        ));
+
+        let mut fx = ChartState::new(8, "EURUSD", Timeframe::M5);
+        let output = chart_frame(&ctx, &mut fx, &worker, vec![]);
+        assert!(!contains_text(&output.shapes, "Ext"));
+        let mut daily = ChartState::new(9, "AAPL", Timeframe::D1);
+        let output = chart_frame(&ctx, &mut daily, &worker, vec![]);
+        assert!(!contains_text(&output.shapes, "Ext"));
+
+        let bar = |ts, close| {
+            tr_core::Bar::new(ts, close, close + 1.0, close - 1.0, close, 10.0)
+                .with_provenance(tr_core::Provenance::Real)
+        };
+        let bars = std::sync::Arc::new(vec![
+            bar(wall(2026, 3, 9, 8, 0), 2.0),
+            bar(wall(2026, 3, 9, 9, 30), 3.5),
+            bar(wall(2026, 3, 9, 16, 0), 5.5),
+        ]);
+        chart.on_history(chart.generation, bars.clone(), SeriesGpu::build(&bars), 0, false, true, false, &worker);
+        let output = chart_frame(&ctx, &mut chart, &worker, vec![]);
+        assert!(contains_text(&output.shapes, "Extended hours: 1 pre-market · 1 after hours"));
+        chart.extended = false;
+        let output = chart_frame(&ctx, &mut chart, &worker, vec![]);
+        assert!(!contains_text(&output.shapes, "Extended hours: 1 pre-market · 1 after hours"));
     }
 
     #[test]

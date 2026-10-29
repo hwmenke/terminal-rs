@@ -117,6 +117,28 @@ pub fn regular_only(bars: Vec<Bar>) -> Vec<Bar> {
     bars.into_iter().filter(|b| in_regular_session(b.ts)).collect()
 }
 
+/// Pre-market, regular session, or after hours. Overnight and closed days are not.
+pub fn in_extended_session(ts: i64) -> bool {
+    matches!(phase(ts), Phase::Pre | Phase::Regular | Phase::Post)
+}
+
+/// Keep bars the cash clock calls pre-market, regular, or after hours.
+/// OHLC is unchanged. Nothing is inserted for a missing print.
+pub fn keep_extended(bars: Vec<Bar>) -> Vec<Bar> {
+    bars.into_iter().filter(|b| in_extended_session(b.ts)).collect()
+}
+
+/// How many kept bars sit outside the regular session. Zero is reported as no bars, not as a price.
+pub fn extended_summary(bars: &[Bar]) -> String {
+    let pre = bars.iter().filter(|b| phase(b.ts) == Phase::Pre).count();
+    let post = bars.iter().filter(|b| phase(b.ts) == Phase::Post).count();
+    if pre == 0 && post == 0 {
+        "Extended hours: no pre-market or after-hours bars in this read.".into()
+    } else {
+        format!("Extended hours: {pre} pre-market · {post} after hours")
+    }
+}
+
 fn step_minutes(tf: Timeframe) -> Option<u32> {
     match tf {
         Timeframe::M1 => Some(1),
@@ -567,6 +589,23 @@ mod tests {
         let early = [bar(wall(2026, 11, 27, 9, 30), 1.0), bar(wall(2026, 11, 27, 12, 30), 1.0)];
         let missing = session_holes(Timeframe::H1, &early);
         assert_eq!(missing, vec![wall(2026, 11, 27, 10, 30), wall(2026, 11, 27, 11, 30)]);
+    }
+
+    #[test]
+    fn extended_hours_keep_pre_and_post_and_drop_the_overnight() {
+        let pre = Bar::new(wall(2026, 3, 9, 8, 0), 1.5, 2.5, 0.5, 2.0, 10.0).with_provenance(Provenance::Real);
+        let regular = Bar::new(wall(2026, 3, 9, 9, 30), 3.0, 4.0, 2.0, 3.5, 20.0).with_provenance(Provenance::Real);
+        let post = Bar::new(wall(2026, 3, 9, 16, 0), 5.0, 6.0, 4.0, 5.5, 7.0).with_provenance(Provenance::Real);
+        let early_post = Bar::new(wall(2026, 11, 27, 13, 0), 8.0, 8.0, 8.0, 8.0, 1.0).with_provenance(Provenance::Real);
+        let overnight = bar(wall(2026, 3, 9, 3, 0), 9.0);
+        let closed = bar(wall(2026, 3, 9, 20, 0), 9.0);
+        let sunday = bar(wall(2026, 3, 8, 18, 0), 9.0);
+        let kept = keep_extended(vec![pre, overnight, regular, post, closed, sunday, early_post]);
+        assert_eq!(kept, vec![pre, regular, post, early_post]);
+        assert_eq!(kept[0].close, 2.0);
+        assert_eq!(extended_summary(&kept), "Extended hours: 1 pre-market · 2 after hours");
+        assert_eq!(extended_summary(&[regular]), "Extended hours: no pre-market or after-hours bars in this read.");
+        assert!(regular_only(vec![pre, regular, post]).iter().all(|b| b.ts == regular.ts));
     }
 
     #[test]

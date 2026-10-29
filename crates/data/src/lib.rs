@@ -362,6 +362,18 @@ pub trait MarketData: Send + Sync {
     /// oldest bar already held.
     async fn history(&self, symbol: &str, tf: Timeframe, end: Option<i64>, limit: usize) -> Result<Vec<Bar>>;
 
+    /// Pre-market, regular, and after-hours bars for a US cash name.
+    /// The default has none, so sample bars are not painted as an extended session.
+    async fn extended_history(
+        &self,
+        symbol: &str,
+        _tf: Timeframe,
+        _end: Option<i64>,
+        _limit: usize,
+    ) -> Result<Vec<Bar>> {
+        anyhow::bail!("no extended-hours bars for {symbol}")
+    }
+
     /// Entry point for research, scans, statistics and backtests: never compute with
     /// fallback or unverified prices. Display the returned error instead of analysis results.
     async fn history_for_analysis(
@@ -489,6 +501,11 @@ impl<P: MarketData> MarketData for Fallback<P> {
                 self.sample.history(symbol, tf, end, limit).await
             }
         }
+    }
+
+    async fn extended_history(&self, symbol: &str, tf: Timeframe, end: Option<i64>, limit: usize) -> Result<Vec<Bar>> {
+        // A failed extended read stays an error. Sample bars are not an extended session.
+        self.primary.extended_history(symbol, tf, end, limit).await
     }
 
     async fn quotes(&self, symbols: &[String]) -> Result<Vec<Quote>> {
