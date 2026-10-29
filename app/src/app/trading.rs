@@ -2474,4 +2474,78 @@ mod tests {
         assert_eq!(app.demo.book.held("AAPL"), 2.0);
         assert!(app.status.contains("last print is stale"), "{}", app.status);
     }
+
+    fn rest_gtc_limit(app: &mut crate::app::TerminalApp) {
+        let order = app
+            .demo
+            .book
+            .submit(
+                &OrderRequest {
+                    account_id: demo::ACCOUNT_ID.into(),
+                    symbol: "AAPL".into(),
+                    side: Side::Buy,
+                    order_type: OrderType::Limit,
+                    time_in_force: TimeInForce::Gtc,
+                    amount: Amount::Units(1.0),
+                    limit: Some(100.0),
+                    stop: None,
+                },
+                Some(150.0),
+                chrono::Utc::now(),
+            )
+            .unwrap();
+        assert_eq!(order.status, "PENDING");
+    }
+
+    #[test]
+    fn a_stale_or_closed_quote_does_not_fill_a_resting_order() {
+        let mut app = test_app();
+        app.demo
+            .book
+            .submit(
+                &OrderRequest {
+                    account_id: demo::ACCOUNT_ID.into(),
+                    symbol: "AAPL".into(),
+                    side: Side::Buy,
+                    order_type: OrderType::Market,
+                    time_in_force: TimeInForce::Day,
+                    amount: Amount::Units(1.0),
+                    limit: None,
+                    stop: None,
+                },
+                Some(150.0),
+                chrono::Utc::now(),
+            )
+            .unwrap();
+        rest_gtc_limit(&mut app);
+        assert_eq!(app.demo.book.positions[0].price, Some(150.0));
+        app.quotes.insert("AAPL US Equity".into(), aapl_quote(1_700_000_000, 90.0, tr_data::Provenance::Real));
+        app.demo_on_quotes(&["AAPL US Equity".into()]);
+        assert_eq!(app.demo.book.held("AAPL"), 1.0, "the resting limit stays unfilled");
+        assert_eq!(app.demo.book.positions[0].price, Some(150.0), "a stale print does not reprice the position");
+        assert!(app.demo.book.orders.iter().any(|o| o.status == "PENDING" && o.limit_price == Some(100.0)));
+
+        let mut sample = test_app();
+        rest_gtc_limit(&mut sample);
+        sample.quotes.insert("AAPL US Equity".into(), aapl_quote(1_700_000_000, 90.0, tr_data::Provenance::Sample));
+        sample.demo_on_quotes(&["AAPL US Equity".into()]);
+        assert_eq!(sample.demo.book.held("AAPL"), 1.0, "sample quotes stay on the existing demo path");
+        assert!(sample.demo.book.orders.iter().any(|o| o.status == "EXECUTED"));
+
+        let mut clock = test_app();
+        rest_gtc_limit(&mut clock);
+        let now = chrono::Utc::now().timestamp();
+        let ts = tr_data::intraday::regular_bucket(tr_core::Timeframe::M1, now).unwrap_or(now);
+        clock.quotes.insert("AAPL US Equity".into(), aapl_quote(ts, 90.0, tr_data::Provenance::Real));
+        clock.demo_on_quotes(&["AAPL US Equity".into()]);
+        let blocked =
+            tr_data::intraday::market_order_block(tr_core::AssetClass::Equity, tr_data::Provenance::Real, ts, now);
+        if blocked.is_none() {
+            assert_eq!(clock.demo.book.held("AAPL"), 1.0);
+            assert!(clock.demo.book.orders.iter().all(|o| o.status == "EXECUTED"));
+        } else {
+            assert_eq!(clock.demo.book.held("AAPL"), 0.0);
+            assert!(clock.demo.book.orders.iter().any(|o| o.status == "PENDING"));
+        }
+    }
 }

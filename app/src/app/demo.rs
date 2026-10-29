@@ -148,6 +148,8 @@ impl TerminalApp {
     }
 
     /// New quotes arrived: mark demo positions and fill resting demo orders they cross.
+    /// A verified print the intraday clock calls stale or closed is not applied, so a
+    /// working limit or stop cannot fill at a price the ticket would refuse.
     pub(super) fn demo_on_quotes(&mut self, keys: &[String]) {
         let now = chrono::Utc::now();
         // Expire overdue Day orders before any quote can fill them.
@@ -155,8 +157,14 @@ impl TerminalApp {
         let mut touched = !events.is_empty();
         for sym in self.demo.book.watched() {
             let Some(k) = market_key(&sym).filter(|k| keys.contains(k)) else { continue };
-            let Some(q) = self.quotes.get(&k).map(|q| q.last).filter(|x| x.is_finite() && *x > 0.0) else { continue };
-            events.extend(self.demo.book.on_price(&sym, q, now));
+            let Some(q) = self.quotes.get(&k) else { continue };
+            if !q.last.is_finite() || q.last <= 0.0 {
+                continue;
+            }
+            if self.market_print_block(&k).is_some() {
+                continue;
+            }
+            events.extend(self.demo.book.on_price(&sym, q.last, now));
             touched = true;
         }
         if touched {
