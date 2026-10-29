@@ -6,13 +6,13 @@
 //! bucket does not vote, and a later bar is never used as the open.
 
 use std::collections::BTreeMap;
-use std::str::FromStr;
 
-use chrono::{NaiveDate, Timelike};
+use chrono::NaiveDate;
 use serde::{Deserialize, Serialize};
-use tr_core::{AssetClass, Bar, Provenance, Security, Timeframe};
+use tr_core::{Bar, Provenance, Timeframe};
 
-use crate::intraday::{self, regular_bucket, regular_opens};
+use crate::cash_session::{self, OpenPrint};
+use crate::intraday::regular_opens;
 use crate::security;
 
 /// Prior sessions requested when the command does not name a count.
@@ -22,14 +22,7 @@ pub const MIN_SAMPLES: usize = 5;
 pub const MAX_WINDOW: usize = 60;
 
 pub fn fetch_limit(tf: Timeframe) -> usize {
-    match tf {
-        Timeframe::M1 => 8_000,
-        Timeframe::M5 => 5_000,
-        Timeframe::M15 => 2_000,
-        Timeframe::M30 => 1_200,
-        Timeframe::H1 => 600,
-        _ => 0,
-    }
+    cash_session::research_fetch_limit(tf)
 }
 
 pub fn supported_timeframe(tf: Timeframe) -> bool {
@@ -80,65 +73,19 @@ pub struct SessionPath {
 /// `spec` is the text after the command (`20 15m`). A bar size there wins over `tf_field`.
 /// A bare number is how many prior sessions to keep. `5` is five sessions, not five-minute bars.
 pub fn parse_query(spec: &str, tf_field: &str) -> Result<PathQuery, String> {
-    let tokens: Vec<&str> = spec.split_whitespace().collect();
-    let mut window: Option<usize> = None;
-    let mut from_spec: Option<Timeframe> = None;
-    for token in tokens {
-        if token.chars().all(|c| c.is_ascii_digit()) {
-            let n: usize = token.parse().map_err(|_| format!("Unknown session count '{token}'."))?;
-            if window.is_some() {
-                return Err("The path lists two session counts.".into());
-            }
-            if !(MIN_SAMPLES..=MAX_WINDOW).contains(&n) {
-                return Err(format!("Use {MIN_SAMPLES} to {MAX_WINDOW} prior sessions."));
-            }
-            window = Some(n);
-            continue;
-        }
-        if token.chars().any(|c| c.is_ascii_digit()) {
-            let tf = Timeframe::from_str(token).map_err(|e| e)?;
-            if !supported_timeframe(tf) {
-                return Err(format!("{} is not a bar size for this path. Use 1m, 5m, 15m, 30m, or 1h.", tf.label()));
-            }
-            if let Some(prev) = from_spec
-                && prev != tf
-            {
-                return Err("The path lists two bar sizes.".into());
-            }
-            from_spec = Some(tf);
-            continue;
-        }
-        return Err(format!("Unrecognised path argument '{token}'."));
-    }
-    let timeframe = match from_spec {
-        Some(tf) => tf,
-        None if tf_field.trim().is_empty() => Timeframe::M5,
-        None => {
-            let tf = Timeframe::from_str(tf_field.trim()).map_err(|_| format!("Unknown bar size '{tf_field}'."))?;
-            if !supported_timeframe(tf) {
-                return Err(format!("{} is not a bar size for this path. Use 1m, 5m, 15m, 30m, or 1h.", tf.label()));
-            }
-            tf
-        }
-    };
-    Ok(PathQuery { window: window.unwrap_or(DEFAULT_WINDOW), timeframe })
+    let query =
+        cash_session::parse_window(spec, tf_field, cash_session::PATH, MIN_SAMPLES, MAX_WINDOW, DEFAULT_WINDOW)?;
+    Ok(PathQuery { window: query.window, timeframe: query.timeframe })
 }
 
 pub fn build_path(symbol: &str, bars: &[Bar], query: &PathQuery, source: &str) -> Result<SessionPath, String> {
-    if !supported_timeframe(query.timeframe) {
-        return Err(format!(
-            "{} is not a bar size for this path. Use 1m, 5m, 15m, 30m, or 1h.",
-            query.timeframe.label()
-        ));
-    }
-    if !(MIN_SAMPLES..=MAX_WINDOW).contains(&query.window) {
-        return Err(format!("Use {MIN_SAMPLES} to {MAX_WINDOW} prior sessions."));
-    }
+    cash_session::require_bar_size(query.timeframe, cash_session::PATH.place)?;
+    cash_session::require_window(query.window, MIN_SAMPLES, MAX_WINDOW)?;
     let sec = security(symbol);
     if symbol.trim().is_empty() || !tr_core::security::looks_like_ticker(&sec.ticker) {
         return Err("SPATH needs a ticker (AAPL SPATH).".into());
     }
-    if !is_cash(&sec) {
+    if !cash_session::is_cash(&sec) {
         return Err(format!("{} has no US cash session.", sec.ticker));
     }
     if bars.is_empty() {
@@ -146,12 +93,7 @@ pub fn build_path(symbol: &str, bars: &[Bar], query: &PathQuery, source: &str) -
     }
     Bar::require_verified(bars, "Session path")?;
     let tf = query.timeframe;
-    let mut by_day: BTreeMap<NaiveDate, Vec<&Bar>> = BTreeMap::new();
-    for bar in bars {
-        if regular_bucket(tf, bar.ts).is_some() {
-            by_day.entry(tr_core::ny::civil(bar.ts).date()).or_default().push(bar);
-        }
-    }
+    let by_day = cash_session::sessions(tf, bars);
     let Some((&today_date, today_bars)) = by_day.iter().next_back() else {
         return Err(format!("{} has no regular-session bars. A premarket print is not the open.", sec.ticker));
     };
@@ -239,33 +181,26 @@ enum SessionBuild {
     Skip(String),
 }
 
-fn draft_session(tf: Timeframe, date: NaiveDate, bars: &[&Bar]) -> SessionBuild {
-    let mut grouped: BTreeMap<i64, Vec<&Bar>> = BTreeMap::new();
-    for bar in bars {
-        if let Some(bucket) = regular_bucket(tf, bar.ts) {
-            grouped.entry(bucket).or_default().push(*bar);
-        }
-    }
+fn draft_session(tf: Timeframe, date: NaiveDate, grouped: &BTreeMap<i64, Vec<&Bar>>) -> SessionBuild {
     let Some(open_ts) = regular_opens(date, tf).into_iter().next() else {
-        return SessionBuild::Skip(format!("{date} has no cash grid."));
+        return SessionBuild::Skip(cash_session::no_cash_grid(date));
     };
-    let Some(open_bars) = grouped.get(&open_ts) else {
-        return SessionBuild::Skip(format!("{date}: 09:30 open is missing. A later bar is not used as the open."));
+    let session_open = match cash_session::open_print(grouped, open_ts) {
+        OpenPrint::Missing => return SessionBuild::Skip(cash_session::open_missing(date)),
+        OpenPrint::Ambiguous => return SessionBuild::Skip(cash_session::open_ambiguous(date)),
+        OpenPrint::One(bar) if !cash_session::usable_price(bar) => {
+            return SessionBuild::Skip(cash_session::open_unusable(date));
+        }
+        OpenPrint::One(bar) => bar.open,
     };
-    if open_bars.len() != 1 {
-        return SessionBuild::Skip(format!("{date}: 09:30 open is ambiguous (more than one print)."));
-    }
-    if !usable(open_bars[0]) {
-        return SessionBuild::Skip(format!("{date}: 09:30 open is not a positive finite price."));
-    }
-    let session_open = open_bars[0].open;
     let mut values = BTreeMap::new();
-    for (ts, bucket) in &grouped {
-        if bucket.len() == 1 && usable(bucket[0]) {
-            let pct = (bucket[0].close / session_open - 1.0) * 100.0;
-            if pct.is_finite()
-                && let Some(minute) = minute_offset(*ts)
-            {
+    for ts in regular_opens(date, tf) {
+        let Some(bar) = cash_session::one_print(grouped, ts) else { continue };
+        if cash_session::usable_price(bar)
+            && let Some(minute) = cash_session::minute_offset(ts)
+        {
+            let pct = (bar.close / session_open - 1.0) * 100.0;
+            if pct.is_finite() {
                 values.insert(minute, pct);
             }
         }
@@ -277,7 +212,7 @@ fn assemble(tf: Timeframe, date: NaiveDate, today: &DayPath, priors: &[DayPath])
     regular_opens(date, tf)
         .into_iter()
         .filter_map(|ts| {
-            let minute = minute_offset(ts)?;
+            let minute = cash_session::minute_offset(ts)?;
             let today_pct = today.values.get(&minute).copied();
             let samples: Vec<f64> = priors.iter().filter_map(|day| day.values.get(&minute).copied()).collect();
             let summary = summarize(&samples);
@@ -320,40 +255,16 @@ fn percentile(sorted: &[f64], p: f64) -> f64 {
     sorted[idx.min(sorted.len() - 1)]
 }
 
-fn minute_offset(ts: i64) -> Option<u32> {
-    if !intraday::in_regular_session(ts) {
-        return None;
-    }
-    let wall = tr_core::ny::civil(ts);
-    Some(wall.hour() * 60 + wall.minute() - intraday::OPEN_MIN)
-}
-
-fn usable(bar: &Bar) -> bool {
-    bar.open.is_finite()
-        && bar.open > 0.0
-        && bar.close.is_finite()
-        && bar.close > 0.0
-        && bar.high.is_finite()
-        && bar.low.is_finite()
-        && bar.high + 1e-9 >= bar.low
-        && bar.high + 1e-9 >= bar.open
-        && bar.high + 1e-9 >= bar.close
-        && bar.low <= bar.open + 1e-9
-        && bar.low <= bar.close + 1e-9
-}
-
-fn is_cash(sec: &Security) -> bool {
-    matches!(sec.class, AssetClass::Equity | AssetClass::Etf | AssetClass::Index)
-}
-
 pub fn clock_label(ts: i64) -> String {
-    tr_core::ny::civil(ts).format("%H:%M").to_string()
+    cash_session::clock_label(ts)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cash_session::minute_offset;
     use crate::history::calendar::is_session;
+    use crate::intraday;
     use chrono::{Duration, NaiveDate};
 
     fn sessions(n: usize) -> Vec<NaiveDate> {
