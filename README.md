@@ -262,6 +262,11 @@ gets the native title bar with traffic lights, window vibrancy behind the sideba
   traded back through that close by the same minute. A hole ends the known
   path. The rate past the last print is not a forecast. Sample bars are
   refused. See [Gap fill](docs/GAP_FILL.md).
+- **Session extreme** — `XTRM` (or `AAPL XTRM 20 15m`) shows when the high and
+  the low of the cash session print. The minute is the first print of that
+  extreme. Only a complete session votes. Today's marker is the running high
+  and low so far. Sample bars are refused. See
+  [Session extreme](docs/SESSION_EXTREME.md).
 - **Historical lookalikes** — `LOOKALIKE` (or `AAPL LOOKALIKE`, `AAPL KNN
   2024-01-15`) finds past sessions whose backward-looking features match the
   query date (standardized Euclidean distance), shows **per-horizon completed /
@@ -422,6 +427,7 @@ Settings › Hotkeys. On Linux and Windows ⌘ is Ctrl and ⌥ is Alt.
 | `BRD` · `AAPL BRD MSFT NVDA` · `BRD 15m` · `NEW BRD` | Share of a list at or above each 09:30 open and session VWAP |
 | `VPACE` · `AAPL VPACE 20 15m` · `NEW VPACE` | Cumulative volume versus the usual pace of prior sessions |
 | `GFILL` · `AAPL GFILL 40 15m` · `NEW GFILL` | Open versus the prior cash close, and how often that gap had filled |
+| `XTRM` · `AAPL XTRM 20 15m` · `NEW XTRM` | When the session high and low print |
 | `NEWS` · `AAPL CN` · `TOP` · `BTCUSD CRNCY OB` · `WEI` · `GC` | watchlist news · one name · top headlines · order book · markets · curve |
 | `CONG` · `NVDA CONG` · `POL PELOSI` · `TRACK PELOSI` · `ALERTS` · `REFRESH` | Congress feed · who traded it · profile · track · alerts · refresh |
 | `AAPL ALERT 150` · `AAPL ALERT BELOW 140` · `NVDA ALERT SETUP NEAR_HIGH` · `UNALERT AAPL` | Price/setup alerts (click a fired row to open the chart) |
