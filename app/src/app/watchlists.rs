@@ -1186,10 +1186,21 @@ mod tests {
                 week_52_low: None,
                 market_cap: None,
                 trailing_pe: None,
+                earnings_ts: Some(
+                    chrono::NaiveDate::from_ymd_opt(2026, 10, 30)
+                        .unwrap()
+                        .and_hms_opt(0, 0, 0)
+                        .unwrap()
+                        .and_utc()
+                        .timestamp(),
+                ),
+                earnings_start: None,
+                earnings_end: None,
             },
         };
         let label = member_text(&m, Some(&q), now);
         assert!(label.contains("pre 10.25") && label.contains("52wH 12.00"), "{label}");
+        assert!(label.contains("ERN 2026-10-29"), "{label}");
         assert!(!label.contains("post") && !label.contains("PE"), "{label}");
         q.stats = tr_data::QuoteStats::default();
         assert!(!member_text(&m, Some(&q), now).contains("pre "), "missing stats stay off the row");

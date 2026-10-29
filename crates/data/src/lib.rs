@@ -62,6 +62,15 @@ pub struct QuoteStats {
     /// Trailing P/E. Negative values are kept; only non-finite numbers are dropped.
     #[serde(default)]
     pub trailing_pe: Option<f64>,
+    /// Earnings instant the provider sent (Unix seconds). Absent when the payload omitted it.
+    #[serde(default)]
+    pub earnings_ts: Option<i64>,
+    /// Start of the provider's earnings window (Unix seconds).
+    #[serde(default)]
+    pub earnings_start: Option<i64>,
+    /// End of the provider's earnings window (Unix seconds).
+    #[serde(default)]
+    pub earnings_end: Option<i64>,
 }
 
 impl QuoteStats {
@@ -78,6 +87,26 @@ impl QuoteStats {
     /// Finite number, including negatives (a trailing P/E can be negative).
     pub fn finite(v: Option<f64>) -> Option<f64> {
         v.filter(|x| x.is_finite())
+    }
+
+    /// Positive Unix seconds. Zero, negative, and non-finite values are absent.
+    pub fn timestamp(v: Option<i64>) -> Option<i64> {
+        v.filter(|t| *t > 0)
+    }
+
+    /// New York calendar date of an earnings instant the provider sent.
+    /// A start and end on different dates is the window; a single instant is one date.
+    /// Nothing is filled in when the payload omitted the field.
+    pub fn earnings_label(&self) -> Option<String> {
+        let date = |ts: i64| tr_core::ny::civil(ts).date().format("%Y-%m-%d").to_string();
+        let shown = match (self.earnings_start.filter(|t| *t > 0), self.earnings_end.filter(|t| *t > 0)) {
+            (Some(start), Some(end)) => Some((start.min(end), start.max(end))),
+            (Some(start), None) => Some((start, start)),
+            (None, Some(end)) => Some((end, end)),
+            (None, None) => self.earnings_ts.filter(|t| *t > 0).map(|t| (t, t)),
+        }?;
+        let (left, right) = (date(shown.0), date(shown.1));
+        if left == right { Some(format!("ERN {left}")) } else { Some(format!("ERN {left}–{right}")) }
     }
 }
 
@@ -286,6 +315,9 @@ impl Quote {
         }
         if let Some(v) = s.trailing_pe {
             parts.push(format!("PE {v:.2}"));
+        }
+        if let Some(v) = s.earnings_label() {
+            parts.push(v);
         }
         parts.join(" · ")
     }
@@ -702,6 +734,9 @@ mod tests {
             week_52_low: QuoteStats::price(Some(0.0)),
             market_cap: QuoteStats::price(Some(2.5e12)),
             trailing_pe: QuoteStats::finite(Some(-4.5)),
+            earnings_ts: None,
+            earnings_start: None,
+            earnings_end: None,
         };
         assert_eq!(q.stats.post_market, None, "non-finite post-market stays missing");
         assert_eq!(q.stats.week_52_low, None, "a zero low is not a price");
@@ -710,6 +745,47 @@ mod tests {
         assert!(label.contains("pre 111.00") && label.contains("vol 1.50M"), "{label}");
         assert!(label.contains("52wH 120.00") && label.contains("cap 2.50T") && label.contains("PE -4.50"), "{label}");
         assert!(!label.contains("post") && !label.contains("52wL") && !label.contains("avg10"), "{label}");
+        assert!(!label.contains("ERN"), "{label}");
         assert!((q.change_pct() - 10.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn earnings_label_uses_the_provider_window_in_new_york() {
+        // 2026-10-30 00:00 UTC is still 2026-10-29 in New York.
+        let midnight_utc =
+            chrono::NaiveDate::from_ymd_opt(2026, 10, 30).unwrap().and_hms_opt(0, 0, 0).unwrap().and_utc().timestamp();
+        let mut stats = QuoteStats { earnings_ts: QuoteStats::timestamp(Some(midnight_utc)), ..QuoteStats::default() };
+        assert_eq!(stats.earnings_label().as_deref(), Some("ERN 2026-10-29"));
+        stats.earnings_ts = QuoteStats::timestamp(Some(0));
+        assert!(stats.earnings_label().is_none());
+        stats.earnings_ts = QuoteStats::timestamp(Some(-5));
+        assert!(stats.earnings_label().is_none());
+
+        let start =
+            tr_core::ny::to_utc(chrono::NaiveDate::from_ymd_opt(2026, 10, 29).unwrap().and_hms_opt(16, 0, 0).unwrap());
+        let end =
+            tr_core::ny::to_utc(chrono::NaiveDate::from_ymd_opt(2026, 10, 30).unwrap().and_hms_opt(16, 0, 0).unwrap());
+        stats.earnings_ts = Some(start);
+        stats.earnings_start = Some(start);
+        stats.earnings_end = Some(end);
+        assert_eq!(stats.earnings_label().as_deref(), Some("ERN 2026-10-29–2026-10-30"));
+        stats.earnings_end = Some(start);
+        assert_eq!(stats.earnings_label().as_deref(), Some("ERN 2026-10-29"));
+        stats.earnings_ts = None;
+        stats.earnings_start = Some(end);
+        stats.earnings_end = None;
+        assert_eq!(stats.earnings_label().as_deref(), Some("ERN 2026-10-30"));
+        stats.earnings_start = None;
+        assert!(stats.earnings_label().is_none());
+        let q = Quote {
+            provenance: Provenance::Sample,
+            symbol: "AAPL US Equity".into(),
+            last: 1.0,
+            prev_close: 1.0,
+            ts: 1,
+            spark: vec![],
+            stats: QuoteStats::default(),
+        };
+        assert!(!q.stats_label().contains("ERN"));
     }
 }
