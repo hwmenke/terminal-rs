@@ -329,6 +329,9 @@ pub enum Function {
     VolumePace {
         spec: String,
     },
+    RealizedVol {
+        spec: String,
+    },
     /// Open versus the prior cash close, and how often that gap had filled (`GFILL`).
     GapFill {
         spec: String,
@@ -570,6 +573,7 @@ fn parse_function(head: &str, rest: &[&str]) -> Option<Function> {
         "SPATH" | "SESSIONPATH" | "TPATH" => Function::SessionPath { spec: joined() },
         "BRD" | "BREADTH" | "SBREADTH" => Function::Breadth { spec: joined() },
         "VPACE" | "VOLPACE" | "CUMVOL" => Function::VolumePace { spec: joined() },
+        "RVAR" | "REALVOL" | "REALIZEDVOL" => Function::RealizedVol { spec: joined() },
         "GFILL" | "GAPFILL" => Function::GapFill { spec: joined() },
         "XTRM" | "EXTREME" => Function::SessionExtreme { spec: joined() },
         "RPATH" | "RELPATH" => Function::RelativePath { spec: joined() },
@@ -832,7 +836,11 @@ fn describe(f: &Function) -> String {
         Function::VolumePace { spec } if spec.is_empty() => {
             "Volume pace: today's cumulative shares versus the mean of prior sessions".into()
         }
+        Function::RealizedVol { spec } if spec.is_empty() => {
+            "Realized volatility: session and rolling log-return variation".into()
+        }
         Function::VolumePace { spec } => format!("Volume pace versus prior sessions ({spec})"),
+        Function::RealizedVol { spec } => format!("Realized volatility, rolling returns ({spec})"),
         Function::GapFill { spec } if spec.is_empty() => {
             "Gap fill: today's 09:30 open versus the prior cash close, and how often same-direction gaps had filled"
                 .into()

@@ -21,6 +21,7 @@ mod options_view;
 mod palette_view;
 mod panels;
 mod portfolio_view;
+mod realized_vol;
 mod relative_path;
 mod research;
 mod session_breadth;
@@ -111,6 +112,7 @@ pub enum PaneKind {
     Breadth(Box<session_breadth::BreadthPane>),
     /// Cumulative volume versus the usual pace of prior sessions (`VPACE`).
     VolumePace(Box<volume_pace::VolumePacePane>),
+    RealizedVol(Box<realized_vol::RealizedVolPane>),
     /// Today's open versus the prior cash close (`GFILL`).
     GapFill(Box<gap_fill::GapFillPane>),
     /// When the session high and low print (`XTRM`).
@@ -351,6 +353,13 @@ impl PaneKind {
                     format!("{} Pace", tr_data::security(&p.symbol).ticker)
                 }
             }
+            PaneKind::RealizedVol(p) => {
+                if p.symbol.trim().is_empty() {
+                    "RVAR".into()
+                } else {
+                    format!("{} RVAR", tr_data::security(&p.symbol).ticker)
+                }
+            }
             PaneKind::GapFill(p) => {
                 if p.symbol.trim().is_empty() {
                     "Gap".into()
@@ -418,6 +427,7 @@ impl PaneKind {
             PaneKind::SessionPath(_) => "SPATH",
             PaneKind::Breadth(_) => "BRD",
             PaneKind::VolumePace(_) => "VPACE",
+            PaneKind::RealizedVol(_) => "RVAR",
             PaneKind::GapFill(_) => "GFILL",
             PaneKind::SessionExtreme(_) => "XTRM",
             PaneKind::RelativePath(_) => "RPATH",
@@ -436,6 +446,7 @@ impl PaneKind {
             PaneKind::OrderBook(b) => Some(&b.symbol),
             PaneKind::Options(o) => Some(&o.symbol),
             PaneKind::VolumePace(p) => Some(&p.symbol),
+            PaneKind::RealizedVol(p) => Some(&p.symbol),
             PaneKind::SessionBrief(p) => Some(&p.symbol),
             _ => None,
         }
@@ -449,6 +460,7 @@ impl PaneKind {
                 | PaneKind::OrderBook(_)
                 | PaneKind::Options(_)
                 | PaneKind::VolumePace(_)
+                | PaneKind::RealizedVol(_)
                 | PaneKind::SessionBrief(_)
         ) || matches!(self, PaneKind::News(n) if n.scope == tr_data::news::NewsScope::Symbol)
     }
@@ -539,6 +551,9 @@ impl PaneKind {
             PaneKind::Breadth(b) => PaneSettings::Breadth { spec: b.spec.clone(), tf: b.tf.clone() },
             PaneKind::VolumePace(p) => {
                 PaneSettings::VolumePace { symbol: p.symbol.clone(), spec: p.spec.clone(), tf: p.tf.clone() }
+            }
+            PaneKind::RealizedVol(p) => {
+                PaneSettings::RealizedVol { symbol: p.symbol.clone(), spec: p.spec.clone(), tf: p.tf.clone() }
             }
             PaneKind::GapFill(p) => {
                 PaneSettings::GapFill { symbol: p.symbol.clone(), spec: p.spec.clone(), tf: p.tf.clone() }
@@ -687,6 +702,13 @@ impl PaneKind {
                     pane.tf = tf;
                 }
                 PaneKind::VolumePace(Box::new(pane))
+            }
+            PaneSettings::RealizedVol { symbol, spec, tf } => {
+                let mut pane = realized_vol::RealizedVolPane::new(symbol, spec);
+                if !tf.is_empty() {
+                    pane.tf = tf;
+                }
+                PaneKind::RealizedVol(Box::new(pane))
             }
             PaneSettings::GapFill { symbol, spec, tf } => {
                 let mut pane = gap_fill::GapFillPane::new(symbol, spec);
@@ -1237,6 +1259,7 @@ impl TerminalApp {
             Command::SymbolFunction(s, Function::SessionPath { spec }) => self.open_session_path(Some(&s), &spec),
             Command::SymbolFunction(s, Function::Breadth { spec }) => self.open_breadth(Some(&s), &spec),
             Command::SymbolFunction(s, Function::VolumePace { spec }) => self.open_volume_pace(Some(&s), &spec),
+            Command::SymbolFunction(s, Function::RealizedVol { spec }) => self.open_realized_vol(Some(&s), &spec),
             Command::SymbolFunction(s, Function::IntradayDesk) => self.open_intraday_desk(Some(&s)),
             Command::SymbolFunction(s, Function::GapFill { spec }) => self.open_gap_fill(Some(&s), &spec),
             Command::SymbolFunction(s, Function::SessionExtreme { spec }) => self.open_session_extreme(Some(&s), &spec),
@@ -1432,6 +1455,7 @@ impl TerminalApp {
             Function::SessionPath { spec } => self.open_session_path(symbol.as_deref(), &spec),
             Function::Breadth { spec } => self.open_breadth(symbol.as_deref(), &spec),
             Function::VolumePace { spec } => self.open_volume_pace(symbol.as_deref(), &spec),
+            Function::RealizedVol { spec } => self.open_realized_vol(symbol.as_deref(), &spec),
             Function::GapFill { spec } => self.open_gap_fill(symbol.as_deref(), &spec),
             Function::SessionExtreme { spec } => self.open_session_extreme(symbol.as_deref(), &spec),
             Function::RelativePath { spec } => self.open_relative_path(symbol.as_deref(), &spec),
@@ -1603,6 +1627,13 @@ impl TerminalApp {
                 }
                 Response::VolumePace { pane, generation, result } => {
                     if let Some(PaneKind::VolumePace(p)) =
+                        self.panes.iter_mut().find(|p| p.id == pane).map(|p| &mut p.kind)
+                    {
+                        p.accept(generation, result);
+                    }
+                }
+                Response::RealizedVol { pane, generation, result } => {
+                    if let Some(PaneKind::RealizedVol(p)) =
                         self.panes.iter_mut().find(|p| p.id == pane).map(|p| &mut p.kind)
                     {
                         p.accept(generation, result);

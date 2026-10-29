@@ -31,6 +31,7 @@ pub mod markets;
 pub mod news;
 pub mod portable;
 pub mod price_alerts;
+pub mod realized_vol;
 pub mod relative_path;
 pub mod rss;
 pub mod sample;
