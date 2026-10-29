@@ -181,6 +181,78 @@ pub fn opening_range(tf: Timeframe, bars: &[Bar]) -> Option<OpeningRange> {
     (high.is_finite() && low.is_finite() && high >= low).then_some(OpeningRange { high, low })
 }
 
+/// High, low, and close of the regular session before the latest one in `bars`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PriorSession {
+    pub high: f64,
+    pub low: f64,
+    pub close: f64,
+}
+
+/// Prior cash session, when that calendar session is fully present and verified.
+/// The latest session can be a single bar. A missing bucket stays blank, and an older
+/// complete day does not stand in. Premarket and after-hours prints are ignored.
+pub fn prior_session(tf: Timeframe, bars: &[Bar]) -> Option<PriorSession> {
+    if step_minutes(tf).is_none() {
+        return None;
+    }
+    #[derive(Clone, Copy)]
+    struct Acc {
+        high: f64,
+        low: f64,
+        close: f64,
+        verified: bool,
+    }
+    let mut by_day: BTreeMap<NaiveDate, BTreeMap<i64, Acc>> = BTreeMap::new();
+    for b in bars {
+        let Some(bucket) = regular_bucket(tf, b.ts) else { continue };
+        let entry = by_day.entry(minute_of(b.ts).0).or_default().entry(bucket).or_insert(Acc {
+            high: f64::NEG_INFINITY,
+            low: f64::INFINITY,
+            close: f64::NAN,
+            verified: true,
+        });
+        if b.high.is_finite() {
+            entry.high = entry.high.max(b.high);
+        }
+        if b.low.is_finite() {
+            entry.low = entry.low.min(b.low);
+        }
+        if b.close.is_finite() {
+            entry.close = b.close;
+        }
+        entry.verified &= b.provenance.is_verified();
+    }
+    let (latest, _) = by_day.pop_last()?;
+    let session = by_day.remove(&previous_session(latest))?;
+    let window = regular_opens(previous_session(latest), tf);
+    if window.is_empty() {
+        return None;
+    }
+    let mut high = f64::NEG_INFINITY;
+    let mut low = f64::INFINITY;
+    let mut close = f64::NAN;
+    for open in window {
+        let bar = session.get(&open)?;
+        if !bar.verified
+            || !bar.high.is_finite()
+            || !bar.low.is_finite()
+            || !bar.close.is_finite()
+            || bar.high < bar.low
+        {
+            return None;
+        }
+        high = high.max(bar.high);
+        low = low.min(bar.low);
+        close = bar.close;
+    }
+    (high.is_finite() && low.is_finite() && close.is_finite() && high >= low).then_some(PriorSession {
+        high,
+        low,
+        close,
+    })
+}
+
 /// How many kept bars sit outside the regular session. Zero is reported as no bars, not as a price.
 pub fn extended_summary(bars: &[Bar]) -> String {
     let pre = bars.iter().filter(|b| phase(b.ts) == Phase::Pre).count();
@@ -701,6 +773,76 @@ mod tests {
         let mut sample = half_hour;
         sample[0].provenance = Provenance::Sample;
         assert!(opening_range(Timeframe::M30, &sample).is_none());
+    }
+
+    fn session_bars(y: i32, m: u32, d: u32, tf: Timeframe) -> Vec<Bar> {
+        regular_opens(NaiveDate::from_ymd_opt(y, m, d).unwrap(), tf)
+            .into_iter()
+            .map(|ts| Bar::new(ts, 10.4, 11.0, 10.0, 10.4, 8.0).with_provenance(Provenance::Real))
+            .collect()
+    }
+
+    #[test]
+    fn prior_session_uses_only_the_complete_previous_cash_day() {
+        let mut friday = session_bars(2026, 3, 6, Timeframe::M30);
+        assert!(friday.len() > 4, "a full Friday has a cash grid");
+        friday[1].high = 12.0;
+        let low_at = friday.len() - 4;
+        friday[low_at].low = 9.0;
+        friday.last_mut().unwrap().close = 10.5;
+        friday.push(Bar::new(wall(2026, 3, 6, 8, 0), 1.0, 80.0, 0.5, 2.0, 40.0).with_provenance(Provenance::Real));
+        friday.push(Bar::new(wall(2026, 3, 6, 16, 0), 1.0, 70.0, 0.4, 3.0, 40.0).with_provenance(Provenance::Real));
+        let mut bars = friday.clone();
+        bars.push(Bar::new(wall(2026, 3, 9, 10, 0), 40.0, 50.0, 30.0, 45.0, 8.0).with_provenance(Provenance::Real));
+        let prior = prior_session(Timeframe::M30, &bars).unwrap();
+        assert!((prior.high - 12.0).abs() < 1e-9);
+        assert!((prior.low - 9.0).abs() < 1e-9);
+        assert!((prior.close - 10.5).abs() < 1e-9);
+
+        let mut gapped = bars.clone();
+        let missing = friday[3].ts;
+        gapped.retain(|b| b.ts != missing);
+        assert!(prior_session(Timeframe::M30, &gapped).is_none(), "a missing prior bucket is not filled");
+
+        let mut older = session_bars(2026, 3, 5, Timeframe::M30);
+        older[0].high = 30.0;
+        older.extend(gapped);
+        assert!(prior_session(Timeframe::M30, &older).is_none(), "an older complete day does not replace Friday");
+
+        assert!(prior_session(Timeframe::M30, &bars[bars.len() - 1..]).is_none(), "today alone has no prior session");
+        assert!(prior_session(Timeframe::D1, &bars).is_none());
+
+        let mut early = session_bars(2026, 11, 27, Timeframe::M30);
+        assert_eq!(early.len(), 7, "early close ends at 13:00");
+        for bar in &mut early {
+            bar.high = 6.0;
+            bar.low = 4.0;
+            bar.close = 5.0;
+        }
+        early.push(Bar::new(wall(2026, 11, 27, 13, 0), 5.0, 20.0, 1.0, 9.0, 3.0).with_provenance(Provenance::Real));
+        early.push(Bar::new(wall(2026, 11, 30, 10, 0), 5.0, 50.0, 1.0, 8.0, 3.0).with_provenance(Provenance::Real));
+        let early_prior = prior_session(Timeframe::M30, &early).unwrap();
+        assert!((early_prior.high - 6.0).abs() < 1e-9);
+        assert!((early_prior.low - 4.0).abs() < 1e-9);
+        assert!((early_prior.close - 5.0).abs() < 1e-9);
+
+        let mut holiday = session_bars(2026, 4, 2, Timeframe::M30);
+        for bar in &mut holiday {
+            bar.high = 7.0;
+            bar.low = 4.0;
+            bar.close = 5.0;
+        }
+        holiday[2].high = 8.0;
+        holiday[2].low = 3.0;
+        holiday.last_mut().unwrap().close = 4.5;
+        holiday.push(Bar::new(wall(2026, 4, 6, 10, 0), 5.0, 9.0, 2.0, 6.0, 3.0).with_provenance(Provenance::Real));
+        let skipped = prior_session(Timeframe::M30, &holiday).unwrap();
+        assert!((skipped.high - 8.0).abs() < 1e-9 && (skipped.low - 3.0).abs() < 1e-9);
+        assert!((skipped.close - 4.5).abs() < 1e-9, "Good Friday is not a missing bucket");
+
+        let mut sample = bars.clone();
+        sample[0].provenance = Provenance::Sample;
+        assert!(prior_session(Timeframe::M30, &sample).is_none());
     }
 
     #[test]
