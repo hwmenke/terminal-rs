@@ -276,6 +276,10 @@ impl TerminalApp {
                         "Earnings calendar for the selected watchlist: provider dates only, click a row to open the chart",
                     ),
                     (
+                        &["ISCAN", "INTRADAY"],
+                        "Intraday scan of the selected watchlist: session RVOL and close versus VWAP from verified 5-minute bars",
+                    ),
+                    (
                         &["DESK", "AAPL DESK", "NEW DESK"],
                         "PM Desk: watchlist leaders, group performance, position size (not PORT)",
                     ),

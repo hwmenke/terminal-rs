@@ -19,6 +19,7 @@ pub mod crypto;
 pub mod earnings;
 pub mod history;
 pub mod intraday;
+pub mod iscan;
 pub mod journal;
 pub mod lookalike;
 pub mod markets;
