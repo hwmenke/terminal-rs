@@ -245,6 +245,8 @@ pub enum Function {
     Earnings,
     /// Session RVOL, VWAP, and return versus SPY for the selected watchlist group (`ISCAN`).
     Intraday,
+    /// Saved 2×2 desk: 5-minute chart, ISCAN, breadth, and volume pace (`IDESK`).
+    IntradayDesk,
     WatchCommand(String),
     /// `LAYOUT 1|2|2H|3|4|6` preset, `LAYOUT <name>` switch, or a layout subcommand
     /// (`SAVE`, `SAVEAS`, `NEW`, `RENAME`, `DUP`, `DEL`, `EXPORT`, `IMPORT`).
@@ -498,6 +500,7 @@ fn parse_function(head: &str, rest: &[&str]) -> Option<Function> {
         "REFRESH" | "SYNC" => Function::Refresh,
         "EARN" | "EARNINGS" | "ECAL" => Function::Earnings,
         "ISCAN" | "INTRADAY" => Function::Intraday,
+        "IDESK" | "IDASH" => Function::IntradayDesk,
         "W" | "WL" | "WATCH" | "WATCHLIST" | "MON" => {
             if rest.is_empty() {
                 Function::Watchlist
@@ -708,6 +711,9 @@ fn describe(f: &Function) -> String {
         Function::Earnings => "Earnings calendar for the selected watchlist".into(),
         Function::Intraday => {
             "Intraday scan of the selected watchlist: session RVOL, close versus VWAP, and return versus SPY".into()
+        }
+        Function::IntradayDesk => {
+            "Intraday desk: 5-minute chart, ISCAN, breadth, and volume pace, saved as the Intraday layout".into()
         }
         Function::WatchCommand(s) => format!("Watchlists: {s}"),
         Function::Layout(l) if l.trim().is_empty() => "Saved layouts".into(),
@@ -1074,6 +1080,11 @@ mod tests {
         assert_eq!(parse("ISCAN"), Some(Command::Function(Function::Intraday)));
         assert_eq!(parse("INTRADAY"), Some(Command::Function(Function::Intraday)));
         assert!(hint("ISCAN").contains("session RVOL"));
+        assert_eq!(parse("IDESK"), Some(Command::Function(Function::IntradayDesk)));
+        assert_eq!(parse("IDASH"), Some(Command::Function(Function::IntradayDesk)));
+        assert_eq!(parse("AAPL IDESK"), Some(Command::SymbolFunction("AAPL US Equity".into(), Function::IntradayDesk)));
+        assert!(hint("IDESK").contains("Intraday desk"));
+        assert_eq!(parse("DESK"), Some(Command::Function(Function::Desk)));
         assert_eq!(parse("ALERT"), Some(Command::Function(Function::Alerts)));
         assert_eq!(
             parse("AAPL ALERT 150"),

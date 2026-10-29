@@ -657,7 +657,7 @@ impl TerminalApp {
         self.intraday_scan = Some(IntradayScan { group, board, fetched_at: chrono::Utc::now().timestamp() });
     }
 
-    fn reload_intraday_scan(&mut self) {
+    pub(super) fn reload_intraday_scan(&mut self) {
         self.watch_ui.intraday_pending = false;
         self.watch_ui.intraday_group.clear();
         self.intraday_scan = None;
