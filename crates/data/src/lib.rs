@@ -85,6 +85,10 @@ pub struct QuoteStats {
     /// Ask size the provider sent. Zero and negative sizes stay absent.
     #[serde(default)]
     pub ask_size: Option<f64>,
+    /// Ex-dividend instant the provider sent (Unix seconds). Absent when the payload omitted it.
+    /// A dividend pay date is not stored here.
+    #[serde(default)]
+    pub ex_dividend_ts: Option<i64>,
 }
 
 impl QuoteStats {
@@ -126,6 +130,13 @@ impl QuoteStats {
         }?;
         let (left, right) = (date(shown.0), date(shown.1));
         if left <= right { Some((left, right)) } else { Some((right, left)) }
+    }
+
+    /// `EXDIV YYYY-MM-DD` in New York, when the provider sent an ex-dividend instant.
+    pub fn ex_dividend_label(&self) -> Option<String> {
+        let ts = self.ex_dividend_ts.filter(|t| *t > 0)?;
+        let date = tr_core::ny::civil(ts).date();
+        Some(format!("EXDIV {}", date.format("%Y-%m-%d")))
     }
 
     /// `ERN YYYY-MM-DD`, or a window when the provider's start and end fall on different New York dates.
@@ -353,6 +364,9 @@ impl Quote {
             parts.push(format!("PE {v:.2}"));
         }
         if let Some(v) = s.earnings_label() {
+            parts.push(v);
+        }
+        if let Some(v) = s.ex_dividend_label() {
             parts.push(v);
         }
         parts.join(" · ")
@@ -805,6 +819,7 @@ mod tests {
             ask: None,
             bid_size: None,
             ask_size: None,
+            ex_dividend_ts: None,
         };
         assert_eq!(q.stats.post_market, None, "non-finite post-market stays missing");
         assert_eq!(q.stats.week_52_low, None, "a zero low is not a price");
@@ -814,6 +829,7 @@ mod tests {
         assert!(label.contains("52wH 120.00") && label.contains("cap 2.50T") && label.contains("PE -4.50"), "{label}");
         assert!(!label.contains("post") && !label.contains("52wL") && !label.contains("avg10"), "{label}");
         assert!(!label.contains("bid") && !label.contains("ask") && !label.contains("ERN"), "{label}");
+        assert!(!label.contains("EXDIV"), "{label}");
         assert!((q.change_pct() - 10.0).abs() < 1e-9);
     }
 

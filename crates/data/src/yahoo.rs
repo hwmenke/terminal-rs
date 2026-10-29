@@ -580,6 +580,7 @@ pub fn parse_quote_stats(json: &str) -> Result<std::collections::HashMap<String,
                 ask: crate::QuoteStats::price(num("ask")),
                 bid_size: crate::QuoteStats::size(num("bidSize")),
                 ask_size: crate::QuoteStats::size(num("askSize")),
+                ex_dividend_ts: unix("exDividendDate"),
             },
         );
     }
@@ -687,6 +688,37 @@ mod tests {
         assert_eq!(quote("IBM").stats_label(), "ask 90.50");
         assert!(stats["IBM"].bid.is_none() && stats["IBM"].bid_size == Some(40.0));
         assert_eq!(quote("T").stats_label(), "bid 10.00 × 1.50M · ask 9.50 × 2");
+    }
+
+    #[test]
+    fn quote_stats_keep_the_ex_dividend_date_the_payload_sent() {
+        let ex =
+            tr_core::ny::to_utc(chrono::NaiveDate::from_ymd_opt(2026, 11, 6).unwrap().and_hms_opt(9, 30, 0).unwrap());
+        let json = format!(
+            r#"{{"quoteResponse":{{"result":[
+                {{"symbol":"AAPL","exDividendDate":{ex}}},
+                {{"symbol":"MSFT","dividendDate":{ex}}},
+                {{"symbol":"IBM","exDividendDate":0}},
+                {{"symbol":"T","exDividendDate":"soon"}},
+                {{"symbol":"KO","exDividendDate":-4}}
+            ],"error":null}}}}"#
+        );
+        let stats = parse_quote_stats(&json).unwrap();
+        assert_eq!(stats["AAPL"].ex_dividend_ts, Some(ex));
+        assert_eq!(stats["AAPL"].ex_dividend_label().as_deref(), Some("EXDIV 2026-11-06"));
+        assert!(stats["MSFT"].ex_dividend_ts.is_none() && stats["MSFT"].ex_dividend_label().is_none());
+        assert!(stats["IBM"].ex_dividend_label().is_none());
+        assert!(stats["T"].ex_dividend_ts.is_none() && stats["KO"].ex_dividend_ts.is_none());
+        let quote = Quote {
+            provenance: tr_core::Provenance::Real,
+            symbol: "AAPL".into(),
+            last: 1.0,
+            prev_close: 1.0,
+            ts: 1,
+            spark: vec![],
+            stats: stats["AAPL"].clone(),
+        };
+        assert!(quote.stats_label().contains("EXDIV 2026-11-06"));
     }
 
     #[test]
