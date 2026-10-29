@@ -277,7 +277,7 @@ impl TerminalApp {
                     ),
                     (
                         &["ISCAN", "INTRADAY"],
-                        "Intraday scan of the selected watchlist: session RVOL and close versus VWAP from verified 5-minute bars",
+                        "Intraday scan of the selected watchlist: session RVOL, close versus VWAP, and return versus SPY from verified 5-minute bars",
                     ),
                     (
                         &["DESK", "AAPL DESK", "NEW DESK"],

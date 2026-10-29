@@ -2058,6 +2058,13 @@ async fn profile(s: &Shared, query: &str) -> Option<Profile> {
 async fn intraday_scan(s: &Shared, symbols: &[String]) -> tr_data::iscan::Board {
     let now = chrono::Utc::now().timestamp();
     let sample = s.provider.name() == "sample";
+    let spy_key = tr_data::security(tr_data::iscan::BENCHMARK).key();
+    let spy = if sample {
+        Err("sample bars are not ranked".into())
+    } else {
+        s.provider.history(&spy_key, Timeframe::M5, None, tr_data::iscan::BARS).await.map_err(|e| format!("{e:#}"))
+    };
+    let bench = spy.as_ref().ok().and_then(|bars| tr_data::iscan::benchmark_span(bars));
     let mut seen = Vec::new();
     let mut items = Vec::new();
     for symbol in symbols {
@@ -2071,9 +2078,16 @@ async fn intraday_scan(s: &Shared, symbols: &[String]) -> tr_data::iscan::Board 
             items.push((key, Err(reason)));
             continue;
         }
-        let read = match s.provider.history(&key, Timeframe::M5, None, tr_data::iscan::BARS).await {
-            Ok(bars) => tr_data::iscan::read_bars(&key, &bars, now),
-            Err(e) => Err(format!("{e:#}")),
+        let read = if key == spy_key {
+            match &spy {
+                Ok(bars) => tr_data::iscan::read_against(&key, bars, now, bench),
+                Err(e) => Err(e.clone()),
+            }
+        } else {
+            match s.provider.history(&key, Timeframe::M5, None, tr_data::iscan::BARS).await {
+                Ok(bars) => tr_data::iscan::read_against(&key, &bars, now, bench),
+                Err(e) => Err(format!("{e:#}")),
+            }
         };
         items.push((key, read));
     }

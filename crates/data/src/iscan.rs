@@ -1,8 +1,10 @@
 //! Intraday scan of a named list. Every number comes from verified 5-minute bars.
 //!
 //! Relative volume stays blank until a prior regular session has volume at the same
-//! offset. A name with no regular-session print, unverified bars, or no US cash
-//! session is a hole. Sample bars are never turned into a rank.
+//! offset. Relative strength versus SPY stays blank unless both series share the
+//! latest regular session's open and the same last bucket. A name with no
+//! regular-session print, unverified bars, or no US cash session is a hole.
+//! Sample bars are never turned into a rank.
 
 use std::collections::HashSet;
 
@@ -19,6 +21,9 @@ pub const CLOSED: &str = "Session closed";
 pub const STALE: &str = "Last bar is stale";
 pub const HOLES: &str = "No read";
 
+/// Benchmark for session relative strength. Its bars come from the same history call as the list.
+pub const BENCHMARK: &str = "SPY";
+
 /// One name whose verified bars support a regular-session print.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Row {
@@ -27,6 +32,8 @@ pub struct Row {
     pub close: f64,
     pub vwap: f64,
     pub rvol: Option<f64>,
+    /// Session return minus SPY's session return, in percentage points.
+    pub rs: Option<f64>,
     pub bar_ts: i64,
     pub freshness: Freshness,
     pub provenance: Provenance,
@@ -39,8 +46,9 @@ impl Row {
 
     pub fn line(&self) -> String {
         let rvol = self.rvol.map(|v| format!("{v:.2}×")).unwrap_or_else(|| "—".into());
+        let rs = self.rs.map(|v| format!("{v:+.2}")).unwrap_or_else(|| "—".into());
         format!(
-            "{:<6}  RVOL {rvol}   {:.2} {} {:.2}  [{}]",
+            "{:<6}  RVOL {rvol}  RS {rs}   {:.2} {} {:.2}  [{}]",
             self.ticker,
             self.close,
             self.side(),
@@ -134,10 +142,27 @@ pub fn read_bars(symbol: &str, bars: &[Bar], now: i64) -> Result<Row, String> {
         close: print.close,
         vwap: print.vwap,
         rvol: intraday::relative_volume(tr_core::Timeframe::M5, bars),
+        rs: None,
         bar_ts: print.bar_ts,
         freshness,
         provenance: Bar::provenance(bars),
     })
+}
+
+/// SPY's verified session span. Sample or missing bars produce no benchmark.
+pub fn benchmark_span(bars: &[Bar]) -> Option<intraday::SessionSpan> {
+    Bar::require_verified(bars, "SPY").ok()?;
+    intraday::session_span(tr_core::Timeframe::M5, bars)
+}
+
+/// `read_bars`, then the session return versus `bench` when both windows match.
+pub fn read_against(symbol: &str, bars: &[Bar], now: i64, bench: Option<intraday::SessionSpan>) -> Result<Row, String> {
+    let mut row = read_bars(symbol, bars, now)?;
+    row.rs = bench.and_then(|bench| {
+        let mine = intraday::session_span(tr_core::Timeframe::M5, bars)?;
+        intraday::session_relative(mine, bench)
+    });
+    Ok(row)
 }
 
 fn sort_rows(rows: &mut [Row]) {
@@ -301,6 +326,7 @@ mod tests {
             close: 10.0,
             vwap: 9.0,
             rvol: Some(2.0),
+            rs: None,
             bar_ts: 1,
             freshness,
             provenance: Provenance::Real,
@@ -342,5 +368,37 @@ mod tests {
         assert_eq!(pace_line(&live, open), "Updates about once a minute during the regular session.");
         assert_eq!(pace_line(&live, shut), "Automatic updates pause outside the regular session.");
         assert_eq!(pace_line(&sample, open), "Sample data is not refreshed into a rank.");
+    }
+
+    #[test]
+    fn relative_strength_uses_spy_only_on_the_same_verified_window() {
+        let now = wall(2026, 3, 9, 9, 36);
+        let spy = vec![bar(wall(2026, 3, 9, 9, 30), 400.0, 100.0), bar(wall(2026, 3, 9, 9, 35), 400.0, 100.0)];
+        let bench = benchmark_span(&spy).unwrap();
+        let row = read_against("AAPL", &session(), now, Some(bench)).unwrap();
+        assert!((row.rs.unwrap() - (10.0 / 11.0 * 100.0)).abs() < 1e-9);
+        assert!(row.line().contains("RS +90.91"));
+        assert!(row.line().contains("RVOL 2.00×"));
+
+        let late = session().into_iter().filter(|b| b.ts >= wall(2026, 3, 9, 9, 35)).collect::<Vec<_>>();
+        let missing_open = read_against("MSFT", &late, now, Some(bench)).unwrap();
+        assert!(missing_open.rs.is_none());
+        assert!(missing_open.line().contains("RS —"));
+
+        let mut cached = spy.clone();
+        cached[0].provenance = Provenance::Cached;
+        cached[1].provenance = Provenance::Cached;
+        assert!(benchmark_span(&cached).is_some());
+
+        let mut sample = spy.clone();
+        sample[0].provenance = Provenance::Sample;
+        assert!(benchmark_span(&sample).is_none());
+        let unstamped = read_against("AAPL", &session(), now, None).unwrap();
+        assert!(unstamped.rs.is_none());
+        assert!(unstamped.line().contains("RS —"));
+
+        let flat = read_against("SPY", &spy, now, Some(bench)).unwrap();
+        assert!(flat.line().contains("RS +0.00"));
+        assert_eq!(flat.ticker, "SPY");
     }
 }
