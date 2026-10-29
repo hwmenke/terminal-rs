@@ -97,6 +97,17 @@ fn session_line(tf: Timeframe, sec: &Security, bars: &[Bar]) -> Option<String> {
     Some(line)
 }
 
+/// Opening range of the latest regular session, when every bucket of the first half-hour is present.
+/// A missing print stays blank. Premarket and later bars do not move the printed high and low.
+fn opening_line(tf: Timeframe, sec: &Security, bars: &[Bar]) -> Option<String> {
+    if !tf.is_intraday() || !matches!(sec.class, AssetClass::Equity | AssetClass::Etf | AssetClass::Index) {
+        return None;
+    }
+    let range = tr_data::intraday::opening_range(tf, bars)?;
+    let prec = sec.decimals(range.high).max(sec.decimals(range.low));
+    Some(format!("OR30  H {high:.prec$}  L {low:.prec$}", high = range.high, low = range.low))
+}
+
 /// Length of the load-in sweep across the visible bars.
 const REVEAL_SECS: f32 = 0.7;
 /// Length of an eased jump (quick ranges, reset, keyboard zoom and pan).
@@ -1364,6 +1375,7 @@ impl ChartState {
         // ---- drawings ----
         self.paint_review_levels(ui, price_rect, &scale);
         self.paint_alert_levels(ui, price_rect, &scale);
+        self.paint_opening_range(ui, price_rect, &scale);
         self.paint_drawings(ui, price_rect, &v, &scale, hover, &plot_resp);
 
         // ---- congress markers ----
@@ -1701,6 +1713,10 @@ impl ChartState {
             p.text(pos2(price_rect.left() + 6.0, ly), Align2::LEFT_TOP, line, mono(11.0), muted());
             ly += 14.0;
         }
+        if let Some(line) = opening_line(self.tf, &self.sec, &self.bars) {
+            p.text(pos2(price_rect.left() + 6.0, ly), Align2::LEFT_TOP, line, mono(11.0), theme::up());
+            ly += 14.0;
+        }
         if self.extended && self.offers_extended() {
             let line = tr_data::intraday::extended_summary(&self.bars);
             p.text(pos2(price_rect.left() + 6.0, ly), Align2::LEFT_TOP, line, mono(11.0), amber());
@@ -1828,6 +1844,31 @@ impl ChartState {
             }
         }
         ly
+    }
+
+    fn paint_opening_range(&self, ui: &Ui, rect: Rect, scale: &PriceScale) {
+        if !self.tf.is_intraday() || !matches!(self.sec.class, AssetClass::Equity | AssetClass::Etf | AssetClass::Index)
+        {
+            return;
+        }
+        let Some(range) = tr_data::intraday::opening_range(self.tf, &self.bars) else { return };
+        let p = ui.painter_at(rect);
+        let rows = [(range.high, "ORH", theme::up()), (range.low, "ORL", theme::down())];
+        for (price, tag, color) in rows {
+            let y = rect.top() + scale.y_of(price) as f32;
+            if !rect.y_range().contains(y) {
+                continue;
+            }
+            dashed_h(&p, rect.x_range(), y, Stroke::new(1.0, color.gamma_multiply(0.85)));
+            let prec = self.sec.decimals(price);
+            p.text(
+                pos2(rect.left() + 6.0, y - 12.0),
+                Align2::LEFT_TOP,
+                format!("{tag} {price:.prec$}"),
+                mono(10.0),
+                color,
+            );
+        }
     }
 
     fn paint_alert_levels(&self, ui: &Ui, rect: Rect, scale: &PriceScale) {
@@ -2475,6 +2516,68 @@ mod tests {
         chart.extended = false;
         let output = chart_frame(&ctx, &mut chart, &worker, vec![]);
         assert!(!contains_text(&output.shapes, "Extended hours: 1 pre-market · 1 after hours"));
+    }
+
+    #[test]
+    fn opening_range_legend_and_lines_need_a_complete_window() {
+        fn wall(y: i32, m: u32, d: u32, h: u32, min: u32) -> i64 {
+            tr_core::ny::to_utc(chrono::NaiveDate::from_ymd_opt(y, m, d).unwrap().and_hms_opt(h, min, 0).unwrap())
+        }
+        let bar = |h: u32, m: u32, high: f64, low: f64| {
+            tr_core::Bar::new(wall(2026, 3, 9, h, m), low + 0.5, high, low, low + 0.4, 10.0)
+                .with_provenance(tr_core::Provenance::Real)
+        };
+        let complete = std::sync::Arc::new(vec![
+            bar(9, 30, 11.0, 10.0),
+            bar(9, 35, 12.0, 9.5),
+            bar(9, 40, 13.0, 8.0),
+            bar(9, 45, 12.5, 9.0),
+            bar(9, 50, 11.5, 9.2),
+            bar(9, 55, 11.2, 9.1),
+            bar(10, 0, 12.0, 9.0),
+        ]);
+        let ctx = egui::Context::default();
+        let (worker, _) = Worker::test_channel();
+        let mut chart = ChartState::new(11, "AAPL", Timeframe::M5);
+        chart.on_history(
+            chart.generation,
+            complete.clone(),
+            SeriesGpu::build(&complete),
+            0,
+            false,
+            true,
+            false,
+            &worker,
+        );
+        let output = chart_frame(&ctx, &mut chart, &worker, vec![]);
+        assert!(contains_text(&output.shapes, "OR30  H 13.00  L 8.00"));
+        assert!(contains_text(&output.shapes, "ORH 13.00"));
+        assert!(contains_text(&output.shapes, "ORL 8.00"));
+
+        let incomplete: Vec<_> = complete.iter().cloned().filter(|b| b.ts != wall(2026, 3, 9, 9, 40)).collect();
+        let incomplete = std::sync::Arc::new(incomplete);
+        chart.on_history(
+            chart.generation,
+            incomplete.clone(),
+            SeriesGpu::build(&incomplete),
+            0,
+            false,
+            true,
+            false,
+            &worker,
+        );
+        let output = chart_frame(&ctx, &mut chart, &worker, vec![]);
+        assert!(!contains_text(&output.shapes, "OR30  H 13.00  L 8.00"));
+        assert!(!contains_text(&output.shapes, "ORH 13.00"));
+        assert!(!contains_text(&output.shapes, "ORL 8.00"));
+
+        let mut fx = ChartState::new(12, "EURUSD", Timeframe::M5);
+        fx.on_history(fx.generation, complete.clone(), SeriesGpu::build(&complete), 0, false, true, false, &worker);
+        let output = chart_frame(&ctx, &mut fx, &worker, vec![]);
+        assert_eq!(fx.sec.class, AssetClass::Fx);
+        assert!(!contains_text(&output.shapes, "OR30  H 13.00  L 8.00"));
+        assert!(!contains_text(&output.shapes, "ORH 13.00"));
+        assert!(!contains_text(&output.shapes, "ORL 8.00"));
     }
 
     #[test]
