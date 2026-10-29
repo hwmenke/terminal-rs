@@ -163,6 +163,15 @@ pub enum PaneSettings {
         #[serde(default)]
         tf: String,
     },
+    /// Intraday multi-symbol compare, percent from each 09:30 open.
+    IntradayCompare {
+        #[serde(default)]
+        symbol: String,
+        #[serde(default)]
+        peers: String,
+        #[serde(default)]
+        tf: String,
+    },
     /// Historical lookalikes for one research symbol.
     Lookalike {
         #[serde(default)]

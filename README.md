@@ -238,6 +238,10 @@ gets the native title bar with traffic lights, window vibrancy behind the sideba
   cash session. Signals fill at the next regular open and flatten at that
   session's close. Missing buckets are skipped. Sample bars are refused. See
   [Intraday backtests](docs/INTRADAY_BACKTEST.md).
+- **Intraday session compare** — `ICMP` (or `AAPL ICMP MSFT NVDA`, `AAPL ICMP 1m`)
+  draws several cash names as percent from each name's own 09:30 open, with SPY
+  on the same clock. A missing bucket is a gap. Sample bars are refused. See
+  [Intraday compare](docs/INTRADAY_COMPARE.md).
 - **Historical lookalikes** — `LOOKALIKE` (or `AAPL LOOKALIKE`, `AAPL KNN
   2024-01-15`) finds past sessions whose backward-looking features match the
   query date (standardized Euclidean distance), shows **per-horizon completed /
@@ -393,6 +397,7 @@ Settings › Hotkeys. On Linux and Windows ⌘ is Ctrl and ⌥ is Alt.
 | `5` `1H` `D` `1W` `1M` · `YTD` `5Y` `ALL` | interval · quick range |
 | `RSI` `MACD` `SMA 200` `BB 20 2.5` `ADTREND` · `IND` `IND VOLUME` · `CLEAR` | toggle any of the 152 indicators (optional parameters) · indicator picker · remove all |
 | `CMP MSFT` · `LOG` · `CANDLE` `BAR` `LINE` `AREA` | compare · log scale · chart type |
+| `ICMP` · `AAPL ICMP MSFT NVDA` · `AAPL ICMP 1m` · `NEW ICMP` | Intraday compare: percent from each 09:30 open, SPY on the same clock |
 | `NEWS` · `AAPL CN` · `TOP` · `BTCUSD CRNCY OB` · `WEI` · `GC` | watchlist news · one name · top headlines · order book · markets · curve |
 | `CONG` · `NVDA CONG` · `POL PELOSI` · `TRACK PELOSI` · `ALERTS` · `REFRESH` | Congress feed · who traded it · profile · track · alerts · refresh |
 | `AAPL ALERT 150` · `AAPL ALERT BELOW 140` · `NVDA ALERT SETUP NEAR_HIGH` · `UNALERT AAPL` | Price/setup alerts (click a fired row to open the chart) |

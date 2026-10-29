@@ -20,6 +20,7 @@ pub mod earnings;
 pub mod history;
 pub mod intraday;
 pub mod intraday_backtest;
+pub mod intraday_compare;
 pub mod iscan;
 pub mod journal;
 pub mod lookalike;
