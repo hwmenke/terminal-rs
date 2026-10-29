@@ -193,6 +193,9 @@ fn stats_from_meta(meta: &Meta) -> crate::QuoteStats {
         week_52_low: QuoteStats::price(meta.fifty_two_week_low),
         market_cap: QuoteStats::price(meta.market_cap),
         trailing_pe: QuoteStats::finite(meta.trailing_pe),
+        earnings_ts: None,
+        earnings_start: None,
+        earnings_end: None,
     }
 }
 
@@ -531,6 +534,11 @@ pub fn parse_quote_stats(json: &str) -> Result<std::collections::HashMap<String,
     for row in rows {
         let Some(symbol) = row["symbol"].as_str() else { continue };
         let num = |key: &str| row.get(key).and_then(|v| v.as_f64());
+        let unix = |key: &str| {
+            let v = row.get(key)?;
+            let t = v.as_i64().or_else(|| v.as_f64().filter(|x| x.is_finite()).map(|x| x.trunc() as i64))?;
+            crate::QuoteStats::timestamp(Some(t))
+        };
         out.insert(
             symbol.to_string(),
             crate::QuoteStats {
@@ -542,6 +550,9 @@ pub fn parse_quote_stats(json: &str) -> Result<std::collections::HashMap<String,
                 week_52_low: crate::QuoteStats::price(num("fiftyTwoWeekLow")),
                 market_cap: crate::QuoteStats::price(num("marketCap")),
                 trailing_pe: crate::QuoteStats::finite(num("trailingPE")),
+                earnings_ts: unix("earningsTimestamp"),
+                earnings_start: unix("earningsTimestampStart"),
+                earnings_end: unix("earningsTimestampEnd"),
             },
         );
     }
@@ -594,8 +605,10 @@ mod tests {
         let json = r#"{"quoteResponse":{"result":[
             {"symbol":"AAPL","preMarketPrice":180.5,"postMarketPrice":null,"regularMarketVolume":1000,
              "averageDailyVolume10Day":2.5e6,"fiftyTwoWeekHigh":200.0,"fiftyTwoWeekLow":0,
-             "marketCap":2.5e12,"trailingPE":-3.5},
-            {"symbol":"MSFT","regularMarketPrice":400.0}
+             "marketCap":2.5e12,"trailingPE":-3.5,
+             "earningsTimestamp":1761778800,"earningsTimestampStart":1761778800,"earningsTimestampEnd":1761865200},
+            {"symbol":"MSFT","regularMarketPrice":400.0,"earningsTimestamp":0,"earningsTimestampStart":null},
+            {"symbol":"IBM","earningsTimestamp":-4,"earningsTimestampEnd":"soon"}
         ],"error":null}}"#;
         let stats = parse_quote_stats(json).unwrap();
         let aapl = &stats["AAPL"];
@@ -608,8 +621,15 @@ mod tests {
         assert_eq!(aapl.market_cap, Some(2.5e12));
         assert_eq!(aapl.trailing_pe, Some(-3.5));
         let msft = &stats["MSFT"];
+        assert_eq!(aapl.earnings_ts, Some(1_761_778_800));
+        assert_eq!(aapl.earnings_start, Some(1_761_778_800));
+        assert_eq!(aapl.earnings_end, Some(1_761_865_200));
+        assert!(aapl.earnings_label().unwrap().starts_with("ERN "));
         assert!(msft.pre_market.is_none() && msft.post_market.is_none() && msft.regular_volume.is_none());
         assert!(msft.market_cap.is_none() && msft.trailing_pe.is_none() && msft.week_52_high.is_none());
+        assert!(msft.earnings_ts.is_none() && msft.earnings_start.is_none() && msft.earnings_label().is_none());
+        let ibm = &stats["IBM"];
+        assert!(ibm.earnings_ts.is_none() && ibm.earnings_end.is_none() && ibm.earnings_label().is_none());
         assert!(cash_session_symbol("AAPL") && cash_session_symbol("BRK-B") && cash_session_symbol("^GSPC"));
         assert!(!cash_session_symbol("EURUSD=X") && !cash_session_symbol("CL=F") && !cash_session_symbol("BTC-USD"));
     }

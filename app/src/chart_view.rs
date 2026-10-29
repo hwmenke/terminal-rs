@@ -190,6 +190,8 @@ pub struct ChartState {
     journal_marks: Vec<String>,
     /// Last hovered bar, used for journal date capture.
     hover_bar: Option<usize>,
+    /// Earnings date from the latest quote. Empty when the provider omitted it.
+    earnings: Option<String>,
     pub news_fetched: Option<std::time::Instant>,
     news_key: u64,
     pending_range: Option<Range>,
@@ -265,6 +267,7 @@ impl ChartState {
             alert_rules: Vec::new(),
             journal_marks: Vec::new(),
             hover_bar: None,
+            earnings: None,
             news_fetched: None,
             news_key: 0,
             pending_range: None,
@@ -295,6 +298,15 @@ impl ChartState {
 
     pub fn set_journal_marks(&mut self, dates: Vec<String>) {
         self.journal_marks = dates;
+    }
+
+    /// Replace the earnings line with the latest quote's label, or clear it.
+    pub fn set_earnings(&mut self, label: Option<String>) {
+        self.earnings = label.filter(|s| !s.is_empty());
+    }
+
+    pub fn earnings_line(&self) -> Option<&str> {
+        self.earnings.as_deref()
     }
 
     /// Hovered bar date, else the last loaded bar (`YYYY-MM-DD`).
@@ -384,6 +396,7 @@ impl ChartState {
             self.drawing_undo = None;
             self.symbol = sec.key();
             self.sec = sec;
+            self.earnings = None;
             self.draw = DrawState::default();
             self.drawings = self.drawing_store.get_view(&self.symbol, self.tf);
         } else {
@@ -1616,6 +1629,10 @@ impl ChartState {
             p.text(pos2(price_rect.left() + 6.0, ly), Align2::LEFT_TOP, line, mono(11.0), muted());
             ly += 14.0;
         }
+        if let Some(line) = &self.earnings {
+            p.text(pos2(price_rect.left() + 6.0, ly), Align2::LEFT_TOP, line, mono(11.0), amber());
+            ly += 14.0;
+        }
         let value_at = |l: &LineRef| l.pyramid.data.get(i).map(|p| p[1] as f64).filter(|v| v.is_finite());
         for bi in self.built.iter().filter(|b| !b.spec.is_pane()) {
             let vals: Vec<String> = bi
@@ -2563,6 +2580,25 @@ mod tests {
         assert_eq!(c.news.len(), 1, "a batch for another name must not replace these markers");
         c.on_news(&tr_data::news::NewsBatch::sample_isolated(day));
         assert!(c.news.is_empty());
+    }
+
+    #[test]
+    fn chart_legend_shows_the_provider_earnings_date_and_a_symbol_change_clears_it() {
+        let ctx = egui::Context::default();
+        let (worker, _) = Worker::test_channel();
+        let mut chart = ChartState::new(1, "AAPL", Timeframe::D1);
+        let bars = Arc::new(vec![Bar::new(1_700_000_000, 10.0, 11.0, 9.0, 10.5, 1_000.0)]);
+        let gpu = SeriesGpu::build(&bars);
+        chart.on_history(chart.generation, bars, gpu, 0, false, true, false, &worker);
+        chart.set_earnings(Some("ERN 2026-10-29".into()));
+        let output = chart_frame(&ctx, &mut chart, &worker, vec![]);
+        let painted = shape_text(&output.shapes);
+        assert!(painted.contains("ERN 2026-10-29"), "{painted}");
+        chart.set_symbol("MSFT", &worker);
+        assert!(chart.earnings_line().is_none());
+        let output = chart_frame(&ctx, &mut chart, &worker, vec![]);
+        let painted = shape_text(&output.shapes);
+        assert!(!painted.contains("ERN"), "{painted}");
     }
 
     fn shape_text(shapes: &[egui::epaint::ClippedShape]) -> String {

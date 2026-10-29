@@ -1239,6 +1239,27 @@ impl TerminalApp {
 
     // ---- worker responses ----------------------------------------------------------------
 
+    /// Store quotes and copy a provider earnings date onto charts of that name.
+    fn apply_quotes(&mut self, q: Vec<tr_data::Quote>) {
+        if q.len() > 20 {
+            self.wei_updated = Some(format!("updated {}", chrono::Local::now().format("%H:%M:%S")));
+        }
+        let keys: Vec<String> = q.iter().map(|x| x.symbol.clone()).collect();
+        for x in q {
+            let label = x.stats.earnings_label();
+            let key = x.symbol.clone();
+            self.quotes.insert(key.clone(), x);
+            for pane in &mut self.panes {
+                if let PaneKind::Chart(c) = &mut pane.kind
+                    && c.symbol == key
+                {
+                    c.set_earnings(label.clone());
+                }
+            }
+        }
+        self.demo_on_quotes(&keys);
+    }
+
     fn chart_mut(&mut self, pane: PaneId) -> Option<&mut ChartState> {
         match self.panes.iter_mut().find(|p| p.id == pane).map(|p| &mut p.kind) {
             Some(PaneKind::Chart(c)) => Some(c),
@@ -1393,16 +1414,7 @@ impl TerminalApp {
                         c.on_markers(&symbol, trades);
                     }
                 }
-                Response::Quotes(q) => {
-                    if q.len() > 20 {
-                        self.wei_updated = Some(format!("updated {}", chrono::Local::now().format("%H:%M:%S")));
-                    }
-                    let keys: Vec<String> = q.iter().map(|x| x.symbol.clone()).collect();
-                    for x in q {
-                        self.quotes.insert(x.symbol.clone(), x);
-                    }
-                    self.demo_on_quotes(&keys);
-                }
+                Response::Quotes(q) => self.apply_quotes(q),
                 Response::Latest(t) => self.latest = t,
                 Response::TickerTrades { pane, symbol, trades } => {
                     if let Some(p) = self.panes.iter_mut().find(|p| p.id == pane)
@@ -2499,6 +2511,46 @@ mod tests {
                 }
             }
             _ => panic!("expected chart from legacy layout"),
+        }
+    }
+
+    #[test]
+    fn a_quote_earnings_date_lands_on_that_chart_only() {
+        let mut app = test_app();
+        let chart = |id, symbol| Pane {
+            id,
+            kind: PaneKind::Chart(Box::new(ChartState::new(id, symbol, tr_core::Timeframe::D1))),
+            link: None,
+            title: None,
+            window: None,
+        };
+        app.panes.push(chart(1, "AAPL"));
+        app.panes.push(chart(2, "MSFT"));
+        let ts =
+            chrono::NaiveDate::from_ymd_opt(2026, 10, 30).unwrap().and_hms_opt(0, 0, 0).unwrap().and_utc().timestamp();
+        let mut quote = tr_data::Quote {
+            provenance: tr_data::Provenance::Real,
+            symbol: "AAPL US Equity".into(),
+            last: 10.0,
+            prev_close: 9.0,
+            ts: 1,
+            spark: vec![],
+            stats: tr_data::QuoteStats { earnings_ts: Some(ts), ..Default::default() },
+        };
+        app.apply_quotes(vec![quote.clone()]);
+        match &app.panes[0].kind {
+            PaneKind::Chart(c) => assert_eq!(c.earnings_line(), Some("ERN 2026-10-29")),
+            _ => panic!("expected the AAPL chart"),
+        }
+        match &app.panes[1].kind {
+            PaneKind::Chart(c) => assert!(c.earnings_line().is_none()),
+            _ => panic!("expected the MSFT chart"),
+        }
+        quote.stats = tr_data::QuoteStats::default();
+        app.apply_quotes(vec![quote]);
+        match &app.panes[0].kind {
+            PaneKind::Chart(c) => assert!(c.earnings_line().is_none()),
+            _ => panic!("expected the AAPL chart"),
         }
     }
 }
