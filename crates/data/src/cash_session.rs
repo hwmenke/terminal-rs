@@ -380,6 +380,14 @@ pub fn one_print<'a>(buckets: &BTreeMap<i64, Vec<&'a Bar>>, ts: i64) -> Option<&
     (bars.len() == 1).then_some(bars[0])
 }
 
+/// The single usable final cash bucket of `date`, including early closes.
+/// Only that bucket is required; a missing or ambiguous close has no fallback.
+pub fn cash_close(tf: Timeframe, date: NaiveDate, day: Option<&BTreeMap<i64, Vec<&Bar>>>) -> Option<f64> {
+    let close_ts = *intraday::regular_opens(date, tf).last()?;
+    let bar = one_print(day?, close_ts)?;
+    usable_range(bar).then_some(bar.close)
+}
+
 pub fn no_cash_grid(date: NaiveDate) -> String {
     format!("{date} has no cash grid.")
 }
