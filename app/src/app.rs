@@ -28,6 +28,7 @@ mod settings_writer;
 mod stats;
 mod theming;
 mod trading;
+mod volume_pace;
 mod watchlists;
 mod workspace;
 
@@ -104,6 +105,8 @@ pub enum PaneKind {
     SessionPath(Box<session_path::SessionPathPane>),
     /// Share of a list at or above the 09:30 open and session VWAP (`BRD`).
     Breadth(Box<session_breadth::BreadthPane>),
+    /// Cumulative volume versus the usual pace of prior sessions (`VPACE`).
+    VolumePace(Box<volume_pace::VolumePacePane>),
     Settings,
 }
 
@@ -329,6 +332,13 @@ impl PaneKind {
                 }
             }
             PaneKind::Breadth(_) => "Breadth".into(),
+            PaneKind::VolumePace(p) => {
+                if p.symbol.trim().is_empty() {
+                    "Pace".into()
+                } else {
+                    format!("{} Pace", tr_data::security(&p.symbol).ticker)
+                }
+            }
             PaneKind::Settings => "Settings".into(),
         }
     }
@@ -367,6 +377,7 @@ impl PaneKind {
             PaneKind::IntradayCompare(_) => "ICMP",
             PaneKind::SessionPath(_) => "SPATH",
             PaneKind::Breadth(_) => "BRD",
+            PaneKind::VolumePace(_) => "VPACE",
             PaneKind::Settings => "PDF",
         }
     }
@@ -473,6 +484,9 @@ impl PaneKind {
                 PaneSettings::SessionPath { symbol: p.symbol.clone(), spec: p.spec.clone(), tf: p.tf.clone() }
             }
             PaneKind::Breadth(b) => PaneSettings::Breadth { spec: b.spec.clone(), tf: b.tf.clone() },
+            PaneKind::VolumePace(p) => {
+                PaneSettings::VolumePace { symbol: p.symbol.clone(), spec: p.spec.clone(), tf: p.tf.clone() }
+            }
             PaneKind::Lookalike(l) => PaneSettings::Lookalike {
                 symbol: l.symbol.clone(),
                 spec: l.spec.clone(),
@@ -603,6 +617,13 @@ impl PaneKind {
                     pane.tf = tf;
                 }
                 PaneKind::Breadth(Box::new(pane))
+            }
+            PaneSettings::VolumePace { symbol, spec, tf } => {
+                let mut pane = volume_pace::VolumePacePane::new(symbol, spec);
+                if !tf.is_empty() {
+                    pane.tf = tf;
+                }
+                PaneKind::VolumePace(Box::new(pane))
             }
             PaneSettings::IntradayCompare { symbol, peers, tf } => {
                 let mut pane = compare::ComparePane::new(symbol, peers);
@@ -1128,6 +1149,7 @@ impl TerminalApp {
             }
             Command::SymbolFunction(s, Function::SessionPath { spec }) => self.open_session_path(Some(&s), &spec),
             Command::SymbolFunction(s, Function::Breadth { spec }) => self.open_breadth(Some(&s), &spec),
+            Command::SymbolFunction(s, Function::VolumePace { spec }) => self.open_volume_pace(Some(&s), &spec),
             Command::SymbolFunction(s, Function::Goto { date }) => self.goto_chart_date(Some(&s), &date),
             Command::SymbolFunction(s, Function::JournalNote { date, text }) => {
                 self.add_journal_note(Some(&s), &date, &text)
@@ -1214,7 +1236,7 @@ impl TerminalApp {
                     }
                     None => {
                         self.status = format!(
-                            "Unknown panel {spec:?}; try CHART, NEWS, BOOK, WEI, GC, CONG, WL, DESK, JOURNAL, STATS, BACKTEST, IBT, ICMP, SPATH, BRD, LOOKALIKE, PORT"
+                            "Unknown panel {spec:?}; try CHART, NEWS, BOOK, WEI, GC, CONG, WL, DESK, JOURNAL, STATS, BACKTEST, IBT, ICMP, SPATH, BRD, VPACE, LOOKALIKE, PORT"
                         )
                     }
                 }
@@ -1315,6 +1337,7 @@ impl TerminalApp {
             Function::IntradayCompare { spec } => self.open_intraday_compare(symbol.as_deref(), &spec),
             Function::SessionPath { spec } => self.open_session_path(symbol.as_deref(), &spec),
             Function::Breadth { spec } => self.open_breadth(symbol.as_deref(), &spec),
+            Function::VolumePace { spec } => self.open_volume_pace(symbol.as_deref(), &spec),
             Function::Goto { date } => self.goto_chart_date(symbol.as_deref(), &date),
             Function::JournalNote { date, text } => self.add_journal_note(symbol.as_deref(), &date, &text),
             Function::Latest => self.with_chart(|c, _| c.jump_latest()),
@@ -1477,6 +1500,13 @@ impl TerminalApp {
                         self.panes.iter_mut().find(|p| p.id == pane).map(|p| &mut p.kind)
                     {
                         b.accept(generation, result);
+                    }
+                }
+                Response::VolumePace { pane, generation, result } => {
+                    if let Some(PaneKind::VolumePace(p)) =
+                        self.panes.iter_mut().find(|p| p.id == pane).map(|p| &mut p.kind)
+                    {
+                        p.accept(generation, result);
                     }
                 }
                 Response::IntradayCompare { pane, generation, result } => {

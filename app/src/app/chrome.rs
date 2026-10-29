@@ -728,6 +728,20 @@ impl TerminalApp {
             }
             if nav_row(
                 ui,
+                Icon::Chart,
+                "Volume pace",
+                Some("VPACE"),
+                is_focused(&PaneKind::VolumePace(Box::new(super::volume_pace::VolumePacePane::new(
+                    String::new(),
+                    String::new(),
+                )))),
+            )
+            .clicked()
+            {
+                out.push(SidebarCmd::Function(Function::VolumePace { spec: String::new() }));
+            }
+            if nav_row(
+                ui,
                 Icon::Search,
                 "Lookalikes",
                 Some("KNN"),

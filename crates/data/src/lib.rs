@@ -34,6 +34,7 @@ pub mod session_breadth;
 pub mod session_path;
 pub mod stats;
 pub mod treasury;
+pub mod volume_pace;
 pub mod whats_news;
 pub mod yahoo;
 

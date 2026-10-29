@@ -323,6 +323,10 @@ pub enum Function {
     Breadth {
         spec: String,
     },
+    /// Cumulative volume versus prior sessions (`VPACE`, `AAPL VPACE 20 15m`).
+    VolumePace {
+        spec: String,
+    },
     /// Historical lookalikes / nearest neighbors (`LOOKALIKE`, `AAPL KNN 2024-01-15 K=15`).
     Lookalike {
         spec: String,
@@ -540,6 +544,7 @@ fn parse_function(head: &str, rest: &[&str]) -> Option<Function> {
         "ICMP" | "ICOMPARE" | "ICOMP" => Function::IntradayCompare { spec: joined() },
         "SPATH" | "SESSIONPATH" | "TPATH" => Function::SessionPath { spec: joined() },
         "BRD" | "BREADTH" | "SBREADTH" => Function::Breadth { spec: joined() },
+        "VPACE" | "VOLPACE" | "CUMVOL" => Function::VolumePace { spec: joined() },
         "GOTO" | "JUMP" | "GTO" => Function::Goto { date: joined() },
         "NOTE" | "JNOTE" => {
             let (date, text) = split_note_args(rest);
@@ -791,6 +796,10 @@ fn describe(f: &Function) -> String {
             "Session breadth: share of the watchlist at or above the 09:30 open and session VWAP".into()
         }
         Function::Breadth { spec } => format!("Session breadth at or above the open and VWAP ({spec})"),
+        Function::VolumePace { spec } if spec.is_empty() => {
+            "Volume pace: today's cumulative shares versus the mean of prior sessions".into()
+        }
+        Function::VolumePace { spec } => format!("Volume pace versus prior sessions ({spec})"),
         Function::Lookalike { spec } if spec.is_empty() => {
             "Historical lookalikes: nearest past conditions, per-horizon counts, jump to neighbor dates".into()
         }

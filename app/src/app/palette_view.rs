@@ -103,6 +103,14 @@ const COMMANDS: &[(&str, &str, &str, Option<Action>)] = &[
     ("BRD AAPL MSFT NVDA", "AAPL, MSFT and NVDA at or above their opens and VWAP", "breadth 5m", None),
     ("BRD 15m", "Watchlist breadth on 15-minute bars", "breadth 15m", None),
     (
+        "VPACE",
+        "Cumulative volume versus the usual pace of prior sessions",
+        "volume pace cumulative rvol prior sessions",
+        None,
+    ),
+    ("AAPL VPACE 20", "AAPL cumulative volume versus the last 20 sessions", "volume pace 20", None),
+    ("AAPL VPACE 15m", "AAPL volume pace on 15-minute bars", "cumulative volume 15m", None),
+    (
         "LOOKALIKE",
         "Historical lookalikes: nearest past conditions and subsequent returns",
         "knn analog neighbor overlap horizon",
@@ -318,6 +326,10 @@ pub(super) fn static_items() -> Vec<Item> {
     v.push(
         Item::new(Kind::Panel, "New session breadth", "NEW BRD", Target::Run("NEW BRD".into()))
             .keywords("panel pane breadth open vwap participation"),
+    );
+    v.push(
+        Item::new(Kind::Panel, "New volume pace", "NEW VPACE", Target::Run("NEW VPACE".into()))
+            .keywords("panel pane vpace cumulative volume prior sessions"),
     );
     v.push(
         Item::new(Kind::Panel, "New Lookalikes pane", "NEW LOOKALIKE", Target::Run("NEW LOOKALIKE".into()))

@@ -188,6 +188,15 @@ pub enum PaneSettings {
         #[serde(default)]
         tf: String,
     },
+    /// Cumulative volume versus the usual pace of prior sessions.
+    VolumePace {
+        #[serde(default)]
+        symbol: String,
+        #[serde(default)]
+        spec: String,
+        #[serde(default)]
+        tf: String,
+    },
     /// Historical lookalikes for one research symbol.
     Lookalike {
         #[serde(default)]
