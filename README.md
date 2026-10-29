@@ -267,6 +267,11 @@ gets the native title bar with traffic lights, window vibrancy behind the sideba
   extreme. Only a complete session votes. Today's marker is the running high
   and low so far. Sample bars are refused. See
   [Session extreme](docs/SESSION_EXTREME.md).
+- **Relative path** — `RPATH` (or `AAPL RPATH 20 15m`) draws this name's percent
+  from its 09:30 open minus SPY's percent from SPY's own 09:30 open, against
+  the mean and the 25th–75th band of prior sessions. A minute counts only when
+  both printed once. Today is not inside the mean. Sample bars are refused.
+  See [Relative path](docs/RELATIVE_PATH.md).
 - **Historical lookalikes** — `LOOKALIKE` (or `AAPL LOOKALIKE`, `AAPL KNN
   2024-01-15`) finds past sessions whose backward-looking features match the
   query date (standardized Euclidean distance), shows **per-horizon completed /
@@ -428,6 +433,7 @@ Settings › Hotkeys. On Linux and Windows ⌘ is Ctrl and ⌥ is Alt.
 | `VPACE` · `AAPL VPACE 20 15m` · `NEW VPACE` | Cumulative volume versus the usual pace of prior sessions |
 | `GFILL` · `AAPL GFILL 40 15m` · `NEW GFILL` | Open versus the prior cash close, and how often that gap had filled |
 | `XTRM` · `AAPL XTRM 20 15m` · `NEW XTRM` | When the session high and low print |
+| `RPATH` · `AAPL RPATH 20 15m` · `NEW RPATH` | Percent from the 09:30 open minus SPY |
 | `NEWS` · `AAPL CN` · `TOP` · `BTCUSD CRNCY OB` · `WEI` · `GC` | watchlist news · one name · top headlines · order book · markets · curve |
 | `CONG` · `NVDA CONG` · `POL PELOSI` · `TRACK PELOSI` · `ALERTS` · `REFRESH` | Congress feed · who traded it · profile · track · alerts · refresh |
 | `AAPL ALERT 150` · `AAPL ALERT BELOW 140` · `NVDA ALERT SETUP NEAR_HIGH` · `UNALERT AAPL` | Price/setup alerts (click a fired row to open the chart) |

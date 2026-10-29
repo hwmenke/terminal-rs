@@ -335,6 +335,10 @@ pub enum Function {
     SessionExtreme {
         spec: String,
     },
+    /// Percent from the 09:30 open minus SPY (`RPATH`, `AAPL RPATH 20 15m`).
+    RelativePath {
+        spec: String,
+    },
     /// Historical lookalikes / nearest neighbors (`LOOKALIKE`, `AAPL KNN 2024-01-15 K=15`).
     Lookalike {
         spec: String,
@@ -555,6 +559,7 @@ fn parse_function(head: &str, rest: &[&str]) -> Option<Function> {
         "VPACE" | "VOLPACE" | "CUMVOL" => Function::VolumePace { spec: joined() },
         "GFILL" | "GAPFILL" => Function::GapFill { spec: joined() },
         "XTRM" | "EXTREME" => Function::SessionExtreme { spec: joined() },
+        "RPATH" | "RELPATH" => Function::RelativePath { spec: joined() },
         "GOTO" | "JUMP" | "GTO" => Function::Goto { date: joined() },
         "NOTE" | "JNOTE" => {
             let (date, text) = split_note_args(rest);
@@ -819,6 +824,10 @@ fn describe(f: &Function) -> String {
             "Session extreme: when the high and the low print, against completed prior sessions".into()
         }
         Function::SessionExtreme { spec } => format!("Session extreme versus completed sessions ({spec})"),
+        Function::RelativePath { spec } if spec.is_empty() => {
+            "Relative path: percent from the 09:30 open minus SPY, against prior sessions".into()
+        }
+        Function::RelativePath { spec } => format!("Relative path versus SPY ({spec})"),
         Function::Lookalike { spec } if spec.is_empty() => {
             "Historical lookalikes: nearest past conditions, per-horizon counts, jump to neighbor dates".into()
         }

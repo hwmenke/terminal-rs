@@ -770,6 +770,20 @@ impl TerminalApp {
             }
             if nav_row(
                 ui,
+                Icon::Chart,
+                "Relative path",
+                Some("RPATH"),
+                is_focused(&PaneKind::RelativePath(Box::new(super::relative_path::RelativePathPane::new(
+                    String::new(),
+                    String::new(),
+                )))),
+            )
+            .clicked()
+            {
+                out.push(SidebarCmd::Function(Function::RelativePath { spec: String::new() }));
+            }
+            if nav_row(
+                ui,
                 Icon::Search,
                 "Lookalikes",
                 Some("KNN"),
