@@ -118,9 +118,20 @@ impl TerminalApp {
             })
         });
         let Some(pane) = pane else {
-            self.status = "EXPORT BACKTEST needs an open BACKTEST pane with results".into();
+            self.status = "EXPORT BACKTEST needs an open BACKTEST or IBT pane with results".into();
             return;
         };
+        if pane.intraday {
+            let Some(report) = &pane.intraday_report else {
+                self.status = "IBT has no results to export yet".into();
+                return;
+            };
+            match env::intraday_backtest_document(report, env::now_rfc3339()) {
+                Ok(doc) => self.finish_write(&doc, path, "Exported intraday backtest"),
+                Err(e) => self.status = e,
+            }
+            return;
+        }
         let Some(report) = &pane.report else {
             self.status = "BACKTEST has no results to export yet".into();
             return;
@@ -229,6 +240,11 @@ impl TerminalApp {
             Kind::Backtest => {
                 self.status =
                     "Backtest exports are snapshots and are not restored into BACKTEST. Open the JSON file instead."
+                        .into();
+            }
+            Kind::IntradayBacktest => {
+                self.status =
+                    "Intraday backtest exports are snapshots and are not restored into IBT. Open the JSON file instead."
                         .into();
             }
             Kind::Lookalike => {

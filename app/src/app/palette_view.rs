@@ -75,6 +75,15 @@ const COMMANDS: &[(&str, &str, &str, Option<Action>)] = &[
     ("AAPL BT ADTREND", "AAPL Adaptive Trend vs buy-and-hold on the evaluate window", "adaptive trend backtest", None),
     ("EXPORT BACKTEST", "Export backtest settings, costs, holdout and metrics", "paper research provenance", None),
     (
+        "IBT",
+        "Paper intraday backtest of session VWAP and the opening range",
+        "vwap opening range next open session holdout",
+        None,
+    ),
+    ("AAPL IBT", "AAPL session VWAP and opening range vs holding the cash session", "intraday backtest 5m", None),
+    ("AAPL IBT VWAP", "AAPL VWAP cross vs session hold on the unseen sessions", "vwap cross fill", None),
+    ("AAPL IBT OR 15m", "AAPL opening-range break on 15-minute bars", "opening range 15m", None),
+    (
         "LOOKALIKE",
         "Historical lookalikes: nearest past conditions and subsequent returns",
         "knn analog neighbor overlap horizon",
@@ -274,6 +283,10 @@ pub(super) fn static_items() -> Vec<Item> {
     v.push(
         Item::new(Kind::Panel, "New Backtest pane", "NEW BACKTEST", Target::Run("NEW BACKTEST".into()))
             .keywords("panel pane backtest strategy buy hold holdout costs"),
+    );
+    v.push(
+        Item::new(Kind::Panel, "New intraday backtest", "NEW IBT", Target::Run("NEW IBT".into()))
+            .keywords("panel pane ibt vwap opening range session"),
     );
     v.push(
         Item::new(Kind::Panel, "New Lookalikes pane", "NEW LOOKALIKE", Target::Run("NEW LOOKALIKE".into()))

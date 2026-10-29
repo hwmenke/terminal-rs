@@ -307,6 +307,10 @@ pub enum Function {
     Backtest {
         spec: String,
     },
+    /// Paper intraday VWAP and opening-range backtest (`IBT`, `AAPL IBT VWAP`).
+    IntradayBacktest {
+        spec: String,
+    },
     /// Historical lookalikes / nearest neighbors (`LOOKALIKE`, `AAPL KNN 2024-01-15 K=15`).
     Lookalike {
         spec: String,
@@ -519,6 +523,7 @@ fn parse_function(head: &str, rest: &[&str]) -> Option<Function> {
         "STATS" | "STAT" | "STATISTICS" => Function::Stats { condition: joined(), conditional: !rest.is_empty() },
         "COND" | "CDIST" | "CONDRET" => Function::Stats { condition: joined(), conditional: true },
         "BACKTEST" | "BT" | "BTEST" => Function::Backtest { spec: joined() },
+        "IBT" | "IBACKTEST" | "SETUPBT" => Function::IntradayBacktest { spec: joined() },
         "LOOKALIKE" | "LOOKALIKES" | "KNN" | "ANALOG" | "ANALOGUE" | "NN" => Function::Lookalike { spec: joined() },
         "GOTO" | "JUMP" | "GTO" => Function::Goto { date: joined() },
         "NOTE" | "JNOTE" => {
@@ -755,6 +760,10 @@ fn describe(f: &Function) -> String {
             "Paper backtest: declared strategies vs buy-and-hold on a chronological holdout".into()
         }
         Function::Backtest { spec } => format!("Paper backtest vs buy-and-hold ({spec})"),
+        Function::IntradayBacktest { spec } if spec.is_empty() => {
+            "Paper intraday backtest: session VWAP and opening range vs holding the cash session".into()
+        }
+        Function::IntradayBacktest { spec } => format!("Paper intraday backtest ({spec})"),
         Function::Lookalike { spec } if spec.is_empty() => {
             "Historical lookalikes: nearest past conditions, per-horizon counts, jump to neighbor dates".into()
         }

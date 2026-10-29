@@ -224,8 +224,13 @@ impl BookPane {
 
 impl PaneKind {
     /// Price history has its own panel identity, so opening research keeps job progress visible.
-    fn panel_type(&self) -> (std::mem::Discriminant<Self>, bool) {
-        (std::mem::discriminant(self), matches!(self,Self::Research(r) if r.history))
+    fn panel_type(&self) -> (std::mem::Discriminant<Self>, u8) {
+        let kind = match self {
+            Self::Research(r) if r.history => 1,
+            Self::Backtest(b) if b.intraday => 2,
+            _ => 0,
+        };
+        (std::mem::discriminant(self), kind)
     }
 
     /// Short tab title.
@@ -286,10 +291,11 @@ impl PaneKind {
                 }
             }
             PaneKind::Backtest(b) => {
+                let kind = if b.intraday { "Intraday" } else { "Backtest" };
                 if b.symbol.trim().is_empty() {
-                    "Backtest".into()
+                    kind.into()
                 } else {
-                    format!("{} Backtest", tr_data::security(&b.symbol).ticker)
+                    format!("{} {kind}", tr_data::security(&b.symbol).ticker)
                 }
             }
             PaneKind::Lookalike(l) => {
@@ -331,6 +337,7 @@ impl PaneKind {
             PaneKind::Desk(_) => "DESK",
             PaneKind::Journal(_) => "JRNL",
             PaneKind::Stats(_) => "STATS",
+            PaneKind::Backtest(b) if b.intraday => "IBT",
             PaneKind::Backtest(_) => "BT",
             PaneKind::Lookalike(_) => "KNN",
             PaneKind::Settings => "PDF",
@@ -429,6 +436,8 @@ impl PaneKind {
                 commission: b.commission.clone(),
                 slippage: b.slippage.clone(),
                 shorts: b.allow_short,
+                intraday: b.intraday,
+                tf: b.tf.clone(),
             },
             PaneKind::Lookalike(l) => PaneSettings::Lookalike {
                 symbol: l.symbol.clone(),
@@ -516,12 +525,19 @@ impl PaneKind {
             PaneSettings::Stats { symbol, condition, conditional } => {
                 PaneKind::Stats(Box::new(stats::StatsPane::new(symbol, condition, conditional)))
             }
-            PaneSettings::Backtest { symbol, spec, holdout, commission, slippage, shorts } => {
-                let mut pane = backtest::BacktestPane::new(symbol, spec);
+            PaneSettings::Backtest { symbol, spec, holdout, commission, slippage, shorts, intraday, tf } => {
+                let mut pane = if intraday {
+                    backtest::BacktestPane::intraday(symbol, spec)
+                } else {
+                    backtest::BacktestPane::new(symbol, spec)
+                };
                 pane.holdout = holdout;
                 pane.commission = commission;
                 pane.slippage = slippage;
                 pane.allow_short = shorts;
+                if !tf.is_empty() {
+                    pane.tf = tf;
+                }
                 PaneKind::Backtest(Box::new(pane))
             }
             PaneSettings::Lookalike { symbol, spec, as_of, k, gap, horizons } => {
@@ -1048,6 +1064,9 @@ impl TerminalApp {
                 self.open_stats(Some(&s), &condition, conditional)
             }
             Command::SymbolFunction(s, Function::Backtest { spec }) => self.open_backtest(Some(&s), &spec),
+            Command::SymbolFunction(s, Function::IntradayBacktest { spec }) => {
+                self.open_intraday_backtest(Some(&s), &spec)
+            }
             Command::SymbolFunction(s, Function::Lookalike { spec }) => self.open_lookalike(Some(&s), &spec),
             Command::SymbolFunction(s, Function::Goto { date }) => self.goto_chart_date(Some(&s), &date),
             Command::SymbolFunction(s, Function::JournalNote { date, text }) => {
@@ -1135,7 +1154,7 @@ impl TerminalApp {
                     }
                     None => {
                         self.status = format!(
-                            "Unknown panel {spec:?}; try CHART, NEWS, BOOK, WEI, GC, CONG, WL, DESK, JOURNAL, STATS, BACKTEST, LOOKALIKE, PORT"
+                            "Unknown panel {spec:?}; try CHART, NEWS, BOOK, WEI, GC, CONG, WL, DESK, JOURNAL, STATS, BACKTEST, IBT, LOOKALIKE, PORT"
                         )
                     }
                 }
@@ -1231,6 +1250,7 @@ impl TerminalApp {
             Function::Journal(extra) => self.open_journal(symbol.as_deref(), &extra),
             Function::Stats { condition, conditional } => self.open_stats(symbol.as_deref(), &condition, conditional),
             Function::Backtest { spec } => self.open_backtest(symbol.as_deref(), &spec),
+            Function::IntradayBacktest { spec } => self.open_intraday_backtest(symbol.as_deref(), &spec),
             Function::Lookalike { spec } => self.open_lookalike(symbol.as_deref(), &spec),
             Function::Goto { date } => self.goto_chart_date(symbol.as_deref(), &date),
             Function::JournalNote { date, text } => self.add_journal_note(symbol.as_deref(), &date, &text),
@@ -1373,6 +1393,13 @@ impl TerminalApp {
                         self.panes.iter_mut().find(|p| p.id == pane).map(|p| &mut p.kind)
                     {
                         b.accept(generation, result);
+                    }
+                }
+                Response::IntradayBacktest { pane, generation, result } => {
+                    if let Some(PaneKind::Backtest(b)) =
+                        self.panes.iter_mut().find(|p| p.id == pane).map(|p| &mut p.kind)
+                    {
+                        b.accept_intraday(generation, result);
                     }
                 }
                 Response::Lookalike { pane, generation, result } => {
@@ -2382,6 +2409,8 @@ mod tests {
                 commission: "5".into(),
                 slippage: "5".into(),
                 shorts: false,
+                intraday: false,
+                tf: String::new(),
             },
             {
                 let mut c = ChartState::new(0, "AAPL", tr_core::Timeframe::D1);

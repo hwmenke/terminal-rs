@@ -66,6 +66,18 @@ pub enum Request {
         slippage_bps: f64,
         allow_short: bool,
     },
+    /// Paper VWAP / opening-range backtest on verified regular-session bars.
+    IntradayBacktest {
+        pane: PaneId,
+        generation: u64,
+        symbol: String,
+        spec: String,
+        timeframe: String,
+        holdout: String,
+        commission_bps: f64,
+        slippage_bps: f64,
+        allow_short: bool,
+    },
     /// Historical lookalikes / nearest neighbors for one archive symbol.
     Lookalike {
         pane: PaneId,
@@ -337,6 +349,11 @@ pub enum Response {
         pane: PaneId,
         generation: u64,
         result: Result<tr_data::backtest::BacktestReport, String>,
+    },
+    IntradayBacktest {
+        pane: PaneId,
+        generation: u64,
+        result: Result<tr_data::intraday_backtest::IntradayReport, String>,
     },
     Lookalike {
         pane: PaneId,
@@ -985,6 +1002,53 @@ async fn research_backtest(
     Ok(report)
 }
 
+/// Verified regular-session bars only. Sample substitution is refused before a setup is scored.
+async fn research_intraday_backtest(
+    s: &Shared,
+    key: &str,
+    spec: &str,
+    timeframe: &str,
+    holdout: &str,
+    commission_bps: f64,
+    slippage_bps: f64,
+    allow_short: bool,
+) -> anyhow::Result<tr_data::intraday_backtest::IntradayReport> {
+    let sec = tr_data::security(key);
+    if !matches!(sec.class, tr_core::AssetClass::Equity | tr_core::AssetClass::Etf | tr_core::AssetClass::Index) {
+        anyhow::bail!(
+            "Intraday backtest refused: {} has no US cash session. Sample prices are never used.",
+            sec.ticker
+        );
+    }
+    if s.provider.name() == "sample" {
+        anyhow::bail!(
+            "Intraday backtest refused: sample / offline display mode does not feed this pane. Sample prices are never used."
+        );
+    }
+    let (setups, tf) = tr_data::intraday_backtest::parse_request(spec, timeframe).map_err(anyhow::Error::msg)?;
+    let limit = tr_data::intraday_backtest::fetch_limit(tf);
+    let symbol = sec.key();
+    let bars = s.provider.history(&symbol, tf, None, limit).await?;
+    if bars.is_empty() {
+        anyhow::bail!(
+            "Intraday backtest refused: no regular-session bars were returned. Sample prices are never used."
+        );
+    }
+    Bar::require_verified(&bars, "Intraday backtest").map_err(anyhow::Error::msg)?;
+    let settings = tr_data::intraday_backtest::RunSettings {
+        holdout_frac: tr_data::backtest::parse_holdout(holdout),
+        costs: tr_data::backtest::CostModel { commission_bps, slippage_bps },
+        seed: tr_data::backtest::DEFAULT_SEED,
+        allow_short,
+        timeframe: tf,
+        setups,
+    };
+    let source = format!("{} {} regular session", s.provider.name(), tf.label());
+    tokio::task::spawn_blocking(move || tr_data::intraday_backtest::compute_report(&symbol, &bars, &settings, &source))
+        .await?
+        .map_err(anyhow::Error::msg)
+}
+
 /// Load one name from the local archive, then Whats-News. Sample/display bars never enter.
 async fn research_lookalike(
     s: &Shared,
@@ -1260,6 +1324,34 @@ async fn handle(s: &Arc<Shared>, req: Request) {
                     &bridge,
                     &symbol,
                     &spec,
+                    &holdout,
+                    commission_bps,
+                    slippage_bps,
+                    allow_short,
+                )
+                .await
+                .map_err(|e| format!("{e:#}")),
+            });
+        }
+        Request::IntradayBacktest {
+            pane,
+            generation,
+            symbol,
+            spec,
+            timeframe,
+            holdout,
+            commission_bps,
+            slippage_bps,
+            allow_short,
+        } => {
+            send(Response::IntradayBacktest {
+                pane,
+                generation,
+                result: research_intraday_backtest(
+                    s,
+                    &symbol,
+                    &spec,
+                    &timeframe,
                     &holdout,
                     commission_bps,
                     slippage_bps,

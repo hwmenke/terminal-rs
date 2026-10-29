@@ -296,6 +296,10 @@ impl TerminalApp {
                         "Paper backtest vs buy-and-hold: costs, next-open fills, chronological holdout, completed-trade win rate",
                     ),
                     (
+                        &["IBT", "AAPL IBT", "AAPL IBT VWAP", "AAPL IBT OR 15m"],
+                        "Paper intraday backtest: session VWAP and opening range vs holding the cash session",
+                    ),
+                    (
                         &["LOOKALIKE", "AAPL LOOKALIKE", "AAPL KNN 2024-01-15", "GOTO 2024-01-15"],
                         "Historical lookalikes: nearest past conditions, per-horizon counts, jump to neighbor dates",
                     ),

@@ -103,3 +103,6 @@ the archive or this pane.
 
 Historical lookalikes are documented in [LOOKALIKE.md](LOOKALIKE.md). Live
 order routing. SnapTrade / credentials. Parameter search on the evaluate window.
+
+Session VWAP and the opening range are not scored on these daily bars. That
+comparison is `IBT`, documented in [INTRADAY_BACKTEST.md](INTRADAY_BACKTEST.md).

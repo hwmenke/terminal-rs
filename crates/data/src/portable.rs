@@ -48,6 +48,8 @@ pub enum Kind {
     Workspace,
     Stats,
     Backtest,
+    /// Intraday VWAP / opening-range paper backtest. Not restored into the pane.
+    IntradayBacktest,
     Lookalike,
 }
 
@@ -60,6 +62,7 @@ impl Kind {
             Self::Workspace => "workspace",
             Self::Stats => "stats",
             Self::Backtest => "backtest",
+            Self::IntradayBacktest => "intraday-backtest",
             Self::Lookalike => "lookalike",
         }
     }
@@ -491,6 +494,31 @@ pub fn backtest_document(
     Ok(Document {
         format: FORMAT,
         kind: Kind::Backtest,
+        exported_at: exported_at.into(),
+        source: report.source.clone(),
+        as_of_date: Some(report.as_of.clone()).filter(|s| !s.is_empty()),
+        provenance: report.provenance,
+        sample,
+        sample_label,
+        credentials_excluded: true,
+        payload,
+    })
+}
+
+/// Intraday setup backtest snapshot. Sample-tagged reports stay labelled and are not restored.
+pub fn intraday_backtest_document(
+    report: &crate::intraday_backtest::IntradayReport,
+    exported_at: impl Into<String>,
+) -> Result<Document, String> {
+    let sample = report.provenance == Provenance::Sample || !report.provenance.is_verified();
+    if !sample {
+        report.provenance.require_verified("export IBT")?;
+    }
+    let payload = serde_json::to_value(report).map_err(|e| format!("intraday backtest payload: {e}"))?;
+    let (sample, sample_label) = sample_fields(sample || report.provenance == Provenance::Sample);
+    Ok(Document {
+        format: FORMAT,
+        kind: Kind::IntradayBacktest,
         exported_at: exported_at.into(),
         source: report.source.clone(),
         as_of_date: Some(report.as_of.clone()).filter(|s| !s.is_empty()),
