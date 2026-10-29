@@ -24,6 +24,7 @@ mod portfolio_view;
 mod relative_path;
 mod research;
 mod session_breadth;
+mod session_brief;
 mod session_extreme;
 mod session_path;
 mod settings_view;
@@ -116,6 +117,8 @@ pub enum PaneKind {
     SessionExtreme(Box<session_extreme::SessionExtremePane>),
     /// This name's percent from the 09:30 open minus SPY (`RPATH`).
     RelativePath(Box<relative_path::RelativePathPane>),
+    /// Path, pace, gap, extreme, and versus SPY for one name (`BRIEF`).
+    SessionBrief(Box<session_brief::SessionBriefPane>),
     Settings,
 }
 
@@ -369,6 +372,13 @@ impl PaneKind {
                     format!("{} vs SPY", tr_data::security(&p.symbol).ticker)
                 }
             }
+            PaneKind::SessionBrief(p) => {
+                if p.symbol.trim().is_empty() {
+                    "Brief".into()
+                } else {
+                    format!("{} Brief", tr_data::security(&p.symbol).ticker)
+                }
+            }
             PaneKind::Settings => "Settings".into(),
         }
     }
@@ -411,6 +421,7 @@ impl PaneKind {
             PaneKind::GapFill(_) => "GFILL",
             PaneKind::SessionExtreme(_) => "XTRM",
             PaneKind::RelativePath(_) => "RPATH",
+            PaneKind::SessionBrief(_) => "BRIEF",
             PaneKind::Settings => "PDF",
         }
     }
@@ -425,6 +436,7 @@ impl PaneKind {
             PaneKind::OrderBook(b) => Some(&b.symbol),
             PaneKind::Options(o) => Some(&o.symbol),
             PaneKind::VolumePace(p) => Some(&p.symbol),
+            PaneKind::SessionBrief(p) => Some(&p.symbol),
             _ => None,
         }
     }
@@ -437,6 +449,7 @@ impl PaneKind {
                 | PaneKind::OrderBook(_)
                 | PaneKind::Options(_)
                 | PaneKind::VolumePace(_)
+                | PaneKind::SessionBrief(_)
         ) || matches!(self, PaneKind::News(n) if n.scope == tr_data::news::NewsScope::Symbol)
     }
 
@@ -536,6 +549,7 @@ impl PaneKind {
             PaneKind::RelativePath(p) => {
                 PaneSettings::RelativePath { symbol: p.symbol.clone(), spec: p.spec.clone(), tf: p.tf.clone() }
             }
+            PaneKind::SessionBrief(p) => PaneSettings::SessionBrief { symbol: p.symbol.clone() },
             PaneKind::Lookalike(l) => PaneSettings::Lookalike {
                 symbol: l.symbol.clone(),
                 spec: l.spec.clone(),
@@ -694,6 +708,9 @@ impl PaneKind {
                     pane.tf = tf;
                 }
                 PaneKind::RelativePath(Box::new(pane))
+            }
+            PaneSettings::SessionBrief { symbol } => {
+                PaneKind::SessionBrief(Box::new(session_brief::SessionBriefPane::new(symbol)))
             }
             PaneSettings::IntradayCompare { symbol, peers, tf } => {
                 let mut pane = compare::ComparePane::new(symbol, peers);
@@ -1224,6 +1241,7 @@ impl TerminalApp {
             Command::SymbolFunction(s, Function::GapFill { spec }) => self.open_gap_fill(Some(&s), &spec),
             Command::SymbolFunction(s, Function::SessionExtreme { spec }) => self.open_session_extreme(Some(&s), &spec),
             Command::SymbolFunction(s, Function::RelativePath { spec }) => self.open_relative_path(Some(&s), &spec),
+            Command::SymbolFunction(s, Function::SessionBrief) => self.open_session_brief(Some(&s)),
             Command::SymbolFunction(s, Function::Goto { date }) => self.goto_chart_date(Some(&s), &date),
             Command::SymbolFunction(s, Function::JournalNote { date, text }) => {
                 self.add_journal_note(Some(&s), &date, &text)
@@ -1416,6 +1434,7 @@ impl TerminalApp {
             Function::GapFill { spec } => self.open_gap_fill(symbol.as_deref(), &spec),
             Function::SessionExtreme { spec } => self.open_session_extreme(symbol.as_deref(), &spec),
             Function::RelativePath { spec } => self.open_relative_path(symbol.as_deref(), &spec),
+            Function::SessionBrief => self.open_session_brief(symbol.as_deref()),
             Function::Goto { date } => self.goto_chart_date(symbol.as_deref(), &date),
             Function::JournalNote { date, text } => self.add_journal_note(symbol.as_deref(), &date, &text),
             Function::Latest => self.with_chart(|c, _| c.jump_latest()),
@@ -1603,6 +1622,13 @@ impl TerminalApp {
                 }
                 Response::RelativePath { pane, generation, result } => {
                     if let Some(PaneKind::RelativePath(p)) =
+                        self.panes.iter_mut().find(|p| p.id == pane).map(|p| &mut p.kind)
+                    {
+                        p.accept(generation, result);
+                    }
+                }
+                Response::SessionBrief { pane, generation, result } => {
+                    if let Some(PaneKind::SessionBrief(p)) =
                         self.panes.iter_mut().find(|p| p.id == pane).map(|p| &mut p.kind)
                     {
                         p.accept(generation, result);
@@ -2615,6 +2641,7 @@ mod tests {
             PaneSettings::Research(None),
             PaneSettings::Research(Some("DARVAS_BREAKOUT".into())),
             PaneSettings::Desk { group: "Growth".into(), selected: Some("AAPL US Equity".into()) },
+            PaneSettings::SessionBrief { symbol: "AAPL US Equity".into() },
             PaneSettings::Backtest {
                 symbol: "AAPL US Equity".into(),
                 spec: "ADTREND".into(),

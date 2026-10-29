@@ -123,6 +123,12 @@ pub enum Request {
         spec: String,
         timeframe: String,
     },
+    /// Five session reads for one name. Not a chart.
+    SessionBrief {
+        pane: PaneId,
+        generation: u64,
+        symbol: String,
+    },
     /// Paper VWAP / opening-range backtest on verified regular-session bars.
     IntradayBacktest {
         pane: PaneId,
@@ -446,6 +452,11 @@ pub enum Response {
         pane: PaneId,
         generation: u64,
         result: Result<tr_data::relative_path::RelativePath, String>,
+    },
+    SessionBrief {
+        pane: PaneId,
+        generation: u64,
+        result: Result<tr_data::session_brief::SessionBrief, String>,
     },
     Lookalike {
         pane: PaneId,
@@ -1328,6 +1339,37 @@ async fn research_relative_path(
     tr_data::relative_path::build_relative(&sec.key(), &bars, &spy, &query, &source).map_err(anyhow::Error::msg)
 }
 
+/// Five session reads from one verified 5-minute history. Sample substitution is refused.
+/// A missing SPY history blanks only the versus-SPY line.
+async fn research_session_brief(s: &Shared, symbol: &str) -> anyhow::Result<tr_data::session_brief::SessionBrief> {
+    if s.provider.name() == "sample" {
+        anyhow::bail!(
+            "Session brief refused: sample / offline display mode does not feed this pane. Sample prices are never used."
+        );
+    }
+    let sec = tr_data::security(symbol);
+    if !matches!(sec.class, tr_core::AssetClass::Equity | tr_core::AssetClass::Etf | tr_core::AssetClass::Index) {
+        anyhow::bail!("{} has no US cash session.", sec.ticker);
+    }
+    let limit = tr_data::session_alerts::fetch_limit();
+    let bars = s.provider.history(&sec.key(), Timeframe::M5, None, limit).await?;
+    if bars.is_empty() {
+        anyhow::bail!("Session brief refused: no regular-session bars were returned. Sample prices are never used.");
+    }
+    Bar::require_verified(&bars, "Session brief").map_err(anyhow::Error::msg)?;
+    let spy_key = tr_data::relative_path::benchmark_key();
+    let spy = if sec.key() == spy_key {
+        Some(bars.clone())
+    } else {
+        match s.provider.history(&spy_key, Timeframe::M5, None, limit).await {
+            Ok(spy) if !spy.is_empty() => Some(spy),
+            _ => None,
+        }
+    };
+    let now = chrono::Utc::now().timestamp();
+    tr_data::session_brief::build(&sec.key(), Timeframe::M5, &bars, spy.as_deref(), now).map_err(anyhow::Error::msg)
+}
+
 /// Verified regular-session bars for a list of cash names. Sample substitution is refused.
 async fn research_breadth(
     s: &Shared,
@@ -1695,6 +1737,13 @@ async fn handle(s: &Arc<Shared>, req: Request) {
                 pane,
                 generation,
                 result: research_relative_path(s, &symbol, &spec, &timeframe).await.map_err(|e| format!("{e:#}")),
+            });
+        }
+        Request::SessionBrief { pane, generation, symbol } => {
+            send(Response::SessionBrief {
+                pane,
+                generation,
+                result: research_session_brief(s, &symbol).await.map_err(|e| format!("{e:#}")),
             });
         }
         Request::Breadth { pane, generation, spec, timeframe, symbols } => {

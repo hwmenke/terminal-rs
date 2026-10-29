@@ -132,6 +132,9 @@ const COMMANDS: &[(&str, &str, &str, Option<Action>)] = &[
     ("RPATH", "Percent from the 09:30 open minus SPY", "relative path spy spread lead lag", None),
     ("AAPL RPATH 20", "AAPL versus SPY over the last 20 sessions", "relative spy 20", None),
     ("AAPL RPATH 15m", "AAPL versus SPY on 15-minute bars", "relative spy 15m", None),
+    ("BRIEF", "Session brief: path, pace, gap, extreme, and versus SPY", "dashboard reads signals", None),
+    ("SBRIEF", "Session brief (alias)", "path pace gap extreme spy", None),
+    ("AAPL BRIEF", "Open the session brief for AAPL", "path pace gap extreme relative", None),
     (
         "LOOKALIKE",
         "Historical lookalikes: nearest past conditions and subsequent returns",
@@ -365,6 +368,10 @@ pub(super) fn static_items() -> Vec<Item> {
     v.push(
         Item::new(Kind::Panel, "New session extreme", "NEW XTRM", Target::Run("NEW XTRM".into()))
             .keywords("panel pane hilo session extreme high low"),
+    );
+    v.push(
+        Item::new(Kind::Panel, "New session brief", "NEW BRIEF", Target::Run("NEW BRIEF".into()))
+            .keywords("panel pane brief path pace gap extreme spy"),
     );
     v.push(
         Item::new(Kind::Panel, "New relative path", "NEW RPATH", Target::Run("NEW RPATH".into()))

@@ -141,7 +141,8 @@ impl TerminalApp {
             | PaneKind::VolumePace(_)
             | PaneKind::GapFill(_)
             | PaneKind::SessionExtreme(_)
-            | PaneKind::RelativePath(_) => {}
+            | PaneKind::RelativePath(_)
+            | PaneKind::SessionBrief(_) => {}
         }
         if matches!(self.panes[i].kind, PaneKind::Desk(_)) {
             actions.extend(self.desk(ui, id));
@@ -178,6 +179,9 @@ impl TerminalApp {
         }
         if matches!(self.panes[i].kind, PaneKind::RelativePath(_)) {
             actions.extend(self.relative_path_pane(ui, id));
+        }
+        if matches!(self.panes[i].kind, PaneKind::SessionBrief(_)) {
+            actions.extend(self.session_brief_pane(ui, id));
         }
         match self.panes[i].kind {
             PaneKind::Watchlist => actions.extend(self.watchlist(ui)),

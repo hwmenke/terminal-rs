@@ -784,6 +784,19 @@ impl TerminalApp {
             }
             if nav_row(
                 ui,
+                Icon::Chart,
+                "Session brief",
+                Some("BRIEF"),
+                is_focused(&PaneKind::SessionBrief(Box::new(super::session_brief::SessionBriefPane::new(
+                    String::new(),
+                )))),
+            )
+            .clicked()
+            {
+                out.push(SidebarCmd::Function(Function::SessionBrief));
+            }
+            if nav_row(
+                ui,
                 Icon::Search,
                 "Lookalikes",
                 Some("KNN"),
