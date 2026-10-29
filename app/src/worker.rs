@@ -191,6 +191,8 @@ pub enum Request {
     IntradayScan {
         group: String,
         symbols: Vec<String>,
+        /// Bumps on each read so a slow answer cannot replace a newer one.
+        generation: u64,
     },
     RefreshCongress,
     /// Write archived daily bars to a portable JSON file (source + dates).
@@ -407,6 +409,7 @@ pub enum Response {
     IntradayScan {
         group: String,
         board: tr_data::iscan::Board,
+        generation: u64,
     },
     /// Result of EXPORT HIST / RESTORE history / price-alert replace.
     Portable(Result<String, String>),
@@ -1592,9 +1595,9 @@ async fn handle(s: &Arc<Shared>, req: Request) {
             s.send(Response::PriceAlertFeed(s.price_alert_snapshot(chrono::Utc::now().timestamp())));
         }
         Request::EvaluatePriceAlerts => evaluate_price_alerts(s).await,
-        Request::IntradayScan { group, symbols } => {
+        Request::IntradayScan { group, symbols, generation } => {
             let board = intraday_scan(s, &symbols).await;
-            s.send(Response::IntradayScan { group, board });
+            s.send(Response::IntradayScan { group, board, generation });
         }
         Request::RefreshCongress => congress_refresh(s).await,
         Request::Forget(pane) => {

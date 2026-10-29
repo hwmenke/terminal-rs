@@ -85,6 +85,32 @@ impl Board {
             self.holes.len()
         )
     }
+
+    /// A later read can still change the rank: a live or stale print during the cash session.
+    pub fn follows_session(&self, now: i64) -> bool {
+        !self.sample && intraday::in_regular_session(now) && (!self.live.is_empty() || !self.stale.is_empty())
+    }
+}
+
+/// Whether an open scan should read again. The wait is the 5-minute chart TTL.
+/// Outside the regular session, and when nothing on the board can still move, it stays put.
+pub fn refresh_due(board: &Board, fetched_at: i64, now: i64) -> bool {
+    if !board.follows_session(now) || fetched_at <= 0 || now < fetched_at {
+        return false;
+    }
+    let Some(ttl) = intraday::refresh_ttl_secs(tr_core::Timeframe::M5) else { return false };
+    now.saturating_sub(fetched_at) >= ttl
+}
+
+/// One line under the scan. The words follow the clock, not a guessed countdown.
+pub fn pace_line(board: &Board, now: i64) -> &'static str {
+    if board.sample {
+        "Sample data is not refreshed into a rank."
+    } else if board.follows_session(now) {
+        "Updates about once a minute during the regular session."
+    } else {
+        "Automatic updates pause outside the regular session."
+    }
 }
 
 fn cash(class: AssetClass) -> bool {
@@ -266,5 +292,55 @@ mod tests {
         let index = read_bars("SPX Index", &session(), now).unwrap();
         assert_eq!(index.ticker, "SPX");
         assert!(matches!(index.freshness, Freshness::Current));
+    }
+
+    fn marker(freshness: Freshness) -> Row {
+        Row {
+            symbol: "AAPL US Equity".into(),
+            ticker: "AAPL".into(),
+            close: 10.0,
+            vwap: 9.0,
+            rvol: Some(2.0),
+            bar_ts: 1,
+            freshness,
+            provenance: Provenance::Real,
+        }
+    }
+
+    fn board_with(live: bool, stale: bool, sample: bool) -> Board {
+        Board {
+            live: live.then(|| marker(Freshness::Current)).into_iter().collect(),
+            closed: vec![],
+            stale: stale.then(|| marker(Freshness::Stale { lag_secs: 1 })).into_iter().collect(),
+            holes: vec![],
+            sample,
+        }
+    }
+
+    #[test]
+    fn refresh_waits_out_the_five_minute_ttl_and_pauses_when_the_session_is_shut() {
+        let ttl = intraday::refresh_ttl_secs(tr_core::Timeframe::M5).unwrap();
+        let open = wall(2026, 3, 9, 10, 0);
+        let shut = wall(2026, 3, 7, 12, 0);
+        let live = board_with(true, false, false);
+        assert!(!refresh_due(&live, open, open + ttl - 1));
+        assert!(refresh_due(&live, open, open + ttl));
+        assert!(!refresh_due(&live, 0, open + ttl), "a scan with no read time does not spin");
+        assert!(!refresh_due(&live, open, shut + ttl), "the cash session is shut");
+        let stale = board_with(false, true, false);
+        assert!(refresh_due(&stale, open, open + ttl));
+        let closed = Board {
+            live: vec![],
+            closed: vec![marker(Freshness::Closed)],
+            stale: vec![],
+            holes: vec![],
+            sample: false,
+        };
+        assert!(!refresh_due(&closed, open, open + ttl));
+        let sample = board_with(true, false, true);
+        assert!(!refresh_due(&sample, open, open + ttl));
+        assert_eq!(pace_line(&live, open), "Updates about once a minute during the regular session.");
+        assert_eq!(pace_line(&live, shut), "Automatic updates pause outside the regular session.");
+        assert_eq!(pace_line(&sample, open), "Sample data is not refreshed into a rank.");
     }
 }

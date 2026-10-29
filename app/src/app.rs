@@ -1424,7 +1424,9 @@ impl TerminalApp {
                     }
                 }
                 Response::Quotes(q) => self.apply_quotes(q),
-                Response::IntradayScan { group, board } => self.store_intraday_scan(group, board),
+                Response::IntradayScan { group, board, generation } => {
+                    self.store_intraday_scan(group, board, generation)
+                }
                 Response::Latest(t) => self.latest = t,
                 Response::TickerTrades { pane, symbol, trades } => {
                     if let Some(p) = self.panes.iter_mut().find(|p| p.id == pane)

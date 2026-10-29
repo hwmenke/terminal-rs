@@ -158,6 +158,8 @@ pub struct UiState {
     /// Group the in-flight or shown intraday scan belongs to.
     pub intraday_group: String,
     pub intraday_pending: bool,
+    /// Bumps on each read so a slow answer cannot replace a newer one.
+    pub intraday_gen: u64,
 }
 
 /// A finished intraday scan for one group.
@@ -165,6 +167,7 @@ pub struct UiState {
 pub struct IntradayScan {
     pub group: String,
     pub board: tr_data::iscan::Board,
+    pub fetched_at: i64,
 }
 
 /// A single display path used by the panel and tested for provenance/freshness.
@@ -643,15 +646,15 @@ impl TerminalApp {
         self.status = format!("Intraday · {}", self.watch_ui.selected_group);
     }
 
-    pub(super) fn store_intraday_scan(&mut self, group: String, board: tr_data::iscan::Board) {
-        if group != self.watch_ui.intraday_group {
+    pub(super) fn store_intraday_scan(&mut self, group: String, board: tr_data::iscan::Board, generation: u64) {
+        if generation != self.watch_ui.intraday_gen || group != self.watch_ui.intraday_group {
             return;
         }
         self.watch_ui.intraday_pending = false;
         if self.watch_ui.intraday {
             self.status = format!("Intraday · {group} · {}", board.summary());
         }
-        self.intraday_scan = Some(IntradayScan { group, board });
+        self.intraday_scan = Some(IntradayScan { group, board, fetched_at: chrono::Utc::now().timestamp() });
     }
 
     fn reload_intraday_scan(&mut self) {
@@ -673,15 +676,43 @@ impl TerminalApp {
         if self.watch_ui.intraday_group == group && (self.watch_ui.intraday_pending || self.intraday_scan.is_some()) {
             return;
         }
+        self.issue_intraday_scan(true);
+    }
+
+    /// Ask for a new read. `clear` drops the board already on screen; a timed refresh keeps it.
+    fn issue_intraday_scan(&mut self, clear: bool) {
+        let group = self.watch_ui.selected_group.clone();
+        let Some(g) = self.watchlists.group(&group) else { return };
+        if g.members.is_empty() {
+            return;
+        }
         let symbols = g.members.iter().map(|m| m.symbol.clone()).collect();
         self.watch_ui.intraday_group = group.clone();
         self.watch_ui.intraday_pending = true;
-        self.intraday_scan = None;
-        self.worker.send(crate::worker::Request::IntradayScan { group, symbols });
+        self.watch_ui.intraday_gen = self.watch_ui.intraday_gen.saturating_add(1);
+        let generation = self.watch_ui.intraday_gen;
+        if clear {
+            self.intraday_scan = None;
+        }
+        self.worker.send(crate::worker::Request::IntradayScan { group, symbols, generation });
+    }
+
+    fn poll_intraday_scan_at(&mut self, now: i64) {
+        if !self.watch_ui.intraday || self.watch_ui.intraday_pending {
+            return;
+        }
+        let Some(scan) = self.intraday_scan.as_ref() else { return };
+        if scan.group != self.watch_ui.selected_group {
+            return;
+        }
+        if tr_data::iscan::refresh_due(&scan.board, scan.fetched_at, now) {
+            self.issue_intraday_scan(false);
+        }
     }
 
     /// Session RVOL and close versus VWAP for the selected group.
     fn intraday_scan(&mut self, ui: &mut egui::Ui, group: &str) -> Vec<Action> {
+        self.poll_intraday_scan_at(Utc::now().timestamp());
         let mut out = Vec::new();
         let Some(g) = self.watchlists.group(group) else {
             return out;
@@ -707,6 +738,7 @@ impl TerminalApp {
         ui.small(
             "RVOL and VWAP come from verified 5-minute bars. A dash means those bars did not support a number. A closed or stale session is not ranked as live.",
         );
+        ui.small(tr_data::iscan::pace_line(&scan.board, Utc::now().timestamp()));
         if scan.board.sample {
             ui.label(
                 RichText::new("Sample / offline mode: intraday ranks are not invented.").color(crate::theme::down()),
@@ -1572,9 +1604,10 @@ mod tests {
         assert!(app.watch_ui.intraday);
         assert!(!app.watch_ui.calendar);
         app.watch_ui.intraday_pending = false;
-        app.intraday_scan = Some(IntradayScan { group: "Default".into(), board });
+        app.intraday_scan = Some(IntradayScan { group: "Default".into(), board: board.clone(), fetched_at: 0 });
         let ctx = egui::Context::default();
         let shapes = frame(&ctx, &mut app, vec![]);
+        text_position(&shapes, tr_data::iscan::pace_line(&board, chrono::Utc::now().timestamp()));
         text_position(&shapes, "RVOL 2.00×");
         text_position(&shapes, "RVOL —");
         text_position(&shapes, "Live");
@@ -1591,5 +1624,55 @@ mod tests {
         text_position(&shapes, "Empty group");
         app.execute("WL");
         assert!(!app.watch_ui.intraday && !app.watch_ui.calendar);
+    }
+
+    #[test]
+    fn a_due_scan_keeps_the_board_and_a_shut_session_does_not_read_again() {
+        fn wall(y: i32, m: u32, d: u32, h: u32, min: u32) -> i64 {
+            tr_core::ny::to_utc(chrono::NaiveDate::from_ymd_opt(y, m, d).unwrap().and_hms_opt(h, min, 0).unwrap())
+        }
+        let open = wall(2026, 3, 9, 10, 0);
+        let ttl = tr_data::intraday::refresh_ttl_secs(tr_core::Timeframe::M5).unwrap();
+        let live = tr_data::iscan::build(
+            vec![(
+                "AAPL".into(),
+                Ok(tr_data::iscan::Row {
+                    symbol: "AAPL US Equity".into(),
+                    ticker: "AAPL".into(),
+                    close: 21.0,
+                    vwap: 15.0,
+                    rvol: Some(2.0),
+                    bar_ts: open,
+                    freshness: tr_data::intraday::Freshness::Current,
+                    provenance: Provenance::Real,
+                }),
+            )],
+            false,
+        );
+        let mut app = test_app();
+        app.watchlists = Watchlists::migrate(&[]);
+        app.watchlists.add("Default", Member::new("AAPL")).unwrap();
+        app.watch_ui.selected_group = "Default".into();
+        app.watch_ui.intraday = true;
+        app.watch_ui.intraday_group = "Default".into();
+        app.intraday_scan = Some(IntradayScan { group: "Default".into(), board: live.clone(), fetched_at: open });
+        app.poll_intraday_scan_at(open + ttl - 1);
+        assert!(!app.watch_ui.intraday_pending);
+        assert_eq!(app.watch_ui.intraday_gen, 0);
+        app.poll_intraday_scan_at(open + ttl);
+        assert!(app.watch_ui.intraday_pending);
+        assert_eq!(app.watch_ui.intraday_gen, 1);
+        assert_eq!(app.intraday_scan.as_ref().map(|s| s.board.clone()), Some(live));
+        app.poll_intraday_scan_at(open + ttl + ttl);
+        assert_eq!(app.watch_ui.intraday_gen, 1, "a read already in flight is not asked twice");
+
+        app.watch_ui.intraday_pending = false;
+        let shut = wall(2026, 3, 7, 12, 0);
+        app.intraday_scan.as_mut().unwrap().fetched_at = shut - ttl;
+        app.poll_intraday_scan_at(shut);
+        assert_eq!(app.watch_ui.intraday_gen, 1, "outside the regular session the board stays put");
+        app.watch_ui.intraday = false;
+        app.poll_intraday_scan_at(open + ttl + ttl);
+        assert_eq!(app.watch_ui.intraday_gen, 1);
     }
 }
