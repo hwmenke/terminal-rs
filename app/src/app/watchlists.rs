@@ -153,6 +153,18 @@ pub struct UiState {
     pub name: String,
     /// Quotes list, or the earnings calendar for the selected group.
     pub calendar: bool,
+    /// Session RVOL and VWAP for the selected group.
+    pub intraday: bool,
+    /// Group the in-flight or shown intraday scan belongs to.
+    pub intraday_group: String,
+    pub intraday_pending: bool,
+}
+
+/// A finished intraday scan for one group.
+#[derive(Debug, Clone, PartialEq)]
+pub struct IntradayScan {
+    pub group: String,
+    pub board: tr_data::iscan::Board,
 }
 
 /// A single display path used by the panel and tested for provenance/freshness.
@@ -442,16 +454,27 @@ impl TerminalApp {
                 self.link_watch_group(id, Some(self.watch_ui.selected_group.clone()));
                 self.status = format!("Chart linked to {}", self.watch_ui.selected_group);
             }
-            if ui.selectable_label(!self.watch_ui.calendar, "Quotes").clicked() {
+            if ui.selectable_label(!self.watch_ui.calendar && !self.watch_ui.intraday, "Quotes").clicked() {
                 self.watch_ui.calendar = false;
+                self.watch_ui.intraday = false;
             }
             if ui.selectable_label(self.watch_ui.calendar, "Earnings").clicked() {
                 self.watch_ui.calendar = true;
+                self.watch_ui.intraday = false;
+            }
+            if ui.selectable_label(self.watch_ui.intraday, "Intraday").clicked() && !self.watch_ui.intraday {
+                self.watch_ui.calendar = false;
+                self.watch_ui.intraday = true;
+                self.ensure_intraday_scan();
             }
         });
         let group = self.watch_ui.selected_group.clone();
         if self.watch_ui.calendar {
             return self.earnings_calendar(ui, &group);
+        }
+        if self.watch_ui.intraday {
+            self.ensure_intraday_scan();
+            return self.intraday_scan(ui, &group);
         }
         ui.label("Security · Last · Change % · Provenance · Freshness");
         ui.small("w: save symbol to group · W: save to last-used · right-click to remove");
@@ -603,17 +626,141 @@ impl TerminalApp {
             self.watch_ui.selected_group = self.watchlists.last_used.clone();
         }
         self.watch_ui.calendar = calendar;
+        self.watch_ui.intraday = false;
         self.open_panel(PaneKind::Watchlist);
         let group = &self.watch_ui.selected_group;
         self.status = if calendar { format!("Earnings calendar · {group}") } else { "Watchlist".into() };
     }
 
-    /// `EARNINGS` turns the watchlist calendar on. `WL` turns it off.
+    pub(super) fn open_intraday(&mut self) {
+        if self.watchlists.index(&self.watch_ui.selected_group).is_none() {
+            self.watch_ui.selected_group = self.watchlists.last_used.clone();
+        }
+        self.watch_ui.calendar = false;
+        self.watch_ui.intraday = true;
+        self.open_panel(PaneKind::Watchlist);
+        self.reload_intraday_scan();
+        self.status = format!("Intraday · {}", self.watch_ui.selected_group);
+    }
+
+    pub(super) fn store_intraday_scan(&mut self, group: String, board: tr_data::iscan::Board) {
+        if group != self.watch_ui.intraday_group {
+            return;
+        }
+        self.watch_ui.intraday_pending = false;
+        if self.watch_ui.intraday {
+            self.status = format!("Intraday · {group} · {}", board.summary());
+        }
+        self.intraday_scan = Some(IntradayScan { group, board });
+    }
+
+    fn reload_intraday_scan(&mut self) {
+        self.watch_ui.intraday_pending = false;
+        self.watch_ui.intraday_group.clear();
+        self.intraday_scan = None;
+        self.ensure_intraday_scan();
+    }
+
+    fn ensure_intraday_scan(&mut self) {
+        if !self.watch_ui.intraday {
+            return;
+        }
+        let group = self.watch_ui.selected_group.clone();
+        let Some(g) = self.watchlists.group(&group) else { return };
+        if g.members.is_empty() {
+            return;
+        }
+        if self.watch_ui.intraday_group == group && (self.watch_ui.intraday_pending || self.intraday_scan.is_some()) {
+            return;
+        }
+        let symbols = g.members.iter().map(|m| m.symbol.clone()).collect();
+        self.watch_ui.intraday_group = group.clone();
+        self.watch_ui.intraday_pending = true;
+        self.intraday_scan = None;
+        self.worker.send(crate::worker::Request::IntradayScan { group, symbols });
+    }
+
+    /// Session RVOL and close versus VWAP for the selected group.
+    fn intraday_scan(&mut self, ui: &mut egui::Ui, group: &str) -> Vec<Action> {
+        let mut out = Vec::new();
+        let Some(g) = self.watchlists.group(group) else {
+            return out;
+        };
+        if g.members.is_empty() {
+            ui.label("Empty group · WL ADD <group> <symbol…>");
+            return out;
+        }
+        let archive: HashMap<String, bool> =
+            g.members.iter().map(|m| (m.symbol.clone(), !m.origins.is_empty())).collect();
+        if ui.button("Refresh").clicked() {
+            self.reload_intraday_scan();
+        }
+        let Some(scan) = self.intraday_scan.clone().filter(|s| s.group == group) else {
+            ui.label("Reading verified 5-minute bars…");
+            return out;
+        };
+        ui.label(
+            RichText::new(format!("Intraday · {group} · {}", scan.board.summary()))
+                .monospace()
+                .color(crate::theme::text()),
+        );
+        ui.small(
+            "RVOL and VWAP come from verified 5-minute bars. A dash means those bars did not support a number. A closed or stale session is not ranked as live.",
+        );
+        if scan.board.sample {
+            ui.label(
+                RichText::new("Sample / offline mode: intraday ranks are not invented.").color(crate::theme::down()),
+            );
+        }
+        let mut row = |ui: &mut egui::Ui, symbol: &str, line: String| {
+            let response = ui.selectable_label(false, RichText::new(line).monospace().color(crate::theme::text()));
+            if response.clicked() {
+                let archive = archive.get(symbol).copied().unwrap_or(false);
+                out.push(Action::WatchChart(group.to_string(), symbol.to_string(), archive));
+            }
+        };
+        egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+            for (title, rows) in [
+                (tr_data::iscan::LIVE, &scan.board.live),
+                (tr_data::iscan::CLOSED, &scan.board.closed),
+                (tr_data::iscan::STALE, &scan.board.stale),
+            ] {
+                if rows.is_empty() {
+                    continue;
+                }
+                ui.add_space(4.0);
+                ui.label(RichText::new(title).monospace().color(crate::theme::amber()));
+                for r in rows {
+                    row(ui, &r.symbol, r.line());
+                }
+            }
+            if !scan.board.holes.is_empty() {
+                ui.add_space(4.0);
+                ui.label(RichText::new(tr_data::iscan::HOLES).monospace().color(crate::theme::amber()));
+                for h in &scan.board.holes {
+                    row(ui, &h.symbol, h.line());
+                }
+            }
+        });
+        out
+    }
+
+    /// `EARNINGS` turns the watchlist calendar on. `ISCAN` turns the intraday scan on. `WL` returns to quotes.
     pub(super) fn apply_watchlist_spec(&mut self, spec: &str) {
         let head = spec.split_whitespace().next().unwrap_or("").to_ascii_uppercase();
         match head.as_str() {
-            "EARN" | "EARNINGS" | "ECAL" => self.watch_ui.calendar = true,
-            "WL" | "WATCHLIST" | "W" | "MON" | "WATCH" => self.watch_ui.calendar = false,
+            "EARN" | "EARNINGS" | "ECAL" => {
+                self.watch_ui.calendar = true;
+                self.watch_ui.intraday = false;
+            }
+            "ISCAN" | "INTRADAY" => {
+                self.watch_ui.calendar = false;
+                self.watch_ui.intraday = true;
+            }
+            "WL" | "WATCHLIST" | "W" | "MON" | "WATCH" => {
+                self.watch_ui.calendar = false;
+                self.watch_ui.intraday = false;
+            }
             _ => {}
         }
     }
@@ -1365,5 +1512,84 @@ mod tests {
         assert!(!label.contains("post") && !label.contains("PE"), "{label}");
         q.stats = tr_data::QuoteStats::default();
         assert!(!member_text(&m, Some(&q), now).contains("pre "), "missing stats stay off the row");
+    }
+
+    fn has_text(shapes: &[egui::epaint::ClippedShape], needle: &str) -> bool {
+        fn find(shape: &egui::Shape, needle: &str) -> bool {
+            match shape {
+                egui::Shape::Text(t) if t.galley.job.text.contains(needle) => true,
+                egui::Shape::Vec(v) => v.iter().any(|s| find(s, needle)),
+                _ => false,
+            }
+        }
+        shapes.iter().any(|s| find(&s.shape, needle))
+    }
+
+    #[test]
+    fn intraday_scan_paints_session_rvol_and_opens_the_chart() {
+        fn wall(y: i32, m: u32, d: u32, h: u32, min: u32) -> i64 {
+            tr_core::ny::to_utc(chrono::NaiveDate::from_ymd_opt(y, m, d).unwrap().and_hms_opt(h, min, 0).unwrap())
+        }
+        fn bar(ts: i64, close: f64, volume: f64) -> tr_core::Bar {
+            tr_core::Bar::new(ts, close, close + 1.0, close - 1.0, close, volume).with_provenance(Provenance::Real)
+        }
+        let session = vec![
+            bar(wall(2026, 3, 6, 9, 30), 11.0, 100.0),
+            bar(wall(2026, 3, 6, 9, 35), 11.0, 100.0),
+            bar(wall(2026, 3, 9, 9, 30), 11.0, 300.0),
+            bar(wall(2026, 3, 9, 9, 35), 21.0, 100.0),
+        ];
+        let today = session.iter().copied().filter(|b| b.ts >= wall(2026, 3, 9, 0, 0)).collect::<Vec<_>>();
+        let closed = vec![bar(wall(2026, 3, 5, 15, 55), 10.0, 100.0), bar(wall(2026, 3, 6, 15, 55), 12.0, 200.0)];
+        let live_at = wall(2026, 3, 9, 9, 36);
+        let board = tr_data::iscan::build(
+            vec![
+                ("AAPL".into(), tr_data::iscan::read_bars("AAPL", &session, live_at)),
+                ("MSFT".into(), tr_data::iscan::read_bars("MSFT", &today, live_at)),
+                ("NVDA".into(), tr_data::iscan::read_bars("NVDA", &session, wall(2026, 3, 9, 10, 7))),
+                ("JPM".into(), tr_data::iscan::read_bars("JPM", &closed, wall(2026, 3, 7, 12, 0))),
+                ("EURUSD".into(), Err(tr_data::iscan::sample_reason("EURUSD"))),
+            ],
+            false,
+        );
+        assert!(board.live.iter().any(|r| r.ticker == "AAPL" && r.line().contains("RVOL 2.00×")));
+        assert!(board.live.iter().any(|r| r.line().contains("RVOL —")));
+        assert_eq!(board.stale.len(), 1);
+        assert_eq!(board.closed.len(), 1);
+        assert!(board.holes.iter().all(|h| !h.line().contains("RVOL")));
+
+        let mut app = test_app();
+        let chart = app.new_pane(PaneKind::Chart(Box::new(ChartState::new(0, "SPY", tr_core::Timeframe::D1))));
+        app.new_pane(PaneKind::Watchlist);
+        app.watch_ui.active_chart = Some(chart);
+        app.focus_cmd = false;
+        app.watchlists = Watchlists::migrate(&[]);
+        for symbol in ["AAPL", "MSFT", "NVDA", "JPM", "EURUSD"] {
+            app.watchlists.add("Default", Member::new(symbol)).unwrap();
+        }
+        app.execute("ISCAN");
+        app.focus_cmd = false;
+        assert!(app.watch_ui.intraday);
+        assert!(!app.watch_ui.calendar);
+        app.watch_ui.intraday_pending = false;
+        app.intraday_scan = Some(IntradayScan { group: "Default".into(), board });
+        let ctx = egui::Context::default();
+        let shapes = frame(&ctx, &mut app, vec![]);
+        text_position(&shapes, "RVOL 2.00×");
+        text_position(&shapes, "RVOL —");
+        text_position(&shapes, "Live");
+        text_position(&shapes, "Session closed");
+        text_position(&shapes, "Last bar is stale");
+        text_position(&shapes, "no US cash session");
+        let pos = text_position(&shapes, "AAPL");
+        click(&ctx, &mut app, pos);
+        assert_eq!(app.panes[0].kind.symbol(), Some("AAPL US Equity"));
+        app.watchlists.create("Other").unwrap();
+        app.watch_ui.selected_group = "Other".into();
+        let shapes = frame(&ctx, &mut app, vec![]);
+        assert!(!has_text(&shapes, "RVOL 2.00×"));
+        text_position(&shapes, "Empty group");
+        app.execute("WL");
+        assert!(!app.watch_ui.intraday && !app.watch_ui.calendar);
     }
 }

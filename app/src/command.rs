@@ -243,6 +243,8 @@ pub enum Function {
     Watchlist,
     /// Earnings dates for the selected watchlist group (`EARNINGS`).
     Earnings,
+    /// Session RVOL and VWAP for the selected watchlist group (`ISCAN`).
+    Intraday,
     WatchCommand(String),
     /// `LAYOUT 1|2|2H|3|4|6` preset, `LAYOUT <name>` switch, or a layout subcommand
     /// (`SAVE`, `SAVEAS`, `NEW`, `RENAME`, `DUP`, `DEL`, `EXPORT`, `IMPORT`).
@@ -450,6 +452,7 @@ fn parse_function(head: &str, rest: &[&str]) -> Option<Function> {
         "UNALERT" | "RMALERT" | "DELALERT" => Function::ClearPriceAlert(joined()),
         "REFRESH" | "SYNC" => Function::Refresh,
         "EARN" | "EARNINGS" | "ECAL" => Function::Earnings,
+        "ISCAN" | "INTRADAY" => Function::Intraday,
         "W" | "WL" | "WATCH" | "WATCHLIST" | "MON" => {
             if rest.is_empty() {
                 Function::Watchlist
@@ -648,6 +651,7 @@ fn describe(f: &Function) -> String {
         Function::Scan(name) => format!("Scan Whats-News archive: {name}"),
         Function::Watchlist => "Watchlist".into(),
         Function::Earnings => "Earnings calendar for the selected watchlist".into(),
+        Function::Intraday => "Intraday scan of the selected watchlist: session RVOL and close versus VWAP".into(),
         Function::WatchCommand(s) => format!("Watchlists: {s}"),
         Function::Layout(l) if l.trim().is_empty() => "Saved layouts".into(),
         Function::Layout(l) => format!("Layout {l}"),
@@ -977,6 +981,9 @@ mod tests {
         assert_eq!(parse("EARNINGS"), Some(Command::Function(Function::Earnings)));
         assert_eq!(parse("ECAL"), Some(Command::Function(Function::Earnings)));
         assert_eq!(parse("EARN"), Some(Command::Function(Function::Earnings)));
+        assert_eq!(parse("ISCAN"), Some(Command::Function(Function::Intraday)));
+        assert_eq!(parse("INTRADAY"), Some(Command::Function(Function::Intraday)));
+        assert!(hint("ISCAN").contains("session RVOL"));
         assert_eq!(parse("ALERT"), Some(Command::Function(Function::Alerts)));
         assert_eq!(
             parse("AAPL ALERT 150"),

@@ -713,6 +713,8 @@ pub struct TerminalApp {
     watchlist: Vec<String>,
     watchlists: watchlists::Watchlists,
     watch_ui: watchlists::UiState,
+    /// Last intraday scan for one watchlist group. Absent until a read finishes.
+    intraday_scan: Option<watchlists::IntradayScan>,
     settings_writer: Option<settings_writer::Writer>,
     quotes: HashMap<String, Quote>,
     last_quotes: Option<Instant>,
@@ -883,6 +885,7 @@ impl TerminalApp {
             watchlist: DEFAULT_WATCHLIST.map(String::from).to_vec(),
             watchlists: watchlists::Watchlists::migrate(&DEFAULT_WATCHLIST.map(String::from)),
             watch_ui: Default::default(),
+            intraday_scan: None,
             settings_writer: None,
             quotes: HashMap::new(),
             last_quotes: None,
@@ -1113,6 +1116,7 @@ impl TerminalApp {
             }
             Function::Watchlist => self.open_watchlist(false),
             Function::Earnings => self.open_watchlist(true),
+            Function::Intraday => self.open_intraday(),
             Function::WatchCommand(line) => self.watch_command(&line),
             Function::Layout(arg) => self.layout_command(&arg),
             Function::Layouts => {
@@ -1420,6 +1424,7 @@ impl TerminalApp {
                     }
                 }
                 Response::Quotes(q) => self.apply_quotes(q),
+                Response::IntradayScan { group, board } => self.store_intraday_scan(group, board),
                 Response::Latest(t) => self.latest = t,
                 Response::TickerTrades { pane, symbol, trades } => {
                     if let Some(p) = self.panes.iter_mut().find(|p| p.id == pane)
@@ -2271,6 +2276,7 @@ mod tests {
             watchlist: DEFAULT_WATCHLIST.map(String::from).to_vec(),
             watchlists: watchlists::Watchlists::migrate(&DEFAULT_WATCHLIST.map(String::from)),
             watch_ui: Default::default(),
+            intraday_scan: None,
             settings_writer: None,
             quotes: HashMap::new(),
             last_quotes: None,

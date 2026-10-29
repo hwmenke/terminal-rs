@@ -187,6 +187,11 @@ pub enum Request {
     },
     MarkPriceAlertsSeen,
     EvaluatePriceAlerts,
+    /// Session RVOL and VWAP for the named watchlist group. Bars are read one name at a time.
+    IntradayScan {
+        group: String,
+        symbols: Vec<String>,
+    },
     RefreshCongress,
     /// Write archived daily bars to a portable JSON file (source + dates).
     ExportHistory {
@@ -399,6 +404,10 @@ pub enum Response {
     NewAlerts(Vec<NewTradeAlert>),
     PriceAlertFeed(tr_data::price_alerts::AlertBatch),
     NewPriceAlerts(Vec<tr_data::price_alerts::FiredAlert>),
+    IntradayScan {
+        group: String,
+        board: tr_data::iscan::Board,
+    },
     /// Result of EXPORT HIST / RESTORE history / price-alert replace.
     Portable(Result<String, String>),
     Status(String),
@@ -1583,6 +1592,10 @@ async fn handle(s: &Arc<Shared>, req: Request) {
             s.send(Response::PriceAlertFeed(s.price_alert_snapshot(chrono::Utc::now().timestamp())));
         }
         Request::EvaluatePriceAlerts => evaluate_price_alerts(s).await,
+        Request::IntradayScan { group, symbols } => {
+            let board = intraday_scan(s, &symbols).await;
+            s.send(Response::IntradayScan { group, board });
+        }
         Request::RefreshCongress => congress_refresh(s).await,
         Request::Forget(pane) => {
             s.series.lock().expect("series lock").remove(&pane);
@@ -1956,6 +1969,31 @@ async fn profile(s: &Shared, query: &str) -> Option<Profile> {
         |tk| prices.get(tk).and_then(|b| b.last()).map(|b| b.close),
     );
     Some(Profile { politician, trades, perf, returns, tracked, price_warnings })
+}
+
+async fn intraday_scan(s: &Shared, symbols: &[String]) -> tr_data::iscan::Board {
+    let now = chrono::Utc::now().timestamp();
+    let sample = s.provider.name() == "sample";
+    let mut seen = Vec::new();
+    let mut items = Vec::new();
+    for symbol in symbols {
+        let key = tr_data::security(symbol).key();
+        if seen.iter().any(|s| s == &key) {
+            continue;
+        }
+        seen.push(key.clone());
+        let reason = tr_data::iscan::sample_reason(&key);
+        if sample || reason == "no US cash session" {
+            items.push((key, Err(reason)));
+            continue;
+        }
+        let read = match s.provider.history(&key, Timeframe::M5, None, tr_data::iscan::BARS).await {
+            Ok(bars) => tr_data::iscan::read_bars(&key, &bars, now),
+            Err(e) => Err(format!("{e:#}")),
+        };
+        items.push((key, read));
+    }
+    tr_data::iscan::build(items, sample)
 }
 
 async fn evaluate_price_alerts(s: &Shared) {
