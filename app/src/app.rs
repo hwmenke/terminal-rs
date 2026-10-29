@@ -1242,6 +1242,7 @@ impl TerminalApp {
             Command::SymbolFunction(s, Function::SessionExtreme { spec }) => self.open_session_extreme(Some(&s), &spec),
             Command::SymbolFunction(s, Function::RelativePath { spec }) => self.open_relative_path(Some(&s), &spec),
             Command::SymbolFunction(s, Function::SessionBrief) => self.open_session_brief(Some(&s)),
+            Command::SymbolFunction(s, Function::CashLevels) => self.open_cash_levels(Some(&s)),
             Command::SymbolFunction(s, Function::Goto { date }) => self.goto_chart_date(Some(&s), &date),
             Command::SymbolFunction(s, Function::JournalNote { date, text }) => {
                 self.add_journal_note(Some(&s), &date, &text)
@@ -1435,6 +1436,7 @@ impl TerminalApp {
             Function::SessionExtreme { spec } => self.open_session_extreme(symbol.as_deref(), &spec),
             Function::RelativePath { spec } => self.open_relative_path(symbol.as_deref(), &spec),
             Function::SessionBrief => self.open_session_brief(symbol.as_deref()),
+            Function::CashLevels => self.open_cash_levels(symbol.as_deref()),
             Function::Goto { date } => self.goto_chart_date(symbol.as_deref(), &date),
             Function::JournalNote { date, text } => self.add_journal_note(symbol.as_deref(), &date, &text),
             Function::Latest => self.with_chart(|c, _| c.jump_latest()),
@@ -1634,6 +1636,7 @@ impl TerminalApp {
                         p.accept(generation, result);
                     }
                 }
+                Response::CashLevels { pane, result } => self.accept_cash_levels(pane, result),
                 Response::IntradayCompare { pane, generation, result } => {
                     if let Some(PaneKind::IntradayCompare(c)) =
                         self.panes.iter_mut().find(|p| p.id == pane).map(|p| &mut p.kind)
@@ -2661,6 +2664,57 @@ mod tests {
         ] {
             assert_eq!(PaneKind::from_settings(s.clone()).settings(), s);
         }
+    }
+
+    #[test]
+    fn marks_draws_cash_levels_on_the_named_chart() {
+        let mut app = test_app();
+        let (worker, mut requests) = Worker::test_channel();
+        app.worker = worker;
+        app.apply(Function::CashLevels);
+        let chart = app
+            .panes
+            .iter()
+            .find_map(|pane| match &pane.kind {
+                PaneKind::Chart(chart) => Some((pane.id, chart.symbol.clone(), chart.tf)),
+                _ => None,
+            })
+            .expect("chart");
+        assert_eq!(chart.1, "AAPL US Equity");
+        assert_eq!(chart.2, tr_core::Timeframe::M5);
+        assert!(app.status.contains("opening range"));
+        let marks = std::iter::from_fn(|| requests.try_recv().ok()).find_map(|request| match request {
+            Request::CashLevels { pane, symbol } => Some((pane, symbol)),
+            _ => None,
+        });
+        assert_eq!(marks, Some((chart.0, "AAPL US Equity".into())));
+        assert_eq!(crate::command::parse("MARKS"), Some(Command::Function(Function::CashLevels)));
+        assert_eq!(crate::command::parse("SMARKS"), Some(Command::Function(Function::CashLevels)));
+        assert_eq!(
+            crate::command::parse("MSFT MARKS"),
+            Some(Command::SymbolFunction("MSFT US Equity".into(), Function::CashLevels))
+        );
+        assert!(!matches!(
+            crate::command::parse("MARKS 5"),
+            Some(Command::Function(Function::CashLevels) | Command::SymbolFunction(_, Function::CashLevels))
+        ));
+        assert!(crate::command::hint("MARKS").contains("opening-range"));
+
+        app.execute("MSFT MARKS");
+        let charts: Vec<_> = app
+            .panes
+            .iter()
+            .filter_map(|pane| match &pane.kind {
+                PaneKind::Chart(chart) => Some(chart.symbol.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(charts, ["AAPL US Equity", "MSFT US Equity"]);
+        let marks = std::iter::from_fn(|| requests.try_recv().ok()).find_map(|request| match request {
+            Request::CashLevels { symbol, .. } => Some(symbol),
+            _ => None,
+        });
+        assert_eq!(marks.as_deref(), Some("MSFT US Equity"));
     }
 
     #[test]

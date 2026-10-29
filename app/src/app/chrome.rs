@@ -795,6 +795,9 @@ impl TerminalApp {
             {
                 out.push(SidebarCmd::Function(Function::SessionBrief));
             }
+            if nav_row(ui, Icon::Chart, "Cash levels", Some("MARKS"), false).clicked() {
+                out.push(SidebarCmd::Function(Function::CashLevels));
+            }
             if nav_row(
                 ui,
                 Icon::Search,

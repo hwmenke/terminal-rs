@@ -52,11 +52,20 @@ pub struct Drawing {
     pub tool: Tool,
     pub a: Anchor,
     pub b: Anchor,
+    /// Set on cash-session levels (`Prior close`, `Open`, `OR high`, `OR low`, `VWAP`).
+    /// User drawings leave this empty, and older files have no field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
 }
 
 impl Drawing {
     pub fn new(tool: Tool, a: Anchor, b: Anchor) -> Self {
-        Self { tool, a, b }
+        Self { tool, a, b, label: None }
+    }
+
+    pub fn labeled(mut self, label: impl Into<String>) -> Self {
+        self.label = Some(label.into());
+        self
     }
 
     /// Fib levels as `(ratio, price)`, measured from `b` (0) back to `a` (1), the

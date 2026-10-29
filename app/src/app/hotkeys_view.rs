@@ -399,6 +399,10 @@ impl TerminalApp {
                         &["BRIEF", "SBRIEF", "AAPL BRIEF"],
                         "Session brief: path, pace, gap, extreme, and versus SPY for one name. Not a chart",
                     ),
+                    (
+                        &["MARKS", "SMARKS", "AAPL MARKS"],
+                        "Draw the prior cash close, 09:30 open, opening range, and session VWAP on the chart",
+                    ),
                     (&["TL", "HL", "VL", "FIB", "MAGNET"], "Drawing tools and snapping"),
                     (&["CLEAR DRAW", "UNDO DRAW"], "Remove all drawings on this name, or undo the last delete"),
                     (&["REVIEW", "AAPL REVIEW"], "Linked daily + weekly archive charts for candidate review"),
