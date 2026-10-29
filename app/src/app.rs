@@ -1248,21 +1248,23 @@ impl TerminalApp {
 
     // ---- worker responses ----------------------------------------------------------------
 
-    /// Store quotes and copy a provider earnings date onto charts of that name.
+    /// Store quotes and copy a provider earnings or ex-dividend date onto charts of that name.
     fn apply_quotes(&mut self, q: Vec<tr_data::Quote>) {
         if q.len() > 20 {
             self.wei_updated = Some(format!("updated {}", chrono::Local::now().format("%H:%M:%S")));
         }
         let keys: Vec<String> = q.iter().map(|x| x.symbol.clone()).collect();
         for x in q {
-            let label = x.stats.earnings_label();
+            let earnings = x.stats.earnings_label();
+            let ex_dividend = x.stats.ex_dividend_label();
             let key = x.symbol.clone();
             self.quotes.insert(key.clone(), x);
             for pane in &mut self.panes {
                 if let PaneKind::Chart(c) = &mut pane.kind
                     && c.symbol == key
                 {
-                    c.set_earnings(label.clone());
+                    c.set_earnings(earnings.clone());
+                    c.set_ex_dividend(ex_dividend.clone());
                 }
             }
         }
@@ -2565,6 +2567,49 @@ mod tests {
         app.apply_quotes(vec![quote]);
         match &app.panes[0].kind {
             PaneKind::Chart(c) => assert!(c.earnings_line().is_none()),
+            _ => panic!("expected the AAPL chart"),
+        }
+    }
+
+    #[test]
+    fn a_quote_ex_dividend_date_lands_on_that_chart_only() {
+        let mut app = test_app();
+        let chart = |id, symbol| Pane {
+            id,
+            kind: PaneKind::Chart(Box::new(ChartState::new(id, symbol, tr_core::Timeframe::D1))),
+            link: None,
+            title: None,
+            window: None,
+        };
+        app.panes.push(chart(1, "AAPL"));
+        app.panes.push(chart(2, "MSFT"));
+        let ts =
+            tr_core::ny::to_utc(chrono::NaiveDate::from_ymd_opt(2026, 11, 6).unwrap().and_hms_opt(9, 30, 0).unwrap());
+        let mut quote = tr_data::Quote {
+            provenance: tr_data::Provenance::Real,
+            symbol: "AAPL US Equity".into(),
+            last: 10.0,
+            prev_close: 9.0,
+            ts: 1,
+            spark: vec![],
+            stats: tr_data::QuoteStats { ex_dividend_ts: Some(ts), ..Default::default() },
+        };
+        app.apply_quotes(vec![quote.clone()]);
+        match &app.panes[0].kind {
+            PaneKind::Chart(c) => {
+                assert_eq!(c.ex_dividend_line(), Some("EXDIV 2026-11-06"));
+                assert!(c.earnings_line().is_none());
+            }
+            _ => panic!("expected the AAPL chart"),
+        }
+        match &app.panes[1].kind {
+            PaneKind::Chart(c) => assert!(c.ex_dividend_line().is_none()),
+            _ => panic!("expected the MSFT chart"),
+        }
+        quote.stats = tr_data::QuoteStats::default();
+        app.apply_quotes(vec![quote]);
+        match &app.panes[0].kind {
+            PaneKind::Chart(c) => assert!(c.ex_dividend_line().is_none()),
             _ => panic!("expected the AAPL chart"),
         }
     }

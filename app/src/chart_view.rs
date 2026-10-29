@@ -248,6 +248,8 @@ pub struct ChartState {
     hover_bar: Option<usize>,
     /// Earnings date from the latest quote. Empty when the provider omitted it.
     earnings: Option<String>,
+    /// Ex-dividend date from the latest quote. Empty when the provider omitted it.
+    ex_dividend: Option<String>,
     pub news_fetched: Option<std::time::Instant>,
     news_key: u64,
     pending_range: Option<Range>,
@@ -325,6 +327,7 @@ impl ChartState {
             journal_marks: Vec::new(),
             hover_bar: None,
             earnings: None,
+            ex_dividend: None,
             news_fetched: None,
             news_key: 0,
             pending_range: None,
@@ -364,6 +367,15 @@ impl ChartState {
 
     pub fn earnings_line(&self) -> Option<&str> {
         self.earnings.as_deref()
+    }
+
+    /// Replace the ex-dividend line with the latest quote's label, or clear it.
+    pub fn set_ex_dividend(&mut self, label: Option<String>) {
+        self.ex_dividend = label.filter(|s| !s.is_empty());
+    }
+
+    pub fn ex_dividend_line(&self) -> Option<&str> {
+        self.ex_dividend.as_deref()
     }
 
     /// Hovered bar date, else the last loaded bar (`YYYY-MM-DD`).
@@ -464,6 +476,7 @@ impl ChartState {
             self.symbol = sec.key();
             self.sec = sec;
             self.earnings = None;
+            self.ex_dividend = None;
             self.draw = DrawState::default();
             self.drawings = self.drawing_store.get_view(&self.symbol, self.tf);
         } else {
@@ -1776,6 +1789,10 @@ impl ChartState {
             ly += 14.0;
         }
         if let Some(line) = &self.earnings {
+            p.text(pos2(price_rect.left() + 6.0, ly), Align2::LEFT_TOP, line, mono(11.0), amber());
+            ly += 14.0;
+        }
+        if let Some(line) = &self.ex_dividend {
             p.text(pos2(price_rect.left() + 6.0, ly), Align2::LEFT_TOP, line, mono(11.0), amber());
             ly += 14.0;
         }
@@ -3103,14 +3120,18 @@ mod tests {
         let gpu = SeriesGpu::build(&bars);
         chart.on_history(chart.generation, bars, gpu, 0, false, true, false, &worker);
         chart.set_earnings(Some("ERN 2026-10-29".into()));
+        chart.set_ex_dividend(Some("EXDIV 2026-11-06".into()));
         let output = chart_frame(&ctx, &mut chart, &worker, vec![]);
         let painted = shape_text(&output.shapes);
         assert!(painted.contains("ERN 2026-10-29"), "{painted}");
+        assert!(painted.contains("EXDIV 2026-11-06"), "{painted}");
         chart.set_symbol("MSFT", &worker);
         assert!(chart.earnings_line().is_none());
+        assert!(chart.ex_dividend_line().is_none());
         let output = chart_frame(&ctx, &mut chart, &worker, vec![]);
         let painted = shape_text(&output.shapes);
         assert!(!painted.contains("ERN"), "{painted}");
+        assert!(!painted.contains("EXDIV"), "{painted}");
     }
 
     fn shape_text(shapes: &[egui::epaint::ClippedShape]) -> String {

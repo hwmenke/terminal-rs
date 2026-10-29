@@ -1536,6 +1536,7 @@ mod tests {
                 ),
                 earnings_start: None,
                 earnings_end: None,
+                ex_dividend_ts: None,
                 bid: None,
                 ask: None,
                 bid_size: None,
@@ -1556,9 +1557,15 @@ mod tests {
         q.stats.ask_size = None;
         let label = member_text(&m, Some(&q), now);
         assert!(label.contains("bid 180.10 × 200") && !label.contains("ask"), "{label}");
+        q.stats.ex_dividend_ts = Some(tr_core::ny::to_utc(
+            chrono::NaiveDate::from_ymd_opt(2026, 11, 6).unwrap().and_hms_opt(9, 30, 0).unwrap(),
+        ));
+        let label = member_text(&m, Some(&q), now);
+        assert!(label.contains("EXDIV 2026-11-06"), "{label}");
         q.stats = tr_data::QuoteStats::default();
         assert!(!member_text(&m, Some(&q), now).contains("pre "), "missing stats stay off the row");
         assert!(!member_text(&m, Some(&q), now).contains("bid"));
+        assert!(!member_text(&m, Some(&q), now).contains("EXDIV"));
     }
 
     #[test]
