@@ -45,7 +45,7 @@ impl YahooProvider {
         }
     }
 
-    async fn chart(&self, symbol: &str, interval: &str, period1: i64, period2: i64) -> Result<Chart> {
+    async fn chart(&self, symbol: &str, interval: &str, period1: i64, period2: i64, pre_post: bool) -> Result<Chart> {
         self.pace().await;
         let url = format!("{BASE}/{}", urlencode(symbol));
         let resp = self
@@ -55,7 +55,7 @@ impl YahooProvider {
                 ("interval", interval.to_string()),
                 ("period1", period1.to_string()),
                 ("period2", period2.to_string()),
-                ("includePrePost", "false".into()),
+                ("includePrePost", if pre_post { "true" } else { "false" }.into()),
             ])
             .send()
             .await?;
@@ -215,21 +215,29 @@ pub fn cash_session_symbol(symbol: &str) -> bool {
     true
 }
 
-#[async_trait]
-impl MarketData for YahooProvider {
-    fn name(&self) -> &str {
-        "yahoo"
-    }
-
-    async fn history(&self, symbol: &str, tf: Timeframe, end: Option<i64>, limit: usize) -> Result<Vec<Bar>> {
+impl YahooProvider {
+    /// `extended` asks Yahoo for pre-market and after-hours prints and keeps those sessions.
+    /// The regular read still drops them. Neither path rewrites a bar's OHLC.
+    async fn fetch_bars(
+        &self,
+        symbol: &str,
+        tf: Timeframe,
+        end: Option<i64>,
+        limit: usize,
+        extended: bool,
+    ) -> Result<Vec<Bar>> {
+        let native = matches!(tf, Timeframe::M1 | Timeframe::M5 | Timeframe::M15 | Timeframe::M30 | Timeframe::H1);
+        if extended && (!native || !cash_session_symbol(symbol)) {
+            bail!("no extended-hours session for {symbol}");
+        }
         let now = chrono::Utc::now().timestamp();
         let period2 = end.unwrap_or(now + 60);
         let (iv, max_back) = interval(tf);
         let base_tf = if tf == Timeframe::H4 { Timeframe::H1 } else { tf };
         let factor = if tf == Timeframe::H4 { 4 } else { 1 };
-        // Over-ask to cover weekends/holidays and, intraday, the ~6.5h equity session
-        // (crypto and FX simply return more than needed and get clipped).
-        let stretch = if tf.is_intraday() { 6 } else { 2 };
+        // Over-ask to cover weekends/holidays and, intraday, the cash session
+        // plus the pre-market and after-hours windows when those were requested.
+        let stretch = if tf.is_intraday() { if extended { 8 } else { 6 } } else { 2 };
         let want = limit as i64 * factor * base_tf.seconds() * stretch + 7 * 86_400;
         let mut period1 = period2 - want;
         if let Some(max) = max_back {
@@ -238,10 +246,9 @@ impl MarketData for YahooProvider {
         if period1 >= period2 {
             return Ok(Vec::new());
         }
-        let mut bars = self.chart(symbol, iv, period1, period2).await?.bars;
-        // Keep the provider's OHLC. Out-of-session prints are not rewritten onto the cash grid.
+        let mut bars = self.chart(symbol, iv, period1, period2, extended).await?.bars;
         if tf.is_intraday() && cash_session_symbol(symbol) {
-            bars = crate::intraday::regular_only(bars);
+            bars = if extended { crate::intraday::keep_extended(bars) } else { crate::intraday::regular_only(bars) };
         }
         // Yahoo's weekly/monthly timestamps are session opens; snap to our calendar buckets.
         // 4h has no Yahoo interval, so it is aggregated from the (session-filtered) 1h bars.
@@ -249,6 +256,21 @@ impl MarketData for YahooProvider {
             bars = tf.resample(&bars);
         }
         Ok(crate::clip(bars, end, limit))
+    }
+}
+
+#[async_trait]
+impl MarketData for YahooProvider {
+    fn name(&self) -> &str {
+        "yahoo"
+    }
+
+    async fn history(&self, symbol: &str, tf: Timeframe, end: Option<i64>, limit: usize) -> Result<Vec<Bar>> {
+        self.fetch_bars(symbol, tf, end, limit, false).await
+    }
+
+    async fn extended_history(&self, symbol: &str, tf: Timeframe, end: Option<i64>, limit: usize) -> Result<Vec<Bar>> {
+        self.fetch_bars(symbol, tf, end, limit, true).await
     }
 
     /// Batched via the spark endpoint (20 symbols per request).

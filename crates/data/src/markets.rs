@@ -64,6 +64,16 @@ impl MarketData for Markets {
         }
     }
 
+    async fn extended_history(&self, symbol: &str, tf: Timeframe, end: Option<i64>, limit: usize) -> Result<Vec<Bar>> {
+        let sec = security(symbol);
+        match sec.class {
+            AssetClass::Equity | AssetClass::Etf | AssetClass::Index => {
+                self.yahoo.extended_history(&yahoo_symbol(&sec), tf, end, limit).await
+            }
+            _ => bail!("no extended-hours session for {}", sec.key()),
+        }
+    }
+
     async fn quotes(&self, symbols: &[String]) -> Result<Vec<Quote>> {
         let (mut crypto, mut govt, mut other) = (Vec::new(), Vec::new(), Vec::new());
         for key in symbols {
