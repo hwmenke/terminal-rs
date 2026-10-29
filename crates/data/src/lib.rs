@@ -358,6 +358,12 @@ pub trait MarketData: Send + Sync {
         None
     }
 
+    /// Whether [`MarketData::live`] would open a stream. Callers must not probe
+    /// `live` itself: a sample tick loop and the crypto websocket start as soon as it is called.
+    fn has_live_feed(&self, _symbol: &str, _tf: Timeframe) -> bool {
+        false
+    }
+
     /// Search securities beyond the built-in catalog (network sources).
     async fn search(&self, _query: &str) -> Result<Vec<SearchHit>> {
         Ok(Vec::new())
@@ -463,6 +469,10 @@ impl<P: MarketData> MarketData for Fallback<P> {
         self.primary.live(symbol, tf)
     }
 
+    fn has_live_feed(&self, symbol: &str, tf: Timeframe) -> bool {
+        self.primary.has_live_feed(symbol, tf)
+    }
+
     async fn search(&self, query: &str) -> Result<Vec<SearchHit>> {
         self.primary.search(query).await
     }
@@ -543,6 +553,14 @@ pub(crate) fn clip(mut bars: Vec<Bar>, end: Option<i64>, limit: usize) -> Vec<Ba
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fallback_reports_the_primary_live_feed_without_subscribing() {
+        let off = Fallback::new(sample::SampleProvider::at(0, 4));
+        assert!(!off.has_live_feed("AAPL", Timeframe::M5));
+        let on = Fallback::new(sample::SampleProvider::at(0, 4).with_live_ticks());
+        assert!(on.has_live_feed("BTCUSD Curncy", Timeframe::M1));
+    }
 
     #[test]
     fn grouping_and_simulated_books() {

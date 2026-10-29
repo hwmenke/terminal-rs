@@ -1365,7 +1365,7 @@ async fn handle(s: &Arc<Shared>, req: Request) {
                     exhausted: false,
                     live: false,
                 });
-                start_live(s.clone(), pane, generation, symbol, tf);
+                follow_quotes(s.clone(), pane, generation, symbol, tf);
                 return;
             }
             // Paint from the disk cache immediately, then refresh from the network.
@@ -1415,10 +1415,16 @@ async fn handle(s: &Arc<Shared>, req: Request) {
                         exhausted,
                         live: false,
                     });
-                    start_live(s.clone(), pane, generation, symbol, tf);
+                    follow_quotes(s.clone(), pane, generation, symbol, tf);
                 }
-                Ok(_) => s.send(Response::HistoryError { pane, generation, error: format!("no data for {symbol}") }),
-                Err(e) => s.send(Response::HistoryError { pane, generation, error: format!("{e:#}") }),
+                Ok(_) => {
+                    s.send(Response::HistoryError { pane, generation, error: format!("no data for {symbol}") });
+                    retry_intraday(s.clone(), pane, generation, symbol, tf);
+                }
+                Err(e) => {
+                    s.send(Response::HistoryError { pane, generation, error: format!("{e:#}") });
+                    retry_intraday(s.clone(), pane, generation, symbol, tf);
+                }
             }
         }
         Request::MoreHistory { pane, generation, symbol, tf, existing, limit } => {
@@ -1740,6 +1746,99 @@ fn current_daily(s: &Shared, pane: PaneId, generation: u64) -> Option<Arc<Vec<Ba
         .get(&pane)
         .filter(|(g, _)| *g == generation)
         .map(|(_, b)| b.clone())
+}
+
+/// Keep an intraday chart moving. A real stream wins; otherwise wait out the cache TTL
+/// and pull again. The wait happens before any provider call, so a test that handles
+/// one history request does not see a second fetch before it returns.
+fn follow_quotes(s: Arc<Shared>, pane: PaneId, generation: u64, symbol: String, tf: Timeframe) {
+    if tf.is_intraday() && !s.provider.has_live_feed(&symbol, tf) {
+        schedule_intraday_refresh(s, pane, generation, symbol, tf);
+    } else {
+        start_live(s, pane, generation, symbol, tf);
+    }
+}
+
+fn retry_intraday(s: Arc<Shared>, pane: PaneId, generation: u64, symbol: String, tf: Timeframe) {
+    if tf.is_intraday() && !s.provider.has_live_feed(&symbol, tf) {
+        schedule_intraday_refresh(s, pane, generation, symbol, tf);
+    }
+}
+
+fn schedule_intraday_refresh(s: Arc<Shared>, pane: PaneId, generation: u64, symbol: String, tf: Timeframe) {
+    let Some(ttl) = tr_data::intraday::refresh_ttl_secs(tf).filter(|ttl| *ttl > 0) else { return };
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_secs(ttl as u64)).await;
+        if current_series(&s, pane, generation).is_none() {
+            return;
+        }
+        refresh_intraday(&s, pane, generation, &symbol, tf).await;
+        if current_series(&s, pane, generation).is_some() {
+            schedule_intraday_refresh(s, pane, generation, symbol, tf);
+        }
+    });
+}
+
+/// Pull the latest intraday bars into the pane's series. A fresh cache skips the network.
+/// Sample, missing, empty, and failed responses leave the bars already on screen.
+async fn refresh_intraday(s: &Shared, pane: PaneId, generation: u64, symbol: &str, tf: Timeframe) {
+    if !tf.is_intraday() || current_series(s, pane, generation).is_none() {
+        return;
+    }
+    let now = chrono::Utc::now().timestamp();
+    let fresh = s.cache.lock().ok().is_some_and(|guard| {
+        guard.as_ref().is_some_and(|cache| {
+            tr_data::intraday::fetched_recently(
+                cache.fetched_at(symbol, tf).ok().flatten(),
+                now,
+                tr_data::intraday::refresh_ttl_secs(tf),
+            )
+        })
+    });
+    if fresh {
+        return;
+    }
+    let limit = current_series(s, pane, generation).map(|bars| bars.len().clamp(300, 5_000)).unwrap_or(300);
+    let Ok(bars) = s.provider.history(symbol, tf, None, limit).await else { return };
+    if bars.is_empty() || !bars.iter().all(|b| b.provenance.is_verified()) {
+        return;
+    }
+    let merged = {
+        let mut map = s.series.lock().expect("series lock");
+        let Some((_, cur)) = map.get_mut(&pane).filter(|(g, _)| *g == generation) else { return };
+        let next = if cur.iter().all(|b| b.provenance.is_verified()) {
+            let mut series = Series { symbol: symbol.to_string(), timeframe: tf, bars: cur.iter().copied().collect() };
+            series.merge(bars);
+            series.bars
+        } else {
+            bars
+        };
+        let next = Arc::new(next);
+        *cur = next.clone();
+        next
+    };
+    if let Ok(mut guard) = s.cache.lock()
+        && let Some(cache) = guard.as_mut()
+    {
+        let _ = cache.store(symbol, tf, &merged);
+        let _ = cache.note_fetch(symbol, tf, chrono::Utc::now().timestamp());
+    }
+    let gpu = build_gpu(merged.clone()).await;
+    if current_series(s, pane, generation).is_none() {
+        return;
+    }
+    s.send(Response::History {
+        pane,
+        generation,
+        symbol: symbol.to_string(),
+        tf,
+        bars: merged,
+        gpu,
+        prepended: 0,
+        from_cache: false,
+        exhausted: false,
+        live: false,
+    });
 }
 
 /// Merge the provider's live feed (if any) into the pane's series, publishing at most
@@ -2423,6 +2522,106 @@ mod tests {
         assert!(begin_request(&s, &daily));
         handle(&s, daily).await;
         assert_eq!(provider.calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn intraday_refresh_merges_verified_bars_and_keeps_real_bars_when_the_refresh_is_not() {
+        use tr_core::Provenance;
+        struct Scripted {
+            calls: std::sync::atomic::AtomicUsize,
+            next: std::sync::Mutex<Vec<anyhow::Result<Vec<Bar>>>>,
+        }
+        #[async_trait::async_trait]
+        impl tr_data::MarketData for Scripted {
+            fn name(&self) -> &str {
+                "offline"
+            }
+            async fn history(&self, _: &str, _: Timeframe, _: Option<i64>, _: usize) -> anyhow::Result<Vec<Bar>> {
+                self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                self.next.lock().unwrap().remove(0)
+            }
+        }
+        let real =
+            |ts: i64, close: f64| Bar::new(ts, close, close, close, close, 1.0).with_provenance(Provenance::Real);
+        let provider = Arc::new(Scripted { calls: Default::default(), next: std::sync::Mutex::new(Vec::new()) });
+        let (s, rx) = shared(provider.clone(), Some(BarCache::open_in_memory().unwrap()));
+        let older = real(1_700_000_000, 1.0);
+        let mid = real(1_700_000_300, 1.5);
+        let req = Request::History { pane: 1, generation: 1, symbol: "AAPL".into(), tf: Timeframe::M5, limit: 10 };
+        assert!(begin_request(&s, &req));
+        assert!(store_series(&s, 1, 1, Arc::new(vec![older, mid])));
+
+        provider.next.lock().unwrap().push(Ok(vec![real(1_700_000_300, 9.0).with_provenance(Provenance::Sample)]));
+        refresh_intraday(&s, 1, 1, "AAPL", Timeframe::M5).await;
+        assert_eq!(provider.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(current_series(&s, 1, 1).unwrap().iter().map(|b| b.close).collect::<Vec<_>>(), vec![1.0, 1.5]);
+        assert!(rx.try_iter().all(|r| !matches!(r, Response::History { .. })));
+        assert!(s.cache.lock().unwrap().as_ref().unwrap().load("AAPL", Timeframe::M5, 10).unwrap().is_empty());
+
+        provider.next.lock().unwrap().push(Err(anyhow::anyhow!("provider down")));
+        refresh_intraday(&s, 1, 1, "AAPL", Timeframe::M5).await;
+        assert_eq!(provider.calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+        assert_eq!(current_series(&s, 1, 1).unwrap().len(), 2);
+
+        provider.next.lock().unwrap().push(Ok(vec![real(1_700_000_300, 2.0), real(1_700_000_600, 3.0)]));
+        refresh_intraday(&s, 1, 1, "AAPL", Timeframe::M5).await;
+        assert_eq!(provider.calls.load(std::sync::atomic::Ordering::SeqCst), 3);
+        let closes: Vec<_> = current_series(&s, 1, 1).unwrap().iter().map(|b| b.close).collect();
+        assert_eq!(closes, vec![1.0, 2.0, 3.0], "paged history stays and the tail updates");
+        match rx.try_recv().unwrap() {
+            Response::History { from_cache, live, bars, .. } => {
+                assert!(!from_cache && !live);
+                assert_eq!(bars.last().unwrap().close, 3.0);
+                assert!(bars.iter().all(|b| b.provenance.is_verified()));
+            }
+            _ => panic!("expected a history refresh"),
+        }
+        let cached = s.cache.lock().unwrap().as_ref().unwrap().load("AAPL", Timeframe::M5, 10).unwrap();
+        assert_eq!(cached.iter().map(|b| b.close).collect::<Vec<_>>(), vec![1.0, 2.0, 3.0]);
+
+        provider.next.lock().unwrap().push(Ok(vec![real(1_700_000_900, 4.0)]));
+        refresh_intraday(&s, 1, 1, "AAPL", Timeframe::M5).await;
+        assert_eq!(provider.calls.load(std::sync::atomic::Ordering::SeqCst), 3, "a fresh fetch is not repeated");
+        assert_eq!(current_series(&s, 1, 1).unwrap().len(), 3);
+
+        s.cache
+            .lock()
+            .unwrap()
+            .as_mut()
+            .unwrap()
+            .note_fetch("AAPL", Timeframe::M5, chrono::Utc::now().timestamp() - 10_000)
+            .unwrap();
+        refresh_intraday(&s, 1, 1, "AAPL", Timeframe::M5).await;
+        assert_eq!(provider.calls.load(std::sync::atomic::Ordering::SeqCst), 4);
+        assert_eq!(current_series(&s, 1, 1).unwrap().last().unwrap().close, 4.0);
+
+        let daily = Request::History { pane: 2, generation: 1, symbol: "AAPL".into(), tf: Timeframe::D1, limit: 10 };
+        assert!(begin_request(&s, &daily));
+        assert!(store_series(&s, 2, 1, Arc::new(vec![real(1_700_000_000, 8.0)])));
+        refresh_intraday(&s, 2, 1, "AAPL", Timeframe::D1).await;
+        assert_eq!(provider.calls.load(std::sync::atomic::Ordering::SeqCst), 4, "daily is not polled on this path");
+        assert_eq!(current_series(&s, 2, 1).unwrap()[0].close, 8.0);
+
+        let sample = real(1_700_000_000, 9.0).with_provenance(Provenance::Sample);
+        let replace = Request::History { pane: 3, generation: 1, symbol: "MSFT".into(), tf: Timeframe::M1, limit: 10 };
+        assert!(begin_request(&s, &replace));
+        assert!(store_series(&s, 3, 1, Arc::new(vec![sample])));
+        provider.next.lock().unwrap().push(Ok(vec![real(1_700_000_060, 4.5)]));
+        refresh_intraday(&s, 3, 1, "MSFT", Timeframe::M1).await;
+        let replaced = current_series(&s, 3, 1).unwrap();
+        assert_eq!(replaced.len(), 1);
+        assert_eq!(replaced[0].close, 4.5);
+        assert!(replaced.iter().all(|b| b.provenance.is_verified()));
+
+        let stale = Request::History { pane: 4, generation: 1, symbol: "AAPL".into(), tf: Timeframe::M15, limit: 10 };
+        assert!(begin_request(&s, &stale));
+        assert!(store_series(&s, 4, 1, Arc::new(vec![real(1_700_000_000, 6.0)])));
+        let newer = Request::History { pane: 4, generation: 2, symbol: "AAPL".into(), tf: Timeframe::M15, limit: 10 };
+        assert!(begin_request(&s, &newer));
+        let calls = provider.calls.load(std::sync::atomic::Ordering::SeqCst);
+        refresh_intraday(&s, 4, 1, "AAPL", Timeframe::M15).await;
+        assert_eq!(provider.calls.load(std::sync::atomic::Ordering::SeqCst), calls);
+        assert!(current_series(&s, 4, 2).unwrap().is_empty());
     }
 
     #[tokio::test]

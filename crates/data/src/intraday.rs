@@ -11,9 +11,9 @@ use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 
 use chrono::{Datelike, NaiveDate, Timelike, Weekday};
-use tr_core::{Bar, Timeframe};
+use tr_core::{AssetClass, Bar, Timeframe};
 
-use crate::history::calendar::is_session;
+use crate::history::calendar::{is_session, previous_session};
 
 /// Regular-session open, 09:30 New York.
 pub const OPEN_MIN: u32 = 9 * 60 + 30;
@@ -323,6 +323,92 @@ pub fn bar_stats(tf: Timeframe, bars: &[Bar]) -> BarStats {
     }
 }
 
+/// How the last bar's age should be read. Cash equities stop at the close;
+/// FX, crypto, futures and rates do not.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MarketClock {
+    UsCash,
+    Continuous,
+}
+
+impl MarketClock {
+    pub fn for_class(class: AssetClass) -> Self {
+        match class {
+            AssetClass::Equity | AssetClass::Etf | AssetClass::Index => Self::UsCash,
+            _ => Self::Continuous,
+        }
+    }
+}
+
+/// Age of the latest bar relative to `now`. Nothing here invents a missing bar.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Freshness {
+    /// The latest bar is the one forming, or the previous one still allowed to print.
+    Current,
+    /// The cash session is over and the last bar covers that session.
+    Closed,
+    /// The last bar is older than the one the clock says should be on screen.
+    Stale { lag_secs: i64 },
+}
+
+/// `None` for daily and higher. Those charts are not aged by this clock.
+pub fn freshness(clock: MarketClock, tf: Timeframe, last_bar_ts: i64, now: i64) -> Option<Freshness> {
+    if !tf.is_intraday() {
+        return None;
+    }
+    Some(match clock {
+        MarketClock::Continuous => continuous_freshness(tf, last_bar_ts, now),
+        MarketClock::UsCash => cash_freshness(tf, last_bar_ts, now),
+    })
+}
+
+fn continuous_freshness(tf: Timeframe, last_bar_ts: i64, now: i64) -> Freshness {
+    let limit = tf.seconds().saturating_mul(2);
+    let age = now.saturating_sub(last_bar_ts);
+    if age <= limit { Freshness::Current } else { Freshness::Stale { lag_secs: age - limit } }
+}
+
+fn cash_freshness(tf: Timeframe, last_bar_ts: i64, now: i64) -> Freshness {
+    if in_regular_session(now) {
+        return if step_minutes(tf).is_some() {
+            session_bar_freshness(tf, last_bar_ts, now)
+        } else {
+            continuous_freshness(tf, last_bar_ts, now)
+        };
+    }
+    let (date, minute) = minute_of(now);
+    let due = if is_session(date) && minute >= OPEN_MIN { date } else { previous_session(date) };
+    if step_minutes(tf).is_none() {
+        return if minute_of(last_bar_ts).0 == due {
+            Freshness::Closed
+        } else {
+            Freshness::Stale { lag_secs: now.saturating_sub(last_bar_ts) }
+        };
+    }
+    let Some(&final_open) = regular_opens(due, tf).last() else {
+        return Freshness::Stale { lag_secs: now.saturating_sub(last_bar_ts) };
+    };
+    let step_secs = step_minutes(tf).unwrap_or(1) as i64 * 60;
+    let close_min = close_minute(due);
+    let close_ts = tr_core::ny::to_utc(due.and_hms_opt(close_min / 60, close_min % 60, 0).unwrap());
+    let ttl = refresh_ttl_secs(tf).unwrap_or(0);
+    let within_grace = now >= close_ts && now < close_ts.saturating_add(ttl);
+    let required = if within_grace { final_open - step_secs } else { final_open };
+    let last = regular_bucket(tf, last_bar_ts).unwrap_or(last_bar_ts);
+    if last >= required { Freshness::Closed } else { Freshness::Stale { lag_secs: required.saturating_sub(last) } }
+}
+
+/// While the session is open, the bar still forming and the one before it count as current.
+fn session_bar_freshness(tf: Timeframe, last_bar_ts: i64, now: i64) -> Freshness {
+    let Some(forming) = regular_bucket(tf, now) else {
+        return continuous_freshness(tf, last_bar_ts, now);
+    };
+    let step_secs = step_minutes(tf).unwrap_or(1) as i64 * 60;
+    let acceptable = forming - step_secs;
+    let last = regular_bucket(tf, last_bar_ts).unwrap_or(last_bar_ts);
+    if last >= acceptable { Freshness::Current } else { Freshness::Stale { lag_secs: acceptable.saturating_sub(last) } }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -470,5 +556,125 @@ mod tests {
         assert_eq!(pace.delay(t0), Duration::from_millis(200));
         assert_eq!(pace.delay(t0 + Duration::from_millis(200)), Duration::from_millis(200));
         assert_eq!(pace.delay(t0 + Duration::from_millis(600)), Duration::ZERO);
+    }
+
+    #[test]
+    fn freshness_tracks_the_forming_bar_the_close_and_a_continuous_clock() {
+        let cash = MarketClock::UsCash;
+        let always = MarketClock::Continuous;
+        let monday = wall(2026, 3, 9, 10, 7);
+        assert_eq!(freshness(cash, Timeframe::D1, monday, monday), None);
+        assert_eq!(freshness(always, Timeframe::W1, 0, monday), None);
+        assert_eq!(MarketClock::for_class(AssetClass::Equity), cash);
+        assert_eq!(MarketClock::for_class(AssetClass::Etf), cash);
+        assert_eq!(MarketClock::for_class(AssetClass::Index), cash);
+        assert_eq!(MarketClock::for_class(AssetClass::Crypto), always);
+        assert_eq!(MarketClock::for_class(AssetClass::Fx), always);
+        assert_eq!(MarketClock::for_class(AssetClass::Cmdty), always);
+        assert_eq!(MarketClock::for_class(AssetClass::Govt), always);
+
+        // 10:07 belongs to the 10:05 bar. 10:00 is the one-bar grace; 09:55 is behind.
+        assert_eq!(freshness(cash, Timeframe::M5, wall(2026, 3, 9, 10, 5), monday), Some(Freshness::Current));
+        assert_eq!(freshness(cash, Timeframe::M5, wall(2026, 3, 9, 10, 0), monday), Some(Freshness::Current));
+        assert_eq!(
+            freshness(cash, Timeframe::M5, wall(2026, 3, 9, 9, 55), monday),
+            Some(Freshness::Stale { lag_secs: 300 })
+        );
+        // 10:31 is the 10:30 hour. The 09:30 bar may still be printing; 08:30 may not.
+        let hour = wall(2026, 3, 9, 10, 31);
+        assert_eq!(freshness(cash, Timeframe::H1, wall(2026, 3, 9, 10, 30), hour), Some(Freshness::Current));
+        assert_eq!(freshness(cash, Timeframe::H1, wall(2026, 3, 9, 9, 30), hour), Some(Freshness::Current));
+        assert_eq!(
+            freshness(cash, Timeframe::H1, wall(2026, 3, 9, 8, 30), hour),
+            Some(Freshness::Stale { lag_secs: 3600 })
+        );
+        // November open is 09:30 EST, not the March UTC instant.
+        let nov = wall(2026, 11, 2, 9, 32);
+        assert_eq!(freshness(cash, Timeframe::M5, wall(2026, 11, 2, 9, 30), nov), Some(Freshness::Current));
+        assert!(matches!(freshness(cash, Timeframe::M5, wall(2026, 11, 2, 9, 20), nov), Some(Freshness::Stale { .. })));
+
+        // Early-close hour: 12:45 belongs to 12:30, so 11:30 is the grace bar.
+        let early_now = wall(2026, 11, 27, 12, 45);
+        assert_eq!(freshness(cash, Timeframe::H1, wall(2026, 11, 27, 11, 30), early_now), Some(Freshness::Current));
+        assert!(matches!(
+            freshness(cash, Timeframe::H1, wall(2026, 11, 27, 10, 30), early_now),
+            Some(Freshness::Stale { .. })
+        ));
+
+        // Thirty seconds after the bell, the prior 5m bar is still an honest close.
+        // Ninety seconds later the TTL has passed and that bar is stale.
+        let bell = wall(2026, 3, 9, 16, 0);
+        assert_eq!(freshness(cash, Timeframe::M5, wall(2026, 3, 9, 15, 50), bell + 30), Some(Freshness::Closed));
+        assert_eq!(freshness(cash, Timeframe::M5, wall(2026, 3, 9, 15, 55), bell + 30), Some(Freshness::Closed));
+        assert_eq!(
+            freshness(cash, Timeframe::M5, wall(2026, 3, 9, 15, 45), bell + 30),
+            Some(Freshness::Stale { lag_secs: 300 })
+        );
+        assert_eq!(
+            freshness(cash, Timeframe::M5, wall(2026, 3, 9, 15, 50), bell + 90),
+            Some(Freshness::Stale { lag_secs: 300 })
+        );
+        assert_eq!(freshness(cash, Timeframe::M5, wall(2026, 3, 9, 15, 55), bell + 90), Some(Freshness::Closed));
+
+        // Half day: grace accepts 11:30; after the 1h TTL only 12:30 counts as the close.
+        let early_bell = wall(2026, 11, 27, 13, 0);
+        assert_eq!(
+            freshness(cash, Timeframe::H1, wall(2026, 11, 27, 11, 30), early_bell + 30),
+            Some(Freshness::Closed)
+        );
+        assert_eq!(
+            freshness(cash, Timeframe::H1, wall(2026, 11, 27, 10, 30), early_bell + 30),
+            Some(Freshness::Stale { lag_secs: 3600 })
+        );
+        assert_eq!(
+            freshness(cash, Timeframe::H1, wall(2026, 11, 27, 11, 30), early_bell + 360),
+            Some(Freshness::Stale { lag_secs: 3600 })
+        );
+        assert_eq!(
+            freshness(cash, Timeframe::H1, wall(2026, 11, 27, 12, 30), early_bell + 360),
+            Some(Freshness::Closed)
+        );
+
+        // Premarket, the weekend, and Good Friday all ask for the previous session's close.
+        let friday_close = wall(2026, 3, 6, 15, 55);
+        let friday_prior = wall(2026, 3, 6, 15, 50);
+        assert_eq!(freshness(cash, Timeframe::M5, friday_close, wall(2026, 3, 9, 8, 0)), Some(Freshness::Closed));
+        assert!(matches!(
+            freshness(cash, Timeframe::M5, friday_prior, wall(2026, 3, 9, 8, 0)),
+            Some(Freshness::Stale { .. })
+        ));
+        assert_eq!(freshness(cash, Timeframe::M5, friday_close, wall(2026, 3, 7, 12, 0)), Some(Freshness::Closed));
+        let thursday = wall(2026, 4, 2, 15, 55);
+        assert_eq!(freshness(cash, Timeframe::M5, thursday, wall(2026, 4, 3, 11, 0)), Some(Freshness::Closed));
+        assert!(matches!(
+            freshness(cash, Timeframe::M5, wall(2026, 4, 1, 15, 55), wall(2026, 4, 3, 11, 0)),
+            Some(Freshness::Stale { .. })
+        ));
+
+        // 4h has no cash grid: age it like a continuous bar during the session,
+        // and call the session closed afterward when the last bar is that New York date.
+        let late_morning = wall(2026, 3, 9, 11, 0);
+        assert_eq!(freshness(cash, Timeframe::H4, wall(2026, 3, 9, 3, 0), late_morning), Some(Freshness::Current));
+        assert_eq!(
+            freshness(cash, Timeframe::H4, wall(2026, 3, 9, 2, 59), late_morning),
+            Some(Freshness::Stale { lag_secs: 60 })
+        );
+        assert_eq!(
+            freshness(cash, Timeframe::H4, wall(2026, 3, 6, 15, 0), wall(2026, 3, 7, 12, 0)),
+            Some(Freshness::Closed)
+        );
+        assert!(matches!(
+            freshness(cash, Timeframe::H4, wall(2026, 3, 5, 15, 0), wall(2026, 3, 7, 12, 0)),
+            Some(Freshness::Stale { .. })
+        ));
+
+        let now = 1_700_000_000;
+        assert_eq!(freshness(always, Timeframe::M5, now - 600, now), Some(Freshness::Current));
+        assert_eq!(freshness(always, Timeframe::M5, now - 601, now), Some(Freshness::Stale { lag_secs: 1 }));
+        assert!(matches!(
+            freshness(always, Timeframe::M1, now - 86_400, now),
+            Some(Freshness::Stale { lag_secs }) if lag_secs > 0
+        ));
+        assert!(!matches!(freshness(always, Timeframe::M5, now - 86_400, now), Some(Freshness::Closed)));
     }
 }

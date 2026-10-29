@@ -64,6 +64,10 @@ impl MarketData for SampleProvider {
         Ok(simulated_book(symbol, last, depth, chrono::Utc::now().timestamp_millis() as u64 / 500))
     }
 
+    fn has_live_feed(&self, _symbol: &str, _tf: Timeframe) -> bool {
+        self.live_ticks
+    }
+
     /// Random-walk ticks on the last bar every 400 ms, rolling into new bars on schedule.
     fn live(&self, symbol: &str, tf: Timeframe) -> Option<LiveFeed> {
         if !self.live_ticks {
@@ -200,6 +204,14 @@ pub fn simulated_book(symbol: &str, mid: f64, depth: usize, step: u64) -> OrderB
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn live_feed_follows_the_tick_flag_without_opening_a_stream() {
+        let off = SampleProvider::at(0, 10);
+        assert!(!off.has_live_feed("AAPL", Timeframe::M1));
+        let on = SampleProvider::at(0, 10).with_live_ticks();
+        assert!(on.has_live_feed("AAPL", Timeframe::M1));
+    }
 
     #[tokio::test]
     async fn paging_is_contiguous() {
