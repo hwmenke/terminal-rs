@@ -181,6 +181,13 @@ pub enum PaneSettings {
         #[serde(default)]
         tf: String,
     },
+    /// Share of a list at or above the 09:30 open and session VWAP.
+    Breadth {
+        #[serde(default)]
+        spec: String,
+        #[serde(default)]
+        tf: String,
+    },
     /// Historical lookalikes for one research symbol.
     Lookalike {
         #[serde(default)]

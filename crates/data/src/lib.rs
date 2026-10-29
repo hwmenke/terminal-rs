@@ -30,6 +30,7 @@ pub mod portable;
 pub mod price_alerts;
 pub mod rss;
 pub mod sample;
+pub mod session_breadth;
 pub mod session_path;
 pub mod stats;
 pub mod treasury;
