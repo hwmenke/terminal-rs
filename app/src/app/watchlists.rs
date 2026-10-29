@@ -177,15 +177,18 @@ pub fn member_text(item: &Member, quote: Option<&tr_data::Quote>, now: DateTime<
     .status_at(now);
     let price = price.filter(|p| p.is_finite()).map(|p| format!("{p:.2}")).unwrap_or_else(|| "—".into());
     let change = change.filter(|p| p.is_finite()).map(|p| format!("{p:+.2}%")).unwrap_or_else(|| "—".into());
+    let extras = quote.map(|q| q.stats_label()).unwrap_or_default();
+    let extras = if extras.is_empty() { String::new() } else { format!(" · {extras}") };
     format!(
-        "{}   {}   {}   [{}] {} · {}{}",
+        "{}   {}   {}   [{}] {} · {}{}{}",
         item.symbol,
         price,
         change,
         provenance.label(),
         status,
         date.as_deref().unwrap_or("no date"),
-        if quote.is_none() && !item.origins.is_empty() { " · ARCHIVE CLOSE" } else { "" }
+        if quote.is_none() && !item.origins.is_empty() { " · ARCHIVE CLOSE" } else { "" },
+        extras,
     )
 }
 
@@ -1092,7 +1095,15 @@ mod tests {
             let key = tr_data::security(symbol).key();
             app.quotes.insert(
                 key.clone(),
-                tr_data::Quote { symbol: key, provenance, last: 10.0, prev_close: 8.0, ts: 1, spark: vec![] },
+                tr_data::Quote {
+                    symbol: key,
+                    provenance,
+                    last: 10.0,
+                    prev_close: 8.0,
+                    ts: 1,
+                    spark: vec![],
+                    stats: tr_data::QuoteStats::default(),
+                },
             );
         }
         let ctx = egui::Context::default();
@@ -1149,6 +1160,7 @@ mod tests {
                 prev_close: 8.0,
                 ts: "2026-10-19T20:00:00Z".parse::<DateTime<Utc>>().unwrap().timestamp(),
                 spark: vec![],
+                stats: tr_data::QuoteStats::default(),
             };
             let label = member_text(&m, Some(&q), now);
             assert!(label.contains(p.label()) && label.contains("STALE") && label.contains("+25.00%"), "{label}");
@@ -1158,5 +1170,28 @@ mod tests {
         }
         let missing = member_text(&Member::new("X"), None, now);
         assert!(missing.contains("UNVERIFIED") && missing.contains("MISSING"));
+        let mut q = tr_data::Quote {
+            symbol: m.symbol.clone(),
+            provenance: Provenance::Real,
+            last: 10.0,
+            prev_close: 8.0,
+            ts: "2026-10-21T18:00:00Z".parse::<DateTime<Utc>>().unwrap().timestamp(),
+            spark: vec![],
+            stats: tr_data::QuoteStats {
+                pre_market: Some(10.25),
+                post_market: None,
+                regular_volume: None,
+                average_volume_10d: None,
+                week_52_high: Some(12.0),
+                week_52_low: None,
+                market_cap: None,
+                trailing_pe: None,
+            },
+        };
+        let label = member_text(&m, Some(&q), now);
+        assert!(label.contains("pre 10.25") && label.contains("52wH 12.00"), "{label}");
+        assert!(!label.contains("post") && !label.contains("PE"), "{label}");
+        q.stats = tr_data::QuoteStats::default();
+        assert!(!member_text(&m, Some(&q), now).contains("pre "), "missing stats stay off the row");
     }
 }

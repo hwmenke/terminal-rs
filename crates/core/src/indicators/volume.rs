@@ -28,10 +28,10 @@ pub fn vwap_by(bars: &[Bar], session_of: impl Fn(i64) -> i64) -> Vec<f64> {
     out
 }
 
-/// Session VWAP resetting each UTC day. For daily and longer bars this
+/// Session VWAP resetting each New York calendar day. For daily and longer bars this
 /// degenerates to hlc3, so callers typically anchor it by month instead.
 pub fn vwap(bars: &[Bar]) -> Vec<f64> {
-    vwap_by(bars, |ts| ts.div_euclid(86_400))
+    vwap_by(bars, crate::ny::date_key)
 }
 
 /// Session VWAP with bands `k` volume-weighted standard deviations of the typical price

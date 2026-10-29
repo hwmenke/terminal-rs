@@ -41,7 +41,29 @@ impl BarCache {
         if !has_provenance {
             conn.execute_batch("ALTER TABLE bars ADD COLUMN provenance TEXT NOT NULL DEFAULT 'Missing';")?;
         }
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS fetches (
+                symbol TEXT NOT NULL, tf TEXT NOT NULL, fetched_at INTEGER NOT NULL,
+                PRIMARY KEY (symbol, tf)
+            ) WITHOUT ROWID;",
+        )?;
         Ok(Self { conn })
+    }
+
+    /// Record when a provider refresh for this series completed.
+    pub fn note_fetch(&mut self, symbol: &str, tf: Timeframe, fetched_at: i64) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO fetches (symbol, tf, fetched_at) VALUES (?1, ?2, ?3)
+             ON CONFLICT (symbol, tf) DO UPDATE SET fetched_at = excluded.fetched_at",
+            params![symbol, tf.label(), fetched_at],
+        )?;
+        Ok(())
+    }
+
+    pub fn fetched_at(&self, symbol: &str, tf: Timeframe) -> Result<Option<i64>> {
+        let mut st = self.conn.prepare_cached("SELECT fetched_at FROM fetches WHERE symbol = ?1 AND tf = ?2")?;
+        let mut rows = st.query(params![symbol, tf.label()])?;
+        Ok(rows.next()?.map(|r| r.get(0)).transpose()?)
     }
 
     pub fn store(&mut self, symbol: &str, tf: Timeframe, bars: &[Bar]) -> Result<()> {
@@ -163,5 +185,29 @@ mod tests {
         assert_eq!(bars.len(), 1);
         assert_eq!(bars[0].provenance, Provenance::Missing);
         assert!(Bar::require_verified(&bars, "Backtest").is_err());
+    }
+
+    #[test]
+    fn fetch_time_is_remembered_per_series() {
+        let mut c = BarCache::open_in_memory().unwrap();
+        assert_eq!(c.fetched_at("AAPL", Timeframe::M5).unwrap(), None);
+        c.note_fetch("AAPL", Timeframe::M5, 1_000).unwrap();
+        c.note_fetch("AAPL", Timeframe::D1, 2_000).unwrap();
+        assert_eq!(c.fetched_at("AAPL", Timeframe::M5).unwrap(), Some(1_000));
+        c.note_fetch("AAPL", Timeframe::M5, 1_500).unwrap();
+        assert_eq!(c.fetched_at("AAPL", Timeframe::M5).unwrap(), Some(1_500));
+        assert_eq!(c.fetched_at("AAPL", Timeframe::D1).unwrap(), Some(2_000));
+        assert_eq!(c.fetched_at("MSFT", Timeframe::M5).unwrap(), None);
+        let now = 1_500;
+        assert!(crate::intraday::fetched_recently(
+            c.fetched_at("AAPL", Timeframe::M5).unwrap(),
+            now,
+            crate::intraday::refresh_ttl_secs(Timeframe::M5),
+        ));
+        assert!(!crate::intraday::fetched_recently(
+            c.fetched_at("AAPL", Timeframe::D1).unwrap(),
+            now,
+            crate::intraday::refresh_ttl_secs(Timeframe::D1),
+        ));
     }
 }

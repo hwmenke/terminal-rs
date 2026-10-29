@@ -232,6 +232,7 @@ impl TreasuryProvider {
                     prev_close: prev,
                     ts: last.ts,
                     spark,
+                    stats: crate::QuoteStats::default(),
                 })
             })
             .collect())

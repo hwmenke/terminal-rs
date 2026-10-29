@@ -6,13 +6,13 @@ use crate::Timeframe;
 
 use super::{NAN, Ohlcv};
 
-/// The session a bar at `ts` belongs to on `tf`, for VWAP and pivots: the UTC day
-/// intraday, the month on daily bars, the year above that.
+/// The session a bar at `ts` belongs to on `tf`, for VWAP and pivots: the New York
+/// calendar day intraday, the month on daily bars, the year above that.
 pub fn session_key(tf: Timeframe) -> impl Fn(i64) -> i64 {
     move |ts| {
         let d = chrono::DateTime::from_timestamp(ts, 0).unwrap_or_default();
         match tf {
-            t if t.is_intraday() => ts.div_euclid(86_400),
+            t if t.is_intraday() => crate::ny::date_key(ts),
             Timeframe::D1 => (d.year() * 12 + d.month() as i32) as i64,
             _ => d.year() as i64,
         }
@@ -146,10 +146,22 @@ mod tests {
 
     #[test]
     fn session_keys() {
-        let day = 86_400;
         let k = session_key(Timeframe::M5);
-        assert_eq!(k(10), k(day - 1));
-        assert_ne!(k(day - 1), k(day));
+        // 13:30 and 19:00 UTC on 2026-03-09 are the same New York date (EDT).
+        let march = |h, m| {
+            chrono::NaiveDate::from_ymd_opt(2026, 3, 9).unwrap().and_hms_opt(h, m, 0).unwrap().and_utc().timestamp()
+        };
+        assert_eq!(k(march(13, 30)), k(march(19, 0)));
+        // 04:30 UTC on March 10 is 00:30 EDT, the next New York date.
+        let next =
+            chrono::NaiveDate::from_ymd_opt(2026, 3, 10).unwrap().and_hms_opt(4, 30, 0).unwrap().and_utc().timestamp();
+        assert_ne!(k(march(19, 0)), k(next));
+        // 03:30 UTC on Nov 2 is still Nov 1 in New York; 14:30 UTC is the Nov 2 open.
+        let late =
+            chrono::NaiveDate::from_ymd_opt(2026, 11, 2).unwrap().and_hms_opt(3, 30, 0).unwrap().and_utc().timestamp();
+        let morning =
+            chrono::NaiveDate::from_ymd_opt(2026, 11, 2).unwrap().and_hms_opt(14, 30, 0).unwrap().and_utc().timestamp();
+        assert_ne!(k(late), k(morning));
         // 2026-01-31 and 2026-02-01 fall in different months on daily bars.
         let m = session_key(Timeframe::D1);
         assert_ne!(m(1_769_817_600), m(1_769_904_000));

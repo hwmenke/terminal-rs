@@ -19,6 +19,8 @@ pub struct YahooProvider {
     /// Session crumb for endpoints that require one (options); the cookie lives in the
     /// client's cookie store.
     crumb: tokio::sync::Mutex<Option<String>>,
+    /// Spaces chart, spark and quote calls so an intraday refresh does not burst.
+    pace: tokio::sync::Mutex<crate::intraday::Pace>,
 }
 
 impl YahooProvider {
@@ -29,10 +31,22 @@ impl YahooProvider {
             .timeout(Duration::from_secs(20))
             .cookie_store(true)
             .build()?;
-        Ok(Self { client, crumb: tokio::sync::Mutex::new(None) })
+        Ok(Self {
+            client,
+            crumb: tokio::sync::Mutex::new(None),
+            pace: tokio::sync::Mutex::new(crate::intraday::Pace::yahoo()),
+        })
+    }
+
+    async fn pace(&self) {
+        let wait = self.pace.lock().await.delay(std::time::Instant::now());
+        if !wait.is_zero() {
+            tokio::time::sleep(wait).await;
+        }
     }
 
     async fn chart(&self, symbol: &str, interval: &str, period1: i64, period2: i64) -> Result<Chart> {
+        self.pace().await;
         let url = format!("{BASE}/{}", urlencode(symbol));
         let resp = self
             .client
@@ -81,6 +95,8 @@ pub struct Chart {
     pub bars: Vec<Bar>,
     pub last_price: Option<f64>,
     pub prev_close: Option<f64>,
+    /// Fields present on the chart meta. Absent fields stay `None`.
+    pub stats: crate::QuoteStats,
 }
 
 #[derive(Deserialize)]
@@ -105,6 +121,22 @@ struct Meta {
     regular_market_price: Option<f64>,
     chart_previous_close: Option<f64>,
     previous_close: Option<f64>,
+    #[serde(default)]
+    regular_market_volume: Option<f64>,
+    #[serde(default)]
+    pre_market_price: Option<f64>,
+    #[serde(default)]
+    post_market_price: Option<f64>,
+    #[serde(default, rename = "averageDailyVolume10Day")]
+    average_daily_volume_10_day: Option<f64>,
+    #[serde(default)]
+    fifty_two_week_high: Option<f64>,
+    #[serde(default)]
+    fifty_two_week_low: Option<f64>,
+    #[serde(default)]
+    market_cap: Option<f64>,
+    #[serde(default, rename = "trailingPE")]
+    trailing_pe: Option<f64>,
 }
 #[derive(Deserialize)]
 struct Indicators {
@@ -146,7 +178,38 @@ pub fn parse_chart(json: &str) -> Result<Chart> {
         bars,
         last_price: r.meta.regular_market_price,
         prev_close: r.meta.previous_close.or(r.meta.chart_previous_close),
+        stats: stats_from_meta(&r.meta),
     })
+}
+
+fn stats_from_meta(meta: &Meta) -> crate::QuoteStats {
+    use crate::QuoteStats;
+    QuoteStats {
+        pre_market: QuoteStats::price(meta.pre_market_price),
+        post_market: QuoteStats::price(meta.post_market_price),
+        regular_volume: QuoteStats::volume(meta.regular_market_volume),
+        average_volume_10d: QuoteStats::volume(meta.average_daily_volume_10_day),
+        week_52_high: QuoteStats::price(meta.fifty_two_week_high),
+        week_52_low: QuoteStats::price(meta.fifty_two_week_low),
+        market_cap: QuoteStats::price(meta.market_cap),
+        trailing_pe: QuoteStats::finite(meta.trailing_pe),
+    }
+}
+
+/// Stocks, ETFs and cash indices. FX (`=X`), futures (`=F`) and `BASE-USD` crypto trade
+/// outside the New York cash session and keep every bar the provider returned.
+pub fn cash_session_symbol(symbol: &str) -> bool {
+    let s = symbol.trim();
+    if s.ends_with("=X") || s.ends_with("=F") {
+        return false;
+    }
+    if let Some((base, quote)) = s.split_once('-')
+        && matches!(quote, "USD" | "USDT" | "EUR" | "BTC")
+        && base.chars().all(|c| c.is_ascii_alphanumeric())
+    {
+        return false;
+    }
+    true
 }
 
 #[async_trait]
@@ -173,7 +236,12 @@ impl MarketData for YahooProvider {
             return Ok(Vec::new());
         }
         let mut bars = self.chart(symbol, iv, period1, period2).await?.bars;
+        // Keep the provider's OHLC. Out-of-session prints are not rewritten onto the cash grid.
+        if tf.is_intraday() && cash_session_symbol(symbol) {
+            bars = crate::intraday::regular_only(bars);
+        }
         // Yahoo's weekly/monthly timestamps are session opens; snap to our calendar buckets.
+        // 4h has no Yahoo interval, so it is aggregated from the (session-filtered) 1h bars.
         if matches!(tf, Timeframe::W1 | Timeframe::MN1 | Timeframe::H4) {
             bars = tf.resample(&bars);
         }
@@ -185,6 +253,15 @@ impl MarketData for YahooProvider {
         let mut out = Vec::with_capacity(symbols.len());
         for chunk in symbols.chunks(20) {
             out.extend(self.spark(chunk).await?);
+        }
+        // Spark has last/prev/spark only. The quote summary adds pre/post and fundamentals
+        // when Yahoo sent them; a failure leaves those fields absent rather than failing the quote.
+        if let Ok(stats) = self.quote_stats(symbols).await {
+            for q in &mut out {
+                if let Some(s) = stats.get(&q.symbol) {
+                    q.stats = s.clone();
+                }
+            }
         }
         Ok(out)
     }
@@ -347,9 +424,12 @@ pub fn parse_news(json: &str) -> Result<Vec<crate::NewsItem>> {
 const SPARK: &str = "https://query1.finance.yahoo.com/v8/finance/spark";
 const SEARCH: &str = "https://query2.finance.yahoo.com/v1/finance/search";
 
+const QUOTE: &str = "https://query1.finance.yahoo.com/v7/finance/quote";
+
 impl YahooProvider {
     /// Last price, previous close and the last few daily closes for each Yahoo symbol.
     pub async fn spark(&self, symbols: &[String]) -> Result<Vec<Quote>> {
+        self.pace().await;
         let resp = self
             .client
             .get(SPARK)
@@ -360,6 +440,19 @@ impl YahooProvider {
             bail!("yahoo spark: HTTP {}", resp.status());
         }
         parse_spark(&resp.text().await?)
+    }
+
+    /// Batched quote summary. Only fields present in the payload are returned.
+    async fn quote_stats(&self, symbols: &[String]) -> Result<std::collections::HashMap<String, crate::QuoteStats>> {
+        if symbols.is_empty() {
+            return Ok(std::collections::HashMap::new());
+        }
+        self.pace().await;
+        let resp = self.client.get(QUOTE).query(&[("symbols", symbols.join(","))]).send().await?;
+        if !resp.status().is_success() {
+            bail!("yahoo quote: HTTP {}", resp.status());
+        }
+        parse_quote_stats(&resp.text().await?)
     }
 }
 
@@ -382,6 +475,7 @@ pub fn parse_spark(json: &str) -> Result<Vec<Quote>> {
             prev_close: prev,
             ts,
             spark: closes,
+            stats: crate::QuoteStats::default(),
         });
     }
     Ok(out)
@@ -428,6 +522,32 @@ pub fn yahoo_symbol(sec: &Security) -> String {
     }
 }
 
+/// Parse `/v7/finance/quote`. Symbols with no usable row are omitted.
+/// A null or non-finite field stays absent.
+pub fn parse_quote_stats(json: &str) -> Result<std::collections::HashMap<String, crate::QuoteStats>> {
+    let v: serde_json::Value = serde_json::from_str(json).context("parsing Yahoo quote")?;
+    let rows = v["quoteResponse"]["result"].as_array().ok_or_else(|| anyhow!("unexpected quote payload"))?;
+    let mut out = std::collections::HashMap::new();
+    for row in rows {
+        let Some(symbol) = row["symbol"].as_str() else { continue };
+        let num = |key: &str| row.get(key).and_then(|v| v.as_f64());
+        out.insert(
+            symbol.to_string(),
+            crate::QuoteStats {
+                pre_market: crate::QuoteStats::price(num("preMarketPrice")),
+                post_market: crate::QuoteStats::price(num("postMarketPrice")),
+                regular_volume: crate::QuoteStats::volume(num("regularMarketVolume")),
+                average_volume_10d: crate::QuoteStats::volume(num("averageDailyVolume10Day")),
+                week_52_high: crate::QuoteStats::price(num("fiftyTwoWeekHigh")),
+                week_52_low: crate::QuoteStats::price(num("fiftyTwoWeekLow")),
+                market_cap: crate::QuoteStats::price(num("marketCap")),
+                trailing_pe: crate::QuoteStats::finite(num("trailingPE")),
+            },
+        );
+    }
+    Ok(out)
+}
+
 /// Parse `/v1/finance/search` into market-key hits.
 pub fn parse_search(json: &str) -> Result<Vec<SearchHit>> {
     let v: serde_json::Value = serde_json::from_str(json).context("parsing Yahoo search")?;
@@ -462,6 +582,36 @@ mod tests {
         assert!(c.bars.windows(2).all(|w| w[0].ts < w[1].ts));
         assert!(c.bars.iter().all(|b| b.high >= b.low && b.volume > 0.0));
         assert_eq!(c.last_price, Some(336.64));
+        assert!((c.stats.week_52_high.unwrap() - 345.34).abs() < 1e-6);
+        assert!((c.stats.week_52_low.unwrap() - 243.42).abs() < 1e-6);
+        assert_eq!(c.stats.regular_volume, Some(37_881_199.0));
+        assert!(c.stats.pre_market.is_none() && c.stats.post_market.is_none());
+        assert!(c.stats.market_cap.is_none() && c.stats.trailing_pe.is_none());
+    }
+
+    #[test]
+    fn quote_stats_keep_only_fields_the_payload_has() {
+        let json = r#"{"quoteResponse":{"result":[
+            {"symbol":"AAPL","preMarketPrice":180.5,"postMarketPrice":null,"regularMarketVolume":1000,
+             "averageDailyVolume10Day":2.5e6,"fiftyTwoWeekHigh":200.0,"fiftyTwoWeekLow":0,
+             "marketCap":2.5e12,"trailingPE":-3.5},
+            {"symbol":"MSFT","regularMarketPrice":400.0}
+        ],"error":null}}"#;
+        let stats = parse_quote_stats(json).unwrap();
+        let aapl = &stats["AAPL"];
+        assert_eq!(aapl.pre_market, Some(180.5));
+        assert_eq!(aapl.post_market, None);
+        assert_eq!(aapl.regular_volume, Some(1000.0));
+        assert_eq!(aapl.average_volume_10d, Some(2.5e6));
+        assert_eq!(aapl.week_52_high, Some(200.0));
+        assert_eq!(aapl.week_52_low, None);
+        assert_eq!(aapl.market_cap, Some(2.5e12));
+        assert_eq!(aapl.trailing_pe, Some(-3.5));
+        let msft = &stats["MSFT"];
+        assert!(msft.pre_market.is_none() && msft.post_market.is_none() && msft.regular_volume.is_none());
+        assert!(msft.market_cap.is_none() && msft.trailing_pe.is_none() && msft.week_52_high.is_none());
+        assert!(cash_session_symbol("AAPL") && cash_session_symbol("BRK-B") && cash_session_symbol("^GSPC"));
+        assert!(!cash_session_symbol("EURUSD=X") && !cash_session_symbol("CL=F") && !cash_session_symbol("BTC-USD"));
     }
 
     #[test]
