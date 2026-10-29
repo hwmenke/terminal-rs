@@ -73,6 +73,18 @@ pub struct QuoteStats {
     /// End of the provider's earnings window (Unix seconds).
     #[serde(default)]
     pub earnings_end: Option<i64>,
+    /// Bid the provider sent. Absent when omitted, non-finite, or not positive.
+    #[serde(default)]
+    pub bid: Option<f64>,
+    /// Ask the provider sent. Absent when omitted, non-finite, or not positive.
+    #[serde(default)]
+    pub ask: Option<f64>,
+    /// Bid size the provider sent. Zero and negative sizes stay absent.
+    #[serde(default)]
+    pub bid_size: Option<f64>,
+    /// Ask size the provider sent. Zero and negative sizes stay absent.
+    #[serde(default)]
+    pub ask_size: Option<f64>,
 }
 
 impl QuoteStats {
@@ -84,6 +96,11 @@ impl QuoteStats {
     /// Finite volume, including zero. Negative and non-finite values are absent.
     pub fn volume(v: Option<f64>) -> Option<f64> {
         v.filter(|x| x.is_finite() && *x >= 0.0)
+    }
+
+    /// Positive finite size. Zero is not a quoted size.
+    pub fn size(v: Option<f64>) -> Option<f64> {
+        v.filter(|x| x.is_finite() && *x > 0.0)
     }
 
     /// Finite number, including negatives (a trailing P/E can be negative).
@@ -305,6 +322,12 @@ impl Quote {
     pub fn stats_label(&self) -> String {
         let s = &self.stats;
         let mut parts = Vec::new();
+        if let Some(side) = quote_side("bid", s.bid, s.bid_size) {
+            parts.push(side);
+        }
+        if let Some(side) = quote_side("ask", s.ask, s.ask_size) {
+            parts.push(side);
+        }
         if let Some(v) = s.pre_market {
             parts.push(format!("pre {v:.2}"));
         }
@@ -333,6 +356,14 @@ impl Quote {
             parts.push(v);
         }
         parts.join(" · ")
+    }
+}
+
+fn quote_side(name: &str, px: Option<f64>, size: Option<f64>) -> Option<String> {
+    let px = px?;
+    match size {
+        Some(size) => Some(format!("{name} {px:.2} × {}", compact_stat(size))),
+        None => Some(format!("{name} {px:.2}")),
     }
 }
 
@@ -713,6 +744,9 @@ mod tests {
         assert_eq!(q.provenance, Provenance::Missing);
         assert_eq!(q.provenance.source_label("Yahoo"), "UNVERIFIED DATA");
         assert!(q.stats.pre_market.is_none() && q.stats.market_cap.is_none() && q.stats_label().is_empty());
+        assert!(
+            q.stats.bid.is_none() && q.stats.ask.is_none() && q.stats.bid_size.is_none() && q.stats.ask_size.is_none()
+        );
     }
 
     #[tokio::test]
@@ -767,6 +801,10 @@ mod tests {
             earnings_ts: None,
             earnings_start: None,
             earnings_end: None,
+            bid: None,
+            ask: None,
+            bid_size: None,
+            ask_size: None,
         };
         assert_eq!(q.stats.post_market, None, "non-finite post-market stays missing");
         assert_eq!(q.stats.week_52_low, None, "a zero low is not a price");
@@ -775,7 +813,7 @@ mod tests {
         assert!(label.contains("pre 111.00") && label.contains("vol 1.50M"), "{label}");
         assert!(label.contains("52wH 120.00") && label.contains("cap 2.50T") && label.contains("PE -4.50"), "{label}");
         assert!(!label.contains("post") && !label.contains("52wL") && !label.contains("avg10"), "{label}");
-        assert!(!label.contains("ERN"), "{label}");
+        assert!(!label.contains("bid") && !label.contains("ask") && !label.contains("ERN"), "{label}");
         assert!((q.change_pct() - 10.0).abs() < 1e-9);
     }
 

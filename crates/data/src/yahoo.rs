@@ -196,6 +196,7 @@ fn stats_from_meta(meta: &Meta) -> crate::QuoteStats {
         earnings_ts: None,
         earnings_start: None,
         earnings_end: None,
+        ..QuoteStats::default()
     }
 }
 
@@ -575,6 +576,10 @@ pub fn parse_quote_stats(json: &str) -> Result<std::collections::HashMap<String,
                 earnings_ts: unix("earningsTimestamp"),
                 earnings_start: unix("earningsTimestampStart"),
                 earnings_end: unix("earningsTimestampEnd"),
+                bid: crate::QuoteStats::price(num("bid")),
+                ask: crate::QuoteStats::price(num("ask")),
+                bid_size: crate::QuoteStats::size(num("bidSize")),
+                ask_size: crate::QuoteStats::size(num("askSize")),
             },
         );
     }
@@ -652,8 +657,36 @@ mod tests {
         assert!(msft.earnings_ts.is_none() && msft.earnings_start.is_none() && msft.earnings_label().is_none());
         let ibm = &stats["IBM"];
         assert!(ibm.earnings_ts.is_none() && ibm.earnings_end.is_none() && ibm.earnings_label().is_none());
+        assert!(aapl.bid.is_none() && aapl.ask.is_none() && msft.bid_size.is_none());
         assert!(cash_session_symbol("AAPL") && cash_session_symbol("BRK-B") && cash_session_symbol("^GSPC"));
         assert!(!cash_session_symbol("EURUSD=X") && !cash_session_symbol("CL=F") && !cash_session_symbol("BTC-USD"));
+    }
+
+    #[test]
+    fn quote_stats_keep_the_bid_and_ask_the_payload_sent() {
+        let json = r#"{"quoteResponse":{"result":[
+            {"symbol":"AAPL","bid":180.1,"ask":180.25,"bidSize":200,"askSize":100},
+            {"symbol":"MSFT","bid":0,"ask":null,"bidSize":-5,"askSize":0},
+            {"symbol":"IBM","ask":90.5,"bidSize":40},
+            {"symbol":"T","bid":10.0,"ask":9.5,"bidSize":1500000,"askSize":2}
+        ],"error":null}}"#;
+        let stats = parse_quote_stats(json).unwrap();
+        let quote = |symbol: &str| Quote {
+            provenance: tr_core::Provenance::Real,
+            symbol: symbol.into(),
+            last: 1.0,
+            prev_close: 1.0,
+            ts: 1,
+            spark: vec![],
+            stats: stats[symbol].clone(),
+        };
+        assert_eq!(quote("AAPL").stats_label(), "bid 180.10 × 200 · ask 180.25 × 100");
+        assert!(stats["MSFT"].bid.is_none() && stats["MSFT"].ask.is_none());
+        assert!(stats["MSFT"].bid_size.is_none() && stats["MSFT"].ask_size.is_none());
+        assert_eq!(quote("MSFT").stats_label(), "");
+        assert_eq!(quote("IBM").stats_label(), "ask 90.50");
+        assert!(stats["IBM"].bid.is_none() && stats["IBM"].bid_size == Some(40.0));
+        assert_eq!(quote("T").stats_label(), "bid 10.00 × 1.50M · ask 9.50 × 2");
     }
 
     #[test]
