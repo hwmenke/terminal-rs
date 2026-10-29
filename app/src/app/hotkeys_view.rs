@@ -368,6 +368,10 @@ impl TerminalApp {
                         &["VPACE", "AAPL VPACE 20 15m"],
                         "Cumulative volume versus the usual pace of prior sessions",
                     ),
+                    (
+                        &["GFILL", "AAPL GFILL 40 15m"],
+                        "Today's open versus the prior cash close, and how often that gap had filled",
+                    ),
                     (&["TL", "HL", "VL", "FIB", "MAGNET"], "Drawing tools and snapping"),
                     (&["CLEAR DRAW", "UNDO DRAW"], "Remove all drawings on this name, or undo the last delete"),
                     (&["REVIEW", "AAPL REVIEW"], "Linked daily + weekly archive charts for candidate review"),

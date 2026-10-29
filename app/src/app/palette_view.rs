@@ -110,6 +110,9 @@ const COMMANDS: &[(&str, &str, &str, Option<Action>)] = &[
     ),
     ("AAPL VPACE 20", "AAPL cumulative volume versus the last 20 sessions", "volume pace 20", None),
     ("AAPL VPACE 15m", "AAPL volume pace on 15-minute bars", "cumulative volume 15m", None),
+    ("GFILL", "Gap fill: today's open versus the prior cash close", "gap fill prior close opening drive", None),
+    ("AAPL GFILL 40", "AAPL gap versus the last 40 sessions' cash closes", "gap fill 40", None),
+    ("AAPL GFILL 15m", "AAPL gap fill on 15-minute bars", "gap fill 15m", None),
     (
         "LOOKALIKE",
         "Historical lookalikes: nearest past conditions and subsequent returns",
@@ -330,6 +333,10 @@ pub(super) fn static_items() -> Vec<Item> {
     v.push(
         Item::new(Kind::Panel, "New volume pace", "NEW VPACE", Target::Run("NEW VPACE".into()))
             .keywords("panel pane vpace cumulative volume prior sessions"),
+    );
+    v.push(
+        Item::new(Kind::Panel, "New gap fill", "NEW GFILL", Target::Run("NEW GFILL".into()))
+            .keywords("panel pane gfill gap fill prior close"),
     );
     v.push(
         Item::new(Kind::Panel, "New Lookalikes pane", "NEW LOOKALIKE", Target::Run("NEW LOOKALIKE".into()))

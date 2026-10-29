@@ -257,6 +257,11 @@ gets the native title bar with traffic lights, window vibrancy behind the sideba
   sessions. A hole ends that session's total. Pace is today's total divided
   by the typical total at the same minute. Sample bars are refused. See
   [Volume pace](docs/VOLUME_PACE.md).
+- **Gap fill** — `GFILL` (or `AAPL GFILL 40 15m`) draws today's open against
+  the prior cash close, and the share of earlier same-direction gaps that had
+  traded back through that close by the same minute. A hole ends the known
+  path. The rate past the last print is not a forecast. Sample bars are
+  refused. See [Gap fill](docs/GAP_FILL.md).
 - **Historical lookalikes** — `LOOKALIKE` (or `AAPL LOOKALIKE`, `AAPL KNN
   2024-01-15`) finds past sessions whose backward-looking features match the
   query date (standardized Euclidean distance), shows **per-horizon completed /
@@ -416,6 +421,7 @@ Settings › Hotkeys. On Linux and Windows ⌘ is Ctrl and ⌥ is Alt.
 | `SPATH` · `AAPL SPATH 20 15m` · `NEW SPATH` | Today versus the typical path of prior sessions, percent from each 09:30 open |
 | `BRD` · `AAPL BRD MSFT NVDA` · `BRD 15m` · `NEW BRD` | Share of a list at or above each 09:30 open and session VWAP |
 | `VPACE` · `AAPL VPACE 20 15m` · `NEW VPACE` | Cumulative volume versus the usual pace of prior sessions |
+| `GFILL` · `AAPL GFILL 40 15m` · `NEW GFILL` | Open versus the prior cash close, and how often that gap had filled |
 | `NEWS` · `AAPL CN` · `TOP` · `BTCUSD CRNCY OB` · `WEI` · `GC` | watchlist news · one name · top headlines · order book · markets · curve |
 | `CONG` · `NVDA CONG` · `POL PELOSI` · `TRACK PELOSI` · `ALERTS` · `REFRESH` | Congress feed · who traded it · profile · track · alerts · refresh |
 | `AAPL ALERT 150` · `AAPL ALERT BELOW 140` · `NVDA ALERT SETUP NEAR_HIGH` · `UNALERT AAPL` | Price/setup alerts (click a fired row to open the chart) |
