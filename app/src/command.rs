@@ -311,6 +311,10 @@ pub enum Function {
     IntradayBacktest {
         spec: String,
     },
+    /// Multi-symbol intraday compare, percent from each 09:30 open (`ICMP`, `AAPL ICMP MSFT`).
+    IntradayCompare {
+        spec: String,
+    },
     /// Historical lookalikes / nearest neighbors (`LOOKALIKE`, `AAPL KNN 2024-01-15 K=15`).
     Lookalike {
         spec: String,
@@ -525,6 +529,7 @@ fn parse_function(head: &str, rest: &[&str]) -> Option<Function> {
         "BACKTEST" | "BT" | "BTEST" => Function::Backtest { spec: joined() },
         "IBT" | "IBACKTEST" | "SETUPBT" => Function::IntradayBacktest { spec: joined() },
         "LOOKALIKE" | "LOOKALIKES" | "KNN" | "ANALOG" | "ANALOGUE" | "NN" => Function::Lookalike { spec: joined() },
+        "ICMP" | "ICOMPARE" | "ICOMP" => Function::IntradayCompare { spec: joined() },
         "GOTO" | "JUMP" | "GTO" => Function::Goto { date: joined() },
         "NOTE" | "JNOTE" => {
             let (date, text) = split_note_args(rest);
@@ -764,6 +769,10 @@ fn describe(f: &Function) -> String {
             "Paper intraday backtest: session VWAP and opening range vs holding the cash session".into()
         }
         Function::IntradayBacktest { spec } => format!("Paper intraday backtest ({spec})"),
+        Function::IntradayCompare { spec } if spec.is_empty() => {
+            "Intraday compare: each name as percent from its own 09:30 open, with SPY on the same clock".into()
+        }
+        Function::IntradayCompare { spec } => format!("Intraday compare from the 09:30 open ({spec})"),
         Function::Lookalike { spec } if spec.is_empty() => {
             "Historical lookalikes: nearest past conditions, per-horizon counts, jump to neighbor dates".into()
         }

@@ -66,6 +66,14 @@ pub enum Request {
         slippage_bps: f64,
         allow_short: bool,
     },
+    /// Multi-symbol intraday compare, percent from each name's 09:30 open.
+    IntradayCompare {
+        pane: PaneId,
+        generation: u64,
+        symbol: String,
+        spec: String,
+        timeframe: String,
+    },
     /// Paper VWAP / opening-range backtest on verified regular-session bars.
     IntradayBacktest {
         pane: PaneId,
@@ -354,6 +362,11 @@ pub enum Response {
         pane: PaneId,
         generation: u64,
         result: Result<tr_data::intraday_backtest::IntradayReport, String>,
+    },
+    IntradayCompare {
+        pane: PaneId,
+        generation: u64,
+        result: Result<tr_data::intraday_compare::CompareChart, String>,
     },
     Lookalike {
         pane: PaneId,
@@ -1049,6 +1062,49 @@ async fn research_intraday_backtest(
         .map_err(anyhow::Error::msg)
 }
 
+/// Verified regular-session bars for several cash names. Sample substitution is refused.
+async fn research_intraday_compare(
+    s: &Shared,
+    symbol: &str,
+    spec: &str,
+    timeframe: &str,
+) -> anyhow::Result<tr_data::intraday_compare::CompareChart> {
+    if s.provider.name() == "sample" {
+        anyhow::bail!(
+            "Intraday compare refused: sample / offline display mode does not feed this pane. Sample prices are never used."
+        );
+    }
+    let query = tr_data::intraday_compare::parse_query(symbol, spec, timeframe).map_err(anyhow::Error::msg)?;
+    let limit = tr_data::intraday_compare::fetch_limit(query.timeframe);
+    let mut rows = Vec::with_capacity(query.symbols.len());
+    for sym in &query.symbols {
+        let sec = tr_data::security(sym);
+        if !matches!(sec.class, tr_core::AssetClass::Equity | tr_core::AssetClass::Etf | tr_core::AssetClass::Index) {
+            rows.push(tr_data::intraday_compare::NamedBars {
+                symbol: sec.key(),
+                bars: Vec::new(),
+                error: Some(format!("{} has no US cash session.", sec.ticker)),
+            });
+            continue;
+        }
+        match s.provider.history(&sec.key(), query.timeframe, None, limit).await {
+            Ok(bars) if bars.is_empty() => rows.push(tr_data::intraday_compare::NamedBars {
+                symbol: sec.key(),
+                bars,
+                error: Some(format!("{} returned no regular-session bars. Sample prices are never used.", sec.ticker)),
+            }),
+            Ok(bars) => rows.push(tr_data::intraday_compare::NamedBars { symbol: sec.key(), bars, error: None }),
+            Err(e) => rows.push(tr_data::intraday_compare::NamedBars {
+                symbol: sec.key(),
+                bars: Vec::new(),
+                error: Some(format!("{e:#}")),
+            }),
+        }
+    }
+    let source = format!("{} {} regular session", s.provider.name(), query.timeframe.label());
+    tr_data::intraday_compare::build_chart(&query.anchor, query.timeframe, &rows, &source).map_err(anyhow::Error::msg)
+}
+
 /// Load one name from the local archive, then Whats-News. Sample/display bars never enter.
 async fn research_lookalike(
     s: &Shared,
@@ -1331,6 +1387,13 @@ async fn handle(s: &Arc<Shared>, req: Request) {
                 )
                 .await
                 .map_err(|e| format!("{e:#}")),
+            });
+        }
+        Request::IntradayCompare { pane, generation, symbol, spec, timeframe } => {
+            send(Response::IntradayCompare {
+                pane,
+                generation,
+                result: research_intraday_compare(s, &symbol, &spec, &timeframe).await.map_err(|e| format!("{e:#}")),
             });
         }
         Request::IntradayBacktest {

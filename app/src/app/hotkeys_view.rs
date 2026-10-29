@@ -352,6 +352,10 @@ impl TerminalApp {
                     (&["CANDLE", "BAR", "LINE", "AREA", "LOG"], "Chart type and log scale"),
                     (&["SMA 50", "RSI", "IND"], "Indicators (see below)"),
                     (&["CMP MSFT"], "Compare, rebased to the main symbol"),
+                    (
+                        &["ICMP", "AAPL ICMP MSFT NVDA"],
+                        "Intraday compare: percent from each name's 09:30 open, with SPY",
+                    ),
                     (&["TL", "HL", "VL", "FIB", "MAGNET"], "Drawing tools and snapping"),
                     (&["CLEAR DRAW", "UNDO DRAW"], "Remove all drawings on this name, or undo the last delete"),
                     (&["REVIEW", "AAPL REVIEW"], "Linked daily + weekly archive charts for candidate review"),

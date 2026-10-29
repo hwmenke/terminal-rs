@@ -10,6 +10,7 @@ mod backup;
 mod broker;
 mod chrome;
 mod command_bar;
+mod compare;
 mod demo;
 mod desk;
 mod hotkeys_view;
@@ -95,6 +96,8 @@ pub enum PaneKind {
     Backtest(Box<backtest::BacktestPane>),
     /// Historical lookalikes / nearest neighbors (`LOOKALIKE` / `KNN`).
     Lookalike(Box<lookalike::LookalikePane>),
+    /// Multi-symbol intraday compare, percent from each 09:30 open (`ICMP`).
+    IntradayCompare(Box<compare::ComparePane>),
     Settings,
 }
 
@@ -305,6 +308,13 @@ impl PaneKind {
                     format!("{} Lookalikes", tr_data::security(&l.symbol).ticker)
                 }
             }
+            PaneKind::IntradayCompare(c) => {
+                if c.symbol.trim().is_empty() {
+                    "Compare".into()
+                } else {
+                    format!("{} Compare", tr_data::security(&c.symbol).ticker)
+                }
+            }
             PaneKind::Settings => "Settings".into(),
         }
     }
@@ -340,6 +350,7 @@ impl PaneKind {
             PaneKind::Backtest(b) if b.intraday => "IBT",
             PaneKind::Backtest(_) => "BT",
             PaneKind::Lookalike(_) => "KNN",
+            PaneKind::IntradayCompare(_) => "ICMP",
             PaneKind::Settings => "PDF",
         }
     }
@@ -439,6 +450,9 @@ impl PaneKind {
                 intraday: b.intraday,
                 tf: b.tf.clone(),
             },
+            PaneKind::IntradayCompare(c) => {
+                PaneSettings::IntradayCompare { symbol: c.symbol.clone(), peers: c.peers.clone(), tf: c.tf.clone() }
+            }
             PaneKind::Lookalike(l) => PaneSettings::Lookalike {
                 symbol: l.symbol.clone(),
                 spec: l.spec.clone(),
@@ -555,6 +569,13 @@ impl PaneKind {
                     pane.horizons = horizons;
                 }
                 PaneKind::Lookalike(Box::new(pane))
+            }
+            PaneSettings::IntradayCompare { symbol, peers, tf } => {
+                let mut pane = compare::ComparePane::new(symbol, peers);
+                if !tf.is_empty() {
+                    pane.tf = tf;
+                }
+                PaneKind::IntradayCompare(Box::new(pane))
             }
         }
     }
@@ -1068,6 +1089,9 @@ impl TerminalApp {
                 self.open_intraday_backtest(Some(&s), &spec)
             }
             Command::SymbolFunction(s, Function::Lookalike { spec }) => self.open_lookalike(Some(&s), &spec),
+            Command::SymbolFunction(s, Function::IntradayCompare { spec }) => {
+                self.open_intraday_compare(Some(&s), &spec)
+            }
             Command::SymbolFunction(s, Function::Goto { date }) => self.goto_chart_date(Some(&s), &date),
             Command::SymbolFunction(s, Function::JournalNote { date, text }) => {
                 self.add_journal_note(Some(&s), &date, &text)
@@ -1154,7 +1178,7 @@ impl TerminalApp {
                     }
                     None => {
                         self.status = format!(
-                            "Unknown panel {spec:?}; try CHART, NEWS, BOOK, WEI, GC, CONG, WL, DESK, JOURNAL, STATS, BACKTEST, IBT, LOOKALIKE, PORT"
+                            "Unknown panel {spec:?}; try CHART, NEWS, BOOK, WEI, GC, CONG, WL, DESK, JOURNAL, STATS, BACKTEST, IBT, ICMP, LOOKALIKE, PORT"
                         )
                     }
                 }
@@ -1252,6 +1276,7 @@ impl TerminalApp {
             Function::Backtest { spec } => self.open_backtest(symbol.as_deref(), &spec),
             Function::IntradayBacktest { spec } => self.open_intraday_backtest(symbol.as_deref(), &spec),
             Function::Lookalike { spec } => self.open_lookalike(symbol.as_deref(), &spec),
+            Function::IntradayCompare { spec } => self.open_intraday_compare(symbol.as_deref(), &spec),
             Function::Goto { date } => self.goto_chart_date(symbol.as_deref(), &date),
             Function::JournalNote { date, text } => self.add_journal_note(symbol.as_deref(), &date, &text),
             Function::Latest => self.with_chart(|c, _| c.jump_latest()),
@@ -1400,6 +1425,13 @@ impl TerminalApp {
                         self.panes.iter_mut().find(|p| p.id == pane).map(|p| &mut p.kind)
                     {
                         b.accept_intraday(generation, result);
+                    }
+                }
+                Response::IntradayCompare { pane, generation, result } => {
+                    if let Some(PaneKind::IntradayCompare(c)) =
+                        self.panes.iter_mut().find(|p| p.id == pane).map(|p| &mut p.kind)
+                    {
+                        c.accept(generation, result);
                     }
                 }
                 Response::Lookalike { pane, generation, result } => {

@@ -689,6 +689,20 @@ impl TerminalApp {
             }
             if nav_row(
                 ui,
+                Icon::Chart,
+                "Session compare",
+                Some("ICMP"),
+                is_focused(&PaneKind::IntradayCompare(Box::new(super::compare::ComparePane::new(
+                    String::new(),
+                    String::new(),
+                )))),
+            )
+            .clicked()
+            {
+                out.push(SidebarCmd::Function(Function::IntradayCompare { spec: String::new() }));
+            }
+            if nav_row(
+                ui,
                 Icon::Search,
                 "Lookalikes",
                 Some("KNN"),

@@ -20,7 +20,7 @@ use crate::widgets::{self, Icon};
 use crate::worker::{Request, Worker};
 
 /// Panels offered by the + menus: label and command word.
-pub const PANELS: [(&str, &str); 18] = [
+pub const PANELS: [(&str, &str); 19] = [
     ("Chart", "CHART"),
     ("Watchlist", "WL"),
     ("News", "NEWS"),
@@ -35,6 +35,7 @@ pub const PANELS: [(&str, &str); 18] = [
     ("Journal", "JOURNAL"),
     ("Backtest", "BACKTEST"),
     ("Intraday BT", "IBT"),
+    ("Session compare", "ICMP"),
     ("Lookalikes", "LOOKALIKE"),
     ("Security Search", "SECF"),
     ("Settings", "PREFS"),
@@ -409,6 +410,15 @@ impl TerminalApp {
                 }
                 b.request(id, &self.worker);
                 PaneKind::Backtest(b)
+            }
+            PaneKind::IntradayCompare(mut c) => {
+                if c.symbol.trim().is_empty() {
+                    if let Some(sym) = self.focused_symbol() {
+                        c.symbol = sym;
+                    }
+                }
+                c.request(id, &self.worker);
+                PaneKind::IntradayCompare(c)
             }
             PaneKind::Lookalike(mut l) => {
                 if l.symbol.trim().is_empty() {
@@ -856,6 +866,12 @@ impl TerminalApp {
                 let symbol = given.or(current).unwrap_or_default();
                 let spec = words.get(1..).unwrap_or(&[]).join(" ");
                 PaneKind::Backtest(Box::new(super::backtest::BacktestPane::new(symbol, spec)))
+            }
+            "ICMP" | "ICOMPARE" | "ICOMP" => {
+                // Peer tickers and the bar size stay in the spec. The anchor is the named or focused symbol.
+                let symbol = symbol.map(|s| tr_data::security(s).key()).or(current).unwrap_or_default();
+                let spec = words.get(1..).unwrap_or(&[]).join(" ");
+                PaneKind::IntradayCompare(Box::new(super::compare::ComparePane::new(symbol, spec)))
             }
             "IBT" | "IBACKTEST" | "SETUPBT" => {
                 // VWAP and OR are setup names, not tickers.

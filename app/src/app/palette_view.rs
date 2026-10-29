@@ -83,6 +83,9 @@ const COMMANDS: &[(&str, &str, &str, Option<Action>)] = &[
     ("AAPL IBT", "AAPL session VWAP and opening range vs holding the cash session", "intraday backtest 5m", None),
     ("AAPL IBT VWAP", "AAPL VWAP cross vs session hold on the unseen sessions", "vwap cross fill", None),
     ("AAPL IBT OR 15m", "AAPL opening-range break on 15-minute bars", "opening range 15m", None),
+    ("ICMP", "Intraday compare: percent from each name's 09:30 open", "session open relative spy multi symbol", None),
+    ("AAPL ICMP MSFT NVDA", "AAPL, MSFT, NVDA and SPY from each 09:30 open", "intraday compare 5m", None),
+    ("AAPL ICMP 1m", "AAPL and SPY on 1-minute bars, percent from the open", "session compare 1m", None),
     (
         "LOOKALIKE",
         "Historical lookalikes: nearest past conditions and subsequent returns",
@@ -287,6 +290,10 @@ pub(super) fn static_items() -> Vec<Item> {
     v.push(
         Item::new(Kind::Panel, "New intraday backtest", "NEW IBT", Target::Run("NEW IBT".into()))
             .keywords("panel pane ibt vwap opening range session"),
+    );
+    v.push(
+        Item::new(Kind::Panel, "New session compare", "NEW ICMP", Target::Run("NEW ICMP".into()))
+            .keywords("panel pane icmp intraday compare session open spy"),
     );
     v.push(
         Item::new(Kind::Panel, "New Lookalikes pane", "NEW LOOKALIKE", Target::Run("NEW LOOKALIKE".into()))
