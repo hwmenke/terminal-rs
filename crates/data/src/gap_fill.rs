@@ -266,10 +266,9 @@ fn draft_session(
     let Some(&open_ts) = opens.first() else { return Err(DraftFail::Open) };
     let Some(open_bar) = one_usable(day, open_ts) else { return Err(DraftFail::Open) };
     let prior_date = previous_session(date);
-    let Some(prior_day) = by_day.get(&prior_date) else { return Err(DraftFail::PriorClose) };
-    let Some(&close_ts) = regular_opens(prior_date, tf).last() else { return Err(DraftFail::PriorClose) };
-    let Some(close_bar) = one_usable(prior_day, close_ts) else { return Err(DraftFail::PriorClose) };
-    let prior_close = close_bar.close;
+    let Some(prior_close) = cash_session::cash_close(tf, prior_date, by_day.get(&prior_date)) else {
+        return Err(DraftFail::PriorClose);
+    };
     let open = open_bar.open;
     let direction = if open > prior_close {
         GapDirection::Up

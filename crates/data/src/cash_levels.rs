@@ -71,7 +71,7 @@ pub fn build(symbol: &str, tf: Timeframe, bars: &[Bar]) -> Result<CashLevels, St
     let mut levels = Vec::new();
     let mut notes = Vec::new();
     let prior = previous_session(date);
-    match prior_close(tf, prior, by_day.get(&prior)) {
+    match cash_session::cash_close(tf, prior, by_day.get(&prior)) {
         Some(price) => levels.push(Level { name: PRIOR_CLOSE, price }),
         None => notes.push(format!("{} has no cash close for {prior}. An older close did not stand in.", sec.ticker)),
     }
@@ -109,17 +109,6 @@ pub fn build(symbol: &str, tf: Timeframe, bars: &[Bar]) -> Result<CashLevels, St
 
 fn tiles_opening_range(tf: Timeframe) -> bool {
     matches!(tf, Timeframe::M1 | Timeframe::M5 | Timeframe::M15 | Timeframe::M30)
-}
-
-fn prior_close<'a>(
-    tf: Timeframe,
-    prior: NaiveDate,
-    day: Option<&std::collections::BTreeMap<i64, Vec<&'a Bar>>>,
-) -> Option<f64> {
-    let day = day?;
-    let close_ts = *regular_opens(prior, tf).last()?;
-    let bar = cash_session::one_print(day, close_ts)?;
-    cash_session::usable_range(bar).then_some(bar.close)
 }
 
 #[cfg(test)]
@@ -183,6 +172,27 @@ mod tests {
         let doubled = build("SPY", Timeframe::M30, &early_bars).unwrap();
         assert!(doubled.price(PRIOR_CLOSE).is_none());
         assert!(doubled.notes.iter().any(|note| note.contains("older close did not stand in")), "{:?}", doubled.notes);
+    }
+
+    #[test]
+    fn missing_or_unusable_prior_close_does_not_use_an_older_or_earlier_print() {
+        let today = NaiveDate::from_ymd_opt(2026, 1, 6).unwrap();
+        let prior = previous_session(today);
+        let older = previous_session(prior);
+        let opens = regular_opens(prior, Timeframe::M30);
+        let mut bars = vec![
+            px(*regular_opens(older, Timeframe::M30).last().unwrap(), 80.0, 81.0, 79.0, 80.0, 1.0),
+            px(opens[opens.len() - 2], 90.0, 91.0, 89.0, 90.0, 1.0),
+            px(regular_opens(today, Timeframe::M30)[0], 100.0, 110.0, 90.0, 105.0, 10.0),
+        ];
+        let missing = build("AAPL", Timeframe::M30, &bars).unwrap();
+        assert!(missing.price(PRIOR_CLOSE).is_none());
+        assert!(missing.price(OPEN).is_some());
+        assert!(missing.price(VWAP).is_some());
+
+        bars.push(px(*opens.last().unwrap(), 90.0, 91.0, 89.0, f64::NAN, 1.0));
+        let unusable = build("AAPL", Timeframe::M30, &bars).unwrap();
+        assert_eq!(unusable, missing);
     }
 
     #[test]
