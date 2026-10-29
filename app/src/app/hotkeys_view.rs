@@ -372,6 +372,10 @@ impl TerminalApp {
                         &["GFILL", "AAPL GFILL 40 15m"],
                         "Today's open versus the prior cash close, and how often that gap had filled",
                     ),
+                    (
+                        &["XTRM", "AAPL XTRM 20 15m"],
+                        "When the session high and low print, against completed prior sessions",
+                    ),
                     (&["TL", "HL", "VL", "FIB", "MAGNET"], "Drawing tools and snapping"),
                     (&["CLEAR DRAW", "UNDO DRAW"], "Remove all drawings on this name, or undo the last delete"),
                     (&["REVIEW", "AAPL REVIEW"], "Linked daily + weekly archive charts for candidate review"),

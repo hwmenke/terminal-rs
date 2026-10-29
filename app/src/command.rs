@@ -331,6 +331,10 @@ pub enum Function {
     GapFill {
         spec: String,
     },
+    /// When the session high and low print (`XTRM`, `AAPL XTRM 20 15m`).
+    SessionExtreme {
+        spec: String,
+    },
     /// Historical lookalikes / nearest neighbors (`LOOKALIKE`, `AAPL KNN 2024-01-15 K=15`).
     Lookalike {
         spec: String,
@@ -550,6 +554,7 @@ fn parse_function(head: &str, rest: &[&str]) -> Option<Function> {
         "BRD" | "BREADTH" | "SBREADTH" => Function::Breadth { spec: joined() },
         "VPACE" | "VOLPACE" | "CUMVOL" => Function::VolumePace { spec: joined() },
         "GFILL" | "GAPFILL" => Function::GapFill { spec: joined() },
+        "XTRM" | "EXTREME" => Function::SessionExtreme { spec: joined() },
         "GOTO" | "JUMP" | "GTO" => Function::Goto { date: joined() },
         "NOTE" | "JNOTE" => {
             let (date, text) = split_note_args(rest);
@@ -810,6 +815,10 @@ fn describe(f: &Function) -> String {
                 .into()
         }
         Function::GapFill { spec } => format!("Gap fill versus the prior cash close ({spec})"),
+        Function::SessionExtreme { spec } if spec.is_empty() => {
+            "Session extreme: when the high and the low print, against completed prior sessions".into()
+        }
+        Function::SessionExtreme { spec } => format!("Session extreme versus completed sessions ({spec})"),
         Function::Lookalike { spec } if spec.is_empty() => {
             "Historical lookalikes: nearest past conditions, per-horizon counts, jump to neighbor dates".into()
         }

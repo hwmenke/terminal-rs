@@ -23,6 +23,7 @@ mod panels;
 mod portfolio_view;
 mod research;
 mod session_breadth;
+mod session_extreme;
 mod session_path;
 mod settings_view;
 mod settings_writer;
@@ -110,6 +111,8 @@ pub enum PaneKind {
     VolumePace(Box<volume_pace::VolumePacePane>),
     /// Today's open versus the prior cash close (`GFILL`).
     GapFill(Box<gap_fill::GapFillPane>),
+    /// When the session high and low print (`XTRM`).
+    SessionExtreme(Box<session_extreme::SessionExtremePane>),
     Settings,
 }
 
@@ -349,6 +352,13 @@ impl PaneKind {
                     format!("{} Gap", tr_data::security(&p.symbol).ticker)
                 }
             }
+            PaneKind::SessionExtreme(p) => {
+                if p.symbol.trim().is_empty() {
+                    "High".into()
+                } else {
+                    format!("{} High", tr_data::security(&p.symbol).ticker)
+                }
+            }
             PaneKind::Settings => "Settings".into(),
         }
     }
@@ -389,6 +399,7 @@ impl PaneKind {
             PaneKind::Breadth(_) => "BRD",
             PaneKind::VolumePace(_) => "VPACE",
             PaneKind::GapFill(_) => "GFILL",
+            PaneKind::SessionExtreme(_) => "XTRM",
             PaneKind::Settings => "PDF",
         }
     }
@@ -500,6 +511,9 @@ impl PaneKind {
             }
             PaneKind::GapFill(p) => {
                 PaneSettings::GapFill { symbol: p.symbol.clone(), spec: p.spec.clone(), tf: p.tf.clone() }
+            }
+            PaneKind::SessionExtreme(p) => {
+                PaneSettings::SessionExtreme { symbol: p.symbol.clone(), spec: p.spec.clone(), tf: p.tf.clone() }
             }
             PaneKind::Lookalike(l) => PaneSettings::Lookalike {
                 symbol: l.symbol.clone(),
@@ -645,6 +659,13 @@ impl PaneKind {
                     pane.tf = tf;
                 }
                 PaneKind::GapFill(Box::new(pane))
+            }
+            PaneSettings::SessionExtreme { symbol, spec, tf } => {
+                let mut pane = session_extreme::SessionExtremePane::new(symbol, spec);
+                if !tf.is_empty() {
+                    pane.tf = tf;
+                }
+                PaneKind::SessionExtreme(Box::new(pane))
             }
             PaneSettings::IntradayCompare { symbol, peers, tf } => {
                 let mut pane = compare::ComparePane::new(symbol, peers);
@@ -1172,6 +1193,7 @@ impl TerminalApp {
             Command::SymbolFunction(s, Function::Breadth { spec }) => self.open_breadth(Some(&s), &spec),
             Command::SymbolFunction(s, Function::VolumePace { spec }) => self.open_volume_pace(Some(&s), &spec),
             Command::SymbolFunction(s, Function::GapFill { spec }) => self.open_gap_fill(Some(&s), &spec),
+            Command::SymbolFunction(s, Function::SessionExtreme { spec }) => self.open_session_extreme(Some(&s), &spec),
             Command::SymbolFunction(s, Function::Goto { date }) => self.goto_chart_date(Some(&s), &date),
             Command::SymbolFunction(s, Function::JournalNote { date, text }) => {
                 self.add_journal_note(Some(&s), &date, &text)
@@ -1258,7 +1280,7 @@ impl TerminalApp {
                     }
                     None => {
                         self.status = format!(
-                            "Unknown panel {spec:?}; try CHART, NEWS, BOOK, WEI, GC, CONG, WL, DESK, JOURNAL, STATS, BACKTEST, IBT, ICMP, SPATH, BRD, VPACE, GFILL, LOOKALIKE, PORT"
+                            "Unknown panel {spec:?}; try CHART, NEWS, BOOK, WEI, GC, CONG, WL, DESK, JOURNAL, STATS, BACKTEST, IBT, ICMP, SPATH, BRD, VPACE, GFILL, XTRM, LOOKALIKE, PORT"
                         )
                     }
                 }
@@ -1361,6 +1383,7 @@ impl TerminalApp {
             Function::Breadth { spec } => self.open_breadth(symbol.as_deref(), &spec),
             Function::VolumePace { spec } => self.open_volume_pace(symbol.as_deref(), &spec),
             Function::GapFill { spec } => self.open_gap_fill(symbol.as_deref(), &spec),
+            Function::SessionExtreme { spec } => self.open_session_extreme(symbol.as_deref(), &spec),
             Function::Goto { date } => self.goto_chart_date(symbol.as_deref(), &date),
             Function::JournalNote { date, text } => self.add_journal_note(symbol.as_deref(), &date, &text),
             Function::Latest => self.with_chart(|c, _| c.jump_latest()),
@@ -1534,6 +1557,13 @@ impl TerminalApp {
                 }
                 Response::GapFill { pane, generation, result } => {
                     if let Some(PaneKind::GapFill(p)) =
+                        self.panes.iter_mut().find(|p| p.id == pane).map(|p| &mut p.kind)
+                    {
+                        p.accept(generation, result);
+                    }
+                }
+                Response::SessionExtreme { pane, generation, result } => {
+                    if let Some(PaneKind::SessionExtreme(p)) =
                         self.panes.iter_mut().find(|p| p.id == pane).map(|p| &mut p.kind)
                     {
                         p.accept(generation, result);

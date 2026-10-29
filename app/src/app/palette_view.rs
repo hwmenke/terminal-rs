@@ -113,6 +113,9 @@ const COMMANDS: &[(&str, &str, &str, Option<Action>)] = &[
     ("GFILL", "Gap fill: today's open versus the prior cash close", "gap fill prior close opening drive", None),
     ("AAPL GFILL 40", "AAPL gap versus the last 40 sessions' cash closes", "gap fill 40", None),
     ("AAPL GFILL 15m", "AAPL gap fill on 15-minute bars", "gap fill 15m", None),
+    ("XTRM", "When the session high and low print", "session extreme high low minute", None),
+    ("AAPL XTRM 20", "AAPL high and low versus the last 20 complete sessions", "hilo 20", None),
+    ("AAPL XTRM 15m", "AAPL session extreme on 15-minute bars", "hilo 15m", None),
     (
         "LOOKALIKE",
         "Historical lookalikes: nearest past conditions and subsequent returns",
@@ -337,6 +340,10 @@ pub(super) fn static_items() -> Vec<Item> {
     v.push(
         Item::new(Kind::Panel, "New gap fill", "NEW GFILL", Target::Run("NEW GFILL".into()))
             .keywords("panel pane gfill gap fill prior close"),
+    );
+    v.push(
+        Item::new(Kind::Panel, "New session extreme", "NEW XTRM", Target::Run("NEW XTRM".into()))
+            .keywords("panel pane hilo session extreme high low"),
     );
     v.push(
         Item::new(Kind::Panel, "New Lookalikes pane", "NEW LOOKALIKE", Target::Run("NEW LOOKALIKE".into()))

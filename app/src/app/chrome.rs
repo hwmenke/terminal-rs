@@ -756,6 +756,20 @@ impl TerminalApp {
             }
             if nav_row(
                 ui,
+                Icon::Chart,
+                "Session extreme",
+                Some("XTRM"),
+                is_focused(&PaneKind::SessionExtreme(Box::new(super::session_extreme::SessionExtremePane::new(
+                    String::new(),
+                    String::new(),
+                )))),
+            )
+            .clicked()
+            {
+                out.push(SidebarCmd::Function(Function::SessionExtreme { spec: String::new() }));
+            }
+            if nav_row(
+                ui,
                 Icon::Search,
                 "Lookalikes",
                 Some("KNN"),
