@@ -21,6 +21,7 @@ mod palette_view;
 mod panels;
 mod portfolio_view;
 mod research;
+mod session_path;
 mod settings_view;
 mod settings_writer;
 mod stats;
@@ -98,6 +99,8 @@ pub enum PaneKind {
     Lookalike(Box<lookalike::LookalikePane>),
     /// Multi-symbol intraday compare, percent from each 09:30 open (`ICMP`).
     IntradayCompare(Box<compare::ComparePane>),
+    /// Today versus the typical intraday path (`SPATH`).
+    SessionPath(Box<session_path::SessionPathPane>),
     Settings,
 }
 
@@ -315,6 +318,13 @@ impl PaneKind {
                     format!("{} Compare", tr_data::security(&c.symbol).ticker)
                 }
             }
+            PaneKind::SessionPath(p) => {
+                if p.symbol.trim().is_empty() {
+                    "Path".into()
+                } else {
+                    format!("{} Path", tr_data::security(&p.symbol).ticker)
+                }
+            }
             PaneKind::Settings => "Settings".into(),
         }
     }
@@ -351,6 +361,7 @@ impl PaneKind {
             PaneKind::Backtest(_) => "BT",
             PaneKind::Lookalike(_) => "KNN",
             PaneKind::IntradayCompare(_) => "ICMP",
+            PaneKind::SessionPath(_) => "SPATH",
             PaneKind::Settings => "PDF",
         }
     }
@@ -452,6 +463,9 @@ impl PaneKind {
             },
             PaneKind::IntradayCompare(c) => {
                 PaneSettings::IntradayCompare { symbol: c.symbol.clone(), peers: c.peers.clone(), tf: c.tf.clone() }
+            }
+            PaneKind::SessionPath(p) => {
+                PaneSettings::SessionPath { symbol: p.symbol.clone(), spec: p.spec.clone(), tf: p.tf.clone() }
             }
             PaneKind::Lookalike(l) => PaneSettings::Lookalike {
                 symbol: l.symbol.clone(),
@@ -569,6 +583,13 @@ impl PaneKind {
                     pane.horizons = horizons;
                 }
                 PaneKind::Lookalike(Box::new(pane))
+            }
+            PaneSettings::SessionPath { symbol, spec, tf } => {
+                let mut pane = session_path::SessionPathPane::new(symbol, spec);
+                if !tf.is_empty() {
+                    pane.tf = tf;
+                }
+                PaneKind::SessionPath(Box::new(pane))
             }
             PaneSettings::IntradayCompare { symbol, peers, tf } => {
                 let mut pane = compare::ComparePane::new(symbol, peers);
@@ -1092,6 +1113,7 @@ impl TerminalApp {
             Command::SymbolFunction(s, Function::IntradayCompare { spec }) => {
                 self.open_intraday_compare(Some(&s), &spec)
             }
+            Command::SymbolFunction(s, Function::SessionPath { spec }) => self.open_session_path(Some(&s), &spec),
             Command::SymbolFunction(s, Function::Goto { date }) => self.goto_chart_date(Some(&s), &date),
             Command::SymbolFunction(s, Function::JournalNote { date, text }) => {
                 self.add_journal_note(Some(&s), &date, &text)
@@ -1178,7 +1200,7 @@ impl TerminalApp {
                     }
                     None => {
                         self.status = format!(
-                            "Unknown panel {spec:?}; try CHART, NEWS, BOOK, WEI, GC, CONG, WL, DESK, JOURNAL, STATS, BACKTEST, IBT, ICMP, LOOKALIKE, PORT"
+                            "Unknown panel {spec:?}; try CHART, NEWS, BOOK, WEI, GC, CONG, WL, DESK, JOURNAL, STATS, BACKTEST, IBT, ICMP, SPATH, LOOKALIKE, PORT"
                         )
                     }
                 }
@@ -1277,6 +1299,7 @@ impl TerminalApp {
             Function::IntradayBacktest { spec } => self.open_intraday_backtest(symbol.as_deref(), &spec),
             Function::Lookalike { spec } => self.open_lookalike(symbol.as_deref(), &spec),
             Function::IntradayCompare { spec } => self.open_intraday_compare(symbol.as_deref(), &spec),
+            Function::SessionPath { spec } => self.open_session_path(symbol.as_deref(), &spec),
             Function::Goto { date } => self.goto_chart_date(symbol.as_deref(), &date),
             Function::JournalNote { date, text } => self.add_journal_note(symbol.as_deref(), &date, &text),
             Function::Latest => self.with_chart(|c, _| c.jump_latest()),
@@ -1425,6 +1448,13 @@ impl TerminalApp {
                         self.panes.iter_mut().find(|p| p.id == pane).map(|p| &mut p.kind)
                     {
                         b.accept_intraday(generation, result);
+                    }
+                }
+                Response::SessionPath { pane, generation, result } => {
+                    if let Some(PaneKind::SessionPath(p)) =
+                        self.panes.iter_mut().find(|p| p.id == pane).map(|p| &mut p.kind)
+                    {
+                        p.accept(generation, result);
                     }
                 }
                 Response::IntradayCompare { pane, generation, result } => {

@@ -135,7 +135,8 @@ impl TerminalApp {
             | PaneKind::Stats(_)
             | PaneKind::Backtest(_)
             | PaneKind::Lookalike(_)
-            | PaneKind::IntradayCompare(_) => {}
+            | PaneKind::IntradayCompare(_)
+            | PaneKind::SessionPath(_) => {}
         }
         if matches!(self.panes[i].kind, PaneKind::Desk(_)) {
             actions.extend(self.desk(ui, id));
@@ -154,6 +155,9 @@ impl TerminalApp {
         }
         if matches!(self.panes[i].kind, PaneKind::IntradayCompare(_)) {
             actions.extend(self.compare_pane(ui, id));
+        }
+        if matches!(self.panes[i].kind, PaneKind::SessionPath(_)) {
+            actions.extend(self.session_path_pane(ui, id));
         }
         match self.panes[i].kind {
             PaneKind::Watchlist => actions.extend(self.watchlist(ui)),

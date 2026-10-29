@@ -74,6 +74,14 @@ pub enum Request {
         spec: String,
         timeframe: String,
     },
+    /// Today versus the typical path of prior regular sessions.
+    SessionPath {
+        pane: PaneId,
+        generation: u64,
+        symbol: String,
+        spec: String,
+        timeframe: String,
+    },
     /// Paper VWAP / opening-range backtest on verified regular-session bars.
     IntradayBacktest {
         pane: PaneId,
@@ -367,6 +375,11 @@ pub enum Response {
         pane: PaneId,
         generation: u64,
         result: Result<tr_data::intraday_compare::CompareChart, String>,
+    },
+    SessionPath {
+        pane: PaneId,
+        generation: u64,
+        result: Result<tr_data::session_path::SessionPath, String>,
     },
     Lookalike {
         pane: PaneId,
@@ -1105,6 +1118,33 @@ async fn research_intraday_compare(
     tr_data::intraday_compare::build_chart(&query.anchor, query.timeframe, &rows, &source).map_err(anyhow::Error::msg)
 }
 
+/// Verified regular-session bars for one cash name. Sample substitution is refused.
+async fn research_session_path(
+    s: &Shared,
+    symbol: &str,
+    spec: &str,
+    timeframe: &str,
+) -> anyhow::Result<tr_data::session_path::SessionPath> {
+    if s.provider.name() == "sample" {
+        anyhow::bail!(
+            "Session path refused: sample / offline display mode does not feed this pane. Sample prices are never used."
+        );
+    }
+    let sec = tr_data::security(symbol);
+    if !matches!(sec.class, tr_core::AssetClass::Equity | tr_core::AssetClass::Etf | tr_core::AssetClass::Index) {
+        anyhow::bail!("{} has no US cash session. The path is the regular session from 09:30.", sec.ticker);
+    }
+    let query = tr_data::session_path::parse_query(spec, timeframe).map_err(anyhow::Error::msg)?;
+    let limit = tr_data::session_path::fetch_limit(query.timeframe);
+    let bars = s.provider.history(&sec.key(), query.timeframe, None, limit).await?;
+    if bars.is_empty() {
+        anyhow::bail!("Session path refused: no regular-session bars were returned. Sample prices are never used.");
+    }
+    Bar::require_verified(&bars, "Session path").map_err(anyhow::Error::msg)?;
+    let source = format!("{} {} regular session", s.provider.name(), query.timeframe.label());
+    tr_data::session_path::build_path(&sec.key(), &bars, &query, &source).map_err(anyhow::Error::msg)
+}
+
 /// Load one name from the local archive, then Whats-News. Sample/display bars never enter.
 async fn research_lookalike(
     s: &Shared,
@@ -1394,6 +1434,13 @@ async fn handle(s: &Arc<Shared>, req: Request) {
                 pane,
                 generation,
                 result: research_intraday_compare(s, &symbol, &spec, &timeframe).await.map_err(|e| format!("{e:#}")),
+            });
+        }
+        Request::SessionPath { pane, generation, symbol, spec, timeframe } => {
+            send(Response::SessionPath {
+                pane,
+                generation,
+                result: research_session_path(s, &symbol, &spec, &timeframe).await.map_err(|e| format!("{e:#}")),
             });
         }
         Request::IntradayBacktest {

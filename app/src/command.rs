@@ -315,6 +315,10 @@ pub enum Function {
     IntradayCompare {
         spec: String,
     },
+    /// Today versus the typical path of prior sessions (`SPATH`, `AAPL SPATH 20 15m`).
+    SessionPath {
+        spec: String,
+    },
     /// Historical lookalikes / nearest neighbors (`LOOKALIKE`, `AAPL KNN 2024-01-15 K=15`).
     Lookalike {
         spec: String,
@@ -530,6 +534,7 @@ fn parse_function(head: &str, rest: &[&str]) -> Option<Function> {
         "IBT" | "IBACKTEST" | "SETUPBT" => Function::IntradayBacktest { spec: joined() },
         "LOOKALIKE" | "LOOKALIKES" | "KNN" | "ANALOG" | "ANALOGUE" | "NN" => Function::Lookalike { spec: joined() },
         "ICMP" | "ICOMPARE" | "ICOMP" => Function::IntradayCompare { spec: joined() },
+        "SPATH" | "SESSIONPATH" | "TPATH" => Function::SessionPath { spec: joined() },
         "GOTO" | "JUMP" | "GTO" => Function::Goto { date: joined() },
         "NOTE" | "JNOTE" => {
             let (date, text) = split_note_args(rest);
@@ -773,6 +778,10 @@ fn describe(f: &Function) -> String {
             "Intraday compare: each name as percent from its own 09:30 open, with SPY on the same clock".into()
         }
         Function::IntradayCompare { spec } => format!("Intraday compare from the 09:30 open ({spec})"),
+        Function::SessionPath { spec } if spec.is_empty() => {
+            "Session path: today versus the mean of prior sessions, each percent from its own 09:30 open".into()
+        }
+        Function::SessionPath { spec } => format!("Session path versus prior 09:30 opens ({spec})"),
         Function::Lookalike { spec } if spec.is_empty() => {
             "Historical lookalikes: nearest past conditions, per-horizon counts, jump to neighbor dates".into()
         }

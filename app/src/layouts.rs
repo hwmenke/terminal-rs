@@ -172,6 +172,15 @@ pub enum PaneSettings {
         #[serde(default)]
         tf: String,
     },
+    /// Today versus the typical path of prior regular sessions.
+    SessionPath {
+        #[serde(default)]
+        symbol: String,
+        #[serde(default)]
+        spec: String,
+        #[serde(default)]
+        tf: String,
+    },
     /// Historical lookalikes for one research symbol.
     Lookalike {
         #[serde(default)]

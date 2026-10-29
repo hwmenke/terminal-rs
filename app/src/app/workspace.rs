@@ -20,7 +20,7 @@ use crate::widgets::{self, Icon};
 use crate::worker::{Request, Worker};
 
 /// Panels offered by the + menus: label and command word.
-pub const PANELS: [(&str, &str); 19] = [
+pub const PANELS: [(&str, &str); 20] = [
     ("Chart", "CHART"),
     ("Watchlist", "WL"),
     ("News", "NEWS"),
@@ -36,6 +36,7 @@ pub const PANELS: [(&str, &str); 19] = [
     ("Backtest", "BACKTEST"),
     ("Intraday BT", "IBT"),
     ("Session compare", "ICMP"),
+    ("Session path", "SPATH"),
     ("Lookalikes", "LOOKALIKE"),
     ("Security Search", "SECF"),
     ("Settings", "PREFS"),
@@ -419,6 +420,15 @@ impl TerminalApp {
                 }
                 c.request(id, &self.worker);
                 PaneKind::IntradayCompare(c)
+            }
+            PaneKind::SessionPath(mut p) => {
+                if p.symbol.trim().is_empty() {
+                    if let Some(sym) = self.focused_symbol() {
+                        p.symbol = sym;
+                    }
+                }
+                p.request(id, &self.worker);
+                PaneKind::SessionPath(p)
             }
             PaneKind::Lookalike(mut l) => {
                 if l.symbol.trim().is_empty() {
@@ -872,6 +882,12 @@ impl TerminalApp {
                 let symbol = symbol.map(|s| tr_data::security(s).key()).or(current).unwrap_or_default();
                 let spec = words.get(1..).unwrap_or(&[]).join(" ");
                 PaneKind::IntradayCompare(Box::new(super::compare::ComparePane::new(symbol, spec)))
+            }
+            "SPATH" | "SESSIONPATH" | "TPATH" => {
+                // A count and a bar size stay in the spec. They are not tickers.
+                let symbol = symbol.map(|s| tr_data::security(s).key()).or(current).unwrap_or_default();
+                let spec = words.get(1..).unwrap_or(&[]).join(" ");
+                PaneKind::SessionPath(Box::new(super::session_path::SessionPathPane::new(symbol, spec)))
             }
             "IBT" | "IBACKTEST" | "SETUPBT" => {
                 // VWAP and OR are setup names, not tickers.
