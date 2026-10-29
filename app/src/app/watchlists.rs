@@ -1536,14 +1536,71 @@ mod tests {
                 ),
                 earnings_start: None,
                 earnings_end: None,
+                bid: None,
+                ask: None,
+                bid_size: None,
+                ask_size: None,
             },
         };
         let label = member_text(&m, Some(&q), now);
         assert!(label.contains("pre 10.25") && label.contains("52wH 12.00"), "{label}");
         assert!(label.contains("ERN 2026-10-29"), "{label}");
-        assert!(!label.contains("post") && !label.contains("PE"), "{label}");
+        assert!(!label.contains("post") && !label.contains("PE") && !label.contains("bid"), "{label}");
+        q.stats.bid = Some(180.10);
+        q.stats.ask = Some(180.25);
+        q.stats.bid_size = Some(200.0);
+        q.stats.ask_size = Some(100.0);
+        let label = member_text(&m, Some(&q), now);
+        assert!(label.contains("bid 180.10 × 200") && label.contains("ask 180.25 × 100"), "{label}");
+        q.stats.ask = None;
+        q.stats.ask_size = None;
+        let label = member_text(&m, Some(&q), now);
+        assert!(label.contains("bid 180.10 × 200") && !label.contains("ask"), "{label}");
         q.stats = tr_data::QuoteStats::default();
         assert!(!member_text(&m, Some(&q), now).contains("pre "), "missing stats stay off the row");
+        assert!(!member_text(&m, Some(&q), now).contains("bid"));
+    }
+
+    #[test]
+    fn watchlist_row_paints_the_provider_bid_and_ask() {
+        let mut app = test_app();
+        app.new_pane(PaneKind::Watchlist);
+        app.focus_cmd = false;
+        app.watchlists = Watchlists::migrate(&[]);
+        app.watchlists.add("Default", Member::new("AAPL")).unwrap();
+        app.watch_ui.selected_group = "Default".into();
+        let key = tr_data::security("AAPL").key();
+        app.quotes.insert(
+            key.clone(),
+            tr_data::Quote {
+                symbol: key,
+                provenance: Provenance::Real,
+                last: 180.2,
+                prev_close: 179.0,
+                ts: 1,
+                spark: vec![],
+                stats: tr_data::QuoteStats {
+                    bid: Some(180.10),
+                    ask: Some(180.25),
+                    bid_size: Some(200.0),
+                    ask_size: Some(100.0),
+                    ..tr_data::QuoteStats::default()
+                },
+            },
+        );
+        let ctx = egui::Context::default();
+        let shapes = frame(&ctx, &mut app, vec![]);
+        assert!(has_text(&shapes, "bid 180.10 × 200"));
+        assert!(has_text(&shapes, "ask 180.25 × 100"));
+
+        let quote = app.quotes.values_mut().next().unwrap();
+        quote.stats.bid = None;
+        quote.stats.ask = None;
+        quote.stats.bid_size = None;
+        quote.stats.ask_size = None;
+        let shapes = frame(&ctx, &mut app, vec![]);
+        assert!(!has_text(&shapes, "bid 180.10 × 200"));
+        assert!(!has_text(&shapes, "ask 180.25 × 100"));
     }
 
     fn has_text(shapes: &[egui::epaint::ClippedShape], needle: &str) -> bool {
