@@ -341,6 +341,8 @@ pub enum Function {
     RelativePath {
         spec: String,
     },
+    /// Path, pace, gap, extreme, and versus SPY for one name (`BRIEF`, `AAPL BRIEF`).
+    SessionBrief,
     /// Historical lookalikes / nearest neighbors (`LOOKALIKE`, `AAPL KNN 2024-01-15 K=15`).
     Lookalike {
         spec: String,
@@ -569,6 +571,7 @@ fn parse_function(head: &str, rest: &[&str]) -> Option<Function> {
         "GFILL" | "GAPFILL" => Function::GapFill { spec: joined() },
         "XTRM" | "EXTREME" => Function::SessionExtreme { spec: joined() },
         "RPATH" | "RELPATH" => Function::RelativePath { spec: joined() },
+        "BRIEF" | "SBRIEF" if rest.is_empty() => Function::SessionBrief,
         "GOTO" | "JUMP" | "GTO" => Function::Goto { date: joined() },
         "NOTE" | "JNOTE" => {
             let (date, text) = split_note_args(rest);
@@ -840,6 +843,9 @@ fn describe(f: &Function) -> String {
             "Relative path: percent from the 09:30 open minus SPY, against prior sessions".into()
         }
         Function::RelativePath { spec } => format!("Relative path versus SPY ({spec})"),
+        Function::SessionBrief => {
+            "Session brief: path, pace, gap, extreme, and versus SPY for one name, on verified 5-minute bars".into()
+        }
         Function::Lookalike { spec } if spec.is_empty() => {
             "Historical lookalikes: nearest past conditions, per-horizon counts, jump to neighbor dates".into()
         }

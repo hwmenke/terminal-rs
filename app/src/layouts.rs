@@ -226,6 +226,11 @@ pub enum PaneSettings {
         #[serde(default)]
         tf: String,
     },
+    /// Five session reads for one name. Not a chart.
+    SessionBrief {
+        #[serde(default)]
+        symbol: String,
+    },
     /// Historical lookalikes for one research symbol.
     Lookalike {
         #[serde(default)]

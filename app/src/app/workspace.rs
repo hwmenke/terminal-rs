@@ -23,7 +23,7 @@ use crate::widgets::{self, Icon};
 use crate::worker::{Request, Worker};
 
 /// Panels offered by the + menus: label and command word.
-pub const PANELS: [(&str, &str); 25] = [
+pub const PANELS: [(&str, &str); 26] = [
     ("Chart", "CHART"),
     ("Watchlist", "WL"),
     ("News", "NEWS"),
@@ -45,6 +45,7 @@ pub const PANELS: [(&str, &str); 25] = [
     ("Gap fill", "GFILL"),
     ("Session extreme", "XTRM"),
     ("Relative path", "RPATH"),
+    ("Session brief", "BRIEF"),
     ("Lookalikes", "LOOKALIKE"),
     ("Security Search", "SECF"),
     ("Settings", "PREFS"),
@@ -483,6 +484,15 @@ impl TerminalApp {
                 p.request(id, &self.worker);
                 PaneKind::RelativePath(p)
             }
+            PaneKind::SessionBrief(mut p) => {
+                if p.symbol.trim().is_empty() {
+                    if let Some(sym) = self.focused_symbol() {
+                        p.symbol = sym;
+                    }
+                }
+                p.request(id, &self.worker);
+                PaneKind::SessionBrief(p)
+            }
             PaneKind::Lookalike(mut l) => {
                 if l.symbol.trim().is_empty() {
                     if let Some(sym) = self.focused_symbol() {
@@ -611,6 +621,15 @@ impl TerminalApp {
                 if p.symbol != key {
                     p.symbol = key.clone();
                     p.pace = None;
+                    p.error = None;
+                    p.loading = false;
+                    p.request(id, &self.worker);
+                }
+            }
+            PaneKind::SessionBrief(p) => {
+                if p.symbol != key {
+                    p.symbol = key.clone();
+                    p.brief = None;
                     p.error = None;
                     p.loading = false;
                     p.request(id, &self.worker);
@@ -979,6 +998,14 @@ impl TerminalApp {
                 let symbol = symbol.map(|s| tr_data::security(s).key()).or(current).unwrap_or_default();
                 let spec = words.get(1..).unwrap_or(&[]).join(" ");
                 PaneKind::RelativePath(Box::new(super::relative_path::RelativePathPane::new(symbol, spec)))
+            }
+            "BRIEF" | "SBRIEF" => {
+                let symbol = symbol
+                    .map(|s| tr_data::security(s).key())
+                    .or(current)
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or_else(|| tr_data::security("AAPL").key());
+                PaneKind::SessionBrief(Box::new(super::session_brief::SessionBriefPane::new(symbol)))
             }
             "IBT" | "IBACKTEST" | "SETUPBT" => {
                 // VWAP and OR are setup names, not tickers.
