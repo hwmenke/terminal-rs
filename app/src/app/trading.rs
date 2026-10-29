@@ -621,6 +621,26 @@ impl TerminalApp {
         self.quotes.get(&t.market_key()?).map(|q| q.last).filter(|x| x.is_finite() && *x > 0.0)
     }
 
+    /// The intraday clock's verdict on a stored quote. Sample quotes are not judged.
+    pub(super) fn market_print_block(&self, market_key: &str) -> Option<tr_data::intraday::MarketBlock> {
+        let q = self.quotes.get(market_key)?;
+        tr_data::intraday::market_order_block(
+            tr_data::security(market_key).class,
+            q.provenance,
+            q.ts,
+            chrono::Utc::now().timestamp(),
+        )
+    }
+
+    /// A market order needs a current verified print. Limit and stop orders keep the user's price.
+    fn refuse_market_order(&self, t: &Ticket) -> Option<String> {
+        if t.order_type != OrderType::Market {
+            return None;
+        }
+        let key = t.market_key()?;
+        self.market_print_block(&key).map(|block| block.explain().to_string())
+    }
+
     /// Keep the ticket's quote fresh and its expiry countdown ticking.
     pub(super) fn trading_periodic(&mut self, ctx: &egui::Context) {
         self.demo_periodic();
@@ -662,6 +682,9 @@ impl TerminalApp {
         }
         self.trading.last_submit = Some(Instant::now());
         let Some(t) = self.trading.ticket.as_ref() else { return };
+        if let Some(reason) = self.refuse_market_order(t) {
+            return self.ticket_error(reason);
+        }
         let quote = self.ticket_quote(t);
         let req = match t.request() {
             Ok(r) => r,
@@ -765,8 +788,12 @@ impl TerminalApp {
 
     /// The user confirmed: send the previewed order. Every precondition is checked again.
     fn ticket_place(&mut self) {
-        let Some(t) = self.trading.ticket.as_mut() else { return };
-        t.confirming = false;
+        if let Some(t) = self.trading.ticket.as_mut() {
+            t.confirming = false;
+        }
+        if let Some(reason) = self.trading.ticket.as_ref().and_then(|t| self.refuse_market_order(t)) {
+            return self.ticket_error(reason);
+        }
         let Some(t) = self.trading.ticket.as_ref() else { return };
         let quote = self.ticket_quote(t);
         let preview = match t.current_preview() {
@@ -1041,6 +1068,8 @@ impl TerminalApp {
         let accounts = self.trade_accounts();
         let pf_loading = !demo_mode && self.broker.loading && self.broker.portfolio.is_none();
         let quote = self.trading.ticket.as_ref().and_then(|t| self.ticket_quote(t));
+        let print_block =
+            self.trading.ticket.as_ref().and_then(|t| t.market_key()).and_then(|k| self.market_print_block(&k));
         let change = self
             .trading
             .ticket
@@ -1188,6 +1217,13 @@ impl TerminalApp {
             match quote {
                 Some(q) => {
                     ui.label(RichText::new(price(q)).font(mono(12.5)).color(text()));
+                    if let Some(block) = print_block {
+                        let color = match block {
+                            tr_data::intraday::MarketBlock::Closed => amber(),
+                            tr_data::intraday::MarketBlock::Stale { .. } => theme::down(),
+                        };
+                        ui.label(RichText::new(block.badge()).font(mono(11.0)).color(color));
+                    }
                     if let Some(c) = change {
                         let col = if c >= 0.0 { theme::up() } else { theme::down() };
                         ui.label(RichText::new(format!("{c:+.2}%")).font(mono(11.5)).color(col));
@@ -1419,6 +1455,11 @@ impl TerminalApp {
                     row(ui, "Buying power", money(bp, &ccy), false);
                 }
             }
+        }
+        if ready.as_ref().is_ok_and(|r| r.order_type == OrderType::Market)
+            && let Some(block) = print_block
+        {
+            problem = Some(block.explain().to_string());
         }
         if let Some(p) = &problem {
             ui.label(RichText::new(p).font(ui_font(11.5)).color(amber()));
@@ -2299,5 +2340,138 @@ mod tests {
         ticket.symbol = "AMD".into();
         ticket.clear_stale_plan();
         assert!(ticket.plan_context().is_none());
+    }
+
+    fn aapl_quote(ts: i64, last: f64, provenance: tr_data::Provenance) -> tr_data::Quote {
+        tr_data::Quote {
+            provenance,
+            symbol: "AAPL US Equity".into(),
+            last,
+            prev_close: last,
+            ts,
+            spark: vec![],
+            stats: tr_data::QuoteStats::default(),
+        }
+    }
+
+    fn buy_one(app: &mut crate::app::TerminalApp) {
+        app.open_ticket(
+            TradeArgs { buy: Some(true), symbol: Some("AAPL".into()), units: Some(1.0), ..Default::default() },
+            None,
+        );
+    }
+
+    #[test]
+    fn stale_verified_market_order_does_not_fill_and_a_limit_still_rests() {
+        let mut app = test_app();
+        app.quotes.insert("AAPL US Equity".into(), aapl_quote(1_700_000_000, 50.0, tr_data::Provenance::Real));
+        buy_one(&mut app);
+        app.ticket_submit();
+        let ticket = app.trading.ticket.as_ref().unwrap();
+        assert_eq!(ticket.error.as_deref(), Some(tr_data::intraday::MarketBlock::Stale { lag_secs: 1 }.explain()));
+        assert!(ticket.done.is_none());
+        assert_eq!(app.demo.book.held("AAPL"), 0.0);
+
+        let ctx = egui::Context::default();
+        let mut output = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(900.0, 700.0))),
+                ..Default::default()
+            },
+            |ui| {
+                let _ = app.ticket_ui(ui);
+            },
+        );
+        output.textures_delta.clear();
+        let mut text = String::new();
+        for clipped in &output.shapes {
+            walk_text(&clipped.shape, &mut text);
+        }
+        assert!(text.contains("STALE"), "{text}");
+        assert!(text.contains("last print is stale"), "{text}");
+
+        app.trading.last_submit = None;
+        app.open_ticket(
+            TradeArgs {
+                buy: Some(true),
+                symbol: Some("AAPL".into()),
+                units: Some(1.0),
+                limit: Some(1.0),
+                ..Default::default()
+            },
+            None,
+        );
+        app.ticket_submit();
+        let ticket = app.trading.ticket.as_ref().unwrap();
+        assert!(ticket.error.is_none(), "{:?}", ticket.error);
+        let done = ticket.done.as_deref().unwrap();
+        assert!(done.contains("working"), "{done}");
+        assert_eq!(app.demo.book.held("AAPL"), 0.0, "a resting limit is not a fill at the stale print");
+    }
+
+    fn walk_text(shape: &egui::Shape, out: &mut String) {
+        match shape {
+            egui::Shape::Text(t) => {
+                out.push_str(&t.galley.job.text);
+                out.push('\n');
+            }
+            egui::Shape::Vec(v) => v.iter().for_each(|s| walk_text(s, out)),
+            _ => {}
+        }
+    }
+
+    #[test]
+    fn sample_quotes_and_a_current_print_still_fill_market_orders() {
+        let mut sample = test_app();
+        sample.quotes.insert("AAPL US Equity".into(), aapl_quote(1_700_000_000, 40.0, tr_data::Provenance::Sample));
+        buy_one(&mut sample);
+        sample.ticket_submit();
+        assert!(sample.trading.ticket.as_ref().unwrap().error.is_none());
+        assert_eq!(sample.demo.book.held("AAPL"), 1.0, "sample quotes stay on the existing demo path");
+
+        let mut app = test_app();
+        let now = chrono::Utc::now().timestamp();
+        let ts = tr_data::intraday::regular_bucket(tr_core::Timeframe::M1, now).unwrap_or(now);
+        app.quotes.insert("AAPL US Equity".into(), aapl_quote(ts, 30.0, tr_data::Provenance::Real));
+        buy_one(&mut app);
+        app.ticket_submit();
+        let ticket = app.trading.ticket.as_ref().unwrap();
+        match tr_data::intraday::market_order_block(tr_core::AssetClass::Equity, tr_data::Provenance::Real, ts, now) {
+            None => {
+                assert!(ticket.error.is_none(), "{:?}", ticket.error);
+                assert_eq!(app.demo.book.held("AAPL"), 1.0);
+            }
+            Some(block) => {
+                assert_eq!(ticket.error.as_deref(), Some(block.explain()));
+                assert_eq!(app.demo.book.held("AAPL"), 0.0);
+            }
+        }
+    }
+
+    #[test]
+    fn demo_close_refuses_a_stale_verified_print() {
+        let mut app = test_app();
+        app.demo
+            .book
+            .submit(
+                &OrderRequest {
+                    account_id: demo::ACCOUNT_ID.into(),
+                    symbol: "AAPL".into(),
+                    side: Side::Buy,
+                    order_type: OrderType::Market,
+                    time_in_force: TimeInForce::Day,
+                    amount: Amount::Units(2.0),
+                    limit: None,
+                    stop: None,
+                },
+                Some(10.0),
+                chrono::Utc::now(),
+            )
+            .unwrap();
+        assert_eq!(app.demo.book.held("AAPL"), 2.0);
+        app.quotes.insert("AAPL US Equity".into(), aapl_quote(1_700_000_000, 50.0, tr_data::Provenance::Real));
+        app.demo_close("AAPL");
+        assert_eq!(app.demo.book.held("AAPL"), 2.0);
+        assert!(app.status.contains("last print is stale"), "{}", app.status);
     }
 }
