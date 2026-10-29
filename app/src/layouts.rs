@@ -215,6 +215,15 @@ pub enum PaneSettings {
         #[serde(default)]
         tf: String,
     },
+    /// Percent from the 09:30 open minus SPY, against prior sessions.
+    RelativePath {
+        #[serde(default)]
+        symbol: String,
+        #[serde(default)]
+        spec: String,
+        #[serde(default)]
+        tf: String,
+    },
     /// Historical lookalikes for one research symbol.
     Lookalike {
         #[serde(default)]

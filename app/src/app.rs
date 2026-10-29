@@ -21,6 +21,7 @@ mod options_view;
 mod palette_view;
 mod panels;
 mod portfolio_view;
+mod relative_path;
 mod research;
 mod session_breadth;
 mod session_extreme;
@@ -113,6 +114,8 @@ pub enum PaneKind {
     GapFill(Box<gap_fill::GapFillPane>),
     /// When the session high and low print (`XTRM`).
     SessionExtreme(Box<session_extreme::SessionExtremePane>),
+    /// This name's percent from the 09:30 open minus SPY (`RPATH`).
+    RelativePath(Box<relative_path::RelativePathPane>),
     Settings,
 }
 
@@ -359,6 +362,13 @@ impl PaneKind {
                     format!("{} High", tr_data::security(&p.symbol).ticker)
                 }
             }
+            PaneKind::RelativePath(p) => {
+                if p.symbol.trim().is_empty() {
+                    "SPY path".into()
+                } else {
+                    format!("{} vs SPY", tr_data::security(&p.symbol).ticker)
+                }
+            }
             PaneKind::Settings => "Settings".into(),
         }
     }
@@ -400,6 +410,7 @@ impl PaneKind {
             PaneKind::VolumePace(_) => "VPACE",
             PaneKind::GapFill(_) => "GFILL",
             PaneKind::SessionExtreme(_) => "XTRM",
+            PaneKind::RelativePath(_) => "RPATH",
             PaneKind::Settings => "PDF",
         }
     }
@@ -514,6 +525,9 @@ impl PaneKind {
             }
             PaneKind::SessionExtreme(p) => {
                 PaneSettings::SessionExtreme { symbol: p.symbol.clone(), spec: p.spec.clone(), tf: p.tf.clone() }
+            }
+            PaneKind::RelativePath(p) => {
+                PaneSettings::RelativePath { symbol: p.symbol.clone(), spec: p.spec.clone(), tf: p.tf.clone() }
             }
             PaneKind::Lookalike(l) => PaneSettings::Lookalike {
                 symbol: l.symbol.clone(),
@@ -666,6 +680,13 @@ impl PaneKind {
                     pane.tf = tf;
                 }
                 PaneKind::SessionExtreme(Box::new(pane))
+            }
+            PaneSettings::RelativePath { symbol, spec, tf } => {
+                let mut pane = relative_path::RelativePathPane::new(symbol, spec);
+                if !tf.is_empty() {
+                    pane.tf = tf;
+                }
+                PaneKind::RelativePath(Box::new(pane))
             }
             PaneSettings::IntradayCompare { symbol, peers, tf } => {
                 let mut pane = compare::ComparePane::new(symbol, peers);
@@ -1194,6 +1215,7 @@ impl TerminalApp {
             Command::SymbolFunction(s, Function::VolumePace { spec }) => self.open_volume_pace(Some(&s), &spec),
             Command::SymbolFunction(s, Function::GapFill { spec }) => self.open_gap_fill(Some(&s), &spec),
             Command::SymbolFunction(s, Function::SessionExtreme { spec }) => self.open_session_extreme(Some(&s), &spec),
+            Command::SymbolFunction(s, Function::RelativePath { spec }) => self.open_relative_path(Some(&s), &spec),
             Command::SymbolFunction(s, Function::Goto { date }) => self.goto_chart_date(Some(&s), &date),
             Command::SymbolFunction(s, Function::JournalNote { date, text }) => {
                 self.add_journal_note(Some(&s), &date, &text)
@@ -1280,7 +1302,7 @@ impl TerminalApp {
                     }
                     None => {
                         self.status = format!(
-                            "Unknown panel {spec:?}; try CHART, NEWS, BOOK, WEI, GC, CONG, WL, DESK, JOURNAL, STATS, BACKTEST, IBT, ICMP, SPATH, BRD, VPACE, GFILL, XTRM, LOOKALIKE, PORT"
+                            "Unknown panel {spec:?}; try CHART, NEWS, BOOK, WEI, GC, CONG, WL, DESK, JOURNAL, STATS, BACKTEST, IBT, ICMP, SPATH, BRD, VPACE, GFILL, XTRM, RPATH, LOOKALIKE, PORT"
                         )
                     }
                 }
@@ -1384,6 +1406,7 @@ impl TerminalApp {
             Function::VolumePace { spec } => self.open_volume_pace(symbol.as_deref(), &spec),
             Function::GapFill { spec } => self.open_gap_fill(symbol.as_deref(), &spec),
             Function::SessionExtreme { spec } => self.open_session_extreme(symbol.as_deref(), &spec),
+            Function::RelativePath { spec } => self.open_relative_path(symbol.as_deref(), &spec),
             Function::Goto { date } => self.goto_chart_date(symbol.as_deref(), &date),
             Function::JournalNote { date, text } => self.add_journal_note(symbol.as_deref(), &date, &text),
             Function::Latest => self.with_chart(|c, _| c.jump_latest()),
@@ -1564,6 +1587,13 @@ impl TerminalApp {
                 }
                 Response::SessionExtreme { pane, generation, result } => {
                     if let Some(PaneKind::SessionExtreme(p)) =
+                        self.panes.iter_mut().find(|p| p.id == pane).map(|p| &mut p.kind)
+                    {
+                        p.accept(generation, result);
+                    }
+                }
+                Response::RelativePath { pane, generation, result } => {
+                    if let Some(PaneKind::RelativePath(p)) =
                         self.panes.iter_mut().find(|p| p.id == pane).map(|p| &mut p.kind)
                     {
                         p.accept(generation, result);

@@ -116,6 +116,9 @@ const COMMANDS: &[(&str, &str, &str, Option<Action>)] = &[
     ("XTRM", "When the session high and low print", "session extreme high low minute", None),
     ("AAPL XTRM 20", "AAPL high and low versus the last 20 complete sessions", "hilo 20", None),
     ("AAPL XTRM 15m", "AAPL session extreme on 15-minute bars", "hilo 15m", None),
+    ("RPATH", "Percent from the 09:30 open minus SPY", "relative path spy spread lead lag", None),
+    ("AAPL RPATH 20", "AAPL versus SPY over the last 20 sessions", "relative spy 20", None),
+    ("AAPL RPATH 15m", "AAPL versus SPY on 15-minute bars", "relative spy 15m", None),
     (
         "LOOKALIKE",
         "Historical lookalikes: nearest past conditions and subsequent returns",
@@ -344,6 +347,10 @@ pub(super) fn static_items() -> Vec<Item> {
     v.push(
         Item::new(Kind::Panel, "New session extreme", "NEW XTRM", Target::Run("NEW XTRM".into()))
             .keywords("panel pane hilo session extreme high low"),
+    );
+    v.push(
+        Item::new(Kind::Panel, "New relative path", "NEW RPATH", Target::Run("NEW RPATH".into()))
+            .keywords("panel pane rpath relative spy spread"),
     );
     v.push(
         Item::new(Kind::Panel, "New Lookalikes pane", "NEW LOOKALIKE", Target::Run("NEW LOOKALIKE".into()))
