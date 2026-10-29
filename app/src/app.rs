@@ -368,7 +368,7 @@ impl PaneKind {
                 drawings: c.drawings.clone(),
                 drawing_store: {
                     let mut store = c.drawing_store.clone();
-                    store.stash(&c.symbol, &c.drawings);
+                    store.stash_view(&c.symbol, c.tf, &c.drawings);
                     store
                 },
                 compare: c.compare.clone(),
@@ -470,8 +470,8 @@ impl PaneKind {
                 c.log = log;
                 c.indicators = indicators;
                 c.drawing_store = drawing_store;
-                c.drawing_store.seed_if_absent(&c.symbol, &drawings);
-                let stored = c.drawing_store.get(&c.symbol);
+                c.drawing_store.seed_view_if_absent(&c.symbol, tf, &drawings);
+                let stored = c.drawing_store.get_view(&c.symbol, tf);
                 c.drawings = if stored.is_empty() { drawings } else { stored };
                 c.compare = compare;
                 c.show_volume = show_volume;

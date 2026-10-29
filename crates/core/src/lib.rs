@@ -4,6 +4,7 @@
 pub mod bar;
 pub mod catalog;
 pub mod indicators;
+pub mod ny;
 pub mod options;
 pub mod provenance;
 pub mod sample;

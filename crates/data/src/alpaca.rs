@@ -117,6 +117,10 @@ impl MarketData for AlpacaProvider {
         }
         out.sort_by_key(|b| b.ts);
         out.dedup_by_key(|b| b.ts);
+        // Alpaca bars are US stocks. Keep regular-session prints and do not resample them.
+        if matches!(tf, Timeframe::M1 | Timeframe::M5 | Timeframe::M15 | Timeframe::M30 | Timeframe::H1) {
+            out = crate::intraday::regular_only(out);
+        }
         Ok(crate::clip(out, end, limit))
     }
 }

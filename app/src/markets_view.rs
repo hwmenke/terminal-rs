@@ -367,6 +367,7 @@ mod tests {
             prev_close: 4.22,
             ts: 0,
             spark: vec![],
+            stats: tr_data::QuoteStats::default(),
         };
         assert_eq!(change_text(&Security::parse("US10Y Govt").unwrap(), &q), "+3.0bp");
         let q = Quote {
@@ -376,6 +377,7 @@ mod tests {
             prev_close: 1.0900,
             ts: 0,
             spark: vec![],
+            stats: tr_data::QuoteStats::default(),
         };
         assert_eq!(change_text(&Security::parse("EURUSD Curncy").unwrap(), &q), "+0.0012");
     }

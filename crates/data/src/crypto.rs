@@ -366,6 +366,7 @@ impl CryptoProvider {
                 prev_close: prev,
                 ts: now,
                 spark,
+                stats: crate::QuoteStats::default(),
             });
         }
         if out.is_empty() && !secs.is_empty() {

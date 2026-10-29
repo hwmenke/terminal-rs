@@ -88,8 +88,14 @@ fn dt(ts: i64) -> DateTime<Utc> {
     DateTime::from_timestamp(ts, 0).unwrap_or_default()
 }
 
-pub fn boundary(prev: i64, cur: i64) -> Boundary {
-    let (a, b) = (dt(prev), dt(cur));
+/// Intraday labels use the New York wall clock. Daily and higher stay on the UTC
+/// date of the bar, which is how the daily archive timestamps its sessions.
+fn wall(ts: i64, tf: Timeframe) -> DateTime<Utc> {
+    if tf.is_intraday() { tr_core::ny::civil(ts).and_utc() } else { dt(ts) }
+}
+
+fn boundary_at(prev: i64, cur: i64, tf: Timeframe) -> Boundary {
+    let (a, b) = (wall(prev, tf), wall(cur, tf));
     if a.year() != b.year() {
         Boundary::Year
     } else if a.month() != b.month() {
@@ -106,7 +112,7 @@ pub fn boundary(prev: i64, cur: i64) -> Boundary {
 }
 
 pub fn label(ts: i64, b: Boundary, tf: Timeframe) -> String {
-    let d = dt(ts);
+    let d = wall(ts, tf);
     match b {
         Boundary::Year => d.format("%Y").to_string(),
         Boundary::Month => d.format("%b").to_string(),
@@ -118,7 +124,7 @@ pub fn label(ts: i64, b: Boundary, tf: Timeframe) -> String {
 
 /// Full timestamp for crosshair labels.
 pub fn crosshair_label(ts: i64, tf: Timeframe) -> String {
-    let d = dt(ts);
+    let d = wall(ts, tf);
     if tf.is_intraday() { d.format("%a %d %b '%y %H:%M").to_string() } else { d.format("%a %d %b '%y").to_string() }
 }
 
@@ -130,8 +136,10 @@ pub fn time_ticks(times: &[i64], lo: usize, hi: usize, min_gap_bars: f64, tf: Ti
         return Vec::new();
     }
     let gap = min_gap_bars.max(1.0).ceil() as usize;
-    let mut cands: Vec<(Boundary, usize)> =
-        (lo.max(1)..hi).map(|i| (boundary(times[i - 1], times[i]), i)).filter(|(b, _)| *b > Boundary::None).collect();
+    let mut cands: Vec<(Boundary, usize)> = (lo.max(1)..hi)
+        .map(|i| (boundary_at(times[i - 1], times[i], tf), i))
+        .filter(|(b, _)| *b > Boundary::None)
+        .collect();
     // Higher boundaries first; within a level, keep chronological order.
     cands.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
     let mut chosen: Vec<(usize, Boundary)> = Vec::new();
@@ -188,5 +196,21 @@ mod tests {
         let labels: Vec<&str> = ticks.iter().map(|(_, l)| l.as_str()).collect();
         assert!(labels.contains(&"Feb") && labels.contains(&"Mar"), "{labels:?}");
         assert!(ticks.windows(2).all(|w| w[1].0 - w[0].0 >= 20));
+    }
+
+    #[test]
+    fn intraday_crosshair_uses_new_york_and_daily_keeps_the_utc_date() {
+        // 2026-11-02 03:30 UTC is 22:30 on Nov 1 in New York, and Nov 2 on the UTC date.
+        let ts =
+            chrono::NaiveDate::from_ymd_opt(2026, 11, 2).unwrap().and_hms_opt(3, 30, 0).unwrap().and_utc().timestamp();
+        let intra = crosshair_label(ts, Timeframe::M5);
+        assert!(intra.contains("01 Nov") && intra.contains("22:30"), "{intra}");
+        let daily = crosshair_label(ts, Timeframe::D1);
+        assert!(daily.contains("02 Nov"), "{daily}");
+        assert!(!daily.contains("22:30"));
+        let open =
+            chrono::NaiveDate::from_ymd_opt(2026, 3, 9).unwrap().and_hms_opt(13, 30, 0).unwrap().and_utc().timestamp();
+        let label = crosshair_label(open, Timeframe::H1);
+        assert!(label.contains("09:30") && !label.contains("13:30"), "{label}");
     }
 }

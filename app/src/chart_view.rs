@@ -34,6 +34,35 @@ const DEFAULT_VISIBLE: usize = 160;
 /// chart has room for at most seven.
 const MAX_SUB_PANES: usize = 6;
 
+/// Session stats for an intraday equity/ETF/index series whose bars match `tf`.
+/// Missing VWAP or relative volume is an em dash, not a made-up number.
+fn session_line(tf: Timeframe, sec: &Security, bars: &[Bar]) -> Option<String> {
+    if !tf.is_intraday() || !matches!(sec.class, AssetClass::Equity | AssetClass::Etf | AssetClass::Index) {
+        return None;
+    }
+    let fits = bars.windows(2).any(|w| {
+        let dt = w[1].ts - w[0].ts;
+        dt > 0 && dt <= tf.seconds().saturating_mul(8)
+    }) || (bars.len() == 1 && tf.is_intraday());
+    if !fits {
+        return None;
+    }
+    let stats = tr_data::intraday::bar_stats(tf, bars);
+    let dec = sec.decimals(stats.vwap.unwrap_or(1.0));
+    let vwap = stats.vwap.map(|v| format!("{v:.dec$}")).unwrap_or_else(|| "—".into());
+    let rvol = stats.relative_volume.map(|v| format!("{v:.2}×")).unwrap_or_else(|| "—".into());
+    let mut line = format!("VWAP {vwap}  RVOL {rvol}");
+    if let Some(poc) = stats.poc() {
+        let d = sec.decimals(poc);
+        line.push_str(&format!("  POC {poc:.d$}"));
+    }
+    if !stats.gaps.is_empty() {
+        let n = stats.gaps.len();
+        line.push_str(&format!("  {n} gap{}", if n == 1 { "" } else { "s" }));
+    }
+    Some(line)
+}
+
 /// Length of the load-in sweep across the visible bars.
 const REVEAL_SECS: f32 = 0.7;
 /// Length of an eased jump (quick ranges, reset, keyboard zoom and pan).
@@ -322,7 +351,7 @@ impl ChartState {
             self.symbol = sec.key();
             self.sec = sec;
             self.draw = DrawState::default();
-            self.drawings = self.drawing_store.get(&self.symbol);
+            self.drawings = self.drawing_store.get_view(&self.symbol, self.tf);
         } else {
             self.symbol = sec.key();
             self.sec = sec;
@@ -331,9 +360,9 @@ impl ChartState {
         self.load(w);
     }
 
-    /// Write the live pane's drawings into the per-symbol store.
+    /// Write the live pane's drawings into the store for this symbol and timeframe.
     pub fn commit_drawings(&mut self) {
-        self.drawing_store.stash(&self.symbol, &self.drawings);
+        self.drawing_store.stash_view(&self.symbol, self.tf, &self.drawings);
     }
 
     pub fn clear_drawings(&mut self) {
@@ -381,7 +410,11 @@ impl ChartState {
             return;
         }
         if tf != self.tf {
+            self.commit_drawings();
+            self.drawing_undo = None;
+            self.draw.selected = None;
             self.tf = tf;
+            self.drawings = self.drawing_store.get_view(&self.symbol, self.tf);
             self.load(w);
         }
     }
@@ -1539,6 +1572,10 @@ impl ChartState {
 
         // Overlay indicator values, one per line.
         let mut ly = y + 16.0;
+        if let Some(line) = session_line(self.tf, &self.sec, &self.bars) {
+            p.text(pos2(price_rect.left() + 6.0, ly), Align2::LEFT_TOP, line, mono(11.0), muted());
+            ly += 14.0;
+        }
         let value_at = |l: &LineRef| l.pyramid.data.get(i).map(|p| p[1] as f64).filter(|v| v.is_finite());
         for bi in self.built.iter().filter(|b| !b.spec.is_pane()) {
             let vals: Vec<String> = bi
@@ -2163,24 +2200,30 @@ mod tests {
         chart.built = crate::worker::build_indicators(&bars, chart.tf, &chart.indicators, &theme::palette());
         chart_frame(&ctx, &mut chart, &worker, vec![]);
         let pos = pos2(500.0, 300.0);
-        chart_frame(&ctx, &mut chart, &worker, vec![
-            egui::Event::PointerMoved(pos),
-            pointer(pos, egui::PointerButton::Secondary, true),
-        ]);
+        chart_frame(
+            &ctx,
+            &mut chart,
+            &worker,
+            vec![egui::Event::PointerMoved(pos), pointer(pos, egui::PointerButton::Secondary, true)],
+        );
         chart_frame(&ctx, &mut chart, &worker, vec![pointer(pos, egui::PointerButton::Secondary, false)]);
         let output = chart_frame(&ctx, &mut chart, &worker, vec![]);
         let pos = text_position(&output.shapes, "Indicators");
-        chart_frame(&ctx, &mut chart, &worker, vec![
-            egui::Event::PointerMoved(pos),
-            pointer(pos, egui::PointerButton::Primary, true),
-        ]);
+        chart_frame(
+            &ctx,
+            &mut chart,
+            &worker,
+            vec![egui::Event::PointerMoved(pos), pointer(pos, egui::PointerButton::Primary, true)],
+        );
         chart_frame(&ctx, &mut chart, &worker, vec![pointer(pos, egui::PointerButton::Primary, false)]);
         let output = chart_frame(&ctx, &mut chart, &worker, vec![]);
         let pos = text_position(&output.shapes, "Remove All");
-        chart_frame(&ctx, &mut chart, &worker, vec![
-            egui::Event::PointerMoved(pos),
-            pointer(pos, egui::PointerButton::Primary, true),
-        ]);
+        chart_frame(
+            &ctx,
+            &mut chart,
+            &worker,
+            vec![egui::Event::PointerMoved(pos), pointer(pos, egui::PointerButton::Primary, true)],
+        );
         chart_frame(&ctx, &mut chart, &worker, vec![pointer(pos, egui::PointerButton::Primary, false)]);
         assert!(chart.built.is_empty());
         assert!(chart.indicators.is_empty());
@@ -2480,5 +2523,65 @@ mod tests {
         assert_eq!(c.news.len(), 1, "a batch for another name must not replace these markers");
         c.on_news(&tr_data::news::NewsBatch::sample_isolated(day));
         assert!(c.news.is_empty());
+    }
+
+    fn shape_text(shapes: &[egui::epaint::ClippedShape]) -> String {
+        fn walk(shape: &egui::Shape, out: &mut String) {
+            match shape {
+                egui::Shape::Text(t) => {
+                    out.push_str(&t.galley.job.text);
+                    out.push('\n');
+                }
+                egui::Shape::Vec(v) => v.iter().for_each(|s| walk(s, out)),
+                _ => {}
+            }
+        }
+        let mut out = String::new();
+        for s in shapes {
+            walk(&s.shape, &mut out);
+        }
+        out
+    }
+
+    #[test]
+    fn timeframe_switch_keeps_intraday_drawings_and_shows_session_stats() {
+        let (worker, _) = Worker::test_channel();
+        let mut chart = ChartState::new(1, "AAPL", Timeframe::D1);
+        let level = Drawing::new(Tool::Horizontal, Anchor { ts: 0, price: 150.0 }, Anchor { ts: 0, price: 150.0 });
+        let daily = Drawing::new(Tool::Trendline, Anchor { ts: 1, price: 10.0 }, Anchor { ts: 2, price: 20.0 });
+        chart.drawings = vec![level, daily];
+        chart.set_timeframe(Timeframe::M5, &worker);
+        assert!(chart.drawings.iter().any(|d| d.horizontal_price() == Some(150.0)));
+        assert!(chart.drawings.iter().all(|d| d.tool != Tool::Trendline));
+        chart.drawings.push(Drawing::new(
+            Tool::Trendline,
+            Anchor { ts: 50, price: 10.0 },
+            Anchor { ts: 51, price: 12.0 },
+        ));
+        chart.set_timeframe(Timeframe::D1, &worker);
+        assert!(chart.drawings.iter().any(|d| d.tool == Tool::Trendline && d.a.ts == 1));
+        assert!(chart.drawings.iter().all(|d| d.a.ts != 50));
+        assert!(chart.drawings.iter().any(|d| d.horizontal_price() == Some(150.0)));
+        chart.set_timeframe(Timeframe::M5, &worker);
+        assert!(chart.drawings.iter().any(|d| d.a.ts == 50));
+        assert!(chart.drawings.iter().all(|d| d.a.ts != 1));
+
+        let open =
+            tr_core::ny::to_utc(chrono::NaiveDate::from_ymd_opt(2026, 3, 9).unwrap().and_hms_opt(9, 30, 0).unwrap());
+        let bars: Arc<Vec<Bar>> = Arc::new(
+            (0..6)
+                .map(|i| Bar::new(open + i * 300, 100.0, 102.0, 99.0, 101.0, 1_000.0).with_provenance(Provenance::Real))
+                .collect(),
+        );
+        chart.on_history(chart.generation, bars.clone(), SeriesGpu::build(&bars), 0, false, true, false, &worker);
+        let specs = vec![IndicatorSpec::new("VWAP", &[]).unwrap()];
+        let built = crate::worker::build_indicators(&bars, Timeframe::M5, &specs, &theme::palette());
+        assert_eq!(built.len(), 1, "indicators run on the intraday series");
+        chart.built = built;
+        let ctx = egui::Context::default();
+        let output = chart_frame(&ctx, &mut chart, &worker, vec![]);
+        let text = shape_text(&output.shapes);
+        assert!(text.contains("VWAP") && text.contains("RVOL —"), "{text}");
+        assert!(!text.contains("gap"), "adjacent session bars are not reported as gaps");
     }
 }

@@ -5,8 +5,8 @@
 //!
 //! Conventions follow the common charting definitions: EMA uses alpha = 2/(n+1) seeded with
 //! an SMA, RSI, ATR and ADX use Wilder smoothing, standard deviations are population ones,
-//! and VWAP and pivot levels reset each session (a day intraday, a month on daily bars, a
-//! year above that).
+//! and VWAP and pivot levels reset each session (a New York calendar day intraday, a month
+//! on daily bars, a year above that).
 //!
 //! The functions are grouped by family; [`registry`] lists every indicator with its
 //! parameters, placement and outputs, and is what the app's command line, picker and chart

@@ -17,6 +17,7 @@ pub mod backtest;
 pub mod cache;
 pub mod crypto;
 pub mod history;
+pub mod intraday;
 pub mod journal;
 pub mod lookalike;
 pub mod markets;
@@ -41,6 +42,45 @@ use tr_core::{AssetClass, Bar, Security, Timeframe, catalog};
 pub use cache::BarCache;
 pub use tr_core::Provenance;
 
+/// Quote fields a provider actually sent. Missing fields stay `None` — never a guessed price.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct QuoteStats {
+    #[serde(default)]
+    pub pre_market: Option<f64>,
+    #[serde(default)]
+    pub post_market: Option<f64>,
+    #[serde(default)]
+    pub regular_volume: Option<f64>,
+    #[serde(default)]
+    pub average_volume_10d: Option<f64>,
+    #[serde(default)]
+    pub week_52_high: Option<f64>,
+    #[serde(default)]
+    pub week_52_low: Option<f64>,
+    #[serde(default)]
+    pub market_cap: Option<f64>,
+    /// Trailing P/E. Negative values are kept; only non-finite numbers are dropped.
+    #[serde(default)]
+    pub trailing_pe: Option<f64>,
+}
+
+impl QuoteStats {
+    /// Positive finite price, or absent.
+    pub fn price(v: Option<f64>) -> Option<f64> {
+        v.filter(|x| x.is_finite() && *x > 0.0)
+    }
+
+    /// Finite volume, including zero. Negative and non-finite values are absent.
+    pub fn volume(v: Option<f64>) -> Option<f64> {
+        v.filter(|x| x.is_finite() && *x >= 0.0)
+    }
+
+    /// Finite number, including negatives (a trailing P/E can be negative).
+    pub fn finite(v: Option<f64>) -> Option<f64> {
+        v.filter(|x| x.is_finite())
+    }
+}
+
 /// Latest quote for a symbol.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Quote {
@@ -53,6 +93,9 @@ pub struct Quote {
     /// Recent daily closes (oldest first) for sparklines; may be empty.
     #[serde(default)]
     pub spark: Vec<f64>,
+    /// Extra fields from the provider. Old saved quotes deserialize with everything absent.
+    #[serde(default)]
+    pub stats: QuoteStats,
 }
 
 /// A symbol-search result.
@@ -215,6 +258,52 @@ impl Quote {
     pub fn change_pct(&self) -> f64 {
         if self.prev_close == 0.0 { 0.0 } else { self.change() / self.prev_close * 100.0 }
     }
+
+    /// One-line label of the stats the provider actually sent. Empty when none were.
+    pub fn stats_label(&self) -> String {
+        let s = &self.stats;
+        let mut parts = Vec::new();
+        if let Some(v) = s.pre_market {
+            parts.push(format!("pre {v:.2}"));
+        }
+        if let Some(v) = s.post_market {
+            parts.push(format!("post {v:.2}"));
+        }
+        if let Some(v) = s.regular_volume {
+            parts.push(format!("vol {}", compact_stat(v)));
+        }
+        if let Some(v) = s.average_volume_10d {
+            parts.push(format!("avg10 {}", compact_stat(v)));
+        }
+        if let Some(v) = s.week_52_high {
+            parts.push(format!("52wH {v:.2}"));
+        }
+        if let Some(v) = s.week_52_low {
+            parts.push(format!("52wL {v:.2}"));
+        }
+        if let Some(v) = s.market_cap {
+            parts.push(format!("cap {}", compact_stat(v)));
+        }
+        if let Some(v) = s.trailing_pe {
+            parts.push(format!("PE {v:.2}"));
+        }
+        parts.join(" · ")
+    }
+}
+
+fn compact_stat(v: f64) -> String {
+    let a = v.abs();
+    if a >= 1e12 {
+        format!("{:.2}T", v / 1e12)
+    } else if a >= 1e9 {
+        format!("{:.2}B", v / 1e9)
+    } else if a >= 1e6 {
+        format!("{:.2}M", v / 1e6)
+    } else if a >= 1e3 {
+        format!("{:.1}K", v / 1e3)
+    } else {
+        format!("{v:.0}")
+    }
 }
 
 /// A source of historical bars and quotes.
@@ -257,6 +346,7 @@ pub trait MarketData: Send + Sync {
                     prev_close: prev,
                     ts: last.ts,
                     spark: vec![],
+                    stats: QuoteStats::default(),
                 });
             }
         }
@@ -542,6 +632,7 @@ mod tests {
         let q: Quote = serde_json::from_str(r#"{"symbol":"X","last":1,"prev_close":1,"ts":0}"#).unwrap();
         assert_eq!(q.provenance, Provenance::Missing);
         assert_eq!(q.provenance.source_label("Yahoo"), "UNVERIFIED DATA");
+        assert!(q.stats.pre_market.is_none() && q.stats.market_cap.is_none() && q.stats_label().is_empty());
     }
 
     #[tokio::test]
@@ -573,15 +664,34 @@ mod tests {
 
     #[test]
     fn quote_change() {
-        let q = Quote {
+        let mut q = Quote {
             provenance: Provenance::Real,
             symbol: "X".into(),
             last: 110.0,
             prev_close: 100.0,
             ts: 0,
             spark: vec![],
+            stats: QuoteStats::default(),
         };
         assert_eq!(q.change(), 10.0);
+        assert!(q.stats_label().is_empty());
+        q.stats = QuoteStats {
+            pre_market: QuoteStats::price(Some(111.0)),
+            post_market: QuoteStats::price(Some(f64::NAN)),
+            regular_volume: QuoteStats::volume(Some(1_500_000.0)),
+            average_volume_10d: None,
+            week_52_high: QuoteStats::price(Some(120.0)),
+            week_52_low: QuoteStats::price(Some(0.0)),
+            market_cap: QuoteStats::price(Some(2.5e12)),
+            trailing_pe: QuoteStats::finite(Some(-4.5)),
+        };
+        assert_eq!(q.stats.post_market, None, "non-finite post-market stays missing");
+        assert_eq!(q.stats.week_52_low, None, "a zero low is not a price");
+        assert_eq!(q.stats.trailing_pe, Some(-4.5));
+        let label = q.stats_label();
+        assert!(label.contains("pre 111.00") && label.contains("vol 1.50M"), "{label}");
+        assert!(label.contains("52wH 120.00") && label.contains("cap 2.50T") && label.contains("PE -4.50"), "{label}");
+        assert!(!label.contains("post") && !label.contains("52wL") && !label.contains("avg10"), "{label}");
         assert!((q.change_pct() - 10.0).abs() < 1e-9);
     }
 }
