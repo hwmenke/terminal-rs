@@ -233,6 +233,11 @@ gets the native title bar with traffic lights, window vibrancy behind the sideba
   commission and slippage, next-open fills, CAGR and **completed-trade** win
   rate (not up-days). Sample bars are refused. Paper / research only. See
   [Backtests](docs/BACKTEST.md).
+- **Intraday setup backtests** — `IBT` (or `AAPL IBT VWAP`, `AAPL IBT OR 15m`)
+  compares a session VWAP cross and the 30-minute opening range to holding the
+  cash session. Signals fill at the next regular open and flatten at that
+  session's close. Missing buckets are skipped. Sample bars are refused. See
+  [Intraday backtests](docs/INTRADAY_BACKTEST.md).
 - **Historical lookalikes** — `LOOKALIKE` (or `AAPL LOOKALIKE`, `AAPL KNN
   2024-01-15`) finds past sessions whose backward-looking features match the
   query date (standardized Euclidean distance), shows **per-horizon completed /
@@ -398,6 +403,7 @@ Settings › Hotkeys. On Linux and Windows ⌘ is Ctrl and ⌥ is Alt.
 | `JOURNAL` · `AAPL JOURNAL` · `AAPL NOTE 2026-10-24 wait` · `NEW JOURNAL` | Trade journal: setup, checklist, $ risk, $ and R outcome, date notes |
 | `STATS` · `AAPL STATS` · `AAPL COND RSI(14) < 30` | Historical risk/returns and what followed a condition |
 | `BACKTEST` · `AAPL BACKTEST` · `AAPL BT ADTREND` · `NEW BACKTEST` | Paper backtest vs buy-and-hold (costs, next-open, chronological holdout) |
+| `IBT` · `AAPL IBT` · `AAPL IBT VWAP` · `AAPL IBT OR 15m` · `NEW IBT` | Paper intraday backtest: session VWAP and opening range vs holding the cash session |
 | `LOOKALIKE` · `AAPL LOOKALIKE` · `AAPL KNN 2024-01-15` · `GOTO 2024-01-15` · `NEW LOOKALIKE` | Historical lookalikes: nearest past conditions, per-horizon counts, jump to neighbor dates |
 | `EXPORT` · `EXPORT SCAN` · `EXPORT JOURNAL` · `EXPORT HIST` · `EXPORT STATS` · `EXPORT BACKTEST` · `EXPORT LOOKALIKE` · `BACKUP` · `RESTORE path` | Export scans/history/journal/stats/backtests/lookalikes; workspace backup/restore (no credentials) |
 | `PORT` · `ACCT` · `POS` · `ORD` · `ACTV` · `AAPL POS` · `AAPL ORD` | brokerage portfolio · accounts and balances · positions · orders · activity · one security |

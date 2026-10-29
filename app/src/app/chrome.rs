@@ -675,6 +675,20 @@ impl TerminalApp {
             }
             if nav_row(
                 ui,
+                Icon::Chart,
+                "Intraday BT",
+                Some("IBT"),
+                is_focused(&PaneKind::Backtest(Box::new(super::backtest::BacktestPane::intraday(
+                    String::new(),
+                    String::new(),
+                )))),
+            )
+            .clicked()
+            {
+                out.push(SidebarCmd::Function(Function::IntradayBacktest { spec: String::new() }));
+            }
+            if nav_row(
+                ui,
                 Icon::Search,
                 "Lookalikes",
                 Some("KNN"),

@@ -20,7 +20,7 @@ use crate::widgets::{self, Icon};
 use crate::worker::{Request, Worker};
 
 /// Panels offered by the + menus: label and command word.
-pub const PANELS: [(&str, &str); 17] = [
+pub const PANELS: [(&str, &str); 18] = [
     ("Chart", "CHART"),
     ("Watchlist", "WL"),
     ("News", "NEWS"),
@@ -34,6 +34,7 @@ pub const PANELS: [(&str, &str); 17] = [
     ("Alerts", "ALRT"),
     ("Journal", "JOURNAL"),
     ("Backtest", "BACKTEST"),
+    ("Intraday BT", "IBT"),
     ("Lookalikes", "LOOKALIKE"),
     ("Security Search", "SECF"),
     ("Settings", "PREFS"),
@@ -855,6 +856,12 @@ impl TerminalApp {
                 let symbol = given.or(current).unwrap_or_default();
                 let spec = words.get(1..).unwrap_or(&[]).join(" ");
                 PaneKind::Backtest(Box::new(super::backtest::BacktestPane::new(symbol, spec)))
+            }
+            "IBT" | "IBACKTEST" | "SETUPBT" => {
+                // VWAP and OR are setup names, not tickers.
+                let symbol = symbol.map(|s| tr_data::security(s).key()).or(current).unwrap_or_default();
+                let spec = words.get(1..).unwrap_or(&[]).join(" ");
+                PaneKind::Backtest(Box::new(super::backtest::BacktestPane::intraday(symbol, spec)))
             }
             "LOOKALIKE" | "LOOKALIKES" | "KNN" | "ANALOG" | "ANALOGUE" | "NN" => {
                 let symbol = given.or(current).unwrap_or_default();

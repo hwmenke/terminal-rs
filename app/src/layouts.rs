@@ -156,6 +156,12 @@ pub enum PaneSettings {
         slippage: String,
         #[serde(default)]
         shorts: bool,
+        /// Session VWAP / opening-range backtest. Daily archive backtests stay false.
+        #[serde(default)]
+        intraday: bool,
+        /// Intraday bar size (`5m`). Ignored by the daily archive backtest.
+        #[serde(default)]
+        tf: String,
     },
     /// Historical lookalikes for one research symbol.
     Lookalike {
@@ -723,26 +729,30 @@ mod tests {
         let mut store = AnnotationStore::new();
         store.stash("AAPL", &[hline(150.0)]);
         store.stash("MSFT", &[hline(400.0)]);
-        let doc = LayoutDoc::preset("Marks", Layout::One, vec![PaneSettings::Chart {
-            archive: false,
-            watch_group: None,
-            symbol: "AAPL US Equity".into(),
-            tf: Timeframe::D1,
-            chart_type: ChartType::Candles,
-            log: false,
-            indicators: vec![],
-            drawings: vec![hline(150.0)],
-            drawing_store: store,
-            compare: None,
-            show_volume: true,
-            show_congress: true,
-            show_news: true,
-            show_journal: true,
-            magnet: false,
-            show_box: false,
-            show_rs: false,
-            show_volume_ctx: false,
-        }]);
+        let doc = LayoutDoc::preset(
+            "Marks",
+            Layout::One,
+            vec![PaneSettings::Chart {
+                archive: false,
+                watch_group: None,
+                symbol: "AAPL US Equity".into(),
+                tf: Timeframe::D1,
+                chart_type: ChartType::Candles,
+                log: false,
+                indicators: vec![],
+                drawings: vec![hline(150.0)],
+                drawing_store: store,
+                compare: None,
+                show_volume: true,
+                show_congress: true,
+                show_news: true,
+                show_journal: true,
+                magnet: false,
+                show_box: false,
+                show_rs: false,
+                show_volume_ctx: false,
+            }],
+        );
         let back = LayoutDoc::from_json(&doc.to_json()).unwrap();
         match &back.panes[0].settings {
             PaneSettings::Chart { symbol, drawings, drawing_store, .. } => {
