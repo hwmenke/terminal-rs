@@ -128,6 +128,59 @@ pub fn keep_extended(bars: Vec<Bar>) -> Vec<Bar> {
     bars.into_iter().filter(|b| in_extended_session(b.ts)).collect()
 }
 
+/// First cash half-hour. A shorter or longer bar cannot stand in for it.
+pub const OPENING_MINUTES: u32 = 30;
+
+/// High and low of the latest regular session's first [`OPENING_MINUTES`], when every bucket is present.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct OpeningRange {
+    pub high: f64,
+    pub low: f64,
+}
+
+/// Opening range of the latest regular session in `bars`.
+/// `None` when the timeframe cannot tile 30 minutes, any bucket in that window is missing,
+/// a bar is unverified, or a pre-market print is the only high. Nothing is filled in.
+pub fn opening_range(tf: Timeframe, bars: &[Bar]) -> Option<OpeningRange> {
+    let step = step_minutes(tf)?;
+    if step == 0 || OPENING_MINUTES % step != 0 {
+        return None;
+    }
+    let need = (OPENING_MINUTES / step) as usize;
+    let mut by_day: BTreeMap<NaiveDate, BTreeMap<i64, (f64, f64, bool)>> = BTreeMap::new();
+    for b in bars {
+        let Some(bucket) = regular_bucket(tf, b.ts) else { continue };
+        let entry = by_day.entry(minute_of(b.ts).0).or_default().entry(bucket).or_insert((
+            f64::NEG_INFINITY,
+            f64::INFINITY,
+            true,
+        ));
+        if b.high.is_finite() {
+            entry.0 = entry.0.max(b.high);
+        }
+        if b.low.is_finite() {
+            entry.1 = entry.1.min(b.low);
+        }
+        entry.2 &= b.provenance.is_verified();
+    }
+    let (date, session) = by_day.pop_last()?;
+    let window: Vec<i64> = regular_opens(date, tf).into_iter().take(need).collect();
+    if window.len() != need {
+        return None;
+    }
+    let mut high = f64::NEG_INFINITY;
+    let mut low = f64::INFINITY;
+    for open in window {
+        let (h, l, verified) = session.get(&open)?;
+        if !verified || !h.is_finite() || !l.is_finite() || *h < *l {
+            return None;
+        }
+        high = high.max(*h);
+        low = low.min(*l);
+    }
+    (high.is_finite() && low.is_finite() && high >= low).then_some(OpeningRange { high, low })
+}
+
 /// How many kept bars sit outside the regular session. Zero is reported as no bars, not as a price.
 pub fn extended_summary(bars: &[Bar]) -> String {
     let pre = bars.iter().filter(|b| phase(b.ts) == Phase::Pre).count();
@@ -606,6 +659,48 @@ mod tests {
         assert_eq!(extended_summary(&kept), "Extended hours: 1 pre-market · 2 after hours");
         assert_eq!(extended_summary(&[regular]), "Extended hours: no pre-market or after-hours bars in this read.");
         assert!(regular_only(vec![pre, regular, post]).iter().all(|b| b.ts == regular.ts));
+    }
+
+    fn m5(day_h: u32, day_m: u32, high: f64, low: f64) -> Bar {
+        Bar::new(wall(2026, 3, 9, day_h, day_m), low + 0.5, high, low, low + 0.4, 10.0)
+            .with_provenance(Provenance::Real)
+    }
+
+    #[test]
+    fn opening_range_uses_only_a_complete_first_half_hour() {
+        let mut bars = Vec::new();
+        for (minute, high, low) in
+            [(30, 11.0, 10.0), (35, 12.0, 9.5), (40, 13.0, 8.0), (45, 12.5, 9.0), (50, 11.5, 9.2), (55, 11.2, 9.1)]
+        {
+            bars.push(m5(9, minute, high, low));
+        }
+        bars.push(Bar::new(wall(2026, 3, 9, 8, 0), 1.0, 40.0, 0.5, 2.0, 50.0).with_provenance(Provenance::Real));
+        bars.push(m5(10, 0, 20.0, 7.0));
+        let range = opening_range(Timeframe::M5, &bars).unwrap();
+        assert!((range.high - 13.0).abs() < 1e-9);
+        assert!((range.low - 8.0).abs() < 1e-9);
+
+        bars.retain(|b| b.ts != wall(2026, 3, 9, 9, 40));
+        assert!(opening_range(Timeframe::M5, &bars).is_none(), "a missing bucket is not filled");
+
+        let friday: Vec<Bar> = (0..6)
+            .map(|i| {
+                Bar::new(wall(2026, 3, 6, 9, 30 + i * 5), 2.0, 4.0, 1.0, 3.0, 1.0).with_provenance(Provenance::Real)
+            })
+            .collect();
+        let mut both = friday;
+        both.push(m5(9, 30, 11.0, 10.0));
+        assert!(opening_range(Timeframe::M5, &both).is_none(), "a partial new session does not reuse yesterday");
+
+        let half_hour = [Bar::new(wall(2026, 3, 9, 9, 30), 3.0, 6.0, 2.5, 5.0, 8.0).with_provenance(Provenance::Real)];
+        let m30 = opening_range(Timeframe::M30, &half_hour).unwrap();
+        assert!((m30.high - 6.0).abs() < 1e-9 && (m30.low - 2.5).abs() < 1e-9);
+        assert!(opening_range(Timeframe::H1, &half_hour).is_none());
+        assert!(opening_range(Timeframe::D1, &half_hour).is_none());
+
+        let mut sample = half_hour;
+        sample[0].provenance = Provenance::Sample;
+        assert!(opening_range(Timeframe::M30, &sample).is_none());
     }
 
     #[test]
