@@ -5,12 +5,12 @@
 //! Premarket and after-hours prints are ignored. SPY is the same-clock benchmark.
 
 use std::collections::BTreeMap;
-use std::str::FromStr;
 
 use chrono::NaiveDate;
 use serde::{Deserialize, Serialize};
-use tr_core::{AssetClass, Bar, Provenance, Security, Timeframe};
+use tr_core::{Bar, Provenance, Timeframe};
 
+use crate::cash_session::{self, OpenPrint};
 use crate::intraday::{regular_bucket, regular_opens};
 use crate::security;
 
@@ -118,76 +118,20 @@ impl CompareChart {
 /// `spec` is the text after the command (`MSFT NVDA 15m`). A bar size written there
 /// wins over `tf_field`. SPY is added when it is not already in the list.
 pub fn parse_query(anchor: &str, spec: &str, tf_field: &str) -> Result<CompareQuery, String> {
-    let anchor_sec = security(anchor.trim());
-    if anchor.trim().is_empty() || !tr_core::security::looks_like_ticker(&anchor_sec.ticker) {
-        return Err("ICMP needs a ticker (AAPL ICMP MSFT).".into());
-    }
-    if !is_cash(&anchor_sec) {
-        return Err(format!("{} has no US cash session.", anchor_sec.ticker));
-    }
-    let spec = spec.replace(',', " ");
-    let tokens: Vec<&str> = spec.split_whitespace().collect();
-    let mut from_spec: Option<Timeframe> = None;
-    let mut symbols = vec![anchor_sec.key()];
-    let mut i = 0;
-    while i < tokens.len() {
-        let token = tokens[i];
-        // A bar size carries a digit (`5m`, `1h`, `15`). A bare letter stays a name.
-        let parsed = token.chars().any(|c| c.is_ascii_digit()).then(|| token.parse::<Timeframe>());
-        match parsed {
-            Some(Ok(tf)) => {
-                if !supported_timeframe(tf) {
-                    return Err(format!(
-                        "{} is not a bar size for this chart. Use 1m, 5m, 15m, 30m, or 1h.",
-                        tf.label()
-                    ));
-                }
-                if let Some(prev) = from_spec
-                    && prev != tf
-                {
-                    return Err("The compare lists two bar sizes.".into());
-                }
-                from_spec = Some(tf);
-                i += 1;
-                continue;
-            }
-            Some(Err(e)) => return Err(e),
-            None => {}
-        }
-        let Some((sec, used)) = Security::resolve_tokens(&tokens[i..]) else {
-            return Err(format!("Unrecognised name '{token}'."));
-        };
-        let key = sec.key();
-        if !symbols.iter().any(|s| s == &key) {
-            symbols.push(key);
-        }
-        i += used.max(1);
-    }
-    let timeframe = match from_spec {
-        Some(tf) => tf,
-        None if tf_field.trim().is_empty() => Timeframe::M5,
-        None => {
-            let tf = Timeframe::from_str(tf_field.trim()).map_err(|_| format!("Unknown bar size '{tf_field}'."))?;
-            if !supported_timeframe(tf) {
-                return Err(format!("{} is not a bar size for this chart. Use 1m, 5m, 15m, 30m, or 1h.", tf.label()));
-            }
-            tf
-        }
-    };
-    let bench = benchmark_key();
-    if !symbols.iter().any(|s| s == &bench) {
-        symbols.push(bench);
-    }
-    if symbols.len() > MAX_SYMBOLS {
-        return Err(format!("At most {MAX_SYMBOLS} names, including SPY."));
-    }
-    Ok(CompareQuery { anchor: anchor_sec.key(), symbols, timeframe })
+    let parsed = cash_session::parse_compare(
+        anchor,
+        spec,
+        tf_field,
+        &benchmark_key(),
+        MAX_SYMBOLS,
+        "ICMP needs a ticker (AAPL ICMP MSFT).",
+        &format!("At most {MAX_SYMBOLS} names, including SPY."),
+    )?;
+    Ok(CompareQuery { anchor: parsed.anchor, symbols: parsed.symbols, timeframe: parsed.timeframe })
 }
 
 pub fn build_chart(anchor: &str, tf: Timeframe, rows: &[NamedBars], source: &str) -> Result<CompareChart, String> {
-    if !supported_timeframe(tf) {
-        return Err(format!("{} is not a bar size for this chart. Use 1m, 5m, 15m, 30m, or 1h.", tf.label()));
-    }
+    cash_session::require_bar_size(tf, cash_session::COMPARE.place)?;
     let anchor_key = security(anchor).key();
     let Some(anchor_row) = rows.iter().find(|r| security(&r.symbol).key() == anchor_key) else {
         return Err("The anchor name was not in this read.".into());
@@ -196,7 +140,7 @@ pub fn build_chart(anchor: &str, tf: Timeframe, rows: &[NamedBars], source: &str
         return Err(err.clone());
     }
     let anchor_sec = security(&anchor_key);
-    if !is_cash(&anchor_sec) {
+    if !cash_session::is_cash(&anchor_sec) {
         return Err(format!("{} has no US cash session.", anchor_sec.ticker));
     }
     let Some(date) = latest_regular_date(tf, &anchor_row.bars) else {
@@ -219,7 +163,7 @@ pub fn build_chart(anchor: &str, tf: Timeframe, rows: &[NamedBars], source: &str
             continue;
         }
         let sec = security(&key);
-        if !is_cash(&sec) {
+        if !cash_session::is_cash(&sec) {
             drafts.push(excluded(&key, format!("{} has no US cash session.", sec.ticker)));
             continue;
         }
@@ -280,12 +224,8 @@ pub fn build_chart(anchor: &str, tf: Timeframe, rows: &[NamedBars], source: &str
     })
 }
 
-fn is_cash(sec: &Security) -> bool {
-    matches!(sec.class, AssetClass::Equity | AssetClass::Etf | AssetClass::Index)
-}
-
 fn latest_regular_date(tf: Timeframe, bars: &[Bar]) -> Option<NaiveDate> {
-    bars.iter().filter(|b| regular_bucket(tf, b.ts).is_some()).map(|b| tr_core::ny::civil(b.ts).date()).max()
+    cash_session::latest_regular_date(tf, bars)
 }
 
 #[derive(Clone)]
@@ -370,30 +310,26 @@ fn draft_series(symbol: &str, bars: &[Bar], tf: Timeframe, date: NaiveDate) -> D
     if let Err(err) = provenance.require_verified("Intraday compare") {
         return excluded(&sec.key(), err);
     }
-    let mut grouped: BTreeMap<i64, Vec<&Bar>> = BTreeMap::new();
-    for bar in &session {
-        if let Some(bucket) = regular_bucket(tf, bar.ts) {
-            grouped.entry(bucket).or_default().push(bar);
-        }
-    }
+    let grouped = cash_session::day_buckets(tf, date, bars);
     let Some(open_ts) = regular_opens(date, tf).into_iter().next() else {
         return excluded(&sec.key(), format!("{} has no cash grid on {date}.", sec.ticker));
     };
-    let Some(open_bars) = grouped.get(&open_ts) else {
-        return excluded(&sec.key(), format!("{date}: 09:30 open is missing. A later bar is not used as the open."));
+    let session_open = match cash_session::open_print(&grouped, open_ts) {
+        OpenPrint::Missing => {
+            return excluded(&sec.key(), cash_session::open_missing(date));
+        }
+        OpenPrint::Ambiguous => {
+            return excluded(&sec.key(), cash_session::open_ambiguous(date));
+        }
+        OpenPrint::One(bar) if !cash_session::usable_price(bar) => {
+            return excluded(&sec.key(), cash_session::open_unusable(date));
+        }
+        OpenPrint::One(bar) => bar.open,
     };
-    if open_bars.len() != 1 {
-        return excluded(&sec.key(), format!("{date}: 09:30 open is ambiguous (more than one print)."));
-    }
-    let open_bar = open_bars[0];
-    if !usable(open_bar) {
-        return excluded(&sec.key(), format!("{date}: 09:30 open is not a positive finite price."));
-    }
-    let session_open = open_bar.open;
     let mut slots = BTreeMap::new();
-    for (ts, bars) in &grouped {
-        let slot = if bars.len() == 1 && usable(bars[0]) {
-            let pct = (bars[0].close / session_open - 1.0) * 100.0;
+    for (ts, bucket) in &grouped {
+        let slot = if bucket.len() == 1 && cash_session::usable_price(bucket[0]) {
+            let pct = (bucket[0].close / session_open - 1.0) * 100.0;
             if pct.is_finite() { Slot::Value(pct) } else { Slot::Blank }
         } else {
             Slot::Blank
@@ -411,22 +347,8 @@ fn draft_series(symbol: &str, bars: &[Bar], tf: Timeframe, date: NaiveDate) -> D
     }
 }
 
-fn usable(bar: &Bar) -> bool {
-    bar.open.is_finite()
-        && bar.open > 0.0
-        && bar.close.is_finite()
-        && bar.close > 0.0
-        && bar.high.is_finite()
-        && bar.low.is_finite()
-        && bar.high + 1e-9 >= bar.low
-        && bar.high + 1e-9 >= bar.open
-        && bar.high + 1e-9 >= bar.close
-        && bar.low <= bar.open + 1e-9
-        && bar.low <= bar.close + 1e-9
-}
-
 pub fn clock_label(ts: i64) -> String {
-    tr_core::ny::civil(ts).format("%H:%M").to_string()
+    cash_session::clock_label(ts)
 }
 
 #[cfg(test)]

@@ -7,13 +7,13 @@
 //! an earlier or later day is not mixed in.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::str::FromStr;
 
-use chrono::{NaiveDate, Timelike};
+use chrono::NaiveDate;
 use serde::{Deserialize, Serialize};
-use tr_core::{AssetClass, Bar, Provenance, Security, Timeframe};
+use tr_core::{Bar, Provenance, Security, Timeframe};
 
-use crate::intraday::{regular_bucket, regular_opens};
+use crate::cash_session;
+use crate::intraday::regular_opens;
 use crate::security;
 
 /// The rate stays blank until this many names have a single print at that minute.
@@ -102,69 +102,18 @@ pub struct Breadth {
 /// A bare number is a bar size (`5` is five-minute bars, `60` is one hour), not a count of names.
 /// Tickers in `spec` are the list. When `spec` has no ticker, `watchlist` is the list.
 pub fn parse_query(spec: &str, tf_field: &str, watchlist: &[String]) -> Result<BreadthQuery, String> {
-    let mut from_spec: Option<Timeframe> = None;
-    let mut symbols = Vec::new();
-    let mut notes = Vec::new();
-    for token in spec.split_whitespace() {
-        if let Ok(tf) = Timeframe::from_str(token) {
-            if !supported_timeframe(tf) {
-                return Err(format!("{} is not a bar size for breadth. Use 1m, 5m, 15m, 30m, or 1h.", tf.label()));
-            }
-            if let Some(prev) = from_spec
-                && prev != tf
-            {
-                return Err("The breadth lists two bar sizes.".into());
-            }
-            from_spec = Some(tf);
-            continue;
-        }
-        let sec = security(token);
-        if !tr_core::security::looks_like_ticker(&sec.ticker) {
-            return Err(format!("Unrecognised breadth argument '{token}'."));
-        }
-        let key = sec.key();
-        if symbols.iter().any(|s| s == &key) {
-            notes.push(format!("{} is listed more than once.", sec.ticker));
-            continue;
-        }
-        symbols.push(key);
-    }
-    if symbols.is_empty() {
-        for symbol in watchlist {
-            let sec = security(symbol);
-            if !tr_core::security::looks_like_ticker(&sec.ticker) {
-                continue;
-            }
-            let key = sec.key();
-            if !symbols.iter().any(|s| s == &key) {
-                symbols.push(key);
-            }
-        }
-    }
-    if symbols.is_empty() {
-        return Err("Breadth needs a watchlist or tickers (BRD AAPL MSFT NVDA).".into());
-    }
-    if symbols.len() > MAX_NAMES {
-        return Err(format!("Breadth reads at most {MAX_NAMES} names."));
-    }
-    let timeframe = match from_spec {
-        Some(tf) => tf,
-        None if tf_field.trim().is_empty() => Timeframe::M5,
-        None => {
-            let tf = Timeframe::from_str(tf_field.trim()).map_err(|_| format!("Unknown bar size '{tf_field}'."))?;
-            if !supported_timeframe(tf) {
-                return Err(format!("{} is not a bar size for breadth. Use 1m, 5m, 15m, 30m, or 1h.", tf.label()));
-            }
-            tf
-        }
-    };
-    Ok(BreadthQuery { symbols, timeframe, notes })
+    let query = cash_session::parse_breadth(
+        spec,
+        tf_field,
+        watchlist,
+        MAX_NAMES,
+        "Breadth needs a watchlist or tickers (BRD AAPL MSFT NVDA).",
+    )?;
+    Ok(BreadthQuery { symbols: query.symbols, timeframe: query.timeframe, notes: query.notes })
 }
 
 pub fn build_breadth(rows: &[NamedBars], query: &BreadthQuery, source: &str) -> Result<Breadth, String> {
-    if !supported_timeframe(query.timeframe) {
-        return Err(format!("{} is not a bar size for breadth. Use 1m, 5m, 15m, 30m, or 1h.", query.timeframe.label()));
-    }
+    cash_session::require_bar_size(query.timeframe, cash_session::BREADTH.place)?;
     if rows.is_empty() {
         return Err("Breadth needs a watchlist or tickers (BRD AAPL MSFT NVDA).".into());
     }
@@ -183,7 +132,7 @@ pub fn build_breadth(rows: &[NamedBars], query: &BreadthQuery, source: &str) -> 
             members.push(excluded(&sec, err.clone()));
             continue;
         }
-        if !is_cash(&sec) {
+        if !cash_session::is_cash(&sec) {
             members.push(excluded(&sec, format!("{} has no US cash session.", sec.ticker)));
             continue;
         }
@@ -271,7 +220,7 @@ pub fn build_breadth(rows: &[NamedBars], query: &BreadthQuery, source: &str) -> 
             }
             BreadthPoint {
                 ts: *ts,
-                minute: minute_offset(*ts),
+                minute: cash_session::minute_offset(*ts).unwrap_or(0),
                 above_open: rate(open_yes, open_votes),
                 above_vwap: rate(vwap_yes, vwap_votes),
                 open_yes,
@@ -340,7 +289,7 @@ pub fn build_breadth(rows: &[NamedBars], query: &BreadthQuery, source: &str) -> 
 }
 
 pub fn clock_label(ts: i64) -> String {
-    tr_core::ny::civil(ts).format("%H:%M").to_string()
+    cash_session::clock_label(ts)
 }
 
 struct Candidate {
@@ -386,7 +335,7 @@ impl Draft {
 }
 
 fn draft_member(tf: Timeframe, date: NaiveDate, candidate: &Candidate) -> Result<Draft, String> {
-    let buckets = buckets_on(tf, date, &candidate.bars);
+    let buckets = cash_session::day_buckets(tf, date, &candidate.bars);
     let open_ts = regular_opens(date, tf).into_iter().next().ok_or_else(|| format!("No cash session on {date}."))?;
     let Some(open_bars) = buckets.get(&open_ts) else {
         return Err(exclude_reason(tf, date, candidate));
@@ -454,7 +403,7 @@ fn exclude_reason(tf: Timeframe, date: NaiveDate, candidate: &Candidate) -> Stri
             candidate.ticker
         );
     }
-    if buckets_on(tf, date, &candidate.bars).is_empty() {
+    if cash_session::day_buckets(tf, date, &candidate.bars).is_empty() {
         return format!("{} has no regular-session bars on {date}.", candidate.ticker);
     }
     format!("{} has no single 09:30 print on {date}. A later bar did not stand in.", candidate.ticker)
@@ -475,13 +424,7 @@ fn rate(yes: usize, votes: usize) -> Option<f64> {
 
 fn clean_open_dates(tf: Timeframe, bars: &[Bar]) -> BTreeSet<NaiveDate> {
     let mut out = BTreeSet::new();
-    let mut by_date: BTreeMap<NaiveDate, BTreeMap<i64, Vec<&Bar>>> = BTreeMap::new();
-    for bar in bars {
-        let Some(bucket) = regular_bucket(tf, bar.ts) else { continue };
-        let date = tr_core::ny::civil(bar.ts).date();
-        by_date.entry(date).or_default().entry(bucket).or_default().push(bar);
-    }
-    for (date, buckets) in by_date {
+    for (date, buckets) in cash_session::sessions(tf, bars) {
         let Some(open_ts) = regular_opens(date, tf).into_iter().next() else { continue };
         if buckets.get(&open_ts).is_some_and(|at| at.len() == 1 && positive_open(at[0])) {
             out.insert(date);
@@ -494,30 +437,8 @@ fn positive_open(bar: &Bar) -> bool {
     bar.open.is_finite() && bar.open > 0.0 && bar.close.is_finite()
 }
 
-fn buckets_on<'a>(tf: Timeframe, date: NaiveDate, bars: &'a [Bar]) -> BTreeMap<i64, Vec<&'a Bar>> {
-    let mut out: BTreeMap<i64, Vec<&Bar>> = BTreeMap::new();
-    for bar in bars {
-        if tr_core::ny::civil(bar.ts).date() != date {
-            continue;
-        }
-        if let Some(bucket) = regular_bucket(tf, bar.ts) {
-            out.entry(bucket).or_default().push(bar);
-        }
-    }
-    out
-}
-
 fn latest_regular_date(tf: Timeframe, bars: &[Bar]) -> Option<NaiveDate> {
-    bars.iter().filter(|b| regular_bucket(tf, b.ts).is_some()).map(|b| tr_core::ny::civil(b.ts).date()).max()
-}
-
-fn minute_offset(ts: i64) -> u32 {
-    let wall = tr_core::ny::civil(ts);
-    wall.hour() * 60 + wall.minute() - (9 * 60 + 30)
-}
-
-fn is_cash(sec: &Security) -> bool {
-    matches!(sec.class, AssetClass::Equity | AssetClass::Etf | AssetClass::Index)
+    cash_session::latest_regular_date(tf, bars)
 }
 
 fn excluded(sec: &Security, reason: String) -> Member {
