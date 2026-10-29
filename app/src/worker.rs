@@ -2000,7 +2000,9 @@ async fn intraday_scan(s: &Shared, symbols: &[String]) -> tr_data::iscan::Board 
 }
 
 async fn evaluate_price_alerts(s: &Shared) {
-    use tr_data::price_alerts::{AlertFailure, AlertKind, EvalInput, PriceTick, evaluate, setup_tick, vwap_tick};
+    use tr_data::price_alerts::{
+        AlertFailure, AlertKind, EvalInput, PriceTick, evaluate, rvol_tick, setup_tick, vwap_tick,
+    };
     use tr_data::whats_news::archive_ticker;
     let now = chrono::Utc::now().timestamp();
     let sample = s.provider.name() == "sample";
@@ -2014,6 +2016,7 @@ async fn evaluate_price_alerts(s: &Shared) {
                 prices: Vec::new(),
                 setups: Vec::new(),
                 vwaps: Vec::new(),
+                rvols: Vec::new(),
                 failures: Vec::new(),
             },
         );
@@ -2026,6 +2029,7 @@ async fn evaluate_price_alerts(s: &Shared) {
     }
     let mut price_keys = Vec::new();
     let mut vwap_keys = Vec::new();
+    let mut rvol_keys = Vec::new();
     let mut setup_keys: Vec<(String, String)> = Vec::new();
     for r in rules.iter().filter(|r| r.enabled) {
         match &r.kind {
@@ -2037,6 +2041,11 @@ async fn evaluate_price_alerts(s: &Shared) {
             AlertKind::Vwap { .. } => {
                 if !vwap_keys.iter().any(|s| s == &r.symbol) {
                     vwap_keys.push(r.symbol.clone());
+                }
+            }
+            AlertKind::Rvol { .. } => {
+                if !rvol_keys.iter().any(|s| s == &r.symbol) {
+                    rvol_keys.push(r.symbol.clone());
                 }
             }
             AlertKind::Setup { setup, .. } => setup_keys.push((r.symbol.clone(), setup.clone())),
@@ -2122,9 +2131,20 @@ async fn evaluate_price_alerts(s: &Shared) {
             Err(e) => failures.push(AlertFailure { symbol: key, error: format!("{e:#}") }),
         }
     }
+    // Relative volume needs a prior session at the same offset, so the read is the scan's window.
+    let mut rvols = Vec::new();
+    for key in rvol_keys {
+        match s.provider.history(&key, Timeframe::M5, None, tr_data::iscan::BARS).await {
+            Ok(bars) => match rvol_tick(&key, &bars, now) {
+                Ok(tick) => rvols.push(tick),
+                Err(error) => failures.push(AlertFailure { symbol: key, error }),
+            },
+            Err(e) => failures.push(AlertFailure { symbol: key, error: format!("{e:#}") }),
+        }
+    }
     let outcome = evaluate(
         &mut s.price_alerts.lock().expect("price alerts"),
-        EvalInput { now, sample_provider: false, prices, setups, vwaps, failures },
+        EvalInput { now, sample_provider: false, prices, setups, vwaps, rvols, failures },
     );
     s.persist_price_alerts();
     if !outcome.fired.is_empty() {

@@ -1,4 +1,4 @@
-//! Persistent price-level, session-VWAP, and setup-change alerts.
+//! Persistent price-level, session-VWAP, session-RVOL, and setup-change alerts.
 //!
 //! Rules live in `price_alerts.json`. Evaluation never invents events from sample or
 //! unverified bars. Freshness and partial-failure banners follow the Step 8 news
@@ -81,6 +81,10 @@ pub enum AlertKind {
     Vwap {
         side: PriceSide,
     },
+    /// Session relative volume crossing up through `multiple`, from verified 5-minute bars.
+    Rvol {
+        multiple: f64,
+    },
     Setup {
         setup: String,
         change: SetupChange,
@@ -92,6 +96,7 @@ impl AlertKind {
         match self {
             Self::Price { side, level } => format!("price:{}:{level:.4}", side.as_str()),
             Self::Vwap { side } => format!("vwap:{}", side.as_str()),
+            Self::Rvol { multiple } => format!("rvol:{multiple:.4}"),
             Self::Setup { setup, change } => format!("setup:{setup}:{}", change.as_str()),
         }
     }
@@ -102,6 +107,9 @@ impl AlertKind {
                 a == b && x.is_finite() && y.is_finite() && (x - y).abs() < 1e-6
             }
             (Self::Vwap { side: a }, Self::Vwap { side: b }) => a == b,
+            (Self::Rvol { multiple: x }, Self::Rvol { multiple: y }) => {
+                x.is_finite() && y.is_finite() && (x - y).abs() < 1e-6
+            }
             (Self::Setup { setup: a, change: c }, Self::Setup { setup: b, change: d }) => a == b && c == d,
             _ => false,
         }
@@ -111,6 +119,7 @@ impl AlertKind {
         match self {
             Self::Price { side, level } => format!("{} {level:.2}", side.label()),
             Self::Vwap { side } => format!("{} session VWAP", side.label()),
+            Self::Rvol { multiple } => format!("session RVOL {multiple:.2}×"),
             Self::Setup { setup, change } => format!("{setup} {}", change.label()),
         }
     }
@@ -193,7 +202,7 @@ impl AlertBatch {
             .filter(|r| r.enabled && r.symbol == symbol)
             .filter_map(|r| match r.kind {
                 AlertKind::Price { side, level } => Some((level, side)),
-                AlertKind::Vwap { .. } | AlertKind::Setup { .. } => None,
+                AlertKind::Vwap { .. } | AlertKind::Rvol { .. } | AlertKind::Setup { .. } => None,
             })
             .collect()
     }
@@ -263,6 +272,11 @@ impl Store {
                 return Err("price level must be a positive number".into());
             }
         }
+        if let AlertKind::Rvol { multiple } = kind {
+            if !multiple.is_finite() || multiple <= 0.0 {
+                return Err("RVOL multiple must be a positive number".into());
+            }
+        }
         if let AlertKind::Setup { ref setup, .. } = kind {
             normalize_setup(setup).ok_or_else(|| format!("unknown setup {setup}"))?;
         }
@@ -270,7 +284,7 @@ impl Store {
             return Ok(existing.clone());
         }
         if self.rules.len() >= MAX_RULES {
-            return Err(format!("at most {MAX_RULES} price, VWAP, or setup rules"));
+            return Err(format!("at most {MAX_RULES} price, VWAP, RVOL, or setup rules"));
         }
         let rule = AlertRule {
             id: format!("{symbol}:{}:{now}", kind.fingerprint()),
@@ -368,6 +382,39 @@ pub fn vwap_tick(symbol: impl Into<String>, bars: &[tr_core::Bar], now: i64) -> 
     })
 }
 
+/// Session relative volume through the last regular 5-minute bar.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RvolTick {
+    pub symbol: String,
+    pub rvol: f64,
+    pub bar_ts: i64,
+    pub provenance: Provenance,
+    /// The last regular bar is the one the intraday clock still calls current.
+    pub fresh: bool,
+}
+
+/// Session relative volume from verified 5-minute bars.
+/// A missing prior session, a non-cash name, and sample bars are errors — never a zero.
+pub fn rvol_tick(symbol: impl Into<String>, bars: &[tr_core::Bar], now: i64) -> Result<RvolTick, String> {
+    use crate::intraday::{Freshness, MarketClock};
+    let sec = crate::security(&symbol.into());
+    if !matches!(sec.class, tr_core::AssetClass::Equity | tr_core::AssetClass::Etf | tr_core::AssetClass::Index) {
+        return Err("no US cash session".into());
+    }
+    let symbol = sec.key();
+    tr_core::Bar::require_verified(bars, "RVOL alert")?;
+    let rvol = crate::intraday::relative_volume(tr_core::Timeframe::M5, bars)
+        .filter(|v| v.is_finite() && *v > 0.0)
+        .ok_or_else(|| "no session RVOL from these bars".to_string())?;
+    let print = crate::intraday::session_print(tr_core::Timeframe::M5, bars)
+        .ok_or_else(|| "no regular-session print".to_string())?;
+    let fresh = matches!(
+        crate::intraday::freshness(MarketClock::for_class(sec.class), tr_core::Timeframe::M5, print.bar_ts, now),
+        Some(Freshness::Current)
+    );
+    Ok(RvolTick { symbol, rvol, bar_ts: print.bar_ts, provenance: tr_core::Bar::provenance(bars), fresh })
+}
+
 /// A verified last price used for crossing checks.
 #[derive(Debug, Clone, PartialEq)]
 pub struct PriceTick {
@@ -393,6 +440,7 @@ pub struct EvalInput {
     pub prices: Vec<PriceTick>,
     pub setups: Vec<SetupTick>,
     pub vwaps: Vec<VwapTick>,
+    pub rvols: Vec<RvolTick>,
     pub failures: Vec<AlertFailure>,
 }
 
@@ -443,6 +491,7 @@ pub fn evaluate(store: &mut Store, input: EvalInput) -> EvalOutcome {
     let prices: BTreeMap<_, _> = input.prices.into_iter().map(|t| (t.symbol.clone(), t)).collect();
     let setups: BTreeMap<_, _> = input.setups.into_iter().map(|t| (t.symbol.clone(), t)).collect();
     let vwaps: BTreeMap<_, _> = input.vwaps.into_iter().map(|t| (t.symbol.clone(), t)).collect();
+    let rvols: BTreeMap<_, _> = input.rvols.into_iter().map(|t| (t.symbol.clone(), t)).collect();
     let rules = store.rules.clone();
     for rule in rules.iter().filter(|r| r.enabled) {
         match &rule.kind {
@@ -527,6 +576,43 @@ pub fn evaluate(store: &mut Store, input: EvalInput) -> EvalOutcome {
                 let state = store.states.entry(rule.id.clone()).or_default();
                 state.last_match = Some(above);
                 state.last_price = Some(tick.price);
+                state.last_bar_ts = Some(tick.bar_ts);
+                state.last_eval_at = input.now;
+            }
+            AlertKind::Rvol { multiple } => {
+                let Some(tick) = rvols.get(&rule.symbol) else {
+                    failures.push(AlertFailure {
+                        symbol: rule.symbol.clone(),
+                        error: "no session RVOL for this name".into(),
+                    });
+                    continue;
+                };
+                if !tick.provenance.is_verified() {
+                    failures.push(AlertFailure {
+                        symbol: rule.symbol.clone(),
+                        error: format!("refused {}: RVOL alerts need verified real bars", tick.provenance.label()),
+                    });
+                    continue;
+                }
+                if !tick.fresh {
+                    stale = true;
+                    continue;
+                }
+                let at = tick.rvol >= *multiple;
+                let prev = store.states.get(&rule.id).and_then(|s| s.last_match);
+                if let Some(false) = prev
+                    && at
+                {
+                    let key = format!("{}:rvol:{multiple:.4}:{}", rule.id, tick.bar_ts);
+                    let ticker = crate::security(&rule.symbol).ticker;
+                    let message = format!("{ticker} session RVOL reached {multiple:.2}× at {:.2}×", tick.rvol);
+                    if let Some(event) = store.try_fire(rule, message, key, input.now) {
+                        fired.push(event);
+                    }
+                }
+                let state = store.states.entry(rule.id.clone()).or_default();
+                state.last_match = Some(at);
+                state.last_price = Some(tick.rvol);
                 state.last_bar_ts = Some(tick.bar_ts);
                 state.last_eval_at = input.now;
             }
@@ -635,7 +721,15 @@ mod tests {
     fn eval(store: &mut Store, now: i64, prices: Vec<PriceTick>, setups: Vec<SetupTick>) -> EvalOutcome {
         evaluate(
             store,
-            EvalInput { now, sample_provider: false, prices, setups, vwaps: Vec::new(), failures: Vec::new() },
+            EvalInput {
+                now,
+                sample_provider: false,
+                prices,
+                setups,
+                vwaps: Vec::new(),
+                rvols: Vec::new(),
+                failures: Vec::new(),
+            },
         )
     }
 
@@ -653,7 +747,15 @@ mod tests {
     fn eval_vwap(store: &mut Store, now: i64, vwaps: Vec<VwapTick>) -> EvalOutcome {
         evaluate(
             store,
-            EvalInput { now, sample_provider: false, prices: vec![], setups: vec![], vwaps, failures: vec![] },
+            EvalInput {
+                now,
+                sample_provider: false,
+                prices: vec![],
+                setups: vec![],
+                vwaps,
+                rvols: vec![],
+                failures: vec![],
+            },
         )
     }
 
@@ -727,6 +829,7 @@ mod tests {
                 prices: vec![price("AAPL", 2.0, 10, Provenance::Sample)],
                 setups: vec![],
                 vwaps: vec![],
+                rvols: vec![],
                 failures: vec![],
             },
         );
@@ -909,5 +1012,123 @@ mod tests {
             [Bar::new(wall(2026, 3, 9, 9, 30), 10.0, 12.0, 8.0, 11.0, 100.0).with_provenance(Provenance::Sample)];
         let err = vwap_tick("AAPL", &sample, wall(2026, 3, 9, 9, 36)).unwrap_err();
         assert!(err.contains("SAMPLE"), "{err}");
+    }
+
+    fn rvol_tick_of(symbol: &str, rvol: f64, bar_ts: i64, provenance: Provenance, fresh: bool) -> RvolTick {
+        RvolTick { symbol: crate::security(symbol).key(), rvol, bar_ts, provenance, fresh }
+    }
+
+    fn eval_rvol(store: &mut Store, now: i64, rvols: Vec<RvolTick>) -> EvalOutcome {
+        evaluate(
+            store,
+            EvalInput {
+                now,
+                sample_provider: false,
+                prices: vec![],
+                setups: vec![],
+                vwaps: vec![],
+                rvols,
+                failures: vec![],
+            },
+        )
+    }
+
+    #[test]
+    fn rvol_cross_fires_once_then_recrosses_and_equal_counts_as_reached() {
+        let mut s = Store::default();
+        let rule = s.add_rule("aapl", AlertKind::Rvol { multiple: 2.0 }, 10).unwrap();
+        let again = s.add_rule("AAPL US Equity", AlertKind::Rvol { multiple: 2.0 }, 11).unwrap();
+        assert_eq!(rule.id, again.id);
+        s.add_rule("aapl", AlertKind::Rvol { multiple: 3.0 }, 12).unwrap();
+        assert_eq!(s.rules.len(), 2);
+        assert!(s.add_rule("aapl", AlertKind::Rvol { multiple: 0.0 }, 13).is_err());
+        assert!(s.snapshot(1, false, false, vec![]).price_levels_for("AAPL US Equity").is_empty());
+
+        let seed = eval_rvol(&mut s, 20, vec![rvol_tick_of("AAPL", 1.5, 20, Provenance::Real, true)]);
+        assert!(seed.fired.is_empty(), "first observation only seeds");
+        assert_eq!(s.states[&rule.id].last_match, Some(false));
+
+        let touch = eval_rvol(&mut s, 30, vec![rvol_tick_of("AAPL", 2.0, 30, Provenance::Real, true)]);
+        assert_eq!(touch.fired.len(), 1);
+        assert!(touch.fired[0].message.contains("session RVOL reached 2.00× at 2.00×"));
+        assert_eq!(touch.fired[0].rule_id, rule.id);
+
+        let held = eval_rvol(&mut s, 40, vec![rvol_tick_of("AAPL", 3.0, 40, Provenance::Real, true)]);
+        assert_eq!(held.fired.len(), 1, "the 2× rule stays quiet; the 3× rule crosses once");
+        assert!(held.fired[0].message.contains("3.00×"));
+        let _ = eval_rvol(&mut s, 50, vec![rvol_tick_of("AAPL", 1.2, 50, Provenance::Real, true)]);
+        let recross = eval_rvol(&mut s, 60, vec![rvol_tick_of("AAPL", 2.5, 60, Provenance::Real, true)]);
+        assert_eq!(recross.fired.len(), 1);
+        let dup = eval_rvol(&mut s, 61, vec![rvol_tick_of("AAPL", 2.5, 60, Provenance::Real, true)]);
+        assert!(dup.fired.is_empty(), "the same bar does not fire twice");
+    }
+
+    #[test]
+    fn rvol_stale_bar_does_not_seed_or_move_and_a_missing_tick_does_not_invent() {
+        let mut s = Store::default();
+        let rule = s.add_rule("aapl", AlertKind::Rvol { multiple: 2.0 }, 1).unwrap();
+        let stale = eval_rvol(&mut s, 2, vec![rvol_tick_of("AAPL", 4.0, 2, Provenance::Real, false)]);
+        assert!(stale.fired.is_empty());
+        assert!(stale.batch.stale);
+        assert!(s.states.get(&rule.id).is_none(), "a stale bar does not seed");
+
+        assert!(eval_rvol(&mut s, 3, vec![rvol_tick_of("AAPL", 1.1, 3, Provenance::Real, true)]).fired.is_empty());
+        let closed = eval_rvol(&mut s, 4, vec![rvol_tick_of("AAPL", 5.0, 4, Provenance::Cached, false)]);
+        assert!(closed.fired.is_empty());
+        assert_eq!(s.states[&rule.id].last_match, Some(false));
+        assert_eq!(s.states[&rule.id].last_bar_ts, Some(3));
+        let fire = eval_rvol(&mut s, 5, vec![rvol_tick_of("AAPL", 2.4, 5, Provenance::Real, true)]);
+        assert_eq!(fire.fired.len(), 1);
+
+        let missing = eval_rvol(&mut s, 6, vec![]);
+        assert!(missing.fired.is_empty());
+        assert!(missing.batch.failures[0].error.contains("no session RVOL"));
+        let sample = eval_rvol(&mut s, 7, vec![rvol_tick_of("AAPL", 9.0, 7, Provenance::Sample, true)]);
+        assert!(sample.fired.is_empty());
+        assert!(sample.batch.failures[0].error.contains("SAMPLE"));
+        assert_eq!(s.states[&rule.id].last_match, Some(true));
+        assert_eq!(s.events.len(), 1);
+    }
+
+    #[test]
+    fn rvol_tick_uses_prior_session_volume_and_the_intraday_clock() {
+        fn wall(y: i32, m: u32, d: u32, h: u32, min: u32) -> i64 {
+            tr_core::ny::to_utc(chrono::NaiveDate::from_ymd_opt(y, m, d).unwrap().and_hms_opt(h, min, 0).unwrap())
+        }
+        fn bar(ts: i64, volume: f64) -> Bar {
+            Bar::new(ts, 10.0, 12.0, 8.0, 11.0, volume).with_provenance(Provenance::Real)
+        }
+        let monday = vec![
+            bar(wall(2026, 3, 6, 9, 30), 100.0),
+            bar(wall(2026, 3, 6, 9, 35), 100.0),
+            bar(wall(2026, 3, 9, 9, 30), 300.0),
+            bar(wall(2026, 3, 9, 9, 35), 100.0),
+            Bar::new(wall(2026, 3, 9, 8, 0), 1.0, 1.0, 1.0, 1.0, 1_000.0).with_provenance(Provenance::Real),
+        ];
+        let tick = rvol_tick("AAPL", &monday, wall(2026, 3, 9, 9, 36)).unwrap();
+        assert!(tick.fresh);
+        assert!((tick.rvol - 2.0).abs() < 1e-9);
+        assert_eq!(tick.bar_ts, wall(2026, 3, 9, 9, 35));
+        let index = rvol_tick("SPX Index", &monday, wall(2026, 3, 9, 9, 36)).unwrap();
+        assert!((index.rvol - 2.0).abs() < 1e-9);
+        assert!(!rvol_tick("AAPL", &monday, wall(2026, 3, 9, 10, 7)).unwrap().fresh, "one bar behind is stale");
+
+        let closed_bars = vec![bar(wall(2026, 3, 5, 15, 55), 100.0), bar(wall(2026, 3, 6, 15, 55), 200.0)];
+        let closed = rvol_tick("AAPL", &closed_bars, wall(2026, 3, 7, 12, 0)).unwrap();
+        assert!(!closed.fresh, "Saturday is session closed");
+        assert!((closed.rvol - 2.0).abs() < 1e-9);
+
+        let bare = vec![bar(wall(2026, 3, 9, 9, 30), 300.0), bar(wall(2026, 3, 9, 9, 35), 100.0)];
+        let err = rvol_tick("AAPL", &bare, wall(2026, 3, 9, 9, 36)).unwrap_err();
+        assert!(err.contains("no session RVOL"), "{err}");
+        let zero = vec![bar(wall(2026, 3, 6, 9, 35), 0.0), bar(wall(2026, 3, 9, 9, 35), 0.0)];
+        let err = rvol_tick("AAPL", &zero, wall(2026, 3, 9, 9, 36)).unwrap_err();
+        assert!(err.contains("no session RVOL"), "{err}");
+        let sample =
+            [Bar::new(wall(2026, 3, 9, 9, 30), 10.0, 12.0, 8.0, 11.0, 100.0).with_provenance(Provenance::Sample)];
+        let err = rvol_tick("AAPL", &sample, wall(2026, 3, 9, 9, 36)).unwrap_err();
+        assert!(err.contains("SAMPLE"), "{err}");
+        let err = rvol_tick("EURUSD", &monday, wall(2026, 3, 9, 9, 36)).unwrap_err();
+        assert!(err.contains("no US cash session"), "{err}");
     }
 }
