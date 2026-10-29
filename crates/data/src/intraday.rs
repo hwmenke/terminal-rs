@@ -464,6 +464,13 @@ pub fn volume_profile(tf: Timeframe, bars: &[Bar], bins: usize) -> Vec<VolumeBin
         .collect()
 }
 
+/// Volume profile of verified bars only. Sample and missing prints contribute no bin.
+/// An empty result is no profile, not a flat one.
+pub fn verified_profile(tf: Timeframe, bars: &[Bar], bins: usize) -> Vec<VolumeBin> {
+    let kept: Vec<Bar> = bars.iter().copied().filter(|b| b.provenance.is_verified()).collect();
+    volume_profile(tf, &kept, bins)
+}
+
 /// Derived intraday stats. Every field stays empty when the inputs do not support it.
 #[derive(Debug, Clone, PartialEq)]
 pub struct BarStats {
@@ -843,6 +850,50 @@ mod tests {
         let mut sample = bars.clone();
         sample[0].provenance = Provenance::Sample;
         assert!(prior_session(Timeframe::M30, &sample).is_none());
+    }
+
+    #[test]
+    fn verified_profile_uses_the_latest_session_volume_only() {
+        let bar = |y, m, d, h, min, high, low, close, volume, provenance| {
+            Bar::new(wall(y, m, d, h, min), close, high, low, close, volume).with_provenance(provenance)
+        };
+        let monday = [
+            bar(2026, 3, 9, 9, 30, 12.0, 10.0, 11.0, 100.0, Provenance::Real),
+            bar(2026, 3, 9, 9, 35, 20.0, 18.0, 19.0, 300.0, Provenance::Real),
+        ];
+        let mut bars = vec![
+            bar(2026, 3, 6, 9, 30, 30.0, 1.0, 15.0, 5_000.0, Provenance::Real),
+            bar(2026, 3, 9, 8, 0, 40.0, 1.0, 20.0, 9_000.0, Provenance::Real),
+        ];
+        bars.extend(monday);
+        let profile = verified_profile(Timeframe::M5, &bars, 24);
+        assert_eq!(profile.len(), 2);
+        let total: f64 = profile.iter().map(|b| b.volume).sum();
+        assert!((total - 400.0).abs() < 1e-9);
+        let peak = profile.iter().max_by(|a, b| a.volume.total_cmp(&b.volume)).unwrap();
+        assert!((peak.volume - 300.0).abs() < 1e-9);
+        let width = 10.0 / 24.0;
+        assert!((peak.price - (10.0 + 21.5 * width)).abs() < 1e-9);
+        let light = profile.iter().find(|b| (b.volume - 100.0).abs() < 1e-9).unwrap();
+        assert!((light.price - (10.0 + 2.5 * width)).abs() < 1e-9);
+
+        let mut cached = monday;
+        cached[0].provenance = Provenance::Cached;
+        cached[1].provenance = Provenance::Cached;
+        assert_eq!(verified_profile(Timeframe::M5, &cached, 24).len(), 2);
+
+        let sample: Vec<_> = monday
+            .into_iter()
+            .map(|mut b| {
+                b.provenance = Provenance::Sample;
+                b
+            })
+            .collect();
+        assert!(verified_profile(Timeframe::M5, &sample, 24).is_empty());
+        assert!(verified_profile(Timeframe::D1, &bars, 24).is_empty());
+        assert!(verified_profile(Timeframe::H4, &bars, 24).is_empty());
+        let flat = [bar(2026, 3, 9, 9, 30, 11.0, 11.0, 11.0, 0.0, Provenance::Real)];
+        assert!(verified_profile(Timeframe::M5, &flat, 24).is_empty());
     }
 
     #[test]

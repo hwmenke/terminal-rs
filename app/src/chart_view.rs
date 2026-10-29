@@ -123,6 +123,34 @@ fn prior_line(tf: Timeframe, sec: &Security, bars: &[Bar]) -> Option<String> {
     ))
 }
 
+/// Share of session volume in one profile bin. `None` when the session has no volume.
+fn profile_share(volume: f64, total: f64) -> Option<String> {
+    if !(volume.is_finite() && total.is_finite() && total > 0.0) {
+        return None;
+    }
+    let pct = volume / total * 100.0;
+    if !pct.is_finite() {
+        return None;
+    }
+    Some(if (pct - pct.round()).abs() < 0.05 { format!("{pct:.0}%") } else { format!("{pct:.1}%") })
+}
+
+/// Latest regular session's verified volume profile. Empty when no verified volume is present.
+fn profile_line(tf: Timeframe, sec: &Security, bars: &[Bar]) -> Option<String> {
+    if !tf.is_intraday() || !matches!(sec.class, AssetClass::Equity | AssetClass::Etf | AssetClass::Index) {
+        return None;
+    }
+    let profile = tr_data::intraday::verified_profile(tf, bars, 24);
+    if profile.is_empty() {
+        return None;
+    }
+    let total: f64 = profile.iter().map(|b| b.volume).sum();
+    let peak = profile.iter().max_by(|a, b| a.volume.total_cmp(&b.volume))?;
+    let share = profile_share(peak.volume, total)?;
+    let prec = sec.decimals(peak.price);
+    Some(format!("VP {}  peak {:.prec$}  {share}", profile.len(), peak.price))
+}
+
 /// Length of the load-in sweep across the visible bars.
 const REVEAL_SECS: f32 = 0.7;
 /// Length of an eased jump (quick ranges, reset, keyboard zoom and pan).
@@ -1388,6 +1416,7 @@ impl ChartState {
         }
 
         // ---- drawings ----
+        self.paint_volume_profile(ui, price_rect, &scale);
         self.paint_review_levels(ui, price_rect, &scale);
         self.paint_alert_levels(ui, price_rect, &scale);
         self.paint_opening_range(ui, price_rect, &scale);
@@ -1737,6 +1766,10 @@ impl ChartState {
             p.text(pos2(price_rect.left() + 6.0, ly), Align2::LEFT_TOP, line, mono(11.0), amber());
             ly += 14.0;
         }
+        if let Some(line) = profile_line(self.tf, &self.sec, &self.bars) {
+            p.text(pos2(price_rect.left() + 6.0, ly), Align2::LEFT_TOP, line, mono(11.0), theme::series(2));
+            ly += 14.0;
+        }
         if self.extended && self.offers_extended() {
             let line = tr_data::intraday::extended_summary(&self.bars);
             p.text(pos2(price_rect.left() + 6.0, ly), Align2::LEFT_TOP, line, mono(11.0), amber());
@@ -1888,6 +1921,41 @@ impl ChartState {
                 mono(10.0),
                 color,
             );
+        }
+    }
+
+    fn paint_volume_profile(&self, ui: &Ui, rect: Rect, scale: &PriceScale) {
+        if !self.tf.is_intraday() || !matches!(self.sec.class, AssetClass::Equity | AssetClass::Etf | AssetClass::Index)
+        {
+            return;
+        }
+        let profile = tr_data::intraday::verified_profile(self.tf, &self.bars, 24);
+        if profile.is_empty() {
+            return;
+        }
+        let total: f64 = profile.iter().map(|b| b.volume).sum();
+        let Some(peak_price) = profile.iter().max_by(|a, b| a.volume.total_cmp(&b.volume)).map(|b| b.price) else {
+            return;
+        };
+        let max = profile.iter().map(|b| b.volume).fold(0.0, f64::max);
+        if !(max.is_finite() && max > 0.0) {
+            return;
+        }
+        let p = ui.painter_at(rect);
+        let max_w = (rect.width() * 0.18).clamp(28.0, 80.0);
+        for bin in &profile {
+            let y = rect.top() + scale.y_of(bin.price) as f32;
+            if !rect.y_range().contains(y) {
+                continue;
+            }
+            let w = ((bin.volume / max) as f32 * max_w).max(2.0);
+            let bar = Rect::from_min_max(pos2(rect.right() - w, y - 3.0), pos2(rect.right() - 2.0, y + 3.0));
+            p.rect_filled(bar, 1.0, theme::series(2).gamma_multiply(0.55));
+            if (bin.price - peak_price).abs() < 1e-9
+                && let Some(share) = profile_share(bin.volume, total)
+            {
+                p.text(pos2(bar.left() - 4.0, y), Align2::RIGHT_CENTER, share, mono(10.0), theme::series(2));
+            }
         }
     }
 
@@ -2689,6 +2757,46 @@ mod tests {
         assert_eq!(fx.sec.class, AssetClass::Fx);
         assert!(!contains_text(&output.shapes, "PDH 12.00  PDL 9.00  PDC 10.50"));
         assert!(!contains_text(&output.shapes, "PDH 12.00"));
+    }
+
+    #[test]
+    fn volume_profile_legend_and_bars_use_verified_session_volume() {
+        fn wall(y: i32, m: u32, d: u32, h: u32, min: u32) -> i64 {
+            tr_core::ny::to_utc(chrono::NaiveDate::from_ymd_opt(y, m, d).unwrap().and_hms_opt(h, min, 0).unwrap())
+        }
+        let bar = |h: u32, m: u32, high: f64, low: f64, close: f64, volume: f64| {
+            tr_core::Bar::new(wall(2026, 3, 9, h, m), close, high, low, close, volume)
+                .with_provenance(tr_core::Provenance::Real)
+        };
+        let bars = std::sync::Arc::new(vec![bar(9, 30, 12.0, 10.0, 11.0, 100.0), bar(9, 35, 20.0, 18.0, 19.0, 300.0)]);
+        let ctx = egui::Context::default();
+        let (worker, _) = Worker::test_channel();
+        let mut chart = ChartState::new(15, "AAPL", Timeframe::M5);
+        chart.on_history(chart.generation, bars.clone(), SeriesGpu::build(&bars), 0, false, true, false, &worker);
+        let output = chart_frame(&ctx, &mut chart, &worker, vec![]);
+        assert!(contains_text(&output.shapes, "VP 2  peak 18.96  75%"));
+        assert!(contains_text(&output.shapes, "75%"));
+
+        let sample = std::sync::Arc::new(
+            bars.iter()
+                .map(|b| {
+                    let mut b = *b;
+                    b.provenance = tr_core::Provenance::Sample;
+                    b
+                })
+                .collect::<Vec<_>>(),
+        );
+        chart.on_history(chart.generation, sample.clone(), SeriesGpu::build(&sample), 0, false, true, false, &worker);
+        let output = chart_frame(&ctx, &mut chart, &worker, vec![]);
+        assert!(!contains_text(&output.shapes, "VP 2  peak 18.96  75%"));
+        assert!(!contains_text(&output.shapes, "75%"));
+
+        let mut fx = ChartState::new(16, "EURUSD", Timeframe::M5);
+        fx.on_history(fx.generation, bars.clone(), SeriesGpu::build(&bars), 0, false, true, false, &worker);
+        let output = chart_frame(&ctx, &mut fx, &worker, vec![]);
+        assert_eq!(fx.sec.class, AssetClass::Fx);
+        assert!(!contains_text(&output.shapes, "VP 2  peak 18.96  75%"));
+        assert!(!contains_text(&output.shapes, "75%"));
     }
 
     #[test]
