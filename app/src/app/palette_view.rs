@@ -121,6 +121,7 @@ const COMMANDS: &[(&str, &str, &str, Option<Action>)] = &[
         "volume pace cumulative rvol prior sessions",
         None,
     ),
+    ("AAPL RVAR 20 5m", "Session and rolling realized volatility", "realized volatility log returns", None),
     ("AAPL VPACE 20", "AAPL cumulative volume versus the last 20 sessions", "volume pace 20", None),
     ("AAPL VPACE 15m", "AAPL volume pace on 15-minute bars", "cumulative volume 15m", None),
     ("GFILL", "Gap fill: today's open versus the prior cash close", "gap fill prior close opening drive", None),
