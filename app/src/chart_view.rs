@@ -108,6 +108,21 @@ fn opening_line(tf: Timeframe, sec: &Security, bars: &[Bar]) -> Option<String> {
     Some(format!("OR30  H {high:.prec$}  L {low:.prec$}", high = range.high, low = range.low))
 }
 
+/// Prior cash session high, low, and close, when that session is complete in `bars`.
+fn prior_line(tf: Timeframe, sec: &Security, bars: &[Bar]) -> Option<String> {
+    if !tf.is_intraday() || !matches!(sec.class, AssetClass::Equity | AssetClass::Etf | AssetClass::Index) {
+        return None;
+    }
+    let prior = tr_data::intraday::prior_session(tf, bars)?;
+    let prec = sec.decimals(prior.high).max(sec.decimals(prior.low)).max(sec.decimals(prior.close));
+    Some(format!(
+        "PDH {high:.prec$}  PDL {low:.prec$}  PDC {close:.prec$}",
+        high = prior.high,
+        low = prior.low,
+        close = prior.close
+    ))
+}
+
 /// Length of the load-in sweep across the visible bars.
 const REVEAL_SECS: f32 = 0.7;
 /// Length of an eased jump (quick ranges, reset, keyboard zoom and pan).
@@ -1376,6 +1391,7 @@ impl ChartState {
         self.paint_review_levels(ui, price_rect, &scale);
         self.paint_alert_levels(ui, price_rect, &scale);
         self.paint_opening_range(ui, price_rect, &scale);
+        self.paint_prior_session(ui, price_rect, &scale);
         self.paint_drawings(ui, price_rect, &v, &scale, hover, &plot_resp);
 
         // ---- congress markers ----
@@ -1717,6 +1733,10 @@ impl ChartState {
             p.text(pos2(price_rect.left() + 6.0, ly), Align2::LEFT_TOP, line, mono(11.0), theme::up());
             ly += 14.0;
         }
+        if let Some(line) = prior_line(self.tf, &self.sec, &self.bars) {
+            p.text(pos2(price_rect.left() + 6.0, ly), Align2::LEFT_TOP, line, mono(11.0), amber());
+            ly += 14.0;
+        }
         if self.extended && self.offers_extended() {
             let line = tr_data::intraday::extended_summary(&self.bars);
             p.text(pos2(price_rect.left() + 6.0, ly), Align2::LEFT_TOP, line, mono(11.0), amber());
@@ -1854,6 +1874,32 @@ impl ChartState {
         let Some(range) = tr_data::intraday::opening_range(self.tf, &self.bars) else { return };
         let p = ui.painter_at(rect);
         let rows = [(range.high, "ORH", theme::up()), (range.low, "ORL", theme::down())];
+        for (price, tag, color) in rows {
+            let y = rect.top() + scale.y_of(price) as f32;
+            if !rect.y_range().contains(y) {
+                continue;
+            }
+            dashed_h(&p, rect.x_range(), y, Stroke::new(1.0, color.gamma_multiply(0.85)));
+            let prec = self.sec.decimals(price);
+            p.text(
+                pos2(rect.left() + 6.0, y - 12.0),
+                Align2::LEFT_TOP,
+                format!("{tag} {price:.prec$}"),
+                mono(10.0),
+                color,
+            );
+        }
+    }
+
+    fn paint_prior_session(&self, ui: &Ui, rect: Rect, scale: &PriceScale) {
+        if !self.tf.is_intraday() || !matches!(self.sec.class, AssetClass::Equity | AssetClass::Etf | AssetClass::Index)
+        {
+            return;
+        }
+        let Some(prior) = tr_data::intraday::prior_session(self.tf, &self.bars) else { return };
+        let p = ui.painter_at(rect);
+        let rows =
+            [(prior.high, "PDH", amber()), (prior.low, "PDL", theme::cyan()), (prior.close, "PDC", theme::series(4))];
         for (price, tag, color) in rows {
             let y = rect.top() + scale.y_of(price) as f32;
             if !rect.y_range().contains(y) {
@@ -2578,6 +2624,71 @@ mod tests {
         assert!(!contains_text(&output.shapes, "OR30  H 13.00  L 8.00"));
         assert!(!contains_text(&output.shapes, "ORH 13.00"));
         assert!(!contains_text(&output.shapes, "ORL 8.00"));
+    }
+
+    #[test]
+    fn prior_session_legend_and_lines_need_the_full_previous_day() {
+        fn wall(y: i32, m: u32, d: u32, h: u32, min: u32) -> i64 {
+            tr_core::ny::to_utc(chrono::NaiveDate::from_ymd_opt(y, m, d).unwrap().and_hms_opt(h, min, 0).unwrap())
+        }
+        let friday = chrono::NaiveDate::from_ymd_opt(2026, 3, 6).unwrap();
+        let mut bars: Vec<tr_core::Bar> = tr_data::intraday::regular_opens(friday, Timeframe::M30)
+            .into_iter()
+            .map(|ts| tr_core::Bar::new(ts, 10.4, 11.0, 10.0, 10.4, 8.0).with_provenance(tr_core::Provenance::Real))
+            .collect();
+        let missing = bars[3].ts;
+        bars[1].high = 12.0;
+        let low_at = bars.len() - 4;
+        bars[low_at].low = 9.0;
+        bars.last_mut().unwrap().close = 10.5;
+        bars.push(
+            tr_core::Bar::new(wall(2026, 3, 9, 10, 0), 11.0, 11.2, 10.6, 11.0, 8.0)
+                .with_provenance(tr_core::Provenance::Real),
+        );
+        let complete = std::sync::Arc::new(bars);
+        let ctx = egui::Context::default();
+        let (worker, _) = Worker::test_channel();
+        let mut chart = ChartState::new(13, "AAPL", Timeframe::M30);
+        chart.on_history(
+            chart.generation,
+            complete.clone(),
+            SeriesGpu::build(&complete),
+            0,
+            false,
+            true,
+            false,
+            &worker,
+        );
+        let output = chart_frame(&ctx, &mut chart, &worker, vec![]);
+        assert!(contains_text(&output.shapes, "PDH 12.00  PDL 9.00  PDC 10.50"));
+        assert!(contains_text(&output.shapes, "PDH 12.00"));
+        assert!(contains_text(&output.shapes, "PDL 9.00"));
+        assert!(contains_text(&output.shapes, "PDC 10.50"));
+
+        let incomplete: Vec<_> = complete.iter().cloned().filter(|b| b.ts != missing).collect();
+        let incomplete = std::sync::Arc::new(incomplete);
+        chart.on_history(
+            chart.generation,
+            incomplete.clone(),
+            SeriesGpu::build(&incomplete),
+            0,
+            false,
+            true,
+            false,
+            &worker,
+        );
+        let output = chart_frame(&ctx, &mut chart, &worker, vec![]);
+        assert!(!contains_text(&output.shapes, "PDH 12.00  PDL 9.00  PDC 10.50"));
+        assert!(!contains_text(&output.shapes, "PDH 12.00"));
+        assert!(!contains_text(&output.shapes, "PDL 9.00"));
+        assert!(!contains_text(&output.shapes, "PDC 10.50"));
+
+        let mut fx = ChartState::new(14, "EURUSD", Timeframe::M30);
+        fx.on_history(fx.generation, complete.clone(), SeriesGpu::build(&complete), 0, false, true, false, &worker);
+        let output = chart_frame(&ctx, &mut fx, &worker, vec![]);
+        assert_eq!(fx.sec.class, AssetClass::Fx);
+        assert!(!contains_text(&output.shapes, "PDH 12.00  PDL 9.00  PDC 10.50"));
+        assert!(!contains_text(&output.shapes, "PDH 12.00"));
     }
 
     #[test]
