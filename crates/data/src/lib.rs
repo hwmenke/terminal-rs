@@ -13,6 +13,7 @@
 //! unreachable, so the terminal always has something to draw.
 
 pub mod alpaca;
+pub mod autocorr;
 pub mod backtest;
 pub mod cache;
 pub mod cash_levels;

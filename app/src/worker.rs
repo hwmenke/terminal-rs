@@ -106,6 +106,13 @@ pub enum Request {
         spec: String,
         timeframe: String,
     },
+    Autocorr {
+        pane: PaneId,
+        generation: u64,
+        symbol: String,
+        spec: String,
+        timeframe: String,
+    },
     /// Today's open versus the prior cash close.
     GapFill {
         pane: PaneId,
@@ -454,6 +461,11 @@ pub enum Response {
         pane: PaneId,
         generation: u64,
         result: Result<tr_data::realized_vol::RealizedVol, String>,
+    },
+    Autocorr {
+        pane: PaneId,
+        generation: u64,
+        result: Result<tr_data::autocorr::Autocorr, String>,
     },
     GapFill {
         pane: PaneId,
@@ -1300,6 +1312,36 @@ async fn research_realized_vol(
     let source = format!("{} {} regular session", s.provider.name(), query.timeframe.label());
     tr_data::realized_vol::build_vol(&sec.key(), &bars, &query, &source).map_err(anyhow::Error::msg)
 }
+async fn research_autocorr(
+    s: &Shared,
+    symbol: &str,
+    spec: &str,
+    timeframe: &str,
+) -> anyhow::Result<tr_data::autocorr::Autocorr> {
+    if s.provider.name() == "sample" {
+        anyhow::bail!(
+            "Return autocorrelation refused: sample / offline display mode does not feed this pane. Sample prices are never used."
+        );
+    }
+    let sec = tr_data::security(symbol);
+    if !matches!(sec.class, tr_core::AssetClass::Equity | tr_core::AssetClass::Etf | tr_core::AssetClass::Index) {
+        anyhow::bail!(
+            "{} has no US cash session. Return autocorrelation uses the regular session from 09:30.",
+            sec.ticker
+        );
+    }
+    let query = tr_data::autocorr::parse_query(spec, timeframe).map_err(anyhow::Error::msg)?;
+    let limit = tr_data::autocorr::fetch_limit(query.timeframe);
+    let bars = s.provider.history(&sec.key(), query.timeframe, None, limit).await?;
+    if bars.is_empty() {
+        anyhow::bail!(
+            "Return autocorrelation refused: no regular-session bars were returned. Sample prices are never used."
+        );
+    }
+    Bar::require_verified(&bars, "Return autocorrelation").map_err(anyhow::Error::msg)?;
+    let source = format!("{} {} regular session", s.provider.name(), query.timeframe.label());
+    tr_data::autocorr::build_autocorr(&sec.key(), &bars, &query, &source).map_err(anyhow::Error::msg)
+}
 
 /// Verified regular-session bars for one cash name. Sample substitution is refused.
 async fn research_gap_fill(
@@ -1794,6 +1836,13 @@ async fn handle(s: &Arc<Shared>, req: Request) {
                 pane,
                 generation,
                 result: research_realized_vol(s, &symbol, &spec, &timeframe).await.map_err(|e| format!("{e:#}")),
+            });
+        }
+        Request::Autocorr { pane, generation, symbol, spec, timeframe } => {
+            send(Response::Autocorr {
+                pane,
+                generation,
+                result: research_autocorr(s, &symbol, &spec, &timeframe).await.map_err(|e| format!("{e:#}")),
             });
         }
         Request::GapFill { pane, generation, symbol, spec, timeframe } => {
