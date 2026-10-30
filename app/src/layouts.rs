@@ -207,6 +207,14 @@ pub enum PaneSettings {
         #[serde(default)]
         tf: String,
     },
+    Autocorr {
+        #[serde(default)]
+        symbol: String,
+        #[serde(default)]
+        spec: String,
+        #[serde(default)]
+        tf: String,
+    },
     /// Today's open versus the prior cash close, and the historical fill rate.
     GapFill {
         #[serde(default)]
