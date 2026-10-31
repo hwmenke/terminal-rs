@@ -30,12 +30,7 @@ pub struct PortfolioPane {
     pub sort: PosSort,
     /// Orders: only open ones.
     pub open_only: bool,
-    pub risk_history: std::collections::HashMap<String, Vec<tr_core::Bar>>,
-    pub risk_loading: bool,
     pub open_risk: bool,
-    pub risk_generation: u64,
-    pub risk_error: Option<String>,
-    pub concentration: f64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
@@ -55,12 +50,7 @@ impl PortfolioPane {
             symbol: None,
             sort: PosSort::Value,
             open_only: false,
-            risk_history: Default::default(),
-            risk_loading: false,
             open_risk: false,
-            risk_generation: 0,
-            risk_error: None,
-            concentration: 0.2,
         }
     }
 

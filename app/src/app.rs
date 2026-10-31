@@ -971,6 +971,7 @@ pub struct TerminalApp {
     last_chrome_poll: Option<Instant>,
     /// Brokerage integration (SnapTrade credentials and the loaded portfolio).
     broker: broker::BrokerState,
+    holding_risk: desk::HoldingRiskState,
     /// Order ticket and trading dialogs.
     trading: trading::TradingState,
     /// The paper-trading demo account (selected by default).
@@ -1052,6 +1053,7 @@ impl TerminalApp {
         let (demo, demo_note) = demo::DemoState::load(demo::demo_path());
         let mut app = Self {
             broker,
+            holding_risk: Default::default(),
             trading: Default::default(),
             demo,
             worker,
@@ -1618,13 +1620,13 @@ impl TerminalApp {
                     }
                 }
                 Response::HoldingHistory { pane, generation, rows, error } => {
-                    if let Some(PaneKind::Portfolio(p)) =
-                        self.panes.iter_mut().find(|p| p.id == pane).map(|p| &mut p.kind)
-                        && p.risk_generation == generation
-                    {
-                        p.risk_loading = false;
-                        p.risk_history = rows.into_iter().collect();
-                        p.risk_error = error;
+                    let _ = pane;
+                    if self.holding_risk.generation == generation {
+                        self.holding_risk.loading = false;
+                        self.holding_risk.history.extend(rows);
+                        self.holding_risk.error = error;
+                        let pf = if self.demo_mode() { Some(&*self.demo.pf) } else { self.broker.portfolio.as_deref() };
+                        self.holding_risk.recompute(pf);
                     }
                 }
                 Response::Desk { pane, generation, result } => {
@@ -2424,6 +2426,7 @@ impl eframe::App for TerminalApp {
         theme::refresh(&ctx, &self.themes[ti], self.system_accent);
         self.drain();
         self.periodic();
+        self.sync_holding_risk();
 
         let screen = ui.max_rect();
         let open = anim::spring_with(
@@ -2571,6 +2574,7 @@ mod tests {
         };
         TerminalApp {
             broker,
+            holding_risk: Default::default(),
             trading: Default::default(),
             demo,
             worker,

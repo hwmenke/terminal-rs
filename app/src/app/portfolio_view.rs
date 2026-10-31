@@ -1211,18 +1211,18 @@ mod tests {
 }
 
 /// Compute risks with the same account, symbol and currency scope as the strip.
-pub(super) fn holding_risks(pane: &PortfolioPane, pf: &Portfolio) -> Vec<tr_core::indicators::HoldingRisk> {
+pub(super) fn holding_risks(pane: &PortfolioPane, pf: &Portfolio, risk: &super::desk::HoldingRiskState) -> Vec<tr_core::indicators::HoldingRisk> {
     pf.positions.iter()
         .filter(|p| pane.account.as_ref().is_none_or(|a| *a == p.account_id))
         .filter(|p| matches_symbol(pane, p.market_key()))
         .map(|p| {
-            let bars = p.market_key().and_then(|k| pane.risk_history.get(&k));
+            let bars = p.market_key().and_then(|k| risk.history.get(&k));
             let values: Option<Vec<_>> = pf.positions.iter()
                 .filter(|q| q.currency == p.currency && pane.account.as_ref().is_none_or(|a| *a == q.account_id))
                 .map(|q| q.market_value().filter(|v| v.is_finite()).map(f64::abs)).collect();
             let total = values.map(|v| v.iter().sum::<f64>()).filter(|v| *v > 0.0);
             let weight = p.market_value().zip(total).map(|(v, t)| v.abs() / t);
-            tr_core::indicators::holding_risk(bars.map(Vec::as_slice).unwrap_or(&[]), weight, pane.concentration)
+            tr_core::indicators::holding_risk(bars.map(Vec::as_slice).unwrap_or(&[]), weight, risk.concentration)
         }).collect()
 }
 
@@ -1233,6 +1233,7 @@ pub(super) fn risk_chips(
     pf: &Portfolio,
     worker: &crate::worker::Worker,
     id: crate::dock::PaneId,
+    risk: &mut super::desk::HoldingRiskState,
 ) {
     if !matches!(pane.view, PortView::Summary | PortView::Positions) {
         return;
@@ -1241,34 +1242,36 @@ pub(super) fn risk_chips(
     egui::CollapsingHeader::new("Holdings risk · daily archive").open(force_open.then_some(true)).show(ui, |ui| {
         ui.horizontal(|ui| {
             ui.label("Concentration threshold (%)");
-            let mut percent = pane.concentration * 100.0;
+            let mut percent = risk.concentration * 100.0;
             if ui.add(egui::DragValue::new(&mut percent).range(0.0..=100.0)).changed() {
-                pane.concentration = percent / 100.0;
+                risk.concentration = percent / 100.0;
+                risk.recompute(Some(pf));
             }
-            if ui.add_enabled(!pane.risk_loading, egui::Button::new("Load / refresh risk")).clicked() {
-                pane.risk_generation += 1;
-                pane.risk_loading = true;
+            if ui.add_enabled(!risk.loading, egui::Button::new("Load / refresh risk")).clicked() {
+                risk.generation += 1;
+                risk.requested = true;
+                risk.loading = true;
                 let mut symbols: Vec<_> = pf.positions.iter()
                     .filter(|p| pane.account.as_ref().is_none_or(|a| *a == p.account_id))
                     .filter_map(|p| p.market_key()).collect();
                 symbols.sort(); symbols.dedup();
                 worker.send(crate::worker::Request::HoldingHistory { pane: id,
-                    generation: pane.risk_generation, symbols });
+                    generation: risk.generation, symbols });
             }
-            if pane.risk_loading { ui.spinner(); }
+            if risk.loading { ui.spinner(); }
         });
         ui.label("SMA50 and RSI14 use daily archive closes. Weight = absolute broker value / gross holdings in the same currency and selected account scope. RSI OB ≥70; OS ≤30.");
-        if let Some(e) = &pane.risk_error { ui.colored_label(amber(), e); }
+        if let Some(e) = &risk.error { ui.colored_label(amber(), e); }
         for p in pf.positions.iter().filter(|p| pane.account.as_ref().is_none_or(|a| *a == p.account_id))
             .filter(|p| matches_symbol(pane, p.market_key())) {
             let key = p.market_key();
-            let bars = key.as_ref().and_then(|k| pane.risk_history.get(k));
+            let bars = key.as_ref().and_then(|k| risk.history.get(k));
             let values: Option<Vec<_>> = pf.positions.iter()
                 .filter(|q| q.currency == p.currency && pane.account.as_ref().is_none_or(|a| *a == q.account_id))
                 .map(|q| q.market_value().filter(|v| v.is_finite()).map(f64::abs)).collect();
             let total = values.map(|v| v.iter().sum::<f64>()).filter(|v| *v > 0.0);
             let weight = p.market_value().zip(total).map(|(v,t)| v.abs()/t);
-            let risk = tr_core::indicators::holding_risk(bars.map(Vec::as_slice).unwrap_or(&[]), weight, pane.concentration);
+            let risk = tr_core::indicators::holding_risk(bars.map(Vec::as_slice).unwrap_or(&[]), weight, risk.concentration);
             ui.horizontal_wrapped(|ui| {
                 ui.label(&p.symbol);
                 let ma = match risk.above_sma50 { Some(true) => "≥ SMA50", Some(false) => "< SMA50", None => "SMA50 —" };

@@ -25,6 +25,8 @@ pub struct Conditions {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Metrics {
     #[serde(default)]
+    pub adma_stretch: Option<f64>,
+    #[serde(default)]
     pub stretch_pct: Option<f64>,
     #[serde(default)]
     pub stretch_atr: Option<f64>,
@@ -172,6 +174,7 @@ pub fn calculate(b: &[Bar]) -> std::result::Result<Metrics, String> {
         };
     let stretch = tr_core::indicators::sma50_stretch(b);
     let metrics = Metrics {
+        adma_stretch: tr_core::indicators::adma_stretch(&b.iter().map(|b| b.close).collect::<Vec<_>>()),
         stretch_pct: stretch.map(|s| s.pct),
         stretch_atr: stretch.and_then(|s| s.atr_units),
         change_pct: (last.close / b[n - 2].close - 1.0) * 100.0,
@@ -407,10 +410,11 @@ pub enum Sort {
     StretchAtr,
     StretchPct,
     SpyStrength,
+    AdmaStretch,
 }
 impl Sort {
     /// Additional desk sorts, alongside the original scanner sort set.
-    pub const DESK: [Self; 3] = [Self::StretchAtr, Self::StretchPct, Self::SpyStrength];
+    pub const DESK: [Self; 4] = [Self::StretchAtr, Self::StretchPct, Self::SpyStrength, Self::AdmaStretch];
     pub const ALL: [Self; 7] =
         [Self::Symbol, Self::Score, Self::Strength, Self::Rsi, Self::Volume, Self::VolumeRatio, Self::Range];
     pub fn label(self) -> &'static str {
@@ -425,6 +429,7 @@ impl Sort {
             Self::StretchAtr => "SMA50 Stretch ATR14",
             Self::StretchPct => "SMA50 Stretch %",
             Self::SpyStrength => "SPY relative 63d %",
+            Self::AdmaStretch => "ADMA Stretch",
         }
     }
     fn value(self, r: &ScanRow) -> Option<f64> {
@@ -440,6 +445,7 @@ impl Sort {
             Self::StretchAtr => m.stretch_atr,
             Self::StretchPct => m.stretch_pct,
             Self::SpyStrength => m.rs_spy_63d,
+            Self::AdmaStretch => m.adma_stretch,
         }
     }
 }
@@ -1042,5 +1048,21 @@ mod desk_metric_tests {
         assert!(m.stretch_atr.unwrap() > 0.0);
         let scan = cache.scan("RSI_OB", vec![("AAPL".into(), bars(110.0))], Provenance::Real).unwrap().0;
         assert_eq!(scan.results[0].metrics.as_ref().unwrap().rs_spy_63d, None);
+    }
+}
+
+#[cfg(test)]
+mod adma_sort_tests {
+    use super::*;
+
+    #[test]
+    fn adma_is_a_separate_signed_sort() {
+        let row = ScanRow { metrics: Some(Metrics {
+            adma_stretch: Some(-3.0), stretch_pct: Some(8.0), ..Default::default()
+        }), ..Default::default() };
+        assert_eq!(Sort::AdmaStretch.value(&row), Some(-3.0));
+        assert_eq!(Sort::StretchPct.value(&row), Some(8.0));
+        assert_eq!(Sort::AdmaStretch.value(&ScanRow::default()), None);
+        assert!(Sort::DESK.contains(&Sort::AdmaStretch));
     }
 }

@@ -165,3 +165,42 @@ mod tests {
         assert!(daily_relative_return(&b[..63], &spy, 63).is_none());
     }
 }
+
+/// ADMA(er=20, fast=2, slow=60) signed stretch in percent.
+/// Source: /workspace/codex-runs/wn60/adaptive_trend.py::_adaptive_ma and
+/// /workspace/codex-runs/wn60/equity_engine.py::adma_stretch.
+pub fn adma_stretch(close: &[f64]) -> Option<f64> {
+    if close.len() < 40 || close.iter().any(|v| !v.is_finite() || *v <= 0.0) {
+        return None;
+    }
+    let mut ma = close[19];
+    let slow = 2.0 / 61.0;
+    let fast = 2.0 / 3.0;
+    for i in 20..close.len() {
+        let volatility: f64 = close[i-20..=i].windows(2).map(|w| (w[1]-w[0]).abs()).sum();
+        let er = if volatility > 1e-12 { (close[i]-close[i-20]).abs()/volatility } else { 0.0 };
+        let alpha = (slow + er * (fast-slow)).clamp(0.0, 1.0);
+        ma += alpha * (close[i]-ma);
+    }
+    let pct = (close.last()? / ma - 1.0) * 100.0;
+    pct.is_finite().then_some(pct)
+}
+
+#[cfg(test)]
+mod adma_tests {
+    use super::adma_stretch;
+
+    // Reference seed and unsquared alpha: wn60/adaptive_trend.py::_adaptive_ma.
+    #[test]
+    fn reference_seed_and_unsquared_alpha() {
+        // Whats-News requires at least 40 closes.
+        assert_eq!(adma_stretch(&vec![10.0; 39]), None);
+        let mut prices = vec![10.0; 39];
+        prices.push(13.0);
+        // ER = 3/3 = 1 → alpha = fast = 2/3; MA = 10 + 2/3*3 = 12.
+        assert!((adma_stretch(&prices).unwrap() - (13.0/12.0-1.0)*100.0).abs() < 1e-10);
+        assert_eq!(adma_stretch(&vec![10.0; 40]), Some(0.0));
+        prices.push(f64::NAN);
+        assert_eq!(adma_stretch(&prices), None);
+    }
+}
