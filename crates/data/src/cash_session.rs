@@ -309,13 +309,38 @@ pub fn exchange_zone(symbol: &str) -> Option<String> {
         .cloned()
 }
 
+// Fallback for index tickers whose exchange is not identified by a Yahoo suffix.
+const NON_US_INDEX_ZONES: &[(&str, &str)] = &[
+    ("^FTSE", "Europe/London"),
+    ("^N225", "Asia/Tokyo"),
+    ("^GDAXI", "Europe/Berlin"),
+    ("^HSI", "Asia/Hong_Kong"),
+    ("^FCHI", "Europe/Paris"),
+    ("^STOXX50E", "Europe/Berlin"),
+    ("^AXJO", "Australia/Sydney"),
+    ("^KS11", "Asia/Seoul"),
+    ("^BSESN", "Asia/Kolkata"),
+    ("^NSEI", "Asia/Kolkata"),
+    ("^BVSP", "America/Sao_Paulo"),
+    ("^GSPTSE", "America/Toronto"),
+    ("^MXX", "America/Mexico_City"),
+    ("^SSMI", "Europe/Zurich"),
+    ("^AEX", "Europe/Amsterdam"),
+    ("^IBEX", "Europe/Madrid"),
+    ("^TWII", "Asia/Taipei"),
+    ("^STI", "Asia/Singapore"),
+    ("000001.SS", "Asia/Shanghai"),
+];
+
 /// Refuse exchange-specific cash grids until the research panes support them.
 /// Yahoo suffixes identify foreign listings when metadata is unavailable. A/B are
 /// also US share-class spellings and retain the existing fallback.
 pub fn require_us_session(symbol: &str, exchange_timezone: Option<&str>) -> Result<(), String> {
     let ticker = symbol.split_whitespace().next().unwrap_or(symbol);
     let observed = exchange_zone(symbol);
-    if let Some(zone) = exchange_timezone.filter(|z| !z.is_empty()).or(observed.as_deref()) {
+    let key = exchange_symbol(symbol);
+    let known = NON_US_INDEX_ZONES.iter().find(|(index, _)| *index == key).map(|(_, zone)| *zone);
+    if let Some(zone) = exchange_timezone.filter(|z| !z.is_empty()).or(observed.as_deref()).or(known) {
         if zone == "America/New_York" {
             return Ok(());
         }
@@ -660,8 +685,19 @@ mod exchange_registry_tests {
     use super::*;
 
     #[test]
+    fn known_foreign_indices_are_refused_without_metadata() {
+        for &(symbol, zone) in NON_US_INDEX_ZONES {
+            assert!(require_us_session(symbol, None).unwrap_err().contains(zone), "{symbol}");
+        }
+        assert!(require_us_session("^ftse Index", None).unwrap_err().contains("Europe/London"));
+        for symbol in ["^GSPC", "^DJI", "^IXIC", "^RUT", "^VIX"] {
+            assert!(require_us_session(symbol, None).is_ok(), "{symbol}");
+        }
+    }
+
+    #[test]
     fn observed_index_zone_refuses_research() {
-        assert!(require_us_session("^N225", None).is_ok());
+        assert!(require_us_session("^N225", None).is_err());
         note_exchange_zone("^N225", "Asia/Tokyo");
         assert_eq!(exchange_zone("^N225").as_deref(), Some("Asia/Tokyo"));
         assert_eq!(

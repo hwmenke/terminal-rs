@@ -47,6 +47,11 @@ impl BarCache {
                 PRIMARY KEY (symbol, tf)
             ) WITHOUT ROWID;",
         )?;
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS exchange_zones (
+                symbol TEXT PRIMARY KEY NOT NULL, zone TEXT NOT NULL
+            ) WITHOUT ROWID;",
+        )?;
         Ok(Self { conn })
     }
 
@@ -67,7 +72,15 @@ impl BarCache {
     }
 
     pub fn store(&mut self, symbol: &str, tf: Timeframe, bars: &[Bar]) -> Result<()> {
+        let zone = crate::cash_session::exchange_zone(symbol);
         let tx = self.conn.transaction()?;
+        if let Some(zone) = zone {
+            tx.execute(
+                "INSERT INTO exchange_zones (symbol, zone) VALUES (?1, ?2)
+                 ON CONFLICT (symbol) DO UPDATE SET zone = excluded.zone",
+                params![symbol, zone],
+            )?;
+        }
         // A shorter real refetch must not leave a synthetic tail to be loaded or
         // paged into real prices on the next startup.
         if !bars.is_empty() && bars.iter().all(|b| b.provenance.is_verified()) {
@@ -119,6 +132,12 @@ impl BarCache {
                 Ok(Bar::new(r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, volume).with_provenance(provenance))
             })?
             .collect::<rusqlite::Result<_>>()?;
+        let mut zones = self.conn.prepare_cached("SELECT zone FROM exchange_zones WHERE symbol = ?1")?;
+        let mut rows = zones.query([symbol])?;
+        if let Some(row) = rows.next()? {
+            let zone: String = row.get(0)?;
+            crate::cash_session::note_exchange_zone(symbol, &zone);
+        }
         bars.reverse();
         Ok(bars)
     }
@@ -127,6 +146,20 @@ impl BarCache {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn exchange_zone_survives_cache_and_restores_guard() {
+        let symbol = "CACHE-FOREIGN-ROUNDTRIP";
+        let mut cache = BarCache::open_in_memory().unwrap();
+        crate::cash_session::note_exchange_zone(symbol, "America/Toronto");
+        cache.store(symbol, Timeframe::M5, &[Bar::new(1, 1.0, 1.0, 1.0, 1.0, 1.0)]).unwrap();
+        // Overwrite the process value to prove load restores the persisted metadata.
+        crate::cash_session::note_exchange_zone(symbol, "America/New_York");
+        assert!(crate::cash_session::require_us_session(symbol, None).is_ok());
+        assert_eq!(cache.load(symbol, Timeframe::M5, 10).unwrap().len(), 1);
+        assert_eq!(crate::cash_session::exchange_zone(symbol).as_deref(), Some("America/Toronto"));
+        assert!(crate::cash_session::require_us_session(symbol, None).is_err());
+    }
 
     #[test]
     fn missing_volume_survives_cache() {
