@@ -244,7 +244,12 @@ mod tests {
             tr_core::Provenance::Real,
             tr_core::Provenance::Cached,
         ] {
-            cat.accept(Ok(Snapshot { provenance, source: "test".into(), data: vec![symbol.clone()] }));
+            cat.accept(Ok(Snapshot {
+                failures: vec![],
+                provenance,
+                source: "test".into(),
+                data: vec![symbol.clone()],
+            }));
             assert_eq!(cat.symbols.len(), usize::from(provenance.is_verified()));
         }
         cat.accept(Err("offline".into()));

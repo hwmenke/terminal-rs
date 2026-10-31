@@ -931,8 +931,10 @@ async fn research_universe(
     }
     let mut rows = std::collections::BTreeMap::new();
     let mut source = local.source.clone();
+    let mut failures = local.failures.clone();
     match external {
         Ok(wn) => {
+            failures.extend(wn.failures);
             source.push_str(&format!(" + {}", wn.source));
             for row in wn.data {
                 rows.insert(row.symbol.clone(), row);
@@ -947,6 +949,7 @@ async fn research_universe(
         }
     }
     Ok(tr_data::whats_news::Snapshot {
+        failures,
         data: rows.into_values().collect(),
         source,
         provenance: tr_core::Provenance::Cached,
@@ -1005,7 +1008,7 @@ async fn research_scan(
     if let Some(service) = service {
         tr_data::whats_news::attach_service(&mut data, service)?;
     }
-    Ok(tr_data::whats_news::Snapshot { data, provenance: tr_core::Provenance::Cached, source })
+    Ok(tr_data::whats_news::Snapshot { failures: vec![], data, provenance: tr_core::Provenance::Cached, source })
 }
 
 /// Load one name from the local archive, then Whats-News. Sample/display bars never enter.
@@ -1687,7 +1690,7 @@ async fn research_desk(
         .map(|r| r.provenance)
         .reduce(tr_core::Provenance::combine)
         .unwrap_or(tr_core::Provenance::Cached);
-    Ok(tr_data::whats_news::Snapshot { data: rows, provenance, source })
+    Ok(tr_data::whats_news::Snapshot { failures: vec![], data: rows, provenance, source })
 }
 
 async fn handle(s: &Arc<Shared>, req: Request) {
@@ -1963,6 +1966,7 @@ async fn handle(s: &Arc<Shared>, req: Request) {
             let local = s.history.db(move |db| db.daily_window(&ticker, before_local, daily_page)).await;
             let result = match local {
                 Ok(data) if !data.is_empty() => Ok(tr_data::whats_news::Snapshot {
+                    failures: vec![],
                     data,
                     provenance: tr_core::Provenance::Cached,
                     source: "Local Yahoo archive".into(),

@@ -133,6 +133,8 @@ pub struct Scan {
 }
 #[derive(Debug, Clone)]
 pub struct Snapshot<T> {
+    /// Symbols excluded because their data could not be verified or read.
+    pub failures: Vec<Skipped>,
     pub provenance: Provenance,
     pub source: String,
     pub data: T,
@@ -228,7 +230,7 @@ impl Bridge {
             })
         })
         .await??;
-        Ok(Snapshot { source, data, provenance: Provenance::Cached })
+        Ok(Snapshot { failures: vec![], source, data, provenance: Provenance::Cached })
     }
     pub async fn universe(&self) -> Result<Snapshot<Vec<Symbol>>> {
         self.universe_with_warning().await.map(|(snapshot, _)| snapshot)
@@ -236,7 +238,12 @@ impl Bridge {
     async fn universe_with_warning(&self) -> Result<(Snapshot<Vec<Symbol>>, String)> {
         self.check()?;
         if !self.prefer_http || self.url.is_none() {
-            match self.sql(|c| universe_sql(&c)).await {
+            match self.sql(universe_sql).await.map(|s| Snapshot {
+                failures: s.data.1,
+                data: s.data.0,
+                source: s.source,
+                provenance: s.provenance,
+            }) {
                 Ok(snapshot) => return Ok((snapshot, String::new())),
                 Err(error) if error.is::<Unverified>() || self.url.is_none() => return Err(error),
                 Err(db) => {
@@ -258,29 +265,32 @@ impl Bridge {
         match self.http_universe().await {
             Ok(snapshot) => Ok((snapshot, String::new())),
             Err(error) if error.is::<Unverified>() => Err(error),
-            Err(http) => self.sql(|c| universe_sql(&c)).await
+            Err(http) => self.sql(universe_sql).await.map(|s| Snapshot { failures: s.data.1, data: s.data.0, source: s.source, provenance: s.provenance })
                 .map(|snapshot| (snapshot, format!("Whats-News HTTP unavailable: {http:#}. Using the archive file. Start Whats-News or check the URL in Settings › Whats-News.")))
                 .map_err(|db| anyhow::anyhow!("Whats-News unavailable: HTTP: {http:#}; archive file: {db:#}")),
         }
     }
     async fn http_universe(&self) -> Result<Snapshot<Vec<Symbol>>> {
-        let data = tokio::time::timeout(Duration::from_secs(15), async {
+        let (data, failures) = tokio::time::timeout(Duration::from_secs(15), async {
             let symbols: Vec<Symbol> = self.get("/api/symbols").await?;
-            let mut rows: Vec<_> = stream::iter(symbols.into_iter().map(|mut s| async move {
-                let bars = self.http_bars(&s.symbol, 1).await?;
-                s.last_date = bars.last().map(|b| date(b.ts));
-                Ok::<_, anyhow::Error>(s)
+            let outcomes: Vec<_> = stream::iter(symbols.into_iter().map(|mut s| async move {
+                match self.http_bars(&s.symbol, 1).await {
+                    Ok(bars) => {
+                        s.last_date = bars.last().map(|b| date(b.ts));
+                        Ok(s)
+                    }
+                    Err(error) => Err((s.symbol, error)),
+                }
             }))
             .buffer_unordered(12)
-            .try_collect()
-            .await?;
-            require_symbols(&rows)?;
-            rows.sort_by(|a, b| a.symbol.cmp(&b.symbol));
-            Ok::<_, anyhow::Error>(rows)
+            .collect()
+            .await;
+            collect_universe(outcomes)
         })
         .await
         .unwrap_or_else(|_| Err(anyhow::anyhow!("Whats-News timed out reading price history. Check the app or switch to the archive file in Settings › Whats-News.")))?;
         Ok(Snapshot {
+            failures,
             source: format!("Whats-News HTTP: {}", self.url.as_deref().unwrap_or_default()),
             data,
             provenance: Provenance::Real,
@@ -334,6 +344,7 @@ impl Bridge {
         }
         match self.http_bars_window(symbol, before, limit).await {
             Ok(data) if !data.is_empty() => Ok(Snapshot {
+                failures: vec![],
                 provenance: Bar::provenance(&data),
                 source: format!("Whats-News HTTP archive: {}", self.url.as_deref().unwrap_or_default()),
                 data,
@@ -374,6 +385,7 @@ impl Bridge {
             .unwrap_or_else(|_| Err(anyhow::anyhow!("Whats-News timed out reading scan histories")));
         match http {
             Ok(data) => Ok(Snapshot {
+                failures: vec![],
                 data,
                 provenance: Provenance::Real,
                 source: format!("Whats-News HTTP archive: {}", self.url.as_deref().unwrap_or_default()),
@@ -412,6 +424,7 @@ impl Bridge {
         self.check()?;
         if tickers.is_empty() {
             return Ok(Snapshot {
+                failures: vec![],
                 data: Histories { bars: vec![], skipped: vec![] },
                 provenance: Provenance::Cached,
                 source: "watchlist (empty)".into(),
@@ -430,6 +443,7 @@ impl Bridge {
             .unwrap_or_else(|_| Err(anyhow::anyhow!("Whats-News timed out reading watchlist histories")));
         match http {
             Ok(data) => Ok(Snapshot {
+                failures: vec![],
                 data,
                 provenance: Provenance::Real,
                 source: format!("Whats-News HTTP archive: {}", self.url.as_deref().unwrap_or_default()),
@@ -506,6 +520,7 @@ impl Bridge {
         }).await.unwrap_or_else(|_|Err(anyhow::anyhow!("Whats-News timed out scanning history. Check the app or switch to the archive file in Settings › Whats-News.")));
         match api {
             Ok(data) => Ok(Snapshot {
+                failures: vec![],
                 provenance: data.provenance,
                 source: format!(
                     "Whats-News HTTP scanner: {} · Rust calculations; original service fields when available",
@@ -588,23 +603,55 @@ fn require_symbols(rows: &[Symbol]) -> Result<()> {
     }
     Ok(())
 }
-fn universe_sql(c: &Connection) -> Result<Vec<Symbol>> {
+fn collect_universe(outcomes: Vec<Result<Symbol, (String, anyhow::Error)>>) -> Result<(Vec<Symbol>, Vec<Skipped>)> {
+    let mut rows = vec![];
+    let mut failures = vec![];
+    let mut first_error = None;
+    for outcome in outcomes {
+        match outcome {
+            Ok(row) => rows.push(row),
+            Err((symbol, error)) => {
+                failures.push(Skipped { symbol, reason: format!("{error:#}") });
+                if first_error.is_none() || error.is::<Unverified>() {
+                    first_error = Some(error);
+                }
+            }
+        }
+    }
+    if !rows.iter().any(|row| row.last_date.is_some()) {
+        if let Some(error) = first_error {
+            return Err(error.context(
+                failures.iter().map(|f| format!("{}: {}", f.symbol, f.reason)).collect::<Vec<_>>().join("; "),
+            ));
+        }
+    }
+    require_symbols(&rows)?;
+    rows.sort_by(|a, b| a.symbol.cmp(&b.symbol));
+    failures.sort_by(|a, b| a.symbol.cmp(&b.symbol));
+    Ok((rows, failures))
+}
+fn universe_sql(c: Connection) -> Result<(Vec<Symbol>, Vec<Skipped>)> {
     let tx = c.unchecked_transaction()?;
     let mut stmt = tx.prepare("SELECT s.symbol, s.name, s.group_tag, MAX(o.date) FROM symbols s LEFT JOIN ohlcv o ON o.symbol=s.symbol AND o.freq='daily' GROUP BY s.symbol ORDER BY s.symbol")?;
-    let rows: Vec<Symbol> = stmt
+    let rows = stmt
         .query_map([], |r| {
             Ok(Symbol { symbol: r.get(0)?, name: r.get(1)?, group_tag: r.get(2)?, last_date: r.get(3)? })
         })?
-        .collect::<rusqlite::Result<_>>()?;
-    require_symbols(&rows)?;
+        .collect::<rusqlite::Result<Vec<_>>>()?;
     // One batch validates all registered daily coverage; no per-symbol reads.
     let (_, skipped) = histories_sql(&tx, &rows)?;
-    if let Some(skip) = skipped.first() {
-        bail!("{}: {}", skip.symbol, skip.reason);
-    }
+    let mut failures: std::collections::BTreeMap<_, _> = skipped.into_iter().collect();
+    let outcomes = rows
+        .into_iter()
+        .map(|row| match failures.remove(&row.symbol) {
+            Some(error) => Err((row.symbol, error)),
+            None => Ok(row),
+        })
+        .collect();
+    let result = collect_universe(outcomes)?;
     drop(stmt);
     tx.commit()?;
-    Ok(rows)
+    Ok(result)
 }
 fn bars_sql(c: &Connection, symbol: &str, before: Option<i64>, limit: usize) -> Result<Vec<Bar>> {
     let provenance = if c.prepare("SELECT provenance FROM ohlcv LIMIT 0").is_ok() { "provenance" } else { "'Real'" };
@@ -659,8 +706,11 @@ pub(crate) fn darvas(b: &[Bar]) -> Option<(f64, f64, &'static str)> {
     None
 }
 /// Batch ALL daily history in one query, retaining per-symbol data failures.
-/// Unverified provenance remains a hard failure at every research entry point.
-fn histories_sql(c: &Connection, symbols: &[Symbol]) -> Result<(Vec<(String, Vec<Bar>)>, Vec<Skipped>)> {
+/// Retain typed provenance errors so callers can exclude symbols or refuse the read.
+fn histories_sql(
+    c: &Connection,
+    symbols: &[Symbol],
+) -> Result<(Vec<(String, Vec<Bar>)>, Vec<(String, anyhow::Error)>)> {
     use std::collections::BTreeMap;
     let provenance = if c.prepare("SELECT provenance FROM ohlcv LIMIT 0").is_ok() { "o.provenance" } else { "'Real'" };
     let mut stmt = c.prepare(&format!("SELECT o.symbol,o.date,o.open,o.high,o.low,o.close,o.volume,{provenance} FROM ohlcv o JOIN symbols s ON s.symbol=o.symbol WHERE o.freq='daily' ORDER BY o.symbol,o.date"))?;
@@ -691,13 +741,13 @@ fn histories_sql(c: &Connection, symbols: &[Symbol]) -> Result<(Vec<(String, Vec
     let mut skipped = vec![];
     for (symbol, rows) in grouped {
         // Check every row before conversion can stop at an invalid earlier bar.
-        for row in &rows {
-            verify(row.provenance, "Whats-News scan/archive")?;
-        }
-        match convert(rows) {
+        let converted = rows
+            .iter()
+            .try_for_each(|row| verify(row.provenance, "Whats-News scan/archive"))
+            .and_then(|()| convert(rows));
+        match converted {
             Ok(bars) => histories.push((symbol, bars)),
-            Err(e) if e.is::<Unverified>() => return Err(e),
-            Err(e) => skipped.push(Skipped { symbol, reason: format!("invalid archived history: {e}") }),
+            Err(e) => skipped.push((symbol, e.context("invalid archived history"))),
         }
     }
     Ok((histories, skipped))
@@ -786,7 +836,14 @@ fn read_histories_conn(c: &Connection) -> Result<Histories> {
         .collect::<rusqlite::Result<Vec<_>>>()?
     };
     require_symbols(&symbols)?;
-    let (bars, skipped) = histories_sql(&tx, &symbols)?;
+    let (bars, failures) = histories_sql(&tx, &symbols)?;
+    let mut skipped = vec![];
+    for (symbol, error) in failures {
+        if error.is::<Unverified>() {
+            return Err(error);
+        }
+        skipped.push(Skipped { symbol, reason: format!("{error:#}") });
+    }
     tx.commit()?;
     Ok(Histories { bars, skipped })
 }
@@ -976,11 +1033,8 @@ mod tests {
             c.execute_batch("ALTER TABLE ohlcv ADD COLUMN provenance TEXT;").unwrap();
             c.execute("UPDATE ohlcv SET provenance=?", [provenance]).unwrap();
             let bridge = f.bridge();
-            for error in [
-                bridge.universe().await.unwrap_err(),
-                bridge.scan("NEAR_HIGH").await.unwrap_err(),
-                bridge.bars("BREAK").await.unwrap_err(),
-            ] {
+            assert!(bridge.universe().await.unwrap_err().is::<Unverified>());
+            for error in [bridge.scan("NEAR_HIGH").await.unwrap_err(), bridge.bars("BREAK").await.unwrap_err()] {
                 assert!(format!("{error:#}").contains("refused"));
             }
         }
@@ -1077,6 +1131,56 @@ mod tests {
         .to_string()
     }
     const BAR_JSON: &str = r#"[{"date":"2026-10-20","open":10,"high":12,"low":9,"close":11,"volume":100}]"#;
+    #[test]
+    fn universe_collection_isolates_failures_and_rejects_all_failed() {
+        let good = Symbol {
+            symbol: "GOOD".into(),
+            name: None,
+            group_tag: None,
+            last_date: Some("2026-10-20".into()),
+        };
+        let failures = || {
+            let invalid: Vec<StoredBar> =
+                serde_json::from_str(&BAR_JSON.replace("\"volume\":100", "\"volume\":-1")).unwrap();
+            let sample: Vec<StoredBar> =
+                serde_json::from_str(&BAR_JSON.replace("\"volume\":100", "\"volume\":100,\"provenance\":\"Sample\""))
+                    .unwrap();
+            vec![
+                Err(("BAD".into(), convert(invalid).unwrap_err())),
+                Err(("SAMPLE".into(), convert(sample).unwrap_err())),
+                Err(("DOWN".into(), anyhow::anyhow!("HTTP 503"))),
+            ]
+        };
+        let mut outcomes = failures();
+        outcomes.push(Ok(good));
+        let (rows, failures_report) = collect_universe(outcomes).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].symbol, "GOOD");
+        assert_eq!(failures_report.len(), 3);
+        assert!(failures_report[0].reason.contains("invalid"));
+        assert!(failures_report[2].reason.contains("refused"));
+        let error = collect_universe(failures()).unwrap_err();
+        assert!(error.is::<Unverified>());
+        assert!(error.to_string().contains("SAMPLE"));
+    }
+
+    #[tokio::test]
+    async fn universe_sql_isolates_invalid_and_unverified_history() {
+        let f = Fixture::new();
+        let c = Connection::open(&f.0).unwrap();
+        c.execute_batch("ALTER TABLE ohlcv ADD COLUMN provenance TEXT DEFAULT 'Real'; UPDATE ohlcv SET provenance='Sample' WHERE symbol='BREAK'; UPDATE ohlcv SET high=0 WHERE symbol='SHORT';").unwrap();
+        assert!(f.bridge().universe().await.unwrap_err().is::<Unverified>());
+
+        c.execute_batch("UPDATE ohlcv SET provenance='Real' WHERE symbol='BREAK';").unwrap();
+        let snapshot = f.bridge().universe().await.unwrap();
+        assert_eq!(snapshot.data.iter().map(|s| s.symbol.as_str()).collect::<Vec<_>>(), ["BREAK", "EMPTY"]);
+        assert!(snapshot.data[0].last_date.is_some());
+        assert_eq!(snapshot.data[1].last_date, None);
+        assert_eq!(snapshot.failures.len(), 1);
+        assert_eq!(snapshot.failures[0].symbol, "SHORT");
+        assert!(snapshot.failures[0].reason.contains("invalid"));
+    }
+
     #[tokio::test]
     async fn prefers_http_and_displays_missing_from_404() {
         let (url, server) = http_fixture(vec![
