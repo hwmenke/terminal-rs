@@ -1276,6 +1276,9 @@ pub(super) fn risk_chips(
                 ui.label(&p.symbol);
                 let ma = match risk.above_sma50 { Some(true) => "≥ SMA50", Some(false) => "< SMA50", None => "SMA50 —" };
                 ui.label(RichText::new(ma).color(if risk.above_sma50 == Some(false) { amber() } else { muted() }).background_color(theme::control()));
+                let stretch = bars.and_then(|b| tr_core::indicators::adma_stretch(&b.iter().map(|b| b.close).collect::<Vec<_>>()));
+                ui.label(RichText::new(stretch.map(|s| format!("ADMA Stretch {s:+.2}%")).unwrap_or_else(|| "ADMA Stretch —".into()))
+                    .color(muted()).background_color(theme::control()));
                 let rsi = risk.rsi14.map(|r| format!("RSI14 {r:.1} {}", if r >= 70.0 { "OB" } else if r <= 30.0 { "OS" } else { "neutral" })).unwrap_or_else(|| "RSI14 —".into());
                 ui.label(RichText::new(rsi).color(if risk.rsi14.is_some_and(|r| r >= 70.0 || r <= 30.0) { amber() } else { muted() }).background_color(theme::control()));
                 ui.label(RichText::new(weight.map(|w| format!("{:.1}%{}", w*100.0, if risk.concentrated == Some(true) { " concentrated" } else { "" })).unwrap_or_else(|| "Weight —".into()))

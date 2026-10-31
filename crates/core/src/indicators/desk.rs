@@ -170,25 +170,95 @@ mod tests {
 /// Source: /workspace/codex-runs/wn60/adaptive_trend.py::_adaptive_ma and
 /// /workspace/codex-runs/wn60/equity_engine.py::adma_stretch.
 pub fn adma_stretch(close: &[f64]) -> Option<f64> {
-    if close.len() < 40 || close.iter().any(|v| !v.is_finite() || *v <= 0.0) {
+    if close.iter().filter(|v| !v.is_nan()).count() < 40 {
         return None;
     }
-    let mut ma = close[19];
-    let slow = 2.0 / 61.0;
-    let fast = 2.0 / 3.0;
-    for i in 20..close.len() {
-        let volatility: f64 = close[i-20..=i].windows(2).map(|w| (w[1]-w[0]).abs()).sum();
-        let er = if volatility > 1e-12 { (close[i]-close[i-20]).abs()/volatility } else { 0.0 };
-        let alpha = (slow + er * (fast-slow)).clamp(0.0, 1.0);
-        ma += alpha * (close[i]-ma);
+    let ma = adaptive_ma_adma(close);
+    // pandas dropna excludes NaN, but retains infinities; _finite is applied afterwards.
+    let last_ma = *ma.iter().rev().find(|v| !v.is_nan())?;
+    let last = *close.last()?;
+    if !last.is_finite() || !last_ma.is_finite() || last_ma <= 0.0 {
+        return None;
     }
-    let pct = (close.last()? / ma - 1.0) * 100.0;
-    pct.is_finite().then_some(pct)
+    let pct = (last / last_ma - 1.0) * 100.0;
+    // Decimal formatting uses ties-to-even, as Python round(value, 2) does.
+    pct.is_finite().then(|| format!("{pct:.2}").parse().unwrap())
+}
+
+/// Line-for-line ADMA branch of wn60/adaptive_trend.py::_adaptive_ma.
+fn adaptive_ma_adma(prices: &[f64]) -> Vec<f64> {
+    let fast_sc = 2.0 / 3.0;
+    let slow_sc = 2.0 / 61.0;
+    let n = prices.len();
+    let mut out = vec![f64::NAN; n];
+    let Some(first) = prices.iter().position(|v| v.is_finite()) else { return out; };
+    let seed = first + 20;
+    if seed >= n { return out; }
+    out[seed - 1] = prices[seed - 1];
+    for i in seed..n {
+        if !prices[i].is_finite() {
+            out[i] = if out[i - 1].is_finite() { out[i - 1] } else { f64::NAN };
+            continue;
+        }
+        let direction = (prices[i] - prices[i - 20]).abs();
+        let window = &prices[i - 20..=i];
+        let volatility: f64 = window.windows(2).map(|w| (w[1] - w[0]).abs()).sum();
+        let er = if volatility > 1e-12 { direction / volatility } else { 0.0 };
+        let alpha = slow_sc + er * (fast_sc - slow_sc);
+        // Python max(min(alpha, 1), 0) preserves a NaN first argument.
+        let alpha = if alpha > 1.0 { 1.0 } else { alpha };
+        let alpha = if alpha < 0.0 { 0.0 } else { alpha };
+        out[i] = out[i - 1] + alpha * (prices[i] - out[i - 1]);
+    }
+    out
 }
 
 #[cfg(test)]
 mod adma_tests {
     use super::adma_stretch;
+
+    // Generated with PYTHONDONTWRITEBYTECODE=1 python3, importing equity_engine
+    // from /workspace/codex-runs/wn60 (read-only), calling adma_stretch and
+    // adaptive_trend._adaptive_ma(pd.Series(values), 20, 2, 60, method="adma").
+    #[test]
+    fn whats_news_python_parity_with_gaps() {
+        let base = vec![
+            100.0, 102.3, 104.6, 106.9, 109.2, 111.5, 113.8,
+            102.1, 104.4, 106.7, 109.0, 111.3, 113.6, 115.9,
+            104.2, 106.5, 108.8, 111.1, 113.4, 115.7, 118.0,
+            106.3, 108.6, 110.9, 113.2, 115.5, 117.8, 120.1,
+            108.4, 110.7, 113.0, 115.3, 117.6, 119.9, 122.2,
+            110.5, 112.8, 115.1, 117.4, 119.7, 122.0, 124.3,
+            112.6, 114.9, 117.2, 119.5, 121.8, 124.1, 126.4,
+            114.7, 117.0, 119.3, 121.6, 123.9, 126.2, 128.5,
+            116.8, 119.1, 121.4, 123.7, 126.0, 128.3, 130.6,
+            118.9, 121.2,
+        ];
+        let mut middle = base.clone(); middle[30] = f64::NAN;
+        let mut leading = vec![f64::NAN; 4]; leading.extend_from_slice(&base);
+        let mut trailing = base.clone(); trailing.push(f64::NAN);
+        let mut seed = base.clone(); seed[19] = f64::NAN;
+        let mut infinity = base.clone(); infinity[30] = f64::INFINITY;
+        let cases = [
+            ("regular", base.clone(), Some(-1.95), 123.60811675134747),
+            ("middle gap", middle, Some(-1.33), 122.83224337055219),
+            ("leading gap", leading, Some(-1.95), 123.60811675134747),
+            ("trailing gap", trailing, None, 123.60811675134747),
+            ("seed gap", seed, None, f64::NAN),
+            ("short", base[..39].to_vec(), None, 116.2552562522923),
+            ("infinity", infinity, Some(3.79), f64::NAN),
+            ("flat", vec![10.0; 40], Some(0.0), 10.0),
+            ("zero MA", vec![0.0; 40], None, 0.0),
+        ];
+        for (name, prices, expected, expected_ma) in cases {
+            assert_eq!(adma_stretch(&prices), expected, "{name}");
+            let ma = super::adaptive_ma_adma(&prices);
+            let last = *ma.last().unwrap();
+            assert!(if expected_ma.is_nan() { last.is_nan() } else { (last - expected_ma).abs() < 1e-10 }, "{name}: {last}");
+        }
+        assert_eq!(adma_stretch(&vec![f64::NAN; 50]), None);
+        assert!(super::adaptive_ma_adma(&[10.0; 20]).iter().all(|v| v.is_nan()));
+    }
 
     // Reference seed and unsquared alpha: wn60/adaptive_trend.py::_adaptive_ma.
     #[test]
@@ -198,7 +268,7 @@ mod adma_tests {
         let mut prices = vec![10.0; 39];
         prices.push(13.0);
         // ER = 3/3 = 1 → alpha = fast = 2/3; MA = 10 + 2/3*3 = 12.
-        assert!((adma_stretch(&prices).unwrap() - (13.0/12.0-1.0)*100.0).abs() < 1e-10);
+        assert!((adma_stretch(&prices).unwrap() - 8.33).abs() < 1e-10);
         assert_eq!(adma_stretch(&vec![10.0; 40]), Some(0.0));
         prices.push(f64::NAN);
         assert_eq!(adma_stretch(&prices), None);
