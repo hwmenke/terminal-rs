@@ -153,6 +153,9 @@ pub struct UiState {
     pub name: String,
     /// Quotes list, or the earnings calendar for the selected group.
     pub calendar: bool,
+    /// Fixed calendar clock for UI test fixtures.
+    #[cfg(test)]
+    pub calendar_now: Option<i64>,
     /// Session RVOL and VWAP for the selected group.
     pub intraday: bool,
     /// Group the in-flight or shown intraday scan belongs to.
@@ -573,7 +576,10 @@ impl TerminalApp {
             .collect();
         let names: Vec<tr_data::earnings::Listed<'_>> =
             listed.iter().map(|(symbol, ticker)| tr_data::earnings::Listed { symbol, ticker }).collect();
-        let cal = tr_data::earnings::calendar(&names, &self.quotes, Utc::now().timestamp());
+        let now = Utc::now().timestamp();
+        #[cfg(test)]
+        let now = self.watch_ui.calendar_now.unwrap_or(now);
+        let cal = tr_data::earnings::calendar(&names, &self.quotes, now);
         ui.label(
             RichText::new(format!("Earnings · {group} · {}", cal.summary())).monospace().color(crate::theme::text()),
         );
@@ -1403,6 +1409,9 @@ mod tests {
     #[test]
     fn earnings_calendar_paints_provider_dates_and_opens_the_chart() {
         let mut app = test_app();
+        app.watch_ui.calendar_now = Some(tr_core::ny::to_utc(
+            chrono::NaiveDate::from_ymd_opt(2026, 10, 28).unwrap().and_hms_opt(12, 0, 0).unwrap(),
+        ));
         let chart = app.new_pane(PaneKind::Chart(Box::new(ChartState::new(0, "SPY", tr_core::Timeframe::D1))));
         app.new_pane(PaneKind::Watchlist);
         app.watch_ui.active_chart = Some(chart);

@@ -3,7 +3,6 @@ use super::{PaneKind, TerminalApp};
 use crate::theme::{self, amber, mono, muted, text, ui_font};
 use crate::{congress_view::Action, dock::PaneId, worker::Request};
 use egui::{Align2, Color32, Rect, RichText, ScrollArea, Sense, Stroke, Ui, pos2, vec2};
-use tr_core::Timeframe;
 use tr_data::cash_session::{parsed_bar_token, without_parsed_bar_tokens};
 use tr_data::session_breadth::{self, Breadth, BreadthPoint, Member};
 

@@ -376,6 +376,7 @@ impl ChartState {
         self.earnings = label.filter(|s| !s.is_empty());
     }
 
+    #[cfg(test)]
     pub fn earnings_line(&self) -> Option<&str> {
         self.earnings.as_deref()
     }
@@ -385,6 +386,7 @@ impl ChartState {
         self.ex_dividend = label.filter(|s| !s.is_empty());
     }
 
+    #[cfg(test)]
     pub fn ex_dividend_line(&self) -> Option<&str> {
         self.ex_dividend.as_deref()
     }
