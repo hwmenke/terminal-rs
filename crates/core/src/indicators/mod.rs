@@ -54,7 +54,7 @@ impl Ohlcv {
             high: bars.iter().map(|b| b.high).collect(),
             low: bars.iter().map(|b| b.low).collect(),
             close: bars.iter().map(|b| b.close).collect(),
-            volume: bars.iter().map(|b| b.volume).collect(),
+            volume: bars.iter().map(|b| b.volume_value().unwrap_or(NAN)).collect(),
         }
     }
 

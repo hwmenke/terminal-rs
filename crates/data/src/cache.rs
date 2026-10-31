@@ -91,7 +91,8 @@ impl BarCache {
                     b.high,
                     b.low,
                     b.close,
-                    b.volume,
+                    // Legacy v is NOT NULL; -1 is the on-disk missing-volume marker.
+                    b.volume_value().unwrap_or(-1.0),
                     format!("{:?}", b.provenance)
                 ])?;
             }
@@ -113,8 +114,9 @@ impl BarCache {
                     Some("Sample") => Provenance::Sample,
                     _ => Provenance::Missing,
                 };
-                Ok(Bar::new(r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)
-                    .with_provenance(provenance))
+                let volume: f64 = r.get(5)?;
+                let volume = if volume < 0.0 { f64::NAN } else { volume };
+                Ok(Bar::new(r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, volume).with_provenance(provenance))
             })?
             .collect::<rusqlite::Result<_>>()?;
         bars.reverse();
@@ -125,6 +127,16 @@ impl BarCache {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn missing_volume_survives_cache() {
+        let mut cache = BarCache::open_in_memory().unwrap();
+        let bars = [Bar::new(1, 10.0, 11.0, 9.0, 10.0, f64::NAN), Bar::new(2, 10.0, 11.0, 9.0, 10.0, 0.0)];
+        cache.store("X", Timeframe::M1, &bars).unwrap();
+        let loaded = cache.load("X", Timeframe::M1, 10).unwrap();
+        assert_eq!(loaded[0].volume_value(), None);
+        assert_eq!(loaded[1].volume_value(), Some(0.0));
+    }
 
     #[test]
     fn store_and_load_recent() {

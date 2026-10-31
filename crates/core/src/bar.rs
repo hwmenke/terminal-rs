@@ -12,12 +12,35 @@ pub struct Bar {
     pub high: f64,
     pub low: f64,
     pub close: f64,
+    /// Missing volume is NaN, distinct from a reported zero. JSON stores it as null.
+    #[serde(default = "missing_volume", deserialize_with = "deserialize_volume")]
     pub volume: f64,
+}
+
+fn missing_volume() -> f64 {
+    f64::NAN
+}
+
+fn deserialize_volume<'de, D: serde::Deserializer<'de>>(d: D) -> Result<f64, D::Error> {
+    Ok(Option::<f64>::deserialize(d)?.unwrap_or(f64::NAN))
 }
 
 impl Bar {
     pub fn new(ts: i64, open: f64, high: f64, low: f64, close: f64, volume: f64) -> Self {
         Self { ts, open, high, low, close, volume, provenance: Provenance::Missing }
+    }
+
+    /// Validate prices at provider ingestion; missing volume does not invalidate prices.
+    pub fn valid_ohlc(&self) -> bool {
+        [self.open, self.high, self.low, self.close].iter().all(|p| p.is_finite() && *p > 0.0)
+            && self.high >= self.open.max(self.close)
+            && self.low <= self.open.min(self.close)
+            && self.high >= self.low
+    }
+
+    /// A reported, finite, nonnegative volume (zero is a valid observation).
+    pub fn volume_value(&self) -> Option<f64> {
+        (self.volume.is_finite() && self.volume >= 0.0).then_some(self.volume)
     }
 
     pub fn with_provenance(mut self, provenance: Provenance) -> Self {
@@ -152,6 +175,31 @@ mod tests {
 
     fn b(ts: i64, c: f64) -> Bar {
         Bar::new(ts, c, c, c, c, 1.0)
+    }
+
+    #[test]
+    fn validates_ohlc_and_preserves_missing_volume() {
+        let valid = Bar::new(0, 10.0, 12.0, 9.0, 11.0, f64::NAN);
+        assert!(valid.valid_ohlc());
+        assert_eq!(valid.volume_value(), None);
+        for bad in [
+            Bar { high: 10.5, ..valid },
+            Bar { low: 10.5, ..valid },
+            Bar { high: 8.0, low: 9.0, ..valid },
+            Bar { open: 0.0, ..valid },
+            Bar { low: -1.0, ..valid },
+            Bar { close: f64::NAN, ..valid },
+            Bar { high: f64::INFINITY, ..valid },
+            Bar { open: f64::NEG_INFINITY, ..valid },
+        ] {
+            assert!(!bad.valid_ohlc(), "{bad:?}");
+        }
+        let json = serde_json::to_string(&valid).unwrap();
+        let restored: Bar = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored.volume_value(), None);
+        assert_eq!(Bar { volume: 0.0, ..valid }.volume_value(), Some(0.0));
+        let resampled = Timeframe::D1.resample(&[valid, Bar { ts: 60, volume: 1.0, ..valid }]);
+        assert_eq!(resampled[0].volume_value(), Some(1.0));
     }
 
     #[test]

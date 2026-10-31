@@ -21,6 +21,16 @@ pub struct GpuBar {
     pub _pad: f32,
 }
 
+// Keep missing distinct from zero while preventing finite f64 volumes from
+// overflowing GPU storage or sums into infinity.
+fn gpu_volume(volume: Option<f64>) -> f32 {
+    volume.map_or(f32::NAN, |v| v.min(f32::MAX as f64) as f32)
+}
+
+fn known_volume(volume: f32) -> Option<f64> {
+    (volume.is_finite() && volume >= 0.0).then_some(volume as f64)
+}
+
 /// Target minimum on-screen width of one drawn instance.
 pub const MIN_INSTANCE_PX: f64 = 2.0;
 
@@ -54,7 +64,7 @@ impl BarPyramid {
                 high: b.high as f32,
                 low: b.low as f32,
                 close: b.close as f32,
-                volume: b.volume as f32,
+                volume: gpu_volume(b.volume_value()),
                 _pad: 0.0,
             })
             .collect();
@@ -73,7 +83,10 @@ impl BarPyramid {
                         high: a.high.max(b.high),
                         low: a.low.min(b.low),
                         close: b.close,
-                        volume: a.volume + b.volume,
+                        volume: gpu_volume(match (known_volume(a.volume), known_volume(b.volume)) {
+                            (Some(a), Some(b)) => Some(a + b),
+                            (a, b) => a.or(b),
+                        }),
                         _pad: 0.0,
                     }
                 } else {
@@ -118,7 +131,9 @@ impl BarPyramid {
         for g in slice {
             l = l.min(g.low);
             h = h.max(g.high);
-            v = v.max(g.volume);
+            if let Some(volume) = known_volume(g.volume) {
+                v = v.max(volume as f32);
+            }
         }
         Some((l as f64, h as f64, v as f64))
     }
@@ -205,6 +220,25 @@ mod tests {
 
     fn bars(n: usize) -> Vec<Bar> {
         (0..n).map(|i| Bar::new(i as i64, i as f64, i as f64 + 2.0, i as f64 - 1.0, i as f64 + 1.0, 1.0)).collect()
+    }
+
+    #[test]
+    fn missing_volume_does_not_poison_pyramid_or_extent() {
+        let mut input = bars(5);
+        for (b, v) in input.iter_mut().zip([f64::NAN, f64::NAN, 0.0, 7.0, f64::NAN]) {
+            b.volume = v;
+        }
+        let p = BarPyramid::build(&input);
+        assert!(p.level(1)[0].volume.is_nan());
+        assert_eq!(p.level(1)[1].volume, 7.0);
+        assert_eq!(p.level(3)[0].volume, 7.0);
+        assert_eq!(p.extent(0, 0, 2).unwrap().2, 0.0);
+        assert_eq!(p.extent(0, 0, 5).unwrap().2, 7.0);
+        input[0].volume = f64::MAX;
+        input[1].volume = f64::MAX;
+        let p = BarPyramid::build(&input);
+        assert_eq!(p.level(0)[0].volume, f32::MAX);
+        assert_eq!(p.level(3)[0].volume, f32::MAX);
     }
 
     #[test]

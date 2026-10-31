@@ -140,7 +140,10 @@ fn profile_line(tf: Timeframe, sec: &Security, bars: &[Bar]) -> Option<String> {
     if !tf.is_intraday() || !matches!(sec.class, AssetClass::Equity | AssetClass::Etf | AssetClass::Index) {
         return None;
     }
-    let profile = tr_data::intraday::verified_profile(tf, bars, 24);
+    let profile: Vec<_> = tr_data::intraday::verified_profile(tf, bars, 24)
+        .into_iter()
+        .filter(|b| b.volume.is_finite() && b.volume > 0.0)
+        .collect();
     if profile.is_empty() {
         return None;
     }
@@ -1789,7 +1792,7 @@ impl ChartState {
             put(format!("{k}{val:.dec$}"), col, &mut x);
         }
         put(format!("{:+.dec$} ({:+.2}%)", chg, if prev != 0.0 { chg / prev * 100.0 } else { 0.0 }), col, &mut x);
-        put(format!("Vol {}", scale::format_volume(b.volume)), muted(), &mut x);
+        put(format!("Vol {}", scale::format_volume(b.volume_value().unwrap_or(f64::NAN))), muted(), &mut x);
 
         // Overlay indicator values, one per line.
         let mut ly = y + 16.0;
@@ -1976,7 +1979,10 @@ impl ChartState {
         {
             return;
         }
-        let profile = tr_data::intraday::verified_profile(self.tf, &self.bars, 24);
+        let profile: Vec<_> = tr_data::intraday::verified_profile(self.tf, &self.bars, 24)
+            .into_iter()
+            .filter(|b| b.volume.is_finite() && b.volume > 0.0)
+            .collect();
         if profile.is_empty() {
             return;
         }

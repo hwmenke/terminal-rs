@@ -303,6 +303,18 @@ mod tests {
     }
 
     #[test]
+    fn missing_volume_ends_the_total_while_zero_is_counted() {
+        let date = sessions(1)[0];
+        let mut bars = day_vol(date, Timeframe::M30, 100.0);
+        bars[1].volume = 0.0;
+        bars[2].volume = f64::NAN;
+        let pace = build_pace("AAPL", &bars, &query(5, Timeframe::M30), "unit").unwrap();
+        assert_eq!(pace.points[1].today, Some(100.0));
+        assert!(pace.points[2].today.is_none());
+        assert!(pace.points[3].today.is_none());
+    }
+
+    #[test]
     fn today_is_kept_out_of_the_mean_and_premarket_volume_is_ignored() {
         let dates = sessions(6);
         let today = *dates.last().unwrap();

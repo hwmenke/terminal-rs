@@ -107,6 +107,7 @@ pub struct Input<'a> {
 }
 
 impl<'a> Input<'a> {
+    /// Normalizes unavailable volume through Ohlcv for VWMA/EVWMA and volume studies.
     pub fn new(bars: &'a [Bar], tf: Timeframe) -> Self {
         Input { bars, tf, d: Ohlcv::new(bars) }
     }

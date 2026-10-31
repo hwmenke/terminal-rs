@@ -92,7 +92,7 @@ impl MarketData for SampleProvider {
                 bar.close = px;
                 bar.high = bar.high.max(px);
                 bar.low = bar.low.min(px);
-                bar.volume += (rng.f64() * 100.0).round();
+                bar.volume = bar.volume_value().unwrap_or(0.0) + (rng.f64() * 100.0).round();
                 if tx.send(bar).await.is_err() {
                     break;
                 }

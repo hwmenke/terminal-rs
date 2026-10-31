@@ -157,7 +157,8 @@ struct QuoteArrays {
 }
 
 /// Parse a chart response. Rows with any missing OHLC value (Yahoo emits nulls for
-/// halted or partial periods) are skipped.
+/// halted or partial periods), or inconsistent/nonpositive prices, are skipped.
+/// Missing or invalid volume stays unavailable (NaN), never a reported zero.
 pub fn parse_chart(json: &str) -> Result<Chart> {
     let env: Envelope = serde_json::from_str(json).context("parsing Yahoo chart JSON")?;
     if let Some(err) = env.chart.error.filter(|e| !e.is_null()) {
@@ -169,9 +170,12 @@ pub fn parse_chart(json: &str) -> Result<Chart> {
     for (i, &ts) in r.timestamp.iter().enumerate() {
         let get = |v: &Vec<Option<f64>>| v.get(i).copied().flatten();
         if let (Some(o), Some(h), Some(l), Some(c)) = (get(&q.open), get(&q.high), get(&q.low), get(&q.close)) {
-            bars.push(
-                Bar::new(ts, o, h, l, c, get(&q.volume).unwrap_or(0.0)).with_provenance(tr_core::Provenance::Real),
-            );
+            let mut bar =
+                Bar::new(ts, o, h, l, c, get(&q.volume).unwrap_or(f64::NAN)).with_provenance(tr_core::Provenance::Real);
+            if bar.valid_ohlc() {
+                bar.volume = bar.volume_value().unwrap_or(f64::NAN);
+                bars.push(bar);
+            }
         }
     }
     Ok(Chart {
@@ -488,12 +492,24 @@ pub fn parse_spark(json: &str) -> Result<Vec<Quote>> {
     let obj = v.as_object().ok_or_else(|| anyhow!("unexpected spark payload"))?;
     let mut out = Vec::new();
     for (sym, d) in obj {
-        let closes: Vec<f64> =
-            d["close"].as_array().map(|a| a.iter().filter_map(|x| x.as_f64()).collect()).unwrap_or_default();
-        let Some(&last) = closes.last() else { continue };
-        let prev =
-            if closes.len() >= 2 { closes[closes.len() - 2] } else { d["chartPreviousClose"].as_f64().unwrap_or(last) };
-        let ts = d["timestamp"].as_array().and_then(|a| a.last()).and_then(|t| t.as_i64()).unwrap_or_default();
+        // Filter paired observations so a null close cannot advance the quote time.
+        let rows: Vec<(i64, f64)> = d["timestamp"]
+            .as_array()
+            .zip(d["close"].as_array())
+            .map(|(times, closes)| {
+                times.iter().zip(closes).filter_map(|(t, c)| Some((t.as_i64()?, c.as_f64()?))).collect()
+            })
+            .unwrap_or_default();
+        let Some(&(ts, last)) = rows.last() else { continue };
+        let closes: Vec<f64> = rows.iter().map(|(_, c)| *c).collect();
+        let prev = d["meta"]["previousClose"]
+            .as_f64()
+            .or_else(|| d["previousClose"].as_f64())
+            .or_else(|| Some(d["fulldayPrice"].as_f64()? - d["fulldayChange"].as_f64()?))
+            .or_else(|| closes.len().checked_sub(2).map(|i| closes[i]))
+            .or_else(|| d["meta"]["chartPreviousClose"].as_f64())
+            .or_else(|| d["chartPreviousClose"].as_f64())
+            .unwrap_or(last);
         out.push(Quote {
             provenance: tr_core::Provenance::Real,
             symbol: sym.clone(),
@@ -612,6 +628,62 @@ pub fn parse_search(json: &str) -> Result<Vec<SearchHit>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn spark_prefers_reference_close_and_keeps_null_times_aligned() {
+        for (reference, expected) in [
+            (serde_json::json!({"meta": {"previousClose": 90.0}, "previousClose": 91.0,
+                "fulldayPrice": 120.0, "fulldayChange": 20.0}), 90.0),
+            (serde_json::json!({"meta": {"previousClose": null}, "previousClose": 91.0,
+                "fulldayPrice": 120.0, "fulldayChange": 20.0}), 91.0),
+            (serde_json::json!({"previousClose": null, "fulldayPrice": 120.0,
+                "fulldayChange": 20.0, "chartPreviousClose": 80.0}), 100.0),
+            (serde_json::json!({"fulldayPrice": 120.0, "chartPreviousClose": 80.0}), 105.0),
+            (serde_json::json!({"fulldayChange": 20.0,
+                "meta": {"chartPreviousClose": 80.0}}), 105.0),
+            (serde_json::json!({}), 105.0),
+        ] {
+            let mut data = reference;
+            data["timestamp"] = serde_json::json!([1, 2, 3, 4, 5, null]);
+            data["close"] = serde_json::json!([100.0, null, 105.0, 110.0, null, 999.0]);
+            let json = serde_json::json!({"X": data});
+            let q = parse_spark(&json.to_string()).unwrap().remove(0);
+            assert_eq!(q.prev_close, expected);
+            assert_eq!(q.last, 110.0);
+            assert_eq!(q.ts, 4);
+            assert_eq!(q.spark, vec![100.0, 105.0, 110.0]);
+        }
+        for (reference, expected) in [
+            (serde_json::json!({"meta": {"chartPreviousClose": 90.0}}), 90.0),
+            (serde_json::json!({"chartPreviousClose": 90.0}), 90.0),
+            (serde_json::json!({"previousClose": null, "chartPreviousClose": null}), 100.0),
+        ] {
+            let mut data = reference;
+            data["timestamp"] = serde_json::json!([1, 2]);
+            data["close"] = serde_json::json!([100.0, null]);
+            let q = parse_spark(&serde_json::json!({"X": data}).to_string()).unwrap().remove(0);
+            assert_eq!((q.prev_close, q.last, q.ts), (expected, 100.0, 1));
+        }
+    }
+
+    #[test]
+    fn chart_skips_invalid_prices_but_keeps_missing_and_zero_volume_distinct() {
+        let json = serde_json::json!({"chart": {"result": [{
+            "meta": {}, "timestamp": [1,2,3,4,5,6,7,8],
+            "indicators": {"quote": [{
+                "open":  [10,10,10,10,10,0,10,null],
+                "high":  [12,12,12,10,12,12,8,12],
+                "low":   [9,9,9,9,11,9,9,9],
+                "close": [11,11,11,11,11,11,11,11],
+                "volume": [null,0]
+            }]}
+        }], "error": null}});
+        let bars = parse_chart(&json.to_string()).unwrap().bars;
+        assert_eq!(bars.iter().map(|b| b.ts).collect::<Vec<_>>(), vec![1, 2, 3]);
+        assert_eq!(bars[0].volume_value(), None);
+        assert_eq!(bars[1].volume_value(), Some(0.0));
+        assert_eq!(bars[2].volume_value(), None);
+    }
 
     #[test]
     fn parses_fixture() {
