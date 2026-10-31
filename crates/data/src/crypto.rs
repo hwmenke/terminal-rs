@@ -77,7 +77,7 @@ pub fn parse_binance_klines(json: &str) -> Result<Vec<Bar>> {
                     num(r.get(2)?)?,
                     num(r.get(3)?)?,
                     num(r.get(4)?)?,
-                    num(r.get(5)?)?,
+                    num(r.get(5).unwrap_or(&Value::Null)).filter(|v| v.is_finite() && *v >= 0.0).unwrap_or(f64::NAN),
                 )
                 .with_provenance(tr_core::Provenance::Real),
             )
@@ -99,19 +99,37 @@ pub fn parse_binance_ws(text: &str) -> Option<Bar> {
     let v: Value = serde_json::from_str(text).ok()?;
     let k = v.get("k")?;
     Some(
-        Bar::new(k["t"].as_i64()? / 1000, num(&k["o"])?, num(&k["h"])?, num(&k["l"])?, num(&k["c"])?, num(&k["v"])?)
-            .with_provenance(tr_core::Provenance::Real),
+        Bar::new(
+            k["t"].as_i64()? / 1000,
+            num(&k["o"])?,
+            num(&k["h"])?,
+            num(&k["l"])?,
+            num(&k["c"])?,
+            num(&k["v"]).filter(|v| v.is_finite() && *v >= 0.0).unwrap_or(f64::NAN),
+        )
+        .with_provenance(tr_core::Provenance::Real),
     )
 }
 
 /// Parse Coinbase `/products/{id}/candles`: `[time, low, high, open, close, volume]`,
 /// newest first. Returned ascending.
 pub fn parse_coinbase_candles(json: &str) -> Result<Vec<Bar>> {
-    let rows: Vec<Vec<f64>> = serde_json::from_str(json).context("parsing Coinbase candles")?;
+    let rows: Vec<Vec<Value>> = serde_json::from_str(json).context("parsing Coinbase candles")?;
     let mut bars: Vec<Bar> = rows
         .iter()
-        .filter(|r| r.len() >= 6)
-        .map(|r| Bar::new(r[0] as i64, r[3], r[2], r[1], r[4], r[5]).with_provenance(tr_core::Provenance::Real))
+        .filter_map(|r| {
+            Some(
+                Bar::new(
+                    r.first()?.as_i64()?,
+                    num(r.get(3)?)?,
+                    num(r.get(2)?)?,
+                    num(r.get(1)?)?,
+                    num(r.get(4)?)?,
+                    r.get(5).and_then(num).filter(|v| v.is_finite() && *v >= 0.0).unwrap_or(f64::NAN),
+                )
+                .with_provenance(tr_core::Provenance::Real),
+            )
+        })
         .collect();
     bars.sort_by_key(|b| b.ts);
     bars.dedup_by_key(|b| b.ts);
@@ -131,7 +149,7 @@ pub fn parse_coinbase_ws(text: &str) -> Option<(i64, f64, f64)> {
         return None;
     }
     let ts = DateTime::parse_from_rfc3339(v["time"].as_str()?).ok()?.timestamp();
-    Some((ts, num(&v["price"])?, num(&v["last_size"]).unwrap_or(0.0)))
+    Some((ts, num(&v["price"])?, num(&v["last_size"]).filter(|v| v.is_finite() && *v >= 0.0).unwrap_or(f64::NAN)))
 }
 
 /// Coinbase granularity used to build `tf` bars, and whether resampling is needed.
@@ -436,7 +454,10 @@ async fn coinbase_ws(product: &str, tf: Timeframe, tx: &mpsc::Sender<Bar>) -> Re
                 b.high = b.high.max(px);
                 b.low = b.low.min(px);
                 b.close = px;
-                b.volume += size;
+                b.volume = match (b.volume_value(), size.is_finite().then_some(size)) {
+                    (Some(a), Some(b)) => a + b,
+                    (a, b) => a.or(b).unwrap_or(f64::NAN),
+                };
                 *b
             }
             _ => *bar.insert(Bar::new(bucket, px, px, px, px, size).with_provenance(tr_core::Provenance::Real)),
@@ -451,6 +472,16 @@ async fn coinbase_ws(product: &str, tf: Timeframe, tx: &mpsc::Sender<Bar>) -> Re
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn candles_keep_prices_with_missing_volume() {
+        let bars = parse_coinbase_candles("[[0,9,12,10,11,null],[60,9,12,10,11,0]]").unwrap();
+        assert_eq!(bars[0].volume_value(), None);
+        assert_eq!(bars[1].volume_value(), Some(0.0));
+        let bars = parse_binance_klines(r#"[[0,"10","12","9","11",null],[60000,"10","12","9","11","0"]]"#).unwrap();
+        assert_eq!(bars[0].volume_value(), None);
+        assert_eq!(bars[1].volume_value(), Some(0.0));
+    }
 
     #[test]
     fn order_book_fixtures() {

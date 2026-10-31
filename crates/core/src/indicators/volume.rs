@@ -9,7 +9,8 @@ use super::volatility::Bands;
 use super::{NAN, Ohlcv, ago, ratio, zip};
 
 /// VWAP resetting whenever `session_of(ts)` changes; falls back to the typical price
-/// while the session has no volume.
+/// while the session has only reported zero volume. Missing observations are NaN
+/// and excluded from subsequent weighted totals.
 pub fn vwap_by(bars: &[Bar], session_of: impl Fn(i64) -> i64) -> Vec<f64> {
     let mut out = Vec::with_capacity(bars.len());
     let (mut pv, mut vol) = (0.0, 0.0);
@@ -20,6 +21,10 @@ pub fn vwap_by(bars: &[Bar], session_of: impl Fn(i64) -> i64) -> Vec<f64> {
             session = Some(s);
             pv = 0.0;
             vol = 0.0;
+        }
+        if b.volume_value().is_none() {
+            out.push(NAN);
+            continue;
         }
         pv += b.hlc3() * b.volume;
         vol += b.volume;
@@ -35,7 +40,7 @@ pub fn vwap(bars: &[Bar]) -> Vec<f64> {
 }
 
 /// Session VWAP with bands `k` volume-weighted standard deviations of the typical price
-/// away.
+/// away. Missing volume leaves a gap and is excluded from weighted totals.
 pub fn vwap_bands(o: &Ohlcv, session_of: impl Fn(i64) -> i64, k: f64) -> Bands {
     let tp = o.hlc3();
     let len = o.len();
@@ -47,6 +52,9 @@ pub fn vwap_bands(o: &Ohlcv, session_of: impl Fn(i64) -> i64, k: f64) -> Bands {
             (pv, pv2, vol, session) = (0.0, 0.0, 0.0, Some(s));
         }
         let v = o.volume[i];
+        if !v.is_finite() || v < 0.0 {
+            continue;
+        }
         pv += tp[i] * v;
         pv2 += tp[i] * tp[i] * v;
         vol += v;
@@ -83,7 +91,9 @@ fn step(values: &[f64], i: usize) -> f64 {
 pub fn obv(o: &Ohlcv) -> Vec<f64> {
     cumulative(o.len(), |i| {
         let d = step(&o.close, i);
-        if d > 0.0 {
+        if !o.volume[i].is_finite() {
+            NAN
+        } else if d > 0.0 {
             o.volume[i]
         } else if d < 0.0 {
             -o.volume[i]
@@ -127,7 +137,7 @@ pub fn mfi(o: &Ohlcv, n: usize) -> Vec<f64> {
         (0..o.len())
             .map(|i| {
                 let d = tp[i] - ago(&tp, i, 1);
-                if d.is_nan() {
+                if d.is_nan() || !o.volume[i].is_finite() {
                     NAN
                 } else if (up && d > 0.0) || (!up && d < 0.0) {
                     tp[i] * o.volume[i]
@@ -166,6 +176,9 @@ fn volume_index(o: &Ohlcv, pick: impl Fn(f64, f64) -> bool) -> Vec<f64> {
     let mut v = 1000.0;
     (0..o.len())
         .map(|i| {
+            if !o.volume[i].is_finite() || (i > 0 && !o.volume[i - 1].is_finite()) {
+                return NAN;
+            }
             if i > 0 && pick(o.volume[i], o.volume[i - 1]) {
                 v *= 1.0 + ratio(step(&o.close, i), o.close[i - 1], 0.0);
             }
@@ -292,7 +305,9 @@ pub fn net_volume(o: &Ohlcv) -> Vec<f64> {
     (0..o.len())
         .map(|i| {
             let d = step(&o.close, i);
-            if d > 0.0 {
+            if !o.volume[i].is_finite() {
+                NAN
+            } else if d > 0.0 {
                 o.volume[i]
             } else if d < 0.0 {
                 -o.volume[i]
@@ -325,6 +340,28 @@ mod tests {
         let b: Vec<Bar> =
             rows.iter().enumerate().map(|(i, r)| Bar::new(i as i64 * 60, r.0, r.1, r.2, r.3, r.4)).collect();
         Ohlcv::new(&b)
+    }
+
+    #[test]
+    fn missing_volume_is_unavailable_and_does_not_poison_later_vwap() {
+        let raw = [
+            Bar::new(0, 10.0, 10.0, 10.0, 10.0, 1.0),
+            Bar::new(60, 20.0, 20.0, 20.0, 20.0, f64::NAN),
+            Bar::new(120, 30.0, 30.0, 30.0, 30.0, 1.0),
+            Bar::new(180, 40.0, 40.0, 40.0, 40.0, 0.0),
+            Bar::new(240, 50.0, 50.0, 50.0, 50.0, 1.0),
+        ];
+        let o = Ohlcv::new(&raw);
+        let v = vwap_by(&raw, |_| 0);
+        assert!(v[1].is_nan());
+        assert_eq!(v[2], 20.0);
+        let bands = vwap_bands(&o, |_| 0, 1.0);
+        assert!(bands.middle[1].is_nan());
+        assert_eq!(bands.middle[2], 20.0);
+        let rvol = relative_volume(&o, 2);
+        assert!(rvol[1].is_nan() && rvol[2].is_nan() && rvol[3].is_nan());
+        assert_eq!(rvol[4], 2.0);
+        assert!(super::super::ma::vwma(&o.close, &o.volume, 2)[2].is_nan());
     }
 
     #[test]

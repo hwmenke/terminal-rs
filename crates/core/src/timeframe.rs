@@ -103,10 +103,13 @@ impl Timeframe {
                     cur.high = cur.high.max(b.high);
                     cur.low = cur.low.min(b.low);
                     cur.close = b.close;
-                    cur.volume += b.volume;
+                    cur.volume = match (cur.volume_value(), b.volume_value()) {
+                        (Some(a), Some(b)) => a + b,
+                        (a, b) => a.or(b).unwrap_or(f64::NAN),
+                    };
                     cur.provenance = cur.provenance.combine(b.provenance);
                 }
-                _ => out.push(Bar { ts: start, ..*b }),
+                _ => out.push(Bar { ts: start, volume: b.volume_value().unwrap_or(f64::NAN), ..*b }),
             }
         }
         out
@@ -175,6 +178,20 @@ mod tests {
         assert_eq!(Timeframe::W1.bucket_start(wed), mon);
         assert_eq!(Timeframe::MN1.bucket_start(wed), first);
         assert_eq!(Timeframe::H1.bucket_start(wed), wed - 30 * 60);
+    }
+
+    #[test]
+    fn resample_sums_only_known_volume() {
+        let bars: Vec<_> = [f64::NAN, 3.0, f64::NAN, 0.0, f64::NAN, f64::NAN]
+            .into_iter()
+            .enumerate()
+            .map(|(i, v)| Bar::new(i as i64 * 60, 10.0, 12.0, 9.0, 11.0, v))
+            .collect();
+        let result = Timeframe::M5.resample(&bars);
+        assert_eq!(result[0].volume_value(), Some(3.0));
+        assert_eq!(result[1].volume_value(), None);
+        let zero = Timeframe::M5.resample(&bars[2..4]);
+        assert_eq!(zero[0].volume_value(), Some(0.0));
     }
 
     #[test]

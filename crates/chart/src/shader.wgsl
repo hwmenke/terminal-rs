@@ -151,6 +151,9 @@ fn vs_candle(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) -
 @vertex
 fn vs_volume(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) -> VsOut {
     let b = bars[ii];
+    if (!(b.volume > 0.0)) {
+        return degenerate();
+    }
     let g = grow(b.x + b.w * 0.5);
     if (g <= 0.0) {
         return degenerate();

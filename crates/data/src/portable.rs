@@ -339,7 +339,8 @@ pub struct HistoryBar {
     pub high: f64,
     pub low: f64,
     pub close: f64,
-    pub volume: f64,
+    #[serde(default)]
+    pub volume: Option<f64>,
     pub provenance: Provenance,
     pub source: String,
 }
@@ -353,14 +354,15 @@ impl HistoryBar {
             high: bar.high,
             low: bar.low,
             close: bar.close,
-            volume: bar.volume,
+            volume: bar.volume_value(),
             provenance: bar.provenance,
             source: source.to_string(),
         }
     }
 
     pub fn to_bar(&self) -> Bar {
-        Bar::new(self.ts, self.open, self.high, self.low, self.close, self.volume).with_provenance(self.provenance)
+        Bar::new(self.ts, self.open, self.high, self.low, self.close, self.volume.unwrap_or(f64::NAN))
+            .with_provenance(self.provenance)
     }
 }
 
@@ -611,6 +613,18 @@ pub fn workspace_document(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn history_volume_round_trips_null_and_zero() {
+        for volume in [f64::NAN, 0.0, 42.0] {
+            let bar = Bar::new(0, 10.0, 12.0, 9.0, 11.0, volume);
+            let row = HistoryBar::from_bar(&bar, "test");
+            let json = serde_json::to_string(&row).unwrap();
+            let restored: HistoryBar = serde_json::from_str(&json).unwrap();
+            assert_eq!(restored.to_bar().volume_value(), bar.volume_value());
+        }
+    }
+
     use crate::journal::{SetupDraft, default_checklist};
     use crate::whats_news::{ScanRow, Symbol};
     use tr_core::Bar;

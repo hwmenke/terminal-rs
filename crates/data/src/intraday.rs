@@ -430,14 +430,17 @@ pub fn relative_volume(tf: Timeframe, bars: &[Bar]) -> Option<f64> {
     step_minutes(tf)?;
     let mut days: BTreeMap<NaiveDate, Vec<&Bar>> = BTreeMap::new();
     for b in bars {
-        if in_regular_session(b.ts) && b.volume.is_finite() && b.volume >= 0.0 {
+        if in_regular_session(b.ts) {
             days.entry(minute_of(b.ts).0).or_default().push(b);
         }
     }
     let (today, today_bars) = days.pop_last()?;
     let offset = minutes_from_open(today_bars.last()?.ts)?;
     let cum = |rows: &[&Bar]| -> f64 {
-        rows.iter().filter(|b| minutes_from_open(b.ts).is_some_and(|m| m <= offset)).map(|b| b.volume).sum()
+        rows.iter()
+            .filter(|b| minutes_from_open(b.ts).is_some_and(|m| m <= offset))
+            .map(|b| b.volume_value().unwrap_or(f64::NAN))
+            .sum()
     };
     let today_vol = cum(&today_bars);
     if !(today_vol.is_finite() && today_vol > 0.0) {
@@ -780,6 +783,18 @@ mod tests {
 
     fn bar(ts: i64, volume: f64) -> Bar {
         Bar::new(ts, 10.0, 12.0, 8.0, 11.0, volume)
+    }
+
+    #[test]
+    fn relative_volume_excludes_incomplete_totals() {
+        let at = |day, volume| {
+            let date = NaiveDate::from_ymd_opt(2026, 1, day).unwrap();
+            Bar::new(tr_core::ny::to_utc(date.and_hms_opt(9, 30, 0).unwrap()), 10.0, 11.0, 9.0, 10.0, volume)
+        };
+        let mut bars = vec![at(5, 100.0), at(6, f64::NAN), at(7, 200.0)];
+        assert_eq!(relative_volume(Timeframe::M5, &bars), Some(2.0));
+        bars[2].volume = f64::NAN;
+        assert_eq!(relative_volume(Timeframe::M5, &bars), None);
     }
 
     #[test]

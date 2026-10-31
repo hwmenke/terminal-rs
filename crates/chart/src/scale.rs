@@ -52,6 +52,9 @@ pub fn format_price(p: f64, decimals: usize) -> String {
 
 /// Compact volume formatting: 37.88M, 101.8K.
 pub fn format_volume(v: f64) -> String {
+    if !v.is_finite() {
+        return "—".into();
+    }
     match v.abs() {
         x if x >= 1e9 => format!("{:.2}B", v / 1e9),
         x if x >= 1e6 => format!("{:.2}M", v / 1e6),
