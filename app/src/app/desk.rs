@@ -728,13 +728,23 @@ pub(super) struct HoldingRiskState {
     pub generation: u64,
     pub error: Option<String>,
     positions: Option<Vec<tr_broker::Position>>,
+    held_keys: std::collections::BTreeSet<String>,
 }
 
 impl Default for HoldingRiskState {
     fn default() -> Self {
         Self { history: Default::default(), concentration: 0.2, breaches: None,
-            loading: false, requested: false, generation: 0, error: None, positions: None }
+            loading: false, requested: false, generation: 0, error: None, positions: None, held_keys: Default::default() }
     }
+}
+
+/// Pure set comparison and history pruning; quote/position ordering is irrelevant.
+fn reconcile_held_history<T>(
+    previous: &std::collections::BTreeSet<String>,
+    current: &std::collections::BTreeSet<String>,
+    history: std::collections::HashMap<String, T>,
+) -> (bool, std::collections::HashMap<String, T>) {
+    (previous != current, history.into_iter().filter(|(key, _)| current.contains(key)).collect())
 }
 
 impl HoldingRiskState {
@@ -750,16 +760,27 @@ impl TerminalApp {
     /// Compare only portfolio inputs; archive histories are never cloned during rendering.
     pub(super) fn sync_holding_risk(&mut self) {
         let pf = if self.demo_mode() { Some(&*self.demo.pf) } else { self.broker.portfolio.as_deref() };
-        if self.holding_risk.positions.as_deref() != pf.map(|pf| pf.positions.as_slice()) {
+        let keys: std::collections::BTreeSet<_> = pf.into_iter()
+            .flat_map(|pf| pf.positions.iter()).filter_map(|p| p.market_key()).collect();
+        let (changed, history) = reconcile_held_history(
+            &self.holding_risk.held_keys, &keys, std::mem::take(&mut self.holding_risk.history));
+        self.holding_risk.history = history;
+        self.holding_risk.held_keys = keys;
+        if changed {
+            // Invalidate in-flight results even when no request target is open.
+            self.holding_risk.generation += 1;
+            self.holding_risk.requested = false;
+            self.holding_risk.loading = false;
+            self.holding_risk.error = None;
+        }
+        if changed || self.holding_risk.positions.as_deref() != pf.map(|pf| pf.positions.as_slice()) {
             self.holding_risk.recompute(pf);
         }
-        if let Some(pf) = pf
+        if pf.is_some()
             && !self.holding_risk.requested
-            && let Some(pane) = self.panes.iter().find(|p| matches!(p.kind, PaneKind::Desk(_))).map(|p| p.id)
+            && let Some(pane) = self.panes.iter().find(|p| matches!(p.kind, PaneKind::Desk(_) | PaneKind::Portfolio(_))).map(|p| p.id)
         {
-            let mut symbols: Vec<_> = pf.positions.iter().filter_map(|p| p.market_key()).collect();
-            symbols.sort();
-            symbols.dedup();
+            let symbols = self.holding_risk.held_keys.iter().cloned().collect();
             self.holding_risk.requested = true;
             self.holding_risk.loading = true;
             self.holding_risk.generation += 1;
@@ -771,6 +792,23 @@ impl TerminalApp {
 #[cfg(test)]
 mod holding_risk_tests {
     use super::*;
+
+    #[test]
+    fn symbol_sets_diff_and_prune_without_price_or_order_inputs() {
+        let old = ["A".into(), "B".into()].into_iter().collect();
+        let same = ["B".into(), "A".into(), "A".into()].into_iter().collect();
+        let history = [("A".into(), 1), ("B".into(), 2), ("stale".into(), 3)].into_iter().collect();
+        let (changed, history) = reconcile_held_history(&old, &same, history);
+        assert!(!changed);
+        assert_eq!(history.len(), 2);
+        let next = ["B".into(), "C".into()].into_iter().collect();
+        let (changed, history) = reconcile_held_history(&old, &next, history);
+        assert!(changed);
+        assert_eq!(history, [("B".into(), 2)].into_iter().collect());
+        let (changed, history) = reconcile_held_history(&next, &Default::default(), history);
+        assert!(changed);
+        assert!(history.is_empty());
+    }
 
     #[test]
     fn holdings_risk_reuses_and_focuses_portfolio() {
@@ -802,6 +840,37 @@ mod holding_risk_tests {
         app.holding_risk.loading = false;
         app.holding_risk.error = Some("archive unavailable".into());
         app.sync_holding_risk();
+        app.sync_holding_risk();
+        assert_eq!(app.holding_risk.generation, generation);
+        assert!(requests.try_recv().is_err());
+    }
+
+    #[test]
+    fn held_set_change_refreshes_generation_prunes_and_recounts() {
+        let mut app = super::super::tests::test_app();
+        let (worker, mut requests) = crate::worker::Worker::test_channel();
+        app.worker = worker;
+        app.prefs.trading.account_mode = crate::prefs::AccountMode::Demo;
+        app.demo.pf = Box::new(tr_broker::sample::portfolio());
+        app.open_desk(None);
+        while requests.try_recv().is_ok() {}
+        let generation = app.holding_risk.generation;
+        assert!(!app.demo.pf.positions.is_empty());
+        app.demo.pf.positions[0].price = Some(123.0);
+        app.demo.pf.positions.reverse();
+        app.sync_holding_risk();
+        assert_eq!(app.holding_risk.generation, generation);
+        assert!(requests.try_recv().is_err());
+        let key = app.demo.pf.positions[0].market_key().unwrap();
+        app.holding_risk.history.insert(key, vec![]);
+        app.demo.pf.positions.clear();
+        app.sync_holding_risk();
+        assert!(app.holding_risk.history.is_empty());
+        assert_eq!(app.holding_risk.breaches, Some(0));
+        assert!(app.holding_risk.generation > generation);
+        assert!(matches!(requests.try_recv(), Ok(Request::HoldingHistory { generation: g, symbols, .. })
+            if g == app.holding_risk.generation && symbols.is_empty()));
+        let generation = app.holding_risk.generation;
         app.sync_holding_risk();
         assert_eq!(app.holding_risk.generation, generation);
         assert!(requests.try_recv().is_err());
