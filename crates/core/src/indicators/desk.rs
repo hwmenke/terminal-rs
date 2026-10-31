@@ -29,6 +29,13 @@ pub struct HoldingRisk {
     pub concentrated: Option<bool>,
 }
 
+/// Count holdings with at least one known breach; missing values do not imply a breach.
+pub fn risk_breaches(risks: impl IntoIterator<Item = HoldingRisk>) -> usize {
+    risks.into_iter().filter(|r| r.above_sma50 == Some(false)
+        || r.rsi14.is_some_and(|v| v.is_finite() && (v >= 70.0 || v <= 30.0))
+        || r.concentrated == Some(true)).count()
+}
+
 /// Weight and threshold are fractions of the same-currency gross holdings value.
 pub fn holding_risk(bars: &[Bar], weight: Option<f64>, threshold: f64) -> HoldingRisk {
     let closes: Vec<_> = bars.iter().map(|b| b.close).collect();
@@ -79,6 +86,19 @@ mod tests {
     use super::*;
     fn bars(n: usize, price: f64) -> Vec<Bar> {
         (0..n).map(|i| Bar::new(i as i64 * 86400, price, price + 1.0, price - 1.0, price, 1.0)).collect()
+    }
+    #[test]
+    fn breaches_count_each_holding_once_and_ignore_unknowns() {
+        let unknown = HoldingRisk { above_sma50: None, rsi14: None, concentrated: None };
+        assert_eq!(risk_breaches([]), 0);
+        assert_eq!(risk_breaches([unknown]), 0);
+        assert_eq!(risk_breaches([
+            HoldingRisk { above_sma50: Some(false), rsi14: Some(70.0), concentrated: Some(true) },
+            HoldingRisk { rsi14: Some(30.0), ..unknown },
+            HoldingRisk { concentrated: Some(true), ..unknown },
+            HoldingRisk { above_sma50: Some(true), rsi14: Some(50.0), concentrated: Some(false) },
+            HoldingRisk { rsi14: Some(f64::NAN), ..unknown },
+        ]), 3);
     }
     #[test]
     fn stretch_uses_full_sma50_and_wilder_atr() {

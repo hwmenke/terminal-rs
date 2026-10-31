@@ -158,6 +158,15 @@ impl TerminalApp {
         if self.watchlists.index(&self.watch_ui.selected_group).is_none() {
             self.watch_ui.selected_group = self.watchlists.last_used.clone();
         }
+        let mut risk_pane = super::broker::PortfolioPane::new(crate::command::PortView::Positions);
+        for p in &self.panes {
+            if let PaneKind::Portfolio(p) = &p.kind {
+                risk_pane.risk_history.extend(p.risk_history.clone());
+            }
+        }
+        let pf = if self.demo_mode() { Some(&*self.demo.pf) } else { self.broker.portfolio.as_deref() };
+        let breaches = pf.map(|pf| tr_core::indicators::risk_breaches(super::portfolio_view::holding_risks(&risk_pane, pf)));
+        let mut open_risk = false;
         let mut actions = vec![];
         let mut refresh = false;
         let mut pick = None;
@@ -186,6 +195,9 @@ impl TerminalApp {
 
             ui.horizontal_wrapped(|ui| {
                 ui.label(RichText::new("PM Desk").strong().color(crate::theme::text()));
+                ui.label(breaches.map(|n| format!("Risk breaches: {n} (known)")).unwrap_or_else(|| "Risk breaches: —".into()))
+                    .on_hover_text("Holdings with any known breach: below SMA50, RSI14 ≥70 / ≤30, or weight >20%. Daily signals require loaded holdings history; unknown signals are not counted.");
+                open_risk = ui.small_button("Holdings risk →").clicked();
                 egui::ComboBox::from_id_salt("desk-group").selected_text(&pane.group).show_ui(ui, |ui| {
                     for g in &self.watchlists.groups {
                         ui.selectable_value(
@@ -398,6 +410,13 @@ impl TerminalApp {
         {
             pane.user_stop = Some(p);
             pane.stop = p;
+        }
+        if open_risk {
+            risk_pane.open_risk = true;
+            self.open_panel(PaneKind::Portfolio(Box::new(risk_pane)));
+            if !self.demo_mode() && self.broker.portfolio.is_none() && !self.broker.loading {
+                self.refresh_portfolio();
+            }
         }
         actions
     }

@@ -857,6 +857,23 @@ pub fn scan_histories(name: &str, histories: Vec<(String, Vec<Bar>)>, provenance
     scanner::scan_cached(name, histories, provenance)
 }
 
+/// Apply a separately loaded verified benchmark without adding it to the scan universe.
+pub fn apply_spy_benchmark(scan: &mut Scan, histories: &[(String, Vec<Bar>)], spy: Option<&[Bar]>) -> Result<()> {
+    if let Some(spy) = spy {
+        Bar::require_verified(spy, "SCAN SPY benchmark").map_err(anyhow::Error::msg)?;
+    }
+    for row in &mut scan.results {
+        if let Some(metrics) = &mut row.metrics {
+            metrics.rs_spy_63d = None;
+            if let Some((_, bars)) = histories.iter().find(|(symbol, _)| symbol == &row.symbol) {
+                Bar::require_verified(bars, "SCAN relative return").map_err(anyhow::Error::msg)?;
+                metrics.rs_spy_63d = spy.and_then(|spy| tr_core::indicators::daily_relative_return(bars, spy, 63));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// US equity sessions after `last` through `today`, saturated at six (the stale threshold).
 /// Regular NYSE holidays are excluded; ad hoc exchange closures are not modeled.
 pub fn trading_days_since(last: NaiveDate, today: NaiveDate) -> usize {

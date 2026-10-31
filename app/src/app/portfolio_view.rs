@@ -1210,6 +1210,22 @@ mod tests {
     }
 }
 
+/// Compute risks with the same account, symbol and currency scope as the strip.
+pub(super) fn holding_risks(pane: &PortfolioPane, pf: &Portfolio) -> Vec<tr_core::indicators::HoldingRisk> {
+    pf.positions.iter()
+        .filter(|p| pane.account.as_ref().is_none_or(|a| *a == p.account_id))
+        .filter(|p| matches_symbol(pane, p.market_key()))
+        .map(|p| {
+            let bars = p.market_key().and_then(|k| pane.risk_history.get(&k));
+            let values: Option<Vec<_>> = pf.positions.iter()
+                .filter(|q| q.currency == p.currency && pane.account.as_ref().is_none_or(|a| *a == q.account_id))
+                .map(|q| q.market_value().filter(|v| v.is_finite()).map(f64::abs)).collect();
+            let total = values.map(|v| v.iter().sum::<f64>()).filter(|v| *v > 0.0);
+            let weight = p.market_value().zip(total).map(|(v, t)| v.abs() / t);
+            tr_core::indicators::holding_risk(bars.map(Vec::as_slice).unwrap_or(&[]), weight, pane.concentration)
+        }).collect()
+}
+
 /// Risk strip for the selected holdings scope, using explicitly loaded archive history.
 pub(super) fn risk_chips(
     ui: &mut Ui,
@@ -1221,7 +1237,8 @@ pub(super) fn risk_chips(
     if !matches!(pane.view, PortView::Summary | PortView::Positions) {
         return;
     }
-    ui.collapsing("Holdings risk · daily archive", |ui| {
+    let force_open = std::mem::take(&mut pane.open_risk);
+    egui::CollapsingHeader::new("Holdings risk · daily archive").open(force_open.then_some(true)).show(ui, |ui| {
         ui.horizontal(|ui| {
             ui.label("Concentration threshold (%)");
             let mut percent = pane.concentration * 100.0;

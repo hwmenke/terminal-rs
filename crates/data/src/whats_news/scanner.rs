@@ -422,8 +422,8 @@ impl Sort {
             Self::Volume => "Volume",
             Self::VolumeRatio => "Volume / prior 20",
             Self::Range => "ADR20 %",
-            Self::StretchAtr => "ADMA Stretch / SMA50 ATR14",
-            Self::StretchPct => "ADMA Stretch / SMA50 %",
+            Self::StretchAtr => "SMA50 Stretch ATR14",
+            Self::StretchPct => "SMA50 Stretch %",
             Self::SpyStrength => "SPY relative 63d %",
         }
     }
@@ -999,6 +999,29 @@ mod desk_metric_tests {
                 assert_eq!(rows[2].symbol, "MISSING");
             }
         }
+    }
+
+    #[test]
+    fn separate_benchmark_keeps_universe_and_verifies_provenance() {
+        let bars = |end: f64| (0..70).map(|i| {
+            let close = if i == 69 { end } else { 100.0 };
+            Bar::new(i * 86400, close, close + 1.0, close - 1.0, close, 10.0)
+                .with_provenance(Provenance::Real)
+        }).collect::<Vec<_>>();
+        let histories = vec![("AAPL".into(), bars(110.0))];
+        let mut scan = ScanCache::default().scan("RSI_OB", histories.clone(), Provenance::Real).unwrap().0;
+        let scanned = scan.scanned;
+        super::super::apply_spy_benchmark(&mut scan, &histories, Some(&bars(100.0))).unwrap();
+        assert_eq!(scan.scanned, scanned);
+        assert_eq!(scan.results.len(), 1);
+        assert_eq!(scan.results[0].symbol, "AAPL");
+        assert!((scan.results[0].metrics.as_ref().unwrap().rs_spy_63d.unwrap() - 10.0).abs() < 1e-9);
+        super::super::apply_spy_benchmark(&mut scan, &histories, Some(&bars(110.0))).unwrap();
+        assert_eq!(scan.results[0].metrics.as_ref().unwrap().rs_spy_63d, Some(0.0));
+        super::super::apply_spy_benchmark(&mut scan, &histories, None).unwrap();
+        assert_eq!(scan.results[0].metrics.as_ref().unwrap().rs_spy_63d, None);
+        let sample: Vec<_> = bars(100.0).into_iter().map(|b| b.with_provenance(Provenance::Sample)).collect();
+        assert!(super::super::apply_spy_benchmark(&mut scan, &histories, Some(&sample)).is_err());
     }
 
     #[test]
