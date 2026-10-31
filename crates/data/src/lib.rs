@@ -555,6 +555,7 @@ impl<P: MarketData> MarketData for Fallback<P> {
             Ok(b) => Ok(b),
             // Paging older history: never splice sample bars onto real ones.
             Err(e) if end.is_some() => Err(e),
+            Err(e) if e.chain().any(|cause| cause.is::<yahoo::RateLimited>()) => Err(e),
             Err(e) => {
                 tracing::warn!("{} history {symbol} {tf} failed, using sample data: {e:#}", self.name);
                 self.sample.history(symbol, tf, end, limit).await
@@ -579,6 +580,7 @@ impl<P: MarketData> MarketData for Fallback<P> {
                 }
                 Ok(q)
             }
+            Err(e) if e.chain().any(|cause| cause.is::<yahoo::RateLimited>()) => Err(e),
             Err(e) => {
                 tracing::warn!("{} quotes failed, using sample data: {e:#}", self.name);
                 self.sample.quotes(symbols).await
@@ -605,6 +607,7 @@ impl<P: MarketData> MarketData for Fallback<P> {
     async fn options(&self, symbol: &str, expiration: Option<i64>) -> Result<OptionChain> {
         match self.primary.options(symbol, expiration).await {
             Ok(c) => Ok(c),
+            Err(e) if e.chain().any(|cause| cause.is::<yahoo::RateLimited>()) => Err(e),
             Err(e) => {
                 tracing::warn!("{} options {symbol}: {e:#}; simulating", self.name);
                 self.sample.options(symbol, expiration).await
@@ -626,6 +629,7 @@ impl<P: MarketData> MarketData for Fallback<P> {
     async fn yield_curves(&self) -> Result<YieldCurves> {
         match self.primary.yield_curves().await {
             Ok(c) => Ok(c),
+            Err(e) if e.chain().any(|cause| cause.is::<yahoo::RateLimited>()) => Err(e),
             Err(e) => {
                 tracing::warn!("{} yield curve failed, using sample data: {e:#}", self.name);
                 self.sample.yield_curves().await

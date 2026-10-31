@@ -14,13 +14,25 @@ pub struct SessionPathPane {
     pub path: Option<SessionPath>,
     pub loading: bool,
     pub error: Option<String>,
+    pub last_refresh: Option<i64>,
+    last_query: Option<(String, String, String)>,
 }
 
 impl SessionPathPane {
     pub fn new(symbol: impl Into<String>, spec: impl Into<String>) -> Self {
         let symbol = symbol.into();
         let symbol = if symbol.trim().is_empty() { symbol } else { tr_data::security(&symbol).key() };
-        Self { symbol, spec: spec.into(), tf: "5m".into(), generation: 0, path: None, loading: false, error: None }
+        Self {
+            symbol,
+            spec: spec.into(),
+            tf: "5m".into(),
+            generation: 0,
+            path: None,
+            loading: false,
+            error: None,
+            last_refresh: None,
+            last_query: None,
+        }
     }
 
     pub fn request(&mut self, pane: PaneId, worker: &crate::worker::Worker) {
@@ -35,10 +47,15 @@ impl SessionPathPane {
             self.loading = false;
             return;
         }
+        let query = (symbol.to_string(), self.spec.clone(), self.tf.clone());
+        if self.last_query.as_ref() != Some(&query) {
+            self.path = None;
+            self.last_refresh = None;
+        }
+        self.last_query = Some(query);
         self.generation += 1;
         self.loading = true;
         self.error = None;
-        self.path = None;
         worker.send(Request::SessionPath {
             pane,
             generation: self.generation,
@@ -62,10 +79,10 @@ impl SessionPathPane {
             Ok(path) => {
                 self.tf = path.timeframe.label().into();
                 self.path = Some(path);
+                self.last_refresh = Some(chrono::Utc::now().timestamp());
                 self.error = None;
             }
             Err(err) => {
-                self.path = None;
                 self.error = Some(err);
             }
         }
@@ -151,6 +168,17 @@ impl TerminalApp {
                     }
                 }
             });
+            if let Some(at) = pane.last_refresh {
+                ui.label(
+                    RichText::new(format!(
+                        "as of {} ET{}",
+                        tr_core::ny::civil(at).format("%H:%M"),
+                        if pane.error.is_some() { " · STALE / retry with Reload" } else { "" }
+                    ))
+                    .font(mono(11.0))
+                    .color(muted()),
+                );
+            }
             if let Some(err) = &pane.error {
                 ui.label(RichText::new(err).font(mono(12.0)).color(theme::down()));
             } else if pane.loading {
@@ -380,6 +408,19 @@ mod tests {
             }
         }
         let mut path = build_path("AAPL", &bars, &PathQuery { window: 5, timeframe: Timeframe::M30 }, "unit").unwrap();
+        let mut healthy = SessionPathPane::new("AAPL", "5");
+        healthy.generation = 1;
+        healthy.accept(1, Ok(path.clone()));
+        let at = healthy.last_refresh;
+        assert!(at.is_some());
+        healthy.accept(0, Err("old error".into()));
+        assert!(healthy.error.is_none());
+        healthy.accept(1, Err("Yahoo cooldown: retry in 30s".into()));
+        assert!(healthy.path.is_some());
+        assert_eq!(healthy.last_refresh, at);
+        assert!(healthy.error.as_deref().unwrap().contains("retry"));
+        healthy.accept(1, Ok(path.clone()));
+        assert!(healthy.error.is_none());
         path.provenance = Provenance::Sample;
         let mut pane = SessionPathPane::new("AAPL", "5");
         pane.generation = 1;

@@ -3,6 +3,8 @@
 //! Yahoo has no 4h interval, so 4h is resampled from 1h. Intraday depth is limited by
 //! Yahoo: 1m ≈ 7 days per request (30 days total), 5–30m ≈ 60 days, 1h ≈ 730 days.
 
+use crate::cache::{FetchKey, InFlight};
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -14,13 +16,17 @@ use crate::{MarketData, Quote, SearchHit};
 
 const BASE: &str = "https://query1.finance.yahoo.com/v8/finance/chart";
 
+#[derive(Clone)]
 pub struct YahooProvider {
+    pending: InFlight,
+    slots: Arc<tokio::sync::Semaphore>,
+    cooldown: Arc<std::sync::Mutex<Backoff>>,
     client: reqwest::Client,
     /// Session crumb for endpoints that require one (options); the cookie lives in the
     /// client's cookie store.
-    crumb: tokio::sync::Mutex<Option<String>>,
+    crumb: Arc<tokio::sync::Mutex<Option<String>>>,
     /// Spaces chart, spark and quote calls so an intraday refresh does not burst.
-    pace: tokio::sync::Mutex<crate::intraday::Pace>,
+    pace: Arc<tokio::sync::Mutex<crate::intraday::Pace>>,
 }
 
 impl YahooProvider {
@@ -31,11 +37,37 @@ impl YahooProvider {
             .timeout(Duration::from_secs(20))
             .cookie_store(true)
             .build()?;
+        // The archive and market-data router can construct separate clients. They
+        // still consume one Yahoo quota and must respect the same cooldown.
+        static POLICY: std::sync::OnceLock<(Arc<tokio::sync::Semaphore>, Arc<std::sync::Mutex<Backoff>>)> =
+            std::sync::OnceLock::new();
+        let (slots, cooldown) = POLICY.get_or_init(|| (Arc::new(tokio::sync::Semaphore::new(4)), Default::default()));
         Ok(Self {
             client,
-            crumb: tokio::sync::Mutex::new(None),
-            pace: tokio::sync::Mutex::new(crate::intraday::Pace::yahoo()),
+            pending: Default::default(),
+            slots: slots.clone(),
+            cooldown: cooldown.clone(),
+            crumb: Arc::new(tokio::sync::Mutex::new(None)),
+            pace: Arc::new(tokio::sync::Mutex::new(crate::intraday::Pace::yahoo())),
         })
+    }
+
+    async fn send(&self, request: reqwest::RequestBuilder) -> Result<YahooResponse> {
+        let permit = self.slots.clone().acquire_owned().await?;
+        let now = chrono::Utc::now().timestamp();
+        let remaining = self.cooldown.lock().unwrap().remaining(now);
+        if remaining > 0 {
+            return Err(RateLimited { retry_secs: remaining }.into());
+        }
+        let response = request.send().await?;
+        if response.status().as_u16() == 429 {
+            let now = chrono::Utc::now().timestamp();
+            let retry =
+                response.headers().get("retry-after").and_then(|h| h.to_str().ok()).and_then(|s| retry_after(s, now));
+            let delay = self.cooldown.lock().unwrap().limited(now, retry);
+            return Err(RateLimited { retry_secs: delay }.into());
+        }
+        Ok(YahooResponse { response, _permit: permit, cooldown: self.cooldown.clone() })
     }
 
     async fn pace(&self) {
@@ -49,15 +81,12 @@ impl YahooProvider {
         self.pace().await;
         let url = format!("{BASE}/{}", urlencode(symbol));
         let resp = self
-            .client
-            .get(&url)
-            .query(&[
+            .send(self.client.get(&url).query(&[
                 ("interval", interval.to_string()),
                 ("period1", period1.to_string()),
                 ("period2", period2.to_string()),
                 ("includePrePost", if pre_post { "true" } else { "false" }.into()),
-            ])
-            .send()
+            ]))
             .await?;
         if !resp.status().is_success() {
             bail!("yahoo {symbol}: HTTP {}", resp.status());
@@ -221,9 +250,25 @@ pub fn cash_session_symbol(symbol: &str) -> bool {
 }
 
 impl YahooProvider {
+    async fn fetch_bars(
+        &self,
+        symbol: &str,
+        tf: Timeframe,
+        end: Option<i64>,
+        limit: usize,
+        extended: bool,
+    ) -> Result<Vec<Bar>> {
+        let key = FetchKey { symbol: symbol.to_string(), tf: tf.label().into(), end, limit, extended };
+        let provider = self.clone();
+        let symbol = symbol.to_string();
+        self.pending
+            .run(key, async move { provider.fetch_bars_uncached(&symbol, tf, end, limit, extended).await })
+            .await
+    }
+
     /// `extended` asks Yahoo for pre-market and after-hours prints and keeps those sessions.
     /// The regular read still drops them. Neither path rewrites a bar's OHLC.
-    async fn fetch_bars(
+    async fn fetch_bars_uncached(
         &self,
         symbol: &str,
         tf: Timeframe,
@@ -298,10 +343,12 @@ impl MarketData for YahooProvider {
 
     async fn search(&self, query: &str) -> Result<Vec<SearchHit>> {
         let resp = self
-            .client
-            .get(SEARCH)
-            .query(&[("q", query), ("quotesCount", "12"), ("newsCount", "0"), ("listsCount", "0")])
-            .send()
+            .send(self.client.get(SEARCH).query(&[
+                ("q", query),
+                ("quotesCount", "12"),
+                ("newsCount", "0"),
+                ("listsCount", "0"),
+            ]))
             .await?;
         if !resp.status().is_success() {
             bail!("yahoo search: HTTP {}", resp.status());
@@ -321,8 +368,8 @@ impl YahooProvider {
             return Ok(c.clone());
         }
         // fc.yahoo.com answers 404 but sets the cookie; only transport errors matter.
-        self.client.get("https://fc.yahoo.com").send().await.context("yahoo session")?;
-        let resp = self.client.get("https://query2.finance.yahoo.com/v1/test/getcrumb").send().await?;
+        self.send(self.client.get("https://fc.yahoo.com")).await.context("yahoo session")?;
+        let resp = self.send(self.client.get("https://query2.finance.yahoo.com/v1/test/getcrumb")).await?;
         let crumb = resp.text().await?.trim().to_string();
         if crumb.is_empty() || crumb.contains('{') || crumb.len() > 64 {
             bail!("yahoo did not issue a crumb");
@@ -340,7 +387,7 @@ impl YahooProvider {
             if let Some(e) = expiration {
                 q.push(("date", e.to_string()));
             }
-            let resp = self.client.get(format!("{OPTIONS}/{}", urlencode(symbol))).query(&q).send().await?;
+            let resp = self.send(self.client.get(format!("{OPTIONS}/{}", urlencode(symbol))).query(&q)).await?;
             let status = resp.status();
             let body = resp.text().await?;
             if status.as_u16() == 401 || body.contains("Invalid Crumb") {
@@ -358,10 +405,12 @@ impl YahooProvider {
     /// Headlines related to a Yahoo symbol or free-text query.
     pub async fn news(&self, query: &str) -> Result<Vec<crate::NewsItem>> {
         let resp = self
-            .client
-            .get(SEARCH)
-            .query(&[("q", query), ("quotesCount", "0"), ("newsCount", "25"), ("listsCount", "0")])
-            .send()
+            .send(self.client.get(SEARCH).query(&[
+                ("q", query),
+                ("quotesCount", "0"),
+                ("newsCount", "25"),
+                ("listsCount", "0"),
+            ]))
             .await?;
         if !resp.status().is_success() {
             bail!("yahoo news: HTTP {}", resp.status());
@@ -461,10 +510,11 @@ impl YahooProvider {
     pub async fn spark(&self, symbols: &[String]) -> Result<Vec<Quote>> {
         self.pace().await;
         let resp = self
-            .client
-            .get(SPARK)
-            .query(&[("symbols", symbols.join(",")), ("range", "10d".into()), ("interval", "1d".into())])
-            .send()
+            .send(self.client.get(SPARK).query(&[
+                ("symbols", symbols.join(",")),
+                ("range", "10d".into()),
+                ("interval", "1d".into()),
+            ]))
             .await?;
         if !resp.status().is_success() {
             bail!("yahoo spark: HTTP {}", resp.status());
@@ -478,7 +528,7 @@ impl YahooProvider {
             return Ok(std::collections::HashMap::new());
         }
         self.pace().await;
-        let resp = self.client.get(QUOTE).query(&[("symbols", symbols.join(","))]).send().await?;
+        let resp = self.send(self.client.get(QUOTE).query(&[("symbols", symbols.join(","))])).await?;
         if !resp.status().is_success() {
             bail!("yahoo quote: HTTP {}", resp.status());
         }
@@ -632,15 +682,27 @@ mod tests {
     #[test]
     fn spark_prefers_reference_close_and_keeps_null_times_aligned() {
         for (reference, expected) in [
-            (serde_json::json!({"meta": {"previousClose": 90.0}, "previousClose": 91.0,
-                "fulldayPrice": 120.0, "fulldayChange": 20.0}), 90.0),
-            (serde_json::json!({"meta": {"previousClose": null}, "previousClose": 91.0,
-                "fulldayPrice": 120.0, "fulldayChange": 20.0}), 91.0),
-            (serde_json::json!({"previousClose": null, "fulldayPrice": 120.0,
-                "fulldayChange": 20.0, "chartPreviousClose": 80.0}), 100.0),
+            (
+                serde_json::json!({"meta": {"previousClose": 90.0}, "previousClose": 91.0,
+                "fulldayPrice": 120.0, "fulldayChange": 20.0}),
+                90.0,
+            ),
+            (
+                serde_json::json!({"meta": {"previousClose": null}, "previousClose": 91.0,
+                "fulldayPrice": 120.0, "fulldayChange": 20.0}),
+                91.0,
+            ),
+            (
+                serde_json::json!({"previousClose": null, "fulldayPrice": 120.0,
+                "fulldayChange": 20.0, "chartPreviousClose": 80.0}),
+                100.0,
+            ),
             (serde_json::json!({"fulldayPrice": 120.0, "chartPreviousClose": 80.0}), 105.0),
-            (serde_json::json!({"fulldayChange": 20.0,
-                "meta": {"chartPreviousClose": 80.0}}), 105.0),
+            (
+                serde_json::json!({"fulldayChange": 20.0,
+                "meta": {"chartPreviousClose": 80.0}}),
+                105.0,
+            ),
             (serde_json::json!({}), 105.0),
         ] {
             let mut data = reference;
@@ -905,21 +967,22 @@ impl crate::history::DailyHistory for YahooProvider {
         use crate::history::{Failure, FailureKind};
         let midnight = |d: chrono::NaiveDate| d.and_hms_opt(0, 0, 0).unwrap().and_utc().timestamp();
         let response = self
-            .client
-            .get(format!("{BASE}/{}", urlencode(symbol)))
-            .query(&[
+            .send(self.client.get(format!("{BASE}/{}", urlencode(symbol))).query(&[
                 ("interval", "1d".to_string()),
                 ("period1", start.map(midnight).unwrap_or(-2_208_988_800).to_string()),
                 ("period2", midnight(end).to_string()),
                 ("includeAdjustedClose", "true".into()),
                 ("events", "div,splits".into()),
-            ])
-            .send()
+            ]))
             .await
             .map_err(|e| {
                 Failure::new(
-                    FailureKind::Network,
-                    if e.is_timeout() { "Yahoo timed out" } else { "Could not reach Yahoo" },
+                    if e.chain().any(|cause| cause.is::<RateLimited>()) {
+                        FailureKind::RateLimited
+                    } else {
+                        FailureKind::Network
+                    },
+                    format!("Yahoo: {e:#}"),
                 )
             })?;
         let status = response.status();
@@ -931,8 +994,16 @@ impl crate::history::DailyHistory for YahooProvider {
             };
             return Err(Failure::new(kind, format!("Yahoo returned HTTP {status}")));
         }
-        let body =
-            response.text().await.map_err(|_| Failure::new(FailureKind::Network, "Yahoo response was interrupted"))?;
+        let body = response.text().await.map_err(|e| {
+            Failure::new(
+                if e.chain().any(|cause| cause.is::<RateLimited>()) {
+                    FailureKind::RateLimited
+                } else {
+                    FailureKind::Network
+                },
+                format!("Yahoo: {e:#}"),
+            )
+        })?;
         parse_archive_daily(&body)
     }
 }
@@ -1035,3 +1106,131 @@ mod archive_tests {
         }
     }
 }
+
+#[derive(Default)]
+struct Backoff {
+    until: i64,
+    attempts: u32,
+}
+impl Backoff {
+    fn remaining(&self, now: i64) -> i64 {
+        (self.until - now).max(0)
+    }
+    fn limited(&mut self, now: i64, retry: Option<i64>) -> i64 {
+        if now > self.until.saturating_add(300) {
+            self.attempts = 0;
+        }
+        let delay = (5_i64 * (1_i64 << self.attempts.min(6))).max(retry.unwrap_or(0));
+        self.attempts = self.attempts.saturating_add(1);
+        self.until = self.until.max(now.saturating_add(delay));
+        self.remaining(now)
+    }
+}
+fn retry_after(value: &str, now: i64) -> Option<i64> {
+    value
+        .parse::<i64>()
+        .ok()
+        .map(|n| n.max(0))
+        .or_else(|| chrono::DateTime::parse_from_rfc2822(value).ok().map(|d| (d.timestamp() - now).max(0)))
+}
+#[cfg(test)]
+mod coordination_tests {
+    use super::*;
+
+    #[test]
+    fn body_rate_limit_signal_requires_unsuccessful_status() {
+        for body in ["too many requests", "rate limit", "RateLimit"] {
+            assert!(!body_signals_rate_limit(reqwest::StatusCode::OK, body));
+            assert!(body_signals_rate_limit(reqwest::StatusCode::FORBIDDEN, body));
+            assert!(body_signals_rate_limit(reqwest::StatusCode::SERVICE_UNAVAILABLE, body));
+        }
+        assert!(!body_signals_rate_limit(reqwest::StatusCode::BAD_REQUEST, "invalid symbol"));
+    }
+
+    #[tokio::test]
+    async fn provider_cap_and_cooldown_are_shared_and_fail_without_network() {
+        let mut provider = YahooProvider::new().unwrap();
+        let independent = YahooProvider::new().unwrap();
+        assert!(Arc::ptr_eq(&provider.slots, &independent.slots));
+        assert!(Arc::ptr_eq(&provider.cooldown, &independent.cooldown));
+        // Isolate the test's injected cooldown from other tests constructing clients.
+        provider.slots = Arc::new(tokio::sync::Semaphore::new(4));
+        provider.cooldown = Default::default();
+        provider.cooldown.lock().unwrap().limited(chrono::Utc::now().timestamp(), Some(60));
+        let clone = provider.clone();
+        let permit = provider.slots.acquire_many(4).await.unwrap();
+        let request = clone.send(clone.client.get("http://unused.invalid"));
+        tokio::pin!(request);
+        assert!(futures::poll!(&mut request).is_pending());
+        drop(permit);
+        let error = match request.await {
+            Err(e) => e,
+            Ok(_) => panic!("cooldown allowed request"),
+        };
+        assert!(error.is::<RateLimited>());
+        assert!(
+            crate::Fallback::new(provider.clone())
+                .history("AAPL", Timeframe::M5, None, 10)
+                .await
+                .unwrap_err()
+                .chain()
+                .any(|e| e.is::<RateLimited>())
+        );
+        assert!(provider.search("AAPL").await.is_err());
+        assert_eq!(provider.slots.available_permits(), 4);
+    }
+
+    #[test]
+    fn backoff_uses_injected_time_and_retry_after() {
+        let mut b = Backoff::default();
+        assert_eq!(b.limited(100, None), 5);
+        assert_eq!(b.remaining(105), 0);
+        assert_eq!(b.limited(105, Some(30)), 30);
+        assert_eq!(b.limited(135, None), 20);
+        assert_eq!(retry_after("12", 0), Some(12));
+        assert_eq!(retry_after("Wed, 21 Oct 2015 07:28:00 GMT", 1445412470), Some(10));
+    }
+}
+
+struct YahooResponse {
+    response: reqwest::Response,
+    _permit: tokio::sync::OwnedSemaphorePermit,
+    cooldown: Arc<std::sync::Mutex<Backoff>>,
+}
+
+fn body_signals_rate_limit(status: reqwest::StatusCode, body: &str) -> bool {
+    if status.is_success() {
+        return false;
+    }
+    let lower = body.to_ascii_lowercase();
+    lower.contains("too many requests") || lower.contains("rate limit") || lower.contains("ratelimit")
+}
+
+impl YahooResponse {
+    fn status(&self) -> reqwest::StatusCode {
+        self.response.status()
+    }
+    async fn text(self) -> Result<String> {
+        let status = self.response.status();
+        let retry = self.response.headers().get("retry-after").and_then(|h| h.to_str().ok()).map(str::to_string);
+        let body = self.response.text().await?;
+        if body_signals_rate_limit(status, &body) {
+            let now = chrono::Utc::now().timestamp();
+            let delay =
+                self.cooldown.lock().unwrap().limited(now, retry.as_deref().and_then(|value| retry_after(value, now)));
+            return Err(RateLimited { retry_secs: delay }.into());
+        }
+        Ok(body)
+    }
+}
+
+#[derive(Debug)]
+pub struct RateLimited {
+    pub retry_secs: i64,
+}
+impl std::fmt::Display for RateLimited {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Yahoo rate limited / cooldown: retry in {}s", self.retry_secs)
+    }
+}
+impl std::error::Error for RateLimited {}

@@ -2540,8 +2540,27 @@ async fn refresh_intraday(s: &Shared, pane: PaneId, generation: u64, symbol: &st
     } else {
         s.provider.history(symbol, tf, None, limit).await
     };
-    let Ok(bars) = fetched else { return };
+    let bars = match fetched {
+        Ok(bars) => bars,
+        Err(error) => {
+            if current_series(s, pane, generation).is_some() {
+                s.send(Response::HistoryError {
+                    pane,
+                    generation,
+                    error: format!("Refresh failed; retry on next poll: {error:#}"),
+                });
+            }
+            return;
+        }
+    };
     if bars.is_empty() || !bars.iter().all(|b| b.provenance.is_verified()) {
+        if current_series(s, pane, generation).is_some() {
+            s.send(Response::HistoryError {
+                pane,
+                generation,
+                error: "Refresh returned no verified bars; retry on next poll".into(),
+            });
+        }
         return;
     }
     let merged = {
@@ -3523,6 +3542,7 @@ mod tests {
         assert_eq!(provider.calls.load(std::sync::atomic::Ordering::SeqCst), 2);
         assert_eq!(current_series(&s, 1, 1).unwrap().len(), 2);
 
+        assert_eq!(rx.try_iter().filter(|r| matches!(r, Response::HistoryError { .. })).count(), 1);
         provider.next.lock().unwrap().push(Ok(vec![real(1_700_000_300, 2.0), real(1_700_000_600, 3.0)]));
         refresh_intraday(&s, 1, 1, "AAPL", Timeframe::M5, false).await;
         assert_eq!(provider.calls.load(std::sync::atomic::Ordering::SeqCst), 3);

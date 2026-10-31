@@ -248,6 +248,7 @@ pub struct ChartState {
     paging: bool,
     exhausted: bool,
     error: Option<String>,
+    last_refresh: Option<i64>,
     built: Vec<BuiltIndicator>,
     compare_line: Option<LineRef>,
     compare_scale: f64,
@@ -331,6 +332,7 @@ impl ChartState {
             paging: false,
             exhausted: false,
             error: None,
+            last_refresh: None,
             built: Vec::new(),
             compare_line: None,
             compare_scale: 1.0,
@@ -411,6 +413,7 @@ impl ChartState {
         self.paging = false;
         self.exhausted = false;
         self.error = None;
+        self.last_refresh = None;
         self.viewport = None;
         self.manual_scale = None;
         self.glide = None;
@@ -859,6 +862,9 @@ impl ChartState {
             self.loading = false;
         }
         self.error = None;
+        if !from_cache && !live && prepended == 0 && self.provenance.is_verified() {
+            self.last_refresh = Some(chrono::Utc::now().timestamp());
+        }
         match self.viewport.as_mut() {
             None => {
                 self.viewport = Some(Viewport::fit_last(new_len, DEFAULT_VISIBLE, 800.0));
@@ -891,12 +897,12 @@ impl ChartState {
 
     pub fn on_history_error(&mut self, generation: u64, error: String) -> bool {
         if generation == self.generation {
+            if self.loading || self.paging {
+                self.exhausted = true;
+            }
             self.loading = false;
             self.paging = false;
-            self.exhausted = true;
-            if self.bars.is_empty() {
-                self.error = Some(error);
-            }
+            self.error = Some(error);
             return true;
         }
         false
@@ -1106,8 +1112,11 @@ impl ChartState {
             }
             rx = lr.right();
         }
+        if let Some(error) = &self.error {
+            ui.interact(range_row, ui.id().with((self.id, "refresh_error")), Sense::hover()).on_hover_text(error);
+        }
         let status = match (&self.error, self.loading, self.paging) {
-            (Some(e), _, _) => format!("ERR {e}"),
+            (Some(_), _, _) => "STALE / ERR · retry pending".into(),
             (_, true, _) => "loading…".into(),
             (_, _, true) => "loading history…".into(),
             _ => format!(
@@ -1120,7 +1129,13 @@ impl ChartState {
         painter.text(
             pos2(range_row.right() - 6.0, range_row.center().y),
             Align2::RIGHT_CENTER,
-            format!("{} · {status}", provenance.label()),
+            format!(
+                "{} · {}{status}",
+                provenance.label(),
+                self.last_refresh
+                    .map(|at| format!("as of {} ET · ", tr_core::ny::civil(at).format("%H:%M")))
+                    .unwrap_or_default()
+            ),
             mono(if provenance.is_verified() { 10.5 } else { 12.0 }),
             if provenance.is_verified() { muted() } else { theme::down() },
         );
@@ -3193,6 +3208,23 @@ mod tests {
         c.reset_view();
         assert_eq!(c.glide.map(|g| g.to), Some(Viewport::fit_last(500, DEFAULT_VISIBLE, 800.0)));
     }
+    #[test]
+    fn refresh_health_retains_bars_rejects_old_errors_and_recovers() {
+        let (worker, _) = Worker::test_channel();
+        let mut chart = ChartState::new(42, "AAPL", Timeframe::M5);
+        let bars = Arc::new(vec![Bar::new(0, 10.0, 12.0, 9.0, 11.0, 1.0).with_provenance(Provenance::Real)]);
+        chart.on_history(0, bars.clone(), SeriesGpu::build(&bars), 0, false, false, false, &worker);
+        let at = chart.last_refresh;
+        assert!(at.is_some());
+        assert!(!chart.on_history_error(1, "obsolete".into()));
+        assert!(chart.on_history_error(0, "cooldown; retry in 30s".into()));
+        assert_eq!(chart.last_refresh, at);
+        assert_eq!(chart.bars.len(), 1);
+        assert!(chart.error.is_some());
+        chart.on_history(0, bars.clone(), SeriesGpu::build(&bars), 0, false, false, false, &worker);
+        assert!(chart.error.is_none());
+    }
+
     #[test]
     fn archive_reload_clears_history_and_rejects_pending_prices() {
         let (worker, mut requests) = Worker::test_channel();
