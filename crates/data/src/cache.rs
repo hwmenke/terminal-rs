@@ -223,3 +223,124 @@ mod tests {
         ));
     }
 }
+
+/// A provider request's complete identity. Session and page boundaries never share results.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct FetchKey {
+    pub symbol: String,
+    pub tf: String,
+    pub end: Option<i64>,
+    pub limit: usize,
+    pub extended: bool,
+}
+
+type SharedBars =
+    futures::future::Shared<futures::future::BoxFuture<'static, Result<Vec<Bar>, std::sync::Arc<anyhow::Error>>>>;
+
+/// Only active work is retained. A detached owner finishes even when a pane closes.
+#[derive(Clone, Default)]
+pub(crate) struct InFlight {
+    pending: std::sync::Arc<tokio::sync::Mutex<std::collections::HashMap<FetchKey, SharedBars>>>,
+}
+impl InFlight {
+    pub async fn run(
+        &self,
+        key: FetchKey,
+        fetch: impl std::future::Future<Output = Result<Vec<Bar>>> + Send + 'static,
+    ) -> Result<Vec<Bar>> {
+        use futures::FutureExt;
+        let future = {
+            let mut pending = self.pending.lock().await;
+            pending
+                .entry(key.clone())
+                .or_insert_with(|| {
+                    let map = self.pending.clone();
+                    let task = tokio::spawn(async move {
+                        // Catch task panics as well so the key is always released.
+                        let result = tokio::spawn(fetch)
+                            .await
+                            .map_err(anyhow::Error::from)
+                            .and_then(|r| r)
+                            .map_err(|e| std::sync::Arc::new(e));
+                        map.lock().await.remove(&key);
+                        result
+                    });
+                    async move { task.await.unwrap_or_else(|e| Err(std::sync::Arc::new(anyhow::Error::from(e)))) }
+                        .boxed()
+                        .shared()
+                })
+                .clone()
+        };
+        future.await.map_err(|e| anyhow::Error::new(SharedFetchError(e)))
+    }
+}
+
+#[cfg(test)]
+mod flight_tests {
+    use super::*;
+    #[tokio::test]
+    async fn closing_first_waiter_does_not_cancel_shared_work() {
+        let flights = InFlight::default();
+        let key = FetchKey { symbol: "AAPL".into(), tf: "5m".into(), end: None, limit: 1, extended: false };
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let mut first = Box::pin(flights.run(key.clone(), async {
+            rx.await.unwrap();
+            Ok(vec![])
+        }));
+        assert!(futures::poll!(&mut first).is_pending());
+        drop(first);
+        let second = flights.run(key, async { panic!("closing pane lost request") });
+        let release = async {
+            tokio::task::yield_now().await;
+            tx.send(()).unwrap();
+        };
+        let (result, _) = tokio::join!(second, release);
+        assert!(result.unwrap().is_empty());
+        assert!(flights.pending.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn identical_work_fans_out_errors_and_releases_key() {
+        let flights = InFlight::default();
+        let key = FetchKey { symbol: "AAPL".into(), tf: "5m".into(), end: None, limit: 300, extended: false };
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let first = flights.run(key.clone(), async {
+            rx.await.unwrap();
+            anyhow::bail!("rate limited")
+        });
+        let second = flights.run(key.clone(), async { panic!("duplicate fetch") });
+        let release = async {
+            tokio::task::yield_now().await;
+            tx.send(()).unwrap();
+        };
+        let (a, b, _) = tokio::join!(first, second, release);
+        assert_eq!(a.unwrap_err().to_string(), b.unwrap_err().to_string());
+        assert!(flights.pending.lock().await.is_empty());
+        assert!(flights.run(key.clone(), async { Ok(vec![]) }).await.unwrap().is_empty());
+        let mut other = key.clone();
+        other.extended = true;
+        assert_ne!(key, other);
+        other = key.clone();
+        other.end = Some(1);
+        assert_ne!(key, other);
+        other = key.clone();
+        other.limit += 1;
+        assert_ne!(key, other);
+        other = key.clone();
+        other.tf = "1m".into();
+        assert_ne!(key, other);
+    }
+}
+
+#[derive(Debug)]
+struct SharedFetchError(std::sync::Arc<anyhow::Error>);
+impl std::fmt::Display for SharedFetchError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+impl std::error::Error for SharedFetchError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.0.as_ref().as_ref())
+    }
+}
