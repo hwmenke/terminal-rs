@@ -91,7 +91,11 @@ impl YahooProvider {
         if !resp.status().is_success() {
             bail!("yahoo {symbol}: HTTP {}", resp.status());
         }
-        parse_chart(&resp.text().await?)
+        let chart = parse_chart(&resp.text().await?)?;
+        if let Some(zone) = chart.session.exchange_timezone_name.as_deref() {
+            crate::cash_session::note_exchange_zone(symbol, zone);
+        }
+        Ok(chart)
     }
 }
 
@@ -119,13 +123,54 @@ fn interval(tf: Timeframe) -> (&'static str, Option<i64>) {
     }
 }
 
+/// Exchange metadata belongs to this response; current periods are not a historical calendar.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct SessionInfo {
+    pub exchange_timezone_name: Option<String>,
+    pub regular: Option<RegularSession>,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+pub struct RegularSession {
+    pub start: Option<i64>,
+    pub end: Option<i64>,
+    pub gmtoffset: Option<i32>,
+}
+
+#[derive(Deserialize)]
+struct TradingPeriod {
+    regular: Option<RegularSession>,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct Chart {
+    pub session: SessionInfo,
     pub bars: Vec<Bar>,
     pub last_price: Option<f64>,
     pub prev_close: Option<f64>,
     /// Fields present on the chart meta. Absent fields stay `None`.
     pub stats: crate::QuoteStats,
+}
+
+impl Chart {
+    /// US grids must never filter a foreign exchange's bars.
+    fn session_bars(self, symbol: &str, tf: Timeframe, extended: bool) -> Result<Vec<Bar>> {
+        if let Some(zone) = self.session.exchange_timezone_name.as_deref().filter(|z| !z.is_empty()) {
+            crate::cash_session::note_exchange_zone(symbol, zone);
+            if zone != "America/New_York" {
+                return Ok(self.bars);
+            }
+        }
+        if tf.is_intraday() && cash_session_symbol(symbol) {
+            Ok(if extended {
+                crate::intraday::keep_extended(self.bars)
+            } else {
+                crate::intraday::regular_only(self.bars)
+            })
+        } else {
+            Ok(self.bars)
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -147,6 +192,8 @@ struct ChartResult {
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct Meta {
+    exchange_timezone_name: Option<String>,
+    current_trading_period: Option<TradingPeriod>,
     regular_market_price: Option<f64>,
     chart_previous_close: Option<f64>,
     previous_close: Option<f64>,
@@ -212,6 +259,10 @@ pub fn parse_chart(json: &str) -> Result<Chart> {
         last_price: r.meta.regular_market_price,
         prev_close: r.meta.previous_close.or(r.meta.chart_previous_close),
         stats: stats_from_meta(&r.meta),
+        session: SessionInfo {
+            exchange_timezone_name: r.meta.exchange_timezone_name,
+            regular: r.meta.current_trading_period.and_then(|p| p.regular),
+        },
     })
 }
 
@@ -296,10 +347,8 @@ impl YahooProvider {
         if period1 >= period2 {
             return Ok(Vec::new());
         }
-        let mut bars = self.chart(symbol, iv, period1, period2, extended).await?.bars;
-        if tf.is_intraday() && cash_session_symbol(symbol) {
-            bars = if extended { crate::intraday::keep_extended(bars) } else { crate::intraday::regular_only(bars) };
-        }
+        let chart = self.chart(symbol, iv, period1, period2, extended).await?;
+        let mut bars = chart.session_bars(symbol, tf, extended)?;
         // Yahoo's weekly/monthly timestamps are session opens; snap to our calendar buckets.
         // 4h has no Yahoo interval, so it is aggregated from the (session-filtered) 1h bars.
         if matches!(tf, Timeframe::W1 | Timeframe::MN1 | Timeframe::H4) {
@@ -1234,3 +1283,43 @@ impl std::fmt::Display for RateLimited {
     }
 }
 impl std::error::Error for RateLimited {}
+
+#[cfg(test)]
+mod exchange_session_tests {
+    use super::*;
+
+    #[test]
+    fn foreign_metadata_is_retained_and_intraday_bars_are_unfiltered() {
+        let chart = parse_chart(include_str!("../tests/fixtures/yahoo_sap_intraday.json")).unwrap();
+        assert_eq!(chart.session.exchange_timezone_name.as_deref(), Some("Europe/Berlin"));
+        let regular = chart.session.regular.as_ref().unwrap();
+        assert_eq!(regular.start, Some(1773043200));
+        assert_eq!(regular.end, Some(1773073800));
+        assert_eq!(regular.gmtoffset, Some(3600));
+        assert_eq!(chart.bars.len(), 2);
+        for extended in [false, true] {
+            assert_eq!(chart.clone().session_bars("SESSION-FOREIGN.DE", Timeframe::M5, extended).unwrap(), chart.bars);
+            assert_eq!(crate::cash_session::exchange_zone("SESSION-FOREIGN.DE").as_deref(), Some("Europe/Berlin"));
+        }
+        assert_eq!(chart.clone().session_bars("SESSION-FOREIGN.DE", Timeframe::D1, false).unwrap(), chart.bars);
+    }
+
+    #[test]
+    fn us_metadata_and_missing_metadata_keep_existing_filtering() {
+        let json = include_str!("../tests/fixtures/yahoo_sap_intraday.json");
+        for zone in [Some("America/New_York"), None] {
+            let mut chart = parse_chart(json).unwrap();
+            chart.session.exchange_timezone_name = zone.map(str::to_string);
+            let expected = crate::intraday::regular_only(chart.bars.clone());
+            assert_eq!(chart.session_bars("SESSION-US-TEST", Timeframe::M5, false).unwrap(), expected);
+        }
+        for symbol in ["SAP.DE", "7203.T", "VOD.L"] {
+            assert!(
+                crate::cash_session::require_us_session(symbol, None).unwrap_err().contains("US cash sessions only")
+            );
+        }
+        for symbol in ["AAPL", "BRK-B", "BRK.B", "^GSPC"] {
+            assert!(crate::cash_session::require_us_session(symbol, None).is_ok());
+        }
+    }
+}
