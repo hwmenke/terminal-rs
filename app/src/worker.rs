@@ -998,9 +998,19 @@ async fn research_scan(
     bridge: &tr_data::whats_news::Bridge,
     name: &str,
 ) -> anyhow::Result<tr_data::whats_news::Snapshot<tr_data::whats_news::Scan>> {
+    let spy = desk_daily(s, bridge, "SPY").await.ok();
     let local = s.history.db(|db| db.histories()).await?;
     if local.is_empty() {
-        return bridge.scan(name).await;
+        let mut snapshot = bridge.scan(name).await?;
+        // Benchmark enrichment is best-effort: a failure leaves the RS column empty, never fails SCAN.
+        if let Ok(histories) = bridge.histories().await {
+            if histories.provenance.require_verified("SCAN archive").is_ok()
+                && tr_data::whats_news::apply_spy_benchmark(&mut snapshot.data, &histories.data.bars, spy.as_deref()).is_err()
+            {
+                let _ = tr_data::whats_news::apply_spy_benchmark(&mut snapshot.data, &[], None);
+            }
+        }
+        return Ok(snapshot);
     }
     if !tr_data::whats_news::SETUPS.contains(&name) {
         anyhow::bail!("Unknown scan {name}");
@@ -1039,7 +1049,12 @@ async fn research_scan(
     }
     let name = name.to_string();
     let mut data = tokio::task::spawn_blocking(move || {
-        tr_data::whats_news::scan_histories(&name, histories.into_iter().collect(), tr_core::Provenance::Cached)
+        let histories: Vec<_> = histories.into_iter().collect();
+        let mut scan = tr_data::whats_news::scan_histories(&name, histories.clone(), tr_core::Provenance::Cached)?;
+        if tr_data::whats_news::apply_spy_benchmark(&mut scan, &histories, spy.as_deref()).is_err() {
+            let _ = tr_data::whats_news::apply_spy_benchmark(&mut scan, &[], None);
+        }
+        Ok::<_, anyhow::Error>(scan)
     })
     .await??;
     data.skipped.extend(skipped);
@@ -1877,8 +1892,16 @@ async fn handle(s: &Arc<Shared>, req: Request) {
             let bridge = config.bridge();
             let mut rows = Vec::new();
             let mut errors = Vec::new();
-            for symbol in symbols {
-                match desk_daily(s, &bridge, &symbol).await {
+            use futures::StreamExt;
+            let results = futures::stream::iter(symbols.into_iter().map(|symbol| {
+                let bridge = &bridge;
+                async move {
+                    let result = desk_daily(s, bridge, &symbol).await;
+                    (symbol, result)
+                }
+            })).buffered(tr_data::news::FETCH_CONCURRENCY).collect::<Vec<_>>().await;
+            for (symbol, result) in results {
+                match result {
                     Ok(bars) => {
                         rows.push((symbol, bars));
                     }
