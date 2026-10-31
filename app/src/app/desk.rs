@@ -137,6 +137,21 @@ impl DeskPane {
 }
 
 impl TerminalApp {
+    fn open_holdings_risk(&mut self) {
+            if let Some(p) = self.panes.iter_mut().find(|p| matches!(p.kind, PaneKind::Portfolio(_))) {
+                if let PaneKind::Portfolio(pp) = &mut p.kind {
+                    pp.open_risk = true;
+                    pp.view = crate::command::PortView::Positions;
+                }
+                self.focus = p.id;
+                self.dock.activate(p.id);
+            } else {
+                let mut pane = super::broker::PortfolioPane::new(crate::command::PortView::Positions);
+                pane.open_risk = true;
+                self.open_panel(PaneKind::Portfolio(Box::new(pane)));
+            }
+    }
+
     pub(super) fn open_desk(&mut self, symbol: Option<&str>) {
         let group = self
             .watchlists
@@ -148,6 +163,7 @@ impl TerminalApp {
             pane.selected = Some(tr_data::security(s).key());
         }
         self.open_panel(PaneKind::Desk(Box::new(pane)));
+        self.sync_holding_risk();
     }
 
     pub(super) fn desk(&mut self, ui: &mut Ui, id: PaneId) -> Vec<Action> {
@@ -158,14 +174,9 @@ impl TerminalApp {
         if self.watchlists.index(&self.watch_ui.selected_group).is_none() {
             self.watch_ui.selected_group = self.watchlists.last_used.clone();
         }
-        let mut risk_pane = super::broker::PortfolioPane::new(crate::command::PortView::Positions);
-        for p in &self.panes {
-            if let PaneKind::Portfolio(p) = &p.kind {
-                risk_pane.risk_history.extend(p.risk_history.clone());
-            }
-        }
-        let pf = if self.demo_mode() { Some(&*self.demo.pf) } else { self.broker.portfolio.as_deref() };
-        let breaches = pf.map(|pf| tr_core::indicators::risk_breaches(super::portfolio_view::holding_risks(&risk_pane, pf)));
+        self.sync_holding_risk();
+        let breaches = self.holding_risk.breaches;
+        let threshold = self.holding_risk.concentration * 100.0;
         let mut open_risk = false;
         let mut actions = vec![];
         let mut refresh = false;
@@ -196,7 +207,7 @@ impl TerminalApp {
             ui.horizontal_wrapped(|ui| {
                 ui.label(RichText::new("PM Desk").strong().color(crate::theme::text()));
                 ui.label(breaches.map(|n| format!("Risk breaches: {n} (known)")).unwrap_or_else(|| "Risk breaches: —".into()))
-                    .on_hover_text("Holdings with any known breach: below SMA50, RSI14 ≥70 / ≤30, or weight >20%. Daily signals require loaded holdings history; unknown signals are not counted.");
+                    .on_hover_text(format!("Holdings with any known breach: below SMA50, RSI14 ≥70 / ≤30, or weight >{threshold}%. Daily signals require loaded holdings history; unknown signals are not counted."));
                 open_risk = ui.small_button("Holdings risk →").clicked();
                 egui::ComboBox::from_id_salt("desk-group").selected_text(&pane.group).show_ui(ui, |ui| {
                     for g in &self.watchlists.groups {
@@ -412,8 +423,7 @@ impl TerminalApp {
             pane.stop = p;
         }
         if open_risk {
-            risk_pane.open_risk = true;
-            self.open_panel(PaneKind::Portfolio(Box::new(risk_pane)));
+            self.open_holdings_risk();
             if !self.demo_mode() && self.broker.portfolio.is_none() && !self.broker.loading {
                 self.refresh_portfolio();
             }
@@ -705,5 +715,110 @@ mod tests {
         assert!(pane.plan().unwrap_err().contains("above entry"));
         pane.entry = f64::NAN;
         assert!(pane.plan().is_err());
+    }
+}
+
+/// Shared archive data and cached, whole-portfolio breach count.
+pub(super) struct HoldingRiskState {
+    pub history: std::collections::HashMap<String, Vec<tr_core::Bar>>,
+    pub concentration: f64,
+    pub breaches: Option<usize>,
+    pub loading: bool,
+    pub requested: bool,
+    pub generation: u64,
+    pub error: Option<String>,
+    positions: Option<Vec<tr_broker::Position>>,
+}
+
+impl Default for HoldingRiskState {
+    fn default() -> Self {
+        Self { history: Default::default(), concentration: 0.2, breaches: None,
+            loading: false, requested: false, generation: 0, error: None, positions: None }
+    }
+}
+
+impl HoldingRiskState {
+    pub fn recompute(&mut self, pf: Option<&tr_broker::Portfolio>) {
+        self.breaches = pf.map(|pf| tr_core::indicators::risk_breaches(
+            super::portfolio_view::holding_risks(
+                &super::broker::PortfolioPane::new(crate::command::PortView::Positions), pf, self)));
+        self.positions = pf.map(|pf| pf.positions.clone());
+    }
+}
+
+impl TerminalApp {
+    /// Compare only portfolio inputs; archive histories are never cloned during rendering.
+    pub(super) fn sync_holding_risk(&mut self) {
+        let pf = if self.demo_mode() { Some(&*self.demo.pf) } else { self.broker.portfolio.as_deref() };
+        if self.holding_risk.positions.as_deref() != pf.map(|pf| pf.positions.as_slice()) {
+            self.holding_risk.recompute(pf);
+        }
+        if let Some(pf) = pf
+            && !self.holding_risk.requested
+            && let Some(pane) = self.panes.iter().find(|p| matches!(p.kind, PaneKind::Desk(_))).map(|p| p.id)
+        {
+            let mut symbols: Vec<_> = pf.positions.iter().filter_map(|p| p.market_key()).collect();
+            symbols.sort();
+            symbols.dedup();
+            self.holding_risk.requested = true;
+            self.holding_risk.loading = true;
+            self.holding_risk.generation += 1;
+            self.worker.send(Request::HoldingHistory { pane, generation: self.holding_risk.generation, symbols });
+        }
+    }
+}
+
+#[cfg(test)]
+mod holding_risk_tests {
+    use super::*;
+
+    #[test]
+    fn holdings_risk_reuses_and_focuses_portfolio() {
+        let mut app = super::super::tests::test_app();
+        app.open_holdings_risk();
+        let id = app.focus;
+        let count = app.panes.len();
+        app.open_desk(None);
+        app.open_holdings_risk();
+        assert_eq!(app.focus, id);
+        assert_eq!(app.panes.len(), count + 1);
+        assert!(app.panes.iter().any(|p| p.id == id && matches!(&p.kind,
+            PaneKind::Portfolio(pp) if pp.open_risk && pp.view == crate::command::PortView::Positions)));
+    }
+
+    #[test]
+    fn desk_requests_once_even_after_failure_and_without_portfolio_pane() {
+        let mut app = super::super::tests::test_app();
+        let (worker, mut requests) = crate::worker::Worker::test_channel();
+        app.worker = worker;
+        app.prefs.trading.account_mode = crate::prefs::AccountMode::Demo;
+        app.open_desk(None);
+        let mut found = false;
+        while let Ok(request) = requests.try_recv() {
+            found |= matches!(request, Request::HoldingHistory { .. });
+        }
+        assert!(found);
+        let generation = app.holding_risk.generation;
+        app.holding_risk.loading = false;
+        app.holding_risk.error = Some("archive unavailable".into());
+        app.sync_holding_risk();
+        app.sync_holding_risk();
+        assert_eq!(app.holding_risk.generation, generation);
+        assert!(requests.try_recv().is_err());
+    }
+
+    #[test]
+    fn cached_count_uses_shared_threshold_and_portfolio_scope() {
+        let pf = tr_broker::sample::portfolio();
+        let mut state = HoldingRiskState::default();
+        state.recompute(Some(&pf));
+        let expected = tr_core::indicators::risk_breaches(super::super::portfolio_view::holding_risks(
+            &super::super::broker::PortfolioPane::new(crate::command::PortView::Positions), &pf, &state));
+        assert_eq!(state.breaches, Some(expected));
+        state.concentration = 1.0;
+        state.recompute(Some(&pf));
+        assert_eq!(state.breaches, Some(0));
+        state.recompute(None);
+        assert_eq!(state.breaches, None);
     }
 }
