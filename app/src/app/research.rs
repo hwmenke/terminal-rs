@@ -76,22 +76,21 @@ impl ResearchPane {
 
     pub fn accept_universe(&mut self, result: Result<Snapshot<Vec<Symbol>>, String>) {
         self.loading = false;
-        self.selected = 0;
-        self.scroll_selected = true;
+        let selected = self.visible_symbols().get(self.selected).map(|s| (*s).to_owned());
         self.error = None;
-        self.universe = None;
         match result.and_then(|s| Self::verify(s, "UNIV research")) {
-            Ok(snapshot) => self.universe = Some(snapshot),
+            Ok(snapshot) => {
+                self.universe = Some(snapshot);
+                self.restore_selection(selected);
+            }
             Err(error) => self.error = Some(error),
         }
     }
 
     pub fn accept_scan(&mut self, result: Result<Snapshot<Scan>, String>) {
         self.loading = false;
-        self.selected = 0;
-        self.scroll_selected = true;
+        let selected = self.visible_symbols().get(self.selected).map(|s| (*s).to_owned());
         self.error = None;
-        self.results = None;
         match result.and_then(|s| {
             s.data.provenance.require_verified("SCAN research")?;
             for row in &s.data.results {
@@ -99,9 +98,17 @@ impl ResearchPane {
             }
             Self::verify(s, "SCAN research")
         }) {
-            Ok(snapshot) => self.results = Some(snapshot),
+            Ok(snapshot) => {
+                self.results = Some(snapshot);
+                self.restore_selection(selected);
+            }
             Err(error) => self.error = Some(error),
         }
+    }
+
+    fn restore_selection(&mut self, symbol: Option<String>) {
+        self.selected = symbol.and_then(|symbol| self.visible_symbols().iter().position(|s| *s == symbol)).unwrap_or(0);
+        self.scroll_selected = true;
     }
 
     #[cfg(test)]
@@ -152,8 +159,6 @@ impl ResearchPane {
         self.generation += 1;
         self.loading = true;
         self.error = None;
-        self.universe = None;
-        self.results = None;
         worker.send(Request::Research { pane, generation: self.generation, scan: self.scan.clone() });
     }
     fn visible_symbols(&self) -> Vec<&str> {
@@ -273,7 +278,7 @@ impl ResearchPane {
             ui.label("Reading research archive…");
         }
         if let Some(error) = &self.error {
-            ui.colored_label(crate::theme::down(), error);
+            ui.colored_label(crate::theme::down(), format!("Refresh failed: {error}"));
         }
         let symbols: std::collections::HashSet<String> =
             self.visible_symbols().into_iter().map(str::to_owned).collect();
@@ -286,6 +291,13 @@ impl ResearchPane {
                 snapshot.source,
                 snapshot.data.len()
             ));
+            if !snapshot.failures.is_empty() {
+                ui.collapsing(format!("{} symbols failed", snapshot.failures.len()), |ui| {
+                    for failure in &snapshot.failures {
+                        ui.label(format!("{} · {}", failure.symbol, failure.reason));
+                    }
+                });
+            }
             ui.label("STALE: older than last completed US trading session · MISSING: no daily bars");
             ui.monospace(format!("{:<14} {:<12} {:<8} {:<18} {}", "TICKER", "LAST BAR", "STATUS", "GROUP", "NAME"));
             rows.extend(snapshot.data.iter().filter(|r| symbols.contains(&r.symbol)).map(DisplayRow::Universe));
@@ -482,7 +494,7 @@ impl ResearchPane {
             worker.send(Request::HistoryTask(command));
         }
         if let Some(error) = &self.error {
-            ui.colored_label(crate::theme::down(), error);
+            ui.colored_label(crate::theme::down(), format!("Refresh failed: {error}"));
         }
         if let Some(s) = &self.history_status {
             ui.label(format!("{} fresh · {} stale · {} failed · {} missing", s.fresh, s.stale, s.failed, s.missing));
@@ -552,13 +564,78 @@ mod tests {
     use tr_core::Provenance;
 
     #[test]
+    fn refresh_retains_verified_snapshot_and_restores_symbol_in_both_panes() {
+        for scan in [false, true] {
+            let mut pane = ResearchPane::new(scan.then(|| "NEAR_HIGH".into()));
+            pane.filter.include_stale = true;
+            let accept = |pane: &mut ResearchPane, symbols: &[&str], provenance| {
+                if scan {
+                    pane.accept_scan(Ok(Snapshot {
+                        failures: vec![],
+                        source: "verified archive".into(),
+                        provenance,
+                        data: Scan {
+                            provenance: Provenance::Real,
+                            scanned: symbols.len(),
+                            skipped: vec![],
+                            results: symbols
+                                .iter()
+                                .map(|s| tr_data::whats_news::ScanRow {
+                                    symbol: (*s).into(),
+                                    provenance: Provenance::Real,
+                                    ..Default::default()
+                                })
+                                .collect(),
+                        },
+                    }));
+                } else {
+                    pane.accept_universe(Ok(Snapshot {
+                        failures: vec![],
+                        source: "verified archive".into(),
+                        provenance,
+                        data: symbols
+                            .iter()
+                            .map(|s| Symbol { symbol: (*s).into(), name: None, group_tag: None, last_date: None })
+                            .collect(),
+                    }));
+                }
+            };
+            accept(&mut pane, &["A", "B"], Provenance::Real);
+            pane.navigate(Key::End);
+            let (worker, _requests) = crate::worker::Worker::test_channel();
+            pane.request(1, &worker);
+            assert_eq!(pane.visible_symbols().len(), 2);
+            if scan {
+                pane.accept_scan(Err("offline".into()));
+            } else {
+                pane.accept_universe(Err("offline".into()));
+            }
+            assert_eq!(pane.visible_symbols()[pane.selected], "B");
+            assert!(pane.error.as_deref().unwrap().contains("offline"));
+            accept(&mut pane, &["BAD"], Provenance::Sample);
+            assert_eq!(pane.visible_symbols()[pane.selected], "B");
+            accept(&mut pane, &["B", "A"], Provenance::Real);
+            assert_eq!(pane.visible_symbols()[pane.selected], "B");
+            assert!(pane.error.is_none());
+            accept(&mut pane, &["A"], Provenance::Real);
+            assert_eq!(pane.selected, 0);
+        }
+    }
+
+    #[test]
     fn research_pane_rejects_sample_and_unverified_results() {
         for provenance in [Provenance::Sample, Provenance::Missing] {
             let mut pane = ResearchPane::new(None);
-            pane.accept_universe(Ok(Snapshot { source: "must not be displayed".into(), provenance, data: vec![] }));
+            pane.accept_universe(Ok(Snapshot {
+                failures: vec![],
+                source: "must not be displayed".into(),
+                provenance,
+                data: vec![],
+            }));
             assert!(pane.universe.is_none());
             assert!(pane.error.as_deref().unwrap().contains("refused"));
             pane.accept_scan(Ok(Snapshot {
+                failures: vec![],
                 source: "must not be displayed".into(),
                 provenance,
                 data: Scan { provenance: Provenance::Real, scanned: 1, skipped: vec![], results: vec![] },
@@ -566,12 +643,14 @@ mod tests {
             assert!(pane.results.is_none());
             assert!(pane.error.as_deref().unwrap().contains("refused"));
             pane.accept_scan(Ok(Snapshot {
+                failures: vec![],
                 source: "must not be displayed".into(),
                 provenance: Provenance::Real,
                 data: Scan { provenance, scanned: 1, skipped: vec![], results: vec![] },
             }));
             assert!(pane.results.is_none());
             pane.accept_scan(Ok(Snapshot {
+                failures: vec![],
                 source: "must not be displayed".into(),
                 provenance: Provenance::Real,
                 data: Scan {
@@ -611,6 +690,7 @@ mod navigation_tests {
             let symbols = ["AAPL", "MSFT", "NVDA"];
             if scan {
                 pane.accept_scan(Ok(Snapshot {
+                    failures: vec![],
                     source: "archive".into(),
                     provenance: Provenance::Cached,
                     data: Scan {
@@ -634,6 +714,7 @@ mod navigation_tests {
                 }));
             } else {
                 pane.accept_universe(Ok(Snapshot {
+                    failures: vec![],
                     source: "archive".into(),
                     provenance: Provenance::Real,
                     data: symbols
@@ -695,6 +776,7 @@ mod navigation_tests {
         };
         let mut pane = ResearchPane::new(Some("NEAR_HIGH".into()));
         pane.accept_scan(Ok(Snapshot {
+            failures: vec![],
             provenance: Provenance::Cached,
             source: "verified archive".into(),
             data: Scan {

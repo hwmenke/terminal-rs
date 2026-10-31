@@ -51,12 +51,14 @@ impl DeskPane {
         self.loading = false;
         match result {
             Ok(snapshot) => {
-                snapshot.provenance.require_verified("PM Desk").ok();
+                if let Err(error) = snapshot.provenance.require_verified("PM Desk") {
+                    self.error = Some(error);
+                    return;
+                }
                 for row in &snapshot.data {
                     if row.skip.is_none() {
                         if let Err(e) = row.provenance.require_verified("PM Desk row") {
                             self.error = Some(e);
-                            self.rows = None;
                             return;
                         }
                     }
@@ -71,7 +73,6 @@ impl DeskPane {
             }
             Err(e) => {
                 self.error = Some(e);
-                self.rows = None;
             }
         }
     }
@@ -211,7 +212,7 @@ impl TerminalApp {
             );
 
             if let Some(err) = &pane.error {
-                ui.label(RichText::new(err).color(crate::theme::down()));
+                ui.label(RichText::new(format!("Refresh failed: {err}")).color(crate::theme::down()));
             }
             if let Some(snap) = &pane.rows {
                 ui.label(
@@ -528,6 +529,30 @@ mod tests {
     }
 
     #[test]
+    fn failed_refresh_preserves_desk_snapshot_and_selection() {
+        let mut pane = DeskPane::new("Growth");
+        let snapshot =
+            |provenance, rows| Snapshot { failures: vec![], source: "archive".into(), provenance, data: rows };
+        pane.accept(0, Ok(snapshot(Provenance::Real, vec![row("A", 1.0), row("B", 2.0)])));
+        pane.selected = Some("B".into());
+        let (worker, _requests) = Worker::test_channel();
+        pane.request(1, &worker, vec!["A".into(), "B".into()]);
+        assert_eq!(pane.rows.as_ref().unwrap().data.len(), 2);
+        pane.accept(pane.generation, Err("offline".into()));
+        assert_eq!(pane.selected.as_deref(), Some("B"));
+        assert_eq!(pane.rows.as_ref().unwrap().data.len(), 2);
+        pane.accept(pane.generation, Ok(snapshot(Provenance::Sample, vec![])));
+        assert_eq!(pane.rows.as_ref().unwrap().data.len(), 2);
+        let mut bad = row("BAD", 0.0);
+        bad.provenance = Provenance::Sample;
+        pane.accept(pane.generation, Ok(snapshot(Provenance::Real, vec![bad])));
+        assert_eq!(pane.rows.as_ref().unwrap().data.len(), 2);
+        pane.accept(pane.generation, Ok(snapshot(Provenance::Real, vec![row("B", 3.0), row("A", 1.0)])));
+        assert_eq!(pane.selected.as_deref(), Some("B"));
+        assert!(pane.error.is_none());
+    }
+
+    #[test]
     fn desk_request_lists_only_the_selected_watchlist() {
         let mut app = test_app();
         let (worker, mut requests) = Worker::test_channel();
@@ -555,6 +580,7 @@ mod tests {
         pane.accept(
             pane.generation,
             Ok(Snapshot {
+                failures: vec![],
                 source: "test".into(),
                 provenance: Provenance::Real,
                 data: {

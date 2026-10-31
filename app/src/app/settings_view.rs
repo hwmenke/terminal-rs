@@ -922,6 +922,7 @@ mod connection_tests {
                 pane,
                 generation: 0,
                 result: Ok(Snapshot {
+                    failures: vec![],
                     source: "old source".into(),
                     provenance: tr_core::Provenance::Real,
                     data: vec![],

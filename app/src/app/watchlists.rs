@@ -1156,6 +1156,7 @@ mod tests {
         if let PaneKind::Research(r) = &mut app.panes[1].kind {
             r.set_include_stale_for_test();
             r.accept_scan(Ok(Snapshot {
+                failures: vec![],
                 source: "test archive".into(),
                 provenance: Provenance::Real,
                 data: Scan {

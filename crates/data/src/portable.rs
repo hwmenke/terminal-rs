@@ -642,6 +642,7 @@ mod tests {
     #[test]
     fn sample_scan_export_is_labelled_and_named() {
         let snapshot = Snapshot {
+            failures: vec![],
             source: "SAMPLE DATA".into(),
             provenance: Provenance::Sample,
             data: Scan {
@@ -669,6 +670,7 @@ mod tests {
     #[test]
     fn verified_scan_export_keeps_source_and_date() {
         let snapshot = Snapshot {
+            failures: vec![],
             source: "Local Yahoo daily research archive".into(),
             provenance: Provenance::Cached,
             data: Scan {

@@ -259,7 +259,12 @@ impl Archive {
                 last_date: e.latest.map(|d| d.to_string()),
             })
             .collect();
-        Ok(Snapshot { data, provenance: Provenance::Cached, source: "Local Yahoo daily research archive".into() })
+        Ok(Snapshot {
+            failures: vec![],
+            data,
+            provenance: Provenance::Cached,
+            source: "Local Yahoo daily research archive".into(),
+        })
     }
     /// Scan coverage and bars in one read transaction/query, including symbols
     /// with no history. Raw validation/skip diagnostics live in the shared scanner.
@@ -311,7 +316,12 @@ impl Archive {
     pub fn scan(&self, name: &str) -> Result<Snapshot<Scan>> {
         let histories = self.histories()?.into_iter().collect();
         let data = crate::whats_news::scan_histories(name, histories, Provenance::Cached)?;
-        Ok(Snapshot { data, provenance: Provenance::Cached, source: "Local Yahoo daily research archive".into() })
+        Ok(Snapshot {
+            failures: vec![],
+            data,
+            provenance: Provenance::Cached,
+            source: "Local Yahoo daily research archive".into(),
+        })
     }
 
     /// Restore a previously exported daily series. Sample / unverified bars are refused.
