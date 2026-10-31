@@ -1209,3 +1209,61 @@ mod tests {
         out.textures_delta.clear();
     }
 }
+
+/// Risk strip for the selected holdings scope, using explicitly loaded archive history.
+pub(super) fn risk_chips(
+    ui: &mut Ui,
+    pane: &mut PortfolioPane,
+    pf: &Portfolio,
+    worker: &crate::worker::Worker,
+    id: crate::dock::PaneId,
+) {
+    if !matches!(pane.view, PortView::Summary | PortView::Positions) {
+        return;
+    }
+    ui.collapsing("Holdings risk · daily archive", |ui| {
+        ui.horizontal(|ui| {
+            ui.label("Concentration threshold (%)");
+            let mut percent = pane.concentration * 100.0;
+            if ui.add(egui::DragValue::new(&mut percent).range(0.0..=100.0)).changed() {
+                pane.concentration = percent / 100.0;
+            }
+            if ui.add_enabled(!pane.risk_loading, egui::Button::new("Load / refresh risk")).clicked() {
+                pane.risk_generation += 1;
+                pane.risk_loading = true;
+                let mut symbols: Vec<_> = pf.positions.iter()
+                    .filter(|p| pane.account.as_ref().is_none_or(|a| *a == p.account_id))
+                    .filter_map(|p| p.market_key()).collect();
+                symbols.sort(); symbols.dedup();
+                worker.send(crate::worker::Request::HoldingHistory { pane: id,
+                    generation: pane.risk_generation, symbols });
+            }
+            if pane.risk_loading { ui.spinner(); }
+        });
+        ui.label("SMA50 and RSI14 use daily archive closes. Weight = absolute broker value / gross holdings in the same currency and selected account scope. RSI OB ≥70; OS ≤30.");
+        if let Some(e) = &pane.risk_error { ui.colored_label(amber(), e); }
+        for p in pf.positions.iter().filter(|p| pane.account.as_ref().is_none_or(|a| *a == p.account_id))
+            .filter(|p| matches_symbol(pane, p.market_key())) {
+            let key = p.market_key();
+            let bars = key.as_ref().and_then(|k| pane.risk_history.get(k));
+            let values: Option<Vec<_>> = pf.positions.iter()
+                .filter(|q| q.currency == p.currency && pane.account.as_ref().is_none_or(|a| *a == q.account_id))
+                .map(|q| q.market_value().filter(|v| v.is_finite()).map(f64::abs)).collect();
+            let total = values.map(|v| v.iter().sum::<f64>()).filter(|v| *v > 0.0);
+            let weight = p.market_value().zip(total).map(|(v,t)| v.abs()/t);
+            let risk = tr_core::indicators::holding_risk(bars.map(Vec::as_slice).unwrap_or(&[]), weight, pane.concentration);
+            ui.horizontal_wrapped(|ui| {
+                ui.label(&p.symbol);
+                let ma = match risk.above_sma50 { Some(true) => "≥ SMA50", Some(false) => "< SMA50", None => "SMA50 —" };
+                ui.label(RichText::new(ma).color(if risk.above_sma50 == Some(false) { amber() } else { muted() }).background_color(theme::control()));
+                let rsi = risk.rsi14.map(|r| format!("RSI14 {r:.1} {}", if r >= 70.0 { "OB" } else if r <= 30.0 { "OS" } else { "neutral" })).unwrap_or_else(|| "RSI14 —".into());
+                ui.label(RichText::new(rsi).color(if risk.rsi14.is_some_and(|r| r >= 70.0 || r <= 30.0) { amber() } else { muted() }).background_color(theme::control()));
+                ui.label(RichText::new(weight.map(|w| format!("{:.1}%{}", w*100.0, if risk.concentrated == Some(true) { " concentrated" } else { "" })).unwrap_or_else(|| "Weight —".into()))
+                    .color(if risk.concentrated == Some(true) { amber() } else { muted() }).background_color(theme::control()));
+                if let Some(last) = bars.and_then(|b| b.last()) {
+                    if let Some(date) = chrono::DateTime::from_timestamp(last.ts, 0) { ui.small(format!("as of {}", date.date_naive())); }
+                }
+            });
+        }
+    });
+}

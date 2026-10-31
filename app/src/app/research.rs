@@ -32,7 +32,7 @@ impl DisplayRow<'_> {
                 let num = |n: Option<f64>| n.map(|n| format!("{n:.2}")).unwrap_or_else(|| "—".into());
                 let m = r.metrics.as_ref();
                 format!(
-                    "{:<12} {:<12} {:<8} {:>9} {:>6} {:>8} {:>7} {:>12} {:>7} {:>7}",
+                    "{:<12} {:<12} {:<8} {:>9} {:>6} {:>8} {:>7} {:>12} {:>7} {:>7} {:>9} {:>9} {:>10}",
                     r.symbol,
                     r.last_date.as_deref().unwrap_or("—"),
                     status,
@@ -42,7 +42,10 @@ impl DisplayRow<'_> {
                     num(m.and_then(|m| m.daily.rsi)),
                     num(m.map(|m| m.volume)),
                     num(m.and_then(|m| m.volume_ratio)),
-                    num(m.map(|m| m.adr_pct))
+                    num(m.map(|m| m.adr_pct)),
+                    num(m.and_then(|m| m.stretch_atr)),
+                    num(m.and_then(|m| m.stretch_pct)),
+                    num(m.and_then(|m| m.rs_spy_63d))
                 )
             }
         }
@@ -331,8 +334,20 @@ impl ResearchPane {
                 Self::scan_details(ui, row);
             }
             ui.monospace(format!(
-                "{:<12} {:<12} {:<8} {:>9} {:>6} {:>8} {:>7} {:>12} {:>7} {:>7}",
-                "TICKER", "LAST BAR", "STATUS", "CLOSE", "SCORE", "RET21%", "RSI14", "VOLUME", "VOL×20", "ADR20%"
+                "{:<12} {:<12} {:<8} {:>9} {:>6} {:>8} {:>7} {:>12} {:>7} {:>7} {:>9} {:>9} {:>10}",
+                "TICKER",
+                "LAST BAR",
+                "STATUS",
+                "CLOSE",
+                "SCORE",
+                "RET21%",
+                "RSI14",
+                "VOLUME",
+                "VOL×20",
+                "ADR20%",
+                "SMA50/ATR",
+                "SMA50%",
+                "RS/SPY63%"
             ));
             rows.extend(visible.into_iter().map(DisplayRow::Scan));
         }
@@ -374,7 +389,7 @@ impl ResearchPane {
         ui.horizontal_wrapped(|ui| {
             ui.checkbox(&mut self.filter.include_stale, "Include stale / undated");
             egui::ComboBox::from_id_salt("scan-sort").selected_text(self.filter.sort.label()).show_ui(ui, |ui| {
-                for sort in Sort::ALL {
+                for sort in Sort::ALL.into_iter().chain(Sort::DESK) {
                     ui.selectable_value(&mut self.filter.sort, sort, sort.label());
                 }
             });
@@ -409,6 +424,7 @@ impl ResearchPane {
                     });
                 }
             });
+            ui.label("Desk columns: signed distance from SMA50 in ATR14 units and percent; RS/SPY63% = relative return over 63 symbol sessions with matching SPY dates. Missing history = —.");
             ui.label("Rust calculations: Wilder RSI14; 21-bar return; last volume / prior 20 mean; ADR20 = mean((H−L)/C) %. Thresholds use full precision.");
             ui.label("Score: near 20-bar high + volume surge + gap EP + 2 for box breakout (or 1 for a box near its high). W/M: completed calendar periods, 20 bars required.");
             ui.label("Stale = older than the last completed US session. RS ranks compare eligible archive names on the same bar date, before filters. Service fields below retain service definitions.");

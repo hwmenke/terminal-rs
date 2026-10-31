@@ -47,6 +47,17 @@ pub enum Request {
         generation: u64,
         symbols: Vec<String>,
     },
+    DailyStrength {
+        pane: PaneId,
+        generation: u64,
+        archive: bool,
+        base: Arc<Vec<Bar>>,
+    },
+    HoldingHistory {
+        pane: PaneId,
+        generation: u64,
+        symbols: Vec<String>,
+    },
     /// Historical statistics and conditional forward returns for one archive symbol.
     Stats {
         pane: PaneId,
@@ -421,6 +432,18 @@ pub enum Response {
         pane: PaneId,
         generation: u64,
         result: Result<tr_data::whats_news::Snapshot<Vec<tr_data::whats_news::MemberRow>>, String>,
+    },
+    DailyStrength {
+        pane: PaneId,
+        generation: u64,
+        base_len: usize,
+        result: Result<LineRef, String>,
+    },
+    HoldingHistory {
+        pane: PaneId,
+        generation: u64,
+        rows: Vec<(String, Vec<Bar>)>,
+        error: Option<String>,
     },
     Stats {
         pane: PaneId,
@@ -918,6 +941,21 @@ pub fn archive_daily_needed(tf: Timeframe, candles: usize) -> usize {
         Timeframe::MN1 => candles.saturating_mul(23).saturating_add(10),
         _ => candles,
     }
+}
+
+async fn desk_daily(s: &Shared, bridge: &tr_data::whats_news::Bridge, symbol: &str) -> anyhow::Result<Vec<Bar>> {
+    let ticker = tr_data::whats_news::archive_ticker(symbol);
+    let wanted = ticker.clone();
+    let local = s.history.db(move |db| db.daily(&wanted)).await?;
+    let bars = if local.is_empty() {
+        let snapshot = bridge.bars(&ticker).await?;
+        snapshot.provenance.require_verified("Daily desk metrics").map_err(anyhow::Error::msg)?;
+        snapshot.data
+    } else {
+        local
+    };
+    Bar::require_verified(&bars, "Daily desk metrics").map_err(anyhow::Error::msg)?;
+    Ok(bars)
 }
 
 async fn research_universe(
@@ -1803,6 +1841,56 @@ async fn handle(s: &Arc<Shared>, req: Request) {
                     result: research_universe(s, &bridge).await.map_err(|e| format!("{e:#}")),
                 });
             }
+        }
+        Request::DailyStrength { pane, generation, archive, base } => {
+            let result = async {
+                Bar::require_verified(&base, "Daily SPY strength").map_err(anyhow::Error::msg)?;
+                let spy = if archive {
+                    desk_daily(s, &config.bridge(), "SPY").await?
+                } else {
+                    s.provider
+                        .history_for_analysis(
+                            "SPY US Equity",
+                            Timeframe::D1,
+                            None,
+                            base.len().max(100),
+                            "Daily SPY strength",
+                        )
+                        .await?
+                };
+                Bar::require_verified(&spy, "Daily SPY strength").map_err(anyhow::Error::msg)?;
+                let values = tr_core::indicators::daily_relative_strength(&base, &spy);
+                if !values.iter().any(|v| v.is_finite()) {
+                    anyhow::bail!("No common daily SPY dates");
+                }
+                Ok(line_ref(&values))
+            }
+            .await;
+            send(Response::DailyStrength {
+                pane,
+                generation,
+                base_len: base.len(),
+                result: result.map_err(|e: anyhow::Error| format!("{e:#}")),
+            });
+        }
+        Request::HoldingHistory { pane, generation, symbols } => {
+            let bridge = config.bridge();
+            let mut rows = Vec::new();
+            let mut errors = Vec::new();
+            for symbol in symbols {
+                match desk_daily(s, &bridge, &symbol).await {
+                    Ok(bars) => {
+                        rows.push((symbol, bars));
+                    }
+                    Err(e) => errors.push(format!("{symbol}: {e}")),
+                }
+            }
+            send(Response::HoldingHistory {
+                pane,
+                generation,
+                rows,
+                error: (!errors.is_empty()).then(|| errors.join("; ")),
+            });
         }
         Request::Desk { pane, generation, symbols } => {
             let bridge = config.bridge();

@@ -94,6 +94,9 @@ impl TerminalApp {
             PaneKind::Portfolio(pp) => {
                 let demo =
                     (self.prefs.trading.account_mode == crate::prefs::AccountMode::Demo).then_some(&*self.demo.pf);
+                if let Some(pf) = demo.or(self.broker.portfolio.as_deref()) {
+                    super::portfolio_view::risk_chips(ui, pp, pf, &self.worker, id);
+                }
                 for a in super::portfolio_view::portfolio(ui, pp, &self.broker, demo, &self.quotes) {
                     use super::portfolio_view::PortAction as P;
                     match a {

@@ -230,6 +230,9 @@ pub struct ChartState {
     /// Last delete/clear of the current symbol, for a one-step undo.
     drawing_undo: Option<Vec<Drawing>>,
     pub compare: Option<String>,
+    pub show_spy_strength: bool,
+    spy_strength: Option<LineRef>,
+    spy_strength_error: Option<String>,
 
     bars: Arc<Vec<Bar>>,
     provenance: Provenance,
@@ -318,6 +321,9 @@ impl ChartState {
             drawing_store: AnnotationStore::new(),
             drawing_undo: None,
             compare: None,
+            show_spy_strength: false,
+            spy_strength: None,
+            spy_strength_error: None,
             bars: Arc::new(Vec::new()),
             provenance: Provenance::Missing,
             gpu: None,
@@ -421,6 +427,8 @@ impl ChartState {
         self.hover_marker = None;
         self.hover_news = None;
         self.last_indicator_req = None;
+        self.spy_strength = None;
+        self.spy_strength_error = None;
         self.compare_scale = 1.0;
         self.compare_line = None;
         self.markers.clear();
@@ -806,7 +814,32 @@ impl ChartState {
         }
     }
 
+    pub fn on_daily_strength(&mut self, generation: u64, base_len: usize, result: Result<LineRef, String>) {
+        if generation != self.generation || base_len != self.bars.len() {
+            return;
+        }
+        match result {
+            Ok(line) => {
+                self.spy_strength = Some(line);
+                self.spy_strength_error = None;
+            }
+            Err(e) => {
+                self.spy_strength = None;
+                self.spy_strength_error = Some(e);
+            }
+        }
+    }
+
     fn request_compare(&self, w: &Worker) {
+        if self.show_spy_strength && self.tf == Timeframe::D1 && !self.bars.is_empty() {
+            w.send(Request::DailyStrength {
+                pane: self.id,
+                generation: self.generation,
+                archive: self.archive,
+                base: self.bars.clone(),
+            });
+        }
+
         if self.archive {
             return;
         }
@@ -1306,6 +1339,23 @@ impl ChartState {
                 scale,
             });
         }
+        if self.show_spy_strength && self.tf == Timeframe::D1 {
+            if let Some(line) = self.spy_strength.as_ref().filter(|l| l.pyramid.data.len() == len) {
+                let scale = self
+                    .bars
+                    .iter()
+                    .zip(line.pyramid.data.iter())
+                    .find(|(_, r)| r[1].is_finite())
+                    .map(|(b, r)| b.close / r[1] as f64)
+                    .unwrap_or(1.0);
+                overlays.push(Overlay {
+                    line: line.clone(),
+                    color: theme::rgba(theme::series(6)),
+                    kind: LineKind::Line,
+                    scale,
+                });
+            }
+        }
         let reveal_t =
             crate::anim::progress(ui.ctx(), egui::Id::new(("chart-reveal", self.id)), self.reveal_key, REVEAL_SECS);
         let reveal = Reveal { opacity: ui.opacity(), ..Reveal::sweep(reveal_t, v.left(), v.visible_bars()) };
@@ -1677,6 +1727,16 @@ impl ChartState {
             .on_hover_text("20-bar / 3-bar confirmation on this interval (same rule as SCAN)");
         ui.checkbox(&mut self.show_rs, "Relative strength")
             .on_hover_text("21-bar close return of this series — not SPY-relative");
+        if ui.add_enabled(self.tf == Timeframe::D1,
+            egui::Checkbox::new(&mut self.show_spy_strength, "Daily RS / SPY (100 at first common date)"))
+            .on_hover_text("Close/SPY close ratio normalized to 100; scaled to the price axis for display. Missing SPY dates stay blank.").changed() {
+            self.spy_strength = None;
+            self.spy_strength_error = None;
+            self.request_compare(w);
+        }
+        if let Some(e) = &self.spy_strength_error {
+            ui.colored_label(theme::amber(), e);
+        }
         ui.checkbox(&mut self.show_volume_ctx, "Volume context")
             .on_hover_text("This bar versus the prior 20, plus 5/20");
         let adaptive_on = self.indicators.iter().any(|s| s.code == "ADTREND");
@@ -1872,6 +1932,18 @@ impl ChartState {
                 format!("+{hidden} more oscillator{} (max {MAX_SUB_PANES} panes)", if hidden == 1 { "" } else { "s" });
             p.text(pos2(price_rect.left() + 6.0, ly), Align2::LEFT_TOP, note, mono(11.0), muted());
             ly += 14.0;
+        }
+        if self.show_spy_strength && self.tf == Timeframe::D1 {
+            if let Some(value) = self.spy_strength.as_ref().and_then(value_at) {
+                p.text(
+                    pos2(price_rect.left() + 6.0, ly),
+                    Align2::LEFT_TOP,
+                    format!("RS/SPY {value:.2} · base 100"),
+                    mono(11.0),
+                    theme::series(6),
+                );
+                ly += 14.0;
+            }
         }
         if let (Some(sym), Some(line)) = (&self.compare, &self.compare_line) {
             // Raw price plus performance relative to the left edge of the view.
