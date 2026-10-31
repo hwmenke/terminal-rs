@@ -655,7 +655,14 @@ impl PaneKind {
                 PaneKind::Options(Box::new(OptionsPane::new(&symbol, strikes, greeks)))
             }
             PaneSettings::Portfolio { view, account, symbol, sort, open_only } => {
-                PaneKind::Portfolio(Box::new(broker::PortfolioPane { view, account, symbol, sort, open_only }))
+                PaneKind::Portfolio(Box::new(broker::PortfolioPane {
+                    view,
+                    account,
+                    symbol,
+                    sort,
+                    open_only,
+                    ..broker::PortfolioPane::new(view)
+                }))
             }
             PaneSettings::Desk { group, selected } => {
                 let mut d = desk::DeskPane::new(group);
@@ -1610,6 +1617,16 @@ impl TerminalApp {
                         r.accept_scan(result);
                     }
                 }
+                Response::HoldingHistory { pane, generation, rows, error } => {
+                    if let Some(PaneKind::Portfolio(p)) =
+                        self.panes.iter_mut().find(|p| p.id == pane).map(|p| &mut p.kind)
+                        && p.risk_generation == generation
+                    {
+                        p.risk_loading = false;
+                        p.risk_history = rows.into_iter().collect();
+                        p.risk_error = error;
+                    }
+                }
                 Response::Desk { pane, generation, result } => {
                     if let Some(PaneKind::Desk(d)) = self.panes.iter_mut().find(|p| p.id == pane).map(|p| &mut p.kind) {
                         d.accept(generation, result);
@@ -1744,6 +1761,11 @@ impl TerminalApp {
                 Response::Indicators { pane, generation, built } => {
                     if let Some(c) = self.chart_mut(pane) {
                         c.on_indicators(generation, built);
+                    }
+                }
+                Response::DailyStrength { pane, generation, base_len, result } => {
+                    if let Some(c) = self.chart_mut(pane) {
+                        c.on_daily_strength(generation, base_len, result);
                     }
                 }
                 Response::Compare { pane, generation, symbol, line } => {

@@ -24,6 +24,12 @@ pub struct Conditions {
 }
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Metrics {
+    #[serde(default)]
+    pub stretch_pct: Option<f64>,
+    #[serde(default)]
+    pub stretch_atr: Option<f64>,
+    #[serde(default)]
+    pub rs_spy_63d: Option<f64>,
     pub change_pct: f64,
     pub ret_21d_pct: f64,
     pub rs_rank: usize,
@@ -164,7 +170,10 @@ pub fn calculate(b: &[Bar]) -> std::result::Result<Metrics, String> {
             Some((_, _, "DARVAS_BOX")) if dist >= -2.0 => 1,
             _ => 0,
         };
+    let stretch = tr_core::indicators::sma50_stretch(b);
     let metrics = Metrics {
+        stretch_pct: stretch.map(|s| s.pct),
+        stretch_atr: stretch.and_then(|s| s.atr_units),
         change_pct: (last.close / b[n - 2].close - 1.0) * 100.0,
         ret_21d_pct: (last.close / b[n - 22].close - 1.0) * 100.0,
         volume: last.volume,
@@ -277,9 +286,15 @@ impl ScanCache {
         }
         let mut scan = Scan { provenance, scanned: 0, results: vec![], skipped: vec![] };
         let mut candidates = vec![];
+        let spy = histories.iter().find(|(s, _)| crate::security(s).ticker == "SPY").map(|(_, b)| b);
         for (symbol, b) in &histories {
             let m = match cached_calculate(b) {
-                Ok(m) => m,
+                Ok(mut m) => {
+                    if let Some(spy) = spy {
+                        m.rs_spy_63d = tr_core::indicators::daily_relative_return(b, spy, 63);
+                    }
+                    m
+                }
                 Err(reason) => {
                     scan.skipped.push(Skipped { symbol: symbol.clone(), reason });
                     continue;
@@ -389,8 +404,13 @@ pub enum Sort {
     Volume,
     VolumeRatio,
     Range,
+    StretchAtr,
+    StretchPct,
+    SpyStrength,
 }
 impl Sort {
+    /// Additional desk sorts, alongside the original scanner sort set.
+    pub const DESK: [Self; 3] = [Self::StretchAtr, Self::StretchPct, Self::SpyStrength];
     pub const ALL: [Self; 7] =
         [Self::Symbol, Self::Score, Self::Strength, Self::Rsi, Self::Volume, Self::VolumeRatio, Self::Range];
     pub fn label(self) -> &'static str {
@@ -402,6 +422,9 @@ impl Sort {
             Self::Volume => "Volume",
             Self::VolumeRatio => "Volume / prior 20",
             Self::Range => "ADR20 %",
+            Self::StretchAtr => "ADMA Stretch / SMA50 ATR14",
+            Self::StretchPct => "ADMA Stretch / SMA50 %",
+            Self::SpyStrength => "SPY relative 63d %",
         }
     }
     fn value(self, r: &ScanRow) -> Option<f64> {
@@ -414,6 +437,9 @@ impl Sort {
             Self::Volume => Some(m.volume),
             Self::VolumeRatio => m.volume_ratio,
             Self::Range => Some(m.adr_pct),
+            Self::StretchAtr => m.stretch_atr,
+            Self::StretchPct => m.stretch_pct,
+            Self::SpyStrength => m.rs_spy_63d,
         }
     }
 }
@@ -942,5 +968,56 @@ mod tests {
         }
         b[29].volume = 1e300;
         assert!(calculate(&b).unwrap_err().contains("non-finite calculation"));
+    }
+}
+
+#[cfg(test)]
+mod desk_metric_tests {
+    use super::*;
+
+    #[test]
+    fn desk_sorts_rank_signed_values_and_keep_missing_last() {
+        let mut rows = vec![];
+        for (symbol, value) in [("LOW", Some(-2.0)), ("HIGH", Some(3.0)), ("MISSING", None)] {
+            rows.push(ScanRow {
+                symbol: symbol.into(),
+                metrics: Some(Metrics {
+                    stretch_atr: value,
+                    stretch_pct: value,
+                    rs_spy_63d: value,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            });
+        }
+        let scan = Scan { provenance: Provenance::Real, scanned: 3, results: rows, skipped: vec![] };
+        for sort in [Sort::StretchAtr, Sort::StretchPct, Sort::SpyStrength] {
+            for descending in [true, false] {
+                let filter = ScanFilter { sort, descending, include_stale: true, ..Default::default() };
+                let rows = filter.rows(&scan, "", NaiveDate::from_ymd_opt(2026, 10, 30).unwrap());
+                assert_eq!(rows[0].symbol, if descending { "HIGH" } else { "LOW" });
+                assert_eq!(rows[2].symbol, "MISSING");
+            }
+        }
+    }
+
+    #[test]
+    fn scan_enriches_from_spy_and_preserves_missing_benchmark() {
+        let bars = |end: f64| {
+            (0..70)
+                .map(|i| {
+                    let close = if i == 69 { end } else { 100.0 };
+                    Bar::new(i * 86400, close, close + 1.0, close - 1.0, close, 10.0).with_provenance(Provenance::Real)
+                })
+                .collect::<Vec<_>>()
+        };
+        let mut cache = ScanCache::default();
+        let histories = vec![("AAPL".into(), bars(110.0)), ("SPY".into(), bars(100.0))];
+        let scan = cache.scan("RSI_OB", histories, Provenance::Real).unwrap().0;
+        let m = scan.results.iter().find(|r| r.symbol == "AAPL").unwrap().metrics.as_ref().unwrap();
+        assert!((m.rs_spy_63d.unwrap() - 10.0).abs() < 1e-9);
+        assert!(m.stretch_atr.unwrap() > 0.0);
+        let scan = cache.scan("RSI_OB", vec![("AAPL".into(), bars(110.0))], Provenance::Real).unwrap().0;
+        assert_eq!(scan.results[0].metrics.as_ref().unwrap().rs_spy_63d, None);
     }
 }

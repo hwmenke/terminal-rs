@@ -15,6 +15,8 @@
 use crate::Bar;
 
 mod adaptive;
+mod desk;
+pub use desk::*;
 mod levels;
 mod ma;
 mod momentum;
