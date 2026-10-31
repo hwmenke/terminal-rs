@@ -1150,6 +1150,7 @@ async fn research_intraday_backtest(
     allow_short: bool,
 ) -> anyhow::Result<tr_data::intraday_backtest::IntradayReport> {
     let sec = tr_data::security(key);
+    tr_data::cash_session::require_us_session(&sec.ticker, None).map_err(anyhow::Error::msg)?;
     if !matches!(sec.class, tr_core::AssetClass::Equity | tr_core::AssetClass::Etf | tr_core::AssetClass::Index) {
         anyhow::bail!(
             "Intraday backtest refused: {} has no US cash session. Sample prices are never used.",
@@ -1165,6 +1166,7 @@ async fn research_intraday_backtest(
     let limit = tr_data::intraday_backtest::fetch_limit(tf);
     let symbol = sec.key();
     let bars = s.provider.history(&symbol, tf, None, limit).await?;
+    tr_data::cash_session::require_us_session(&sec.ticker, None).map_err(anyhow::Error::msg)?;
     if bars.is_empty() {
         anyhow::bail!(
             "Intraday backtest refused: no regular-session bars were returned. Sample prices are never used."
@@ -1202,6 +1204,7 @@ async fn research_intraday_compare(
     let mut rows = Vec::with_capacity(query.symbols.len());
     for sym in &query.symbols {
         let sec = tr_data::security(sym);
+        tr_data::cash_session::require_us_session(&sec.ticker, None).map_err(anyhow::Error::msg)?;
         if !matches!(sec.class, tr_core::AssetClass::Equity | tr_core::AssetClass::Etf | tr_core::AssetClass::Index) {
             rows.push(tr_data::intraday_compare::NamedBars {
                 symbol: sec.key(),
@@ -1210,7 +1213,9 @@ async fn research_intraday_compare(
             });
             continue;
         }
-        match s.provider.history(&sec.key(), query.timeframe, None, limit).await {
+        let fetched = s.provider.history(&sec.key(), query.timeframe, None, limit).await;
+        tr_data::cash_session::require_us_session(&sec.ticker, None).map_err(anyhow::Error::msg)?;
+        match fetched {
             Ok(bars) if bars.is_empty() => rows.push(tr_data::intraday_compare::NamedBars {
                 symbol: sec.key(),
                 bars,
@@ -1241,12 +1246,14 @@ async fn research_session_path(
         );
     }
     let sec = tr_data::security(symbol);
+    tr_data::cash_session::require_us_session(&sec.ticker, None).map_err(anyhow::Error::msg)?;
     if !matches!(sec.class, tr_core::AssetClass::Equity | tr_core::AssetClass::Etf | tr_core::AssetClass::Index) {
         anyhow::bail!("{} has no US cash session. The path is the regular session from 09:30.", sec.ticker);
     }
     let query = tr_data::session_path::parse_query(spec, timeframe).map_err(anyhow::Error::msg)?;
     let limit = tr_data::session_path::fetch_limit(query.timeframe);
     let bars = s.provider.history(&sec.key(), query.timeframe, None, limit).await?;
+    tr_data::cash_session::require_us_session(&sec.ticker, None).map_err(anyhow::Error::msg)?;
     if bars.is_empty() {
         anyhow::bail!("Session path refused: no regular-session bars were returned. Sample prices are never used.");
     }
@@ -1268,12 +1275,14 @@ async fn research_volume_pace(
         );
     }
     let sec = tr_data::security(symbol);
+    tr_data::cash_session::require_us_session(&sec.ticker, None).map_err(anyhow::Error::msg)?;
     if !matches!(sec.class, tr_core::AssetClass::Equity | tr_core::AssetClass::Etf | tr_core::AssetClass::Index) {
         anyhow::bail!("{} has no US cash session. The pace is the regular session from 09:30.", sec.ticker);
     }
     let query = tr_data::volume_pace::parse_query(spec, timeframe).map_err(anyhow::Error::msg)?;
     let limit = tr_data::volume_pace::fetch_limit(query.timeframe);
     let bars = s.provider.history(&sec.key(), query.timeframe, None, limit).await?;
+    tr_data::cash_session::require_us_session(&sec.ticker, None).map_err(anyhow::Error::msg)?;
     if bars.is_empty() {
         anyhow::bail!("Volume pace refused: no regular-session bars were returned. Sample prices are never used.");
     }
@@ -1294,6 +1303,7 @@ async fn research_realized_vol(
         );
     }
     let sec = tr_data::security(symbol);
+    tr_data::cash_session::require_us_session(&sec.ticker, None).map_err(anyhow::Error::msg)?;
     if !matches!(sec.class, tr_core::AssetClass::Equity | tr_core::AssetClass::Etf | tr_core::AssetClass::Index) {
         anyhow::bail!(
             "{} has no US cash session. Realized volatility uses the regular session from 09:30.",
@@ -1303,6 +1313,7 @@ async fn research_realized_vol(
     let query = tr_data::realized_vol::parse_query(spec, timeframe).map_err(anyhow::Error::msg)?;
     let limit = tr_data::realized_vol::fetch_limit(query.timeframe);
     let bars = s.provider.history(&sec.key(), query.timeframe, None, limit).await?;
+    tr_data::cash_session::require_us_session(&sec.ticker, None).map_err(anyhow::Error::msg)?;
     if bars.is_empty() {
         anyhow::bail!(
             "Realized volatility refused: no regular-session bars were returned. Sample prices are never used."
@@ -1324,6 +1335,7 @@ async fn research_autocorr(
         );
     }
     let sec = tr_data::security(symbol);
+    tr_data::cash_session::require_us_session(&sec.ticker, None).map_err(anyhow::Error::msg)?;
     if !matches!(sec.class, tr_core::AssetClass::Equity | tr_core::AssetClass::Etf | tr_core::AssetClass::Index) {
         anyhow::bail!(
             "{} has no US cash session. Return autocorrelation uses the regular session from 09:30.",
@@ -1333,6 +1345,7 @@ async fn research_autocorr(
     let query = tr_data::autocorr::parse_query(spec, timeframe).map_err(anyhow::Error::msg)?;
     let limit = tr_data::autocorr::fetch_limit(query.timeframe);
     let bars = s.provider.history(&sec.key(), query.timeframe, None, limit).await?;
+    tr_data::cash_session::require_us_session(&sec.ticker, None).map_err(anyhow::Error::msg)?;
     if bars.is_empty() {
         anyhow::bail!(
             "Return autocorrelation refused: no regular-session bars were returned. Sample prices are never used."
@@ -1356,12 +1369,14 @@ async fn research_gap_fill(
         );
     }
     let sec = tr_data::security(symbol);
+    tr_data::cash_session::require_us_session(&sec.ticker, None).map_err(anyhow::Error::msg)?;
     if !matches!(sec.class, tr_core::AssetClass::Equity | tr_core::AssetClass::Etf | tr_core::AssetClass::Index) {
         anyhow::bail!("{} has no US cash session. The gap is the regular session from 09:30.", sec.ticker);
     }
     let query = tr_data::gap_fill::parse_query(spec, timeframe).map_err(anyhow::Error::msg)?;
     let limit = tr_data::gap_fill::fetch_limit(query.timeframe);
     let bars = s.provider.history(&sec.key(), query.timeframe, None, limit).await?;
+    tr_data::cash_session::require_us_session(&sec.ticker, None).map_err(anyhow::Error::msg)?;
     if bars.is_empty() {
         anyhow::bail!("Gap fill refused: no regular-session bars were returned. Sample prices are never used.");
     }
@@ -1383,12 +1398,14 @@ async fn research_session_extreme(
         );
     }
     let sec = tr_data::security(symbol);
+    tr_data::cash_session::require_us_session(&sec.ticker, None).map_err(anyhow::Error::msg)?;
     if !matches!(sec.class, tr_core::AssetClass::Equity | tr_core::AssetClass::Etf | tr_core::AssetClass::Index) {
         anyhow::bail!("{} has no US cash session. The extreme is the regular session from 09:30.", sec.ticker);
     }
     let query = tr_data::session_extreme::parse_query(spec, timeframe).map_err(anyhow::Error::msg)?;
     let limit = tr_data::session_extreme::fetch_limit(query.timeframe);
     let bars = s.provider.history(&sec.key(), query.timeframe, None, limit).await?;
+    tr_data::cash_session::require_us_session(&sec.ticker, None).map_err(anyhow::Error::msg)?;
     if bars.is_empty() {
         anyhow::bail!("Session extreme refused: no regular-session bars were returned. Sample prices are never used.");
     }
@@ -1410,6 +1427,7 @@ async fn research_relative_path(
         );
     }
     let sec = tr_data::security(symbol);
+    tr_data::cash_session::require_us_session(&sec.ticker, None).map_err(anyhow::Error::msg)?;
     if sec.key() == tr_data::relative_path::benchmark_key() {
         anyhow::bail!("SPY is the benchmark. RPATH needs another cash name.");
     }
@@ -1419,6 +1437,7 @@ async fn research_relative_path(
     let query = tr_data::relative_path::parse_query(spec, timeframe).map_err(anyhow::Error::msg)?;
     let limit = tr_data::relative_path::fetch_limit(query.timeframe);
     let bars = s.provider.history(&sec.key(), query.timeframe, None, limit).await?;
+    tr_data::cash_session::require_us_session(&sec.ticker, None).map_err(anyhow::Error::msg)?;
     if bars.is_empty() {
         anyhow::bail!("Relative path refused: no regular-session bars were returned. Sample prices are never used.");
     }
@@ -1442,11 +1461,13 @@ async fn research_session_brief(s: &Shared, symbol: &str) -> anyhow::Result<tr_d
         );
     }
     let sec = tr_data::security(symbol);
+    tr_data::cash_session::require_us_session(&sec.ticker, None).map_err(anyhow::Error::msg)?;
     if !matches!(sec.class, tr_core::AssetClass::Equity | tr_core::AssetClass::Etf | tr_core::AssetClass::Index) {
         anyhow::bail!("{} has no US cash session.", sec.ticker);
     }
     let limit = tr_data::session_alerts::fetch_limit();
     let bars = s.provider.history(&sec.key(), Timeframe::M5, None, limit).await?;
+    tr_data::cash_session::require_us_session(&sec.ticker, None).map_err(anyhow::Error::msg)?;
     if bars.is_empty() {
         anyhow::bail!("Session brief refused: no regular-session bars were returned. Sample prices are never used.");
     }
@@ -1472,10 +1493,12 @@ async fn research_cash_levels(s: &Shared, symbol: &str) -> anyhow::Result<tr_dat
         );
     }
     let sec = tr_data::security(symbol);
+    tr_data::cash_session::require_us_session(&sec.ticker, None).map_err(anyhow::Error::msg)?;
     if !matches!(sec.class, tr_core::AssetClass::Equity | tr_core::AssetClass::Etf | tr_core::AssetClass::Index) {
         anyhow::bail!("{} has no US cash session.", sec.ticker);
     }
     let bars = s.provider.history(&sec.key(), Timeframe::M5, None, tr_data::cash_levels::fetch_limit()).await?;
+    tr_data::cash_session::require_us_session(&sec.ticker, None).map_err(anyhow::Error::msg)?;
     if bars.is_empty() {
         anyhow::bail!("{} has no regular-session bars. A premarket print is not the open.", sec.ticker);
     }
@@ -1500,6 +1523,7 @@ async fn research_breadth(
     let mut rows = Vec::with_capacity(query.symbols.len());
     for symbol in &query.symbols {
         let sec = tr_data::security(symbol);
+        tr_data::cash_session::require_us_session(&sec.ticker, None).map_err(anyhow::Error::msg)?;
         if !matches!(sec.class, tr_core::AssetClass::Equity | tr_core::AssetClass::Etf | tr_core::AssetClass::Index) {
             rows.push(tr_data::session_breadth::NamedBars {
                 symbol: sec.key(),
@@ -1508,7 +1532,9 @@ async fn research_breadth(
             });
             continue;
         }
-        match s.provider.history(&sec.key(), query.timeframe, None, limit).await {
+        let fetched = s.provider.history(&sec.key(), query.timeframe, None, limit).await;
+        tr_data::cash_session::require_us_session(&sec.ticker, None).map_err(anyhow::Error::msg)?;
+        match fetched {
             Ok(bars) if bars.is_empty() => rows.push(tr_data::session_breadth::NamedBars {
                 symbol: sec.key(),
                 bars,

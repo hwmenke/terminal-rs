@@ -8,8 +8,9 @@
 //! are left out. Two prints in one bucket stay two prints: callers decide whether
 //! that minute is blank or the whole session is dropped.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::str::FromStr;
+use std::sync::{Mutex, OnceLock};
 
 use chrono::{NaiveDate, Timelike};
 use tr_core::{AssetClass, Bar, Security, Timeframe};
@@ -279,6 +280,55 @@ fn window_range(min_window: usize, max_window: usize) -> String {
 
 pub fn is_cash(sec: &Security) -> bool {
     matches!(sec.class, AssetClass::Equity | AssetClass::Etf | AssetClass::Index)
+}
+
+static EXCHANGE_ZONES: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
+
+fn exchange_symbol(symbol: &str) -> String {
+    symbol.split_whitespace().next().unwrap_or(symbol).to_ascii_uppercase()
+}
+
+/// Remember exchange metadata observed in a provider response.
+pub fn note_exchange_zone(symbol: &str, zone: &str) {
+    if !zone.is_empty() {
+        EXCHANGE_ZONES
+            .get_or_init(Mutex::default)
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(exchange_symbol(symbol), zone.to_string());
+    }
+}
+
+/// Last observed exchange timezone for this symbol in this process.
+pub fn exchange_zone(symbol: &str) -> Option<String> {
+    EXCHANGE_ZONES
+        .get_or_init(Mutex::default)
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&exchange_symbol(symbol))
+        .cloned()
+}
+
+/// Refuse exchange-specific cash grids until the research panes support them.
+/// Yahoo suffixes identify foreign listings when metadata is unavailable. A/B are
+/// also US share-class spellings and retain the existing fallback.
+pub fn require_us_session(symbol: &str, exchange_timezone: Option<&str>) -> Result<(), String> {
+    let ticker = symbol.split_whitespace().next().unwrap_or(symbol);
+    let observed = exchange_zone(symbol);
+    if let Some(zone) = exchange_timezone.filter(|z| !z.is_empty()).or(observed.as_deref()) {
+        if zone == "America/New_York" {
+            return Ok(());
+        }
+        return Err(format!("Session research supports US cash sessions only ({ticker} trades on {zone})"));
+    }
+    if let Some((_, suffix)) = ticker.rsplit_once('.')
+        && !matches!(suffix, "A" | "B")
+    {
+        return Err(format!(
+            "Session research supports US cash sessions only ({ticker} has a non-US exchange suffix; exchange timezone unavailable)"
+        ));
+    }
+    Ok(())
 }
 
 pub fn clock_label(ts: i64) -> String {
@@ -602,5 +652,22 @@ mod tests {
         assert_eq!(parsed_bar_token("NVDA 4h"), Some("4h"));
         assert_eq!(without_parsed_bar_tokens("NVDA 4h"), "NVDA");
         assert_eq!(without_letter_bar_tokens("AAPL 15m MSFT"), "AAPL MSFT");
+    }
+}
+
+#[cfg(test)]
+mod exchange_registry_tests {
+    use super::*;
+
+    #[test]
+    fn observed_index_zone_refuses_research() {
+        assert!(require_us_session("^N225", None).is_ok());
+        note_exchange_zone("^N225", "Asia/Tokyo");
+        assert_eq!(exchange_zone("^N225").as_deref(), Some("Asia/Tokyo"));
+        assert_eq!(
+            require_us_session("^N225", None).unwrap_err(),
+            "Session research supports US cash sessions only (^N225 trades on Asia/Tokyo)"
+        );
+        assert!(require_us_session("^N225", Some("America/New_York")).is_ok());
     }
 }
