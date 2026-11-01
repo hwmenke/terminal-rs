@@ -32,7 +32,7 @@ impl DisplayRow<'_> {
                 let num = |n: Option<f64>| n.map(|n| format!("{n:.2}")).unwrap_or_else(|| "—".into());
                 let m = r.metrics.as_ref();
                 format!(
-                    "{:<12} {:<12} {:<8} {:>9} {:>6} {:>8} {:>7} {:>12} {:>7} {:>7} {:>9} {:>9} {:>10} {:>7} {:>8}",
+                    "{:<12} {:<12} {:<8} {:>9} {:>6} {:>8} {:>7} {:>12} {:>7} {:>7} {:>9} {:>9} {:>10} {:>7} {:>8} {:>8} {:>8} {:>9}",
                     r.symbol,
                     r.last_date.as_deref().unwrap_or("—"),
                     status,
@@ -47,7 +47,10 @@ impl DisplayRow<'_> {
                     num(m.and_then(|m| m.stretch_pct)),
                     num(m.and_then(|m| m.rs_spy_63d)),
                     m.map(|m| if m.ma.stacked_ma { "yes" } else { "no" }).unwrap_or("—"),
-                    m.map(|m| if m.ma.pullback_rising_ma { "yes" } else { "no" }).unwrap_or("—")
+                    m.map(|m| if m.ma.pullback_rising_ma { "yes" } else { "no" }).unwrap_or("—"),
+                    num(m.and_then(|m| m.rsi_lens.rsi14)),
+                    num(m.and_then(|m| m.rsi_lens.rsi14_prev)),
+                    m.map(|m| format!("{}/{}/{}", m.rsi_lens.rsi_os as u8, m.rsi_lens.rsi_ob as u8, m.rsi_lens.rsi_rising_from_os as u8)).unwrap_or_else(|| "—".into())
                 )
             }
         }
@@ -336,7 +339,7 @@ impl ResearchPane {
                 Self::scan_details(ui, row);
             }
             ui.monospace(format!(
-                "{:<12} {:<12} {:<8} {:>9} {:>6} {:>8} {:>7} {:>12} {:>7} {:>7} {:>9} {:>9} {:>10} {:>7} {:>8}",
+                "{:<12} {:<12} {:<8} {:>9} {:>6} {:>8} {:>7} {:>12} {:>7} {:>7} {:>9} {:>9} {:>10} {:>7} {:>8} {:>8} {:>8} {:>9}",
                 "TICKER",
                 "LAST BAR",
                 "STATUS",
@@ -351,7 +354,7 @@ impl ResearchPane {
                 "SMA50%",
                 "RS/SPY63%",
                 "STACKED",
-                "PULLBACK"
+                "PULLBACK", "LENS RSI", "RSI PREV", "OS/OB/RISE"
             ));
             rows.extend(visible.into_iter().map(DisplayRow::Scan));
         }

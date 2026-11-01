@@ -1,4 +1,5 @@
 """Run from wn60 with PYTHONDONTWRITEBYTECODE=1; only output is the supplied path.
+RSI only: python3 /path/to/this/script.py --rsi /path/to/scan_pack_rsi.json
 PYTHONDONTWRITEBYTECODE=1 python3 /path/to/this/script.py /path/to/scan_pack.json
 """
 import json
@@ -9,6 +10,39 @@ import pandas as pd
 # The read-only reference is the current working directory, not this script's dir.
 sys.path.insert(0, '.')
 import scan_pack as sp
+
+# RSI-only mode never opens or regenerates the original MA/breadth fixture.
+if len(sys.argv) > 1 and sys.argv[1] == '--rsi':
+    rkeys = 'rsi14 rsi14_prev rsi_os rsi_ob rsi_rising_from_os'.split()
+    rcases = {
+        'up': np.linspace(80, 120, 32),
+        'down': np.linspace(120, 80, 32),
+        'flat': np.full(32, 100.),
+        'empty': np.array([]),
+        'short': np.linspace(80, 120, 15),
+        'minimum': np.r_[np.linspace(120, 80, 15), 81.],
+        'oversold_exit': np.r_[np.linspace(120, 80, 30), 81., 110.],
+        'one_rsi_value': np.r_[np.linspace(120, 100, 8), np.nan, np.linspace(101, 105, 8)],
+        'oversold_rising': np.r_[np.linspace(120, 80, 30), 82., 84.],
+        'mixed': np.array([100 + i*.1 + (-1)**i*2 for i in range(40)]),
+    }
+    for name, positions in [('nan_last', [-1]), ('nan_prev', [-2]), ('nan_gap', [18,19,20])]:
+        x = rcases['mixed'].copy()
+        x[positions] = np.nan
+        rcases[name] = x
+    output = []
+    for name, close in rcases.items():
+        if len(close):
+            row = sp.measure(name, df=pd.DataFrame({'close': close}))
+            expected = {k: row[k] for k in rkeys}
+            match = row['match']['rsi']
+        else:
+            expected = dict(rsi14=None, rsi14_prev=None, rsi_os=False, rsi_ob=False, rsi_rising_from_os=False)
+            match = False
+        output.append(dict(name=name, close=['nan' if np.isnan(v) else float(v) for v in close], expected=expected, match=match))
+    with open(sys.argv[2], 'w') as out:
+        json.dump(output, out, separators=(',', ':'), allow_nan=False)
+    sys.exit(0)
 
 keys = 'ready price day_pct bars sma20 sma50 sma200 sma20_rising sma50_rising sma200_rising vs20 vs50 vs200 stacked_ma pullback_rising_ma'.split()
 bkeys = 'ready n stored_n n_sma50 n_sma200 n_ad_1d n_ad_5d pct_above_sma50 pct_above_sma200 adv_1d dec_1d unch_1d adv_5d dec_5d unch_5d ad_1d ad_5d'.split()

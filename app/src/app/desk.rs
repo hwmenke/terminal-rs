@@ -177,6 +177,10 @@ impl TerminalApp {
         self.sync_holding_risk();
         let breaches = self.holding_risk.breaches;
         let threshold = self.holding_risk.concentration * 100.0;
+        let breadth_chips = breadth_chips(&self.holding_risk.breadth);
+        let breadth_hint = if self.holding_risk.breadth.ready {
+            format!("Loaded holdings histories only ({} closes). A/D is advances / (advances + declines), excluding unchanged. No additional fetches.\n{}", self.holding_risk.breadth.n, self.holding_risk.breadth.summary())
+        } else { "No loaded holdings daily histories. Breadth uses existing in-memory data only.".into() };
         let mut open_risk = false;
         let mut actions = vec![];
         let mut refresh = false;
@@ -219,6 +223,10 @@ impl TerminalApp {
 
             ui.horizontal_wrapped(|ui| {
                 ui.label(RichText::new("PM Desk").strong().color(crate::theme::text()));
+                ui.small("Holdings breadth:").on_hover_text(&breadth_hint);
+                for chip in &breadth_chips {
+                    ui.small(chip).on_hover_text(&breadth_hint);
+                }
                 ui.label(breaches.map(|n| format!("Risk breaches: {n} (known)")).unwrap_or_else(|| "Risk breaches: —".into()))
                     .on_hover_text(format!("Holdings with any known breach: below SMA50, RSI14 ≥70 / ≤30, or weight >{threshold}%. Daily signals require loaded holdings history; unknown signals are not counted."));
                 open_risk = ui.small_button("Holdings risk →").clicked();
@@ -734,6 +742,7 @@ mod tests {
 /// Shared archive data and cached, whole-portfolio breach count.
 pub(super) struct HoldingRiskState {
     pub history: std::collections::HashMap<String, Vec<tr_core::Bar>>,
+    pub breadth: tr_data::whats_news::scan_pack::Breadth,
     pub concentration: f64,
     pub breaches: Option<usize>,
     pub adma_stretch: std::collections::HashMap<String, Option<f64>>,
@@ -747,7 +756,7 @@ pub(super) struct HoldingRiskState {
 
 impl Default for HoldingRiskState {
     fn default() -> Self {
-        Self { history: Default::default(), adma_stretch: Default::default(), concentration: 0.2, breaches: None,
+        Self { history: Default::default(), breadth: Default::default(), adma_stretch: Default::default(), concentration: 0.2, breaches: None,
             loading: false, requested: false, generation: 0, error: None, positions: None, held_keys: Default::default() }
     }
 }
@@ -762,6 +771,11 @@ fn reconcile_held_history<T>(
 }
 
 impl HoldingRiskState {
+    /// Called only when loaded histories change, independently of portfolio edits.
+    pub fn refresh_breadth(&mut self) {
+        self.breadth = tr_data::whats_news::scan_pack::breadth(
+            &self.history.values().map(|bars| bars.iter().map(|b| b.close).collect()).collect::<Vec<_>>());
+    }
     pub fn recompute(&mut self, pf: Option<&tr_broker::Portfolio>) {
         self.adma_stretch = pf.into_iter().flat_map(|pf| &pf.positions)
             .filter_map(|p| p.market_key()).map(|key| {
@@ -782,10 +796,14 @@ impl TerminalApp {
         let pf = if self.demo_mode() { Some(&*self.demo.pf) } else { self.broker.portfolio.as_deref() };
         let keys: std::collections::BTreeSet<_> = pf.into_iter()
             .flat_map(|pf| pf.positions.iter()).filter_map(|p| p.market_key()).collect();
+        let previous_history_len = self.holding_risk.history.len();
         let (changed, history) = reconcile_held_history(
             &self.holding_risk.held_keys, &keys, std::mem::take(&mut self.holding_risk.history));
         self.holding_risk.history = history;
         self.holding_risk.held_keys = keys;
+        if self.holding_risk.history.len() != previous_history_len {
+            self.holding_risk.refresh_breadth();
+        }
         if changed {
             // Invalidate in-flight results even when no request target is open.
             self.holding_risk.generation += 1;
@@ -937,5 +955,29 @@ mod holding_risk_tests {
         assert_eq!(state.breaches, Some(0));
         state.recompute(None);
         assert_eq!(state.breaches, None);
+    }
+}
+
+/// Formatting is pure; breadth itself is cached when histories change.
+fn breadth_chips(b: &tr_data::whats_news::scan_pack::Breadth) -> [String; 4] {
+    let pct = |v: Option<f64>, n| v.map(|v| format!("{v:.1}%/{n}")).unwrap_or_else(|| "—".into());
+    let ad = |v: Option<f64>| v.map(|v| format!("{v:.3}")).unwrap_or_else(|| "—".into());
+    [format!(">SMA50 {}", pct(b.pct_above_sma50, b.n_sma50)),
+     format!(">SMA200 {}", pct(b.pct_above_sma200, b.n_sma200)),
+     format!("1d A/D {}", ad(b.ad_1d)), format!("5d A/D {}", ad(b.ad_5d))]
+}
+#[cfg(test)]
+mod breadth_chip_tests {
+    use super::*;
+    #[test]
+    fn loaded_scope_and_missing_values() {
+        let mut state = HoldingRiskState::default();
+        assert_eq!(breadth_chips(&state.breadth), [">SMA50 —", ">SMA200 —", "1d A/D —", "5d A/D —"]);
+        state.history.insert("A".into(), (0..201).map(|i| tr_core::Bar::new(i, 1., 1., 1., i as f64 + 1., 1.)).collect());
+        state.refresh_breadth();
+        assert_eq!(breadth_chips(&state.breadth), [">SMA50 100.0%/1", ">SMA200 100.0%/1", "1d A/D 1.000", "5d A/D 1.000"]);
+        state.history.clear();
+        state.refresh_breadth();
+        assert!(!state.breadth.ready);
     }
 }

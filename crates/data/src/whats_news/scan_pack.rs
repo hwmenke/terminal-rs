@@ -213,3 +213,80 @@ impl Breadth {
 pub fn history_breadth(histories: &[(String, Vec<tr_core::Bar>)]) -> Breadth {
     breadth(&histories.iter().map(|(_, bars)| bars.iter().map(|b| b.close).collect()).collect::<Vec<_>>())
 }
+
+/// Whats-News RSI lens: pandas adjust=False EWM, including missing-position weights.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct RsiMetrics {
+    pub rsi14: Option<f64>,
+    pub rsi14_prev: Option<f64>,
+    pub rsi_os: bool,
+    pub rsi_ob: bool,
+    pub rsi_rising_from_os: bool,
+}
+impl RsiMetrics {
+    pub fn matches_rsi(&self) -> bool {
+        self.rsi_os || self.rsi_ob || self.rsi_rising_from_os
+    }
+}
+pub fn measure_rsi(close: &[f64]) -> RsiMetrics {
+    if close.iter().filter(|v| !v.is_nan()).count() < 16 {
+        return RsiMetrics::default();
+    }
+    let alpha = 1.0 / 14.0;
+    let mut gain: Option<f64> = None;
+    let mut loss: Option<f64> = None;
+    let mut weight = 1.0;
+    let mut count = 0;
+    let mut values = Vec::new();
+    let mut deltas = Vec::new();
+    for pair in close.windows(2) {
+        let delta = pair[1] - pair[0];
+        // pandas EWM treats infinities as missing as well.
+        let observed = delta.is_finite();
+        if observed {
+            deltas.push(delta);
+            count += 1;
+        }
+        if let (Some(g), Some(l)) = (gain, loss) {
+            weight *= 1.0 - alpha;
+            if observed {
+                let ng = delta.max(0.0);
+                let nl = -delta.min(0.0);
+                gain = Some(if g == ng { g } else { (weight * g + alpha * ng) / (weight + alpha) });
+                loss = Some(if l == nl { l } else { (weight * l + alpha * nl) / (weight + alpha) });
+                weight = 1.0;
+            }
+        } else if observed {
+            gain = Some(delta.max(0.0));
+            loss = Some(-delta.min(0.0));
+        }
+        if count >= 14 {
+            if let (Some(g), Some(l)) = (gain, loss) {
+                if l != 0.0 {
+                    values.push(100.0 - 100.0 / (1.0 + g / l));
+                }
+            }
+        }
+    }
+    let (cur, prev) = if let Some(last) = values.last() {
+        (rounded(*last, 2), values.len().checked_sub(2).and_then(|i| rounded(values[i], 2)))
+    } else {
+        let limit = if deltas.len() < 14 {
+            None
+        } else if deltas.iter().all(|d| *d >= 0.0) {
+            Some(100.0)
+        } else if deltas.iter().all(|d| *d <= 0.0) {
+            Some(0.0)
+        } else {
+            None
+        };
+        (limit, limit)
+    };
+    RsiMetrics {
+        rsi14: cur,
+        rsi14_prev: prev,
+        rsi_os: cur.is_some_and(|v| v <= 30.0),
+        rsi_ob: cur.is_some_and(|v| v >= 70.0),
+        rsi_rising_from_os: cur.zip(prev).is_some_and(|(c, p)| p < 30.0 && c > p),
+    }
+}
