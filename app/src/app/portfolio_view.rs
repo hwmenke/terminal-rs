@@ -1271,12 +1271,12 @@ pub(super) fn risk_chips(
                 .map(|q| q.market_value().filter(|v| v.is_finite()).map(f64::abs)).collect();
             let total = values.map(|v| v.iter().sum::<f64>()).filter(|v| *v > 0.0);
             let weight = p.market_value().zip(total).map(|(v,t)| v.abs()/t);
+            let stretch = key.as_ref().and_then(|k| risk.adma_stretch.get(k)).copied().flatten();
             let risk = tr_core::indicators::holding_risk(bars.map(Vec::as_slice).unwrap_or(&[]), weight, risk.concentration);
             ui.horizontal_wrapped(|ui| {
                 ui.label(&p.symbol);
                 let ma = match risk.above_sma50 { Some(true) => "≥ SMA50", Some(false) => "< SMA50", None => "SMA50 —" };
                 ui.label(RichText::new(ma).color(if risk.above_sma50 == Some(false) { amber() } else { muted() }).background_color(theme::control()));
-                let stretch = bars.and_then(|b| tr_core::indicators::adma_stretch(&b.iter().map(|b| b.close).collect::<Vec<_>>()));
                 ui.label(RichText::new(stretch.map(|s| format!("ADMA Stretch {s:+.2}%")).unwrap_or_else(|| "ADMA Stretch —".into()))
                     .color(muted()).background_color(theme::control()));
                 let rsi = risk.rsi14.map(|r| format!("RSI14 {r:.1} {}", if r >= 70.0 { "OB" } else if r <= 30.0 { "OS" } else { "neutral" })).unwrap_or_else(|| "RSI14 —".into());
