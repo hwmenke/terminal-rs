@@ -32,7 +32,7 @@ impl DisplayRow<'_> {
                 let num = |n: Option<f64>| n.map(|n| format!("{n:.2}")).unwrap_or_else(|| "—".into());
                 let m = r.metrics.as_ref();
                 format!(
-                    "{:<12} {:<12} {:<8} {:>9} {:>6} {:>8} {:>7} {:>12} {:>7} {:>7} {:>9} {:>9} {:>10}",
+                    "{:<12} {:<12} {:<8} {:>9} {:>6} {:>8} {:>7} {:>12} {:>7} {:>7} {:>9} {:>9} {:>10} {:>7} {:>8}",
                     r.symbol,
                     r.last_date.as_deref().unwrap_or("—"),
                     status,
@@ -45,7 +45,9 @@ impl DisplayRow<'_> {
                     num(m.map(|m| m.adr_pct)),
                     num(m.and_then(|m| m.stretch_atr)),
                     num(m.and_then(|m| m.stretch_pct)),
-                    num(m.and_then(|m| m.rs_spy_63d))
+                    num(m.and_then(|m| m.rs_spy_63d)),
+                    m.map(|m| if m.ma.stacked_ma { "yes" } else { "no" }).unwrap_or("—"),
+                    m.map(|m| if m.ma.pullback_rising_ma { "yes" } else { "no" }).unwrap_or("—")
                 )
             }
         }
@@ -334,7 +336,7 @@ impl ResearchPane {
                 Self::scan_details(ui, row);
             }
             ui.monospace(format!(
-                "{:<12} {:<12} {:<8} {:>9} {:>6} {:>8} {:>7} {:>12} {:>7} {:>7} {:>9} {:>9} {:>10}",
+                "{:<12} {:<12} {:<8} {:>9} {:>6} {:>8} {:>7} {:>12} {:>7} {:>7} {:>9} {:>9} {:>10} {:>7} {:>8}",
                 "TICKER",
                 "LAST BAR",
                 "STATUS",
@@ -347,7 +349,9 @@ impl ResearchPane {
                 "ADR20%",
                 "SMA50/ATR",
                 "SMA50%",
-                "RS/SPY63%"
+                "RS/SPY63%",
+                "STACKED",
+                "PULLBACK"
             ));
             rows.extend(visible.into_iter().map(DisplayRow::Scan));
         }
@@ -437,9 +441,11 @@ impl ResearchPane {
     fn scan_details(ui: &mut Ui, row: &tr_data::whats_news::ScanRow) {
         ui.collapsing(format!("{} · conditions / source fields",row.symbol),|ui| {
             let num=|v:Option<f64>|v.map(|v|format!("{v:.2}")).unwrap_or_else(||"—".into());
+            let flag=|v:Option<bool>| match v { Some(true)=>"yes", Some(false)=>"no", None=>"—" };
             if let Some(m)=&row.metrics {
                 ui.label(format!("Rust: change {}% · return21 {}% · mean prior volume {} · 5/20 volume {} · gap {}% · distance from high {}%",
                     num(Some(m.change_pct)),num(Some(m.ret_21d_pct)),num(Some(m.avg_volume20)),num(m.vol_ratio_5_20),num(Some(m.gap_pct)),num(Some(m.dist_20d_high_pct))));
+                ui.label(format!("MA: SMA20 {} (vs {}%) · SMA50 {} (vs {}%) · SMA200 {} (vs {}%) · rising 20/50/200 {}/{}/{}",num(m.ma.sma20),num(m.ma.vs20),num(m.ma.sma50),num(m.ma.vs50),num(m.ma.sma200),num(m.ma.vs200),flag(m.ma.sma20_rising),flag(m.ma.sma50_rising),flag(m.ma.sma200_rising)));
                 if m.rs_n>0 { ui.label(format!("Archive RS rank: {} / {} (same-date universe)",m.rs_rank,m.rs_n)); }
                 for (label,c) in [("Daily",&m.daily),("Weekly",&m.weekly),("Monthly",&m.monthly)] {
                     ui.label(format!("{label}: {} bars · RSI {} · {}",c.bars,num(c.rsi),c.unavailable.clone().unwrap_or_else(||if c.above_sma20==Some(true) { "Close ≥ SMA20".into() } else { "Close < SMA20".into() })));
