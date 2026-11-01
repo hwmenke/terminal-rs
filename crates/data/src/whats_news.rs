@@ -43,7 +43,6 @@ fn archive_provenance() -> Provenance {
 }
 
 pub const SETUPS: &[&str] = &[
-    "MA",
     "DARVAS_BREAKOUT",
     "DARVAS_BOX",
     "DARVAS_FAIL",
@@ -53,6 +52,8 @@ pub const SETUPS: &[&str] = &[
     "BREAKOUT_QUEUE",
     "RSI_OB",
     "RSI_OS",
+    "MA",
+    "RSI_LENS",
 ];
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

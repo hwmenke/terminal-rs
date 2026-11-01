@@ -1623,7 +1623,11 @@ impl TerminalApp {
                     let _ = pane;
                     if self.holding_risk.generation == generation {
                         self.holding_risk.loading = false;
+                        let history_changed = rows.iter().any(|(key, bars)| self.holding_risk.history.get(key) != Some(bars));
                         self.holding_risk.history.extend(rows);
+                        if history_changed {
+                            self.holding_risk.refresh_breadth();
+                        }
                         self.holding_risk.error = error;
                         let pf = if self.demo_mode() { Some(&*self.demo.pf) } else { self.broker.portfolio.as_deref() };
                         self.holding_risk.recompute(pf);
