@@ -186,6 +186,19 @@ impl TerminalApp {
             PaneKind::Desk(d) => d.selected.clone(),
             _ => None,
         };
+        if let Some(chart) = self.panes.iter_mut().find_map(|p| match &mut p.kind {
+            PaneKind::Chart(chart) if selected_key.as_deref() == Some(chart.symbol.as_str())
+                && chart.tf == tr_core::Timeframe::D1 => Some(chart),
+            _ => None,
+        }) {
+            let mut enabled = chart.show_spy_strength;
+            if ui.checkbox(&mut enabled, "RS vs SPY").changed() {
+                chart.set_spy_strength(enabled, &self.worker);
+            }
+        } else {
+            ui.add_enabled(false, egui::Checkbox::new(&mut false, "RS vs SPY"))
+                .on_hover_text("Open a daily chart for the selected symbol");
+        }
         let chart_lines =
             selected_key.as_deref().map(|k| drawing_stops(&self.chart_horizontals(k))).unwrap_or_default();
         {
@@ -723,6 +736,7 @@ pub(super) struct HoldingRiskState {
     pub history: std::collections::HashMap<String, Vec<tr_core::Bar>>,
     pub concentration: f64,
     pub breaches: Option<usize>,
+    pub adma_stretch: std::collections::HashMap<String, Option<f64>>,
     pub loading: bool,
     pub requested: bool,
     pub generation: u64,
@@ -733,7 +747,7 @@ pub(super) struct HoldingRiskState {
 
 impl Default for HoldingRiskState {
     fn default() -> Self {
-        Self { history: Default::default(), concentration: 0.2, breaches: None,
+        Self { history: Default::default(), adma_stretch: Default::default(), concentration: 0.2, breaches: None,
             loading: false, requested: false, generation: 0, error: None, positions: None, held_keys: Default::default() }
     }
 }
@@ -749,6 +763,12 @@ fn reconcile_held_history<T>(
 
 impl HoldingRiskState {
     pub fn recompute(&mut self, pf: Option<&tr_broker::Portfolio>) {
+        self.adma_stretch = pf.into_iter().flat_map(|pf| &pf.positions)
+            .filter_map(|p| p.market_key()).map(|key| {
+                let stretch = self.history.get(&key).and_then(|bars|
+                    tr_core::indicators::adma_stretch(&bars.iter().map(|b| b.close).collect::<Vec<_>>()));
+                (key, stretch)
+            }).collect();
         self.breaches = pf.map(|pf| tr_core::indicators::risk_breaches(
             super::portfolio_view::holding_risks(
                 &super::broker::PortfolioPane::new(crate::command::PortView::Positions), pf, self)));
@@ -775,6 +795,9 @@ impl TerminalApp {
         }
         if changed || self.holding_risk.positions.as_deref() != pf.map(|pf| pf.positions.as_slice()) {
             self.holding_risk.recompute(pf);
+        }
+        if self.holding_risk.held_keys.is_empty() {
+            self.holding_risk.requested = true;
         }
         if pf.is_some()
             && !self.holding_risk.requested
@@ -830,6 +853,7 @@ mod holding_risk_tests {
         let (worker, mut requests) = crate::worker::Worker::test_channel();
         app.worker = worker;
         app.prefs.trading.account_mode = crate::prefs::AccountMode::Demo;
+        app.demo.pf = Box::new(tr_broker::sample::portfolio());
         app.open_desk(None);
         let mut found = false;
         while let Ok(request) = requests.try_recv() {
@@ -868,12 +892,36 @@ mod holding_risk_tests {
         assert!(app.holding_risk.history.is_empty());
         assert_eq!(app.holding_risk.breaches, Some(0));
         assert!(app.holding_risk.generation > generation);
-        assert!(matches!(requests.try_recv(), Ok(Request::HoldingHistory { generation: g, symbols, .. })
-            if g == app.holding_risk.generation && symbols.is_empty()));
+        assert!(requests.try_recv().is_err());
         let generation = app.holding_risk.generation;
         app.sync_holding_risk();
         assert_eq!(app.holding_risk.generation, generation);
         assert!(requests.try_recv().is_err());
+    }
+
+    #[test]
+    fn cached_stretch_tracks_history_and_pruned_holdings() {
+        let mut pf = tr_broker::sample::portfolio();
+        let key = pf.positions.iter().find_map(|p| p.market_key()).unwrap();
+        let mut state = HoldingRiskState::default();
+        state.recompute(Some(&pf));
+        assert_eq!(state.adma_stretch.get(&key), Some(&None));
+        let bars = (0..40).map(|i| tr_core::Bar::new(i, 10.0, 10.0, 10.0, 10.0, 1.0)).collect();
+        state.history.insert(key.clone(), bars);
+        state.recompute(Some(&pf));
+        assert_eq!(state.adma_stretch.get(&key), Some(&Some(0.0)));
+        state.history.get_mut(&key).unwrap().last_mut().unwrap().close = 15.0;
+        state.recompute(Some(&pf));
+        let expected = tr_core::indicators::adma_stretch(
+            &state.history[&key].iter().map(|b| b.close).collect::<Vec<_>>());
+        assert_eq!(state.adma_stretch[&key], expected);
+        assert_ne!(expected, Some(0.0));
+        pf.positions.clear();
+        state.history.clear();
+        state.recompute(Some(&pf));
+        assert!(state.adma_stretch.is_empty());
+        state.recompute(None);
+        assert!(state.adma_stretch.is_empty());
     }
 
     #[test]

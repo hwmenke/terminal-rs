@@ -830,6 +830,13 @@ impl ChartState {
         }
     }
 
+    pub fn set_spy_strength(&mut self, enabled: bool, w: &Worker) {
+        self.show_spy_strength = enabled;
+        self.spy_strength = None;
+        self.spy_strength_error = None;
+        self.request_compare(w);
+    }
+
     fn request_compare(&self, w: &Worker) {
         if self.show_spy_strength && self.tf == Timeframe::D1 && !self.bars.is_empty() {
             w.send(Request::DailyStrength {
@@ -1730,9 +1737,7 @@ impl ChartState {
         if ui.add_enabled(self.tf == Timeframe::D1,
             egui::Checkbox::new(&mut self.show_spy_strength, "Daily RS / SPY (100 at first common date)"))
             .on_hover_text("Close/SPY close ratio normalized to 100; scaled to the price axis for display. Missing SPY dates stay blank.").changed() {
-            self.spy_strength = None;
-            self.spy_strength_error = None;
-            self.request_compare(w);
+            self.set_spy_strength(self.show_spy_strength, w);
         }
         if let Some(e) = &self.spy_strength_error {
             ui.colored_label(theme::amber(), e);
@@ -3220,6 +3225,20 @@ mod tests {
             !matches!(requests.try_recv(), Ok(Request::MoreHistory { .. })),
             "Paging must not request market MoreHistory"
         );
+    }
+
+    #[test]
+    fn spy_strength_toggle_uses_daily_strength_request() {
+        let (worker, mut requests) = Worker::test_channel();
+        let mut chart = ChartState::new(1, "AAPL", Timeframe::D1);
+        chart.bars = Arc::new(tr_core::sample::generate("AAPL", Timeframe::D1, 80, 1_790_000_000));
+        chart.set_spy_strength(true, &worker);
+        assert!(chart.show_spy_strength);
+        assert!(matches!(requests.try_recv(), Ok(Request::DailyStrength { pane: 1, base, .. })
+            if base.len() == 80));
+        chart.set_spy_strength(false, &worker);
+        assert!(!chart.show_spy_strength);
+        assert!(requests.try_recv().is_err());
     }
 
     #[test]
