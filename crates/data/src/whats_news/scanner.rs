@@ -25,6 +25,8 @@ pub struct Conditions {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Metrics {
     #[serde(default)]
+    pub ma: super::scan_pack::MaMetrics,
+    #[serde(default)]
     pub adma_stretch: Option<f64>,
     #[serde(default)]
     pub stretch_pct: Option<f64>,
@@ -174,6 +176,7 @@ pub fn calculate(b: &[Bar]) -> std::result::Result<Metrics, String> {
         };
     let stretch = tr_core::indicators::sma50_stretch(b);
     let metrics = Metrics {
+        ma: super::scan_pack::measure(&b.iter().map(|b| b.close).collect::<Vec<_>>()),
         adma_stretch: tr_core::indicators::adma_stretch(&b.iter().map(|b| b.close).collect::<Vec<_>>()),
         stretch_pct: stretch.map(|s| s.pct),
         stretch_atr: stretch.and_then(|s| s.atr_units),
@@ -249,6 +252,7 @@ fn matches_setup(name: &str, b: &[Bar], m: &Metrics) -> bool {
     let near = m.dist_20d_high_pct >= -5.0;
     let surge = m.volume_ratio.is_some_and(|v| v >= 1.5);
     match name {
+        "MA" => m.ma.matches_ma(),
         "NEAR_HIGH" => near,
         "VOL_SURGE" => surge,
         "EP" => m.gap_pct >= 4.0 && surge,
@@ -411,10 +415,13 @@ pub enum Sort {
     StretchPct,
     SpyStrength,
     AdmaStretch,
+    StackedMa,
+    PullbackMa,
 }
 impl Sort {
     /// Additional desk sorts, alongside the original scanner sort set.
-    pub const DESK: [Self; 4] = [Self::StretchAtr, Self::StretchPct, Self::SpyStrength, Self::AdmaStretch];
+    pub const DESK: [Self; 6] =
+        [Self::StretchAtr, Self::StretchPct, Self::SpyStrength, Self::AdmaStretch, Self::StackedMa, Self::PullbackMa];
     pub const ALL: [Self; 7] =
         [Self::Symbol, Self::Score, Self::Strength, Self::Rsi, Self::Volume, Self::VolumeRatio, Self::Range];
     pub fn label(self) -> &'static str {
@@ -430,6 +437,8 @@ impl Sort {
             Self::StretchPct => "SMA50 Stretch %",
             Self::SpyStrength => "SPY relative 63d %",
             Self::AdmaStretch => "ADMA Stretch",
+            Self::StackedMa => "Stacked MAs",
+            Self::PullbackMa => "Pullback to rising MA",
         }
     }
     fn value(self, r: &ScanRow) -> Option<f64> {
@@ -446,6 +455,8 @@ impl Sort {
             Self::StretchPct => m.stretch_pct,
             Self::SpyStrength => m.rs_spy_63d,
             Self::AdmaStretch => m.adma_stretch,
+            Self::StackedMa => Some(u8::from(m.ma.stacked_ma) as f64),
+            Self::PullbackMa => Some(u8::from(m.ma.pullback_rising_ma) as f64),
         }
     }
 }

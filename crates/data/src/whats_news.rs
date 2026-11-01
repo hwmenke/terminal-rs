@@ -5,6 +5,7 @@ use std::{path::PathBuf, time::Duration};
 mod desk;
 mod link;
 mod review;
+pub mod scan_pack;
 mod scanner;
 pub use desk::{
     ATR_LEN, ATR_MULT, GroupSummary, HandoffBlock, MemberRow, PlanContext, RETURN_BARS, RiskPlan, StopSource,
@@ -42,6 +43,7 @@ fn archive_provenance() -> Provenance {
 }
 
 pub const SETUPS: &[&str] = &[
+    "MA",
     "DARVAS_BREAKOUT",
     "DARVAS_BOX",
     "DARVAS_FAIL",
@@ -505,7 +507,7 @@ impl Bridge {
         if !self.prefer_http || self.url.is_none() {
             let name = name.to_owned();
             match self.sql(move |c| scan_sql(&c, &name)).await {
-                Ok(snapshot) => return Ok(snapshot),
+                Ok(snapshot) => return Ok(scan_snapshot_with_breadth(snapshot)),
                 Err(e) if e.is::<Unverified>() || self.url.is_none() => return Err(e),
                 Err(_) => {}
             }
@@ -513,18 +515,20 @@ impl Bridge {
         let api=tokio::time::timeout(Duration::from_secs(20),async {
             let service=self.service_scan().await?;
             let histories=self.http_histories().await?;
+            let breadth=scan_pack::history_breadth(&histories.bars);
             let mut scan=scan_histories(name,histories.bars,Provenance::Real)?;
             scan.skipped.extend(histories.skipped);
             if let Some(service)=service { attach_service(&mut scan,service)?; }
-            Ok::<_,anyhow::Error>(scan)
+            Ok::<_,anyhow::Error>((scan,breadth))
         }).await.unwrap_or_else(|_|Err(anyhow::anyhow!("Whats-News timed out scanning history. Check the app or switch to the archive file in Settings › Whats-News.")));
         match api {
-            Ok(data) => Ok(Snapshot {
+            Ok((data, breadth)) => Ok(Snapshot {
                 failures: vec![],
                 provenance: data.provenance,
                 source: format!(
-                    "Whats-News HTTP scanner: {} · Rust calculations; original service fields when available",
-                    self.url.as_deref().unwrap_or_default()
+                    "Whats-News HTTP scanner: {} · Rust calculations; original service fields when available\n{}",
+                    self.url.as_deref().unwrap_or_default(),
+                    breadth.summary()
                 ),
                 data,
             }),
@@ -533,6 +537,7 @@ impl Bridge {
                 let name = name.to_owned();
                 self.sql(move |c| scan_sql(&c, &name))
                     .await
+                    .map(scan_snapshot_with_breadth)
                     .map_err(|db| anyhow::anyhow!("Whats-News unavailable: HTTP: {http}; SQLite: {db:#}"))
             }
         }
@@ -847,11 +852,20 @@ fn read_histories_conn(c: &Connection) -> Result<Histories> {
     tx.commit()?;
     Ok(Histories { bars, skipped })
 }
-fn scan_sql(c: &Connection, name: &str) -> Result<Scan> {
+fn scan_snapshot_with_breadth(s: Snapshot<(Scan, scan_pack::Breadth)>) -> Snapshot<Scan> {
+    Snapshot {
+        failures: s.failures,
+        provenance: s.provenance,
+        source: format!("{}\n{}", s.source, s.data.1.summary()),
+        data: s.data.0,
+    }
+}
+fn scan_sql(c: &Connection, name: &str) -> Result<(Scan, scan_pack::Breadth)> {
     let histories = read_histories_conn(c)?;
+    let breadth = scan_pack::history_breadth(&histories.bars);
     let mut scan = scan_histories(name, histories.bars, Provenance::Cached)?;
     scan.skipped.extend(histories.skipped);
-    Ok(scan)
+    Ok((scan, breadth))
 }
 pub fn scan_histories(name: &str, histories: Vec<(String, Vec<Bar>)>, provenance: Provenance) -> Result<Scan> {
     scanner::scan_cached(name, histories, provenance)

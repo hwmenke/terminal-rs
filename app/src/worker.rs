@@ -1005,7 +1005,8 @@ async fn research_scan(
         // Benchmark enrichment is best-effort: a failure leaves the RS column empty, never fails SCAN.
         if let Ok(histories) = bridge.histories().await {
             if histories.provenance.require_verified("SCAN archive").is_ok()
-                && tr_data::whats_news::apply_spy_benchmark(&mut snapshot.data, &histories.data.bars, spy.as_deref()).is_err()
+                && tr_data::whats_news::apply_spy_benchmark(&mut snapshot.data, &histories.data.bars, spy.as_deref())
+                    .is_err()
             {
                 let _ = tr_data::whats_news::apply_spy_benchmark(&mut snapshot.data, &[], None);
             }
@@ -1047,6 +1048,10 @@ async fn research_scan(
             Err(e) => source.push_str(&format!(" · Whats-News unavailable: {e}")),
         }
     }
+    let breadth = tr_data::whats_news::scan_pack::history_breadth(
+        &histories.iter().map(|(s, b)| (s.clone(), b.clone())).collect::<Vec<_>>(),
+    );
+    source.push_str(&format!("\n{}", breadth.summary()));
     let name = name.to_string();
     let mut data = tokio::task::spawn_blocking(move || {
         let histories: Vec<_> = histories.into_iter().collect();
