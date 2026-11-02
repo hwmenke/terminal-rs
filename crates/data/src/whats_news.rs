@@ -54,6 +54,7 @@ pub const SETUPS: &[&str] = &[
     "RSI_OS",
     "MA",
     "RSI_LENS",
+    "BREAKOUT_LENS",
 ];
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -141,6 +142,19 @@ pub struct Snapshot<T> {
     pub provenance: Provenance,
     pub source: String,
     pub data: T,
+}
+/// SCAN snapshot with cached breadth of the full loaded universe.
+#[derive(Debug, Clone)]
+pub struct ScanSnapshot {
+    pub snapshot: Snapshot<Scan>,
+    pub breadth: scan_pack::ScanBreadth,
+}
+impl std::ops::Deref for ScanSnapshot {
+    type Target = Snapshot<Scan>;
+    fn deref(&self) -> &Self::Target { &self.snapshot }
+}
+impl std::ops::DerefMut for ScanSnapshot {
+    fn deref_mut(&mut self) -> &mut Self::Target { &mut self.snapshot }
 }
 #[derive(Debug, Clone)]
 pub struct Histories {
@@ -500,7 +514,7 @@ impl Bridge {
         }
         Ok(Some(scan))
     }
-    pub async fn scan(&self, name: &str) -> Result<Snapshot<Scan>> {
+    pub async fn scan(&self, name: &str) -> Result<ScanSnapshot> {
         self.check()?;
         if !SETUPS.contains(&name) {
             bail!("Unknown scan {name:?}. Available: {}", SETUPS.join(", "));
@@ -516,23 +530,23 @@ impl Bridge {
         let api=tokio::time::timeout(Duration::from_secs(20),async {
             let service=self.service_scan().await?;
             let histories=self.http_histories().await?;
-            let breadth=scan_pack::history_breadth(&histories.bars);
+            let breadth=scan_pack::ScanBreadth::from_histories(&histories.bars);
             let mut scan=scan_histories(name,histories.bars,Provenance::Real)?;
             scan.skipped.extend(histories.skipped);
             if let Some(service)=service { attach_service(&mut scan,service)?; }
             Ok::<_,anyhow::Error>((scan,breadth))
         }).await.unwrap_or_else(|_|Err(anyhow::anyhow!("Whats-News timed out scanning history. Check the app or switch to the archive file in Settings › Whats-News.")));
         match api {
-            Ok((data, breadth)) => Ok(Snapshot {
+            Ok((data, breadth)) => Ok(ScanSnapshot { breadth: breadth.clone(), snapshot: Snapshot {
                 failures: vec![],
                 provenance: data.provenance,
                 source: format!(
                     "Whats-News HTTP scanner: {} · Rust calculations; original service fields when available\n{}",
                     self.url.as_deref().unwrap_or_default(),
-                    breadth.summary()
+                    breadth.breadth.summary()
                 ),
                 data,
-            }),
+            }}),
             Err(e) if e.is::<Unverified>() => Err(e),
             Err(http) => {
                 let name = name.to_owned();
@@ -853,17 +867,17 @@ fn read_histories_conn(c: &Connection) -> Result<Histories> {
     tx.commit()?;
     Ok(Histories { bars, skipped })
 }
-fn scan_snapshot_with_breadth(s: Snapshot<(Scan, scan_pack::Breadth)>) -> Snapshot<Scan> {
-    Snapshot {
+fn scan_snapshot_with_breadth(s: Snapshot<(Scan, scan_pack::ScanBreadth)>) -> ScanSnapshot {
+    ScanSnapshot { breadth: s.data.1.clone(), snapshot: Snapshot {
         failures: s.failures,
         provenance: s.provenance,
-        source: format!("{}\n{}", s.source, s.data.1.summary()),
+        source: format!("{}\n{}", s.source, s.data.1.breadth.summary()),
         data: s.data.0,
-    }
+    }}
 }
-fn scan_sql(c: &Connection, name: &str) -> Result<(Scan, scan_pack::Breadth)> {
+fn scan_sql(c: &Connection, name: &str) -> Result<(Scan, scan_pack::ScanBreadth)> {
     let histories = read_histories_conn(c)?;
-    let breadth = scan_pack::history_breadth(&histories.bars);
+    let breadth = scan_pack::ScanBreadth::from_histories(&histories.bars);
     let mut scan = scan_histories(name, histories.bars, Provenance::Cached)?;
     scan.skipped.extend(histories.skipped);
     Ok((scan, breadth))

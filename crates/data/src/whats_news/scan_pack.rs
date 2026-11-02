@@ -290,3 +290,56 @@ pub fn measure_rsi(close: &[f64]) -> RsiMetrics {
         rsi_rising_from_os: cur.zip(prev).is_some_and(|(c, p)| p < 30.0 && c > p),
     }
 }
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct BreakoutMetrics {
+    pub dist_52w_pct: Option<f64>,
+    pub dist_nd_pct: Option<f64>,
+    pub near_52w: bool,
+    pub near_nd: bool,
+    pub vol_ratio: Option<f64>,
+    pub vol_surge: bool,
+}
+pub const NEAR_HIGH_PCT: f64 = -5.0;
+pub const HIGH_ND: usize = 20;
+pub const VOL_SURGE_X: f64 = 1.5;
+impl BreakoutMetrics {
+    pub fn matches_breakout(&self) -> bool { self.near_52w || self.near_nd || self.vol_surge }
+}
+pub fn measure_breakout(close: &[f64], high: &[f64], volume: &[f64]) -> BreakoutMetrics {
+    let dist = |n: usize, minimum: usize| {
+        let c = finite(*close.last()?)?;
+        let window = &high[high.len().saturating_sub(n)..];
+        if window.iter().filter(|v| !v.is_nan()).count() < minimum { return None; }
+        let hi = window.iter().copied().filter(|v| !v.is_nan()).reduce(f64::max).and_then(finite)?;
+        if hi <= 0.0 { return None; }
+        rounded((c / hi - 1.0) * 100.0, 2)
+    };
+    let vol_ratio = (|| {
+        if volume.len() < 3 { return None; }
+        let today = finite(*volume.last()?)?;
+        let prior: Vec<_> = volume[volume.len().saturating_sub(21)..volume.len()-1].iter().copied().filter(|v| !v.is_nan()).collect();
+        let avg = finite(prior.iter().sum::<f64>() / prior.len() as f64)?;
+        if avg <= 0.0 { return None; }
+        rounded(today / avg, 2)
+    })();
+    let dist_52w_pct = dist(252, 60);
+    let dist_nd_pct = dist(HIGH_ND, 10);
+    BreakoutMetrics { dist_52w_pct, dist_nd_pct, vol_ratio,
+        near_52w: dist_52w_pct.is_some_and(|v| v >= NEAR_HIGH_PCT),
+        near_nd: dist_nd_pct.is_some_and(|v| v >= NEAR_HIGH_PCT),
+        vol_surge: vol_ratio.is_some_and(|v| v >= VOL_SURGE_X) }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct ScanBreadth {
+    pub breadth: Breadth,
+    pub symbols: usize,
+    pub as_of: Option<chrono::NaiveDate>,
+}
+impl ScanBreadth {
+    pub fn from_histories(histories: &[(String, Vec<tr_core::Bar>)]) -> Self {
+        Self { breadth: history_breadth(histories), symbols: histories.len(),
+            as_of: histories.iter().flat_map(|(_, bars)| bars.iter()).filter_map(|b| chrono::DateTime::from_timestamp(b.ts, 0)).max().map(|d| d.date_naive()) }
+    }
+}

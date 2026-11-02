@@ -1616,6 +1616,10 @@ impl TerminalApp {
                         self.panes.iter_mut().find(|p| p.id == pane).map(|p| &mut p.kind)
                         && r.generation == generation
                     {
+                        let result = result.map(|scan| {
+                            if scan.provenance.require_verified("SCAN").is_ok() { self.holding_risk.scan_breadth = Some(scan.breadth); }
+                            scan.snapshot
+                        });
                         r.accept_scan(result);
                     }
                 }

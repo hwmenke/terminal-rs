@@ -426,7 +426,7 @@ pub enum Response {
     Scan {
         pane: PaneId,
         generation: u64,
-        result: Result<tr_data::whats_news::Snapshot<tr_data::whats_news::Scan>, String>,
+        result: Result<tr_data::whats_news::ScanSnapshot, String>,
     },
     Desk {
         pane: PaneId,
@@ -997,7 +997,7 @@ async fn research_scan(
     s: &Shared,
     bridge: &tr_data::whats_news::Bridge,
     name: &str,
-) -> anyhow::Result<tr_data::whats_news::Snapshot<tr_data::whats_news::Scan>> {
+) -> anyhow::Result<tr_data::whats_news::ScanSnapshot> {
     let spy = desk_daily(s, bridge, "SPY").await.ok();
     let local = s.history.db(|db| db.histories()).await?;
     if local.is_empty() {
@@ -1048,10 +1048,10 @@ async fn research_scan(
             Err(e) => source.push_str(&format!(" · Whats-News unavailable: {e}")),
         }
     }
-    let breadth = tr_data::whats_news::scan_pack::history_breadth(
+    let breadth = tr_data::whats_news::scan_pack::ScanBreadth::from_histories(
         &histories.iter().map(|(s, b)| (s.clone(), b.clone())).collect::<Vec<_>>(),
     );
-    source.push_str(&format!("\n{}", breadth.summary()));
+    source.push_str(&format!("\n{}", breadth.breadth.summary()));
     let name = name.to_string();
     let mut data = tokio::task::spawn_blocking(move || {
         let histories: Vec<_> = histories.into_iter().collect();
@@ -1066,7 +1066,7 @@ async fn research_scan(
     if let Some(service) = service {
         tr_data::whats_news::attach_service(&mut data, service)?;
     }
-    Ok(tr_data::whats_news::Snapshot { failures: vec![], data, provenance: tr_core::Provenance::Cached, source })
+    Ok(tr_data::whats_news::ScanSnapshot { breadth, snapshot: tr_data::whats_news::Snapshot { failures: vec![], data, provenance: tr_core::Provenance::Cached, source } })
 }
 
 /// Load one name from the local archive, then Whats-News. Sample/display bars never enter.

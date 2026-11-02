@@ -177,10 +177,9 @@ impl TerminalApp {
         self.sync_holding_risk();
         let breaches = self.holding_risk.breaches;
         let threshold = self.holding_risk.concentration * 100.0;
-        let breadth_chips = breadth_chips(&self.holding_risk.breadth);
-        let breadth_hint = if self.holding_risk.breadth.ready {
-            format!("Loaded holdings histories only ({} closes). A/D is advances / (advances + declines), excluding unchanged. No additional fetches.\n{}", self.holding_risk.breadth.n, self.holding_risk.breadth.summary())
-        } else { "No loaded holdings daily histories. Breadth uses existing in-memory data only.".into() };
+        let (breadth, breadth_label) = self.holding_risk.selected_breadth();
+        let breadth_chips = breadth_chips(breadth);
+        let breadth_hint = format!("A/D is advances / (advances + declines), excluding unchanged.\n{}", breadth.summary());
         let mut open_risk = false;
         let mut actions = vec![];
         let mut refresh = false;
@@ -223,7 +222,7 @@ impl TerminalApp {
 
             ui.horizontal_wrapped(|ui| {
                 ui.label(RichText::new("PM Desk").strong().color(crate::theme::text()));
-                ui.small("Holdings breadth:").on_hover_text(&breadth_hint);
+                ui.small(&breadth_label).on_hover_text(&breadth_hint);
                 for chip in &breadth_chips {
                     ui.small(chip).on_hover_text(&breadth_hint);
                 }
@@ -743,6 +742,7 @@ mod tests {
 pub(super) struct HoldingRiskState {
     pub history: std::collections::HashMap<String, Vec<tr_core::Bar>>,
     pub breadth: tr_data::whats_news::scan_pack::Breadth,
+    pub scan_breadth: Option<tr_data::whats_news::scan_pack::ScanBreadth>,
     pub concentration: f64,
     pub breaches: Option<usize>,
     pub adma_stretch: std::collections::HashMap<String, Option<f64>>,
@@ -756,7 +756,7 @@ pub(super) struct HoldingRiskState {
 
 impl Default for HoldingRiskState {
     fn default() -> Self {
-        Self { history: Default::default(), breadth: Default::default(), adma_stretch: Default::default(), concentration: 0.2, breaches: None,
+        Self { history: Default::default(), breadth: Default::default(), scan_breadth: None, adma_stretch: Default::default(), concentration: 0.2, breaches: None,
             loading: false, requested: false, generation: 0, error: None, positions: None, held_keys: Default::default() }
     }
 }
@@ -772,6 +772,12 @@ fn reconcile_held_history<T>(
 
 impl HoldingRiskState {
     /// Called only when loaded histories change, independently of portfolio edits.
+    fn selected_breadth(&self) -> (&tr_data::whats_news::scan_pack::Breadth, String) {
+        if let Some(scan) = &self.scan_breadth {
+            return (&scan.breadth, format!("Market breadth (SCAN, {} symbols, as of {})", scan.symbols, scan.as_of.map(|d| d.to_string()).unwrap_or_else(|| "—".into())));
+        }
+        (&self.breadth, if self.breadth.ready { format!("Holdings breadth ({})", self.breadth.n) } else { "—".into() })
+    }
     pub fn refresh_breadth(&mut self) {
         self.breadth = tr_data::whats_news::scan_pack::breadth(
             &self.history.values().map(|bars| bars.iter().map(|b| b.close).collect()).collect::<Vec<_>>());
@@ -979,5 +985,26 @@ mod breadth_chip_tests {
         state.history.clear();
         state.refresh_breadth();
         assert!(!state.breadth.ready);
+    }
+}
+
+#[cfg(test)]
+mod scan_breadth_selection_tests {
+    use super::*;
+    #[test]
+    fn scan_takes_precedence_and_preserves_empty_scan_scope() {
+        let mut state = HoldingRiskState::default();
+        assert_eq!(state.selected_breadth().1, "—");
+        state.breadth = tr_data::whats_news::scan_pack::breadth(&[vec![100.; 201]]);
+        assert_eq!(state.selected_breadth().1, "Holdings breadth (1)");
+        state.scan_breadth = Some(tr_data::whats_news::scan_pack::ScanBreadth {
+            breadth: tr_data::whats_news::scan_pack::breadth(&[vec![90.; 201], vec![100.; 201]]),
+            symbols: 2, as_of: Some(chrono::NaiveDate::from_ymd_opt(2026, 10, 30).unwrap()),
+        });
+        assert_eq!(state.selected_breadth().0.n, 2);
+        assert_eq!(state.selected_breadth().1, "Market breadth (SCAN, 2 symbols, as of 2026-10-30)");
+        state.scan_breadth = Some(Default::default());
+        assert_eq!(state.selected_breadth().0.n, 0);
+        assert_eq!(state.selected_breadth().1, "Market breadth (SCAN, 0 symbols, as of —)");
     }
 }
