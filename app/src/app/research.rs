@@ -50,6 +50,7 @@ impl DisplayRow<'_> {
                 let extra = match setup {
                     Some("MA") => m.map(|m| format!(" {:>7} {:>8}", if m.ma.stacked_ma { "yes" } else { "no" }, if m.ma.pullback_rising_ma { "yes" } else { "no" })),
                     Some("RSI_LENS") => m.map(|m| format!(" {:>8} {:>8} {:>9}", num(m.rsi_lens.rsi14), num(m.rsi_lens.rsi14_prev), format!("{}/{}/{}", m.rsi_lens.rsi_os as u8, m.rsi_lens.rsi_ob as u8, m.rsi_lens.rsi_rising_from_os as u8))),
+                    Some("QULLA_LENS") => m.map(|m| format!(" {:>8} {:>5} {:>8} {:>8} {:>5}", num(m.qulla_lens.gap_pct), m.qulla_lens.is_ep, num(m.breakout_lens.vol_ratio), m.breakout_lens.near_nd, m.qulla_lens.qulla)),
                     Some("BREAKOUT_LENS") => m.map(|m| { let b = &m.breakout_lens; format!(" {:>9} {:>9} {:>8} {:>8} {:>8} {:>9}", num(b.dist_52w_pct), num(b.dist_nd_pct), b.near_52w, b.near_nd, num(b.vol_ratio), b.vol_surge) }),
                     _ => None,
                 };
@@ -884,6 +885,7 @@ mod navigation_tests {
 
 fn lens_columns(setup: Option<&str>) -> &'static [(&'static str, usize)] {
     match setup {
+        Some("QULLA_LENS") => &[("GAP%", 8), ("EP", 5), ("VOL×", 8), ("NEAR20D", 8), ("QULLA", 5)],
         Some("MA") => &[("STACKED", 7), ("PULLBACK", 8)],
         Some("RSI_LENS") => &[("LENS RSI", 8), ("RSI PREV", 8), ("OS/OB/RISE", 9)],
         Some("BREAKOUT_LENS") => &[("52W DIST%", 9), ("20D DIST%", 9), ("NEAR52W", 8), ("NEAR20D", 8), ("LENS VOL", 8), ("VOL SURGE", 9)],
@@ -910,5 +912,24 @@ mod lens_column_tests {
             assert!(label.starts_with(&base));
             assert_eq!(label[base.len()..].split_whitespace().count(), lens_columns(Some(setup)).len());
         }
+    }
+}
+
+#[cfg(test)]
+mod qulla_column_tests {
+    use super::*;
+    #[test]
+    fn qulla_columns_and_values() {
+        assert_eq!(lens_columns(Some("QULLA_LENS")).iter().map(|c| c.0).collect::<Vec<_>>(), ["GAP%", "EP", "VOL×", "NEAR20D", "QULLA"]);
+        let mut row = tr_data::whats_news::ScanRow::default();
+        let base = DisplayRow::Scan(&row).label(None);
+        assert_eq!(DisplayRow::Scan(&row).label(Some("QULLA_LENS"))[base.len()..].split_whitespace().collect::<Vec<_>>(), ["—"; 5]);
+        let mut metrics = tr_data::whats_news::Metrics::default();
+        metrics.qulla_lens = tr_data::whats_news::scan_pack::QullaMetrics { gap_pct: Some(4.), is_ep: true, qulla: true };
+        metrics.breakout_lens.vol_ratio = Some(1.5);
+        metrics.breakout_lens.near_nd = false;
+        row.metrics = Some(metrics);
+        let base = DisplayRow::Scan(&row).label(None);
+        assert_eq!(DisplayRow::Scan(&row).label(Some("QULLA_LENS"))[base.len()..].split_whitespace().collect::<Vec<_>>(), ["4.00", "true", "1.50", "false", "true"]);
     }
 }

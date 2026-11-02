@@ -743,6 +743,7 @@ pub(super) struct HoldingRiskState {
     pub history: std::collections::HashMap<String, Vec<tr_core::Bar>>,
     pub breadth: tr_data::whats_news::scan_pack::Breadth,
     pub scan_breadth: Option<tr_data::whats_news::scan_pack::ScanBreadth>,
+    pub scan_breadth_received: Option<std::time::Instant>,
     pub concentration: f64,
     pub breaches: Option<usize>,
     pub adma_stretch: std::collections::HashMap<String, Option<f64>>,
@@ -756,7 +757,7 @@ pub(super) struct HoldingRiskState {
 
 impl Default for HoldingRiskState {
     fn default() -> Self {
-        Self { history: Default::default(), breadth: Default::default(), scan_breadth: None, adma_stretch: Default::default(), concentration: 0.2, breaches: None,
+        Self { history: Default::default(), breadth: Default::default(), scan_breadth: None, scan_breadth_received: None, adma_stretch: Default::default(), concentration: 0.2, breaches: None,
             loading: false, requested: false, generation: 0, error: None, positions: None, held_keys: Default::default() }
     }
 }
@@ -770,11 +771,23 @@ fn reconcile_held_history<T>(
     (previous != current, history.into_iter().filter(|(key, _)| current.contains(key)).collect())
 }
 
+fn format_scan_age(age: std::time::Duration) -> String {
+    let seconds = age.as_secs();
+    let (value, unit) = match seconds {
+        0..60 => (seconds, "s"),
+        60..3600 => (seconds / 60, "m"),
+        3600..86400 => (seconds / 3600, "h"),
+        _ => (seconds / 86400, "d"),
+    };
+    format!("{value}{unit}")
+}
+
 impl HoldingRiskState {
     /// Called only when loaded histories change, independently of portfolio edits.
     fn selected_breadth(&self) -> (&tr_data::whats_news::scan_pack::Breadth, String) {
-        if let Some(scan) = &self.scan_breadth {
-            return (&scan.breadth, format!("Market breadth (SCAN, {} symbols, as of {})", scan.symbols, scan.as_of.map(|d| d.to_string()).unwrap_or_else(|| "—".into())));
+        if let Some(scan) = self.scan_breadth.as_ref().filter(|s| s.symbols > 0 && s.breadth.n > 0) {
+            let age = self.scan_breadth_received.map(|t| format!(", {} ago", format_scan_age(t.elapsed()))).unwrap_or_default();
+            return (&scan.breadth, format!("Market breadth (SCAN, {} symbols, as of {}{})", scan.symbols, scan.as_of.map(|d| d.to_string()).unwrap_or_else(|| "—".into()), age));
         }
         (&self.breadth, if self.breadth.ready { format!("Holdings breadth ({})", self.breadth.n) } else { "—".into() })
     }
@@ -1004,7 +1017,32 @@ mod scan_breadth_selection_tests {
         assert_eq!(state.selected_breadth().0.n, 2);
         assert_eq!(state.selected_breadth().1, "Market breadth (SCAN, 2 symbols, as of 2026-10-30)");
         state.scan_breadth = Some(Default::default());
-        assert_eq!(state.selected_breadth().0.n, 0);
-        assert_eq!(state.selected_breadth().1, "Market breadth (SCAN, 0 symbols, as of —)");
+        assert_eq!(state.selected_breadth().0.n, 1);
+        assert_eq!(state.selected_breadth().1, "Holdings breadth (1)");
+    }
+}
+
+#[cfg(test)]
+mod scan_age_tests {
+    use super::*;
+    #[test]
+    fn age_units_and_boundaries() {
+        for (seconds, expected) in [(0,"0s"),(59,"59s"),(60,"1m"),(720,"12m"),(3599,"59m"),(3600,"1h"),(86399,"23h"),(86400,"1d"),(172800,"2d")] {
+            assert_eq!(format_scan_age(std::time::Duration::from_secs(seconds)), expected);
+        }
+    }
+    #[test]
+    fn scan_age_and_empty_fallbacks() {
+        let mut state = HoldingRiskState::default();
+        state.scan_breadth = Some(tr_data::whats_news::scan_pack::ScanBreadth {
+            symbols: 1, breadth: tr_data::whats_news::scan_pack::breadth(&[vec![100.]]), as_of: chrono::NaiveDate::from_ymd_opt(2026,10,30),
+        });
+        state.scan_breadth_received = Some(std::time::Instant::now());
+        assert_eq!(state.selected_breadth().1, "Market breadth (SCAN, 1 symbols, as of 2026-10-30, 0s ago)");
+        state.scan_breadth.as_mut().unwrap().symbols = 0;
+        assert_eq!(state.selected_breadth().1, "—");
+        state.scan_breadth.as_mut().unwrap().symbols = 1;
+        state.scan_breadth.as_mut().unwrap().breadth = Default::default();
+        assert_eq!(state.selected_breadth().1, "—");
     }
 }
