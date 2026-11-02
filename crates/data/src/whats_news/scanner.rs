@@ -25,6 +25,8 @@ pub struct Conditions {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Metrics {
     #[serde(default)]
+    pub breakout_lens: super::scan_pack::BreakoutMetrics,
+    #[serde(default)]
     pub rsi_lens: super::scan_pack::RsiMetrics,
     #[serde(default)]
     pub ma: super::scan_pack::MaMetrics,
@@ -178,6 +180,7 @@ pub fn calculate(b: &[Bar]) -> std::result::Result<Metrics, String> {
         };
     let stretch = tr_core::indicators::sma50_stretch(b);
     let metrics = Metrics {
+        breakout_lens: super::scan_pack::measure_breakout(&b.iter().map(|b| b.close).collect::<Vec<_>>(), &b.iter().map(|b| b.high).collect::<Vec<_>>(), &b.iter().map(|b| b.volume).collect::<Vec<_>>()),
         rsi_lens: super::scan_pack::measure_rsi(&b.iter().map(|b| b.close).collect::<Vec<_>>()),
         ma: super::scan_pack::measure(&b.iter().map(|b| b.close).collect::<Vec<_>>()),
         adma_stretch: tr_core::indicators::adma_stretch(&b.iter().map(|b| b.close).collect::<Vec<_>>()),
@@ -255,6 +258,7 @@ fn matches_setup(name: &str, b: &[Bar], m: &Metrics) -> bool {
     let near = m.dist_20d_high_pct >= -5.0;
     let surge = m.volume_ratio.is_some_and(|v| v >= 1.5);
     match name {
+        "BREAKOUT_LENS" => m.breakout_lens.matches_breakout(),
         "MA" => m.ma.matches_ma(),
         "RSI_LENS" => m.rsi_lens.matches_rsi(),
         "NEAR_HIGH" => near,

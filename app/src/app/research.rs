@@ -15,7 +15,7 @@ impl DisplayRow<'_> {
             Self::Scan(r) => &r.symbol,
         }
     }
-    fn label(&self) -> String {
+    fn label(&self, setup: Option<&str>) -> String {
         match self {
             Self::Universe(r) => format!(
                 "{:<14} {:<12} {:<8} {:<18} {}",
@@ -31,8 +31,8 @@ impl DisplayRow<'_> {
                         .status_at(chrono::Utc::now());
                 let num = |n: Option<f64>| n.map(|n| format!("{n:.2}")).unwrap_or_else(|| "—".into());
                 let m = r.metrics.as_ref();
-                format!(
-                    "{:<12} {:<12} {:<8} {:>9} {:>6} {:>8} {:>7} {:>12} {:>7} {:>7} {:>9} {:>9} {:>10} {:>7} {:>8} {:>8} {:>8} {:>9}",
+                let base = format!(
+                    "{:<12} {:<12} {:<8} {:>9} {:>6} {:>8} {:>7} {:>12} {:>7} {:>7} {:>9} {:>9} {:>10}",
                     r.symbol,
                     r.last_date.as_deref().unwrap_or("—"),
                     status,
@@ -46,12 +46,14 @@ impl DisplayRow<'_> {
                     num(m.and_then(|m| m.stretch_atr)),
                     num(m.and_then(|m| m.stretch_pct)),
                     num(m.and_then(|m| m.rs_spy_63d)),
-                    m.map(|m| if m.ma.stacked_ma { "yes" } else { "no" }).unwrap_or("—"),
-                    m.map(|m| if m.ma.pullback_rising_ma { "yes" } else { "no" }).unwrap_or("—"),
-                    num(m.and_then(|m| m.rsi_lens.rsi14)),
-                    num(m.and_then(|m| m.rsi_lens.rsi14_prev)),
-                    m.map(|m| format!("{}/{}/{}", m.rsi_lens.rsi_os as u8, m.rsi_lens.rsi_ob as u8, m.rsi_lens.rsi_rising_from_os as u8)).unwrap_or_else(|| "—".into())
-                )
+                );
+                let extra = match setup {
+                    Some("MA") => m.map(|m| format!(" {:>7} {:>8}", if m.ma.stacked_ma { "yes" } else { "no" }, if m.ma.pullback_rising_ma { "yes" } else { "no" })),
+                    Some("RSI_LENS") => m.map(|m| format!(" {:>8} {:>8} {:>9}", num(m.rsi_lens.rsi14), num(m.rsi_lens.rsi14_prev), format!("{}/{}/{}", m.rsi_lens.rsi_os as u8, m.rsi_lens.rsi_ob as u8, m.rsi_lens.rsi_rising_from_os as u8))),
+                    Some("BREAKOUT_LENS") => m.map(|m| { let b = &m.breakout_lens; format!(" {:>9} {:>9} {:>8} {:>8} {:>8} {:>9}", num(b.dist_52w_pct), num(b.dist_nd_pct), b.near_52w, b.near_nd, num(b.vol_ratio), b.vol_surge) }),
+                    _ => None,
+                };
+                format!("{base}{}", extra.unwrap_or_else(|| lens_columns(setup).iter().map(|(_, width)| format!(" {:>width$}", "—")).collect::<String>()))
             }
         }
     }
@@ -338,8 +340,8 @@ impl ResearchPane {
             if let Some(row) = visible.get(self.selected) {
                 Self::scan_details(ui, row);
             }
-            ui.monospace(format!(
-                "{:<12} {:<12} {:<8} {:>9} {:>6} {:>8} {:>7} {:>12} {:>7} {:>7} {:>9} {:>9} {:>10} {:>7} {:>8} {:>8} {:>8} {:>9}",
+            let mut header = format!(
+                "{:<12} {:<12} {:<8} {:>9} {:>6} {:>8} {:>7} {:>12} {:>7} {:>7} {:>9} {:>9} {:>10}",
                 "TICKER",
                 "LAST BAR",
                 "STATUS",
@@ -353,9 +355,9 @@ impl ResearchPane {
                 "SMA50/ATR",
                 "SMA50%",
                 "RS/SPY63%",
-                "STACKED",
-                "PULLBACK", "LENS RSI", "RSI PREV", "OS/OB/RISE"
-            ));
+            );
+            for (name, width) in lens_columns(self.scan.as_deref()) { header.push_str(&format!(" {name:>width$}")); }
+            ui.monospace(header);
             rows.extend(visible.into_iter().map(DisplayRow::Scan));
         }
         if rows.is_empty() && !self.loading && self.error.is_none() {
@@ -370,7 +372,7 @@ impl ResearchPane {
         scroll.show_rows(ui, 22.0, rows.len(), |ui, range| {
             for index in range {
                 let row = &rows[index];
-                let label = row.label();
+                let label = row.label(self.scan.as_deref());
                 let r = ui.selectable_label(
                     index == self.selected,
                     RichText::new(&label).monospace().color(if label.contains("STALE") {
@@ -876,6 +878,37 @@ mod navigation_tests {
             ["Include stale", "Skipped / excluded symbols", "SHORT", "need 30 bars", "RET21%", "VOL×20", "ADR20%"]
         {
             assert!(text.contains(label), "missing {label}: {text}");
+        }
+    }
+}
+
+fn lens_columns(setup: Option<&str>) -> &'static [(&'static str, usize)] {
+    match setup {
+        Some("MA") => &[("STACKED", 7), ("PULLBACK", 8)],
+        Some("RSI_LENS") => &[("LENS RSI", 8), ("RSI PREV", 8), ("OS/OB/RISE", 9)],
+        Some("BREAKOUT_LENS") => &[("52W DIST%", 9), ("20D DIST%", 9), ("NEAR52W", 8), ("NEAR20D", 8), ("LENS VOL", 8), ("VOL SURGE", 9)],
+        _ => &[],
+    }
+}
+
+#[cfg(test)]
+mod lens_column_tests {
+    use super::*;
+    #[test]
+    fn only_selected_lens_adds_columns() {
+        assert_eq!(lens_columns(Some("MA")).iter().map(|c| c.0).collect::<Vec<_>>(), ["STACKED", "PULLBACK"]);
+        assert_eq!(lens_columns(Some("RSI_LENS")).len(), 3);
+        assert_eq!(lens_columns(Some("BREAKOUT_LENS")).len(), 6);
+        assert!(lens_columns(Some("NEAR_HIGH")).is_empty());
+        assert!(lens_columns(None).is_empty());
+        let row = tr_data::whats_news::ScanRow::default();
+        let display = DisplayRow::Scan(&row);
+        let base = display.label(None);
+        assert_eq!(base, display.label(Some("VOL_SURGE")));
+        for setup in ["MA", "RSI_LENS", "BREAKOUT_LENS"] {
+            let label = display.label(Some(setup));
+            assert!(label.starts_with(&base));
+            assert_eq!(label[base.len()..].split_whitespace().count(), lens_columns(Some(setup)).len());
         }
     }
 }

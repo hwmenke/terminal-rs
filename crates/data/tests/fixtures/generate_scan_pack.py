@@ -11,6 +11,40 @@ import pandas as pd
 sys.path.insert(0, '.')
 import scan_pack as sp
 
+# Breakout-only mode leaves the existing fixtures untouched. Compact constant
+# runs keep the 252-bar window cases small while preserving NaN positions.
+if len(sys.argv) > 1 and sys.argv[1] == '--breakout':
+    keys = 'dist_52w_pct dist_nd_pct near_52w near_nd vol_ratio vol_surge'.split()
+    def run(n, close=95., high=100., volume=100.):
+        return [np.full(n, close), np.full(n, high), np.full(n, volume)]
+    cases = {name: run(n) for name, n in [('empty',0),('two',2),('short_high',9),('minimum_nd',10),('before_52w',59),('minimum_52w',60),('window_252',260)]}
+    cases['exact_threshold'] = run(60); cases['exact_threshold'][2][-1] = 150.
+    cases['rounded_inside'] = run(60, close=94.996); cases['rounded_inside'][2][-1] = 149.6
+    cases['outside'] = run(60, close=94.994); cases['outside'][2][-1] = 149.4
+    cases['nan_high'] = run(60); cases['nan_high'][1][-1] = np.nan
+    cases['nan_volume'] = run(60); cases['nan_volume'][2][-1] = np.nan
+    cases['nan_prior_volume'] = run(60); cases['nan_prior_volume'][2][-3:] = [np.nan, np.nan, 150.]
+    cases['nan_close'] = run(60); cases['nan_close'][0][-1] = np.nan
+    cases['window_252'][1][0] = 1000.
+    def compact(values):
+        runs = []
+        for v in values:
+            v = 'nan' if np.isnan(v) else float(v)
+            if runs and runs[-1][1] == v: runs[-1][0] += 1
+            else: runs.append([1,v])
+        return runs
+    output = []
+    for name, (close, high, volume) in cases.items():
+        if len(close):
+            row = sp.measure(name, df=pd.DataFrame(dict(close=close,high=high,volume=volume)))
+            expected = {k: row[k] for k in keys}; match = row['match']['breakout']
+        else:
+            expected = dict(dist_52w_pct=None,dist_nd_pct=None,near_52w=False,near_nd=False,vol_ratio=None,vol_surge=False); match = False
+        output.append(dict(name=name,close=compact(close),high=compact(high),volume=compact(volume),expected=expected,match=match))
+    with open(sys.argv[2], 'w') as out:
+        json.dump(output,out,separators=(',', ':'),allow_nan=False)
+    sys.exit(0)
+
 # RSI-only mode never opens or regenerates the original MA/breadth fixture.
 if len(sys.argv) > 1 and sys.argv[1] == '--rsi':
     rkeys = 'rsi14 rsi14_prev rsi_os rsi_ob rsi_rising_from_os'.split()
