@@ -360,3 +360,28 @@ pub fn measure_qulla(close: &[f64], open: Option<&[f64]>, breakout: &BreakoutMet
     let is_ep = gap_pct.is_some_and(|g| g >= EP_GAP_PCT) && breakout.vol_surge;
     QullaMetrics { gap_pct, is_ep, qulla: is_ep || breakout.vol_surge || breakout.near_nd }
 }
+
+/// O'Neil price/RS lens, matching Python's positional (not date-aligned) inputs.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct OneilMetrics {
+    pub rs_spy_pct: Option<f64>,
+    pub oneil_rs: bool,
+}
+pub const RS_BARS: usize = 63;
+pub fn measure_oneil(close: &[f64], spy_close: Option<&[f64]>) -> OneilMetrics {
+    let rs_spy_pct = (|| {
+        let spy: Vec<_> = spy_close?.iter().copied().filter(|v| !v.is_nan()).collect();
+        if close.len() <= RS_BARS || spy.len() <= RS_BARS
+            || close.iter().filter(|v| !v.is_nan()).count() <= RS_BARS {
+            return None;
+        }
+        // Symbol indexing retains NaN positions; SPY indexing follows dropna().
+        let s0 = finite(close[close.len() - RS_BARS - 1])?;
+        let s1 = finite(*close.last()?)?;
+        let p0 = finite(spy[spy.len() - RS_BARS - 1])?;
+        let p1 = finite(*spy.last()?)?;
+        if s0 <= 0.0 || p0 <= 0.0 || s1 == 0.0 || p1 == 0.0 { return None; }
+        rounded(((s1 / s0) / (p1 / p0) - 1.0) * 100.0, 2)
+    })();
+    OneilMetrics { rs_spy_pct, oneil_rs: rs_spy_pct.is_some_and(|v| v > 0.0) }
+}

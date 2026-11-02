@@ -787,7 +787,7 @@ impl HoldingRiskState {
     fn selected_breadth(&self) -> (&tr_data::whats_news::scan_pack::Breadth, String) {
         if let Some(scan) = self.scan_breadth.as_ref().filter(|s| s.symbols > 0 && s.breadth.n > 0) {
             let age = self.scan_breadth_received.map(|t| format!(", {} ago", format_scan_age(t.elapsed()))).unwrap_or_default();
-            return (&scan.breadth, format!("Market breadth (SCAN, {} symbols, as of {}{})", scan.symbols, scan.as_of.map(|d| d.to_string()).unwrap_or_else(|| "—".into()), age));
+            return (&scan.breadth, format!("Market breadth (SCAN, {} {}, as of {}{})", scan.symbols, if scan.symbols == 1 { "symbol" } else { "symbols" }, scan.as_of.map(|d| d.to_string()).unwrap_or_else(|| "—".into()), age));
         }
         (&self.breadth, if self.breadth.ready { format!("Holdings breadth ({})", self.breadth.n) } else { "—".into() })
     }
@@ -1038,7 +1038,7 @@ mod scan_age_tests {
             symbols: 1, breadth: tr_data::whats_news::scan_pack::breadth(&[vec![100.]]), as_of: chrono::NaiveDate::from_ymd_opt(2026,10,30),
         });
         state.scan_breadth_received = Some(std::time::Instant::now());
-        assert_eq!(state.selected_breadth().1, "Market breadth (SCAN, 1 symbols, as of 2026-10-30, 0s ago)");
+        assert_eq!(state.selected_breadth().1, "Market breadth (SCAN, 1 symbol, as of 2026-10-30, 0s ago)");
         state.scan_breadth.as_mut().unwrap().symbols = 0;
         assert_eq!(state.selected_breadth().1, "—");
         state.scan_breadth.as_mut().unwrap().symbols = 1;

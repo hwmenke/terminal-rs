@@ -11,6 +11,33 @@ import pandas as pd
 sys.path.insert(0, '.')
 import scan_pack as sp
 
+# O'Neil-only mode writes only its separate compact fixture.
+if len(sys.argv) > 1 and sys.argv[1] == '--oneil':
+    def compact(values):
+        runs = []
+        for v in values:
+            v = 'nan' if np.isnan(v) else float(v)
+            if runs and runs[-1][1] == v: runs[-1][0] += 1
+            else: runs.append([1, v])
+        return runs
+    output = []
+    for name in ['outperform', 'underperform', 'equal', 'short_symbol', 'short_spy', 'nan_at_minus64', 'zero_s0', 'spy_missing']:
+        close, spy = np.full(65, 100.), np.full(65, 100.)
+        close[-1], spy[-1] = 120., 110.
+        if name == 'underperform': close[-1] = 105.
+        if name == 'equal': close[-1] = 110.
+        if name == 'short_symbol': close = close[-63:]
+        if name == 'short_spy': spy = spy[-63:]
+        if name == 'nan_at_minus64': close[-64] = np.nan
+        if name == 'zero_s0': close[-64] = 0.
+        spy_df = None if name == 'spy_missing' else pd.DataFrame({'close': spy})
+        row = sp.measure(name, df=pd.DataFrame({'close': close}), spy_df=spy_df)
+        output.append(dict(name=name, close=compact(close), spy=None if spy_df is None else compact(spy),
+                           expected=dict(rs_spy_pct=row['rs_spy_63d'], oneil_rs=row['match']['oneil'])))
+    with open(sys.argv[2], 'w') as out:
+        json.dump(output, out, separators=(',', ':'), allow_nan=False)
+    sys.exit(0)
+
 # Qulla-only mode writes a separate compact fixture, never existing fixtures.
 if len(sys.argv) > 1 and sys.argv[1] == '--qulla':
     def compact(values):

@@ -56,6 +56,7 @@ pub const SETUPS: &[&str] = &[
     "RSI_LENS",
     "BREAKOUT_LENS",
     "QULLA_LENS",
+    "ONEIL_LENS",
 ];
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -892,11 +893,14 @@ pub fn apply_spy_benchmark(scan: &mut Scan, histories: &[(String, Vec<Bar>)], sp
     if let Some(spy) = spy {
         Bar::require_verified(spy, "SCAN SPY benchmark").map_err(anyhow::Error::msg)?;
     }
+    let spy_close = spy.map(|bars| bars.iter().map(|b| b.close).collect::<Vec<_>>());
     for row in &mut scan.results {
         if let Some(metrics) = &mut row.metrics {
             metrics.rs_spy_63d = None;
+            metrics.oneil_lens = scan_pack::OneilMetrics::default();
             if let Some((_, bars)) = histories.iter().find(|(symbol, _)| symbol == &row.symbol) {
                 Bar::require_verified(bars, "SCAN relative return").map_err(anyhow::Error::msg)?;
+                metrics.oneil_lens = scan_pack::measure_oneil(&bars.iter().map(|b| b.close).collect::<Vec<_>>(), spy_close.as_deref());
                 metrics.rs_spy_63d = spy.and_then(|spy| tr_core::indicators::daily_relative_return(bars, spy, 63));
             }
         }
