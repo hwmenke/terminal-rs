@@ -343,3 +343,20 @@ impl ScanBreadth {
             as_of: histories.iter().flat_map(|(_, bars)| bars.iter()).filter_map(|b| chrono::DateTime::from_timestamp(b.ts, 0)).max().map(|d| d.date_naive()) }
     }
 }
+
+/// Whats-News qulla lens; open falls back to close only when the column is absent.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct QullaMetrics {
+    pub gap_pct: Option<f64>,
+    pub is_ep: bool,
+    pub qulla: bool,
+}
+pub const EP_GAP_PCT: f64 = 4.0;
+pub fn measure_qulla(close: &[f64], open: Option<&[f64]>, breakout: &BreakoutMetrics) -> QullaMetrics {
+    let prev = close.len().checked_sub(2).and_then(|i| finite(close[i]));
+    let today_open = open.unwrap_or(close).last().copied().and_then(finite);
+    let gap_pct = today_open.zip(prev).filter(|(o, p)| *o != 0.0 && *p != 0.0)
+        .and_then(|(o, p)| rounded((o / p - 1.0) * 100.0, 2));
+    let is_ep = gap_pct.is_some_and(|g| g >= EP_GAP_PCT) && breakout.vol_surge;
+    QullaMetrics { gap_pct, is_ep, qulla: is_ep || breakout.vol_surge || breakout.near_nd }
+}

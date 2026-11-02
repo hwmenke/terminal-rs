@@ -11,6 +11,38 @@ import pandas as pd
 sys.path.insert(0, '.')
 import scan_pack as sp
 
+# Qulla-only mode writes a separate compact fixture, never existing fixtures.
+if len(sys.argv) > 1 and sys.argv[1] == '--qulla':
+    def compact(values):
+        runs = []
+        for v in values:
+            v = 'nan' if np.isnan(v) else float(v)
+            if runs and runs[-1][1] == v: runs[-1][0] += 1
+            else: runs.append([1, v])
+        return runs
+    output = []
+    for name in ['miss', 'exact_4', 'rounded_4', 'below_4', 'vol_only', 'near_only', 'zero_open', 'nan_open', 'nan_prev', 'zero_prev', 'missing_open', 'negative_open_prev']:
+        close, high, volume, opn = [np.full(30, v) for v in [90., 100., 100., 90.]]
+        if name in ['exact_4', 'rounded_4', 'below_4']:
+            opn[-1] = {'exact_4':93.6, 'rounded_4':93.599, 'below_4':93.59}[name]
+            volume[-1] = 150.
+        if name == 'vol_only': volume[-1] = 150.
+        if name == 'near_only': close[-1] = 96.
+        if name == 'zero_open': opn[-1] = 0.
+        if name == 'nan_open': opn[-1] = np.nan
+        if name == 'nan_prev': close[-2] = np.nan
+        if name == 'zero_prev': close[-2] = 0.
+        if name == 'negative_open_prev': close[-2], opn[-1] = -90., -93.6
+        frame = dict(close=close, high=high, volume=volume)
+        if name != 'missing_open': frame['open'] = opn
+        row = sp.measure(name, df=pd.DataFrame(frame))
+        output.append(dict(name=name, close=compact(close), high=compact(high), volume=compact(volume),
+                           open=compact(opn) if 'open' in frame else None,
+                           expected=dict(gap_pct=row['gap_pct'], is_ep='EP' in row['tags'], qulla=row['match']['qulla'])))
+    with open(sys.argv[2], 'w') as out:
+        json.dump(output, out, separators=(',', ':'), allow_nan=False)
+    sys.exit(0)
+
 # Breakout-only mode leaves the existing fixtures untouched. Compact constant
 # runs keep the 252-bar window cases small while preserving NaN positions.
 if len(sys.argv) > 1 and sys.argv[1] == '--breakout':

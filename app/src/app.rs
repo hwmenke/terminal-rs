@@ -1617,7 +1617,7 @@ impl TerminalApp {
                         && r.generation == generation
                     {
                         let result = result.map(|scan| {
-                            if scan.provenance.require_verified("SCAN").is_ok() { self.holding_risk.scan_breadth = Some(scan.breadth); }
+                            if scan.provenance.require_verified("SCAN").is_ok() { self.holding_risk.scan_breadth = Some(scan.breadth); self.holding_risk.scan_breadth_received = Some(std::time::Instant::now()); }
                             scan.snapshot
                         });
                         r.accept_scan(result);
