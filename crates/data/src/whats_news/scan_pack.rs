@@ -385,3 +385,82 @@ pub fn measure_oneil(close: &[f64], spy_close: Option<&[f64]>) -> OneilMetrics {
     })();
     OneilMetrics { rs_spy_pct, oneil_rs: rs_spy_pct.is_some_and(|v| v > 0.0) }
 }
+
+/// Honest VCP proxy using pandas-compatible range, Wilder ATR and swing contraction.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct VcpMetrics {
+    pub range_ratio: Option<f64>,
+    pub atr_declining: Option<bool>,
+    pub swing_contract: Option<bool>,
+    pub contracted: bool,
+    pub vcp_proxy: bool,
+}
+pub const VCP_RANGE_RATIO: f64 = 0.55;
+fn nan_extreme(values: &[f64], maximum: bool) -> Option<f64> {
+    values.iter().copied().filter(|v| !v.is_nan())
+        .reduce(if maximum { f64::max } else { f64::min })
+}
+pub fn range_ratio(high: &[f64], low: &[f64]) -> Option<f64> {
+    if high.len() < 50 || low.len() < 50 { return None; }
+    let range = |n| Some(finite(nan_extreme(&high[high.len()-n..], true)?)?
+        - finite(nan_extreme(&low[low.len()-n..], false)?)?);
+    let long = range(50)?;
+    if long <= 0.0 { return None; }
+    rounded(range(10)? / long, 3)
+}
+pub fn atr_declining(high: &[f64], low: &[f64], close: &[f64]) -> Option<bool> {
+    if high.len().min(low.len()).min(close.len()) < 20 { return None; }
+    let mut mean: Option<f64> = None;
+    let mut weight = 1.0;
+    let mut count = 0;
+    let mut values = Vec::new();
+    let alpha = 1.0 / 14.0;
+    for i in 0..high.len().max(low.len()).max(close.len()) {
+        let h = high.get(i).copied().unwrap_or(f64::NAN);
+        let l = low.get(i).copied().unwrap_or(f64::NAN);
+        let prev = i.checked_sub(1).and_then(|j| close.get(j)).copied().unwrap_or(f64::NAN);
+        // DataFrame.max skips NaN, but retains infinity; EWM treats infinity as missing.
+        let tr = nan_extreme(&[(h-l).abs(), (h-prev).abs(), (l-prev).abs()], true).and_then(finite);
+        if tr.is_some() { count += 1; }
+        if let Some(old) = mean {
+            weight *= 1.0 - alpha;
+            if let Some(x) = tr {
+                mean = Some(if old == x { old } else { (weight * old + alpha * x) / (weight + alpha) });
+                weight = 1.0;
+            }
+        } else if let Some(x) = tr { mean = Some(x); }
+        // dropna retains carried EWM values at missing input positions.
+        if count >= 14 { if let Some(x) = mean { values.push(x); } }
+    }
+    if values.len() < 6 { return None; }
+    Some(finite(*values.last()?)? < finite(values[values.len()-6])?)
+}
+pub fn swing_ranges(high: &[f64], low: &[f64]) -> Vec<f64> {
+    if high.len() < 7 || low.len() != high.len() { return Vec::new(); }
+    let mut swings = Vec::new();
+    for i in 2..high.len()-2 {
+        if high[i].is_finite() && Some(high[i]) == nan_extreme(&high[i-2..=i+2], true) {
+            swings.push(high[i]);
+        } else if low[i].is_finite() && Some(low[i]) == nan_extreme(&low[i-2..=i+2], false) {
+            swings.push(low[i]);
+        }
+    }
+    swings.windows(2).map(|w| (w[1]-w[0]).abs()).filter(|v| v.is_finite() && *v > 0.0).collect()
+}
+pub fn swing_contract(high: &[f64], low: &[f64]) -> Option<bool> {
+    let ranges = swing_ranges(high, low);
+    let n = ranges.len();
+    if n < 6 { return None; }
+    let prior = ranges[n-6..n-3].iter().sum::<f64>() / 3.0;
+    if prior <= 0.0 { return None; }
+    Some(ranges[n-3..].iter().sum::<f64>() / 3.0 < prior)
+}
+pub fn measure_vcp(close: &[f64], high: &[f64], low: &[f64], breakout: &BreakoutMetrics) -> VcpMetrics {
+    let range_ratio = range_ratio(high, low);
+    let atr_declining = atr_declining(high, low, close);
+    let swing_contract = swing_contract(high, low);
+    let contracted = range_ratio.is_some_and(|r| r <= VCP_RANGE_RATIO)
+        || atr_declining == Some(true) || swing_contract == Some(true);
+    VcpMetrics { range_ratio, atr_declining, swing_contract, contracted,
+        vcp_proxy: contracted && (breakout.near_52w || breakout.near_nd) }
+}

@@ -11,6 +11,45 @@ import pandas as pd
 sys.path.insert(0, '.')
 import scan_pack as sp
 
+# VCP-only mode leaves every other fixture untouched.
+if len(sys.argv) > 1 and sys.argv[1] == '--vcp':
+    def compact(values):
+        runs = []
+        for v in values:
+            v = 'nan' if np.isnan(v) else float(v)
+            if runs and runs[-1][1] == v: runs[-1][0] += 1
+            else: runs.append([1, v])
+        return runs
+    output = []
+    for name in ['contracting', 'expanding', 'flat', 'short_49', 'nan_high_low', 'atr_short', 'atr_few_values', 'too_few_swings', 'away_high', 'atr_nan_gap', 'atr_nan_tail', 'swing_contracting', 'swing_expanding']:
+        width = np.repeat([20., 16., 12., 8., 4., 2.], 10)
+        if name == 'expanding': width = width[::-1].copy()
+        close = np.full(60, 99.)
+        high, low = 100. + width / 2, 100. - width / 2
+        if name.startswith('swing_'):
+            amplitudes = np.repeat([12., 10., 8., 6., 4., 2.], 10)
+            if name == 'swing_expanding': amplitudes = amplitudes[::-1].copy()
+            wave = np.tile([0., 1., 0., -1., 0.], 12) * amplitudes
+            high, low = 101. + wave, 99. + wave
+        if name == 'flat': high[:], low[:] = 100., 100.
+        if name == 'too_few_swings': high, low = np.arange(60.) + 100., np.arange(60.) + 90.
+        if name == 'away_high': close[:] = 60.
+        if name == 'nan_high_low': high[[5, 49, 59]], low[[6, 48, 58]] = np.nan, np.nan
+        if name == 'atr_nan_gap': high[40:44], low[40:44], close[39:44] = np.nan, np.nan, np.nan
+        if name == 'atr_nan_tail': high[-4:], low[-4:], close[-5:-1] = np.nan, np.nan, np.nan
+        if name == 'atr_few_values': high[:44], low[:44], close[:44] = np.nan, np.nan, np.nan
+        if name in ['short_49', 'atr_short']:
+            n = 49 if name == 'short_49' else 19
+            close, high, low = close[-n:], high[-n:], low[-n:]
+        h, l, c = map(pd.Series, [high, low, close])
+        ratio, atr, swing = sp._range_ratio(h, l), sp._atr_declining(h, l, c), sp._swing_contract(h, l)
+        contracted = bool(ratio is not None and ratio <= sp.VCP_RANGE_RATIO) or atr is True or swing is True
+        row = sp.measure(name, df=pd.DataFrame(dict(close=close, high=high, low=low)))
+        output.append(dict(name=name, close=compact(close), high=compact(high), low=compact(low), expected=dict(range_ratio=ratio, atr_declining=atr, swing_contract=swing, contracted=contracted, vcp_proxy=row['vcp_proxy'])))
+    with open(sys.argv[2], 'w') as out:
+        json.dump(output, out, separators=(',', ':'), allow_nan=False)
+    sys.exit(0)
+
 # O'Neil-only mode writes only its separate compact fixture.
 if len(sys.argv) > 1 and sys.argv[1] == '--oneil':
     def compact(values):
