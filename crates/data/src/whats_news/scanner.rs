@@ -25,6 +25,8 @@ pub struct Conditions {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Metrics {
     #[serde(default)]
+    pub oneil_lens: super::scan_pack::OneilMetrics,
+    #[serde(default)]
     pub qulla_lens: super::scan_pack::QullaMetrics,
     #[serde(default)]
     pub breakout_lens: super::scan_pack::BreakoutMetrics,
@@ -264,6 +266,7 @@ fn matches_setup(name: &str, b: &[Bar], m: &Metrics) -> bool {
     match name {
         "BREAKOUT_LENS" => m.breakout_lens.matches_breakout(),
         "QULLA_LENS" => m.qulla_lens.qulla,
+        "ONEIL_LENS" => m.oneil_lens.oneil_rs,
         "MA" => m.ma.matches_ma(),
         "RSI_LENS" => m.rsi_lens.matches_rsi(),
         "NEAR_HIGH" => near,
@@ -307,9 +310,11 @@ impl ScanCache {
         let mut scan = Scan { provenance, scanned: 0, results: vec![], skipped: vec![] };
         let mut candidates = vec![];
         let spy = histories.iter().find(|(s, _)| crate::security(s).ticker == "SPY").map(|(_, b)| b);
+        let spy_close = spy.map(|bars| bars.iter().map(|b| b.close).collect::<Vec<_>>());
         for (symbol, b) in &histories {
             let m = match cached_calculate(b) {
                 Ok(mut m) => {
+                    m.oneil_lens = super::scan_pack::measure_oneil(&b.iter().map(|b| b.close).collect::<Vec<_>>(), spy_close.as_deref());
                     if let Some(spy) = spy {
                         m.rs_spy_63d = tr_core::indicators::daily_relative_return(b, spy, 63);
                     }

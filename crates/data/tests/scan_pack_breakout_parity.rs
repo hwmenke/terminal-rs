@@ -24,7 +24,7 @@ fn breakout_lens_setup_is_appended_and_uses_its_own_metrics() {
     use tr_core::{Bar, Provenance};
     use tr_data::whats_news::{SETUPS, scan_histories};
     assert!(SETUPS.contains(&"BREAKOUT_LENS"));
-    assert_eq!(SETUPS.last(), Some(&"QULLA_LENS"));
+    assert!(SETUPS.contains(&"QULLA_LENS"));
     let histories = [("MATCH", 96.), ("MISS", 90.)].into_iter().map(|(symbol, close)| {
         (symbol.into(), (0..60).map(|i| Bar::new(1_700_000_000 + i * 86400, close, 100., 80., close, 100.).with_provenance(Provenance::Real)).collect())
     }).collect();

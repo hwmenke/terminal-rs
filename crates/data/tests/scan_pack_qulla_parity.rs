@@ -25,7 +25,7 @@ fn python_qulla_lens_fixtures() {
 fn qulla_is_appended_and_scan_uses_lens_metrics() {
     use tr_core::{Bar, Provenance};
     use tr_data::whats_news::{SETUPS, scan_histories};
-    assert_eq!(SETUPS.last(), Some(&"QULLA_LENS"));
+    assert!(SETUPS.contains(&"QULLA_LENS"));
     let histories = [("NEAR", 96., 100.), ("VOL", 90., 150.), ("MISS", 90., 100.)].into_iter().map(|(symbol, close, volume)| {
         (symbol.into(), (0..60).map(|i| Bar::new(1_700_000_000 + i * 86400, close, 100., 80., close, if i == 59 { volume } else { 100. }).with_provenance(Provenance::Real)).collect())
     }).collect();

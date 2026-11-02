@@ -1000,7 +1000,7 @@ async fn research_scan(
 ) -> anyhow::Result<tr_data::whats_news::ScanSnapshot> {
     let spy = desk_daily(s, bridge, "SPY").await.ok();
     let local = s.history.db(|db| db.histories()).await?;
-    if local.is_empty() {
+    if local.is_empty() && name != "ONEIL_LENS" {
         let mut snapshot = bridge.scan(name).await?;
         // Benchmark enrichment is best-effort: a failure leaves the RS column empty, never fails SCAN.
         if let Ok(histories) = bridge.histories().await {
@@ -1054,10 +1054,21 @@ async fn research_scan(
     source.push_str(&format!("\n{}", breadth.breadth.summary()));
     let name = name.to_string();
     let mut data = tokio::task::spawn_blocking(move || {
-        let histories: Vec<_> = histories.into_iter().collect();
+        let mut histories: Vec<_> = histories.into_iter().collect();
+        let added_spy = name == "ONEIL_LENS"
+            && !histories.iter().any(|(s, _)| tr_data::security(s).ticker == "SPY")
+            && spy.is_some();
+        if added_spy { histories.push(("SPY".into(), spy.clone().unwrap())); }
         let mut scan = tr_data::whats_news::scan_histories(&name, histories.clone(), tr_core::Provenance::Cached)?;
         if tr_data::whats_news::apply_spy_benchmark(&mut scan, &histories, spy.as_deref()).is_err() {
             let _ = tr_data::whats_news::apply_spy_benchmark(&mut scan, &[], None);
+        }
+        if added_spy {
+            scan.results.retain(|r| r.symbol != "SPY");
+            if !scan.skipped.iter().any(|r| r.symbol == "SPY") {
+                scan.scanned = scan.scanned.saturating_sub(1);
+            }
+            scan.skipped.retain(|r| r.symbol != "SPY");
         }
         Ok::<_, anyhow::Error>(scan)
     })
