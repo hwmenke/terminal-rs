@@ -315,7 +315,7 @@ impl ResearchPane {
             rows.extend(snapshot.data.iter().filter(|r| symbols.contains(&r.symbol)).map(DisplayRow::Universe));
         }
         if let Some(snapshot) = &self.results {
-            ui.label(format!("[{}] {}", snapshot.provenance.label(), snapshot.source));
+            ui.add(egui::Label::new(format!("[{}] {}", snapshot.provenance.label(), snapshot.source)).wrap());
             let expected = tr_data::history::calendar::last_expected_session(chrono::Utc::now());
             let visible = self.filter.rows(&snapshot.data, &self.search, expected);
             ui.label(format!(

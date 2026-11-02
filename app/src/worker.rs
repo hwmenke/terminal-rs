@@ -993,6 +993,14 @@ async fn research_universe(
         provenance: tr_core::Provenance::Cached,
     })
 }
+/// Apply lens selection only after separately verified benchmark enrichment.
+fn filter_enriched_scan(name: &str, mut scan: tr_data::whats_news::Scan) -> tr_data::whats_news::Scan {
+    if name == "ONEIL_LENS" {
+        scan.results.retain(|row| row.metrics.as_ref().is_some_and(|metrics| metrics.oneil_lens.oneil_rs));
+    }
+    scan
+}
+
 async fn research_scan(
     s: &Shared,
     bridge: &tr_data::whats_news::Bridge,
@@ -1000,16 +1008,47 @@ async fn research_scan(
 ) -> anyhow::Result<tr_data::whats_news::ScanSnapshot> {
     let spy = desk_daily(s, bridge, "SPY").await.ok();
     let local = s.history.db(|db| db.histories()).await?;
-    if local.is_empty() && name != "ONEIL_LENS" {
+    if local.is_empty() {
         let mut snapshot = bridge.scan(name).await?;
-        // Benchmark enrichment is best-effort: a failure leaves the RS column empty, never fails SCAN.
+        // Rebuild O'Neil candidates with the separately verified benchmark before
+        // the scanner's initial selection; enrichment alone cannot recover rows.
+        let mut benchmark_available = false;
         if let Ok(histories) = bridge.histories().await {
-            if histories.provenance.require_verified("SCAN archive").is_ok()
-                && tr_data::whats_news::apply_spy_benchmark(&mut snapshot.data, &histories.data.bars, spy.as_deref())
-                    .is_err()
-            {
-                let _ = tr_data::whats_news::apply_spy_benchmark(&mut snapshot.data, &[], None);
+            if histories.provenance.require_verified("SCAN archive").is_ok() {
+                let mut bars = histories.data.bars;
+                if name == "ONEIL_LENS" {
+                    let added_spy = !bars.iter().any(|(symbol, _)| tr_data::security(symbol).ticker == "SPY")
+                        && spy.is_some();
+                    if added_spy {
+                        bars.push(("SPY".into(), spy.clone().unwrap()));
+                    }
+                    let mut scan = tr_data::whats_news::scan_histories(name, bars.clone(), snapshot.provenance)?;
+                    scan.skipped.extend(histories.data.skipped);
+                    if added_spy {
+                        scan.results.retain(|row| row.symbol != "SPY");
+                        if !scan.skipped.iter().any(|row| row.symbol == "SPY") {
+                            scan.scanned = scan.scanned.saturating_sub(1);
+                        }
+                        scan.skipped.retain(|row| row.symbol != "SPY");
+                    }
+                    for row in &mut scan.results {
+                        if let Some(original) = snapshot.data.results.iter().find(|original| original.symbol == row.symbol) {
+                            row.service = original.service.clone();
+                            row.from_service = original.from_service;
+                        }
+                    }
+                    snapshot.data = scan;
+                }
+                benchmark_available = spy.is_some()
+                    && tr_data::whats_news::apply_spy_benchmark(&mut snapshot.data, &bars, spy.as_deref()).is_ok();
             }
+        }
+        if !benchmark_available {
+            let _ = tr_data::whats_news::apply_spy_benchmark(&mut snapshot.data, &[], None);
+        }
+        snapshot.snapshot.data = filter_enriched_scan(name, snapshot.snapshot.data);
+        if name == "ONEIL_LENS" && !benchmark_available {
+            snapshot.source.push_str(" · SPY unavailable — O'Neil RS not computed");
         }
         return Ok(snapshot);
     }
@@ -1052,15 +1091,18 @@ async fn research_scan(
         &histories.iter().map(|(s, b)| (s.clone(), b.clone())).collect::<Vec<_>>(),
     );
     source.push_str(&format!("\n{}", breadth.breadth.summary()));
-    let name = name.to_string();
-    let mut data = tokio::task::spawn_blocking(move || {
+    let scan_name = name.to_string();
+    let (mut data, benchmark_available) = tokio::task::spawn_blocking(move || {
+        let name = scan_name;
         let mut histories: Vec<_> = histories.into_iter().collect();
         let added_spy = name == "ONEIL_LENS"
             && !histories.iter().any(|(s, _)| tr_data::security(s).ticker == "SPY")
             && spy.is_some();
         if added_spy { histories.push(("SPY".into(), spy.clone().unwrap())); }
         let mut scan = tr_data::whats_news::scan_histories(&name, histories.clone(), tr_core::Provenance::Cached)?;
-        if tr_data::whats_news::apply_spy_benchmark(&mut scan, &histories, spy.as_deref()).is_err() {
+        let benchmark_available = spy.is_some()
+            && tr_data::whats_news::apply_spy_benchmark(&mut scan, &histories, spy.as_deref()).is_ok();
+        if !benchmark_available {
             let _ = tr_data::whats_news::apply_spy_benchmark(&mut scan, &[], None);
         }
         if added_spy {
@@ -1070,9 +1112,12 @@ async fn research_scan(
             }
             scan.skipped.retain(|r| r.symbol != "SPY");
         }
-        Ok::<_, anyhow::Error>(scan)
+        Ok::<_, anyhow::Error>((filter_enriched_scan(&name, scan), benchmark_available))
     })
     .await??;
+    if name == "ONEIL_LENS" && !benchmark_available {
+        source.push_str(" · SPY unavailable — O'Neil RS not computed");
+    }
     data.skipped.extend(skipped);
     if let Some(service) = service {
         tr_data::whats_news::attach_service(&mut data, service)?;
@@ -4040,5 +4085,32 @@ mod tests {
             i * 2
         })));
         assert_eq!(out, (0..20).map(|i| i * 2).collect::<Vec<_>>());
+    }
+}
+
+#[cfg(test)]
+mod enriched_scan_tests {
+    use super::filter_enriched_scan;
+    use tr_data::whats_news::{Metrics, Scan, ScanRow};
+
+    #[test]
+    fn oneil_selection_uses_enriched_metrics_and_preserves_scan_counts() {
+        let mut positive = Metrics::default();
+        positive.oneil_lens.oneil_rs = true;
+        let scan = Scan {
+            provenance: tr_core::Provenance::Cached,
+            scanned: 3,
+            skipped: vec![],
+            results: vec![
+                ScanRow { symbol: "WIN".into(), metrics: Some(positive), ..Default::default() },
+                ScanRow { symbol: "LOSE".into(), metrics: Some(Metrics::default()), ..Default::default() },
+                ScanRow { symbol: "MISSING".into(), ..Default::default() },
+            ],
+        };
+        assert_eq!(filter_enriched_scan("MA", scan.clone()).results.len(), 3);
+        let filtered = filter_enriched_scan("ONEIL_LENS", scan);
+        assert_eq!(filtered.scanned, 3);
+        assert_eq!(filtered.results.len(), 1);
+        assert_eq!(filtered.results[0].symbol, "WIN");
     }
 }
