@@ -177,6 +177,7 @@ impl TerminalApp {
         self.sync_holding_risk();
         let breaches = self.holding_risk.breaches;
         let setup_hits = self.holding_risk.total_setup_hits();
+        let setup_hits_hover = self.holding_risk.setup_hits_hover();
         let threshold = self.holding_risk.concentration * 100.0;
         let (breadth, breadth_label) = self.holding_risk.selected_breadth();
         let breadth_chips = breadth_chips(breadth);
@@ -230,7 +231,7 @@ impl TerminalApp {
                 ui.label(breaches.map(|n| format!("Risk breaches: {n} (known)")).unwrap_or_else(|| "Risk breaches: —".into()))
                     .on_hover_text(format!("Holdings with any known breach: below SMA50, RSI14 ≥70 / ≤30, or weight >{threshold}%. Daily signals require loaded holdings history; unknown signals are not counted."));
                 ui.label(setup_hits.map(|n| format!("Setup hits: {n}")).unwrap_or_else(|| "Setup hits: —".into()))
-                    .on_hover_text("Sum of active setup tags on holdings with verified daily history; O'Neil needs SPY in that series.");
+                    .on_hover_text(&setup_hits_hover);
                 open_risk = ui.small_button("Holdings risk →").clicked();
                 egui::ComboBox::from_id_salt("desk-group").selected_text(&pane.group).show_ui(ui, |ui| {
                     for g in &self.watchlists.groups {
@@ -794,6 +795,24 @@ impl HoldingRiskState {
             .fold(None, |total, count| Some(total.unwrap_or(0) + count))
     }
 
+    fn setup_hits_hover(&self) -> String {
+        let mut lines = vec!["Sum of active setup tags on holdings with verified daily history; O'Neil needs SPY in that series.".to_owned()];
+        let mut zeros = 0;
+        let mut unknown = 0;
+        for key in &self.held_keys {
+            match self.setup_count.get(key).copied().flatten() {
+                Some(0) => zeros += 1,
+                Some(count) => {
+                    let label = tr_core::Security::parse(key).map(|security| security.ticker).unwrap_or_else(|| key.clone());
+                    lines.push(format!("{label} {count}"));
+                }
+                None => unknown += 1,
+            }
+        }
+        lines.push(format!("Zero hits: {zeros} holdings; unknown: {unknown} holdings."));
+        lines.join("\n")
+    }
+
     /// Called only when loaded histories change, independently of portfolio edits.
     fn selected_breadth(&self) -> (&tr_data::whats_news::scan_pack::Breadth, String) {
         if let Some(scan) = self.scan_breadth.as_ref().filter(|s| s.symbols > 0 && s.breadth.n > 0) {
@@ -956,6 +975,23 @@ mod holding_risk_tests {
         app.sync_holding_risk();
         assert_eq!(app.holding_risk.generation, generation);
         assert!(requests.try_recv().is_err());
+    }
+
+    #[test]
+    fn setup_hits_hover_lists_only_held_positive_counts() {
+        let state = HoldingRiskState {
+            held_keys: ["AAPL US Equity", "MSFT US Equity", "ZERO", "UNKNOWN", "MISSING"].map(String::from).into_iter().collect(),
+            setup_count: [("AAPL US Equity", Some(3)), ("MSFT US Equity", Some(2)), ("ZERO", Some(0)), ("UNKNOWN", None), ("STALE", Some(9))]
+                .into_iter().map(|(key, count)| (key.into(), count)).collect(),
+            ..Default::default()
+        };
+        let hover = state.setup_hits_hover();
+        assert!(hover.contains("\nAAPL 3\n"));
+        assert!(hover.contains("\nMSFT 2\n"));
+        assert!(hover.contains("Zero hits: 1 holdings; unknown: 2 holdings."));
+        assert!(hover.contains("O'Neil needs SPY"));
+        assert!(!hover.contains("STALE"));
+        assert!(!hover.contains("US Equity"));
     }
 
     #[test]
