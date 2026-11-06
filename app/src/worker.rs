@@ -3109,7 +3109,15 @@ async fn evaluate_price_alerts(s: &Shared) {
                 for (symbol, ticker, names) in pairs {
                     match map.get(&ticker) {
                         Some(bars) => match setup_tick(&symbol, bars, &names, now, spy.as_deref()) {
-                            Ok(tick) => setups.push(tick),
+                            Ok(result) => {
+                                setups.push(result.tick);
+                                for (setup, error) in result.failures {
+                                    failures.push(AlertFailure {
+                                        symbol: symbol.clone(),
+                                        error: format!("{setup}: {error}"),
+                                    });
+                                }
+                            }
                             Err(error) => failures.push(AlertFailure { symbol, error }),
                         },
                         None => failures

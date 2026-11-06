@@ -445,6 +445,13 @@ pub struct SetupTick {
     pub stale: bool,
 }
 
+/// Independently evaluated setups and any setup-specific failures.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SetupTickResult {
+    pub tick: SetupTick,
+    pub failures: Vec<(String, String)>,
+}
+
 pub struct EvalInput {
     pub now: i64,
     pub sample_provider: bool,
@@ -725,28 +732,41 @@ pub fn evaluate(store: &mut Store, input: EvalInput) -> EvalOutcome {
     EvalOutcome { batch: store.snapshot(input.now, stale, false, failures), fired }
 }
 
-/// Build a [`SetupTick`] from verified daily bars. Sample / unverified history is refused.
+/// Build a [`SetupTick`] from verified daily bars, collecting setup-specific failures.
+/// Missing or unverified symbol history fails the entire tick.
 pub fn setup_tick(
     symbol: impl Into<String>,
     bars: &[tr_core::Bar],
     wanted: &[String],
     now: i64,
     spy: Option<&[tr_core::Bar]>,
-) -> Result<SetupTick, String> {
+) -> Result<SetupTickResult, String> {
     let symbol = crate::security(&symbol.into()).key();
     tr_core::Bar::require_verified(bars, "price/setup alert")?;
     let last = bars.last().ok_or_else(|| "no daily history".to_string())?;
     let mut active = BTreeMap::new();
+    let mut failures = Vec::new();
     for name in wanted {
-        let setup = normalize_setup(name).ok_or_else(|| format!("unknown setup {name}"))?;
-        active.insert(setup.clone(), crate::whats_news::setup_active_with_spy(&setup, bars, spy)?);
+        let Some(setup) = normalize_setup(name) else {
+            failures.push((name.clone(), format!("unknown setup {name}")));
+            continue;
+        };
+        match crate::whats_news::setup_active_with_spy(&setup, bars, spy) {
+            Ok(matches) => {
+                active.insert(setup, matches);
+            }
+            Err(error) => failures.push((setup, error)),
+        }
     }
-    Ok(SetupTick {
-        symbol,
-        active,
-        bar_ts: last.ts,
-        provenance: tr_core::Bar::provenance(bars),
-        stale: setup_bars_stale(last.ts, now),
+    Ok(SetupTickResult {
+        tick: SetupTick {
+            symbol,
+            active,
+            bar_ts: last.ts,
+            provenance: tr_core::Bar::provenance(bars),
+            stale: setup_bars_stale(last.ts, now),
+        },
+        failures,
     })
 }
 
@@ -955,17 +975,62 @@ mod tests {
             Bar::new(b.ts, close, close + 1.0, close - 1.0, close, 1000.0)
                 .with_provenance(Provenance::Real)
         }).collect();
-        let wanted = vec!["ONEIL_LENS".into()];
-        assert!(setup_tick("AAPL", &symbol, &wanted, 80 * 86400, None)
-            .unwrap_err().contains("benchmark unavailable"));
-        let tick = setup_tick("AAPL", &symbol, &wanted, 80 * 86400, Some(&spy)).unwrap();
-        assert_eq!(tick.active.get("ONEIL_LENS"), Some(&true));
+        let wanted = vec!["ONEIL_LENS".into(), "NEAR_HIGH".into()];
         let sample: Vec<_> = spy.iter().cloned().map(|b| b.with_provenance(Provenance::Sample)).collect();
-        assert!(setup_tick("AAPL", &symbol, &wanted, 80 * 86400, Some(&sample))
-            .unwrap_err().contains("benchmark unavailable"));
+        for benchmark in [None, Some(sample.as_slice())] {
+            let result = setup_tick("AAPL", &symbol, &wanted, 80 * 86400, benchmark).unwrap();
+            assert_eq!(result.tick.active.get("NEAR_HIGH"), Some(&true));
+            assert!(!result.tick.active.contains_key("ONEIL_LENS"));
+            assert_eq!(result.failures.len(), 1);
+            assert_eq!(result.failures[0].0, "ONEIL_LENS");
+            assert!(result.failures[0].1.contains("benchmark unavailable"));
+        }
+        let result = setup_tick("AAPL", &symbol, &wanted, 80 * 86400, Some(&spy)).unwrap();
+        assert_eq!(result.tick.active.get("ONEIL_LENS"), Some(&true));
+        assert_eq!(result.tick.active.get("NEAR_HIGH"), Some(&true));
+        assert!(result.failures.is_empty());
         let all = vec!["ALL".into()];
-        assert!(setup_tick("AAPL", &symbol, &all, 80 * 86400, None).unwrap().active.get("ALL") == Some(&true));
-        assert_eq!(setup_tick("AAPL", &symbol, &all, 80 * 86400, Some(&spy)).unwrap().active.get("ALL"), Some(&true));
+        for benchmark in [None, Some(spy.as_slice())] {
+            let result = setup_tick("AAPL", &symbol, &all, 80 * 86400, benchmark).unwrap();
+            assert_eq!(result.tick.active.get("ALL"), Some(&true));
+            assert!(result.failures.is_empty());
+        }
+    }
+
+    #[test]
+    fn missing_setup_preserves_state_while_other_setup_fires() {
+        let mut store = Store::default();
+        let oneil = store
+            .add_rule("AAPL", AlertKind::Setup { setup: "ONEIL_LENS".into(), change: SetupChange::Either }, 1)
+            .unwrap();
+        store
+            .add_rule("AAPL", AlertKind::Setup { setup: "NEAR_HIGH".into(), change: SetupChange::Enter }, 2)
+            .unwrap();
+        let mut seed = setup("AAPL", "ONEIL_LENS", true, 3, Provenance::Real, false);
+        seed.active.insert("NEAR_HIGH".into(), false);
+        eval(&mut store, 3, vec![], vec![seed]);
+        let previous = store.states[&oneil.id].clone();
+        let outcome = evaluate(
+            &mut store,
+            EvalInput {
+                now: 4,
+                sample_provider: false,
+                prices: vec![],
+                setups: vec![setup("AAPL", "NEAR_HIGH", true, 4, Provenance::Real, false)],
+                vwaps: vec![],
+                rvols: vec![],
+                sessions: vec![],
+                failures: vec![AlertFailure {
+                    symbol: crate::security("AAPL").key(),
+                    error: "ONEIL_LENS: benchmark unavailable".into(),
+                }],
+            },
+        );
+        assert_eq!(outcome.fired.len(), 1);
+        assert!(outcome.fired[0].message.contains("NEAR_HIGH"));
+        assert!(outcome.batch.failures.iter().any(|f| f.error == "ONEIL_LENS: benchmark unavailable"));
+        assert!(outcome.batch.failures.iter().any(|f| f.error.contains("could not be evaluated")));
+        assert_eq!(store.states[&oneil.id], previous);
     }
 
     #[test]
