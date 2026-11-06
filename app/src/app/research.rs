@@ -4,6 +4,14 @@ use crate::{congress_view::Action, worker::Request};
 use egui::{Key, RichText, Ui};
 use tr_data::whats_news::{Condition, Scan, ScanFilter, Snapshot, Sort, Symbol};
 
+/// Counts each setup once per row, in the scanner's canonical display order.
+fn setup_tag_counts(rows: &[tr_data::whats_news::ScanRow]) -> Vec<(String, usize)> {
+    tr_data::whats_news::SETUPS.iter().filter(|&&tag| tag != "ALL").filter_map(|&tag| {
+        let count = rows.iter().filter(|row| row.service.setups.iter().any(|setup| setup == tag)).count();
+        (count > 0).then(|| (tag.to_owned(), count))
+    }).collect()
+}
+
 enum DisplayRow<'a> {
     Universe(&'a Symbol),
     Scan(&'a tr_data::whats_news::ScanRow),
@@ -415,11 +423,17 @@ impl ResearchPane {
         self.sync_setup_filter();
         let before = self.filter.clone();
         if self.scan.as_deref() == Some("ALL") {
+            let rows = self.results.as_ref().map(|snapshot| snapshot.data.results.as_slice()).unwrap_or_default();
+            let total = rows.len();
+            let counts = setup_tag_counts(rows);
+            if self.filter.setup_tag.as_ref().is_some_and(|selected| !counts.iter().any(|(tag, _)| tag == selected)) {
+                self.filter.setup_tag = None;
+            }
             egui::ScrollArea::horizontal().id_salt("setup-tag-pills").show(ui, |ui| {
                 ui.horizontal(|ui| {
-                    ui.selectable_value(&mut self.filter.setup_tag, None, "All");
-                    for &tag in tr_data::whats_news::SETUPS.iter().filter(|&&tag| tag != "ALL") {
-                        ui.selectable_value(&mut self.filter.setup_tag, Some(tag.to_owned()), tag.replace('_', " "));
+                    ui.selectable_value(&mut self.filter.setup_tag, None, format!("All ({total})"));
+                    for (tag, count) in &counts {
+                        ui.selectable_value(&mut self.filter.setup_tag, Some(tag.clone()), format!("{} ({count})", tag.replace('_', " ")));
                     }
                 });
             });
@@ -618,6 +632,18 @@ impl ResearchPane {
 mod tests {
     use super::*;
     use tr_core::Provenance;
+
+    #[test]
+    fn setup_tag_counts_overlap_in_setup_order() {
+        let row = |tags: &[&str]| {
+            let mut row = tr_data::whats_news::ScanRow::default();
+            row.service.setups = tags.iter().map(|tag| (*tag).to_owned()).collect();
+            row
+        };
+        let rows = [row(&["VOL_SURGE", "NEAR_HIGH"]), row(&["NEAR_HIGH", "DARVAS_BOX", "NEAR_HIGH"])];
+        assert_eq!(setup_tag_counts(&rows), vec![("DARVAS_BOX".into(), 1), ("NEAR_HIGH".into(), 2), ("VOL_SURGE".into(), 1)]);
+        assert!(setup_tag_counts(&[]).is_empty());
+    }
 
     #[test]
     fn setup_tag_resets_on_scan_change_and_non_all_ignores_it() {
