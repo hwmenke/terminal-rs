@@ -993,6 +993,32 @@ async fn research_universe(
         provenance: tr_core::Provenance::Cached,
     })
 }
+// Temporarily include verified SPY bars when O'Neil RS is needed (ONEIL_LENS or ALL tags).
+fn with_spy_for_oneil(
+    name: &str,
+    mut bars: Vec<(String, Vec<tr_core::Bar>)>,
+    spy: Option<&[tr_core::Bar]>,
+) -> (Vec<(String, Vec<tr_core::Bar>)>, bool) {
+    let needs_spy = name == "ONEIL_LENS" || name == "ALL";
+    let added_spy = needs_spy
+        && !bars.iter().any(|(symbol, _)| tr_data::security(symbol).ticker == "SPY")
+        && spy.is_some();
+    if added_spy {
+        bars.push(("SPY".into(), spy.unwrap().to_vec()));
+    }
+    (bars, added_spy)
+}
+
+fn strip_spy_from_scan(scan: &mut tr_data::whats_news::Scan, added_spy: bool) {
+    if added_spy {
+        scan.results.retain(|row| row.symbol != "SPY");
+        if !scan.skipped.iter().any(|row| row.symbol == "SPY") {
+            scan.scanned = scan.scanned.saturating_sub(1);
+        }
+        scan.skipped.retain(|row| row.symbol != "SPY");
+    }
+}
+
 /// Apply lens selection only after separately verified benchmark enrichment.
 fn filter_enriched_scan(name: &str, mut scan: tr_data::whats_news::Scan) -> tr_data::whats_news::Scan {
     if name == "ONEIL_LENS" {
@@ -1015,25 +1041,21 @@ async fn research_scan(
         let mut benchmark_available = false;
         if let Ok(histories) = bridge.histories().await {
             if histories.provenance.require_verified("SCAN archive").is_ok() {
-                let mut bars = histories.data.bars;
-                if name == "ONEIL_LENS" {
-                    let added_spy = !bars.iter().any(|(symbol, _)| tr_data::security(symbol).ticker == "SPY")
-                        && spy.is_some();
-                    if added_spy {
-                        bars.push(("SPY".into(), spy.clone().unwrap()));
-                    }
+                let (bars, added_spy) = with_spy_for_oneil(name, histories.data.bars, spy.as_deref());
+                if name == "ONEIL_LENS" || name == "ALL" {
                     let mut scan = tr_data::whats_news::scan_histories(name, bars.clone(), snapshot.provenance)?;
                     scan.skipped.extend(histories.data.skipped);
-                    if added_spy {
-                        scan.results.retain(|row| row.symbol != "SPY");
-                        if !scan.skipped.iter().any(|row| row.symbol == "SPY") {
-                            scan.scanned = scan.scanned.saturating_sub(1);
-                        }
-                        scan.skipped.retain(|row| row.symbol != "SPY");
-                    }
+                    strip_spy_from_scan(&mut scan, added_spy);
                     for row in &mut scan.results {
                         if let Some(original) = snapshot.data.results.iter().find(|original| original.symbol == row.symbol) {
+                            // Keep Rust setup tags for ALL; HTTP service fields still attach below for other scans.
+                            let setups = std::mem::take(&mut row.service.setups);
+                            let setup_count = row.service.setup_count;
                             row.service = original.service.clone();
+                            if name == "ALL" {
+                                row.service.setups = setups;
+                                row.service.setup_count = setup_count;
+                            }
                             row.from_service = original.from_service;
                         }
                     }
@@ -1045,6 +1067,9 @@ async fn research_scan(
         }
         if !benchmark_available {
             let _ = tr_data::whats_news::apply_spy_benchmark(&mut snapshot.data, &[], None);
+        }
+        if name == "ALL" {
+            tr_data::whats_news::refresh_setup_tags(&mut snapshot.data);
         }
         snapshot.snapshot.data = filter_enriched_scan(name, snapshot.snapshot.data);
         if name == "ONEIL_LENS" && !benchmark_available {
@@ -1094,23 +1119,16 @@ async fn research_scan(
     let scan_name = name.to_string();
     let (mut data, benchmark_available) = tokio::task::spawn_blocking(move || {
         let name = scan_name;
-        let mut histories: Vec<_> = histories.into_iter().collect();
-        let added_spy = name == "ONEIL_LENS"
-            && !histories.iter().any(|(s, _)| tr_data::security(s).ticker == "SPY")
-            && spy.is_some();
-        if added_spy { histories.push(("SPY".into(), spy.clone().unwrap())); }
+        let (histories, added_spy) = with_spy_for_oneil(&name, histories.into_iter().collect(), spy.as_deref());
         let mut scan = tr_data::whats_news::scan_histories(&name, histories.clone(), tr_core::Provenance::Cached)?;
         let benchmark_available = spy.is_some()
             && tr_data::whats_news::apply_spy_benchmark(&mut scan, &histories, spy.as_deref()).is_ok();
         if !benchmark_available {
             let _ = tr_data::whats_news::apply_spy_benchmark(&mut scan, &[], None);
         }
-        if added_spy {
-            scan.results.retain(|r| r.symbol != "SPY");
-            if !scan.skipped.iter().any(|r| r.symbol == "SPY") {
-                scan.scanned = scan.scanned.saturating_sub(1);
-            }
-            scan.skipped.retain(|r| r.symbol != "SPY");
+        strip_spy_from_scan(&mut scan, added_spy);
+        if name == "ALL" {
+            tr_data::whats_news::refresh_setup_tags(&mut scan);
         }
         Ok::<_, anyhow::Error>((filter_enriched_scan(&name, scan), benchmark_available))
     })
@@ -4092,6 +4110,21 @@ mod tests {
 mod enriched_scan_tests {
     use super::filter_enriched_scan;
     use tr_data::whats_news::{Metrics, Scan, ScanRow};
+
+    #[test]
+    fn added_spy_is_stripped_and_decrements_scanned() {
+        let mut scan = Scan {
+            provenance: tr_core::Provenance::Cached,
+            scanned: 2,
+            skipped: vec![],
+            results: vec![ScanRow { symbol: "SPY".into(), ..Default::default() }, ScanRow { symbol: "WIN".into(), ..Default::default() }],
+        };
+        super::strip_spy_from_scan(&mut scan, true);
+        assert_eq!(scan.scanned, 1);
+        assert_eq!(scan.results.len(), 1);
+        assert_eq!(scan.results[0].symbol, "WIN");
+        assert!(scan.skipped.is_empty());
+    }
 
     #[test]
     fn oneil_selection_uses_enriched_metrics_and_preserves_scan_counts() {
