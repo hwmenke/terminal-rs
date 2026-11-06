@@ -3077,6 +3077,13 @@ async fn evaluate_price_alerts(s: &Shared) {
     }
     let mut setups = Vec::new();
     if !setup_keys.is_empty() {
+        let needs_spy = setup_keys.iter().any(|(_, setup)| setup == "ONEIL_LENS" || setup == "ALL");
+        let spy = if needs_spy {
+            let config = s.whats_news.borrow().1.clone();
+            desk_daily(s, &config.bridge(), "SPY").await.ok()
+        } else {
+            None
+        };
         let mut wanted: Vec<String> = Vec::new();
         let mut pairs: Vec<(String, String, Vec<String>)> = Vec::new();
         for (symbol, setup) in setup_keys {
@@ -3101,7 +3108,7 @@ async fn evaluate_price_alerts(s: &Shared) {
             Ok(map) => {
                 for (symbol, ticker, names) in pairs {
                     match map.get(&ticker) {
-                        Some(bars) => match setup_tick(&symbol, bars, &names, now) {
+                        Some(bars) => match setup_tick(&symbol, bars, &names, now, spy.as_deref()) {
                             Ok(tick) => setups.push(tick),
                             Err(error) => failures.push(AlertFailure { symbol, error }),
                         },
