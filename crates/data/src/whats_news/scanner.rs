@@ -260,6 +260,9 @@ pub fn setup_active(name: &str, bars: &[Bar]) -> std::result::Result<bool, Strin
     }
     Bar::require_verified(bars, "price/setup alert")?;
     let m = cached_calculate(bars)?;
+    if name == "ALL" {
+        return Ok(!active_setups(bars, &m).is_empty());
+    }
     Ok(matches_setup(name, bars, &m))
 }
 
@@ -267,6 +270,7 @@ fn matches_setup(name: &str, b: &[Bar], m: &Metrics) -> bool {
     let near = m.dist_20d_high_pct >= -5.0;
     let surge = m.volume_ratio.is_some_and(|v| v >= 1.5);
     match name {
+        "ALL" => false,
         "BREAKOUT_LENS" => m.breakout_lens.matches_breakout(),
         "QULLA_LENS" => m.qulla_lens.qulla,
         "ONEIL_LENS" => m.oneil_lens.oneil_rs,
@@ -281,6 +285,12 @@ fn matches_setup(name: &str, b: &[Bar], m: &Metrics) -> bool {
         "RSI_OS" => m.daily.rsi.is_some_and(|r| r <= 30.0),
         _ => darvas(b).is_some_and(|(_, _, state)| state == name),
     }
+}
+
+/// All individual setup hits, in scan menu order.
+pub fn active_setups(bars: &[Bar], metrics: &Metrics) -> Vec<String> {
+    SETUPS.iter().filter(|name| **name != "ALL" && matches_setup(name, bars, metrics))
+        .map(|name| (*name).to_string()).collect()
 }
 
 /// Bounded, exact-content cache. Full bar/provenance equality catches corrections
@@ -331,8 +341,10 @@ impl ScanCache {
             };
             scan.scanned += 1;
             let box_ = darvas(b);
+            let setups = active_setups(b, &m);
+            let matched = if name == "ALL" { !setups.is_empty() } else { matches_setup(name, b, &m) };
             candidates.push((
-                matches_setup(name, b, &m),
+                matched,
                 ScanRow {
                     provenance,
                     symbol: symbol.clone(),
@@ -342,6 +354,7 @@ impl ScanCache {
                     darvas_bottom: box_.map(|b| b.1),
                     last_date: Some(date(b.last().unwrap().ts)),
                     metrics: Some(m),
+                    service: super::ServiceFields { setup_count: Some(setups.len()), setups, ..Default::default() },
                     ..Default::default()
                 },
             ));
@@ -634,6 +647,52 @@ mod tests {
     fn close(a: f64, b: f64) {
         assert!((a - b).abs() < 1e-8, "{a} != {b}");
     }
+    #[test]
+    fn all_scan_tags_only_active_setups_and_keeps_near_high() {
+        assert_eq!(SETUPS.first(), Some(&"ALL"));
+        let near = bars(30);
+        let mut quiet = bars(30);
+        for (i, bar) in quiet.iter_mut().enumerate() {
+            bar.close = 100.0 + (i % 2) as f64;
+            bar.high = 150.0 + i as f64;
+        }
+        assert!(active_setups(&quiet, &calculate(&quiet).unwrap()).is_empty());
+        let histories = vec![("NEAR".into(), near.clone()), ("QUIET".into(), quiet), ("SHORT".into(), bars(2))];
+        let mut cache = ScanCache::default();
+        let (scan, _) = cache.scan("ALL", histories.clone(), Provenance::Real).unwrap();
+        assert_eq!(scan.results.len(), 1);
+        let row = &scan.results[0];
+        assert_eq!(row.symbol, "NEAR");
+        assert!(row.service.setups.iter().any(|s| s == "NEAR_HIGH"));
+        assert!(!row.service.setups.iter().any(|s| s == "ALL"));
+        assert_eq!(row.service.setup_count, Some(row.service.setups.len()));
+        assert!(scan.results.iter().all(|r| !r.service.setups.is_empty()));
+        let (single, _) = cache.scan("NEAR_HIGH", histories.clone(), Provenance::Real).unwrap();
+        assert_eq!(single.results[0].service.setups, row.service.setups);
+        assert!(!matches_setup("ALL", &near, &calculate(&near).unwrap()));
+        assert!(setup_active("ALL", &near).unwrap());
+        assert!(cache.scan("UNKNOWN", histories, Provenance::Real).is_err());
+    }
+
+    #[test]
+    fn all_setup_tags_refresh_after_benchmark_changes() {
+        let mut positive = Metrics::default();
+        positive.oneil_lens.oneil_rs = true;
+        let mut scan = Scan {
+            provenance: Provenance::Real, scanned: 3, skipped: vec![],
+            results: vec![row("OTHER", 0.0), row("ONLY_ONEIL", 0.0), row("GAIN_ONEIL", 0.0)],
+        };
+        scan.results[0].service.setups = vec!["NEAR_HIGH".into(), "ONEIL_LENS".into()];
+        scan.results[1].service.setups = vec!["ONEIL_LENS".into()];
+        scan.results[2].metrics = Some(positive);
+        super::super::refresh_setup_tags(&mut scan);
+        assert_eq!(scan.scanned, 3);
+        assert_eq!(scan.results.len(), 2);
+        assert_eq!(scan.results[0].service.setups, ["NEAR_HIGH"]);
+        assert_eq!(scan.results[1].service.setups, ["ONEIL_LENS"]);
+        assert!(scan.results.iter().all(|r| r.service.setup_count == Some(1)));
+    }
+
     #[test]
     fn wilder_rsi_seed_smoothing_and_extremes() {
         let prices = [

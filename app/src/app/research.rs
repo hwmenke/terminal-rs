@@ -48,6 +48,11 @@ impl DisplayRow<'_> {
                     num(m.and_then(|m| m.rs_spy_63d)),
                 );
                 let extra = match setup {
+                    Some("ALL") => {
+                        let tags = r.service.setups.join(",");
+                        let compact = if tags.chars().count() > 48 { format!("{}…", tags.chars().take(47).collect::<String>()) } else { tags };
+                        Some(format!(" {compact:<48}"))
+                    },
                     Some("MA") => m.map(|m| format!(" {:>7} {:>8}", if m.ma.stacked_ma { "yes" } else { "no" }, if m.ma.pullback_rising_ma { "yes" } else { "no" })),
                     Some("RSI_LENS") => m.map(|m| format!(" {:>8} {:>8} {:>9}", num(m.rsi_lens.rsi14), num(m.rsi_lens.rsi14_prev), format!("{}/{}/{}", m.rsi_lens.rsi_os as u8, m.rsi_lens.rsi_ob as u8, m.rsi_lens.rsi_rising_from_os as u8))),
                     Some("ONEIL_LENS") => m.map(|m| format!(" {:>8} {:>5}", num(m.oneil_lens.rs_spy_pct), m.oneil_lens.oneil_rs)),
@@ -887,6 +892,7 @@ mod navigation_tests {
 
 fn lens_columns(setup: Option<&str>) -> &'static [(&'static str, usize)] {
     match setup {
+        Some("ALL") => &[("SETUPS", 48)],
         Some("VCP_LENS") => &[("RANGE10/50", 10), ("ATR↓", 5), ("SWING↓", 6), ("VCP", 5)],
         Some("ONEIL_LENS") => &[("RS/SPY%", 8), ("ONEIL", 5)],
         Some("QULLA_LENS") => &[("GAP%", 8), ("EP", 5), ("VOL×", 8), ("NEAR20D", 8), ("QULLA", 5)],

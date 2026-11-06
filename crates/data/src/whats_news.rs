@@ -43,6 +43,7 @@ fn archive_provenance() -> Provenance {
 }
 
 pub const SETUPS: &[&str] = &[
+    "ALL",
     "DARVAS_BREAKOUT",
     "DARVAS_BOX",
     "DARVAS_FAIL",
@@ -576,7 +577,13 @@ pub fn attach_service(scan: &mut Scan, service: Scan) -> Result<()> {
             row.setup_score = original.setup_score;
             row.darvas_top = original.darvas_top;
             row.darvas_bottom = original.darvas_bottom;
+            let setups = std::mem::take(&mut row.service.setups);
+            let setup_count = row.service.setup_count;
             row.service = original.service;
+            if setup_count.is_some() {
+                row.service.setups = setups;
+                row.service.setup_count = setup_count;
+            }
             row.from_service = true;
         }
     }
@@ -907,6 +914,19 @@ pub fn apply_spy_benchmark(scan: &mut Scan, histories: &[(String, Vec<Bar>)], sp
         }
     }
     Ok(())
+}
+
+/// Refresh the benchmark-dependent tag after enrichment, retaining other setup hits.
+pub fn refresh_setup_tags(scan: &mut Scan) {
+    for row in &mut scan.results {
+        row.service.setups.retain(|name| name != "ONEIL_LENS" && name != "ALL");
+        if row.metrics.as_ref().is_some_and(|m| m.oneil_lens.oneil_rs) {
+            row.service.setups.push("ONEIL_LENS".into());
+        }
+        row.service.setups.sort_by_key(|name| SETUPS.iter().position(|s| *s == name).unwrap_or(usize::MAX));
+        row.service.setup_count = Some(row.service.setups.len());
+    }
+    scan.results.retain(|row| !row.service.setups.is_empty());
 }
 
 /// US equity sessions after `last` through `today`, saturated at six (the stale threshold).
