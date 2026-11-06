@@ -443,6 +443,7 @@ pub enum Response {
         pane: PaneId,
         generation: u64,
         rows: Vec<(String, Vec<Bar>)>,
+        spy: Option<Vec<Bar>>,
         error: Option<String>,
     },
     Stats {
@@ -1971,6 +1972,13 @@ async fn handle(s: &Arc<Shared>, req: Request) {
             let bridge = config.bridge();
             let mut rows = Vec::new();
             let mut errors = Vec::new();
+            // Include the benchmark once, reusing its fetch if SPY is itself held.
+            let held_symbols = symbols;
+            let mut symbols = held_symbols.clone();
+            if !symbols.iter().any(|s| tr_data::whats_news::archive_ticker(s) == "SPY") {
+                symbols.push("SPY".into());
+            }
+            let mut spy = None;
             use futures::StreamExt;
             let results = futures::stream::iter(symbols.into_iter().map(|symbol| {
                 let bridge = &bridge;
@@ -1982,7 +1990,12 @@ async fn handle(s: &Arc<Shared>, req: Request) {
             for (symbol, result) in results {
                 match result {
                     Ok(bars) => {
-                        rows.push((symbol, bars));
+                        if tr_data::whats_news::archive_ticker(&symbol) == "SPY" {
+                            spy = Some(bars.clone());
+                        }
+                        if held_symbols.contains(&symbol) {
+                            rows.push((symbol, bars));
+                        }
                     }
                     Err(e) => errors.push(format!("{symbol}: {e}")),
                 }
@@ -1991,6 +2004,7 @@ async fn handle(s: &Arc<Shared>, req: Request) {
                 pane,
                 generation,
                 rows,
+                spy,
                 error: (!errors.is_empty()).then(|| errors.join("; ")),
             });
         }
@@ -3439,6 +3453,45 @@ mod tests {
             } else {
                 assert_eq!(bars[0].volume, 5.0);
                 assert_eq!(bars[1].volume, 20.0);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn holding_history_returns_separate_spy_and_preserves_partial_results() {
+        let (mut s, rx) = shared(Arc::new(tr_data::sample::SampleProvider::at(0, 10)), None);
+        Arc::get_mut(&mut s).unwrap().history = Arc::new(tr_data::history::Service::new(
+            tr_data::history::Archive::memory().unwrap(), Arc::new(ArchivePrices),
+            tr_data::history::Policy { spacing: Duration::ZERO, ..Default::default() },
+        ));
+        s.whats_news.send_replace((0, tr_data::whats_news::Config { enabled: false, ..Default::default() }));
+        s.history.run("ADD", tr_data::history::universe::resolve("AAPL").unwrap(), |_| {}).await.unwrap();
+        s.history.run("REFRESH", vec![], |_| {}).await.unwrap();
+        handle(&s, Request::HoldingHistory { pane: 1, generation: 7, symbols: vec!["AAPL US Equity".into()] }).await;
+        let Response::WhatsNews { response, .. } = rx.try_recv().unwrap() else { panic!("expected archive envelope") };
+        let Response::HoldingHistory { generation, rows, spy, error, .. } = *response else {
+            panic!("expected holdings response")
+        };
+        assert_eq!(generation, 7);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].0, "AAPL US Equity");
+        assert!(spy.is_none());
+        assert!(error.unwrap().contains("SPY"));
+
+        s.history.run("ADD", tr_data::history::universe::resolve("SPY").unwrap(), |_| {}).await.unwrap();
+        s.history.run("REFRESH", vec![], |_| {}).await.unwrap();
+        for symbols in [vec!["AAPL US Equity".into()], vec!["AAPL US Equity".into(), "SPY US Equity".into()]] {
+            handle(&s, Request::HoldingHistory { pane: 1, generation: 8, symbols: symbols.clone() }).await;
+            let Response::WhatsNews { response, .. } = rx.try_recv().unwrap() else { panic!("expected archive envelope") };
+            let Response::HoldingHistory { rows, spy, error, .. } = *response else {
+                panic!("expected holdings response")
+            };
+            assert!(error.is_none());
+            assert_eq!(rows.len(), symbols.len());
+            let spy = spy.unwrap();
+            Bar::require_verified(&spy, "test benchmark").unwrap();
+            if let Some((_, held_spy)) = rows.iter().find(|(symbol, _)| symbol == "SPY US Equity") {
+                assert_eq!(*held_spy, spy);
             }
         }
     }

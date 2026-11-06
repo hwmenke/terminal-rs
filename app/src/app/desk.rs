@@ -745,6 +745,7 @@ mod tests {
 /// Shared archive data and cached, whole-portfolio breach count.
 pub(super) struct HoldingRiskState {
     pub history: std::collections::HashMap<String, Vec<tr_core::Bar>>,
+    pub spy: Option<Vec<tr_core::Bar>>,
     pub breadth: tr_data::whats_news::scan_pack::Breadth,
     pub scan_breadth: Option<tr_data::whats_news::scan_pack::ScanBreadth>,
     pub scan_breadth_received: Option<std::time::Instant>,
@@ -763,7 +764,7 @@ pub(super) struct HoldingRiskState {
 
 impl Default for HoldingRiskState {
     fn default() -> Self {
-        Self { history: Default::default(), breadth: Default::default(), scan_breadth: None, scan_breadth_received: None, setup_count: Default::default(), setups: Default::default(), adma_stretch: Default::default(), concentration: 0.2, breaches: None,
+        Self { history: Default::default(), spy: None, breadth: Default::default(), scan_breadth: None, scan_breadth_received: None, setup_count: Default::default(), setups: Default::default(), adma_stretch: Default::default(), concentration: 0.2, breaches: None,
             loading: false, requested: false, generation: 0, error: None, positions: None, held_keys: Default::default() }
     }
 }
@@ -796,7 +797,7 @@ impl HoldingRiskState {
     }
 
     fn setup_hits_hover(&self) -> String {
-        let mut lines = vec!["Sum of active setup tags on holdings with verified daily history; O'Neil needs SPY in that series.".to_owned()];
+        let mut lines = vec!["Sum of active setup tags on holdings with verified daily history; O'Neil needs SPY history with verified provenance.".to_owned()];
         let mut zeros = 0;
         let mut unknown = 0;
         for key in &self.held_keys {
@@ -832,11 +833,16 @@ impl HoldingRiskState {
                     tr_core::indicators::adma_stretch(&bars.iter().map(|b| b.close).collect::<Vec<_>>()));
                 (key, stretch)
             }).collect();
+        let spy_close = self.spy.as_deref()
+            .filter(|bars| tr_core::Bar::require_verified(bars, "holding SPY benchmark").is_ok())
+            .map(|bars| bars.iter().map(|b| b.close).collect::<Vec<_>>());
         self.setups = pf.into_iter().flat_map(|pf| &pf.positions)
             .filter_map(|p| p.market_key()).map(|key| {
                 let setups = self.history.get(&key).and_then(|bars| {
                     tr_core::Bar::require_verified(bars, "holding setups").ok()?;
-                    let metrics = tr_data::whats_news::cached_calculate(bars).ok()?;
+                    let mut metrics = tr_data::whats_news::cached_calculate(bars).ok()?;
+                    metrics.oneil_lens = tr_data::whats_news::scan_pack::measure_oneil(
+                        &bars.iter().map(|b| b.close).collect::<Vec<_>>(), spy_close.as_deref());
                     Some(tr_data::whats_news::active_setups(bars, &metrics))
                 });
                 (key, setups)
@@ -1032,6 +1038,50 @@ mod holding_risk_tests {
         assert_eq!(state.setup_count[&key], None);
         state.recompute(None);
         assert!(state.setup_count.is_empty());
+    }
+
+    #[test]
+    fn holding_oneil_hits_follow_verified_shared_spy_and_refreshes() {
+        let pf = tr_broker::sample::portfolio();
+        let keys: Vec<_> = pf.positions.iter().filter_map(|p| p.market_key()).take(2).collect();
+        assert_eq!(keys.len(), 2);
+        let bars = |step: f64| (0..80).map(|i| {
+            let close = 100.0 + i as f64 * step;
+            tr_core::Bar::new(i * 86400, close, close + 1.0, close - 1.0, close, 100.0)
+                .with_provenance(tr_core::Provenance::Real)
+        }).collect::<Vec<_>>();
+        let mut state = HoldingRiskState::default();
+        for key in &keys { state.history.insert(key.clone(), bars(1.0)); }
+        state.refresh_breadth();
+        let breadth_n = state.breadth.n;
+        let has_oneil = |state: &HoldingRiskState| keys.iter().all(|key|
+            state.setups[key].as_ref().unwrap().iter().any(|tag| tag == "ONEIL_LENS"));
+        state.recompute(Some(&pf));
+        assert!(!has_oneil(&state));
+        let counts = state.setup_count.clone();
+
+        state.spy = Some(bars(0.0));
+        state.recompute(Some(&pf));
+        assert!(has_oneil(&state));
+        for key in &keys { assert_eq!(state.setup_count[key], counts[key].map(|n| n + 1)); }
+        state.refresh_breadth();
+        assert_eq!(state.breadth.n, breadth_n, "benchmark must not enter holdings breadth");
+        assert_eq!(state.history.len(), keys.len());
+
+        // Reusing cached symbol metrics must still reflect a refreshed benchmark.
+        state.spy = Some(bars(2.0));
+        state.recompute(Some(&pf));
+        assert!(!has_oneil(&state));
+        state.spy = Some(bars(0.0));
+        state.spy.as_mut().unwrap()[0].provenance = tr_core::Provenance::Sample;
+        state.recompute(Some(&pf));
+        assert!(!has_oneil(&state));
+        state.spy = Some(bars(0.0)[..63].to_vec());
+        state.recompute(Some(&pf));
+        assert!(!has_oneil(&state));
+        state.spy = None;
+        state.recompute(Some(&pf));
+        for key in &keys { assert_eq!(state.setup_count[key], counts[key]); }
     }
 
     #[test]
