@@ -259,11 +259,36 @@ pub fn cached_calculate(bars: &[Bar]) -> std::result::Result<Metrics, String> {
 }
 /// Whether `name` is active on verified daily bars. Sample / unverified history is refused.
 pub fn setup_active(name: &str, bars: &[Bar]) -> std::result::Result<bool, String> {
+    setup_active_with_spy(name, bars, None)
+}
+
+/// Evaluate setup membership with a verified SPY benchmark for O’Neil relative strength.
+pub fn setup_active_with_spy(name: &str, bars: &[Bar], spy: Option<&[Bar]>) -> std::result::Result<bool, String> {
     if !super::SETUPS.contains(&name) {
         return Err(format!("unknown setup {name}"));
     }
     Bar::require_verified(bars, "price/setup alert")?;
-    let m = cached_calculate(bars)?;
+    let mut m = cached_calculate(bars)?;
+    // ONEIL_LENS needs SPY or it silently stays false. ALL still matches other
+    // tags without a benchmark; enrich O'Neil only when verified SPY is present.
+    if name == "ONEIL_LENS" {
+        let spy = spy.ok_or_else(|| "SPY benchmark unavailable for O'Neil setup".to_string())?;
+        Bar::require_verified(spy, "SPY benchmark")
+            .map_err(|e| format!("SPY benchmark unavailable: {e}"))?;
+        m.oneil_lens = super::scan_pack::measure_oneil(
+            &bars.iter().map(|b| b.close).collect::<Vec<_>>(),
+            Some(&spy.iter().map(|b| b.close).collect::<Vec<_>>()),
+        );
+    } else if name == "ALL" {
+        if let Some(spy) = spy {
+            if Bar::require_verified(spy, "SPY benchmark").is_ok() {
+                m.oneil_lens = super::scan_pack::measure_oneil(
+                    &bars.iter().map(|b| b.close).collect::<Vec<_>>(),
+                    Some(&spy.iter().map(|b| b.close).collect::<Vec<_>>()),
+                );
+            }
+        }
+    }
     if name == "ALL" {
         return Ok(!active_setups(bars, &m).is_empty());
     }
@@ -636,6 +661,28 @@ mod tests {
     fn bars(n: usize) -> Vec<Bar> {
         (0..n).map(|i| bar(d("2024-01-02") + Days::days(i as i64), 100.0)).collect()
     }
+    #[test]
+    fn oneil_setup_requires_verified_spy_and_enriches_cached_metrics() {
+        let mut symbol = bars(80);
+        for (i, bar) in symbol.iter_mut().enumerate() {
+            bar.close = 100.0 + i as f64;
+            bar.open = bar.close;
+            bar.high = bar.close + 1.0;
+            bar.low = bar.close - 1.0;
+        }
+        let spy = bars(80);
+        assert!(!cached_calculate(&symbol).unwrap().oneil_lens.oneil_rs);
+        assert!(setup_active("ONEIL_LENS", &symbol).unwrap_err().contains("benchmark unavailable"));
+        assert!(setup_active_with_spy("ONEIL_LENS", &symbol, Some(&spy)).unwrap());
+        let sample: Vec<_> = spy.iter().cloned().map(|b| b.with_provenance(Provenance::Sample)).collect();
+        assert!(setup_active_with_spy("ONEIL_LENS", &symbol, Some(&sample)).unwrap_err().contains("benchmark unavailable"));
+        // ALL still fires on other tags without SPY; with SPY it can include O'Neil.
+        assert!(setup_active("ALL", &symbol).unwrap());
+        assert!(setup_active_with_spy("ALL", &symbol, Some(&spy)).unwrap());
+        assert!(setup_active_with_spy("ALL", &symbol, Some(&sample)).unwrap());
+        assert!(!cached_calculate(&symbol).unwrap().oneil_lens.oneil_rs);
+    }
+
     fn row(symbol: &str, value: f64) -> ScanRow {
         ScanRow {
             symbol: symbol.into(),
@@ -681,7 +728,7 @@ mod tests {
         let (single, _) = cache.scan("NEAR_HIGH", histories.clone(), Provenance::Real).unwrap();
         assert_eq!(single.results[0].service.setups, row.service.setups);
         assert!(!matches_setup("ALL", &near, &calculate(&near).unwrap()));
-        assert!(setup_active("ALL", &near).unwrap());
+        assert!(setup_active_with_spy("ALL", &near, Some(&near)).unwrap());
         assert!(cache.scan("UNKNOWN", histories, Provenance::Real).is_err());
     }
 

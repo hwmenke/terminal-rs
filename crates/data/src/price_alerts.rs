@@ -731,6 +731,7 @@ pub fn setup_tick(
     bars: &[tr_core::Bar],
     wanted: &[String],
     now: i64,
+    spy: Option<&[tr_core::Bar]>,
 ) -> Result<SetupTick, String> {
     let symbol = crate::security(&symbol.into()).key();
     tr_core::Bar::require_verified(bars, "price/setup alert")?;
@@ -738,7 +739,7 @@ pub fn setup_tick(
     let mut active = BTreeMap::new();
     for name in wanted {
         let setup = normalize_setup(name).ok_or_else(|| format!("unknown setup {name}"))?;
-        active.insert(setup.clone(), crate::whats_news::setup_active(&setup, bars)?);
+        active.insert(setup.clone(), crate::whats_news::setup_active_with_spy(&setup, bars, spy)?);
     }
     Ok(SetupTick {
         symbol,
@@ -944,9 +945,33 @@ mod tests {
     }
 
     #[test]
+    fn setup_tick_oneil_requires_spy() {
+        let spy: Vec<_> = (0..80).map(|i| {
+            Bar::new(i * 86400, 100.0, 101.0, 99.0, 100.0, 1000.0)
+                .with_provenance(Provenance::Real)
+        }).collect();
+        let symbol: Vec<_> = spy.iter().enumerate().map(|(i, b)| {
+            let close = 100.0 + i as f64;
+            Bar::new(b.ts, close, close + 1.0, close - 1.0, close, 1000.0)
+                .with_provenance(Provenance::Real)
+        }).collect();
+        let wanted = vec!["ONEIL_LENS".into()];
+        assert!(setup_tick("AAPL", &symbol, &wanted, 80 * 86400, None)
+            .unwrap_err().contains("benchmark unavailable"));
+        let tick = setup_tick("AAPL", &symbol, &wanted, 80 * 86400, Some(&spy)).unwrap();
+        assert_eq!(tick.active.get("ONEIL_LENS"), Some(&true));
+        let sample: Vec<_> = spy.iter().cloned().map(|b| b.with_provenance(Provenance::Sample)).collect();
+        assert!(setup_tick("AAPL", &symbol, &wanted, 80 * 86400, Some(&sample))
+            .unwrap_err().contains("benchmark unavailable"));
+        let all = vec!["ALL".into()];
+        assert!(setup_tick("AAPL", &symbol, &all, 80 * 86400, None).unwrap().active.get("ALL") == Some(&true));
+        assert_eq!(setup_tick("AAPL", &symbol, &all, 80 * 86400, Some(&spy)).unwrap().active.get("ALL"), Some(&true));
+    }
+
+    #[test]
     fn setup_tick_refuses_sample_bars() {
         let bars = vec![Bar::new(1, 1.0, 1.0, 1.0, 1.0, 1.0).with_provenance(Provenance::Sample)];
-        let err = setup_tick("AAPL", &bars, &["NEAR_HIGH".into()], 10).unwrap_err();
+        let err = setup_tick("AAPL", &bars, &["NEAR_HIGH".into()], 10, None).unwrap_err();
         assert!(err.contains("SAMPLE"), "{err}");
     }
 
