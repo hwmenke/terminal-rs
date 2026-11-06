@@ -176,6 +176,7 @@ impl TerminalApp {
         }
         self.sync_holding_risk();
         let breaches = self.holding_risk.breaches;
+        let setup_hits = self.holding_risk.total_setup_hits();
         let threshold = self.holding_risk.concentration * 100.0;
         let (breadth, breadth_label) = self.holding_risk.selected_breadth();
         let breadth_chips = breadth_chips(breadth);
@@ -228,6 +229,8 @@ impl TerminalApp {
                 }
                 ui.label(breaches.map(|n| format!("Risk breaches: {n} (known)")).unwrap_or_else(|| "Risk breaches: —".into()))
                     .on_hover_text(format!("Holdings with any known breach: below SMA50, RSI14 ≥70 / ≤30, or weight >{threshold}%. Daily signals require loaded holdings history; unknown signals are not counted."));
+                ui.label(setup_hits.map(|n| format!("Setup hits: {n}")).unwrap_or_else(|| "Setup hits: —".into()))
+                    .on_hover_text("Sum of active setup tags on holdings with verified daily history; O'Neil needs SPY in that series.");
                 open_risk = ui.small_button("Holdings risk →").clicked();
                 egui::ComboBox::from_id_salt("desk-group").selected_text(&pane.group).show_ui(ui, |ui| {
                     for g in &self.watchlists.groups {
@@ -785,6 +788,12 @@ fn format_scan_age(age: std::time::Duration) -> String {
 }
 
 impl HoldingRiskState {
+    /// Unknown histories contribute nothing; a verified zero remains known.
+    fn total_setup_hits(&self) -> Option<usize> {
+        self.held_keys.iter().filter_map(|key| self.setup_count.get(key).copied().flatten())
+            .fold(None, |total, count| Some(total.unwrap_or(0) + count))
+    }
+
     /// Called only when loaded histories change, independently of portfolio edits.
     fn selected_breadth(&self) -> (&tr_data::whats_news::scan_pack::Breadth, String) {
         if let Some(scan) = self.scan_breadth.as_ref().filter(|s| s.symbols > 0 && s.breadth.n > 0) {
@@ -947,6 +956,21 @@ mod holding_risk_tests {
         app.sync_holding_risk();
         assert_eq!(app.holding_risk.generation, generation);
         assert!(requests.try_recv().is_err());
+    }
+
+    #[test]
+    fn total_setup_hits_preserves_unknown_and_known_zero() {
+        let mut state = HoldingRiskState::default();
+        assert_eq!(state.total_setup_hits(), None);
+        state.held_keys = ["A", "B", "C"].into_iter().map(str::to_owned).collect();
+        state.setup_count.insert("A".into(), None);
+        assert_eq!(state.total_setup_hits(), None);
+        state.setup_count.insert("A".into(), Some(0));
+        assert_eq!(state.total_setup_hits(), Some(0));
+        state.setup_count.insert("A".into(), Some(3));
+        state.setup_count.insert("B".into(), Some(4));
+        state.setup_count.insert("NOT_HELD".into(), Some(99));
+        assert_eq!(state.total_setup_hits(), Some(7));
     }
 
     #[test]
