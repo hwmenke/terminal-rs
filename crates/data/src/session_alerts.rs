@@ -160,7 +160,7 @@ fn gap_state(symbol: &str, tf: Timeframe, bars: &[Bar]) -> Result<(bool, String,
         &GapQuery { window: gap_fill::DEFAULT_WINDOW, timeframe: tf },
         "session alert",
     )?;
-    let bar_ts = gap.fill_ts.or(gap.today_last_ts).ok_or_else(|| "no print today".to_string())?;
+    let bar_ts = gap.today_last_ts.or(gap.fill_ts).ok_or_else(|| "no print today".to_string())?;
     let (active, detail) = match gap.direction {
         GapDirection::Flat => (false, "the open equals the prior close".to_string()),
         GapDirection::Up | GapDirection::Down => {
@@ -340,6 +340,37 @@ mod tests {
         let no_gap = read(SessionSignal::Gap, "AAPL", Timeframe::M30, &flat, None, now_of(&flat)).unwrap();
         assert!(!no_gap.active);
         assert!(no_gap.detail.contains("prior close"));
+    }
+
+    #[test]
+    fn gap_freshness_tracks_the_latest_print_after_a_morning_fill() {
+        let dates = sessions(2);
+        let opens = regular_opens(dates[1], Timeframe::M5);
+        let now = opens[12];
+        for (print_count, expected_fresh) in [(13, true), (3, false)] {
+            let mut bars: Vec<Bar> = regular_opens(dates[0], Timeframe::M5)
+                .into_iter()
+                .map(|ts| px(ts, 100.0, 100.0, 1_000.0))
+                .collect();
+            bars.push(Bar::new(opens[0], 102.0, 103.0, 99.0, 101.0, 1_000.0).with_provenance(Provenance::Real));
+            bars.extend(opens.iter().take(print_count).skip(1).map(|&ts| px(ts, 101.0, 102.0, 1_000.0)));
+
+            let gap = gap_fill::build_gap(
+                "AAPL",
+                &bars,
+                &GapQuery { window: gap_fill::DEFAULT_WINDOW, timeframe: Timeframe::M5 },
+                "session alert test",
+            )
+            .unwrap();
+            assert_eq!(gap.fill_ts, Some(opens[0]));
+            assert_eq!(gap.today_last_ts, Some(opens[print_count - 1]));
+
+            let tick = read(SessionSignal::Gap, "AAPL", Timeframe::M5, &bars, None, now).unwrap();
+            assert!(tick.active);
+            assert!(tick.detail.contains("filled"));
+            assert_eq!(tick.bar_ts, opens[print_count - 1]);
+            assert_eq!(tick.fresh, expected_fresh, "print count: {print_count}");
+        }
     }
 
     #[test]
