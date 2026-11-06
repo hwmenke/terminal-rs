@@ -25,6 +25,8 @@ pub struct Conditions {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Metrics {
     #[serde(default)]
+    pub fragile_lens: super::scan_pack::FragileMetrics,
+    #[serde(default)]
     pub vcp_lens: super::scan_pack::VcpMetrics,
     #[serde(default)]
     pub oneil_lens: super::scan_pack::OneilMetrics,
@@ -187,6 +189,7 @@ pub fn calculate(b: &[Bar]) -> std::result::Result<Metrics, String> {
     let stretch = tr_core::indicators::sma50_stretch(b);
     let breakout_lens = super::scan_pack::measure_breakout(&b.iter().map(|b| b.close).collect::<Vec<_>>(), &b.iter().map(|b| b.high).collect::<Vec<_>>(), &b.iter().map(|b| b.volume).collect::<Vec<_>>());
     let metrics = Metrics {
+        fragile_lens: super::scan_pack::measure_fragile(&b.iter().map(|b| b.close).collect::<Vec<_>>()),
         vcp_lens: super::scan_pack::measure_vcp(&b.iter().map(|b| b.close).collect::<Vec<_>>(), &b.iter().map(|b| b.high).collect::<Vec<_>>(), &b.iter().map(|b| b.low).collect::<Vec<_>>(), &breakout_lens),
         qulla_lens: super::scan_pack::measure_qulla(&b.iter().map(|b| b.close).collect::<Vec<_>>(), Some(&b.iter().map(|b| b.open).collect::<Vec<_>>()), &breakout_lens),
         breakout_lens,
@@ -276,6 +279,7 @@ fn matches_setup(name: &str, b: &[Bar], m: &Metrics) -> bool {
         "QULLA_LENS" => m.qulla_lens.qulla,
         "ONEIL_LENS" => m.oneil_lens.oneil_rs,
         "VCP_LENS" => m.vcp_lens.vcp_proxy,
+        "FRAGILE_LENS" => m.fragile_lens.fragile,
         "MA" => m.ma.matches_ma(),
         "RSI_LENS" => m.rsi_lens.matches_rsi(),
         "NEAR_HIGH" => near,

@@ -64,6 +64,7 @@ impl DisplayRow<'_> {
                     Some("MA") => m.map(|m| format!(" {:>7} {:>8}", if m.ma.stacked_ma { "yes" } else { "no" }, if m.ma.pullback_rising_ma { "yes" } else { "no" })),
                     Some("RSI_LENS") => m.map(|m| format!(" {:>8} {:>8} {:>9}", num(m.rsi_lens.rsi14), num(m.rsi_lens.rsi14_prev), format!("{}/{}/{}", m.rsi_lens.rsi_os as u8, m.rsi_lens.rsi_ob as u8, m.rsi_lens.rsi_rising_from_os as u8))),
                     Some("ONEIL_LENS") => m.map(|m| format!(" {:>8} {:>5}", num(m.oneil_lens.rs_spy_pct), m.oneil_lens.oneil_rs)),
+                    Some("FRAGILE_LENS") => m.map(|m| { let f = &m.fragile_lens; format!(" {:>6} {:>7} {:>11} {:>7}", num(f.d_65d), num(f.move_65d), f.read_65d.as_deref().or(f.read_130d.as_deref()).unwrap_or("—"), f.fragile) }),
                     Some("VCP_LENS") => m.map(|m| { let v = &m.vcp_lens; format!(" {:>10} {:>5} {:>6} {:>5}", v.range_ratio.map(|v| format!("{v:.3}")).unwrap_or_else(|| "—".into()), v.atr_declining.map(|v| v.to_string()).unwrap_or_else(|| "—".into()), v.swing_contract.map(|v| v.to_string()).unwrap_or_else(|| "—".into()), v.vcp_proxy) }),
                     Some("QULLA_LENS") => m.map(|m| format!(" {:>8} {:>5} {:>8} {:>8} {:>5}", num(m.qulla_lens.gap_pct), m.qulla_lens.is_ep, num(m.breakout_lens.vol_ratio), m.breakout_lens.near_nd, m.qulla_lens.qulla)),
                     Some("BREAKOUT_LENS") => m.map(|m| { let b = &m.breakout_lens; format!(" {:>9} {:>9} {:>8} {:>8} {:>8} {:>9}", num(b.dist_52w_pct), num(b.dist_nd_pct), b.near_52w, b.near_nd, num(b.vol_ratio), b.vol_surge) }),
@@ -982,6 +983,7 @@ mod navigation_tests {
 fn lens_columns(setup: Option<&str>) -> &'static [(&'static str, usize)] {
     match setup {
         Some("ALL") => &[("SETUPS", 48)],
+        Some("FRAGILE_LENS") => &[("D65", 6), ("M65", 7), ("READ", 11), ("FRAGILE", 7)],
         Some("VCP_LENS") => &[("RANGE10/50", 10), ("ATR↓", 5), ("SWING↓", 6), ("VCP", 5)],
         Some("ONEIL_LENS") => &[("RS/SPY%", 8), ("ONEIL", 5)],
         Some("QULLA_LENS") => &[("GAP%", 8), ("EP", 5), ("VOL×", 8), ("NEAR20D", 8), ("QULLA", 5)],

@@ -464,3 +464,79 @@ pub fn measure_vcp(close: &[f64], high: &[f64], low: &[f64], breakout: &Breakout
     VcpMetrics { range_ratio, atr_declining, swing_contract, contracted,
         vcp_proxy: contracted && (breakout.near_52w || breakout.near_nd) }
 }
+
+/// Non-overlapping log-return block scaling from Whats-News fractal_scan.py.
+pub const HORIZONS: [usize; 6] = [1, 2, 4, 8, 16, 32];
+pub const WIN_65: usize = 65;
+pub const WIN_130: usize = 130;
+pub const FRAGILE_D: f64 = 1.40;
+pub const FRAGILE_MOVE: f64 = 5.0;
+
+fn valid_closes(close: &[f64]) -> bool {
+    close.len() >= 2 && close.iter().all(|v| v.is_finite() && *v > 0.0)
+}
+#[allow(non_snake_case)]
+pub fn hurst_H(close: &[f64]) -> Option<f64> {
+    if !valid_closes(close) { return None; }
+    let returns: Vec<_> = close.windows(2).map(|p| p[1].ln() - p[0].ln()).collect();
+    let mut points = Vec::new();
+    for k in HORIZONS {
+        let blocks = returns.len() / k;
+        if blocks < 2 { continue; }
+        let mean = returns.chunks_exact(k).map(|b| b.iter().sum::<f64>().abs()).sum::<f64>() / blocks as f64;
+        if mean > 0.0 && mean.is_finite() { points.push(((k as f64).ln(), mean.ln())); }
+    }
+    if points.len() < 3 { return None; }
+    let x = points.iter().map(|p| p.0).sum::<f64>() / points.len() as f64;
+    let y = points.iter().map(|p| p.1).sum::<f64>() / points.len() as f64;
+    let variance = points.iter().map(|p| (p.0 - x).powi(2)).sum::<f64>();
+    if variance <= 0.0 { return None; }
+    finite(points.iter().map(|p| (p.0 - x) * (p.1 - y)).sum::<f64>() / variance)
+}
+#[allow(non_snake_case)]
+pub fn hurst_D(close: &[f64]) -> Option<f64> { finite(2.0 - hurst_H(close)?) }
+pub fn simple_move_pct(close: &[f64]) -> Option<f64> {
+    if !valid_closes(close) { return None; }
+    finite((close.last()? / close[0] - 1.0) * 100.0)
+}
+pub fn reading(d: Option<f64>, move_pct: Option<f64>) -> Option<&'static str> {
+    let d = finite(d?)?;
+    let movement = move_pct.and_then(finite).unwrap_or(0.0).abs();
+    Some(if d <= FRAGILE_D && movement > FRAGILE_MOVE { "FRAGILE" }
+        else if d <= 1.50 { "orderly" } else if d < 1.70 { "near-random" }
+        else if d < 1.85 { "choppy" } else { "max chop" })
+}
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct FractalWindow {
+    pub d: Option<f64>,
+    pub h: Option<f64>,
+    pub movement: Option<f64>,
+    pub read: Option<String>,
+}
+pub fn window_pack(close: &[f64], n: usize) -> FractalWindow {
+    if n < 2 || close.len() < n { return FractalWindow::default(); }
+    let window = &close[close.len() - n..];
+    if !valid_closes(window) { return FractalWindow::default(); }
+    let h = hurst_H(window);
+    let d = h.and_then(|h| finite(2.0 - h));
+    let movement = simple_move_pct(window);
+    FractalWindow { d: d.and_then(|v| rounded(v, 4)), h: h.and_then(|v| rounded(v, 4)),
+        movement: movement.and_then(|v| rounded(v, 2)), read: reading(d, movement).map(str::to_owned) }
+}
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct FragileMetrics {
+    pub d_65d: Option<f64>,
+    pub d_130d: Option<f64>,
+    pub move_65d: Option<f64>,
+    pub move_130d: Option<f64>,
+    pub read_65d: Option<String>,
+    pub read_130d: Option<String>,
+    pub fragile: bool,
+}
+pub fn measure_fragile(close: &[f64]) -> FragileMetrics {
+    let a = window_pack(close, WIN_65);
+    let b = window_pack(close, WIN_130);
+    FragileMetrics { fragile: a.read.as_deref() == Some("FRAGILE") || b.read.as_deref() == Some("FRAGILE"),
+        d_65d: a.d, d_130d: b.d, move_65d: a.movement, move_130d: b.movement,
+        read_65d: a.read, read_130d: b.read }
+}
