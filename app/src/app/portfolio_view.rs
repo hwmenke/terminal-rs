@@ -1272,6 +1272,10 @@ pub(super) fn risk_chips(
             let total = values.map(|v| v.iter().sum::<f64>()).filter(|v| *v > 0.0);
             let weight = p.market_value().zip(total).map(|(v,t)| v.abs()/t);
             let stretch = key.as_ref().and_then(|k| risk.adma_stretch.get(k)).copied().flatten();
+            let setup_count = key.as_ref().and_then(|k| risk.setup_count.get(k)).copied().flatten();
+            let setup_hover = key.as_ref().and_then(|k| risk.setups.get(k)).and_then(Option::as_ref)
+                .map(|tags| if tags.is_empty() { "No active setups".into() } else { tags.join(", ") })
+                .unwrap_or_else(|| "Verified daily history unavailable".into());
             let risk = tr_core::indicators::holding_risk(bars.map(Vec::as_slice).unwrap_or(&[]), weight, risk.concentration);
             ui.horizontal_wrapped(|ui| {
                 ui.label(&p.symbol);
@@ -1279,6 +1283,8 @@ pub(super) fn risk_chips(
                 ui.label(RichText::new(ma).color(if risk.above_sma50 == Some(false) { amber() } else { muted() }).background_color(theme::control()));
                 ui.label(RichText::new(stretch.map(|s| format!("ADMA Stretch {s:+.2}%")).unwrap_or_else(|| "ADMA Stretch —".into()))
                     .color(muted()).background_color(theme::control()));
+                ui.label(RichText::new(setup_count.map(|n| format!("Setups {n}")).unwrap_or_else(|| "Setups —".into()))
+                    .color(muted()).background_color(theme::control())).on_hover_text(setup_hover);
                 let rsi = risk.rsi14.map(|r| format!("RSI14 {r:.1} {}", if r >= 70.0 { "OB" } else if r <= 30.0 { "OS" } else { "neutral" })).unwrap_or_else(|| "RSI14 —".into());
                 ui.label(RichText::new(rsi).color(if risk.rsi14.is_some_and(|r| r >= 70.0 || r <= 30.0) { amber() } else { muted() }).background_color(theme::control()));
                 ui.label(RichText::new(weight.map(|w| format!("{:.1}%{}", w*100.0, if risk.concentrated == Some(true) { " concentrated" } else { "" })).unwrap_or_else(|| "Weight —".into()))

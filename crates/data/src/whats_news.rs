@@ -13,7 +13,7 @@ pub use desk::{
 };
 pub use link::{Config, DEFAULT_URL, Health, LinkState, detect_archive, retry_delay};
 pub use review::ReviewContext;
-pub use scanner::{Condition, Conditions, Metrics, ScanCache, ScanFilter, Skipped, Sort, setup_active};
+pub use scanner::{Condition, Conditions, Metrics, ScanCache, ScanFilter, Skipped, Sort, active_setups, cached_calculate, setup_active};
 
 use crate::history::calendar::is_session;
 use anyhow::{Context, Result, bail};

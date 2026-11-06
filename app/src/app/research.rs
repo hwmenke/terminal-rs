@@ -69,6 +69,7 @@ impl DisplayRow<'_> {
 
 pub struct ResearchPane {
     pub scan: Option<String>,
+    filter_scan: Option<String>,
     pub history: bool,
     pub history_status: Option<tr_data::history::Status>,
     history_input: String,
@@ -136,6 +137,7 @@ impl ResearchPane {
 
     pub fn new(scan: Option<String>) -> Self {
         Self {
+            filter_scan: scan.clone(),
             scan,
             history: false,
             history_status: None,
@@ -168,7 +170,14 @@ impl ResearchPane {
             Err(e) => self.error = Some(e),
         }
     }
+    fn sync_setup_filter(&mut self) {
+        if self.filter_scan != self.scan || self.scan.as_deref() != Some("ALL") {
+            self.filter.setup_tag = None;
+            self.filter_scan = self.scan.clone();
+        }
+    }
     pub fn request(&mut self, pane: u64, worker: &crate::worker::Worker) {
+        self.sync_setup_filter();
         if self.history {
             worker.send(Request::HistoryStatus);
             self.polled = Some(std::time::Instant::now());
@@ -263,6 +272,7 @@ impl ResearchPane {
         None
     }
     pub fn show(&mut self, ui: &mut Ui, worker: &crate::worker::Worker) -> (Vec<Action>, bool) {
+        self.sync_setup_filter();
         if self.history {
             return (self.show_history(ui, worker), false);
         }
@@ -402,7 +412,18 @@ impl ResearchPane {
         (actions, refresh)
     }
     fn scan_controls(&mut self, ui: &mut Ui) {
+        self.sync_setup_filter();
         let before = self.filter.clone();
+        if self.scan.as_deref() == Some("ALL") {
+            egui::ScrollArea::horizontal().id_salt("setup-tag-pills").show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.selectable_value(&mut self.filter.setup_tag, None, "All");
+                    for &tag in tr_data::whats_news::SETUPS.iter().filter(|&&tag| tag != "ALL") {
+                        ui.selectable_value(&mut self.filter.setup_tag, Some(tag.to_owned()), tag.replace('_', " "));
+                    }
+                });
+            });
+        }
         ui.horizontal_wrapped(|ui| {
             ui.checkbox(&mut self.filter.include_stale, "Include stale / undated");
             egui::ComboBox::from_id_salt("scan-sort").selected_text(self.filter.sort.label()).show_ui(ui, |ui| {
@@ -597,6 +618,23 @@ impl ResearchPane {
 mod tests {
     use super::*;
     use tr_core::Provenance;
+
+    #[test]
+    fn setup_tag_resets_on_scan_change_and_non_all_ignores_it() {
+        let mut pane = ResearchPane::new(Some("ALL".into()));
+        pane.filter.setup_tag = Some("NEAR_HIGH".into());
+        pane.sync_setup_filter();
+        assert_eq!(pane.filter.setup_tag.as_deref(), Some("NEAR_HIGH"));
+        pane.scan = Some("MA".into());
+        pane.sync_setup_filter();
+        assert_eq!(pane.filter.setup_tag, None);
+        pane.filter.setup_tag = Some("NEAR_HIGH".into());
+        pane.sync_setup_filter();
+        assert_eq!(pane.filter.setup_tag, None);
+        pane.scan = Some("ALL".into());
+        pane.sync_setup_filter();
+        assert_eq!(pane.filter.setup_tag, None);
+    }
 
     #[test]
     fn refresh_retains_verified_snapshot_and_restores_symbol_in_both_panes() {
