@@ -5,10 +5,10 @@ use egui::{Key, RichText, Ui};
 use tr_data::whats_news::{Condition, Scan, ScanFilter, Snapshot, Sort, Symbol};
 
 /// Counts each setup once per row, in the scanner's canonical display order.
-fn setup_tag_counts(rows: &[tr_data::whats_news::ScanRow]) -> Vec<(String, usize)> {
+fn setup_tag_counts(rows: &[tr_data::whats_news::ScanRow], selected: Option<&str>) -> Vec<(String, usize)> {
     tr_data::whats_news::SETUPS.iter().filter(|&&tag| tag != "ALL").filter_map(|&tag| {
         let count = rows.iter().filter(|row| row.service.setups.iter().any(|setup| setup == tag)).count();
-        (count > 0).then(|| (tag.to_owned(), count))
+        (count > 0 || selected == Some(tag)).then(|| (tag.to_owned(), count))
     }).collect()
 }
 
@@ -425,10 +425,7 @@ impl ResearchPane {
         if self.scan.as_deref() == Some("ALL") {
             let rows = self.results.as_ref().map(|snapshot| snapshot.data.results.as_slice()).unwrap_or_default();
             let total = rows.len();
-            let counts = setup_tag_counts(rows);
-            if self.filter.setup_tag.as_ref().is_some_and(|selected| !counts.iter().any(|(tag, _)| tag == selected)) {
-                self.filter.setup_tag = None;
-            }
+            let counts = setup_tag_counts(rows, self.filter.setup_tag.as_deref());
             egui::ScrollArea::horizontal().id_salt("setup-tag-pills").show(ui, |ui| {
                 ui.horizontal(|ui| {
                     ui.selectable_value(&mut self.filter.setup_tag, None, format!("All ({total})"));
@@ -641,8 +638,36 @@ mod tests {
             row
         };
         let rows = [row(&["VOL_SURGE", "NEAR_HIGH"]), row(&["NEAR_HIGH", "DARVAS_BOX", "NEAR_HIGH"])];
-        assert_eq!(setup_tag_counts(&rows), vec![("DARVAS_BOX".into(), 1), ("NEAR_HIGH".into(), 2), ("VOL_SURGE".into(), 1)]);
-        assert!(setup_tag_counts(&[]).is_empty());
+        assert_eq!(setup_tag_counts(&rows, None), vec![("DARVAS_BOX".into(), 1), ("NEAR_HIGH".into(), 2), ("VOL_SURGE".into(), 1)]);
+        assert!(setup_tag_counts(&[], None).is_empty());
+    }
+
+    #[test]
+    fn all_setup_tag_survives_refresh_with_empty_and_missing_results() {
+        let mut pane = ResearchPane::new(Some("ALL".into()));
+        pane.filter.setup_tag = Some("NEAR_HIGH".into());
+        let (worker, _requests) = crate::worker::Worker::test_channel();
+        let ctx = egui::Context::default();
+        for tags in [None, Some("VOL_SURGE")] {
+            pane.request(1, &worker);
+            let results = tags.into_iter().map(|tag| {
+                let mut row = tr_data::whats_news::ScanRow { provenance: Provenance::Real, ..Default::default() };
+                row.service.setups = vec![tag.into()];
+                row
+            }).collect();
+            pane.accept_scan(Ok(Snapshot {
+                failures: vec![], source: "archive".into(), provenance: Provenance::Real,
+                data: Scan { provenance: Provenance::Real, scanned: 1, skipped: vec![], results },
+            }));
+            let mut output = ctx.run_ui(Default::default(), |ui| pane.scan_controls(ui));
+            output.textures_delta.clear();
+            assert_eq!(pane.filter.setup_tag.as_deref(), Some("NEAR_HIGH"));
+            let counts = setup_tag_counts(&pane.results.as_ref().unwrap().data.results, pane.filter.setup_tag.as_deref());
+            assert!(counts.contains(&("NEAR_HIGH".into(), 0)));
+        }
+        pane.scan = Some("MA".into());
+        pane.sync_setup_filter();
+        assert_eq!(pane.filter.setup_tag, None);
     }
 
     #[test]
