@@ -249,7 +249,8 @@ impl CalculationCache {
         metrics
     }
 }
-pub(super) fn cached_calculate(bars: &[Bar]) -> std::result::Result<Metrics, String> {
+/// Cached metrics for daily bars; callers must check provenance before using setup hits.
+pub fn cached_calculate(bars: &[Bar]) -> std::result::Result<Metrics, String> {
     static CACHE: OnceLock<Mutex<CalculationCache>> = OnceLock::new();
     CACHE.get_or_init(|| Mutex::new(CalculationCache::default())).lock().unwrap().get(bars)
 }
@@ -497,6 +498,8 @@ impl Sort {
 }
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ScanFilter {
+    #[serde(default)]
+    pub setup_tag: Option<String>,
     pub include_stale: bool,
     pub min_score: Option<f64>,
     pub min_strength: Option<f64>,
@@ -515,6 +518,7 @@ pub struct ScanFilter {
 impl Default for ScanFilter {
     fn default() -> Self {
         Self {
+            setup_tag: None,
             include_stale: false,
             min_score: None,
             min_strength: None,
@@ -534,6 +538,9 @@ impl Default for ScanFilter {
 }
 impl ScanFilter {
     pub fn reason(&self, r: &ScanRow, expected: NaiveDate) -> Option<String> {
+        if self.setup_tag.as_ref().is_some_and(|tag| !r.service.setups.contains(tag)) {
+            return Some("setup tag not selected".into());
+        }
         let date = r.last_date.as_deref().and_then(|d| NaiveDate::parse_from_str(d, "%Y-%m-%d").ok());
         if !self.include_stale {
             match date {
@@ -672,6 +679,19 @@ mod tests {
         assert!(!matches_setup("ALL", &near, &calculate(&near).unwrap()));
         assert!(setup_active("ALL", &near).unwrap());
         assert!(cache.scan("UNKNOWN", histories, Provenance::Real).is_err());
+    }
+
+    #[test]
+    fn setup_tag_filter_and_all_tags() {
+        let mut near = row("NEAR", 1.0);
+        near.service.setups = vec!["NEAR_HIGH".into()];
+        let mut other = row("OTHER", 2.0);
+        other.service.setups = vec!["VOL_SURGE".into()];
+        let scan = Scan { provenance: Provenance::Real, scanned: 2, results: vec![near, other], skipped: vec![] };
+        let mut filter = ScanFilter { setup_tag: Some("NEAR_HIGH".into()), include_stale: true, ..Default::default() };
+        assert_eq!(filter.rows(&scan, "", d("2026-10-21")).iter().map(|r| r.symbol.as_str()).collect::<Vec<_>>(), ["NEAR"]);
+        filter.setup_tag = None;
+        assert_eq!(filter.rows(&scan, "", d("2026-10-21")).len(), 2);
     }
 
     #[test]

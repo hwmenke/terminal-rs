@@ -747,6 +747,8 @@ pub(super) struct HoldingRiskState {
     pub concentration: f64,
     pub breaches: Option<usize>,
     pub adma_stretch: std::collections::HashMap<String, Option<f64>>,
+    pub setup_count: std::collections::HashMap<String, Option<usize>>,
+    pub setups: std::collections::HashMap<String, Option<Vec<String>>>,
     pub loading: bool,
     pub requested: bool,
     pub generation: u64,
@@ -757,7 +759,7 @@ pub(super) struct HoldingRiskState {
 
 impl Default for HoldingRiskState {
     fn default() -> Self {
-        Self { history: Default::default(), breadth: Default::default(), scan_breadth: None, scan_breadth_received: None, adma_stretch: Default::default(), concentration: 0.2, breaches: None,
+        Self { history: Default::default(), breadth: Default::default(), scan_breadth: None, scan_breadth_received: None, setup_count: Default::default(), setups: Default::default(), adma_stretch: Default::default(), concentration: 0.2, breaches: None,
             loading: false, requested: false, generation: 0, error: None, positions: None, held_keys: Default::default() }
     }
 }
@@ -802,6 +804,17 @@ impl HoldingRiskState {
                     tr_core::indicators::adma_stretch(&bars.iter().map(|b| b.close).collect::<Vec<_>>()));
                 (key, stretch)
             }).collect();
+        self.setups = pf.into_iter().flat_map(|pf| &pf.positions)
+            .filter_map(|p| p.market_key()).map(|key| {
+                let setups = self.history.get(&key).and_then(|bars| {
+                    tr_core::Bar::require_verified(bars, "holding setups").ok()?;
+                    let metrics = tr_data::whats_news::cached_calculate(bars).ok()?;
+                    Some(tr_data::whats_news::active_setups(bars, &metrics))
+                });
+                (key, setups)
+            }).collect();
+        self.setup_count = self.setups.iter().map(|(key, setups)|
+            (key.clone(), setups.as_ref().map(Vec::len))).collect();
         self.breaches = pf.map(|pf| tr_core::indicators::risk_breaches(
             super::portfolio_view::holding_risks(
                 &super::broker::PortfolioPane::new(crate::command::PortView::Positions), pf, self)));
@@ -934,6 +947,31 @@ mod holding_risk_tests {
         app.sync_holding_risk();
         assert_eq!(app.holding_risk.generation, generation);
         assert!(requests.try_recv().is_err());
+    }
+
+    #[test]
+    fn cached_setup_hits_require_verified_history() {
+        let pf = tr_broker::sample::portfolio();
+        let key = pf.positions.iter().find_map(|p| p.market_key()).unwrap();
+        let mut state = HoldingRiskState::default();
+        state.recompute(Some(&pf));
+        assert_eq!(state.setup_count[&key], None);
+        state.history.insert(key.clone(), vec![]);
+        state.recompute(Some(&pf));
+        assert_eq!(state.setup_count[&key], None);
+        let bars = (0..40).map(|i| tr_core::Bar::new(i * 86400, 100.0, 101.0, 99.0, 100.0, 100.0)
+            .with_provenance(tr_core::Provenance::Real)).collect();
+        state.history.insert(key.clone(), bars);
+        state.recompute(Some(&pf));
+        let setups = state.setups[&key].as_ref().unwrap();
+        assert!(setups.iter().any(|s| s == "NEAR_HIGH"));
+        assert!(!setups.iter().any(|s| s == "ONEIL_LENS"));
+        assert_eq!(state.setup_count[&key], Some(setups.len()));
+        state.history.get_mut(&key).unwrap()[0].provenance = tr_core::Provenance::Sample;
+        state.recompute(Some(&pf));
+        assert_eq!(state.setup_count[&key], None);
+        state.recompute(None);
+        assert!(state.setup_count.is_empty());
     }
 
     #[test]
