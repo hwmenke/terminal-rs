@@ -1,4 +1,5 @@
 """Run from wn60 with PYTHONDONTWRITEBYTECODE=1; only output is the supplied path.
+Fractal only: python3 /path/to/this/script.py --fragile /path/to/scan_pack_fragile.json
 RSI only: python3 /path/to/this/script.py --rsi /path/to/scan_pack_rsi.json
 PYTHONDONTWRITEBYTECODE=1 python3 /path/to/this/script.py /path/to/scan_pack.json
 """
@@ -9,6 +10,34 @@ import numpy as np
 import pandas as pd
 # The read-only reference is the current working directory, not this script's dir.
 sys.path.insert(0, '.')
+if len(sys.argv) > 1 and sys.argv[1] == '--fragile':
+    import fractal_scan as fs
+    def compact(values):
+        runs = []
+        for v in values:
+            v = 'nan' if np.isnan(v) else 'inf' if v == np.inf else '-inf' if v == -np.inf else float(v)
+            if runs and runs[-1][1] == v: runs[-1][0] += 1
+            else: runs.append([1, v])
+        return runs
+    cases = dict(empty=np.array([]), short=np.full(64, 100.), flat=np.full(130, 100.))
+    for name, values in dict(up=[100,104,108,112,116,120,124,128,132,136,140,144,148], down=[148,144,140,136,132,128,124,120,116,112,108,104,100], chop=[100,110,95,108,98,112,96,109,99,111,97,107,100], only_130=[80,90,100,110,120,130,140,140.2,140.4,140.6,140.8,141,141.2]).items():
+        cases[name] = np.repeat(np.array(values, dtype=float), 10)
+    cases['minimum_65'] = cases['up'][-65:]
+    cases['move_exact_5'] = np.r_[np.full(32, 100.), np.full(33, 105.)]
+    cases['move_over_5'] = np.r_[np.full(32, 100.), np.full(33, 105.001)]
+    for name, value in [('nan', np.nan), ('inf', np.inf), ('neg_inf', -np.inf), ('zero', 0.), ('negative', -1.)]:
+        cases[name] = cases['up'].copy(); cases[name][-1] = value
+    cases['gap_130_only'] = cases['up'].copy(); cases['gap_130_only'][0] = np.nan
+    cases['invalid_outside'] = np.r_[np.nan, cases['up']]
+    output = []
+    for name, close in cases.items():
+        a, b = fs.window_pack(close, 65), fs.window_pack(close, 130)
+        expected = dict(d_65d=a['d'], d_130d=b['d'], move_65d=a['move'], move_130d=b['move'], read_65d=a['read'], read_130d=b['read'], fragile='FRAGILE' in [a['read'], b['read']])
+        output.append(dict(name=name, close=compact(close), expected=expected, windows=[a,b]))
+    with open(sys.argv[2], 'w') as out:
+        json.dump(output, out, separators=(',', ':'), allow_nan=False)
+    sys.exit(0)
+
 import scan_pack as sp
 
 # VCP-only mode leaves every other fixture untouched.

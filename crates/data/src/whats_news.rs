@@ -59,6 +59,7 @@ pub const SETUPS: &[&str] = &[
     "QULLA_LENS",
     "ONEIL_LENS",
     "VCP_LENS",
+    "FRAGILE_LENS",
 ];
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
