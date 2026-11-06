@@ -223,6 +223,8 @@ impl AlertBatch {
 pub struct RuleState {
     pub last_price: Option<f64>,
     pub last_match: Option<bool>,
+    #[serde(default)]
+    pub last_session_date: Option<chrono::NaiveDate>,
     pub last_eval_at: i64,
     pub last_bar_ts: Option<i64>,
 }
@@ -711,7 +713,13 @@ pub fn evaluate(store: &mut Store, input: EvalInput) -> EvalOutcome {
                     stale = true;
                     continue;
                 }
-                let prev = store.states.get(&rule.id).and_then(|s| s.last_match);
+                let prev = store.states.get(&rule.id).and_then(|s| {
+                    if s.last_session_date.is_some_and(|date| date != tick.session_date) {
+                        Some(false)
+                    } else {
+                        s.last_match
+                    }
+                });
                 if let Some(false) = prev
                     && tick.active
                 {
@@ -724,6 +732,7 @@ pub fn evaluate(store: &mut Store, input: EvalInput) -> EvalOutcome {
                 }
                 let state = store.states.entry(rule.id.clone()).or_default();
                 state.last_match = Some(tick.active);
+                state.last_session_date = Some(tick.session_date);
                 state.last_bar_ts = Some(tick.bar_ts);
                 state.last_eval_at = input.now;
             }
@@ -1307,7 +1316,52 @@ mod tests {
     }
 
     #[test]
-    fn a_session_signal_fires_when_it_turns_on_and_stays_quiet_while_it_holds() {
+    fn session_signals_rearm_on_a_new_session_and_persist_the_date() {
+        for signal in [
+            SessionSignal::Gap,
+            SessionSignal::Path,
+            SessionSignal::Pace,
+            SessionSignal::Extreme,
+            SessionSignal::Relative,
+        ] {
+            let mut s = Store::default();
+            let rule = s.add_rule("AAPL", AlertKind::Session { signal }, 1).unwrap();
+            let mut tick = session_tick(true, 10, true, Provenance::Real);
+            tick.signal = signal;
+            let seed = eval_session(&mut s, 10, vec![tick.clone()]);
+            assert!(seed.fired.is_empty(), "{signal:?}: the first active read only seeds");
+
+            let json = serde_json::to_string(&s).unwrap();
+            let mut loaded: Store = serde_json::from_str(&json).unwrap();
+            assert_eq!(loaded, s);
+            assert_eq!(loaded.states[&rule.id].last_session_date, Some(tick.session_date));
+
+            tick.bar_ts = 20;
+            assert!(eval_session(&mut loaded, 20, vec![tick.clone()]).fired.is_empty());
+            tick.session_date = tick.session_date.succ_opt().unwrap();
+            tick.bar_ts = 30;
+            assert_eq!(eval_session(&mut loaded, 30, vec![tick.clone()]).fired.len(), 1,
+                "{signal:?}: the next session's first active read fires");
+            assert_eq!(loaded.states[&rule.id].last_session_date, Some(tick.session_date));
+            tick.bar_ts = 40;
+            assert!(eval_session(&mut loaded, 40, vec![tick]).fired.is_empty());
+        }
+    }
+
+    #[test]
+    fn session_state_from_old_json_keeps_its_transition_seed() {
+        let state: RuleState = serde_json::from_str(
+            r#"{"last_price":null,"last_match":true,"last_eval_at":10,"last_bar_ts":10}"#,
+        ).unwrap();
+        assert_eq!(state.last_session_date, None);
+        let mut s = Store::default();
+        let rule = s.add_rule("AAPL", AlertKind::Session { signal: SessionSignal::Path }, 1).unwrap();
+        s.states.insert(rule.id, state);
+        assert!(eval_session(&mut s, 20, vec![session_tick(true, 20, true, Provenance::Real)]).fired.is_empty());
+    }
+
+    #[test]
+        fn a_session_signal_fires_when_it_turns_on_and_stays_quiet_while_it_holds() {
         let mut s = Store::default();
         let rule = s.add_rule("aapl", AlertKind::Session { signal: SessionSignal::Path }, 1).unwrap();
         let again = s.add_rule("AAPL US Equity", AlertKind::Session { signal: SessionSignal::Path }, 2).unwrap();
