@@ -1623,12 +1623,13 @@ impl TerminalApp {
                         r.accept_scan(result);
                     }
                 }
-                Response::HoldingHistory { pane, generation, rows, error } => {
+                Response::HoldingHistory { pane, generation, rows, spy, error } => {
                     let _ = pane;
                     if self.holding_risk.generation == generation {
                         self.holding_risk.loading = false;
                         let history_changed = rows.iter().any(|(key, bars)| self.holding_risk.history.get(key) != Some(bars));
                         self.holding_risk.history.extend(rows);
+                        self.holding_risk.spy = spy;
                         if history_changed {
                             self.holding_risk.refresh_breadth();
                         }
