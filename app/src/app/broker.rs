@@ -88,6 +88,8 @@ pub struct BrokerState {
     pub portfolio: Option<Box<Portfolio>>,
     /// Invalidates portfolio requests when credentials are saved or forgotten.
     pub credential_generation: u64,
+    /// Identifies the latest issued portfolio refresh within this app session.
+    pub portfolio_request_id: u64,
     pub error: Option<String>,
     pub loading: bool,
     pub fetched: Option<Instant>,
@@ -132,6 +134,7 @@ impl BrokerState {
             reveal: false,
             portfolio: None,
             credential_generation: 0,
+            portfolio_request_id: 0,
             error: None,
             loading: false,
             fetched: None,
@@ -199,9 +202,10 @@ impl TerminalApp {
             BrokerMode::Simulated => None,
             BrokerMode::Setup => return,
         };
+        b.portfolio_request_id += 1;
         b.loading = true;
         b.fetched = Some(Instant::now());
-        self.worker.send(Request::Portfolio(b.credential_generation, creds));
+        self.worker.send(Request::Portfolio(b.credential_generation, b.portfolio_request_id, creds));
     }
 
     /// Periodic portfolio and quote refresh while a portfolio pane is visible.
@@ -237,8 +241,8 @@ impl TerminalApp {
         }
     }
 
-    pub(super) fn on_portfolio(&mut self, generation: u64, result: Result<Box<Portfolio>, String>) {
-        if generation != self.broker.credential_generation {
+    pub(super) fn on_portfolio(&mut self, generation: u64, request_id: u64, result: Result<Box<Portfolio>, String>) {
+        if generation != self.broker.credential_generation || request_id != self.broker.portfolio_request_id {
             return;
         }
         let result = self.keep_simulated_trades(result);
@@ -843,24 +847,92 @@ mod tests {
 
     // Worker channels record requests and deliver mock results without brokerage/network I/O.
     #[test]
+    fn portfolio_ignores_late_same_credentials_success() {
+        let mut app = super::super::tests::test_app();
+        let (worker, mut requests, responses) = crate::worker::Worker::test_channel_with_responses();
+        app.worker = worker;
+        app.refresh_portfolio();
+        let Request::Portfolio(a_generation, a_request_id, _) = requests.try_recv().unwrap() else {
+            panic!("expected portfolio A")
+        };
+        app.refresh_portfolio();
+        let Request::Portfolio(b_generation, b_request_id, _) = requests.try_recv().unwrap() else {
+            panic!("expected portfolio B")
+        };
+        assert_eq!(a_generation, b_generation);
+        assert!(b_request_id > a_request_id);
+        let mut newer = tr_broker::sample::portfolio();
+        newer.warnings = vec!["new".into()];
+        assert!(
+            responses.send(crate::worker::Response::Portfolio(b_generation, b_request_id, Ok(Box::new(newer)))).is_ok()
+        );
+        app.drain();
+        assert!(!app.broker.loading);
+        let mut older = tr_broker::sample::portfolio();
+        older.warnings = vec!["old".into()];
+        assert!(
+            responses.send(crate::worker::Response::Portfolio(a_generation, a_request_id, Ok(Box::new(older)))).is_ok()
+        );
+        app.drain();
+        assert_eq!(app.broker.portfolio.as_ref().unwrap().warnings, ["new"]);
+        assert!(!app.broker.loading);
+        assert!(app.broker.error.is_none());
+    }
+
+    #[test]
+    fn portfolio_ignores_late_same_credentials_error() {
+        let mut app = super::super::tests::test_app();
+        let (worker, mut requests, responses) = crate::worker::Worker::test_channel_with_responses();
+        app.worker = worker;
+        app.refresh_portfolio();
+        let Request::Portfolio(a_generation, a_request_id, _) = requests.try_recv().unwrap() else {
+            panic!("expected portfolio A")
+        };
+        app.refresh_portfolio();
+        let Request::Portfolio(b_generation, b_request_id, _) = requests.try_recv().unwrap() else {
+            panic!("expected portfolio B")
+        };
+        assert_eq!(a_generation, b_generation);
+        assert!(b_request_id > a_request_id);
+        let mut newer = tr_broker::sample::portfolio();
+        newer.warnings = vec!["new".into()];
+        assert!(
+            responses.send(crate::worker::Response::Portfolio(b_generation, b_request_id, Ok(Box::new(newer)))).is_ok()
+        );
+        app.drain();
+        assert!(!app.broker.loading);
+        assert!(
+            responses
+                .send(crate::worker::Response::Portfolio(a_generation, a_request_id, Err("old error".into())))
+                .is_ok()
+        );
+        app.drain();
+        assert_eq!(app.broker.portfolio.as_ref().unwrap().warnings, ["new"]);
+        assert!(!app.broker.loading);
+        assert!(app.broker.error.is_none());
+    }
+
+    #[test]
     fn portfolio_ignores_late_response_after_save() {
         let mut app = super::super::tests::test_app();
         let (worker, mut requests, responses) = crate::worker::Worker::test_channel_with_responses();
         app.worker = worker;
         app.refresh_portfolio();
-        let Request::Portfolio(a_generation, _) = requests.try_recv().unwrap() else {
+        let Request::Portfolio(a_generation, a_request_id, _) = requests.try_recv().unwrap() else {
             panic!("expected portfolio A")
         };
         app.broker.form.client_id = "B".into();
         app.broker.form.consumer_key = "mock-key".into();
         app.save_broker_form("saved B");
         app.refresh_portfolio();
-        let Request::Portfolio(b_generation, _) = requests.try_recv().unwrap() else {
+        let Request::Portfolio(b_generation, b_request_id, _) = requests.try_recv().unwrap() else {
             panic!("expected portfolio B")
         };
         let mut b = tr_broker::sample::portfolio();
         b.warnings = vec!["B".into()];
-        assert!(responses.send(crate::worker::Response::Portfolio(b_generation, Ok(Box::new(b)))).is_ok());
+        assert!(
+            responses.send(crate::worker::Response::Portfolio(b_generation, b_request_id, Ok(Box::new(b)))).is_ok()
+        );
         app.drain();
         assert_eq!(app.broker.portfolio.as_ref().unwrap().warnings, ["B"]);
         // A subsequent current request is still loading when obsolete A completes.
@@ -868,14 +940,24 @@ mod tests {
         app.broker.error = Some("current error".into());
         app.broker.testing = true;
         let message = app.broker.message.clone();
-        assert!(responses
-            .send(crate::worker::Response::Portfolio(a_generation, Ok(Box::new(tr_broker::sample::portfolio()))))
-            .is_ok());
+        assert!(
+            responses
+                .send(crate::worker::Response::Portfolio(
+                    a_generation,
+                    a_request_id,
+                    Ok(Box::new(tr_broker::sample::portfolio()))
+                ))
+                .is_ok()
+        );
         app.drain();
         assert_eq!(app.broker.portfolio.as_ref().unwrap().warnings, ["B"]);
         assert!(app.broker.loading);
         assert_eq!(app.broker.error.as_deref(), Some("current error"));
-        assert!(responses.send(crate::worker::Response::Portfolio(a_generation, Err("old error".into()))).is_ok());
+        assert!(
+            responses
+                .send(crate::worker::Response::Portfolio(a_generation, a_request_id, Err("old error".into())))
+                .is_ok()
+        );
         app.drain();
         assert!(app.broker.loading);
         assert_eq!(app.broker.error.as_deref(), Some("current error"));
@@ -889,14 +971,20 @@ mod tests {
         let (worker, mut requests, responses) = crate::worker::Worker::test_channel_with_responses();
         app.worker = worker;
         app.refresh_portfolio();
-        let Request::Portfolio(a_generation, _) = requests.try_recv().unwrap() else {
+        let Request::Portfolio(a_generation, a_request_id, _) = requests.try_recv().unwrap() else {
             panic!("expected portfolio A")
         };
         app.forget_broker_credentials();
         let loading = app.broker.loading;
-        assert!(responses
-            .send(crate::worker::Response::Portfolio(a_generation, Ok(Box::new(tr_broker::sample::portfolio()))))
-            .is_ok());
+        assert!(
+            responses
+                .send(crate::worker::Response::Portfolio(
+                    a_generation,
+                    a_request_id,
+                    Ok(Box::new(tr_broker::sample::portfolio()))
+                ))
+                .is_ok()
+        );
         app.drain();
         assert!(app.broker.portfolio.is_none());
         assert_eq!(app.broker.loading, loading);
