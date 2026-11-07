@@ -214,6 +214,14 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn sample_quotes_carry_sample_provenance() {
+        let provider = SampleProvider::at(1_790_000_000, 100);
+        let quotes = provider.quotes(&["AAPL US Equity".into()]).await.unwrap();
+        assert_eq!(quotes.len(), 1);
+        assert_eq!(quotes[0].provenance, tr_core::Provenance::Sample);
+    }
+
+    #[tokio::test]
     async fn paging_is_contiguous() {
         let p = SampleProvider::at(1_790_000_000, 1_000);
         let recent = p.history("AAPL", Timeframe::H1, None, 300).await.unwrap();
