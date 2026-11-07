@@ -189,7 +189,7 @@ pub enum Request {
         before: Option<i64>,
     },
     /// Load the brokerage portfolio through SnapTrade (`None` = the simulated sample).
-    Portfolio(Option<tr_broker::Credentials>),
+    Portfolio(u64, Option<tr_broker::Credentials>),
     /// Register a SnapTrade user under the partner keys.
     BrokerRegister {
         creds: tr_broker::Credentials,
@@ -520,7 +520,7 @@ pub enum Response {
         generation: u64,
         result: Result<tr_data::lookalike::LookalikeReport, String>,
     },
-    Portfolio(Result<Box<tr_broker::Portfolio>, String>),
+    Portfolio(u64, Result<Box<tr_broker::Portfolio>, String>),
     /// `(userId, userSecret)` for a newly registered SnapTrade user.
     BrokerRegistered(Result<(String, String), String>),
     BrokerPortal(Result<String, String>),
@@ -2512,7 +2512,7 @@ async fn handle(s: &Arc<Shared>, req: Request) {
             Ok(c) => s.send(Response::Curves(Box::new(c))),
             Err(e) => s.send(Response::Status(format!("yield curve: {e:#}"))),
         },
-        Request::Portfolio(creds) => {
+        Request::Portfolio(generation, creds) => {
             let result = match creds {
                 None => Ok(tr_broker::sample::portfolio()),
                 Some(c) => match tr_broker::SnapTrade::new(c) {
@@ -2520,7 +2520,7 @@ async fn handle(s: &Arc<Shared>, req: Request) {
                     Err(e) => Err(e),
                 },
             };
-            s.send(Response::Portfolio(result.map(Box::new).map_err(|e| format!("{e:#}"))));
+            s.send(Response::Portfolio(generation, result.map(Box::new).map_err(|e| format!("{e:#}"))));
         }
         Request::BrokerRegister { creds, user_id } => {
             let result = match tr_broker::SnapTrade::new(creds) {
