@@ -1863,7 +1863,9 @@ impl TerminalApp {
                         }
                     }
                 }
-                Response::Portfolio(generation, result) => self.on_portfolio(generation, result),
+                Response::Portfolio(generation, request_id, result) => {
+                    self.on_portfolio(generation, request_id, result)
+                }
                 Response::BrokerRegistered(result) => self.on_broker_registered(result),
                 Response::BrokerPortal(result) => self.on_broker_portal(result),
                 Response::BrokerDisconnected(result) => self.on_broker_disconnected(result),
@@ -2566,6 +2568,7 @@ mod tests {
             reveal: false,
             portfolio: None,
             credential_generation: 0,
+            portfolio_request_id: 0,
             error: None,
             loading: false,
             fetched: None,
