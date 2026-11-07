@@ -86,6 +86,8 @@ pub struct BrokerState {
     pub form: Credentials,
     pub reveal: bool,
     pub portfolio: Option<Box<Portfolio>>,
+    /// Invalidates portfolio requests when credentials are saved or forgotten.
+    pub credential_generation: u64,
     pub error: Option<String>,
     pub loading: bool,
     pub fetched: Option<Instant>,
@@ -129,6 +131,7 @@ impl BrokerState {
             from_env,
             reveal: false,
             portfolio: None,
+            credential_generation: 0,
             error: None,
             loading: false,
             fetched: None,
@@ -194,7 +197,7 @@ impl TerminalApp {
         };
         b.loading = true;
         b.fetched = Some(Instant::now());
-        self.worker.send(Request::Portfolio(creds));
+        self.worker.send(Request::Portfolio(b.credential_generation, creds));
     }
 
     /// Periodic portfolio and quote refresh while a portfolio pane is visible.
@@ -230,7 +233,11 @@ impl TerminalApp {
         }
     }
 
-    pub(super) fn on_portfolio(&mut self, result: Result<Box<Portfolio>, String>) {
+    pub(super) fn on_portfolio(&mut self, generation: u64, result: Result<Box<Portfolio>, String>) {
+        if generation != self.broker.credential_generation {
+            return;
+        }
+        let result = self.keep_simulated_trades(result);
         let b = &mut self.broker;
         b.loading = false;
         if std::mem::take(&mut b.testing) {
@@ -314,6 +321,8 @@ impl TerminalApp {
                 b.from_env = creds.apply_env(|k| std::env::var(k).ok());
                 b.creds = creds;
                 b.message = Some((ok.into(), false));
+                b.credential_generation += 1;
+                b.loading = false;
                 b.portfolio = None;
                 b.error = None;
                 b.fetched = None;
@@ -331,6 +340,8 @@ impl TerminalApp {
                 let mut creds = Credentials::default();
                 b.from_env = creds.apply_env(|k| std::env::var(k).ok());
                 b.creds = creds;
+                b.credential_generation += 1;
+                b.loading = false;
                 b.portfolio = None;
                 b.error = None;
                 b.fetched = None;
@@ -786,6 +797,68 @@ impl TerminalApp {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Worker channels record requests and deliver mock results without brokerage/network I/O.
+    #[test]
+    fn portfolio_ignores_late_response_after_save() {
+        let mut app = super::super::tests::test_app();
+        let (worker, mut requests, responses) = crate::worker::Worker::test_channel_with_responses();
+        app.worker = worker;
+        app.refresh_portfolio();
+        let Request::Portfolio(a_generation, _) = requests.try_recv().unwrap() else {
+            panic!("expected portfolio A")
+        };
+        app.broker.form.client_id = "B".into();
+        app.broker.form.consumer_key = "mock-key".into();
+        app.save_broker_form("saved B");
+        app.refresh_portfolio();
+        let Request::Portfolio(b_generation, _) = requests.try_recv().unwrap() else {
+            panic!("expected portfolio B")
+        };
+        let mut b = tr_broker::sample::portfolio();
+        b.warnings = vec!["B".into()];
+        assert!(responses.send(crate::worker::Response::Portfolio(b_generation, Ok(Box::new(b)))).is_ok());
+        app.drain();
+        assert_eq!(app.broker.portfolio.as_ref().unwrap().warnings, ["B"]);
+        // A subsequent current request is still loading when obsolete A completes.
+        app.refresh_portfolio();
+        app.broker.error = Some("current error".into());
+        app.broker.testing = true;
+        let message = app.broker.message.clone();
+        assert!(responses
+            .send(crate::worker::Response::Portfolio(a_generation, Ok(Box::new(tr_broker::sample::portfolio()))))
+            .is_ok());
+        app.drain();
+        assert_eq!(app.broker.portfolio.as_ref().unwrap().warnings, ["B"]);
+        assert!(app.broker.loading);
+        assert_eq!(app.broker.error.as_deref(), Some("current error"));
+        assert!(responses.send(crate::worker::Response::Portfolio(a_generation, Err("old error".into()))).is_ok());
+        app.drain();
+        assert!(app.broker.loading);
+        assert_eq!(app.broker.error.as_deref(), Some("current error"));
+        assert!(app.broker.testing);
+        assert_eq!(app.broker.message, message);
+    }
+
+    #[test]
+    fn portfolio_ignores_late_response_after_forget() {
+        let mut app = super::super::tests::test_app();
+        let (worker, mut requests, responses) = crate::worker::Worker::test_channel_with_responses();
+        app.worker = worker;
+        app.refresh_portfolio();
+        let Request::Portfolio(a_generation, _) = requests.try_recv().unwrap() else {
+            panic!("expected portfolio A")
+        };
+        app.forget_broker_credentials();
+        let loading = app.broker.loading;
+        assert!(responses
+            .send(crate::worker::Response::Portfolio(a_generation, Ok(Box::new(tr_broker::sample::portfolio()))))
+            .is_ok());
+        app.drain();
+        assert!(app.broker.portfolio.is_none());
+        assert_eq!(app.broker.loading, loading);
+        assert!(app.broker.error.is_none());
+    }
 
     #[test]
     fn user_ids_are_unique_and_anonymous() {

@@ -1863,10 +1863,7 @@ impl TerminalApp {
                         }
                     }
                 }
-                Response::Portfolio(result) => {
-                    let result = self.keep_simulated_trades(result);
-                    self.on_portfolio(result)
-                }
+                Response::Portfolio(generation, result) => self.on_portfolio(generation, result),
                 Response::BrokerRegistered(result) => self.on_broker_registered(result),
                 Response::BrokerPortal(result) => self.on_broker_portal(result),
                 Response::BrokerDisconnected(result) => self.on_broker_disconnected(result),
@@ -2568,6 +2565,7 @@ mod tests {
             from_env: false,
             reveal: false,
             portfolio: None,
+            credential_generation: 0,
             error: None,
             loading: false,
             fetched: None,
