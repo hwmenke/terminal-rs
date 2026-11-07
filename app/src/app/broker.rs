@@ -211,19 +211,24 @@ impl TerminalApp {
         self.worker.send(Request::Portfolio(b.credential_generation, b.portfolio_request_id, creds));
     }
 
-    /// Periodic portfolio and quote refresh while a portfolio pane is visible.
+    /// Periodic portfolio discovery and refresh, plus quotes for visible portfolio panes.
     pub(super) fn broker_periodic(&mut self, visible: &[usize]) {
         let shown = visible.iter().any(|&i| matches!(self.panes[i].kind, PaneKind::Portfolio(_)));
-        if !shown {
-            return;
-        }
+        let brokerage_settings_shown = self.settings_tab == super::settings_view::SettingsTab::Brokerage
+            && visible.iter().any(|&i| matches!(self.panes[i].kind, PaneKind::Settings));
         let b = &self.broker;
         let connecting = b.connecting_since.is_some_and(|t| t.elapsed() < CONNECT_WINDOW);
         let every = if connecting { CONNECT_POLL } else { REFRESH };
-        // The demo account is local: live accounts load only while they are shown.
-        let live = !self.demo_mode();
-        if live && !b.loading && b.mode() != BrokerMode::Setup && b.fetched.is_none_or(|t| t.elapsed() > every) {
+        let discovering = brokerage_settings_shown && b.mode() == BrokerMode::Live && connecting;
+        if ((shown && !self.demo_mode()) || discovering)
+            && !b.loading
+            && b.mode() != BrokerMode::Setup
+            && b.fetched.is_none_or(|t| t.elapsed() > every)
+        {
             self.refresh_portfolio();
+        }
+        if !shown {
+            return;
         }
         // Reprice holdings with the terminal's own quotes.
         if let Some(pf) = self.shown_portfolio()
@@ -818,6 +823,133 @@ impl TerminalApp {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn discovery_app() -> (TerminalApp, tokio::sync::mpsc::UnboundedReceiver<Request>) {
+        let mut app = super::super::tests::test_app();
+        let (worker, requests) = crate::worker::Worker::test_channel();
+        app.worker = worker;
+        app.broker.creds = Credentials {
+            client_id: "mock-client".into(),
+            consumer_key: "mock-key".into(),
+            user_id: "mock-user".into(),
+            user_secret: "mock-secret".into(),
+        };
+        app.broker.portfolio = Some(Box::new(Portfolio::default()));
+        app.broker.loading = false;
+        let now = Instant::now();
+        app.broker.connecting_since = Some(now);
+        app.broker.fetched = Some(now - Duration::from_secs(21));
+        app.prefs.trading.account_mode = crate::prefs::AccountMode::Live;
+        app.settings_tab = super::super::SettingsTab::Brokerage;
+        app.panes.push(super::super::Pane { id: 1, kind: PaneKind::Settings, link: None, title: None, window: None });
+        (app, requests)
+    }
+
+    #[test]
+    fn settings_brokerage_discovers_new_accounts() {
+        let (mut app, mut requests) = discovery_app();
+        app.panes.push(super::super::Pane { id: 2, kind: PaneKind::Settings, link: None, title: None, window: None });
+        app.focus = 1; // Discovery follows visibility even when another pane has focus.
+        app.broker_periodic(&[0]);
+        assert!(matches!(requests.try_recv(), Ok(Request::Portfolio(_, _, Some(_)))));
+        assert!(requests.try_recv().is_err(), "expected exactly one portfolio request");
+    }
+
+    #[test]
+    fn settings_discovery_requires_visible_brokerage_tab() {
+        for (visible, tab) in
+            [(vec![], super::super::SettingsTab::Brokerage), (vec![0], super::super::SettingsTab::Appearance)]
+        {
+            let (mut app, mut requests) = discovery_app();
+            app.settings_tab = tab;
+            app.broker_periodic(&visible);
+            assert!(requests.try_recv().is_err());
+        }
+    }
+
+    #[test]
+    fn settings_discovery_requires_active_window() {
+        for age in [None, Some(CONNECT_WINDOW), Some(CONNECT_WINDOW + Duration::from_secs(1))] {
+            let (mut app, mut requests) = discovery_app();
+            app.broker.connecting_since = age.map(|age| Instant::now() - age);
+            // Even a normally overdue refresh must not run for Settings outside discovery.
+            app.broker.fetched = Some(Instant::now() - REFRESH - Duration::from_secs(1));
+            app.broker_periodic(&[0]);
+            assert!(requests.try_recv().is_err(), "window age: {age:?}");
+        }
+    }
+
+    #[test]
+    fn settings_discovery_requires_ready_credentials() {
+        for simulate in [false, true] {
+            let (mut app, mut requests) = discovery_app();
+            app.broker.simulate = simulate;
+            app.broker.creds.user_secret.clear();
+            app.broker_periodic(&[0]);
+            assert!(requests.try_recv().is_err());
+        }
+    }
+
+    #[test]
+    fn settings_discovery_obeys_loading_and_cadence() {
+        for (loading, age) in [(true, 21), (false, 19)] {
+            let (mut app, mut requests) = discovery_app();
+            app.broker.loading = loading;
+            app.broker.fetched = Some(Instant::now() - Duration::from_secs(age));
+            app.broker_periodic(&[0]);
+            app.broker_periodic(&[0]);
+            assert!(requests.try_recv().is_err());
+        }
+        let (mut app, mut requests) = discovery_app();
+        app.broker_periodic(&[0]);
+        assert!(app.broker.loading);
+        app.broker_periodic(&[0]);
+        assert!(matches!(requests.try_recv(), Ok(Request::Portfolio(_, _, Some(_)))));
+        assert!(requests.try_recv().is_err());
+    }
+
+    #[test]
+    fn settings_discovery_in_demo_requires_window_and_never_requests_quotes() {
+        for connecting in [true, false] {
+            let (mut app, mut requests) = discovery_app();
+            app.prefs.trading.account_mode = crate::prefs::AccountMode::Demo;
+            // Nonempty holdings make accidental quote refresh observable.
+            app.broker.portfolio = Some(Box::new(tr_broker::sample::portfolio()));
+            app.demo.pf = Box::new(tr_broker::sample::portfolio());
+            if !connecting {
+                app.broker.connecting_since = None;
+                app.broker.fetched = None;
+            }
+            app.broker_periodic(&[0]);
+            if connecting {
+                assert!(matches!(requests.try_recv(), Ok(Request::Portfolio(_, _, Some(_)))));
+            }
+            assert!(requests.try_recv().is_err());
+            assert!(app.broker.last_quotes.is_none());
+        }
+    }
+
+    #[test]
+    fn visible_portfolio_retains_refresh_and_quote_behavior() {
+        for (demo, connecting, age, refresh) in
+            [(false, false, 121, true), (false, false, 21, false), (false, true, 21, true), (true, true, 121, false)]
+        {
+            let (mut app, mut requests) = discovery_app();
+            app.panes[0].kind = PaneKind::Portfolio(Box::new(PortfolioPane::new(PortView::Summary)));
+            app.prefs.trading.account_mode =
+                if demo { crate::prefs::AccountMode::Demo } else { crate::prefs::AccountMode::Live };
+            app.broker.connecting_since = connecting.then(Instant::now);
+            app.broker.fetched = Some(Instant::now() - Duration::from_secs(age));
+            app.broker.portfolio = Some(Box::new(tr_broker::sample::portfolio()));
+            app.demo.pf = Box::new(tr_broker::sample::portfolio());
+            app.broker_periodic(&[0]);
+            if refresh {
+                assert!(matches!(requests.try_recv(), Ok(Request::Portfolio(_, _, Some(_)))));
+            }
+            assert!(matches!(requests.try_recv(), Ok(Request::Quotes(_))));
+            assert!(requests.try_recv().is_err());
+        }
+    }
 
     #[test]
     fn disconnect_cancels_inflight_connection_test_feedback() {
