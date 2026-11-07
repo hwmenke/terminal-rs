@@ -389,7 +389,13 @@ impl Portfolio {
         // Prefer the broker's total; fall back to cash + holdings when it is missing.
         let reported: Vec<f64> = self.accounts.iter().filter(|a| selected(&a.id)).filter_map(|a| a.total).collect();
         let n = self.accounts.iter().filter(|a| selected(&a.id)).count();
-        t.value = if reported.len() == n && n > 0 && price_of_is_trivial(&self.positions, &price_of) {
+        t.value = if reported.len() == n
+            && n > 0
+            && price_of_is_trivial(
+                self.positions.iter().filter(|p| selected(&p.account_id) && !p.cash_equivalent),
+                &price_of,
+            )
+        {
             reported.iter().sum()
         } else {
             t.cash + t.invested + cash_like
@@ -399,8 +405,11 @@ impl Portfolio {
 }
 
 /// True when the price override changes nothing (so the broker's totals stay authoritative).
-fn price_of_is_trivial(positions: &[Position], price_of: &impl Fn(&Position) -> Option<f64>) -> bool {
-    positions.iter().all(|p| price_of(p).is_none())
+fn price_of_is_trivial<'a>(
+    mut positions: impl Iterator<Item = &'a Position>,
+    price_of: &impl Fn(&Position) -> Option<f64>,
+) -> bool {
+    positions.all(|p| price_of(p).is_none())
 }
 
 // ---- parsing ------------------------------------------------------------------------------
@@ -722,6 +731,30 @@ mod tests {
         pf.accounts[0].total = None;
         assert_eq!(pf.totals(Some("a"), |_| None).value, 2500.0);
         assert_eq!(pf.totals(Some("other"), |_| None), Totals::default());
+    }
+
+    #[test]
+    fn totals_only_reprice_selected_non_cash_positions() {
+        let mut accounts = parse_accounts(&serde_json::json!([
+            {"id": "A", "balance": {"total": {"amount": 1000}}},
+            {"id": "B", "balance": {"total": {"amount": 500}}}
+        ]));
+        accounts[0].cash = Some(100.0);
+        let mut a = pos(InstrumentKind::Stock, "AAPL", 10.0, 80.0, 70.0);
+        a.account_id = "A".into();
+        let mut b = pos(InstrumentKind::Stock, "MSFT", 1.0, 500.0, 400.0);
+        b.account_id = "B".into();
+        let mut pf = Portfolio { accounts, positions: vec![a, b], ..Default::default() };
+
+        assert_eq!(pf.totals(Some("A"), |_| None).value, 1000.0);
+        assert_eq!(pf.totals(Some("A"), |p| (p.symbol == "MSFT").then_some(600.0)).value, 1000.0);
+        assert_eq!(pf.totals(Some("A"), |p| (p.symbol == "AAPL").then_some(85.0)).value, 950.0);
+
+        let mut cash = pos(InstrumentKind::Cash, "CASH", 1.0, 100.0, 100.0);
+        cash.account_id = "A".into();
+        cash.cash_equivalent = true;
+        pf.positions.push(cash);
+        assert_eq!(pf.totals(Some("A"), |p| (p.symbol == "CASH").then_some(200.0)).value, 1000.0);
     }
 
     #[test]
