@@ -2574,6 +2574,7 @@ mod tests {
             fetched: None,
             message: None,
             busy: None,
+            registering: None,
             portal_url: None,
             connecting_since: None,
             simulate: true,

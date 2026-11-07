@@ -97,6 +97,8 @@ pub struct BrokerState {
     pub message: Option<(String, bool)>,
     /// A request in flight from Settings ("Registering…").
     pub busy: Option<&'static str>,
+    /// Credentials submitted for the pending user registration.
+    pub registering: Option<Credentials>,
     /// Last Connection Portal link, so it can be copied if no browser opened.
     pub portal_url: Option<String>,
     pub connecting_since: Option<Instant>,
@@ -140,6 +142,7 @@ impl BrokerState {
             fetched: None,
             message,
             busy: None,
+            registering: None,
             portal_url: None,
             connecting_since: None,
             simulate,
@@ -291,8 +294,12 @@ impl TerminalApp {
 
     pub(super) fn on_broker_registered(&mut self, result: Result<(String, String), String>) {
         self.broker.busy = None;
+        let submitted = self.broker.registering.take();
         match result {
             Ok((id, secret)) => {
+                if let Some(form) = submitted {
+                    self.broker.form = form;
+                }
                 self.broker.form.user_id = id;
                 self.broker.form.user_secret = secret;
                 // SnapTrade returns the secret only once: persist it immediately.
@@ -376,6 +383,7 @@ impl TerminalApp {
         let user_id = if form.user_id.trim().is_empty() { new_user_id() } else { form.user_id.trim().to_string() };
         self.broker.busy = Some("Registering user…");
         self.broker.message = None;
+        self.broker.registering = Some(form.clone());
         self.worker.send(Request::BrokerRegister { creds: form, user_id });
     }
 
@@ -805,6 +813,37 @@ impl TerminalApp {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn registration_saves_submitted_keys_after_form_edits() {
+        let mut app = super::super::tests::test_app();
+        let (worker, mut requests, responses) = crate::worker::Worker::test_channel_with_responses();
+        app.worker = worker;
+        let submitted = Credentials {
+            client_id: "client_a".into(),
+            consumer_key: "key_a".into(),
+            ..Default::default()
+        };
+        app.broker.form = submitted.clone();
+        app.register_snaptrade_user();
+        let Request::BrokerRegister { creds, .. } = requests.try_recv().unwrap() else {
+            panic!("expected registration request")
+        };
+        assert_eq!(creds, submitted);
+        app.broker.form.client_id = "client_b".into();
+        app.broker.form.consumer_key = "key_b".into();
+        assert!(
+            responses
+                .send(crate::worker::Response::BrokerRegistered(Ok(("user_a".into(), "secret_a".into()))))
+                .is_ok()
+        );
+        app.drain();
+
+        let expected = Credentials { user_id: "user_a".into(), user_secret: "secret_a".into(), ..submitted };
+        assert_eq!(app.broker.creds, expected);
+        assert_eq!(app.broker.saved, expected);
+        assert_eq!(app.broker.store.load().unwrap(), Some(expected));
+    }
 
     #[test]
     fn live_price_respects_portfolio_quote_provenance() {
