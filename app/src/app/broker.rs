@@ -416,6 +416,11 @@ impl TerminalApp {
         self.broker.disconnecting = None;
         match result {
             Ok(id) => {
+                // Reject all portfolio loads issued before disconnect completed, including
+                // refreshes started while it was pending. Keep fetched to bound polling.
+                self.broker.portfolio_request_id += 1;
+                self.broker.loading = false;
+                self.broker.testing = false;
                 let name = self
                     .broker
                     .portfolio
@@ -813,6 +818,209 @@ impl TerminalApp {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn disconnect_cancels_inflight_connection_test_feedback() {
+        let mut app = super::super::tests::test_app();
+        let (worker, mut requests, responses) = crate::worker::Worker::test_channel_with_responses();
+        app.worker = worker;
+        app.broker.creds = Credentials {
+            client_id: "mock-client".into(),
+            consumer_key: "mock-key".into(),
+            user_id: "mock-user".into(),
+            user_secret: "mock-secret".into(),
+        };
+        let mut portfolio = tr_broker::sample::portfolio();
+        portfolio.simulated = false;
+        let id = portfolio.connections[0].id.clone();
+        app.broker.portfolio = Some(Box::new(portfolio));
+        app.broker.testing = true;
+        app.broker.message = None;
+        app.refresh_portfolio();
+        let Request::Portfolio(generation, request_id, _) = requests.try_recv().unwrap() else {
+            panic!("expected test portfolio request")
+        };
+        let old = app.broker.portfolio.clone().unwrap();
+        app.disconnect_brokerage(id.clone());
+        assert!(matches!(requests.try_recv().unwrap(), Request::BrokerDisconnect { .. }));
+        assert!(responses.send(crate::worker::Response::BrokerDisconnected(Ok(id))).is_ok());
+        app.drain();
+        let message = app.broker.message.clone();
+        assert!(message.as_ref().is_some_and(|(text, error)| text.contains("disconnected") && !error));
+        assert!(!app.broker.testing);
+        assert!(responses.send(crate::worker::Response::Portfolio(generation, request_id, Ok(old))).is_ok());
+        app.drain();
+        assert_eq!(app.broker.message, message);
+        app.refresh_portfolio();
+        let Request::Portfolio(generation, fresh_request_id, _) = requests.try_recv().unwrap() else {
+            panic!("expected fresh portfolio request")
+        };
+        assert!(fresh_request_id > request_id);
+        let fresh = app.broker.portfolio.clone().unwrap();
+        assert!(responses.send(crate::worker::Response::Portfolio(generation, fresh_request_id, Ok(fresh))).is_ok());
+        app.drain();
+        assert_eq!(app.broker.message, message);
+        assert!(!app.broker.testing);
+    }
+
+    #[test]
+    fn disconnect_rejects_pre_disconnect_portfolio() {
+        let mut app = super::super::tests::test_app();
+        let (worker, mut requests, responses) = crate::worker::Worker::test_channel_with_responses();
+        app.worker = worker;
+        app.broker.creds = Credentials {
+            client_id: "mock-client".into(),
+            consumer_key: "mock-key".into(),
+            user_id: "mock-user".into(),
+            user_secret: "mock-secret".into(),
+        };
+        let mut portfolio = tr_broker::sample::portfolio();
+        portfolio.simulated = false;
+        let id = portfolio.connections[0].id.clone();
+        assert!(portfolio.accounts_of(&id).next().is_some());
+        app.broker.portfolio = Some(Box::new(portfolio));
+        app.refresh_portfolio();
+        let Request::Portfolio(generation, request_id, _) = requests.try_recv().unwrap() else {
+            panic!("expected portfolio request")
+        };
+        let old = app.broker.portfolio.clone().unwrap();
+        app.disconnect_brokerage(id.clone());
+        assert!(matches!(requests.try_recv().unwrap(), Request::BrokerDisconnect { id: sent, .. } if sent == id));
+        assert!(responses.send(crate::worker::Response::BrokerDisconnected(Ok(id.clone()))).is_ok());
+        app.drain();
+        let pf = app.broker.portfolio.as_ref().unwrap();
+        assert!(!pf.connections.iter().any(|c| c.id == id));
+        assert!(pf.accounts_of(&id).next().is_none());
+        assert!(responses.send(crate::worker::Response::Portfolio(generation, request_id, Ok(old))).is_ok());
+        app.drain();
+        let pf = app.broker.portfolio.as_ref().unwrap();
+        assert!(!pf.connections.iter().any(|c| c.id == id));
+        assert!(pf.accounts_of(&id).next().is_none());
+        assert!(!app.broker.loading);
+        assert!(requests.try_recv().is_err());
+        app.refresh_portfolio();
+        assert!(matches!(requests.try_recv().unwrap(), Request::Portfolio(_, next, _) if next > request_id));
+        assert!(app.broker.loading);
+    }
+
+    #[test]
+    fn disconnect_prunes_already_applied_portfolio() {
+        let mut app = super::super::tests::test_app();
+        let (worker, mut requests, responses) = crate::worker::Worker::test_channel_with_responses();
+        app.worker = worker;
+        app.broker.creds = Credentials {
+            client_id: "mock-client".into(),
+            consumer_key: "mock-key".into(),
+            user_id: "mock-user".into(),
+            user_secret: "mock-secret".into(),
+        };
+        let mut portfolio = tr_broker::sample::portfolio();
+        portfolio.simulated = false;
+        let id = portfolio.connections[0].id.clone();
+        assert!(portfolio.accounts_of(&id).next().is_some());
+        app.broker.portfolio = Some(Box::new(portfolio));
+        app.refresh_portfolio();
+        let Request::Portfolio(generation, request_id, _) = requests.try_recv().unwrap() else {
+            panic!("expected portfolio request")
+        };
+        let mut old = app.broker.portfolio.clone().unwrap();
+        old.warnings = vec!["response applied".into()];
+        app.disconnect_brokerage(id.clone());
+        assert!(matches!(requests.try_recv().unwrap(), Request::BrokerDisconnect { .. }));
+        assert!(responses.send(crate::worker::Response::Portfolio(generation, request_id, Ok(old))).is_ok());
+        app.drain();
+        assert_eq!(app.broker.portfolio.as_ref().unwrap().warnings, ["response applied"]);
+        let fetched = app.broker.fetched;
+        assert!(responses.send(crate::worker::Response::BrokerDisconnected(Ok(id.clone()))).is_ok());
+        app.drain();
+        assert!(app.broker.portfolio_request_id > request_id);
+        assert!(!app.broker.loading);
+        assert_eq!(app.broker.fetched, fetched);
+        assert!(requests.try_recv().is_err());
+        let pf = app.broker.portfolio.as_ref().unwrap();
+        assert!(!pf.connections.iter().any(|c| c.id == id));
+        assert!(pf.accounts_of(&id).next().is_none());
+        assert!(pf.positions.iter().all(|p| pf.accounts.iter().any(|a| a.id == p.account_id)));
+    }
+
+    #[test]
+    fn disconnect_failure_accepts_inflight_portfolio() {
+        let mut app = super::super::tests::test_app();
+        let (worker, mut requests, responses) = crate::worker::Worker::test_channel_with_responses();
+        app.worker = worker;
+        app.broker.creds = Credentials {
+            client_id: "mock-client".into(),
+            consumer_key: "mock-key".into(),
+            user_id: "mock-user".into(),
+            user_secret: "mock-secret".into(),
+        };
+        let mut portfolio = tr_broker::sample::portfolio();
+        portfolio.simulated = false;
+        let id = portfolio.connections[0].id.clone();
+        assert!(portfolio.accounts_of(&id).next().is_some());
+        app.broker.portfolio = Some(Box::new(portfolio));
+        app.refresh_portfolio();
+        let Request::Portfolio(generation, request_id, _) = requests.try_recv().unwrap() else {
+            panic!("expected portfolio request")
+        };
+        let mut old = app.broker.portfolio.clone().unwrap();
+        old.warnings = vec!["response applied".into()];
+        app.disconnect_brokerage(id.clone());
+        assert!(matches!(requests.try_recv().unwrap(), Request::BrokerDisconnect { .. }));
+        let fetched = app.broker.fetched;
+        assert!(responses.send(crate::worker::Response::BrokerDisconnected(Err("mock failure".into()))).is_ok());
+        app.drain();
+        assert_eq!(app.broker.portfolio_request_id, request_id);
+        assert!(app.broker.loading);
+        assert_eq!(app.broker.fetched, fetched);
+        assert!(requests.try_recv().is_err());
+        assert!(responses.send(crate::worker::Response::Portfolio(generation, request_id, Ok(old))).is_ok());
+        app.drain();
+        let pf = app.broker.portfolio.as_ref().unwrap();
+        assert_eq!(pf.warnings, ["response applied"]);
+        assert!(pf.connections.iter().any(|c| c.id == id));
+        assert!(pf.accounts_of(&id).next().is_some());
+        assert!(!app.broker.loading);
+    }
+
+    #[test]
+    fn disconnect_rejects_portfolio_issued_while_pending() {
+        let mut app = super::super::tests::test_app();
+        let (worker, mut requests, responses) = crate::worker::Worker::test_channel_with_responses();
+        app.worker = worker;
+        app.broker.creds = Credentials {
+            client_id: "mock-client".into(),
+            consumer_key: "mock-key".into(),
+            user_id: "mock-user".into(),
+            user_secret: "mock-secret".into(),
+        };
+        let mut portfolio = tr_broker::sample::portfolio();
+        portfolio.simulated = false;
+        let id = portfolio.connections[0].id.clone();
+        assert!(portfolio.accounts_of(&id).next().is_some());
+        app.broker.portfolio = Some(Box::new(portfolio));
+        app.disconnect_brokerage(id.clone());
+        assert!(matches!(requests.try_recv().unwrap(), Request::BrokerDisconnect { .. }));
+        app.refresh_portfolio();
+        let Request::Portfolio(generation, request_id, _) = requests.try_recv().unwrap() else {
+            panic!("expected portfolio request")
+        };
+        let mut old = app.broker.portfolio.clone().unwrap();
+        old.warnings = vec!["response applied".into()];
+        let fetched = app.broker.fetched;
+        assert!(responses.send(crate::worker::Response::BrokerDisconnected(Ok(id.clone()))).is_ok());
+        app.drain();
+        assert!(app.broker.portfolio_request_id > request_id);
+        assert!(!app.broker.loading);
+        assert_eq!(app.broker.fetched, fetched);
+        assert!(requests.try_recv().is_err());
+        assert!(responses.send(crate::worker::Response::Portfolio(generation, request_id, Ok(old))).is_ok());
+        app.drain();
+        let pf = app.broker.portfolio.as_ref().unwrap();
+        assert!(!pf.connections.iter().any(|c| c.id == id));
+        assert!(pf.accounts_of(&id).next().is_none());
+        assert!(pf.positions.iter().all(|p| pf.accounts.iter().any(|a| a.id == p.account_id)));
+    }
 
     #[test]
     fn registration_saves_submitted_keys_after_form_edits() {
