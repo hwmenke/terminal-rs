@@ -380,26 +380,23 @@ impl Portfolio {
                 t.pnl += pnl;
             }
         }
-        let cash_like: f64 = self
-            .positions
-            .iter()
-            .filter(|p| selected(&p.account_id) && p.cash_equivalent)
-            .filter_map(|p| p.market_value())
-            .sum();
-        // Prefer the broker's total; fall back to cash + holdings when it is missing.
-        let reported: Vec<f64> = self.accounts.iter().filter(|a| selected(&a.id)).filter_map(|a| a.total).collect();
-        let n = self.accounts.iter().filter(|a| selected(&a.id)).count();
-        t.value = if reported.len() == n
-            && n > 0
-            && price_of_is_trivial(
-                self.positions.iter().filter(|p| selected(&p.account_id) && !p.cash_equivalent),
-                &price_of,
-            )
-        {
-            reported.iter().sum()
-        } else {
-            t.cash + t.invested + cash_like
-        };
+        // A quote override only replaces the reported total for its own account.
+        for a in self.accounts.iter().filter(|a| selected(&a.id)) {
+            let positions = || self.positions.iter().filter(|p| p.account_id == a.id);
+            t.value +=
+                if let Some(total) =
+                    a.total.filter(|_| price_of_is_trivial(positions().filter(|p| !p.cash_equivalent), &price_of))
+                {
+                    total
+                } else {
+                    a.cash.unwrap_or(0.0)
+                        + positions()
+                            .filter_map(|p| {
+                                if p.cash_equivalent { p.market_value() } else { p.market_value_at(price_of(p)) }
+                            })
+                            .sum::<f64>()
+                };
+        }
         t
     }
 }
@@ -693,6 +690,58 @@ mod tests {
         let mut opt = pos(InstrumentKind::Option, "AAPL  261218C00240000", 1.0, 1.0, 1.0);
         opt.underlying = Some("AAPL".into());
         assert_eq!(opt.market_key().as_deref(), Some("AAPL US Equity"), "options chart their underlying");
+    }
+
+    #[test]
+    fn totals_mix_reported_and_missing_account_totals() {
+        let mut accounts = parse_accounts(&serde_json::json!([
+            {"id": "A", "balance": {"total": {"amount": 1000}}},
+            {"id": "B"}
+        ]));
+        accounts[1].cash = Some(100.0);
+        let pf = Portfolio { accounts, ..Default::default() };
+
+        assert_eq!(pf.totals(None, |_| None).value, 1100.0);
+        assert_eq!(pf.totals(Some("A"), |_| None).value, 1000.0);
+        assert_eq!(pf.totals(Some("B"), |_| None).value, 100.0);
+        assert_eq!(pf.totals(Some("missing"), |_| None), Totals::default());
+    }
+
+    #[test]
+    fn totals_choose_reported_or_repriced_value_per_account() {
+        let mut accounts = parse_accounts(&serde_json::json!([
+            {"id": "A", "balance": {"total": {"amount": 1000}}},
+            {"id": "B", "balance": {"total": {"amount": 500}}}
+        ]));
+        accounts[0].cash = Some(100.0);
+        accounts[1].cash = Some(50.0);
+        accounts[1].buying_power = Some(200.0);
+        let mut stock = pos(InstrumentKind::Stock, "MSFT", 2.0, 100.0, 80.0);
+        stock.account_id = "B".into();
+        let mut cash = pos(InstrumentKind::Cash, "CASH", 1.0, 25.0, 25.0);
+        cash.account_id = "B".into();
+        cash.cash_equivalent = true;
+        let mut pf = Portfolio { accounts, positions: vec![stock, cash], ..Default::default() };
+
+        assert_eq!(pf.totals(None, |_| None).value, 1500.0);
+        assert_eq!(pf.totals(None, |p| (p.symbol == "CASH").then_some(999.0)).value, 1500.0);
+        let repriced = pf.totals(None, |p| (p.symbol == "MSFT").then_some(120.0));
+        assert_eq!(
+            repriced,
+            Totals { value: 1315.0, cash: 150.0, buying_power: 200.0, invested: 240.0, cost: 160.0, pnl: 80.0 }
+        );
+        assert_eq!(pf.totals(Some("A"), |_| Some(120.0)).value, 1000.0);
+        assert_eq!(pf.totals(Some("B"), |p| (p.symbol == "MSFT").then_some(120.0)).value, 315.0);
+
+        for a in &mut pf.accounts {
+            a.total = None;
+        }
+        let fallback = pf.totals(None, |_| None);
+        assert_eq!(
+            fallback,
+            Totals { value: 375.0, cash: 150.0, buying_power: 200.0, invested: 200.0, cost: 160.0, pnl: 40.0 }
+        );
+        assert_eq!(pf.totals(None, |p| (p.symbol == "CASH").then_some(999.0)), fallback);
     }
 
     #[test]
