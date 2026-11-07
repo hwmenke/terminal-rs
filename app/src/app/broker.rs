@@ -163,7 +163,11 @@ impl BrokerState {
         if p.kind == tr_broker::InstrumentKind::Option {
             return None;
         }
-        quotes.get(&p.market_key()?).map(|q| q.last).filter(|x| x.is_finite() && *x > 0.0)
+        quotes
+            .get(&p.market_key()?)
+            .filter(|q| self.portfolio.as_ref().is_some_and(|pf| pf.simulated) || q.provenance.is_verified())
+            .map(|q| q.last)
+            .filter(|x| x.is_finite() && *x > 0.0)
     }
 }
 
@@ -797,6 +801,45 @@ impl TerminalApp {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn live_price_respects_portfolio_quote_provenance() {
+        use tr_core::Provenance;
+
+        let mut app = super::super::tests::test_app();
+        let mut portfolio = tr_broker::sample::portfolio();
+        portfolio.simulated = false;
+        let position = &mut portfolio.positions[0];
+        position.units = 1.0;
+        position.multiplier = 1.0;
+        position.price = Some(100.0);
+        let position = position.clone();
+        let key = position.market_key().unwrap();
+        app.broker.portfolio = Some(Box::new(portfolio));
+
+        for provenance in [Provenance::Sample, Provenance::Missing, Provenance::Real, Provenance::Cached] {
+            let quotes = std::collections::HashMap::from([(
+                key.clone(),
+                tr_data::Quote {
+                    provenance,
+                    symbol: key.clone(),
+                    last: 999.0,
+                    prev_close: 999.0,
+                    ts: 0,
+                    spark: Vec::new(),
+                    stats: Default::default(),
+                },
+            )]);
+            let expected = if provenance.is_verified() { Some(999.0) } else { None };
+            let live = app.broker.live_price(&quotes, &position);
+            assert_eq!(live, expected, "real portfolio with {provenance:?} quote");
+            assert_eq!(position.market_value_at(live), Some(expected.unwrap_or(100.0)));
+
+            app.broker.portfolio.as_mut().unwrap().simulated = true;
+            assert_eq!(app.broker.live_price(&quotes, &position), Some(999.0));
+            app.broker.portfolio.as_mut().unwrap().simulated = false;
+        }
+    }
 
     // Worker channels record requests and deliver mock results without brokerage/network I/O.
     #[test]
