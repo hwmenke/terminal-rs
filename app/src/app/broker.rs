@@ -339,6 +339,10 @@ impl TerminalApp {
                 b.saved = b.form.clone();
                 let mut creds = b.form.clone();
                 b.from_env = creds.apply_env(|k| std::env::var(k).ok());
+                if b.creds != creds {
+                    b.connecting_since = None;
+                    b.portal_url = None;
+                }
                 b.creds = creds;
                 b.message = Some((ok.into(), false));
                 b.credential_generation += 1;
@@ -359,13 +363,16 @@ impl TerminalApp {
                 b.form = Credentials::default();
                 let mut creds = Credentials::default();
                 b.from_env = creds.apply_env(|k| std::env::var(k).ok());
+                if b.creds != creds {
+                    b.connecting_since = None;
+                    b.portal_url = None;
+                }
                 b.creds = creds;
                 b.credential_generation += 1;
                 b.loading = false;
                 b.portfolio = None;
                 b.error = None;
                 b.fetched = None;
-                b.portal_url = None;
                 b.message = Some((
                     if b.from_env {
                         "Saved credentials removed (SNAPTRADE_* environment variables still apply).".into()
@@ -843,6 +850,116 @@ mod tests {
         app.settings_tab = super::super::SettingsTab::Brokerage;
         app.panes.push(super::super::Pane { id: 1, kind: PaneKind::Settings, link: None, title: None, window: None });
         (app, requests)
+    }
+
+    #[test]
+    fn credential_session_save_different_clears_portal_and_window() {
+        let (mut app, mut requests) = discovery_app();
+        app.broker.portal_url = Some("https://example.invalid/old-identity".into());
+        app.broker.form = app.broker.creds.clone();
+        app.broker.form.user_id = "different-mock-user".into();
+        app.save_broker_form("saved");
+        assert!(app.broker.message.as_ref().is_some_and(|(_, error)| !error));
+        assert_eq!(
+            (app.broker.connecting_since.is_none(), app.broker.portal_url.is_none()),
+            (true, true),
+            "connection window and portal must both be cleared"
+        );
+        assert!(requests.try_recv().is_err());
+    }
+
+    #[test]
+    fn credential_session_forget_clears_window() {
+        let (mut app, mut requests) = discovery_app();
+        app.broker.portal_url = Some("https://example.invalid/old-identity".into());
+        app.forget_broker_credentials();
+        assert!(app.broker.message.as_ref().is_some_and(|(_, error)| !error));
+        assert!(app.broker.connecting_since.is_none());
+        assert!(app.broker.portal_url.is_none());
+        assert!(requests.try_recv().is_err());
+    }
+
+    #[test]
+    fn credential_session_save_identical_keeps_portal_and_window() {
+        let (mut app, mut requests) = discovery_app();
+        app.broker.form = app.broker.creds.clone();
+        app.broker.form.apply_env(|k| std::env::var(k).ok());
+        app.broker.creds = app.broker.form.clone();
+        let since = app.broker.connecting_since;
+        let portal = Some("https://example.invalid/same-identity".to_string());
+        app.broker.portal_url = portal.clone();
+        app.save_broker_form("saved");
+        assert!(app.broker.message.as_ref().is_some_and(|(_, error)| !error));
+        assert_eq!(app.broker.connecting_since, since);
+        assert_eq!(app.broker.portal_url, portal);
+        assert!(requests.try_recv().is_err());
+    }
+
+    #[test]
+    fn credential_session_forget_identical_effective_credentials_keeps_session() {
+        let (mut app, mut requests) = discovery_app();
+        let mut effective = Credentials::default();
+        effective.apply_env(|k| std::env::var(k).ok());
+        app.broker.creds = effective;
+        let since = app.broker.connecting_since;
+        let portal = Some("https://example.invalid/same-identity".to_string());
+        app.broker.portal_url = portal.clone();
+        app.forget_broker_credentials();
+        assert!(app.broker.message.as_ref().is_some_and(|(_, error)| !error));
+        assert_eq!(app.broker.connecting_since, since);
+        assert_eq!(app.broker.portal_url, portal);
+        assert!(requests.try_recv().is_err());
+    }
+
+    #[test]
+    fn credential_session_persistence_failure_keeps_state() {
+        for forget in [false, true] {
+            let (mut app, mut requests) = discovery_app();
+            // A directory cannot be replaced by the credential file or removed as a file.
+            let tr_broker::secrets::Backend::File(path) = &app.broker.store.backend else {
+                panic!("fixture must use a file store")
+            };
+            let path = path.with_extension("blocked-store");
+            std::fs::create_dir_all(&path).unwrap();
+            app.broker.store = tr_broker::SecretStore::file(&path);
+            app.broker.form = app.broker.creds.clone();
+            app.broker.form.user_id = "different-mock-user".into();
+            let creds = app.broker.creds.clone();
+            let saved = app.broker.saved.clone();
+            let form = app.broker.form.clone();
+            let generation = app.broker.credential_generation;
+            let since = app.broker.connecting_since;
+            let portal = Some("https://example.invalid/old-identity".to_string());
+            app.broker.portal_url = portal.clone();
+            if forget {
+                app.forget_broker_credentials();
+            } else {
+                app.save_broker_form("saved");
+            }
+            assert!(app.broker.message.as_ref().is_some_and(|(_, error)| *error));
+            assert!(app.broker.creds == creds);
+            assert!(app.broker.saved == saved);
+            assert!(app.broker.form == form);
+            assert_eq!(app.broker.credential_generation, generation);
+            assert!(app.broker.portfolio.is_some());
+            assert!(app.broker.fetched.is_some());
+            assert_eq!(app.broker.connecting_since, since);
+            assert_eq!(app.broker.portal_url, portal);
+            assert!(requests.try_recv().is_err());
+            std::fs::remove_dir_all(path).unwrap();
+        }
+    }
+
+    #[test]
+    fn credential_session_new_save_stops_settings_discovery() {
+        let (mut app, mut requests) = discovery_app();
+        app.broker.form = app.broker.creds.clone();
+        app.broker.form.user_id = "different-mock-user".into();
+        app.save_broker_form("saved");
+        assert!(app.broker.message.as_ref().is_some_and(|(_, error)| !error));
+        assert!(app.broker.creds.is_ready());
+        app.broker_periodic(&[0]);
+        assert!(requests.try_recv().is_err(), "new credentials must not inherit Settings discovery");
     }
 
     #[test]
