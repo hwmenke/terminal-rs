@@ -588,8 +588,7 @@ impl ChartState {
     pub fn set_range(&mut self, r: Range, w: &Worker) {
         self.pending_range = Some(r);
         if !self.archive && r.timeframe() != self.tf {
-            self.tf = r.timeframe();
-            self.load(w);
+            self.set_timeframe(r.timeframe(), w);
         } else {
             self.glide(Self::apply_range);
         }
@@ -3413,6 +3412,64 @@ mod tests {
             walk(&s.shape, &mut out);
         }
         out
+    }
+
+    #[test]
+    fn quick_range_restores_timeframe_drawings_without_corrupting_store() {
+        let (worker, _) = Worker::test_channel();
+        let mut chart = ChartState::new(1, "AAPL", Timeframe::D1);
+        let daily = Drawing::new(Tool::Trendline, Anchor { ts: 1, price: 10.0 }, Anchor { ts: 2, price: 20.0 });
+        let intraday = Drawing::new(Tool::Trendline, Anchor { ts: 50, price: 10.0 }, Anchor { ts: 51, price: 12.0 });
+        chart.drawings = vec![daily.clone()];
+        chart.set_timeframe(Timeframe::M5, &worker);
+        chart.drawings = vec![intraday.clone()];
+
+        chart.set_range(Range::Y1, &worker);
+        assert_eq!(chart.tf, Timeframe::D1);
+        assert_eq!(chart.pending_range, Some(Range::Y1));
+        assert_eq!(chart.drawings, vec![daily.clone()]);
+        assert_eq!(chart.drawing_store.get_view("AAPL", Timeframe::M5), vec![intraday.clone()]);
+
+        chart.set_timeframe(Timeframe::M5, &worker);
+        assert_eq!(chart.drawings, vec![intraday]);
+        assert_eq!(chart.drawing_store.get_view("AAPL", Timeframe::D1), vec![daily]);
+    }
+
+    #[test]
+    fn quick_range_cross_timeframe_clears_drawing_undo_and_selection() {
+        let (worker, _) = Worker::test_channel();
+        let mut chart = ChartState::new(1, "AAPL", Timeframe::M5);
+        let intraday = Drawing::new(Tool::Trendline, Anchor { ts: 50, price: 10.0 }, Anchor { ts: 51, price: 12.0 });
+        chart.drawings = vec![intraday.clone()];
+        chart.clear_drawings();
+        chart.drawings = vec![intraday.clone()];
+        chart.draw.selected = Some(0);
+        assert!(chart.drawing_undo.is_some());
+
+        chart.set_range(Range::Y1, &worker);
+        assert!(chart.drawings.is_empty());
+        assert!(chart.draw.selected.is_none());
+        assert!(!chart.undo_drawings());
+        assert_eq!(chart.drawing_store.get_view("AAPL", Timeframe::M5), vec![intraday]);
+    }
+
+    #[test]
+    fn quick_range_same_timeframe_keeps_drawings_undo_and_selection() {
+        let (worker, _) = Worker::test_channel();
+        let mut chart = ChartState::new(1, "AAPL", Timeframe::D1);
+        let daily = Drawing::new(Tool::Trendline, Anchor { ts: 1, price: 10.0 }, Anchor { ts: 2, price: 20.0 });
+        chart.drawings = vec![daily.clone()];
+        chart.clear_drawings();
+        chart.drawings = vec![daily.clone()];
+        chart.draw.selected = Some(0);
+        let generation = chart.generation;
+
+        chart.set_range(Range::Y1, &worker);
+        assert_eq!(chart.drawings, vec![daily.clone()]);
+        assert_eq!(chart.draw.selected, Some(0));
+        assert_eq!(chart.generation, generation, "same-timeframe range must not reload");
+        assert!(chart.undo_drawings());
+        assert_eq!(chart.drawings, vec![daily]);
     }
 
     #[test]
