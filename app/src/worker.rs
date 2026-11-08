@@ -1870,7 +1870,8 @@ async fn handle(s: &Arc<Shared>, req: Request) {
             s.send(Response::Portable(result.map_err(|e| format!("{e:#}"))));
             s.send(Response::HistoryChanged);
         }
-        Request::ReplacePriceAlerts(store) => {
+        Request::ReplacePriceAlerts(mut store) => {
+            store.repair_ids();
             {
                 let mut lock = s.price_alerts.lock().expect("price alerts");
                 *lock = store;
@@ -4133,6 +4134,38 @@ mod tests {
         let (s, _rx) = shared(std::sync::Arc::new(tr_data::sample::SampleProvider::at(0, 10)), None);
         let batch = fetch_news(&s, Some(vec!["AAPL US Equity".into()])).await;
         assert!(batch.sample && batch.items.is_empty());
+    }
+
+    #[tokio::test]
+    async fn replace_price_alerts_repairs_before_publish_and_persist() {
+        use tr_data::price_alerts::{AlertKind, PriceSide, RuleState, Store};
+        let (mut shared, rx) = shared(std::sync::Arc::new(tr_data::sample::SampleProvider::at(0, 10)), None);
+        let path = std::env::temp_dir().join(format!("tr-worker-alert-repair-{}.json", std::process::id()));
+        Arc::get_mut(&mut shared).unwrap().price_alerts_path = path.clone();
+        let mut incoming = Store::default();
+        for level in [100.00001, 100.00002] {
+            incoming.add_rule("AAPL", AlertKind::Price { side: PriceSide::Above, level }, 10).unwrap();
+        }
+        let base = incoming.rules[1].id.clone();
+        incoming.rules[0].id = base.clone();
+        incoming.states.insert(base.clone(), RuleState { last_price: Some(99.0), ..Default::default() });
+        handle(&shared, Request::ReplacePriceAlerts(incoming)).await;
+        let installed = shared.price_alerts.lock().unwrap().clone();
+        assert_ne!(installed.rules[0].id, installed.rules[1].id);
+        assert_eq!(installed.rules[0].id, base);
+        assert!(installed.states.is_empty());
+        let published = rx
+            .try_iter()
+            .find_map(|response| match response {
+                Response::PriceAlertFeed(batch) => Some(batch),
+                _ => None,
+            })
+            .expect("restored feed");
+        assert_eq!(published.rules, installed.rules);
+        // Deserialize directly so load's repair cannot mask a missing repair at installation.
+        let persisted: Store = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(persisted, installed);
+        std::fs::remove_file(path).unwrap();
     }
 
     #[tokio::test]
