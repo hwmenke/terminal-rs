@@ -4,7 +4,7 @@
 //! unverified bars. Freshness and partial-failure banners follow the Step 8 news
 //! pattern ([`crate::news::STALE_AFTER_SECS`], leftover list on a failed refresh).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use chrono::{TimeZone, Utc};
@@ -239,9 +239,52 @@ pub struct Store {
     pub states: BTreeMap<String, RuleState>,
 }
 
+/// Keep the legacy base whenever available; reserve each allocation for the next caller.
+fn allocate_id(base: &str, reserved: &mut BTreeSet<String>) -> String {
+    let mut candidate = base.to_string();
+    let mut suffix = 0usize;
+    while !reserved.insert(candidate.clone()) {
+        suffix += 1;
+        candidate = format!("{base}:{suffix}");
+    }
+    candidate
+}
+
 impl Store {
     pub fn load(path: &Path) -> Self {
-        std::fs::read(path).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default()
+        let mut store: Self =
+            std::fs::read(path).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default();
+        store.repair_ids();
+        store
+    }
+
+    fn reserved_ids(&self) -> BTreeSet<String> {
+        self.rules
+            .iter()
+            .map(|r| r.id.clone())
+            .chain(self.states.keys().cloned())
+            .chain(self.events.iter().map(|e| e.rule_id.clone()))
+            .collect()
+    }
+
+    /// Repair legacy collisions without reassigning historical events or ambiguous seeds.
+    pub fn repair_ids(&mut self) {
+        let mut counts = BTreeMap::new();
+        for rule in &self.rules {
+            *counts.entry(rule.id.clone()).or_insert(0usize) += 1;
+        }
+        let mut reserved = self.reserved_ids();
+        let mut seen = BTreeSet::new();
+        for rule in &mut self.rules {
+            if !seen.insert(rule.id.clone()) {
+                rule.id = allocate_id(&rule.id, &mut reserved);
+            }
+        }
+        for (id, count) in counts {
+            if count > 1 {
+                self.states.remove(&id);
+            }
+        }
     }
 
     pub fn save(&self, path: &Path) {
@@ -300,7 +343,7 @@ impl Store {
             return Err(format!("at most {MAX_RULES} price, VWAP, RVOL, setup, or session rules"));
         }
         let rule = AlertRule {
-            id: format!("{symbol}:{}:{now}", kind.fingerprint()),
+            id: allocate_id(&format!("{symbol}:{}:{now}", kind.fingerprint()), &mut self.reserved_ids()),
             symbol,
             kind,
             created_at: now,
@@ -840,6 +883,192 @@ mod tests {
                 failures: vec![],
             },
         )
+    }
+
+    #[test]
+    fn rvol_fingerprint_collision_allocates_unique_ids_and_fires_independently() {
+        let mut s = Store::default();
+        let a = s.add_rule("AAPL", AlertKind::Rvol { multiple: 2.00001 }, 10).unwrap();
+        let b = s.add_rule("AAPL", AlertKind::Rvol { multiple: 2.00002 }, 10).unwrap();
+        assert_eq!(b.id, format!("{}:1", a.id));
+        assert!(eval_rvol(&mut s, 20, vec![rvol_tick_of("AAPL", 1.0, 20, Provenance::Real, true)]).fired.is_empty());
+        let fired = eval_rvol(&mut s, 30, vec![rvol_tick_of("AAPL", 3.0, 30, Provenance::Real, true)]).fired;
+        assert_eq!(fired.len(), 2);
+        assert_ne!(fired[0].rule_id, fired[1].rule_id);
+        assert!(eval_rvol(&mut s, 30, vec![rvol_tick_of("AAPL", 3.0, 30, Provenance::Real, true)]).fired.is_empty());
+    }
+
+    #[test]
+    fn semantic_duplicates_keep_existing_row() {
+        for kind in
+            [AlertKind::Price { side: PriceSide::Above, level: 100.00001 }, AlertKind::Rvol { multiple: 2.00001 }]
+        {
+            let mut s = Store::default();
+            let original = s.add_rule("AAPL", kind.clone(), 10).unwrap();
+            assert_eq!(s.add_rule("AAPL", kind.clone(), 10).unwrap(), original);
+            let near = match kind {
+                AlertKind::Price { side, level } => AlertKind::Price { side, level: level + 0.0000005 },
+                AlertKind::Rvol { multiple } => AlertKind::Rvol { multiple: multiple + 0.0000005 },
+                _ => unreachable!(),
+            };
+            assert_eq!(s.add_rule("AAPL", near, 11).unwrap(), original);
+            assert_eq!(s.rules.len(), 1);
+        }
+    }
+
+    fn historical_event(rule_id: String) -> FiredAlert {
+        FiredAlert {
+            id: "historical".into(),
+            rule_id,
+            symbol: "AAPL US Equity".into(),
+            message: "unchanged".into(),
+            created_at: 3,
+            seen: true,
+            kind: AlertKind::Price { side: PriceSide::Above, level: 90.0 },
+            trigger_key: "old-trigger".into(),
+        }
+    }
+
+    #[test]
+    fn allocator_skips_rule_state_and_event_reservations() {
+        let mut s = collision_pair();
+        let base = s.rules[1].id.clone();
+        s.states.insert(format!("{base}:2"), RuleState::default());
+        s.events.push(historical_event(format!("{base}:3")));
+        let next = s.add_rule("AAPL", AlertKind::Price { side: PriceSide::Above, level: 100.00003 }, 10).unwrap();
+        assert_eq!(next.id, format!("{base}:4"));
+    }
+
+    #[test]
+    fn allocated_ids_target_toggle_remove_and_symbol_removal() {
+        let mut s = collision_pair();
+        let id = s.rules[0].id.clone();
+        assert!(s.set_enabled(&id, false));
+        assert!(!s.rules[0].enabled);
+        assert!(s.rules[1].enabled);
+        assert_eq!(s.remove(&id), 1);
+        assert_eq!(s.rules.len(), 1);
+        s.add_rule("AAPL", AlertKind::Rvol { multiple: 2.0 }, 10).unwrap();
+        assert_eq!(s.remove("AAPL"), 2);
+    }
+
+    fn legacy_collision_store() -> Store {
+        let mut s = collision_pair();
+        let base = s.rules[1].id.clone();
+        s.rules[0].id = base.clone();
+        let mut third = s.rules[0].clone();
+        third.kind = AlertKind::Price { side: PriceSide::Above, level: 100.00003 };
+        third.enabled = false;
+        third.created_at = 9;
+        s.rules.push(third);
+        let mut suffixed = s.rules[0].clone();
+        suffixed.id = format!("{base}:1");
+        suffixed.symbol = "MSFT US Equity".into();
+        s.rules.push(suffixed);
+        s.states.insert(base.clone(), RuleState { last_price: Some(99.0), ..Default::default() });
+        s.states.insert(format!("{base}:2"), RuleState { last_eval_at: 7, ..Default::default() });
+        s.events.push(historical_event(format!("{base}:3")));
+        s.events.push(historical_event(base));
+        s
+    }
+
+    #[test]
+    fn repair_preserves_fields_order_events_and_unrelated_states() {
+        let original = legacy_collision_store();
+        let base = original.rules[0].id.clone();
+        let mut s = original.clone();
+        s.repair_ids();
+        assert_eq!(
+            s.rules.iter().map(|r| r.id.clone()).collect::<Vec<_>>(),
+            vec![base.clone(), format!("{base}:4"), format!("{base}:5"), format!("{base}:1")]
+        );
+        for (mut repaired, old) in s.rules.clone().into_iter().zip(&original.rules) {
+            repaired.id = old.id.clone();
+            assert_eq!(&repaired, old);
+        }
+        assert_eq!(s.events, original.events);
+        let mut expected_states = original.states.clone();
+        expected_states.remove(&base);
+        assert_eq!(s.states, expected_states);
+    }
+
+    #[test]
+    fn repair_is_deterministic_idempotent_and_unique_stores_unchanged() {
+        let mut a = legacy_collision_store();
+        let mut b = a.clone();
+        a.repair_ids();
+        b.repair_ids();
+        assert_eq!(a, b);
+        a.repair_ids();
+        assert_eq!(a, b);
+        let mut unique = collision_pair();
+        unique.states.insert(unique.rules[0].id.clone(), RuleState::default());
+        unique.events.push(historical_event(unique.rules[1].id.clone()));
+        let before = unique.clone();
+        unique.repair_ids();
+        assert_eq!(unique, before);
+    }
+
+    #[test]
+    fn repaired_rules_reseed_then_cross_independently() {
+        let mut s = collision_pair();
+        let base = s.rules[1].id.clone();
+        s.rules[0].id = base.clone();
+        s.states.insert(base, RuleState { last_price: Some(99.0), ..Default::default() });
+        s.repair_ids();
+        assert!(eval(&mut s, 20, vec![price("AAPL", 101.0, 20, Provenance::Real)], vec![]).fired.is_empty());
+        assert!(eval(&mut s, 30, vec![price("AAPL", 99.0, 30, Provenance::Real)], vec![]).fired.is_empty());
+        let first = eval(&mut s, 40, vec![price("AAPL", 100.000015, 40, Provenance::Real)], vec![]).fired;
+        let second = eval(&mut s, 50, vec![price("AAPL", 101.0, 50, Provenance::Real)], vec![]).fired;
+        assert_eq!(first.len(), 1);
+        assert_eq!(second.len(), 1);
+        assert_ne!(first[0].rule_id, second[0].rule_id);
+    }
+
+    #[test]
+    fn load_repairs_legacy_collisions_without_writes_and_roundtrips() {
+        let path = std::env::temp_dir().join(format!("tr-alert-collision-{}.json", std::process::id()));
+        let original = legacy_collision_store();
+        original.save(&path);
+        let bytes = std::fs::read(&path).unwrap();
+        let loaded = Store::load(&path);
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        assert_eq!(Store::load(&path), loaded);
+        let mut expected = original;
+        expected.repair_ids();
+        assert_eq!(loaded, expected);
+        loaded.save(&path);
+        assert_eq!(Store::load(&path), loaded);
+        let unique = collision_pair();
+        unique.save(&path);
+        assert_eq!(Store::load(&path), unique);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    fn collision_pair() -> Store {
+        let mut s = Store::default();
+        for level in [100.00001, 100.00002] {
+            s.add_rule("AAPL", AlertKind::Price { side: PriceSide::Above, level }, 10).unwrap();
+        }
+        assert_eq!(s.rules.len(), 2);
+        s
+    }
+
+    #[test]
+    fn price_fingerprint_collision_allocates_unique_deterministic_ids() {
+        let s = collision_pair();
+        assert_eq!(s.rules[1].id, "AAPL US Equity:price:above:100.0000:10");
+        assert_eq!(s.rules[0].id, format!("{}:1", s.rules[1].id));
+    }
+
+    #[test]
+    fn colliding_price_rules_fire_independently() {
+        let mut s = collision_pair();
+        assert!(eval(&mut s, 20, vec![price("AAPL", 99.0, 20, Provenance::Real)], vec![]).fired.is_empty());
+        let fired = eval(&mut s, 30, vec![price("AAPL", 101.0, 30, Provenance::Real)], vec![]).fired;
+        assert_eq!(fired.len(), 2, "shared state misses one crossing");
+        assert_ne!(fired[0].rule_id, fired[1].rule_id);
+        assert!(eval(&mut s, 30, vec![price("AAPL", 101.0, 30, Provenance::Real)], vec![]).fired.is_empty());
     }
 
     #[test]
