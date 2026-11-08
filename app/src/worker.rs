@@ -1141,7 +1141,15 @@ async fn research_scan(
     if let Some(service) = service {
         tr_data::whats_news::attach_service(&mut data, service)?;
     }
-    Ok(tr_data::whats_news::ScanSnapshot { breadth, snapshot: tr_data::whats_news::Snapshot { failures: vec![], data, provenance: tr_core::Provenance::Cached, source } })
+    Ok(tr_data::whats_news::ScanSnapshot {
+        breadth,
+        snapshot: tr_data::whats_news::Snapshot {
+            failures: vec![],
+            data,
+            provenance: tr_core::Provenance::Cached,
+            source,
+        },
+    })
 }
 
 /// Load one name from the local archive, then Whats-News. Sample/display bars never enter.
@@ -2993,6 +3001,48 @@ async fn intraday_scan(s: &Shared, symbols: &[String]) -> tr_data::iscan::Board 
     tr_data::iscan::build(items, sample)
 }
 
+/// One daily/M5 pair per enabled symbol, with each requested setup evaluated once.
+fn combo_acquisition_plan(
+    rules: &[tr_data::price_alerts::AlertRule],
+) -> std::collections::BTreeMap<String, Vec<String>> {
+    let mut plan: std::collections::BTreeMap<String, Vec<String>> = Default::default();
+    for rule in rules.iter().filter(|r| r.enabled) {
+        if let tr_data::price_alerts::AlertKind::SetupPriceRvol { setup, .. } = &rule.kind {
+            let names = plan.entry(rule.symbol.clone()).or_default();
+            if !names.contains(setup) {
+                names.push(setup.clone());
+            }
+        }
+    }
+    plan
+}
+
+#[cfg(test)]
+mod combo_acquisition_tests {
+    use super::*;
+    #[test]
+    fn combo_plan_deduplicates_enabled_symbols_and_setups() {
+        use tr_data::price_alerts::{AlertKind, PriceSide, Store};
+        let mut store = Store::default();
+        for (setup, level) in [("NEAR_HIGH", 100.0), ("NEAR_HIGH", 110.0), ("VOL_SURGE", 120.0)] {
+            store
+                .add_rule(
+                    "AAPL",
+                    AlertKind::SetupPriceRvol { setup: setup.into(), side: PriceSide::Above, level, multiple: 2.0 },
+                    1,
+                )
+                .unwrap();
+        }
+        let mut disabled = store.rules[0].clone();
+        disabled.symbol = "MSFT US Equity".into();
+        disabled.enabled = false;
+        store.rules.push(disabled);
+        let plan = combo_acquisition_plan(&store.rules);
+        assert_eq!(plan.len(), 1);
+        assert_eq!(plan["AAPL US Equity"].len(), 2);
+    }
+}
+
 async fn evaluate_price_alerts(s: &Shared) {
     use tr_data::price_alerts::{
         AlertFailure, AlertKind, EvalInput, PriceTick, evaluate, rvol_tick, setup_tick, vwap_tick,
@@ -3013,6 +3063,7 @@ async fn evaluate_price_alerts(s: &Shared) {
                 vwaps: Vec::new(),
                 rvols: Vec::new(),
                 sessions: Vec::new(),
+                combos: Vec::new(),
                 failures: Vec::new(),
             },
         );
@@ -3023,6 +3074,7 @@ async fn evaluate_price_alerts(s: &Shared) {
         s.send(Response::PriceAlertFeed(s.price_alert_snapshot(now)));
         return;
     }
+    let combo_keys = combo_acquisition_plan(&rules);
     let mut price_keys = Vec::new();
     let mut vwap_keys = Vec::new();
     let mut rvol_keys = Vec::new();
@@ -3030,6 +3082,7 @@ async fn evaluate_price_alerts(s: &Shared) {
     let mut session_rules: Vec<(String, SessionSignal)> = Vec::new();
     for r in rules.iter().filter(|r| r.enabled) {
         match &r.kind {
+            AlertKind::SetupPriceRvol { .. } => {}
             AlertKind::Price { .. } => {
                 if !price_keys.iter().any(|s| s == &r.symbol) {
                     price_keys.push(r.symbol.clone());
@@ -3207,9 +3260,27 @@ async fn evaluate_price_alerts(s: &Shared) {
             }
         }
     }
+    let mut combos = Vec::new();
+    for (symbol, names) in combo_keys {
+        let ticker = archive_ticker(&symbol);
+        let daily = s
+            .history
+            .db(move |db| {
+                db.histories_for(std::slice::from_ref(&ticker)).map(|mut map| map.remove(&ticker).unwrap_or_default())
+            })
+            .await;
+        let m5 = s.provider.history(&symbol, Timeframe::M5, None, tr_data::iscan::BARS).await;
+        match (daily, m5) {
+            (Ok(daily), Ok(m5)) => match tr_data::price_alerts::combo_tick(&symbol, &daily, &m5, &names, now) {
+                Ok(tick) => combos.push(tick),
+                Err(error) => failures.push(AlertFailure { symbol, error }),
+            },
+            (Err(e), _) | (_, Err(e)) => failures.push(AlertFailure { symbol, error: format!("{e:#}") }),
+        }
+    }
     let outcome = evaluate(
         &mut s.price_alerts.lock().expect("price alerts"),
-        EvalInput { now, sample_provider: false, prices, setups, vwaps, rvols, sessions, failures },
+        EvalInput { now, sample_provider: false, prices, setups, vwaps, rvols, sessions, combos, failures },
     );
     s.persist_price_alerts();
     if !outcome.fired.is_empty() {
@@ -4218,7 +4289,10 @@ mod enriched_scan_tests {
             provenance: tr_core::Provenance::Cached,
             scanned: 2,
             skipped: vec![],
-            results: vec![ScanRow { symbol: "SPY".into(), ..Default::default() }, ScanRow { symbol: "WIN".into(), ..Default::default() }],
+            results: vec![
+                ScanRow { symbol: "SPY".into(), ..Default::default() },
+                ScanRow { symbol: "WIN".into(), ..Default::default() },
+            ],
         };
         super::strip_spy_from_scan(&mut scan, true);
         assert_eq!(scan.scanned, 1);

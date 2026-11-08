@@ -12,6 +12,7 @@ use crate::worker::Request;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AlertDraftMode {
+    Combo,
     Price,
     Vwap,
     Rvol,
@@ -25,6 +26,7 @@ pub struct AlertDraft {
     pub mode: AlertDraftMode,
     pub side: PriceSide,
     pub level: String,
+    pub multiple: String,
     pub setup: String,
     pub change: SetupChange,
     pub signal: SessionSignal,
@@ -37,6 +39,7 @@ impl Default for AlertDraft {
             mode: AlertDraftMode::Price,
             side: PriceSide::Above,
             level: String::new(),
+            multiple: String::new(),
             setup: "NEAR_HIGH".into(),
             change: SetupChange::Enter,
             signal: SessionSignal::Path,
@@ -108,7 +111,30 @@ impl TerminalApp {
             if ui.selectable_label(self.alert_draft.mode == AlertDraftMode::Session, "Session").clicked() {
                 self.alert_draft.mode = AlertDraftMode::Session;
             }
+            if ui.selectable_label(self.alert_draft.mode == AlertDraftMode::Combo, "Setup + price + RVOL").clicked() {
+                self.alert_draft.mode = AlertDraftMode::Combo;
+            }
             match self.alert_draft.mode {
+                AlertDraftMode::Combo => {
+                    egui::ComboBox::from_id_salt("combo-setup").selected_text(&self.alert_draft.setup).show_ui(
+                        ui,
+                        |ui| {
+                            for name in SETUPS.iter().filter(|s| **s != "ALL" && **s != "ONEIL_LENS") {
+                                ui.selectable_value(&mut self.alert_draft.setup, (*name).to_string(), *name);
+                            }
+                        },
+                    );
+                    ui.selectable_value(&mut self.alert_draft.side, PriceSide::Above, "above");
+                    ui.selectable_value(&mut self.alert_draft.side, PriceSide::Below, "below");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.alert_draft.level).desired_width(72.0).hint_text("level"),
+                    );
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.alert_draft.multiple)
+                            .desired_width(72.0)
+                            .hint_text("RVOL min"),
+                    );
+                }
                 AlertDraftMode::Price => {
                     if ui.selectable_label(self.alert_draft.side == PriceSide::Above, "above").clicked() {
                         self.alert_draft.side = PriceSide::Above;
@@ -178,7 +204,7 @@ impl TerminalApp {
         });
         ui.label(
             RichText::new(
-                "AAPL ALERT 150 · AAPL ALERT VWAP · AAPL ALERT RVOL 2 · AAPL ALERT PATH · AAPL ALERT PACE · AAPL ALERT GAP · AAPL ALERT XTRM · AAPL ALERT RPATH · NVDA ALERT SETUP NEAR_HIGH · click a fired row for the chart",
+                "AAPL ALERT COMBO NEAR_HIGH ABOVE 250 RVOL 2 · previous session setup; M5 crossing with RVOL at that print · AAPL ALERT 150 · AAPL ALERT VWAP · AAPL ALERT RVOL 2 · AAPL ALERT PATH · AAPL ALERT PACE · AAPL ALERT GAP · AAPL ALERT XTRM · AAPL ALERT RPATH · NVDA ALERT SETUP NEAR_HIGH · click a fired row for the chart",
             )
             .font(ui_font(11.0))
             .color(muted()),
@@ -187,6 +213,16 @@ impl TerminalApp {
 
     fn draft_kind(&self) -> Result<AlertKind, String> {
         match self.alert_draft.mode {
+            AlertDraftMode::Combo => {
+                let setup = tr_data::price_alerts::normalize_combo_setup(&self.alert_draft.setup)
+                    .ok_or("Pick an individual setup")?;
+                let level: f64 = self.alert_draft.level.trim().parse().map_err(|_| "Type a price level")?;
+                let multiple: f64 = self.alert_draft.multiple.trim().parse().map_err(|_| "Type an RVOL multiple")?;
+                if !level.is_finite() || level <= 0.0 || !multiple.is_finite() || multiple <= 0.0 {
+                    return Err("Price and RVOL must be positive numbers".into());
+                }
+                Ok(AlertKind::SetupPriceRvol { setup, side: self.alert_draft.side, level, multiple })
+            }
             AlertDraftMode::Price => {
                 let level: f64 = self.alert_draft.level.trim().parse().map_err(|_| "Type a price level".to_string())?;
                 if !level.is_finite() || level <= 0.0 {
@@ -362,10 +398,13 @@ mod tests {
             egui::RawInput {
                 time: Some(ctx.input(|i| i.time) + 0.2),
                 events,
-                screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(1100.0, 240.0))),
+                screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(1100.0, 700.0))),
                 ..Default::default()
             },
-            |ui| app.alert_form(ui),
+            |ui| {
+                app.alert_form(ui);
+                app.alert_rules(ui);
+            },
         );
         output.textures_delta.clear();
         output.shapes
@@ -406,6 +445,104 @@ mod tests {
         let pos = text_position(shapes, label);
         paint(ctx, app, vec![egui::Event::PointerMoved(pos), pointer(pos, true)]);
         paint(ctx, app, vec![pointer(pos, false)]);
+    }
+
+    #[test]
+    fn combo_feed_and_fired_event_chart_jump() {
+        let ctx = egui::Context::default();
+        let mut app = test_app();
+        let (worker, _requests, responses) = crate::worker::Worker::test_channel_with_responses();
+        app.worker = worker;
+        let kind = AlertKind::SetupPriceRvol {
+            setup: "NEAR_HIGH".into(),
+            side: PriceSide::Above,
+            level: 250.0,
+            multiple: 2.0,
+        };
+        let mut batch = tr_data::price_alerts::AlertBatch::empty(1);
+        batch.events.push(tr_data::price_alerts::FiredAlert {
+            id: "event".into(),
+            rule_id: "combo".into(),
+            symbol: "MSFT US Equity".into(),
+            message: "Combo fired".into(),
+            created_at: 1,
+            seen: false,
+            kind,
+            trigger_key: "event".into(),
+        });
+        responses.send(crate::worker::Response::PriceAlertFeed(batch.clone())).unwrap();
+        app.drain();
+        assert_eq!(app.price_alerts, batch);
+        assert_eq!(app.price_alerts.unread(), 1);
+        let mut render = |events| {
+            let mut actions = Vec::new();
+            let mut output = ctx.run_ui(
+                egui::RawInput {
+                    time: Some(ctx.input(|i| i.time) + 0.2),
+                    events,
+                    screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(1100.0, 700.0))),
+                    ..Default::default()
+                },
+                |ui| app.alert_events(ui, &mut actions),
+            );
+            output.textures_delta.clear();
+            (output.shapes, actions)
+        };
+        let (shapes, _) = render(vec![]);
+        let pos = text_position(&shapes, "Combo fired");
+        render(vec![egui::Event::PointerMoved(pos), pointer(pos, true)]);
+        let (_, actions) = render(vec![pointer(pos, false)]);
+        assert!(actions.iter().any(|a| matches!(a, Action::OpenChart(symbol) if symbol == "MSFT US Equity")));
+        app.open_security("MSFT US Equity");
+        assert!(
+            app.panes
+                .iter()
+                .any(|p| matches!(&p.kind, super::super::PaneKind::Chart(c) if c.symbol == "MSFT US Equity"))
+        );
+    }
+
+    #[test]
+    fn combo_form_label_and_worker_request() {
+        let ctx = egui::Context::default();
+        let mut app = test_app();
+        let (worker, mut requests) = crate::worker::Worker::test_channel();
+        app.worker = worker;
+        app.alert_draft.symbol = "aapl".into();
+        let shapes = paint(&ctx, &mut app, vec![]);
+        click(&ctx, &mut app, &shapes, "Setup + price + RVOL");
+        assert_eq!(app.alert_draft.mode, AlertDraftMode::Combo);
+        assert!(app.draft_kind().is_err());
+        app.alert_draft.level = "250".into();
+        app.alert_draft.multiple = "2".into();
+        let kind = app.draft_kind().unwrap();
+        assert_eq!(kind.label(), "NEAR_HIGH + above 250.00 + RVOL ≥ 2.00×");
+        let shapes = paint(&ctx, &mut app, vec![]);
+        click(&ctx, &mut app, &shapes, "WATCH");
+        assert!(std::iter::from_fn(|| requests.try_recv().ok()).any(
+            |r| matches!(r, Request::AddPriceAlert { symbol, kind: k } if symbol == "AAPL US Equity" && k == kind)
+        ));
+        app.price_alerts.rules.push(tr_data::price_alerts::AlertRule {
+            id: "combo".into(),
+            symbol: "AAPL US Equity".into(),
+            kind: kind.clone(),
+            created_at: 1,
+            enabled: true,
+        });
+        let shapes = paint(&ctx, &mut app, vec![]);
+        assert!(galley_contains(&shapes, &kind.label()));
+        click(&ctx, &mut app, &shapes, "on");
+        assert!(
+            std::iter::from_fn(|| requests.try_recv().ok())
+                .any(|r| matches!(r, Request::SetPriceAlertEnabled { id, enabled: false } if id == "combo"))
+        );
+        let shapes = paint(&ctx, &mut app, vec![]);
+        click(&ctx, &mut app, &shapes, "Remove");
+        assert!(
+            std::iter::from_fn(|| requests.try_recv().ok())
+                .any(|r| matches!(r, Request::RemovePriceAlert { query } if query == "combo"))
+        );
+        app.alert_draft.setup = "ALL".into();
+        assert!(app.draft_kind().is_err());
     }
 
     #[test]

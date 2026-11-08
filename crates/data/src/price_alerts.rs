@@ -74,6 +74,12 @@ impl SetupChange {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "PascalCase")]
 pub enum AlertKind {
+    SetupPriceRvol {
+        setup: String,
+        side: PriceSide,
+        level: f64,
+        multiple: f64,
+    },
     Price {
         side: PriceSide,
         level: f64,
@@ -99,6 +105,9 @@ pub enum AlertKind {
 impl AlertKind {
     pub fn fingerprint(&self) -> String {
         match self {
+            Self::SetupPriceRvol { setup, side, level, multiple } => {
+                format!("combo:{setup}:{}:{level:.4}:{multiple:.4}", side.as_str())
+            }
             Self::Price { side, level } => format!("price:{}:{level:.4}", side.as_str()),
             Self::Vwap { side } => format!("vwap:{}", side.as_str()),
             Self::Rvol { multiple } => format!("rvol:{multiple:.4}"),
@@ -109,6 +118,19 @@ impl AlertKind {
 
     pub fn same(&self, other: &Self) -> bool {
         match (self, other) {
+            (
+                Self::SetupPriceRvol { setup: a, side: b, level: c, multiple: d },
+                Self::SetupPriceRvol { setup: w, side: x, level: y, multiple: z },
+            ) => {
+                a == w
+                    && b == x
+                    && c.is_finite()
+                    && d.is_finite()
+                    && y.is_finite()
+                    && z.is_finite()
+                    && (c - y).abs() < 1e-6
+                    && (d - z).abs() < 1e-6
+            }
             (Self::Price { side: a, level: x }, Self::Price { side: b, level: y }) => {
                 a == b && x.is_finite() && y.is_finite() && (x - y).abs() < 1e-6
             }
@@ -124,6 +146,9 @@ impl AlertKind {
 
     pub fn label(&self) -> String {
         match self {
+            Self::SetupPriceRvol { setup, side, level, multiple } => {
+                format!("{setup} + {} {level:.2} + RVOL ≥ {multiple:.2}×", side.label())
+            }
             Self::Price { side, level } => format!("{} {level:.2}", side.label()),
             Self::Vwap { side } => format!("{} session VWAP", side.label()),
             Self::Rvol { multiple } => format!("session RVOL {multiple:.2}×"),
@@ -210,7 +235,8 @@ impl AlertBatch {
             .filter(|r| r.enabled && r.symbol == symbol)
             .filter_map(|r| match r.kind {
                 AlertKind::Price { side, level } => Some((level, side)),
-                AlertKind::Vwap { .. }
+                AlertKind::SetupPriceRvol { .. }
+                | AlertKind::Vwap { .. }
                 | AlertKind::Rvol { .. }
                 | AlertKind::Setup { .. }
                 | AlertKind::Session { .. } => None,
@@ -322,6 +348,15 @@ impl Store {
         let symbol = crate::security(&symbol.into()).key();
         if symbol.is_empty() {
             return Err("invalid security".into());
+        }
+        if let AlertKind::SetupPriceRvol { ref setup, level, multiple, .. } = kind
+            && (normalize_combo_setup(setup).as_ref() != Some(setup)
+                || !level.is_finite()
+                || level <= 0.0
+                || !multiple.is_finite()
+                || multiple <= 0.0)
+        {
+            return Err("COMBO needs an individual setup, positive price and RVOL multiple".into());
         }
         if let AlertKind::Price { level, .. } = kind {
             if !level.is_finite() || level <= 0.0 {
@@ -497,6 +532,83 @@ pub struct SetupTickResult {
     pub failures: Vec<(String, String)>,
 }
 
+/// One temporally aligned observation; missing setup entries remain unknown.
+#[derive(Debug, Clone)]
+pub struct ComboTick {
+    pub symbol: String,
+    pub price: f64,
+    pub rvol: f64,
+    pub bar_ts: i64,
+    pub session_date: chrono::NaiveDate,
+    pub active: BTreeMap<String, bool>,
+    pub fresh: bool,
+    pub provenance: Provenance,
+}
+
+pub fn normalize_combo_setup(name: &str) -> Option<String> {
+    normalize_setup(name).filter(|s| s != "ALL" && s != "ONEIL_LENS")
+}
+
+/// Price and RVOL share exactly one M5 read; daily history ends on the prior session.
+pub fn combo_tick(
+    symbol: &str,
+    daily: &[tr_core::Bar],
+    m5: &[tr_core::Bar],
+    wanted: &[String],
+    now: i64,
+) -> Result<ComboTick, String> {
+    if m5.iter().any(|b| {
+        !b.open.is_finite()
+            || !b.high.is_finite()
+            || !b.low.is_finite()
+            || !b.close.is_finite()
+            || !b.volume.is_finite()
+            || b.volume < 0.0
+    }) {
+        return Err("invalid M5 history".into());
+    }
+    let mut m5 = m5.to_vec();
+    m5.sort_by_key(|b| b.ts);
+    let rv = rvol_tick(symbol, &m5, now)?;
+    let print = crate::intraday::session_print(tr_core::Timeframe::M5, &m5).ok_or("no regular print")?;
+    if print.bar_ts != rv.bar_ts {
+        return Err("unaligned price and RVOL print".into());
+    }
+    let session_date = Utc.timestamp_opt(rv.bar_ts, 0).single().ok_or("invalid timestamp")?.date_naive();
+    let prior = crate::history::calendar::previous_session(session_date);
+    let bars: Vec<_> = daily
+        .iter()
+        .filter(|b| Utc.timestamp_opt(b.ts, 0).single().is_some_and(|d| d.date_naive() <= prior))
+        .cloned()
+        .collect();
+    if bars.last().and_then(|b| Utc.timestamp_opt(b.ts, 0).single()).map(|d| d.date_naive()) != Some(prior) {
+        return Err("COMBO needs daily history ending on the previous session".into());
+    }
+    if wanted.iter().any(|s| normalize_combo_setup(s).as_ref() != Some(s)) {
+        return Err("unsupported COMBO setup".into());
+    }
+    if bars.iter().any(|b| {
+        !b.open.is_finite()
+            || !b.high.is_finite()
+            || !b.low.is_finite()
+            || !b.close.is_finite()
+            || !b.volume.is_finite()
+    }) {
+        return Err("invalid daily history".into());
+    }
+    let result = setup_tick(symbol, &bars, wanted, rv.bar_ts, None)?;
+    Ok(ComboTick {
+        symbol: rv.symbol,
+        price: print.close,
+        rvol: rv.rvol,
+        bar_ts: rv.bar_ts,
+        session_date,
+        active: result.tick.active,
+        fresh: rv.fresh,
+        provenance: rv.provenance,
+    })
+}
+
 pub struct EvalInput {
     pub now: i64,
     pub sample_provider: bool,
@@ -505,6 +617,7 @@ pub struct EvalInput {
     pub vwaps: Vec<VwapTick>,
     pub rvols: Vec<RvolTick>,
     pub sessions: Vec<SessionTick>,
+    pub combos: Vec<ComboTick>,
     pub failures: Vec<AlertFailure>,
 }
 
@@ -545,6 +658,9 @@ fn crossed(prev: f64, price: f64, side: PriceSide, level: f64) -> bool {
 /// Sample / unverified ticks never produce events.
 pub fn evaluate(store: &mut Store, input: EvalInput) -> EvalOutcome {
     if input.sample_provider {
+        for r in store.rules.iter().filter(|r| matches!(r.kind, AlertKind::SetupPriceRvol { .. })) {
+            store.states.remove(&r.id);
+        }
         let mut batch = store.snapshot(input.now, false, true, Vec::new());
         batch.sample = true;
         return EvalOutcome { batch, fired: Vec::new() };
@@ -560,6 +676,71 @@ pub fn evaluate(store: &mut Store, input: EvalInput) -> EvalOutcome {
     let rules = store.rules.clone();
     for rule in rules.iter().filter(|r| r.enabled) {
         match &rule.kind {
+            AlertKind::SetupPriceRvol { setup, side, level, multiple } => {
+                let tick = input.combos.iter().find(|t| t.symbol == rule.symbol);
+                // Out-of-order observations cannot change the seed.
+                if tick.is_some_and(|t| {
+                    store.states.get(&rule.id).and_then(|s| s.last_bar_ts).is_some_and(|ts| t.bar_ts < ts)
+                }) {
+                    continue;
+                }
+                let valid = tick.filter(|t| {
+                    t.provenance.is_verified()
+                        && t.fresh
+                        && t.price.is_finite()
+                        && t.price > 0.0
+                        && t.rvol.is_finite()
+                        && t.rvol > 0.0
+                        && t.active.contains_key(setup)
+                });
+                let Some(t) = valid else {
+                    if tick.is_some_and(|t| !t.fresh) {
+                        stale = true;
+                    }
+                    failures.push(AlertFailure {
+                        symbol: rule.symbol.clone(),
+                        error: format!("COMBO {setup}: missing, stale or invalid aligned observation"),
+                    });
+                    let state = store.states.entry(rule.id.clone()).or_default();
+                    state.last_price = None;
+                    if let Some(t) = tick {
+                        state.last_bar_ts = Some(t.bar_ts);
+                    }
+                    continue;
+                };
+                // A stale/sample duplicate above still marks an unknown interval.
+                if store.states.get(&rule.id).and_then(|s| s.last_bar_ts) == Some(t.bar_ts) {
+                    continue;
+                }
+                let prev = store
+                    .states
+                    .get(&rule.id)
+                    .filter(|s| s.last_session_date == Some(t.session_date))
+                    .and_then(|s| s.last_price);
+                if prev.is_some_and(|p| crossed(p, t.price, *side, *level))
+                    && t.active[setup]
+                    && t.rvol >= *multiple
+                    && let Some(event) = store.try_fire(
+                        rule,
+                        format!(
+                            "{} {} at {:.2} (RVOL {:.2}×)",
+                            crate::security(&rule.symbol).ticker,
+                            rule.kind.label(),
+                            t.price,
+                            t.rvol
+                        ),
+                        format!("{}:combo:{}", rule.id, t.bar_ts),
+                        input.now,
+                    )
+                {
+                    fired.push(event);
+                }
+                let state = store.states.entry(rule.id.clone()).or_default();
+                state.last_price = Some(t.price);
+                state.last_bar_ts = Some(t.bar_ts);
+                state.last_session_date = Some(t.session_date);
+                state.last_eval_at = input.now;
+            }
             AlertKind::Price { side, level } => {
                 let Some(tick) = prices.get(&rule.symbol) else {
                     failures.push(AlertFailure { symbol: rule.symbol.clone(), error: "no quote for this name".into() });
@@ -832,6 +1013,163 @@ mod tests {
     use super::*;
     use tr_core::Bar;
 
+    #[test]
+    fn combo_builder_aligns_previous_session_without_lookahead() {
+        let wall = |d, h, m| {
+            tr_core::ny::to_utc(chrono::NaiveDate::from_ymd_opt(2026, 3, d).unwrap().and_hms_opt(h, m, 0).unwrap())
+        };
+        let bar = |ts, volume| Bar::new(ts, 99.0, 101.0, 98.0, 100.0, volume).with_provenance(Provenance::Real);
+        let m5 = vec![bar(wall(6, 9, 30), 100.0), bar(wall(9, 9, 30), 300.0)];
+        let daily = vec![bar(wall(6, 0, 0), 100.0), bar(wall(9, 0, 0), 999.0)];
+        let wanted = vec!["NEAR_HIGH".into()];
+        let tick = combo_tick("AAPL", &daily, &m5, &wanted, wall(9, 9, 31)).unwrap();
+        let prior = combo_tick("AAPL", &daily[..1], &m5, &wanted, wall(9, 9, 31)).unwrap();
+        assert_eq!(tick.active, prior.active);
+        assert_eq!(tick.price, 100.0);
+        assert_eq!(tick.rvol, 3.0);
+        assert_eq!(tick.bar_ts, wall(9, 9, 30));
+        assert!(combo_tick("AAPL", &daily[1..], &m5, &wanted, wall(9, 9, 31)).is_err());
+        assert!(combo_tick("AAPL", &daily, &m5[1..], &wanted, wall(9, 9, 31)).is_err());
+        let mut sample = daily.clone();
+        sample[0].provenance = Provenance::Sample;
+        assert!(combo_tick("AAPL", &sample, &m5, &wanted, wall(9, 9, 31)).is_err());
+    }
+
+    fn combo_rule(side: PriceSide) -> AlertKind {
+        AlertKind::SetupPriceRvol { setup: "NEAR_HIGH".into(), side, level: 100.0, multiple: 2.0 }
+    }
+
+    fn combo_eval(s: &mut Store, ts: i64, price: f64, rvol: f64, active: Option<bool>, day: u32) -> EvalOutcome {
+        let combos = active
+            .map(|active| ComboTick {
+                symbol: crate::security("AAPL").key(),
+                price,
+                rvol,
+                bar_ts: ts,
+                session_date: chrono::NaiveDate::from_ymd_opt(2026, 11, day).unwrap(),
+                active: BTreeMap::from([("NEAR_HIGH".into(), active)]),
+                fresh: true,
+                provenance: Provenance::Real,
+            })
+            .into_iter()
+            .collect();
+        evaluate(
+            s,
+            EvalInput {
+                now: ts,
+                sample_provider: false,
+                prices: vec![],
+                setups: vec![],
+                vwaps: vec![],
+                rvols: vec![],
+                sessions: vec![],
+                combos,
+                failures: vec![],
+            },
+        )
+    }
+
+    #[test]
+    fn combo_seed_crossing_gates_unknown_rollover_and_order() {
+        for side in [PriceSide::Above, PriceSide::Below] {
+            let mut s = Store::default();
+            s.add_rule("AAPL", combo_rule(side), 1).unwrap();
+            let (before, after) = if side == PriceSide::Above { (99.0, 101.0) } else { (101.0, 99.0) };
+            assert!(combo_eval(&mut s, 10, before, 3.0, Some(true), 2).fired.is_empty());
+            // RVOL must pass at the crossing, and cannot catch up later.
+            assert!(combo_eval(&mut s, 20, after, 1.0, Some(true), 2).fired.is_empty());
+            assert!(combo_eval(&mut s, 30, after, 3.0, Some(true), 2).fired.is_empty());
+            combo_eval(&mut s, 40, before, 3.0, Some(false), 2);
+            assert!(combo_eval(&mut s, 50, after, 3.0, Some(false), 2).fired.is_empty());
+            assert!(combo_eval(&mut s, 60, after, 3.0, Some(true), 2).fired.is_empty());
+            combo_eval(&mut s, 70, before, 3.0, Some(true), 2);
+            assert_eq!(combo_eval(&mut s, 80, 100.0, 2.0, Some(true), 2).fired.len(), 1);
+            assert!(combo_eval(&mut s, 80, before, 3.0, Some(true), 2).fired.is_empty());
+            assert!(combo_eval(&mut s, 75, before, 3.0, Some(true), 2).fired.is_empty());
+            assert!(combo_eval(&mut s, 90, after, 3.0, Some(true), 2).fired.is_empty());
+            combo_eval(&mut s, 100, before, 3.0, Some(true), 2);
+            assert!(!combo_eval(&mut s, 110, after, 3.0, None, 2).batch.failures.is_empty());
+            assert!(combo_eval(&mut s, 120, after, 3.0, Some(true), 2).fired.is_empty());
+            combo_eval(&mut s, 130, before, 3.0, Some(true), 2);
+            assert!(combo_eval(&mut s, 140, after, 3.0, Some(true), 3).fired.is_empty());
+            combo_eval(&mut s, 150, before, 3.0, Some(true), 3);
+            combo_eval(&mut s, 160, after, f64::NAN, Some(true), 3);
+            assert!(combo_eval(&mut s, 170, after, 3.0, Some(true), 3).fired.is_empty());
+            let bytes = serde_json::to_vec(&s).unwrap();
+            let mut restored: Store = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(restored, s);
+            assert!(combo_eval(&mut restored, 170, after, 3.0, Some(true), 3).fired.is_empty());
+        }
+    }
+
+    #[test]
+    fn combo_stale_sample_and_missing_membership_clear_seed() {
+        for mode in 0..4 {
+            let mut s = Store::default();
+            let rule = s.add_rule("AAPL", combo_rule(PriceSide::Above), 1).unwrap();
+            combo_eval(&mut s, 10, 99.0, 3.0, Some(true), 2);
+            let mut tick = ComboTick {
+                symbol: rule.symbol,
+                price: 101.0,
+                rvol: 3.0,
+                bar_ts: 10,
+                session_date: chrono::NaiveDate::from_ymd_opt(2026, 11, 2).unwrap(),
+                active: BTreeMap::from([("NEAR_HIGH".into(), true)]),
+                fresh: true,
+                provenance: Provenance::Real,
+            };
+            match mode {
+                0 => tick.fresh = false,
+                1 => tick.provenance = Provenance::Sample,
+                2 => tick.active.clear(),
+                _ => tick.price = f64::NAN,
+            }
+            let out = evaluate(
+                &mut s,
+                EvalInput {
+                    now: 20,
+                    sample_provider: false,
+                    prices: vec![],
+                    setups: vec![],
+                    vwaps: vec![],
+                    rvols: vec![],
+                    sessions: vec![],
+                    combos: vec![tick],
+                    failures: vec![],
+                },
+            );
+            assert!(!out.batch.failures.is_empty());
+            assert_eq!(s.states[&rule.id].last_price, None);
+            assert!(combo_eval(&mut s, 30, 101.0, 3.0, Some(true), 2).fired.is_empty());
+        }
+    }
+
+    #[test]
+    fn combo_validation_identity_and_legacy_state() {
+        let mut s = Store::default();
+        let r = s.add_rule("AAPL", combo_rule(PriceSide::Above), 1).unwrap();
+        assert_eq!(s.add_rule("AAPL", r.kind.clone(), 2).unwrap().id, r.id);
+        assert!(r.kind.label().contains("RVOL ≥ 2.00"));
+        assert!(normalize_combo_setup("ALL").is_none());
+        assert!(normalize_combo_setup("ONEIL_LENS").is_none());
+        let legacy = r#"{"rules":[],"events":[],"states":{"old":{"last_price":99.0,"last_match":null,"last_eval_at":1,"last_bar_ts":1}}}"#;
+        s.add_rule("AAPL", AlertKind::Price { side: PriceSide::Below, level: 90.0 }, 2).unwrap();
+        let mut colliding = combo_rule(PriceSide::Above);
+        if let AlertKind::SetupPriceRvol { ref mut level, .. } = colliding {
+            *level += 0.00001;
+        }
+        let collision = s.add_rule("AAPL", colliding, 1).unwrap();
+        assert_eq!(collision.id, format!("{}:1", r.id));
+        let path = std::env::temp_dir().join(format!("tr-combo-store-{}.json", std::process::id()));
+        s.save(&path);
+        assert_eq!(Store::load(&path), s);
+        std::fs::write(&path, legacy).unwrap();
+        assert_eq!(Store::load(&path).states["old"].last_price, Some(99.0));
+        std::fs::remove_file(path).unwrap();
+        let old: Store = serde_json::from_str(legacy).unwrap();
+        assert_eq!(old.states["old"].last_session_date, None);
+    }
+
     fn price(symbol: &str, last: f64, ts: i64, provenance: Provenance) -> PriceTick {
         PriceTick { symbol: crate::security(symbol).key(), price: last, ts, provenance }
     }
@@ -853,6 +1191,7 @@ mod tests {
                 vwaps: Vec::new(),
                 rvols: Vec::new(),
                 sessions: Vec::new(),
+                combos: Vec::new(),
                 failures: Vec::new(),
             },
         )
@@ -880,6 +1219,7 @@ mod tests {
                 vwaps,
                 rvols: vec![],
                 sessions: vec![],
+                combos: vec![],
                 failures: vec![],
             },
         )
@@ -1143,6 +1483,7 @@ mod tests {
                 vwaps: vec![],
                 rvols: vec![],
                 sessions: vec![],
+                combos: vec![],
                 failures: vec![],
             },
         );
@@ -1204,15 +1545,17 @@ mod tests {
 
     #[test]
     fn setup_tick_oneil_requires_spy() {
-        let spy: Vec<_> = (0..80).map(|i| {
-            Bar::new(i * 86400, 100.0, 101.0, 99.0, 100.0, 1000.0)
-                .with_provenance(Provenance::Real)
-        }).collect();
-        let symbol: Vec<_> = spy.iter().enumerate().map(|(i, b)| {
-            let close = 100.0 + i as f64;
-            Bar::new(b.ts, close, close + 1.0, close - 1.0, close, 1000.0)
-                .with_provenance(Provenance::Real)
-        }).collect();
+        let spy: Vec<_> = (0..80)
+            .map(|i| Bar::new(i * 86400, 100.0, 101.0, 99.0, 100.0, 1000.0).with_provenance(Provenance::Real))
+            .collect();
+        let symbol: Vec<_> = spy
+            .iter()
+            .enumerate()
+            .map(|(i, b)| {
+                let close = 100.0 + i as f64;
+                Bar::new(b.ts, close, close + 1.0, close - 1.0, close, 1000.0).with_provenance(Provenance::Real)
+            })
+            .collect();
         let wanted = vec!["ONEIL_LENS".into(), "NEAR_HIGH".into()];
         let sample: Vec<_> = spy.iter().cloned().map(|b| b.with_provenance(Provenance::Sample)).collect();
         for benchmark in [None, Some(sample.as_slice())] {
@@ -1258,6 +1601,7 @@ mod tests {
                 vwaps: vec![],
                 rvols: vec![],
                 sessions: vec![],
+                combos: vec![],
                 failures: vec![AlertFailure {
                     symbol: crate::security("AAPL").key(),
                     error: "ONEIL_LENS: benchmark unavailable".into(),
@@ -1411,6 +1755,7 @@ mod tests {
                 vwaps: vec![],
                 rvols,
                 sessions: vec![],
+                combos: vec![],
                 failures: vec![],
             },
         )
@@ -1539,6 +1884,7 @@ mod tests {
                 vwaps: vec![],
                 rvols: vec![],
                 sessions,
+                combos: vec![],
                 failures: vec![],
             },
         )
@@ -1579,9 +1925,9 @@ mod tests {
 
     #[test]
     fn session_state_from_old_json_keeps_its_transition_seed() {
-        let state: RuleState = serde_json::from_str(
-            r#"{"last_price":null,"last_match":true,"last_eval_at":10,"last_bar_ts":10}"#,
-        ).unwrap();
+        let state: RuleState =
+            serde_json::from_str(r#"{"last_price":null,"last_match":true,"last_eval_at":10,"last_bar_ts":10}"#)
+                .unwrap();
         assert_eq!(state.last_session_date, None);
         let mut s = Store::default();
         let rule = s.add_rule("AAPL", AlertKind::Session { signal: SessionSignal::Path }, 1).unwrap();
