@@ -69,8 +69,10 @@ pub struct PortfolioRisk {
     pub covered_risk: f64,
     pub candidate_risk: f64,
     pub total_with_candidate: f64,
+    /// Arithmetic only; not a verdict about coverage, breaches, or budget safety.
     pub remaining_budget: Option<f64>,
-    /// False when any holding selected by the account filter is uncovered.
+    /// False when any selected holding is uncovered. Complete does not mean
+    /// unbreached or within budget.
     pub complete: bool,
 }
 
@@ -85,6 +87,16 @@ pub struct RiskInput<'a> {
     pub base_currency: &'a str,
 }
 
+impl PortfolioRisk {
+    pub fn has_breaches(&self) -> bool {
+        self.rows.iter().any(|row| row.status == Status::Breached)
+    }
+}
+
+fn positive(value: f64) -> bool {
+    value.is_finite() && value > 0.0
+}
+
 fn valid(value: f64) -> bool {
     value.is_finite() && value >= 0.0
 }
@@ -92,8 +104,8 @@ fn valid(value: f64) -> bool {
 fn holding_status(holding: &Holding, stop: Option<f64>, base: &str) -> Status {
     use UncoveredReason::*;
     let reason = if !holding.quantity.is_finite()
-        || holding.mark.is_some_and(|value| !valid(value))
-        || stop.is_some_and(|value| !valid(value))
+        || holding.mark.is_some_and(|value| !positive(value))
+        || stop.is_some_and(|value| !positive(value))
     {
         InvalidValue
     } else if holding.quantity < 0.0 {
@@ -124,8 +136,8 @@ pub fn calculate(input: RiskInput<'_>) -> Result<PortfolioRisk, RiskError> {
     let candidate_risk = match input.candidate {
         None => 0.0,
         Some(candidate) => {
-            if !valid(candidate.entry)
-                || !valid(candidate.stop)
+            if !positive(candidate.entry)
+                || !positive(candidate.stop)
                 || !valid(candidate.quantity)
                 || candidate.stop >= candidate.entry
             {
@@ -237,6 +249,7 @@ mod tests {
         assert_eq!(result.remaining_budget, None);
         let breached = calculate(input(&holdings[3..], &stops)).unwrap();
         assert!(breached.complete);
+        assert!(breached.has_breaches());
     }
 
     #[test]
@@ -298,6 +311,19 @@ mod tests {
                 assert!(!result.complete);
             }
         }
+    }
+
+    #[test]
+    fn zero_prices_rejected_but_zero_budget_allowed() {
+        let holdings = [holding("a", "X", 1.0, 0.0)];
+        let stops = stops(&[("a", "X", 0.0)]);
+        let mut request = input(&holdings, &stops);
+        request.budget = Some(0.0);
+        let result = calculate(request).unwrap();
+        assert!(!result.complete);
+        assert_eq!(result.remaining_budget, Some(0.0));
+        let holdings = [holding("a", "X", 1.0, 10.0)];
+        assert!(!calculate(input(&holdings, &stops)).unwrap().complete);
     }
 
     #[test]

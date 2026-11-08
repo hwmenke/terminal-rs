@@ -21,6 +21,8 @@ mod lookalike;
 mod options_view;
 mod palette_view;
 mod panels;
+mod portfolio_risk;
+mod portfolio_stops;
 mod portfolio_view;
 mod realized_vol;
 mod relative_path;
@@ -945,6 +947,8 @@ pub struct TerminalApp {
     watch_ui: watchlists::UiState,
     /// Last intraday scan for one watchlist group. Absent until a read finishes.
     intraday_scan: Option<watchlists::IntradayScan>,
+    planning_stops: portfolio_stops::Store,
+    planning_ui: portfolio_risk::State,
     settings_writer: Option<settings_writer::Writer>,
     quotes: HashMap<String, Quote>,
     last_quotes: Option<Instant>,
@@ -1118,6 +1122,8 @@ impl TerminalApp {
             watchlists: watchlists::Watchlists::migrate(&DEFAULT_WATCHLIST.map(String::from)),
             watch_ui: Default::default(),
             intraday_scan: None,
+            planning_stops: portfolio_stops::Store::load(data_dir()),
+            planning_ui: Default::default(),
             settings_writer: None,
             quotes: HashMap::new(),
             last_quotes: None,
@@ -2650,6 +2656,8 @@ mod tests {
             watchlists: watchlists::Watchlists::migrate(&DEFAULT_WATCHLIST.map(String::from)),
             watch_ui: Default::default(),
             intraday_scan: None,
+            planning_stops: portfolio_stops::Store::load(dir.clone()),
+            planning_ui: Default::default(),
             settings_writer: None,
             quotes: HashMap::new(),
             last_quotes: None,

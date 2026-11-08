@@ -294,6 +294,7 @@ pub fn portfolio(
     b: &BrokerState,
     demo: Option<&Portfolio>,
     quotes: &HashMap<String, Quote>,
+    planning: Option<(&mut super::portfolio_stops::Store, &mut super::portfolio_risk::State)>,
 ) -> Vec<PortAction> {
     let mut out = Vec::new();
     toolbar(ui, pane, b, demo, &mut out);
@@ -326,6 +327,15 @@ pub fn portfolio(
             }
             if pane.account.as_ref().is_some_and(|a| pf.account(a).is_none()) {
                 pane.account = None;
+            }
+            if matches!(pane.view, PortView::Summary | PortView::Positions)
+                && let Some((store, state)) = planning
+            {
+                egui::ScrollArea::vertical()
+                    .id_salt("planned-risk")
+                    .max_height(dp(300.0))
+                    .auto_shrink([false, true])
+                    .show(ui, |ui| super::portfolio_risk::panel(ui, pf, pane.account.as_deref(), quotes, store, state));
             }
             let price_of = |p: &Position| b.live_price(quotes, p);
             match pane.view {
@@ -1181,13 +1191,13 @@ mod tests {
         for view in PortView::ALL {
             let mut pane = PortfolioPane::new(view);
             let mut out = ctx.run_ui(Default::default(), |ui| {
-                let _ = portfolio(ui, &mut pane, &b, None, &quotes);
+                let _ = portfolio(ui, &mut pane, &b, None, &quotes, None);
             });
             out.textures_delta.clear();
             pane.account = Some("sim-ira".into());
             pane.symbol = Some("SPY US Equity".into());
             let mut out = ctx.run_ui(Default::default(), |ui| {
-                let _ = portfolio(ui, &mut pane, &b, None, &quotes);
+                let _ = portfolio(ui, &mut pane, &b, None, &quotes, None);
             });
             out.textures_delta.clear();
         }
@@ -1196,7 +1206,7 @@ mod tests {
         for view in PortView::ALL {
             let mut pane = PortfolioPane::new(view);
             let mut out = ctx.run_ui(Default::default(), |ui| {
-                let _ = portfolio(ui, &mut pane, &b, Some(&demo), &quotes);
+                let _ = portfolio(ui, &mut pane, &b, Some(&demo), &quotes, None);
             });
             out.textures_delta.clear();
         }
@@ -1204,7 +1214,7 @@ mod tests {
         b.simulate = false;
         let mut pane = PortfolioPane::new(PortView::Summary);
         let mut out = ctx.run_ui(Default::default(), |ui| {
-            let _ = portfolio(ui, &mut pane, &b, None, &quotes);
+            let _ = portfolio(ui, &mut pane, &b, None, &quotes, None);
         });
         out.textures_delta.clear();
     }
