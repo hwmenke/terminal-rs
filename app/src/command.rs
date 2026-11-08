@@ -424,6 +424,24 @@ fn parse_alert_kind(rest: &[&str]) -> Option<tr_data::price_alerts::AlertKind> {
         Some("EITHER" | "CHANGE" | "FLIP") => SetupChange::Either,
         _ => SetupChange::Enter,
     };
+    if first == "COMBO" {
+        if up.len() != 6 || up[4] != "RVOL" {
+            return None;
+        }
+        let setup = tr_data::price_alerts::normalize_combo_setup(&up[1])?;
+        let side = match up[2].as_str() {
+            "ABOVE" => PriceSide::Above,
+            "BELOW" => PriceSide::Below,
+            _ => return None,
+        };
+        let level: f64 = rest[3].parse().ok()?;
+        let multiple: f64 = rest[5].parse().ok()?;
+        if up[4] != "RVOL" {
+            return None;
+        }
+        return (level.is_finite() && level > 0.0 && multiple.is_finite() && multiple > 0.0)
+            .then_some(AlertKind::SetupPriceRvol { setup, side, level, multiple });
+    }
     if first == "SETUP" {
         let setup = parse_setup_name(up.get(1)?)?;
         return Some(AlertKind::Setup { setup, change: change(2) });
@@ -1367,6 +1385,29 @@ mod tests {
                 }
                 assert_eq!(parse(&format!("IND {code}")), parse(code), "IND {code}");
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod combo_tests {
+    use super::*;
+    #[test]
+    fn combo_command_is_strict() {
+        assert!(matches!(
+            parse_alert_kind(&["COMBO", "NEAR_HIGH", "ABOVE", "250", "RVOL", "2"]),
+            Some(tr_data::price_alerts::AlertKind::SetupPriceRvol { level: 250.0, multiple: 2.0, .. })
+        ));
+        for args in [
+            "COMBO ALL ABOVE 250 RVOL 2",
+            "COMBO ONEIL_LENS ABOVE 250 RVOL 2",
+            "COMBO NEAR_HIGH ABOVE 250 RVOL",
+            "COMBO NEAR_HIGH ABOVE 250 RVOL 2 extra",
+            "COMBO NEAR_HIGH OVER 250 RVOL 2",
+            "COMBO NEAR_HIGH BELOW NaN RVOL 2",
+            "COMBO NEAR_HIGH BELOW 250 RVOL 0",
+        ] {
+            assert!(parse_alert_kind(&args.split_whitespace().collect::<Vec<_>>()).is_none(), "{args}");
         }
     }
 }
