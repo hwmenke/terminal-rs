@@ -97,7 +97,14 @@ impl TerminalApp {
                 if let Some(pf) = demo.or(self.broker.portfolio.as_deref()) {
                     super::portfolio_view::risk_chips(ui, pp, pf, &self.worker, id, &mut self.holding_risk);
                 }
-                for a in super::portfolio_view::portfolio(ui, pp, &self.broker, demo, &self.quotes) {
+                for a in super::portfolio_view::portfolio(
+                    ui,
+                    pp,
+                    &self.broker,
+                    demo,
+                    &self.quotes,
+                    Some((&mut self.planning_stops, &mut self.planning_ui)),
+                ) {
                     use super::portfolio_view::PortAction as P;
                     match a {
                         P::Core(a) => actions.push(a),
