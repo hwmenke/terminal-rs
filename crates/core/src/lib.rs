@@ -6,6 +6,7 @@ pub mod catalog;
 pub mod indicators;
 pub mod ny;
 pub mod options;
+pub mod portfolio_risk;
 pub mod provenance;
 pub mod sample;
 pub mod security;
