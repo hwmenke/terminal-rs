@@ -1,5 +1,7 @@
 # terminal-rs
 
+PM Desk [trade plans](docs/TRADE_PLANS.md) watch entry → stop/target brackets from verified quotes, with no orders.
+
 A fast, keyboard-driven market terminal in pure Rust: TradingView-class GPU charting with a
 Bloomberg Terminal look (dense tiled panes, monospace numbers, a command line like `AAPL <GO>`)
 across **stocks, ETFs, indices, FX, crypto, US Treasuries, futures/commodities and options**,

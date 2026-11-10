@@ -65,12 +65,14 @@ impl TerminalApp {
             }));
             if ui.button(RichText::new("MARK READ").font(mono(11.5))).clicked() {
                 self.worker.send(Request::MarkPriceAlertsSeen);
+                self.worker.send(Request::MarkTradePlansSeen);
                 mark_congress = true;
             }
         });
         ui.add_space(2.0);
         banners(ui, &self.price_alerts, self.provider.eq_ignore_ascii_case("sample"));
         self.alert_form(ui);
+        self.trade_plans_section(ui, &mut out);
         ui.add_space(4.0);
         ui.label(RichText::new("RULES").font(mono(11.0)).color(muted()));
         self.alert_rules(ui);
@@ -248,6 +250,153 @@ impl TerminalApp {
         }
     }
 
+    fn trade_plans_section(&mut self, ui: &mut Ui, out: &mut Vec<Action>) {
+        use tr_data::trade_plans::{PlanStatus, open_r};
+        ui.add_space(6.0);
+        ui.label(RichText::new("TRADE PLANS").font(mono(11.0)).color(muted()));
+        if self.trade_plans.sample || self.provider.eq_ignore_ascii_case("sample") {
+            ui.label(
+                RichText::new("Sample / offline mode: trade plans are not evaluated and never fire.")
+                    .color(theme::down()),
+            );
+        }
+        let now = chrono::Utc::now().timestamp();
+        if self.trade_plans.stale || tr_data::price_alerts::is_stale(self.trade_plans.fetched_at, now) {
+            ui.label(RichText::new("Stale quotes — plans hold their last verified state.").color(amber()));
+        }
+        if !self.trade_plans.failures.is_empty() {
+            let failed = self
+                .trade_plans
+                .failures
+                .iter()
+                .map(|f| format!("{} ({})", tr_data::security(&f.symbol).ticker, f.error))
+                .collect::<Vec<_>>()
+                .join(" · ");
+            ui.label(RichText::new(format!("Partial: {failed}")).color(amber()));
+        }
+        let mut plans: Vec<_> = self.trade_plans.plans.iter().collect();
+        plans.sort_by_key(|p| (!p.status.active(), std::cmp::Reverse(p.closed_at.unwrap_or(p.created_at))));
+        let mut closed = 0;
+        if plans.is_empty() {
+            ui.label(
+                RichText::new("No trade plans. Arm one from DESK or NVDA PLAN 142.5 STOP 138.2 TARGET 151.1 RISK 300.")
+                    .font(mono(12.0))
+                    .color(muted()),
+            );
+        }
+        ScrollArea::vertical().id_salt("trade-plan-rows").max_height(260.0).show(ui, |ui| {
+            for plan in plans {
+                if !plan.status.active() {
+                    closed += 1;
+                    if closed > 10 {
+                        continue;
+                    }
+                }
+                ui.push_id(&plan.id, |ui| {
+                    ui.horizontal_wrapped(|ui| {
+                        let ticker = tr_data::security(&plan.symbol).ticker;
+                        if ui
+                            .add(
+                                egui::Label::new(RichText::new(ticker).font(mono(12.0)).color(text()))
+                                    .sense(Sense::click()),
+                            )
+                            .clicked()
+                        {
+                            out.push(Action::OpenChart(plan.symbol.clone()));
+                        }
+                        ui.label(RichText::new(if plan.long { "Long" } else { "Short" }).font(mono(12.0)));
+                        let color = match plan.status {
+                            PlanStatus::Armed | PlanStatus::Triggered => amber(),
+                            PlanStatus::Stopped | PlanStatus::Invalidated => theme::down(),
+                            PlanStatus::TargetHit => theme::up(),
+                            PlanStatus::Cancelled => muted(),
+                        };
+                        ui.label(RichText::new(plan.status.label()).font(mono(12.0)).color(color));
+                        let direction = match plan.entry_side {
+                            Some(PriceSide::Above) => " ↑",
+                            Some(PriceSide::Below) => " ↓",
+                            None => "",
+                        };
+                        let target = plan
+                            .target
+                            .map(|p| format!("  target {p:.2} ({:.1}R)", (p - plan.entry) / (plan.entry - plan.stop)))
+                            .unwrap_or_default();
+                        let size = if plan.dollar_risk == 0.0 {
+                            "size not set".into()
+                        } else {
+                            format!("{:.0} sh  ${:.0} risk", plan.shares, plan.dollar_risk)
+                        };
+                        ui.label(
+                            RichText::new(format!(
+                                "entry {:.2}{direction}  stop {:.2}{target}  {size}",
+                                plan.entry, plan.stop
+                            ))
+                            .font(mono(12.0)),
+                        );
+                        if plan.status.active() {
+                            if ui.small_button("Cancel").clicked() {
+                                self.worker.send(Request::CancelTradePlan { id: plan.id.clone() });
+                            }
+                        } else {
+                            if ui.small_button("Journal").clicked() {
+                                out.push(Action::Command(format!("{} JOURNAL", plan.symbol)));
+                            }
+                            if ui.small_button("Remove").clicked() {
+                                self.worker.send(Request::RemoveTradePlan { query: plan.id.clone() });
+                            }
+                        }
+                    });
+                    let as_of = plan
+                        .last_tick_ts
+                        .and_then(|ts| chrono::DateTime::from_timestamp(ts, 0))
+                        .map(|ts| ts.format("%H:%M UTC").to_string())
+                        .unwrap_or_default();
+                    let observation = if let Some(r) = open_r(plan) {
+                        format!("open R {r:+.2} as of {as_of} — at observed quote, not a fill")
+                    } else if plan.last_price.is_none() {
+                        "awaiting first verified quote".into()
+                    } else if plan.status == PlanStatus::Armed {
+                        format!("awaiting cross · as of {as_of}")
+                    } else {
+                        format!("as of {as_of}")
+                    };
+                    ui.label(RichText::new(observation).font(mono(11.0)).color(muted()));
+                });
+            }
+        });
+        ScrollArea::vertical().id_salt("trade-plan-events").max_height(180.0).show(ui, |ui| {
+            for event in &self.trade_plans.events {
+                ui.horizontal_wrapped(|ui| {
+                    let ts = chrono::DateTime::from_timestamp(event.created_at, 0)
+                        .map(|d| d.format("%Y-%m-%d %H:%M").to_string())
+                        .unwrap_or_default();
+                    ui.label(RichText::new(ts).font(mono(12.0)).color(if event.seen { muted() } else { amber() }));
+                    for label in [tr_data::security(&event.symbol).ticker, event.message.clone()] {
+                        let response = ui.add(
+                            egui::Label::new(RichText::new(label).font(mono(12.0)).color(if event.seen {
+                                muted()
+                            } else {
+                                text()
+                            }))
+                            .sense(Sense::click()),
+                        );
+                        if response.hovered() {
+                            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                        }
+                        if response.clicked() {
+                            out.push(Action::OpenChart(event.symbol.clone()));
+                        }
+                    }
+                });
+            }
+        });
+        ui.label(
+            RichText::new("Plans watch quotes only. They place no orders, and R is at the observed quote, not a fill.")
+                .font(ui_font(11.0))
+                .color(muted()),
+        );
+    }
+
     fn alert_rules(&mut self, ui: &mut Ui) {
         if self.price_alerts.rules.is_empty() {
             ui.label(
@@ -403,6 +552,7 @@ mod tests {
             },
             |ui| {
                 app.alert_form(ui);
+                app.trade_plans_section(ui, &mut Vec::new());
                 app.alert_rules(ui);
             },
         );
@@ -447,6 +597,157 @@ mod tests {
         paint(ctx, app, vec![pointer(pos, false)]);
     }
 
+    fn plan_store() -> tr_data::trade_plans::Store {
+        let mut store = tr_data::trade_plans::Store::default();
+        store
+            .arm(
+                tr_data::trade_plans::PlanDraft {
+                    symbol: "NVDA".into(),
+                    entry: 100.0,
+                    stop: 90.0,
+                    target: Some(120.0),
+                    dollar_risk: 300.0,
+                    shares: 30.0,
+                    stop_source: "command".into(),
+                },
+                100,
+            )
+            .unwrap();
+        store
+    }
+
+    #[test]
+    fn plan_commands_dispatch_sized_and_unsized_drafts() {
+        let mut app = test_app();
+        let (worker, mut requests) = crate::worker::Worker::test_channel();
+        app.worker = worker;
+        for (command, risk, shares) in [
+            ("NVDA PLAN 142.5 STOP 138.2 TARGET 151.1 RISK 300", 300.0, 69.0),
+            ("NVDA PLAN 142.5 STOP 138.2 TARGET 151.1", 0.0, 0.0),
+        ] {
+            app.execute(command);
+            let draft = std::iter::from_fn(|| requests.try_recv().ok())
+                .find_map(|r| match r {
+                    Request::ArmTradePlan(draft) => Some(draft),
+                    _ => None,
+                })
+                .expect("arm command request");
+            assert_eq!(draft.symbol, "NVDA US Equity");
+            assert_eq!(draft.entry, 142.5);
+            assert_eq!(draft.stop, 138.2);
+            assert_eq!(draft.target, Some(151.1));
+            assert_eq!(draft.dollar_risk, risk);
+            assert_eq!(draft.shares, shares);
+            assert_eq!(draft.stop_source, "command");
+        }
+        app.execute("PLANS");
+        assert!(std::iter::from_fn(|| requests.try_recv().ok()).any(|r| matches!(r, Request::TradePlans)));
+        assert!(app.panes.iter().any(|p| matches!(p.kind, super::super::PaneKind::Alerts)));
+        app.execute("UNPLAN NVDA");
+        assert!(
+            std::iter::from_fn(|| requests.try_recv().ok())
+                .any(|r| matches!(r, Request::CancelTradePlansFor { query } if query == "NVDA"))
+        );
+    }
+
+    #[test]
+    fn trade_plan_rows_render_status_and_cancel_sends_request() {
+        let ctx = egui::Context::default();
+        let mut app = test_app();
+        let (worker, mut requests) = crate::worker::Worker::test_channel();
+        app.worker = worker;
+        let store = plan_store();
+        let id = store.plans[0].id.clone();
+        app.trade_plans = store.snapshot(chrono::Utc::now().timestamp(), false, false, vec![]);
+        let shapes = paint(&ctx, &mut app, vec![]);
+        for label in [
+            "TRADE PLANS",
+            "ARMED",
+            "entry 100.00",
+            "stop 90.00",
+            "target 120.00 (2.0R)",
+            "30 sh",
+            "$300 risk",
+            "awaiting first verified quote",
+        ] {
+            assert!(galley_contains(&shapes, label), "missing {label}");
+        }
+        click(&ctx, &mut app, &shapes, "Cancel");
+        assert!(
+            std::iter::from_fn(|| requests.try_recv().ok())
+                .any(|r| matches!(r, Request::CancelTradePlan { id: sent } if sent == id))
+        );
+        app.trade_plans.plans[0].status = tr_data::trade_plans::PlanStatus::Stopped;
+        let shapes = paint(&ctx, &mut app, vec![]);
+        assert!(galley_contains(&shapes, "STOPPED"));
+        assert!(galley_contains(&shapes, "Journal"));
+        click(&ctx, &mut app, &shapes, "Remove");
+        assert!(
+            std::iter::from_fn(|| requests.try_recv().ok())
+                .any(|r| matches!(r, Request::RemoveTradePlan { query } if query == id))
+        );
+    }
+
+    #[test]
+    fn plan_event_click_opens_chart_and_counts_unread() {
+        let ctx = egui::Context::default();
+        let mut app = test_app();
+        let (worker, _requests, responses) = crate::worker::Worker::test_channel_with_responses();
+        app.worker = worker;
+        let mut store = plan_store();
+        for (price, ts) in [(99.0, 101), (100.0, 102)] {
+            let outcome = tr_data::trade_plans::evaluate(
+                &mut store,
+                tr_data::trade_plans::EvalInput {
+                    now: ts,
+                    sample_provider: false,
+                    prices: vec![tr_data::price_alerts::PriceTick {
+                        symbol: "NVDA US Equity".into(),
+                        price,
+                        ts,
+                        provenance: tr_core::Provenance::Real,
+                    }],
+                    failures: vec![],
+                },
+            );
+            if !outcome.fired.is_empty() {
+                responses.send(crate::worker::Response::NewTradePlanEvents(outcome.fired)).unwrap();
+            }
+        }
+        responses.send(crate::worker::Response::TradePlanFeed(store.snapshot(102, false, false, vec![]))).unwrap();
+        let previous_unread = app.unread_alerts();
+        let previous_toasts = app.toasts.len();
+        app.drain();
+        assert_eq!(app.unread_alerts(), previous_unread + 1);
+        assert_eq!(app.toasts.len(), previous_toasts + 1);
+        assert_eq!(app.trade_plans.plans[0].status, tr_data::trade_plans::PlanStatus::Triggered);
+        let mut render = |events| {
+            let mut actions = Vec::new();
+            let mut output = ctx.run_ui(
+                egui::RawInput {
+                    time: Some(ctx.input(|i| i.time) + 0.2),
+                    events,
+                    screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(1800.0, 700.0))),
+                    ..Default::default()
+                },
+                |ui| app.trade_plans_section(ui, &mut actions),
+            );
+            output.textures_delta.clear();
+            (output.shapes, actions)
+        };
+        let (shapes, _) = render(vec![]);
+        assert!(galley_contains(&shapes, "open R +0.00 as of 00:01 UTC"));
+        assert!(galley_contains(&shapes, "at observed quote, not a fill"));
+        let pos = text_position(&shapes, &store.events[0].message);
+        render(vec![egui::Event::PointerMoved(pos), pointer(pos, true)]);
+        let (_, actions) = render(vec![pointer(pos, false)]);
+        assert!(actions.iter().any(|a| matches!(a, Action::OpenChart(s) if s == "NVDA US Equity")));
+        store.mark_seen();
+        responses.send(crate::worker::Response::TradePlanFeed(store.snapshot(102, false, false, vec![]))).unwrap();
+        app.drain();
+        assert_eq!(app.unread_alerts(), previous_unread);
+    }
+
     #[test]
     fn combo_feed_and_fired_event_chart_jump() {
         let ctx = egui::Context::default();
@@ -485,6 +786,7 @@ mod tests {
                 },
                 |ui| app.alert_events(ui, &mut actions),
             );
+            output.textures_delta.clear();
             output.textures_delta.clear();
             (output.shapes, actions)
         };

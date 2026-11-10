@@ -138,18 +138,18 @@ impl DeskPane {
 
 impl TerminalApp {
     fn open_holdings_risk(&mut self) {
-            if let Some(p) = self.panes.iter_mut().find(|p| matches!(p.kind, PaneKind::Portfolio(_))) {
-                if let PaneKind::Portfolio(pp) = &mut p.kind {
-                    pp.open_risk = true;
-                    pp.view = crate::command::PortView::Positions;
-                }
-                self.focus = p.id;
-                self.dock.activate(p.id);
-            } else {
-                let mut pane = super::broker::PortfolioPane::new(crate::command::PortView::Positions);
-                pane.open_risk = true;
-                self.open_panel(PaneKind::Portfolio(Box::new(pane)));
+        if let Some(p) = self.panes.iter_mut().find(|p| matches!(p.kind, PaneKind::Portfolio(_))) {
+            if let PaneKind::Portfolio(pp) = &mut p.kind {
+                pp.open_risk = true;
+                pp.view = crate::command::PortView::Positions;
             }
+            self.focus = p.id;
+            self.dock.activate(p.id);
+        } else {
+            let mut pane = super::broker::PortfolioPane::new(crate::command::PortView::Positions);
+            pane.open_risk = true;
+            self.open_panel(PaneKind::Portfolio(Box::new(pane)));
+        }
     }
 
     pub(super) fn open_desk(&mut self, symbol: Option<&str>) {
@@ -181,8 +181,10 @@ impl TerminalApp {
         let threshold = self.holding_risk.concentration * 100.0;
         let (breadth, breadth_label) = self.holding_risk.selected_breadth();
         let breadth_chips = breadth_chips(breadth);
-        let breadth_hint = format!("A/D is advances / (advances + declines), excluding unchanged.\n{}", breadth.summary());
+        let breadth_hint =
+            format!("A/D is advances / (advances + declines), excluding unchanged.\n{}", breadth.summary());
         let mut open_risk = false;
+        let mut armed_plan = None;
         let mut actions = vec![];
         let mut refresh = false;
         let mut pick = None;
@@ -192,8 +194,11 @@ impl TerminalApp {
             _ => None,
         };
         if let Some(chart) = self.panes.iter_mut().find_map(|p| match &mut p.kind {
-            PaneKind::Chart(chart) if selected_key.as_deref() == Some(chart.symbol.as_str())
-                && chart.tf == tr_core::Timeframe::D1 => Some(chart),
+            PaneKind::Chart(chart)
+                if selected_key.as_deref() == Some(chart.symbol.as_str()) && chart.tf == tr_core::Timeframe::D1 =>
+            {
+                Some(chart)
+            }
             _ => None,
         }) {
             let mut enabled = chart.show_spy_strength;
@@ -361,6 +366,31 @@ impl TerminalApp {
                             let _ = ui.add_enabled(false, egui::Button::new("Buy…")).on_disabled_hover_text(reason);
                         }
                     }
+                    let draft = pane.plan().and_then(|plan| {
+                        if let Some(reason) = &row.skip {
+                            return Err(reason.clone());
+                        }
+                        if !row.provenance.is_verified() {
+                            return Err("Trade plans need verified real data".into());
+                        }
+                        Ok(tr_data::trade_plans::PlanDraft {
+                            symbol: row.key.clone(),
+                            entry: plan.entry,
+                            stop: plan.stop,
+                            target: plan.target,
+                            dollar_risk: plan.dollar_risk,
+                            shares: plan.whole_shares,
+                            stop_source: plan.stop_source.label().into(),
+                        })
+                    });
+                    let arm = ui
+                        .add_enabled_ui(draft.is_ok(), |ui| ui.small_button("Arm plan"))
+                        .inner
+                        .on_hover_text("Watch entry, then stop/target, from verified quotes. Places no orders.");
+                    let arm = if let Err(reason) = &draft { arm.on_disabled_hover_text(reason) } else { arm };
+                    if arm.clicked() {
+                        armed_plan = draft.ok();
+                    }
                     if ui
                         .small_button("Journal")
                         .on_hover_text("Open a journal draft with this name, last bar date, and planned $ risk")
@@ -445,6 +475,10 @@ impl TerminalApp {
         {
             pane.user_stop = Some(p);
             pane.stop = p;
+        }
+        if let Some(draft) = armed_plan {
+            self.worker.send(Request::ArmTradePlan(draft));
+            actions.push(Action::Command("PLANS".into()));
         }
         if open_risk {
             self.open_holdings_risk();
@@ -578,6 +612,113 @@ mod tests {
             skip: None,
             watchlist_rank: None,
             watchlist_n: None,
+        }
+    }
+
+    fn paint(
+        ctx: &egui::Context,
+        app: &mut TerminalApp,
+        id: PaneId,
+        events: Vec<egui::Event>,
+    ) -> (Vec<egui::epaint::ClippedShape>, Vec<Action>) {
+        let mut actions = Vec::new();
+        let mut output = ctx.run_ui(
+            egui::RawInput {
+                time: Some(ctx.input(|i| i.time) + 0.2),
+                events,
+                screen_rect: Some(egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(1800.0, 1400.0))),
+                ..Default::default()
+            },
+            |ui| actions = app.desk(ui, id),
+        );
+        output.textures_delta.clear();
+        (output.shapes, actions)
+    }
+    fn arm_position(shapes: &[egui::epaint::ClippedShape]) -> egui::Pos2 {
+        fn find(shape: &egui::Shape) -> Option<egui::Pos2> {
+            match shape {
+                egui::Shape::Text(t) if t.galley.job.text == "Arm plan" => Some(t.pos + t.galley.size() * 0.5),
+                egui::Shape::Vec(v) => v.iter().find_map(find),
+                _ => None,
+            }
+        }
+        shapes.iter().find_map(|s| find(&s.shape)).expect("Arm plan button")
+    }
+    fn click(
+        ctx: &egui::Context,
+        app: &mut TerminalApp,
+        id: PaneId,
+        shapes: &[egui::epaint::ClippedShape],
+    ) -> Vec<Action> {
+        let pos = arm_position(shapes);
+        let pointer = |pressed| egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        };
+        paint(ctx, app, id, vec![egui::Event::PointerMoved(pos), pointer(true)]);
+        paint(ctx, app, id, vec![pointer(false)]).1
+    }
+
+    #[test]
+    fn desk_arm_plan_sends_draft_with_whole_shares_and_is_disabled_for_unverified_rows() {
+        let ctx = egui::Context::default();
+        let mut app = test_app();
+        let (worker, mut requests) = Worker::test_channel();
+        app.worker = worker;
+        app.open_desk(None);
+        let id = app.focus;
+        let pane = match &mut app.panes.iter_mut().find(|p| p.id == id).unwrap().kind {
+            PaneKind::Desk(pane) => pane,
+            _ => unreachable!(),
+        };
+        pane.accept(
+            pane.generation,
+            Ok(Snapshot {
+                failures: vec![],
+                source: "test".into(),
+                provenance: Provenance::Real,
+                data: vec![row("NVDA US Equity", 0.0)],
+            }),
+        );
+        pane.entry = 100.0;
+        pane.stop = 93.0;
+        pane.user_stop = Some(93.0);
+        pane.has_target = true;
+        pane.target = 114.0;
+        pane.dollar_risk = 300.0;
+        let expected = pane.plan().unwrap();
+        let (shapes, _) = paint(&ctx, &mut app, id, vec![]);
+        let actions = click(&ctx, &mut app, id, &shapes);
+        let draft = std::iter::from_fn(|| requests.try_recv().ok())
+            .find_map(|r| match r {
+                Request::ArmTradePlan(draft) => Some(draft),
+                _ => None,
+            })
+            .expect("arm request");
+        assert_eq!(draft.symbol, "NVDA US Equity");
+        assert_eq!(draft.entry, expected.entry);
+        assert_eq!(draft.stop, expected.stop);
+        assert_eq!(draft.target, expected.target);
+        assert_eq!(draft.dollar_risk, 300.0);
+        assert_eq!(draft.shares, 42.0);
+        assert_eq!(draft.shares, expected.whole_shares);
+        assert_eq!(draft.stop_source, expected.stop_source.label());
+        assert!(actions.iter().any(|a| matches!(a, Action::Command(c) if c == "PLANS")));
+        for mode in 0..3 {
+            if let PaneKind::Desk(pane) = &mut app.panes.iter_mut().find(|p| p.id == id).unwrap().kind {
+                let row = &mut pane.rows.as_mut().unwrap().data[0];
+                row.provenance = if mode == 0 { Provenance::Sample } else { Provenance::Real };
+                row.skip = (mode == 1).then(|| "missing history".into());
+                if mode == 2 {
+                    pane.stop = pane.entry;
+                }
+            }
+            let (shapes, _) = paint(&ctx, &mut app, id, vec![]);
+            let actions = click(&ctx, &mut app, id, &shapes);
+            assert!(actions.is_empty());
+            assert!(!std::iter::from_fn(|| requests.try_recv().ok()).any(|r| matches!(r, Request::ArmTradePlan(_))));
         }
     }
 
@@ -764,8 +905,24 @@ pub(super) struct HoldingRiskState {
 
 impl Default for HoldingRiskState {
     fn default() -> Self {
-        Self { history: Default::default(), spy: None, breadth: Default::default(), scan_breadth: None, scan_breadth_received: None, setup_count: Default::default(), setups: Default::default(), adma_stretch: Default::default(), concentration: 0.2, breaches: None,
-            loading: false, requested: false, generation: 0, error: None, positions: None, held_keys: Default::default() }
+        Self {
+            history: Default::default(),
+            spy: None,
+            breadth: Default::default(),
+            scan_breadth: None,
+            scan_breadth_received: None,
+            setup_count: Default::default(),
+            setups: Default::default(),
+            adma_stretch: Default::default(),
+            concentration: 0.2,
+            breaches: None,
+            loading: false,
+            requested: false,
+            generation: 0,
+            error: None,
+            positions: None,
+            held_keys: Default::default(),
+        }
     }
 }
 
@@ -792,7 +949,9 @@ fn format_scan_age(age: std::time::Duration) -> String {
 impl HoldingRiskState {
     /// Unknown histories contribute nothing; a verified zero remains known.
     fn total_setup_hits(&self) -> Option<usize> {
-        self.held_keys.iter().filter_map(|key| self.setup_count.get(key).copied().flatten())
+        self.held_keys
+            .iter()
+            .filter_map(|key| self.setup_count.get(key).copied().flatten())
             .fold(None, |total, count| Some(total.unwrap_or(0) + count))
     }
 
@@ -804,7 +963,8 @@ impl HoldingRiskState {
             match self.setup_count.get(key).copied().flatten() {
                 Some(0) => zeros += 1,
                 Some(count) => {
-                    let label = tr_core::Security::parse(key).map(|security| security.ticker).unwrap_or_else(|| key.clone());
+                    let label =
+                        tr_core::Security::parse(key).map(|security| security.ticker).unwrap_or_else(|| key.clone());
                     lines.push(format!("{label} {count}"));
                 }
                 None => unknown += 1,
@@ -817,41 +977,71 @@ impl HoldingRiskState {
     /// Called only when loaded histories change, independently of portfolio edits.
     fn selected_breadth(&self) -> (&tr_data::whats_news::scan_pack::Breadth, String) {
         if let Some(scan) = self.scan_breadth.as_ref().filter(|s| s.symbols > 0 && s.breadth.n > 0) {
-            let age = self.scan_breadth_received.map(|t| format!(", {} ago", format_scan_age(t.elapsed()))).unwrap_or_default();
-            return (&scan.breadth, format!("Market breadth (SCAN, {} {}, as of {}{})", scan.symbols, if scan.symbols == 1 { "symbol" } else { "symbols" }, scan.as_of.map(|d| d.to_string()).unwrap_or_else(|| "—".into()), age));
+            let age = self
+                .scan_breadth_received
+                .map(|t| format!(", {} ago", format_scan_age(t.elapsed())))
+                .unwrap_or_default();
+            return (
+                &scan.breadth,
+                format!(
+                    "Market breadth (SCAN, {} {}, as of {}{})",
+                    scan.symbols,
+                    if scan.symbols == 1 { "symbol" } else { "symbols" },
+                    scan.as_of.map(|d| d.to_string()).unwrap_or_else(|| "—".into()),
+                    age
+                ),
+            );
         }
         (&self.breadth, if self.breadth.ready { format!("Holdings breadth ({})", self.breadth.n) } else { "—".into() })
     }
     pub fn refresh_breadth(&mut self) {
         self.breadth = tr_data::whats_news::scan_pack::breadth(
-            &self.history.values().map(|bars| bars.iter().map(|b| b.close).collect()).collect::<Vec<_>>());
+            &self.history.values().map(|bars| bars.iter().map(|b| b.close).collect()).collect::<Vec<_>>(),
+        );
     }
     pub fn recompute(&mut self, pf: Option<&tr_broker::Portfolio>) {
-        self.adma_stretch = pf.into_iter().flat_map(|pf| &pf.positions)
-            .filter_map(|p| p.market_key()).map(|key| {
-                let stretch = self.history.get(&key).and_then(|bars|
-                    tr_core::indicators::adma_stretch(&bars.iter().map(|b| b.close).collect::<Vec<_>>()));
+        self.adma_stretch = pf
+            .into_iter()
+            .flat_map(|pf| &pf.positions)
+            .filter_map(|p| p.market_key())
+            .map(|key| {
+                let stretch = self.history.get(&key).and_then(|bars| {
+                    tr_core::indicators::adma_stretch(&bars.iter().map(|b| b.close).collect::<Vec<_>>())
+                });
                 (key, stretch)
-            }).collect();
-        let spy_close = self.spy.as_deref()
+            })
+            .collect();
+        let spy_close = self
+            .spy
+            .as_deref()
             .filter(|bars| tr_core::Bar::require_verified(bars, "holding SPY benchmark").is_ok())
             .map(|bars| bars.iter().map(|b| b.close).collect::<Vec<_>>());
-        self.setups = pf.into_iter().flat_map(|pf| &pf.positions)
-            .filter_map(|p| p.market_key()).map(|key| {
+        self.setups = pf
+            .into_iter()
+            .flat_map(|pf| &pf.positions)
+            .filter_map(|p| p.market_key())
+            .map(|key| {
                 let setups = self.history.get(&key).and_then(|bars| {
                     tr_core::Bar::require_verified(bars, "holding setups").ok()?;
                     let mut metrics = tr_data::whats_news::cached_calculate(bars).ok()?;
                     metrics.oneil_lens = tr_data::whats_news::scan_pack::measure_oneil(
-                        &bars.iter().map(|b| b.close).collect::<Vec<_>>(), spy_close.as_deref());
+                        &bars.iter().map(|b| b.close).collect::<Vec<_>>(),
+                        spy_close.as_deref(),
+                    );
                     Some(tr_data::whats_news::active_setups(bars, &metrics))
                 });
                 (key, setups)
-            }).collect();
-        self.setup_count = self.setups.iter().map(|(key, setups)|
-            (key.clone(), setups.as_ref().map(Vec::len))).collect();
-        self.breaches = pf.map(|pf| tr_core::indicators::risk_breaches(
-            super::portfolio_view::holding_risks(
-                &super::broker::PortfolioPane::new(crate::command::PortView::Positions), pf, self)));
+            })
+            .collect();
+        self.setup_count =
+            self.setups.iter().map(|(key, setups)| (key.clone(), setups.as_ref().map(Vec::len))).collect();
+        self.breaches = pf.map(|pf| {
+            tr_core::indicators::risk_breaches(super::portfolio_view::holding_risks(
+                &super::broker::PortfolioPane::new(crate::command::PortView::Positions),
+                pf,
+                self,
+            ))
+        });
         self.positions = pf.map(|pf| pf.positions.clone());
     }
 }
@@ -860,11 +1050,11 @@ impl TerminalApp {
     /// Compare only portfolio inputs; archive histories are never cloned during rendering.
     pub(super) fn sync_holding_risk(&mut self) {
         let pf = if self.demo_mode() { Some(&*self.demo.pf) } else { self.broker.portfolio.as_deref() };
-        let keys: std::collections::BTreeSet<_> = pf.into_iter()
-            .flat_map(|pf| pf.positions.iter()).filter_map(|p| p.market_key()).collect();
+        let keys: std::collections::BTreeSet<_> =
+            pf.into_iter().flat_map(|pf| pf.positions.iter()).filter_map(|p| p.market_key()).collect();
         let previous_history_len = self.holding_risk.history.len();
-        let (changed, history) = reconcile_held_history(
-            &self.holding_risk.held_keys, &keys, std::mem::take(&mut self.holding_risk.history));
+        let (changed, history) =
+            reconcile_held_history(&self.holding_risk.held_keys, &keys, std::mem::take(&mut self.holding_risk.history));
         self.holding_risk.history = history;
         self.holding_risk.held_keys = keys;
         if self.holding_risk.history.len() != previous_history_len {
@@ -885,7 +1075,8 @@ impl TerminalApp {
         }
         if pf.is_some()
             && !self.holding_risk.requested
-            && let Some(pane) = self.panes.iter().find(|p| matches!(p.kind, PaneKind::Desk(_) | PaneKind::Portfolio(_))).map(|p| p.id)
+            && let Some(pane) =
+                self.panes.iter().find(|p| matches!(p.kind, PaneKind::Desk(_) | PaneKind::Portfolio(_))).map(|p| p.id)
         {
             let symbols = self.holding_risk.held_keys.iter().cloned().collect();
             self.holding_risk.requested = true;
@@ -927,7 +1118,8 @@ mod holding_risk_tests {
         app.open_holdings_risk();
         assert_eq!(app.focus, id);
         assert_eq!(app.panes.len(), count + 1);
-        assert!(app.panes.iter().any(|p| p.id == id && matches!(&p.kind,
+        assert!(app.panes.iter().any(|p| p.id == id
+            && matches!(&p.kind,
             PaneKind::Portfolio(pp) if pp.open_risk && pp.view == crate::command::PortView::Positions)));
     }
 
@@ -986,9 +1178,20 @@ mod holding_risk_tests {
     #[test]
     fn setup_hits_hover_lists_only_held_positive_counts() {
         let state = HoldingRiskState {
-            held_keys: ["AAPL US Equity", "MSFT US Equity", "ZERO", "UNKNOWN", "MISSING"].map(String::from).into_iter().collect(),
-            setup_count: [("AAPL US Equity", Some(3)), ("MSFT US Equity", Some(2)), ("ZERO", Some(0)), ("UNKNOWN", None), ("STALE", Some(9))]
-                .into_iter().map(|(key, count)| (key.into(), count)).collect(),
+            held_keys: ["AAPL US Equity", "MSFT US Equity", "ZERO", "UNKNOWN", "MISSING"]
+                .map(String::from)
+                .into_iter()
+                .collect(),
+            setup_count: [
+                ("AAPL US Equity", Some(3)),
+                ("MSFT US Equity", Some(2)),
+                ("ZERO", Some(0)),
+                ("UNKNOWN", None),
+                ("STALE", Some(9)),
+            ]
+            .into_iter()
+            .map(|(key, count)| (key.into(), count))
+            .collect(),
             ..Default::default()
         };
         let hover = state.setup_hits_hover();
@@ -1025,8 +1228,12 @@ mod holding_risk_tests {
         state.history.insert(key.clone(), vec![]);
         state.recompute(Some(&pf));
         assert_eq!(state.setup_count[&key], None);
-        let bars = (0..40).map(|i| tr_core::Bar::new(i * 86400, 100.0, 101.0, 99.0, 100.0, 100.0)
-            .with_provenance(tr_core::Provenance::Real)).collect();
+        let bars = (0..40)
+            .map(|i| {
+                tr_core::Bar::new(i * 86400, 100.0, 101.0, 99.0, 100.0, 100.0)
+                    .with_provenance(tr_core::Provenance::Real)
+            })
+            .collect();
         state.history.insert(key.clone(), bars);
         state.recompute(Some(&pf));
         let setups = state.setups[&key].as_ref().unwrap();
@@ -1045,17 +1252,24 @@ mod holding_risk_tests {
         let pf = tr_broker::sample::portfolio();
         let keys: Vec<_> = pf.positions.iter().filter_map(|p| p.market_key()).take(2).collect();
         assert_eq!(keys.len(), 2);
-        let bars = |step: f64| (0..80).map(|i| {
-            let close = 100.0 + i as f64 * step;
-            tr_core::Bar::new(i * 86400, close, close + 1.0, close - 1.0, close, 100.0)
-                .with_provenance(tr_core::Provenance::Real)
-        }).collect::<Vec<_>>();
+        let bars = |step: f64| {
+            (0..80)
+                .map(|i| {
+                    let close = 100.0 + i as f64 * step;
+                    tr_core::Bar::new(i * 86400, close, close + 1.0, close - 1.0, close, 100.0)
+                        .with_provenance(tr_core::Provenance::Real)
+                })
+                .collect::<Vec<_>>()
+        };
         let mut state = HoldingRiskState::default();
-        for key in &keys { state.history.insert(key.clone(), bars(1.0)); }
+        for key in &keys {
+            state.history.insert(key.clone(), bars(1.0));
+        }
         state.refresh_breadth();
         let breadth_n = state.breadth.n;
-        let has_oneil = |state: &HoldingRiskState| keys.iter().all(|key|
-            state.setups[key].as_ref().unwrap().iter().any(|tag| tag == "ONEIL_LENS"));
+        let has_oneil = |state: &HoldingRiskState| {
+            keys.iter().all(|key| state.setups[key].as_ref().unwrap().iter().any(|tag| tag == "ONEIL_LENS"))
+        };
         state.recompute(Some(&pf));
         assert!(!has_oneil(&state));
         let counts = state.setup_count.clone();
@@ -1063,7 +1277,9 @@ mod holding_risk_tests {
         state.spy = Some(bars(0.0));
         state.recompute(Some(&pf));
         assert!(has_oneil(&state));
-        for key in &keys { assert_eq!(state.setup_count[key], counts[key].map(|n| n + 1)); }
+        for key in &keys {
+            assert_eq!(state.setup_count[key], counts[key].map(|n| n + 1));
+        }
         state.refresh_breadth();
         assert_eq!(state.breadth.n, breadth_n, "benchmark must not enter holdings breadth");
         assert_eq!(state.history.len(), keys.len());
@@ -1081,7 +1297,9 @@ mod holding_risk_tests {
         assert!(!has_oneil(&state));
         state.spy = None;
         state.recompute(Some(&pf));
-        for key in &keys { assert_eq!(state.setup_count[key], counts[key]); }
+        for key in &keys {
+            assert_eq!(state.setup_count[key], counts[key]);
+        }
     }
 
     #[test]
@@ -1097,8 +1315,8 @@ mod holding_risk_tests {
         assert_eq!(state.adma_stretch.get(&key), Some(&Some(0.0)));
         state.history.get_mut(&key).unwrap().last_mut().unwrap().close = 15.0;
         state.recompute(Some(&pf));
-        let expected = tr_core::indicators::adma_stretch(
-            &state.history[&key].iter().map(|b| b.close).collect::<Vec<_>>());
+        let expected =
+            tr_core::indicators::adma_stretch(&state.history[&key].iter().map(|b| b.close).collect::<Vec<_>>());
         assert_eq!(state.adma_stretch[&key], expected);
         assert_ne!(expected, Some(0.0));
         pf.positions.clear();
@@ -1115,7 +1333,10 @@ mod holding_risk_tests {
         let mut state = HoldingRiskState::default();
         state.recompute(Some(&pf));
         let expected = tr_core::indicators::risk_breaches(super::super::portfolio_view::holding_risks(
-            &super::super::broker::PortfolioPane::new(crate::command::PortView::Positions), &pf, &state));
+            &super::super::broker::PortfolioPane::new(crate::command::PortView::Positions),
+            &pf,
+            &state,
+        ));
         assert_eq!(state.breaches, Some(expected));
         state.concentration = 1.0;
         state.recompute(Some(&pf));
@@ -1129,9 +1350,12 @@ mod holding_risk_tests {
 fn breadth_chips(b: &tr_data::whats_news::scan_pack::Breadth) -> [String; 4] {
     let pct = |v: Option<f64>, n| v.map(|v| format!("{v:.1}%/{n}")).unwrap_or_else(|| "—".into());
     let ad = |v: Option<f64>| v.map(|v| format!("{v:.3}")).unwrap_or_else(|| "—".into());
-    [format!(">SMA50 {}", pct(b.pct_above_sma50, b.n_sma50)),
-     format!(">SMA200 {}", pct(b.pct_above_sma200, b.n_sma200)),
-     format!("1d A/D {}", ad(b.ad_1d)), format!("5d A/D {}", ad(b.ad_5d))]
+    [
+        format!(">SMA50 {}", pct(b.pct_above_sma50, b.n_sma50)),
+        format!(">SMA200 {}", pct(b.pct_above_sma200, b.n_sma200)),
+        format!("1d A/D {}", ad(b.ad_1d)),
+        format!("5d A/D {}", ad(b.ad_5d)),
+    ]
 }
 #[cfg(test)]
 mod breadth_chip_tests {
@@ -1140,9 +1364,14 @@ mod breadth_chip_tests {
     fn loaded_scope_and_missing_values() {
         let mut state = HoldingRiskState::default();
         assert_eq!(breadth_chips(&state.breadth), [">SMA50 —", ">SMA200 —", "1d A/D —", "5d A/D —"]);
-        state.history.insert("A".into(), (0..201).map(|i| tr_core::Bar::new(i, 1., 1., 1., i as f64 + 1., 1.)).collect());
+        state
+            .history
+            .insert("A".into(), (0..201).map(|i| tr_core::Bar::new(i, 1., 1., 1., i as f64 + 1., 1.)).collect());
         state.refresh_breadth();
-        assert_eq!(breadth_chips(&state.breadth), [">SMA50 100.0%/1", ">SMA200 100.0%/1", "1d A/D 1.000", "5d A/D 1.000"]);
+        assert_eq!(
+            breadth_chips(&state.breadth),
+            [">SMA50 100.0%/1", ">SMA200 100.0%/1", "1d A/D 1.000", "5d A/D 1.000"]
+        );
         state.history.clear();
         state.refresh_breadth();
         assert!(!state.breadth.ready);
@@ -1160,7 +1389,8 @@ mod scan_breadth_selection_tests {
         assert_eq!(state.selected_breadth().1, "Holdings breadth (1)");
         state.scan_breadth = Some(tr_data::whats_news::scan_pack::ScanBreadth {
             breadth: tr_data::whats_news::scan_pack::breadth(&[vec![90.; 201], vec![100.; 201]]),
-            symbols: 2, as_of: Some(chrono::NaiveDate::from_ymd_opt(2026, 10, 30).unwrap()),
+            symbols: 2,
+            as_of: Some(chrono::NaiveDate::from_ymd_opt(2026, 10, 30).unwrap()),
         });
         assert_eq!(state.selected_breadth().0.n, 2);
         assert_eq!(state.selected_breadth().1, "Market breadth (SCAN, 2 symbols, as of 2026-10-30)");
@@ -1175,7 +1405,17 @@ mod scan_age_tests {
     use super::*;
     #[test]
     fn age_units_and_boundaries() {
-        for (seconds, expected) in [(0,"0s"),(59,"59s"),(60,"1m"),(720,"12m"),(3599,"59m"),(3600,"1h"),(86399,"23h"),(86400,"1d"),(172800,"2d")] {
+        for (seconds, expected) in [
+            (0, "0s"),
+            (59, "59s"),
+            (60, "1m"),
+            (720, "12m"),
+            (3599, "59m"),
+            (3600, "1h"),
+            (86399, "23h"),
+            (86400, "1d"),
+            (172800, "2d"),
+        ] {
             assert_eq!(format_scan_age(std::time::Duration::from_secs(seconds)), expected);
         }
     }
@@ -1183,7 +1423,9 @@ mod scan_age_tests {
     fn scan_age_and_empty_fallbacks() {
         let mut state = HoldingRiskState::default();
         state.scan_breadth = Some(tr_data::whats_news::scan_pack::ScanBreadth {
-            symbols: 1, breadth: tr_data::whats_news::scan_pack::breadth(&[vec![100.]]), as_of: chrono::NaiveDate::from_ymd_opt(2026,10,30),
+            symbols: 1,
+            breadth: tr_data::whats_news::scan_pack::breadth(&[vec![100.]]),
+            as_of: chrono::NaiveDate::from_ymd_opt(2026, 10, 30),
         });
         state.scan_breadth_received = Some(std::time::Instant::now());
         assert_eq!(state.selected_breadth().1, "Market breadth (SCAN, 1 symbol, as of 2026-10-30, 0s ago)");

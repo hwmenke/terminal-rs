@@ -935,6 +935,7 @@ pub struct TerminalApp {
     pol_search: String,
     alerts: Vec<Alert>,
     price_alerts: tr_data::price_alerts::AlertBatch,
+    trade_plans: tr_data::trade_plans::PlanBatch,
     alert_draft: alerts::AlertDraft,
     last_price_alerts: Option<Instant>,
     journal: tr_data::journal::Store,
@@ -1113,6 +1114,7 @@ impl TerminalApp {
             pol_search: String::new(),
             alerts: Vec::new(),
             price_alerts: tr_data::price_alerts::AlertBatch::empty(0),
+            trade_plans: tr_data::trade_plans::PlanBatch::empty(0),
             alert_draft: alerts::AlertDraft::default(),
             last_price_alerts: None,
             journal: tr_data::journal::Store::load(&tr_data::journal::store_path(data_dir())),
@@ -1173,6 +1175,7 @@ impl TerminalApp {
         app.worker.send(Request::Latest { limit: 2_000 });
         app.worker.send(Request::SearchPoliticians(String::new()));
         app.worker.send(Request::Alerts);
+        app.worker.send(Request::TradePlans);
         if let Some(note) = demo_note {
             app.trade_toast(note, false);
         }
@@ -1308,6 +1311,9 @@ impl TerminalApp {
             Command::SymbolFunction(s, Function::JournalNote { date, text }) => {
                 self.add_journal_note(Some(&s), &date, &text)
             }
+            Command::SymbolFunction(s, Function::ArmPlan { entry, stop, target, risk }) => {
+                self.arm_trade_plan(Some(s), entry, stop, target, risk);
+            }
             Command::SymbolFunction(s, Function::SetPriceAlert(kind)) => self.set_price_alert(Some(s), kind),
             Command::SymbolFunction(s, Function::ClearPriceAlert(_)) => self.clear_price_alert(&s),
             Command::SymbolFunction(s, f) => {
@@ -1343,10 +1349,16 @@ impl TerminalApp {
             Function::Politician(q) => self.open_panel(PaneKind::Profile { query: q, data: None, loading: true }),
             Function::Track(q) => self.worker.send(Request::Track { query: q, on: true }),
             Function::Untrack(q) => self.worker.send(Request::Track { query: q, on: false }),
-            Function::Alerts => {
+            Function::Alerts | Function::Plans => {
                 self.worker.send(Request::Alerts);
                 self.worker.send(Request::PriceAlerts);
+                self.worker.send(Request::TradePlans);
                 self.worker.send(Request::EvaluatePriceAlerts);
+                self.open_panel(PaneKind::Alerts);
+            }
+            Function::ArmPlan { entry, stop, target, risk } => self.arm_trade_plan(symbol, entry, stop, target, risk),
+            Function::CancelPlans(query) => {
+                self.worker.send(Request::CancelTradePlansFor { query });
                 self.open_panel(PaneKind::Alerts);
             }
             Function::SetPriceAlert(kind) => self.set_price_alert(symbol, kind),
@@ -1623,7 +1635,10 @@ impl TerminalApp {
                         && r.generation == generation
                     {
                         let result = result.map(|scan| {
-                            if scan.provenance.require_verified("SCAN").is_ok() { self.holding_risk.scan_breadth = Some(scan.breadth); self.holding_risk.scan_breadth_received = Some(std::time::Instant::now()); }
+                            if scan.provenance.require_verified("SCAN").is_ok() {
+                                self.holding_risk.scan_breadth = Some(scan.breadth);
+                                self.holding_risk.scan_breadth_received = Some(std::time::Instant::now());
+                            }
                             scan.snapshot
                         });
                         r.accept_scan(result);
@@ -1633,7 +1648,8 @@ impl TerminalApp {
                     let _ = pane;
                     if self.holding_risk.generation == generation {
                         self.holding_risk.loading = false;
-                        let history_changed = rows.iter().any(|(key, bars)| self.holding_risk.history.get(key) != Some(bars));
+                        let history_changed =
+                            rows.iter().any(|(key, bars)| self.holding_risk.history.get(key) != Some(bars));
                         self.holding_risk.history.extend(rows);
                         self.holding_risk.spy = spy;
                         if history_changed {
@@ -1884,6 +1900,13 @@ impl TerminalApp {
                     }
                     self.worker.send(Request::Alerts);
                 }
+                Response::TradePlanFeed(batch) => self.trade_plans = batch,
+                Response::NewTradePlanEvents(events) => {
+                    for event in events {
+                        tracing::info!("ALERT: {}", event.message);
+                        self.toasts.push((event.message, Instant::now()));
+                    }
+                }
                 Response::PriceAlertFeed(batch) => {
                     self.price_alerts = batch;
                     self.sync_chart_alerts();
@@ -1913,6 +1936,31 @@ impl TerminalApp {
                 }
             }
         }
+    }
+
+    fn arm_trade_plan(
+        &mut self,
+        symbol: Option<String>,
+        entry: f64,
+        stop: f64,
+        target: Option<f64>,
+        risk: Option<f64>,
+    ) {
+        let Some(symbol) = symbol.or_else(|| self.focused_symbol()) else {
+            self.status = "PLAN needs a ticker: NVDA PLAN 142.5 STOP 138.2 TARGET 151.1 RISK 300".into();
+            return;
+        };
+        let shares = risk.map(|risk| (risk / (entry - stop).abs()).floor()).unwrap_or(0.0);
+        self.worker.send(Request::ArmTradePlan(tr_data::trade_plans::PlanDraft {
+            symbol,
+            entry,
+            stop,
+            target,
+            dollar_risk: risk.unwrap_or(0.0),
+            shares,
+            stop_source: "command".into(),
+        }));
+        self.open_panel(PaneKind::Alerts);
     }
 
     fn set_price_alert(&mut self, symbol: Option<String>, kind: tr_data::price_alerts::AlertKind) {
@@ -1948,7 +1996,7 @@ impl TerminalApp {
     }
 
     fn unread_alerts(&self) -> usize {
-        self.alerts.iter().filter(|a| !a.seen).count() + self.price_alerts.unread()
+        self.alerts.iter().filter(|a| !a.seen).count() + self.price_alerts.unread() + self.trade_plans.unread()
     }
 
     /// Freshness line for the Congress feed: last check, newest filing, next check.
@@ -2335,7 +2383,8 @@ impl TerminalApp {
             self.worker.send(Request::Latest { limit: 2_000 });
             self.last_feed = Some(Instant::now());
         }
-        if self.price_alerts.rules.iter().any(|r| r.enabled)
+        if (self.price_alerts.rules.iter().any(|r| r.enabled)
+            || self.trade_plans.plans.iter().any(|p| p.status.active()))
             && self.last_price_alerts.is_none_or(|t| t.elapsed() > Duration::from_secs(20))
         {
             self.worker.send(Request::EvaluatePriceAlerts);
@@ -2647,6 +2696,7 @@ mod tests {
             pol_search: String::new(),
             alerts: Vec::new(),
             price_alerts: tr_data::price_alerts::AlertBatch::empty(0),
+            trade_plans: tr_data::trade_plans::PlanBatch::empty(0),
             alert_draft: alerts::AlertDraft::default(),
             last_price_alerts: None,
             journal: Default::default(),

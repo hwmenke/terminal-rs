@@ -232,6 +232,14 @@ pub enum Function {
     Track(String),
     Untrack(String),
     Alerts,
+    ArmPlan {
+        entry: f64,
+        stop: f64,
+        target: Option<f64>,
+        risk: Option<f64>,
+    },
+    Plans,
+    CancelPlans(String),
     /// `AAPL ALERT 150` / `AAPL ALERT VWAP` / `AAPL ALERT RVOL 2` / `AAPL ALERT SETUP NEAR_HIGH`.
     SetPriceAlert(tr_data::price_alerts::AlertKind),
     /// `UNALERT` / `UNALERT AAPL` — drop price, VWAP, RVOL, and setup rules.
@@ -482,6 +490,29 @@ fn parse_alert_kind(rest: &[&str]) -> Option<tr_data::price_alerts::AlertKind> {
     (level.is_finite() && level > 0.0).then_some(AlertKind::Price { side: PriceSide::Above, level })
 }
 
+fn parse_plan(rest: &[&str]) -> Option<Function> {
+    let positive = |s: &str| s.parse::<f64>().ok().filter(|v| v.is_finite() && *v > 0.0);
+    let entry = positive(rest.first()?)?;
+    if !rest.get(1)?.eq_ignore_ascii_case("STOP") {
+        return None;
+    }
+    let stop = positive(rest.get(2)?)?;
+    let mut target = None;
+    let mut risk = None;
+    for pair in rest[3..].chunks(2) {
+        let [keyword, value] = pair else {
+            return None;
+        };
+        let value = positive(value)?;
+        match keyword.to_ascii_uppercase().as_str() {
+            "TARGET" | "TGT" if target.is_none() => target = Some(value),
+            "RISK" if risk.is_none() => risk = Some(value),
+            _ => return None,
+        }
+    }
+    Some(Function::ArmPlan { entry, stop, target, risk })
+}
+
 fn parse_function(head: &str, rest: &[&str]) -> Option<Function> {
     let up = head.to_ascii_uppercase();
     let words = || rest.iter().map(|s| s.to_ascii_uppercase()).collect::<Vec<_>>();
@@ -521,6 +552,9 @@ fn parse_function(head: &str, rest: &[&str]) -> Option<Function> {
         "POL" | "PROFILE" => Function::Politician(joined()),
         "TRACK" => Function::Track(joined()),
         "UNTRACK" => Function::Untrack(joined()),
+        "PLAN" => parse_plan(rest)?,
+        "PLANS" if rest.is_empty() => Function::Plans,
+        "UNPLAN" if !rest.is_empty() => Function::CancelPlans(joined()),
         "ALRT" | "ALERTS" => Function::Alerts,
         "ALERT" if rest.is_empty() => Function::Alerts,
         "ALERT" => Function::SetPriceAlert(parse_alert_kind(rest)?),
@@ -732,6 +766,9 @@ fn describe(f: &Function) -> String {
         Function::Alerts => {
             "Alerts: price levels, session VWAP crosses, session RVOL, session path/pace/gap/extreme/relative, setup changes, and tracked filings".into()
         }
+        Function::ArmPlan { .. } => "Arm an entry → stop/target quote plan (places no orders)".into(),
+        Function::Plans => "Open trade plans in Alerts".into(),
+        Function::CancelPlans(q) => format!("Cancel active trade plans for {q}"),
         Function::SetPriceAlert(kind) => format!("Watch {}", kind.label()),
         Function::ClearPriceAlert(q) if q.is_empty() => "Remove price/setup alerts for the focused name".into(),
         Function::ClearPriceAlert(q) => format!("Remove price/setup alerts for {q}"),
@@ -948,6 +985,43 @@ fn describe(f: &Function) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn plan_command_parses_levels_target_and_risk() {
+        for (command, target, risk) in [
+            ("NVDA PLAN 142.5 STOP 138.2 TARGET 151.1 RISK 300", Some(151.1), Some(300.0)),
+            ("nvda plan 142.5 stop 138.2 risk 300", None, Some(300.0)),
+            ("NVDA PLAN 142.5 STOP 138.2", None, None),
+            ("NVDA PLAN 142.5 STOP 138.2 TGT 151.1", Some(151.1), None),
+        ] {
+            assert_eq!(
+                parse(command),
+                Some(Command::SymbolFunction(
+                    "NVDA US Equity".into(),
+                    Function::ArmPlan { entry: 142.5, stop: 138.2, target, risk }
+                ))
+            );
+        }
+        for command in [
+            "NVDA PLAN 142.5",
+            "NVDA PLAN 142.5 138.2",
+            "NVDA PLAN x STOP 138.2",
+            "NVDA PLAN 142.5 STOP NaN",
+            "NVDA PLAN 142.5 STOP 138.2 RISK 0",
+            "NVDA PLAN 142.5 STOP 138.2 TARGET -1",
+            "NVDA PLAN 142.5 STOP 138.2 RISK",
+            "NVDA PLAN 142.5 STOP 138.2 TARGET 151 TARGET 152",
+        ] {
+            assert!(parse(command).is_none(), "{command}");
+        }
+    }
+
+    #[test]
+    fn plans_and_unplan_parse() {
+        assert_eq!(parse("PLANS"), Some(Command::Function(Function::Plans)));
+        assert_eq!(parse("unplan nvda"), Some(Command::Function(Function::CancelPlans("nvda".into()))));
+        assert!(describe(&Function::Plans).contains("trade plans"));
+    }
 
     #[test]
     fn symbols() {
