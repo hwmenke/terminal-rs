@@ -979,7 +979,10 @@ fn catalog() -> Vec<Def> {
         .n("Length", 22.0)
         .real("Multiplier", 3.0, 0.1, 20.0),
         overlay("ADTREND", "Adaptive Trend", trd, |i, p| {
-            let t = adaptive_trend(&i.d, AdaptiveTrendParams::from_registry(p));
+            let mut params = AdaptiveTrendParams::from_registry(p);
+            params.session_atr = i.tf.is_intraday();
+            let starts = i.tf.is_intraday().then(|| session_starts(&i.d.ts));
+            let t = adaptive_trend_with(&i.d, params, starts.as_deref());
             let (lng, sht) = t.flip_dots(&i.d.close);
             vec![
                 nth("SB", t.sb, 0),

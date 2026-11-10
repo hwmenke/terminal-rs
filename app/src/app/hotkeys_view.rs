@@ -413,6 +413,9 @@ impl TerminalApp {
                     (&["REVIEW", "AAPL REVIEW"], "Linked daily + weekly archive charts for candidate review"),
                     (&["LATEST", "END"], "Jump to the latest candle (keeps zoom)"),
                     (&["BOX", "RS", "VCTX"], "Toggle box levels, 21-bar return, volume context"),
+                    (&["TSTACK", "STACK", "MTF", "REGIME"], "Trend Stack: completed timeframe lanes, confidence cloud, verified bars only"),
+                    (&["TSTACK ON", "TSTACK OFF", "NEW TSTACK NVDA", "SPLIT DOWN TSTACK"], "Enable, disable, or open a stacked chart; saved with the layout"),
+                    (&[",", ".", "\\"], "Chart interval shorter / longer / last intraday ↔ daily (empty command line)"),
                     (&["ADTREND", "ATREND"], "Adaptive Trend bands, regime flips, MRT/LRT stops (verified bars)"),
                 ],
             );

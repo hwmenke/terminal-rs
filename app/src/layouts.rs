@@ -95,6 +95,8 @@ pub enum PaneSettings {
         show_rs: bool,
         #[serde(default)]
         show_volume_ctx: bool,
+        #[serde(default)]
+        show_stack: bool,
     },
     /// Congress feed with its filter (`None` = unfiltered).
     Feed(Option<FeedSettings>),
@@ -498,6 +500,7 @@ pub fn chart_settings(symbol: &str, d: &crate::prefs::PanelDefaults) -> PaneSett
         show_box: false,
         show_rs: false,
         show_volume_ctx: false,
+        show_stack: false,
     }
 }
 
@@ -660,6 +663,23 @@ mod tests {
     use super::*;
     use crate::dock::Zone;
     use crate::prefs::PanelDefaults;
+
+    #[test]
+    fn show_stack_round_trips_and_defaults_off_for_old_layouts() {
+        let mut settings = chart_settings("AAPL", &Default::default());
+        if let PaneSettings::Chart { show_stack, .. } = &mut settings {
+            *show_stack = true;
+        }
+        let json = serde_json::to_value(&settings).unwrap();
+        let restored: PaneSettings = serde_json::from_value(json.clone()).unwrap();
+        assert!(matches!(restored, PaneSettings::Chart { show_stack: true, .. }));
+        let mut old = json;
+        old.get_mut("Chart").unwrap().as_object_mut().unwrap().remove("show_stack");
+        assert!(matches!(
+            serde_json::from_value::<PaneSettings>(old).unwrap(),
+            PaneSettings::Chart { show_stack: false, .. }
+        ));
+    }
 
     #[test]
     fn rotation_settings_round_trip() {
@@ -874,6 +894,7 @@ mod tests {
                 show_box: false,
                 show_rs: false,
                 show_volume_ctx: false,
+                show_stack: false,
             }],
         );
         let back = LayoutDoc::from_json(&doc.to_json()).unwrap();

@@ -213,6 +213,7 @@ impl Range {
 #[derive(Debug, Clone, PartialEq)]
 pub enum Function {
     Timeframe(Timeframe),
+    TrendStack(Option<bool>),
     ChartType(ChartType),
     /// Add or remove an indicator (any code from the catalog: `RSI`, `BB 20 2.5`, `ICHIMOKU`).
     Indicator(IndicatorSpec),
@@ -613,6 +614,12 @@ fn parse_function(head: &str, rest: &[&str]) -> Option<Function> {
         }
         "LAYOUT" | "GRID" | "LP" => Function::Layout(joined()),
         "LAYOUTS" => Function::Layouts,
+        "TSTACK" | "STACK" | "MTF" | "REGIME" => Function::TrendStack(match rest {
+            [] => None,
+            [arg] if arg.eq_ignore_ascii_case("ON") => Some(true),
+            [arg] if arg.eq_ignore_ascii_case("OFF") => Some(false),
+            _ => return None,
+        }),
         "NEW" | "ADD" => Function::NewPanel(joined()),
         "SPLIT" | "SPLITV" | "SPLITH" => {
             let w = words();
@@ -774,6 +781,7 @@ pub fn hint(input: &str) -> String {
 
 fn describe(f: &Function) -> String {
     match f {
+        Function::TrendStack(on) => format!("Trend Stack{}", match on { None => " toggle", Some(true) => " on", Some(false) => " off" }),
         Function::Timeframe(tf) => format!(
             "Interval {}",
             match tf {
@@ -1031,6 +1039,22 @@ fn describe(f: &Function) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tstack_and_aliases_parse() {
+        for alias in ["TSTACK", "STACK", "MTF", "REGIME"] {
+            assert_eq!(parse(alias), Some(Command::Function(Function::TrendStack(None))));
+            assert_eq!(parse(&format!("{alias} ON")), Some(Command::Function(Function::TrendStack(Some(true)))));
+        }
+        assert_eq!(parse("TSTACK OFF"), Some(Command::Function(Function::TrendStack(Some(false)))));
+        assert_eq!(
+            parse("AAPL TSTACK"),
+            Some(Command::SymbolFunction("AAPL US Equity".into(), Function::TrendStack(None)))
+        );
+        assert!(parse("TSTACK FOO").is_none());
+        assert!(parse("TSTACK ON FOO").is_none());
+        assert!(matches!(parse("STACK US Equity"), Some(Command::Symbol(_))));
+    }
 
     #[test]
     fn rrg_and_aliases_parse() {

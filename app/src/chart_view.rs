@@ -7,6 +7,7 @@ use egui::{
     Align2, Color32, CornerRadius, CursorIcon, Pos2, Rect, RichText, Sense, Stroke, StrokeKind, Ui, UiBuilder, pos2,
     vec2,
 };
+use std::time::{Duration, Instant};
 use tr_chart::drawings::{self, Anchor, AnnotationStore, Drawing, Shape, Tool};
 use tr_chart::gpu::{ChartCallback, Frame, LineKind, LineRef, Reveal, Style};
 use tr_chart::scale;
@@ -14,7 +15,9 @@ use tr_chart::scene::{self, ChartType, Overlay, PricePane, SeriesGpu};
 use tr_chart::viewport::{PriceScale, Viewport};
 use tr_congress::{Trade, TxType};
 use tr_core::indicators::registry::{self, Category};
+use tr_core::indicators::{AdaptiveTrendParams, Lane, LaneStatus, StackScore, TrendStack, ladder};
 use tr_core::{AssetClass, Bar, Provenance, Security, Timeframe};
+use tr_data::intraday::{Freshness, MarketClock};
 
 use crate::command::{IndicatorSpec, Range};
 use crate::congress_view::Action;
@@ -199,6 +202,13 @@ struct DrawState {
     selected: Option<usize>,
 }
 
+#[derive(Default)]
+struct StackPaint {
+    key: Vec<u64>,
+    cloud: Vec<egui::Shape>,
+    lanes: Vec<egui::Shape>,
+}
+
 pub struct ChartState {
     pub id: PaneId,
     pub archive: bool,
@@ -231,6 +241,16 @@ pub struct ChartState {
     drawing_undo: Option<Vec<Drawing>>,
     pub compare: Option<String>,
     pub show_spy_strength: bool,
+    pub show_stack: bool,
+    stack: Option<TrendStack>,
+    stack_error: Option<String>,
+    last_intraday_tf: Timeframe,
+    stack_pulse: Option<(i64, Instant)>,
+    stack_paint: StackPaint,
+    stack_revision: u64,
+    stack_arrived: Option<Instant>,
+    previous_stack_lanes: Option<(Vec<egui::Shape>, Instant)>,
+    interval_glide: Option<Viewport>,
     spy_strength: Option<LineRef>,
     spy_strength_error: Option<String>,
 
@@ -322,6 +342,16 @@ impl ChartState {
             drawing_undo: None,
             compare: None,
             show_spy_strength: false,
+            show_stack: false,
+            stack: None,
+            stack_error: None,
+            last_intraday_tf: if tf.is_intraday() { tf } else { Timeframe::M5 },
+            stack_pulse: None,
+            stack_paint: Default::default(),
+            stack_revision: 0,
+            stack_arrived: None,
+            previous_stack_lanes: None,
+            interval_glide: None,
             spy_strength: None,
             spy_strength_error: None,
             bars: Arc::new(Vec::new()),
@@ -415,6 +445,13 @@ impl ChartState {
     /// (Re)load history for the current symbol and timeframe.
     pub fn load(&mut self, w: &Worker) {
         self.generation += 1;
+        self.stack = None;
+        self.stack_error = None;
+        self.stack_pulse = None;
+        self.stack_paint = Default::default();
+        self.stack_arrived = None;
+        self.previous_stack_lanes = None;
+        self.interval_glide = None;
         self.loading = true;
         self.paging = false;
         self.exhausted = false;
@@ -579,9 +616,19 @@ impl ChartState {
             self.commit_drawings();
             self.drawing_undo = None;
             self.draw.selected = None;
+            let previous_lanes =
+                (self.show_stack && !self.stack_paint.lanes.is_empty()).then(|| self.stack_paint.lanes.clone());
             self.tf = tf;
+            if tf.is_intraday() {
+                self.last_intraday_tf = tf;
+            }
             self.drawings = self.drawing_store.get_view(&self.symbol, self.tf);
+            let from = self.viewport;
             self.load(w);
+            if self.show_stack {
+                self.interval_glide = from;
+                self.previous_stack_lanes = previous_lanes.map(|shapes| (shapes, Instant::now()));
+            }
         }
     }
 
@@ -801,6 +848,7 @@ impl ChartState {
     }
 
     fn request_indicators(&self, w: &Worker) {
+        self.request_trend_stack(w);
         if !self.bars.is_empty() {
             w.send(Request::Indicators {
                 pane: self.id,
@@ -811,6 +859,248 @@ impl ChartState {
                 palette: theme::palette(),
             });
         }
+    }
+
+    fn stack_params(&self) -> AdaptiveTrendParams {
+        self.indicators
+            .iter()
+            .find(|s| s.code == "ADTREND")
+            .map(|s| AdaptiveTrendParams::from_registry(&s.params))
+            .unwrap_or_default()
+    }
+
+    fn request_trend_stack(&self, w: &Worker) {
+        if self.show_stack && !self.bars.is_empty() {
+            w.send(Request::TrendStack {
+                pane: self.id,
+                generation: self.generation,
+                symbol: self.symbol.clone(),
+                tf: self.tf,
+                archive: self.archive,
+                base: self.bars.clone(),
+                params: self.stack_params(),
+            });
+        }
+    }
+
+    pub fn set_trend_stack(&mut self, on: Option<bool>, w: &Worker) {
+        self.show_stack = on.unwrap_or(!self.show_stack);
+        self.stack_error = None;
+        if self.show_stack {
+            self.request_trend_stack(w);
+        } else {
+            self.stack = None;
+            self.stack_pulse = None;
+            self.stack_paint = Default::default();
+            self.previous_stack_lanes = None;
+        }
+    }
+
+    pub fn on_trend_stack(&mut self, generation: u64, base_len: usize, result: Result<TrendStack, String>) {
+        if !self.show_stack || generation != self.generation || base_len != self.bars.len() {
+            return;
+        }
+        match result {
+            Ok(mut stack) => {
+                if self.bars.last().is_none_or(|b| b.ts != stack.base_last_ts) {
+                    return;
+                }
+                // A refresh's base-first preview must not blank already verified lanes.
+                if self.stack.is_some()
+                    && stack
+                        .lanes
+                        .iter()
+                        .skip(1)
+                        .any(|l| matches!(&l.status, LaneStatus::Unavailable(e) if e == "Loading…"))
+                {
+                    return;
+                }
+                if self.stack.is_some()
+                    && self.stack_motion_allowed(chrono::Utc::now().timestamp())
+                    && stack.score.as_ref().is_some_and(|s| s.provenance == Provenance::Real)
+                {
+                    if let Some(i) = self.bars.len().checked_sub(2) {
+                        let ts = self.bars[i].ts;
+                        if self.stack.as_ref().is_some_and(|old| old.base_last_ts <= ts)
+                            && i > 0
+                            && stack.medium[i] != 0
+                            && stack.medium[i] != stack.medium[i - 1]
+                            && self.stack_pulse.is_none_or(|(last, _)| last != ts)
+                        {
+                            self.stack_pulse = Some((ts, Instant::now()));
+                        }
+                    }
+                }
+                // Retain the last verified display on a failed native refresh,
+                // explicitly hatched/unavailable and excluded from scoring.
+                if let Some(old) = &self.stack {
+                    if old.base_len == stack.base_len && old.base_last_ts == stack.base_last_ts {
+                        for lane in &mut stack.lanes {
+                            if matches!(&lane.status, LaneStatus::Unavailable(e) if e != "Loading…") {
+                                if let Some(previous) =
+                                    old.lanes.iter().find(|l| l.tf == lane.tf && l.provenance.is_verified())
+                                {
+                                    let status = lane.status.clone();
+                                    *lane = previous.clone();
+                                    lane.status = status;
+                                }
+                            }
+                        }
+                        stack.score = tr_core::indicators::score(&stack.lanes);
+                    }
+                }
+                if self.stack.is_none() {
+                    self.stack_arrived = Some(Instant::now());
+                }
+                self.stack = Some(stack);
+                self.stack_error = None;
+            }
+            Err(error) => {
+                self.stack = None;
+                self.stack_error = Some(error);
+                self.stack_pulse = None;
+            }
+        }
+        self.stack_revision = self.stack_revision.wrapping_add(1);
+        self.stack_paint.key.clear();
+    }
+
+    pub fn step_timeframe(&mut self, dir: i32, w: &Worker) {
+        let frames = &Timeframe::ALL;
+        let lo = if self.archive { 6 } else { 0 };
+        let index = frames.iter().position(|t| *t == self.tf).unwrap_or(lo) as i32;
+        let next = (index + dir.signum()).clamp(lo as i32, frames.len() as i32 - 1);
+        self.set_timeframe(frames[next as usize], w);
+    }
+
+    pub fn flip_intraday(&mut self, w: &Worker) {
+        if self.archive {
+            self.error = Some("Archive charts are daily and higher".into());
+            return;
+        }
+        self.set_timeframe(if self.tf.is_intraday() { Timeframe::D1 } else { self.last_intraday_tf }, w);
+    }
+
+    fn stack_freshness(&self, now: i64) -> Option<Freshness> {
+        if self.archive {
+            return None;
+        }
+        self.bars
+            .last()
+            .and_then(|b| tr_data::intraday::freshness(MarketClock::for_class(self.sec.class), self.tf, b.ts, now))
+    }
+
+    fn stack_motion_allowed(&self, now: i64) -> bool {
+        !self.archive
+            && self.provenance == Provenance::Real
+            && self.last_refresh.is_some()
+            && self.stack_freshness(now) == Some(Freshness::Current)
+    }
+
+    fn lane_stale(&self, lane: &Lane, now: i64) -> bool {
+        matches!(lane.status, LaneStatus::Stale { .. })
+            || (!self.archive
+                && lane.last_bar_ts.is_some_and(|ts| {
+                    matches!(
+                        tr_data::intraday::freshness(MarketClock::for_class(self.sec.class), lane.tf, ts, now),
+                        Some(Freshness::Stale { .. })
+                    )
+                }))
+    }
+
+    fn stack_score(&self, now: i64) -> Option<StackScore> {
+        let stack = self.stack.as_ref()?;
+        let base = stack.lanes.first()?;
+        if base.status != LaneStatus::Ready || self.lane_stale(base, now) {
+            return None;
+        }
+        let dir = *base.state.last()?;
+        let mut score = StackScore { aligned: 0, scored: 0, dir, provenance: Provenance::Real };
+        for lane in &stack.lanes {
+            if lane.status == LaneStatus::Ready && lane.provenance.is_verified() && !self.lane_stale(lane, now) {
+                score.scored += 1;
+                score.aligned += u8::from(lane.state.last() == Some(&dir));
+                score.provenance = score.provenance.combine(lane.provenance);
+            }
+        }
+        Some(score)
+    }
+
+    fn stack_hud(&self, now: i64) -> (String, Color32) {
+        if !self.bars.is_empty() && !self.provenance.is_verified() {
+            return (format!("TREND STACK REFUSED · {}", self.provenance.label()), theme::down());
+        }
+        if let Some(error) = &self.stack_error {
+            return (format!("TREND STACK REFUSED · {error}"), theme::down());
+        }
+        if let Some(Freshness::Stale { lag_secs }) = self.stack_freshness(now) {
+            return (
+                format!(
+                    "STACK HELD · STALE {}m · last {} ET",
+                    (lag_secs + 59) / 60,
+                    self.bars.last().map(|b| tr_core::ny::civil(b.ts).format("%H:%M").to_string()).unwrap_or_default()
+                ),
+                theme::down(),
+            );
+        }
+        let Some(stack) = &self.stack else {
+            return ("STACK loading…".into(), muted());
+        };
+        let suffix = if self.archive {
+            " · RESEARCH ARCHIVE"
+        } else if self.stack_freshness(now) == Some(Freshness::Closed) {
+            " · SESSION CLOSED"
+        } else {
+            ""
+        };
+        if stack.lanes.iter().any(|l| matches!(&l.status,LaneStatus::Unavailable(e) if e == "Loading…")) {
+            return (format!("STACK loading…{suffix}"), muted());
+        }
+        let Some(score) = self.stack_score(now) else {
+            return (format!("STACK warming…{suffix}"), muted());
+        };
+        let arrow = if score.scored > 1 && score.dir != 0 { if score.dir > 0 { " ▲" } else { " ▼" } } else { "" };
+        let lanes = stack
+            .lanes
+            .iter()
+            .map(|l| {
+                format!(
+                    "{}{}",
+                    l.tf.label(),
+                    if l.status != LaneStatus::Ready || self.lane_stale(l, now) {
+                        "?"
+                    } else {
+                        match l.state.last().copied().unwrap_or(0) {
+                            1 => "▲",
+                            -1 => "▼",
+                            _ => "·",
+                        }
+                    }
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(" ");
+        let conf =
+            stack.lanes.first().and_then(|l| l.conf.last()).copied().filter(|v| v.is_finite()).unwrap_or(0.0) * 100.0;
+        let asof = self.last_refresh.unwrap_or(stack.base_last_ts);
+        let unavailable = if score.scored == 1 && stack.lanes.len() > 1 { " · higher frames unavailable" } else { "" };
+        let color = if score.dir == 0 {
+            muted()
+        } else if score.scored <= 1 || score.aligned != score.scored {
+            amber()
+        } else {
+            stack_color(score.dir)
+        };
+        (
+            format!(
+                "STACK {}/{}{arrow}  {lanes} · conf {conf:.0} · {} · as of {} ET{unavailable}{suffix}",
+                score.aligned,
+                score.scored,
+                score.provenance.label(),
+                tr_core::ny::civil(asof).format("%H:%M")
+            ),
+            color,
+        )
     }
 
     pub fn on_daily_strength(&mut self, generation: u64, base_len: usize, result: Result<LineRef, String>) {
@@ -882,6 +1172,13 @@ impl ChartState {
         }
         let old_len = self.bars.len();
         let new_len = bars.len();
+        // Paging shifts every aligned index. Show loading until the worker aligns
+        // against the new base, rather than drawing the old cells on other bars.
+        if prepended > 0 {
+            self.stack = None;
+            self.stack_pulse = None;
+            self.stack_paint = Default::default();
+        }
         if old_len == 0 && new_len > 0 {
             self.reveal_key = crate::anim::fresh_key();
             self.shown_scale = None;
@@ -916,6 +1213,14 @@ impl ChartState {
             }
         }
         self.apply_range();
+        if old_len == 0 && !crate::anim::reduced() {
+            if let (Some(mut from), Some(to)) = (self.interval_glide.take(), self.viewport) {
+                from.right = to.right;
+                from.width_px = to.width_px;
+                self.viewport = Some(from);
+                self.glide = Some(Glide { from, to, start: None });
+            }
+        }
         // Live ticks only move the last bar: refresh indicators at most every 1.5 s and
         // leave the compare series alone.
         let due = self.last_indicator_req.is_none_or(|t| t.elapsed().as_millis() >= 1500);
@@ -1198,6 +1503,11 @@ impl ChartState {
             return clicked;
         }
 
+        let stack_h = if self.show_stack && plot_all.width() >= 220.0 && plot_all.height() >= 160.0 {
+            ladder(self.tf, self.archive).len() as f32 * 8.0 + 4.0
+        } else {
+            0.0
+        };
         let Some(gpu) = self.gpu.clone().filter(|g| !g.is_empty()) else {
             let msg = self.error.clone().unwrap_or_else(|| {
                 if self.loading {
@@ -1207,21 +1517,32 @@ impl ChartState {
                 }
             });
             painter.text(plot_all.center(), Align2::CENTER_CENTER, msg, mono(13.0), amber_dim());
+            if self.show_stack {
+                self.paint_stack_hud(&painter, plot_all, plot_all.top() + 4.0);
+                if stack_h > 0.0 {
+                    let r = Rect::from_min_max(pos2(plot_all.left(), plot_all.bottom() - stack_h), plot_all.max);
+                    self.paint_stack_loading(ui, r);
+                }
+            }
             return clicked;
         };
 
+        let content_h = plot_all.height() - stack_h;
         // Split plot height between the price pane and oscillator sub-panes.
         let pane_specs: Vec<usize> = (0..self.built.len()).filter(|&i| self.built[i].spec.is_pane()).collect();
         let n_sub = pane_specs.len().min(MAX_SUB_PANES);
         // Sub-panes share at most 60% of the plot so prices stay readable.
-        let sub_h = if n_sub > 0 {
-            (plot_all.height() * 0.2).clamp(50.0, 160.0).min(plot_all.height() * 0.6 / n_sub as f32)
-        } else {
-            0.0
-        };
-        let price_rect =
-            Rect::from_min_max(plot_all.min, pos2(plot_all.right(), plot_all.bottom() - sub_h * n_sub as f32));
+        let sub_h =
+            if n_sub > 0 { (content_h * 0.2).clamp(50.0, 160.0).min(content_h * 0.6 / n_sub as f32) } else { 0.0 };
+        let price_rect = Rect::from_min_max(
+            plot_all.min,
+            pos2(plot_all.right(), plot_all.bottom() - stack_h - sub_h * n_sub as f32),
+        );
 
+        let stack_rect = Rect::from_min_max(
+            pos2(plot_all.left(), price_rect.bottom()),
+            pos2(plot_all.right(), price_rect.bottom() + stack_h),
+        );
         let len = self.bars.len();
         if let Some(g) = self.glide.as_mut() {
             let now = ui.input(|i| i.time);
@@ -1418,15 +1739,22 @@ impl ChartState {
             let y = price_rect.top() + scale.y_of(*t) as f32;
             price_painter.hline(price_rect.x_range(), y, Stroke::new(1.0, theme::grid()));
         }
+        if self.show_stack {
+            self.prepare_stack_paint(price_rect, stack_rect, &v, &scale);
+            self.paint_stack_cloud(ui, price_rect, &v, &scale, &reveal);
+        }
         let frame_no = ui.ctx().cumulative_frame_nr();
         let frame = Frame { pane: self.id * 8, frame_no, cmds: out.cmds };
         ui.painter().add(tr_chart::egui_wgpu::Callback::new_paint_callback(price_rect, ChartCallback(Arc::new(frame))));
 
+        if self.show_stack {
+            self.paint_stack_pulse(ui, price_rect, &v, &scale);
+        }
         // Sub panes.
         let mut sub_rects = Vec::new();
         for (k, &bi) in pane_specs.iter().take(n_sub).enumerate() {
             let b = &self.built[bi];
-            let top = price_rect.bottom() + sub_h * k as f32;
+            let top = price_rect.bottom() + stack_h + sub_h * k as f32;
             let r = Rect::from_min_max(pos2(plot_all.left(), top), pos2(plot_all.right(), top + sub_h));
             let def = b.spec.def();
             let ovs: Vec<Overlay> = b.overlays.iter().map(|o| o.1.clone()).collect();
@@ -1446,6 +1774,12 @@ impl ChartState {
             sub_rects.push((r, bi, so.scale));
         }
 
+        if self.show_stack && stack_h > 0.0 {
+            if let Some(tf) = self.paint_stack_lanes(ui, stack_rect, &v, hover, &reveal) {
+                self.set_timeframe(tf, w);
+                return true;
+            }
+        }
         // ---- axes ----
         let axis_painter = ui.painter_at(Rect::from_min_max(pos2(plot_all.right(), body.top()), body.max));
         axis_painter.vline(plot_all.right(), body.y_range(), Stroke::new(1.0, theme::border()));
@@ -1690,6 +2024,7 @@ impl ChartState {
             ui.separator();
             if ui.button("Remove All").clicked() {
                 self.clear_indicators();
+                self.request_trend_stack(w);
                 ui.close();
             }
         });
@@ -1743,6 +2078,10 @@ impl ChartState {
         }
         ui.checkbox(&mut self.show_volume_ctx, "Volume context")
             .on_hover_text("This bar versus the prior 20, plus 5/20");
+        let mut stack_on = self.show_stack;
+        if ui.checkbox(&mut stack_on, "Trend Stack").changed() {
+            self.set_trend_stack(Some(stack_on), w);
+        }
         let adaptive_on = self.indicators.iter().any(|s| s.code == "ADTREND");
         if ui
             .checkbox(&mut adaptive_on.clone(), "Adaptive Trend")
@@ -1962,6 +2301,9 @@ impl ChartState {
         }
         ly = self.paint_review_hud(&p, price_rect, ly);
         ly = self.paint_adaptive_hud(&p, price_rect, ly);
+        if self.show_stack {
+            ly = self.paint_stack_hud(&p, price_rect, ly);
+        }
         if let Some(tool) = self.draw.tool {
             let msg = if self.draw.pending.is_some() {
                 "click second point (Esc cancels)"
@@ -2038,6 +2380,467 @@ impl ChartState {
             }
         }
         ly
+    }
+
+    fn paint_stack_hud(&self, p: &egui::Painter, rect: Rect, ly: f32) -> f32 {
+        let now = chrono::Utc::now().timestamp();
+        let (label, color) = self.stack_hud(now);
+        let galley = p.text(pos2(rect.left() + 6.0, ly), Align2::LEFT_TOP, &label, mono(11.0), color);
+        if self.stack_countdown(now) {
+            let ttl = tr_data::intraday::refresh_ttl_secs(self.tf).unwrap_or(1) as f32;
+            let remaining = (1.0 - (now - self.last_refresh.unwrap_or(now)).max(0) as f32 / ttl).clamp(0.0, 1.0);
+            p.hline(
+                rect.left() + 6.0..=rect.left() + 6.0 + galley.width().min(rect.width() - 12.0) * remaining,
+                ly + 13.0,
+                Stroke::new(1.0, amber_dim()),
+            );
+            p.ctx().request_repaint_after(Duration::from_secs(1));
+        }
+        ly + 15.0
+    }
+
+    fn stack_countdown(&self, now: i64) -> bool {
+        self.show_stack
+            && self.provenance.is_verified()
+            && self.last_refresh.is_some()
+            && self.stack.is_some()
+            && self.stack_freshness(now) == Some(Freshness::Current)
+    }
+
+    fn paint_stack_loading(&self, ui: &Ui, rect: Rect) {
+        let p = ui.painter_at(rect);
+        let phase = (ui.input(|i| i.time) as f32 * 0.8).fract();
+        for (k, tf) in ladder(self.tf, self.archive).iter().enumerate() {
+            let y = rect.top() + 2.0 + k as f32 * 8.0;
+            p.text(
+                pos2(rect.left() + 2.0, y + 3.5),
+                Align2::LEFT_CENTER,
+                tf.label(),
+                mono(10.0),
+                if *tf == self.tf { amber() } else { muted() },
+            );
+            let r = Rect::from_min_max(pos2(rect.left() + 30.0, y), pos2(rect.right(), y + 7.0));
+            p.rect_filled(r, 0.0, theme::grid());
+            let x = r.left() + r.width() * phase;
+            p.rect_filled(
+                Rect::from_min_max(pos2(x, y), pos2((x + 30.0).min(r.right()), y + 7.0)),
+                0.0,
+                muted().gamma_multiply(0.15),
+            );
+        }
+        ui.ctx().request_repaint_after(Duration::from_secs(1));
+    }
+
+    /// Geometry is rebuilt only on data, viewport, scale, layout, theme or freshness changes.
+    /// A completed frame submits one cloud mesh and one mesh per native lane.
+    fn prepare_stack_paint(&mut self, rect: Rect, strip: Rect, v: &Viewport, scale: &PriceScale) {
+        let now = chrono::Utc::now().timestamp();
+        let held = matches!(self.stack_freshness(now), Some(Freshness::Stale { .. }));
+        let stale_bits = self
+            .stack
+            .as_ref()
+            .map(|s| s.lanes.iter().enumerate().fold(0u64, |a, (i, l)| a | (u64::from(self.lane_stale(l, now)) << i)))
+            .unwrap_or(0);
+        let key = vec![
+            self.stack_revision,
+            v.left().to_bits(),
+            v.bar_px.to_bits(),
+            scale.lo.to_bits(),
+            scale.hi.to_bits(),
+            u64::from(scale.log),
+            rect.left().to_bits() as u64,
+            rect.top().to_bits() as u64,
+            rect.width().to_bits() as u64,
+            rect.height().to_bits() as u64,
+            strip.bottom().to_bits() as u64,
+            u64::from(held),
+            stale_bits,
+            u32::from_le_bytes(theme::up().to_array()) as u64,
+            u32::from_le_bytes(theme::down().to_array()) as u64,
+            u32::from_le_bytes(theme::grid().to_array()) as u64,
+        ];
+        if self.stack_paint.key == key {
+            return;
+        }
+        let mut cloud = Vec::new();
+        let mut lanes = Vec::new();
+        if !self.provenance.is_verified() {
+            self.stack_paint = StackPaint { key, cloud, lanes };
+            return;
+        }
+        let Some(stack) = &self.stack else {
+            return;
+        };
+        let dim = if held { 0.35 } else { 1.0 };
+        let (lo, hi) = v.visible_range(stack.base_len);
+        let x = |i: usize| rect.left() + v.x_center(i) as f32;
+        let edge = |i: usize| rect.left() + v.x_of(i as f64) as f32;
+        // Low-alpha regime wash, merged across contiguous medium-state runs.
+        let mut i = lo;
+        while i < hi {
+            let start = i;
+            let state = stack.medium[i];
+            let mut conf = 0.0;
+            let mut count = 0;
+            while i < hi && stack.medium[i] == state {
+                if stack.confidence[i].is_finite() {
+                    conf += stack.confidence[i] as f32;
+                    count += 1;
+                }
+                i += 1;
+            }
+            if state != 0 && count > 0 {
+                cloud.push(egui::Shape::rect_filled(
+                    Rect::from_min_max(pos2(edge(start), rect.top()), pos2(edge(i), rect.bottom())),
+                    0.0,
+                    stack_color(state).gamma_multiply((0.03 + 0.06 * conf / count as f32) * dim),
+                ));
+            }
+        }
+        let mut mesh = egui::Mesh::default();
+        let mut previous: Option<(u32, usize, f32, [f32; 2])> = None;
+        for i in lo..hi {
+            let mb = stack.mb[i];
+            let sigma = stack.sigma[i];
+            let conf = stack.confidence[i];
+            let ys = [mb - sigma, mb + sigma, mb - 2.0 * sigma, mb + 2.0 * sigma]
+                .map(|value| rect.top() + scale.y_of(value) as f32);
+            if !mb.is_finite() || !sigma.is_finite() || !conf.is_finite() || ys.iter().any(|y| !y.is_finite()) {
+                previous = None;
+                continue;
+            }
+            let xx = x(i);
+            if let Some((_, _, px, _)) = previous {
+                if xx - px < 2.0 && i + 1 < hi && stack.medium[i] == stack.medium[i - 1] {
+                    continue;
+                }
+            }
+            let color = stack_color(stack.medium[i]).gamma_multiply((0.10 + 0.22 * conf as f32) * dim);
+            let index = mesh.vertices.len() as u32;
+            mesh.colored_vertex(pos2(xx, ys[0]), color);
+            mesh.colored_vertex(pos2(xx, ys[1]), color);
+            if let Some((prev, _, px, outer)) = previous {
+                mesh.add_triangle(prev, prev + 1, index);
+                mesh.add_triangle(prev + 1, index + 1, index);
+                for k in 0..2 {
+                    stack_dotted(&mut mesh, pos2(px, outer[k]), pos2(xx, ys[k + 2]), amber_dim().gamma_multiply(dim));
+                }
+            }
+            previous = Some((index, i, xx, [ys[2], ys[3]]));
+        }
+        cloud.push(egui::Shape::mesh(mesh));
+        if strip.height() > 0.0 {
+            for (k, lane) in stack.lanes.iter().enumerate() {
+                let top = strip.top() + 2.0 + k as f32 * 8.0;
+                let dim = if held || self.lane_stale(lane, now) || matches!(lane.status, LaneStatus::Unavailable(_)) {
+                    0.35
+                } else {
+                    1.0
+                };
+                if !matches!(lane.status, LaneStatus::Ready | LaneStatus::Stale { .. })
+                    && !(matches!(lane.status, LaneStatus::Unavailable(_)) && lane.provenance.is_verified())
+                {
+                    continue;
+                }
+                let mut mesh = egui::Mesh::default();
+                let mut i = lo;
+                while i < hi {
+                    if !lane.conf[i].is_finite() {
+                        i += 1;
+                        continue;
+                    }
+                    let start = i;
+                    let state = lane.state[i];
+                    let conf = lane.conf[i];
+                    i += 1;
+                    while i < hi && lane.state[i] == state && lane.conf[i] == conf {
+                        i += 1;
+                    }
+                    let r = Rect::from_min_max(
+                        pos2(edge(start).max(strip.left() + 30.0), top),
+                        pos2(edge(i).min(strip.right()), top + 7.0),
+                    );
+                    if r.is_positive() {
+                        mesh.add_colored_rect(r, stack_lane_color(state).gamma_multiply((0.35 + 0.65 * conf) * dim));
+                    }
+                }
+                lanes.push(egui::Shape::mesh(mesh));
+            }
+            if self.tf.is_intraday() {
+                for i in lo.max(1)..hi {
+                    if tr_core::ny::date_key(self.bars[i].ts) != tr_core::ny::date_key(self.bars[i - 1].ts)
+                        && edge(i) >= strip.left() + 30.0
+                    {
+                        lanes.push(egui::Shape::line_segment(
+                            [pos2(edge(i), strip.top()), pos2(edge(i), strip.bottom())],
+                            Stroke::new(1.0, theme::border()),
+                        ));
+                    }
+                }
+            }
+        }
+        self.stack_paint = StackPaint { key, cloud, lanes };
+    }
+
+    fn paint_stack_cloud(&self, ui: &Ui, rect: Rect, v: &Viewport, scale: &PriceScale, reveal: &Reveal) {
+        if !self.provenance.is_verified() {
+            return;
+        }
+        let right = (rect.left() + v.x_of(reveal.line_front) as f32).min(rect.right());
+        let clip = Rect::from_min_max(rect.min, pos2(right.max(rect.left()), rect.bottom()));
+        ui.painter_at(clip).extend(self.stack_paint.cloud.iter().cloned());
+        if let Some(stack) = &self.stack {
+            if let Some(i) = self.bars.len().checked_sub(1).filter(|i| (*i as f64) < reveal.line_front) {
+                let mb = stack.mb.get(i).copied().unwrap_or(f64::NAN);
+                let sigma = stack.sigma.get(i).copied().unwrap_or(f64::NAN);
+                for (value, label) in [(mb + 2.0 * sigma, "+2σ"), (mb - 2.0 * sigma, "−2σ")] {
+                    let y = rect.top() + scale.y_of(value) as f32;
+                    if y.is_finite() && rect.y_range().contains(y) {
+                        ui.painter().text(pos2(rect.right() + 4.0, y), Align2::LEFT_CENTER, label, mono(9.0), muted());
+                    }
+                }
+            }
+        }
+    }
+
+    fn paint_stack_lanes(
+        &self,
+        ui: &Ui,
+        rect: Rect,
+        v: &Viewport,
+        chart_hover: Option<Pos2>,
+        reveal: &Reveal,
+    ) -> Option<Timeframe> {
+        let p = ui.painter_at(rect);
+        p.hline(rect.x_range(), rect.top(), Stroke::new(1.0, theme::border()));
+        let now = chrono::Utc::now().timestamp();
+        if !self.provenance.is_verified() || self.stack_error.is_some() {
+            stack_hatch(&p, rect, theme::down());
+            let label = if !self.provenance.is_verified() {
+                format!("TREND STACK REFUSED · {}", self.provenance.label())
+            } else {
+                format!("TREND STACK REFUSED · {}", self.stack_error.as_deref().unwrap_or_default())
+            };
+            p.text(rect.left_center() + vec2(6.0, 0.0), Align2::LEFT_CENTER, label, mono(11.0), theme::down());
+            return None;
+        }
+        let Some(stack) = &self.stack else {
+            self.paint_stack_loading(ui, rect);
+            return None;
+        };
+        let fade = self.stack_arrived.map(|t| (t.elapsed().as_secs_f32() / 0.16).min(1.0)).unwrap_or(1.0);
+        let right = (rect.left() + v.x_of(reveal.line_front) as f32).min(rect.right());
+        let mut cells = ui.painter_at(Rect::from_min_max(
+            pos2(rect.left() + 30.0, rect.top()),
+            pos2(right.max(rect.left() + 30.0), rect.bottom()),
+        ));
+        cells.multiply_opacity(fade);
+        cells.extend(self.stack_paint.lanes.iter().cloned());
+        if fade < 1.0 {
+            ui.ctx().request_repaint_after(Duration::from_millis(16));
+        }
+        if let Some((old, at)) = &self.previous_stack_lanes {
+            let remaining = 1.0 - at.elapsed().as_secs_f32() / 0.16;
+            if remaining > 0.0 {
+                let mut p = p.clone();
+                p.multiply_opacity(remaining);
+                p.extend(old.iter().cloned());
+                ui.ctx().request_repaint_after(Duration::from_millis(16));
+            }
+        }
+        let held = matches!(self.stack_freshness(now), Some(Freshness::Stale { .. }));
+        let hover = ui.input(|i| i.pointer.hover_pos()).filter(|at| self.hover_enabled && rect.contains(*at));
+        for (k, lane) in stack.lanes.iter().enumerate() {
+            let top = rect.top() + 2.0 + k as f32 * 8.0;
+            let row = Rect::from_min_max(pos2(rect.left(), top), pos2(rect.right(), top + 7.0));
+            let area = Rect::from_min_max(pos2(rect.left() + 30.0, top), row.max);
+            let stale = self.lane_stale(lane, now);
+            let mut col = if lane.tf == self.tf { amber() } else { muted() };
+            if held || stale {
+                col = col.gamma_multiply(0.35);
+            }
+            p.text(pos2(rect.left() + 2.0, top + 3.5), Align2::LEFT_CENTER, lane.tf.label(), mono(10.0), col);
+            let status = match &lane.status {
+                LaneStatus::Warming { have, need } => Some((format!("{} WARMING {have}/{need}", lane.tf), muted())),
+                LaneStatus::Refused(_) => Some((format!("{} REFUSED · UNVERIFIED", lane.tf), theme::down())),
+                LaneStatus::Unavailable(e) if e == "Loading…" => {
+                    Some((format!("{} loading…", lane.tf), theme::grid()))
+                }
+                LaneStatus::Unavailable(_) => Some((format!("{} UNAVAILABLE", lane.tf), muted())),
+                _ if stale => Some(("STALE".into(), muted().gamma_multiply(0.35))),
+                _ => None,
+            };
+            if let Some((label, color)) = status {
+                if matches!(&lane.status,LaneStatus::Unavailable(e) if e == "Loading…") {
+                    p.rect_filled(area, 0.0, theme::grid());
+                    let x = area.left() + area.width() * (ui.input(|i| i.time) as f32 * 0.8).fract();
+                    p.rect_filled(
+                        Rect::from_min_max(pos2(x, top), pos2((x + 30.0).min(area.right()), top + 7.0)),
+                        0.0,
+                        muted().gamma_multiply(0.15),
+                    );
+                    ui.ctx().request_repaint_after(Duration::from_secs(1));
+                } else if !matches!(lane.status, LaneStatus::Ready | LaneStatus::Stale { .. }) {
+                    stack_hatch(&p, area, color);
+                }
+                p.text(pos2(area.left() + 2.0, top + 3.5), Align2::LEFT_CENTER, label, mono(9.0), color);
+            }
+            let latest = stack.base_len.saturating_sub(1);
+            let cap = Rect::from_min_max(
+                pos2(rect.left() + v.x_of(latest as f64) as f32, top + 3.5),
+                pos2(rect.left() + v.x_of((latest + 1) as f64) as f32, top + 7.0),
+            );
+            if k > 0
+                && lane.tf > self.tf
+                && matches!(lane.status, LaneStatus::Ready | LaneStatus::Stale { .. })
+                && let Some((state, conf)) = lane.forming.filter(|(_, c)| c.is_finite())
+            {
+                let dim = if held || stale { 0.35 } else { 1.0 };
+                if cap.left() < right && cap.right() > area.left() {
+                    cells.rect_filled(cap, 0.0, stack_lane_color(state).gamma_multiply((0.35 + 0.65 * conf) * dim));
+                    cells.rect_stroke(cap, 0.0, Stroke::new(1.0, theme::border()), StrokeKind::Inside);
+                }
+            }
+            if let Some(at) = hover.filter(|at| row.contains(*at)) {
+                let response = ui.interact(row, ui.id().with((self.id, "stack-lane", k)), Sense::click());
+                ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
+                if response.clicked() {
+                    return Some(lane.tf);
+                }
+                let i = v.bar_at((at.x - rect.left()) as f64, stack.base_len).unwrap_or(latest);
+                let cap_label = if k > 0 && cap.contains(at) {
+                    if MarketClock::for_class(self.sec.class) == MarketClock::UsCash
+                        && !tr_data::intraday::in_regular_session(now)
+                    {
+                        "last"
+                    } else {
+                        "forming"
+                    }
+                } else {
+                    "completed bars only"
+                };
+                self.stack_hover_card(ui, at, lane, i, cap_label, now);
+            }
+        }
+        if let Some(at) = hover.or(chart_hover) {
+            if let Some(i) = v.bar_at((at.x - rect.left()) as f64, stack.base_len) {
+                p.vline(rect.left() + v.x_center(i) as f32, rect.y_range(), Stroke::new(1.0, muted()));
+            }
+        }
+        if self.stack_motion_allowed(now)
+            && let Some((ts, at)) = self.stack_pulse
+        {
+            let progress = at.elapsed().as_secs_f32() / 1.2;
+            if progress < 1.0
+                && let Some(i) = self.bars.iter().position(|b| b.ts == ts)
+            {
+                let r = Rect::from_min_max(
+                    pos2(rect.left() + v.x_of((i + 1) as f64) as f32, rect.top() + 2.0),
+                    pos2(rect.left() + v.x_of((i + 2) as f64) as f32, rect.top() + 9.0),
+                );
+                p.rect_filled(
+                    r,
+                    0.0,
+                    stack_color(stack.medium.get(i).copied().unwrap_or(0)).gamma_multiply(1.0 - progress),
+                );
+                ui.ctx().request_repaint_after(Duration::from_millis(16));
+            }
+        }
+        None
+    }
+
+    fn stack_hover_card(&self, ui: &Ui, at: Pos2, lane: &Lane, i: usize, cap: &str, now: i64) {
+        let reason = match &lane.status {
+            LaneStatus::Refused(e) | LaneStatus::Unavailable(e) => e.clone(),
+            LaneStatus::Warming { have, need } => format!("WARMING {have}/{need}"),
+            _ if self.lane_stale(lane, now) => "STALE · excluded from score".into(),
+            _ => String::new(),
+        };
+        let forming = cap == "forming" || cap == "last";
+        let state =
+            if forming { lane.forming.map(|(s, _)| s).unwrap_or(0) } else { lane.state.get(i).copied().unwrap_or(0) };
+        let since = lane
+            .since
+            .get(i)
+            .copied()
+            .flatten()
+            .map(|ts| tr_core::ny::civil(ts).format("%d %b %H:%M").to_string())
+            .unwrap_or_else(|| "—".into());
+        let last = (if forming { lane.last_bar_ts } else { lane.completed_ts.get(i).copied().flatten() })
+            .map(|ts| tr_core::ny::civil(ts).format("%H:%M ET").to_string())
+            .unwrap_or_else(|| "—".into());
+        let conf = if forming {
+            lane.forming.map(|(_, c)| c).unwrap_or(f32::NAN)
+        } else {
+            lane.conf.get(i).copied().unwrap_or(f32::NAN)
+        };
+        let mrt = lane
+            .trails
+            .get(i)
+            .copied()
+            .filter(|v| v.is_finite())
+            .map(|v| format!("{v:.2}"))
+            .unwrap_or_else(|| "—".into());
+        let lines = [
+            format!(
+                "{} · {} since {since} ({} bars)",
+                lane.tf,
+                match state {
+                    1 => "LONG",
+                    -1 => "SHORT",
+                    _ => "FLAT",
+                },
+                lane.age.get(i).copied().unwrap_or(0)
+            ),
+            format!("conf {conf:.2} · MRT {mrt} · {} · last bar {last}", lane.provenance.label()),
+            format!(
+                "{cap}{}{}",
+                if self.extended { " · higher lanes regular-session" } else { "" },
+                if self.archive { " · RESEARCH ARCHIVE" } else { "" }
+            ),
+            reason,
+        ];
+        let width = lines.iter().map(|l| l.chars().count()).max().unwrap_or(10) as f32 * 6.8 + 14.0;
+        let size = vec2(width, 64.0);
+        let screen = ui.ctx().content_rect();
+        let pos = pos2(
+            (at.x + 12.0).min(screen.right() - size.x).max(screen.left()),
+            (at.y - size.y - 8.0).max(screen.top()),
+        );
+        let card = Rect::from_min_size(pos, size);
+        let p =
+            ui.ctx().layer_painter(egui::LayerId::new(egui::Order::Tooltip, egui::Id::new((self.id, "stack-card"))));
+        p.rect_filled(card, 0.0, Color32::from_rgb(16, 16, 16));
+        p.rect_stroke(card, 0.0, Stroke::new(1.0, amber_dim()), StrokeKind::Inside);
+        for (k, line) in lines.iter().enumerate() {
+            p.text(
+                card.min + vec2(7.0, 4.0 + k as f32 * 14.0),
+                Align2::LEFT_TOP,
+                line,
+                mono(11.0),
+                if k == 3 { theme::down() } else { text() },
+            );
+        }
+    }
+
+    fn paint_stack_pulse(&self, ui: &Ui, rect: Rect, v: &Viewport, scale: &PriceScale) {
+        if !self.stack_motion_allowed(chrono::Utc::now().timestamp()) {
+            return;
+        }
+        if let Some((ts, at)) = self.stack_pulse {
+            let t = at.elapsed().as_secs_f32() / 1.2;
+            if t < 1.0
+                && let Some(i) = self.bars.iter().position(|b| b.ts == ts)
+            {
+                let state = self.stack.as_ref().and_then(|s| s.medium.get(i)).copied().unwrap_or(0);
+                ui.painter_at(rect).circle_stroke(
+                    pos2(rect.left() + v.x_center(i) as f32, rect.top() + scale.y_of(self.bars[i].close) as f32),
+                    4.0 + 10.0 * t,
+                    Stroke::new(1.0, stack_color(state).gamma_multiply(0.8 * (1.0 - t))),
+                );
+                ui.ctx().request_repaint_after(Duration::from_millis(16));
+            }
+        }
     }
 
     fn paint_opening_range(&self, ui: &Ui, rect: Rect, scale: &PriceScale) {
@@ -2525,6 +3328,48 @@ fn dashed_v(p: &egui::Painter, x: f32, y: egui::Rangef, s: Stroke) {
     }
 }
 
+fn stack_color(state: i8) -> Color32 {
+    match state {
+        1 => theme::up(),
+        -1 => theme::down(),
+        _ => muted(),
+    }
+}
+fn stack_lane_color(state: i8) -> Color32 {
+    if state == 0 { theme::grid() } else { stack_color(state) }
+}
+fn stack_hatch(p: &egui::Painter, rect: Rect, color: Color32) {
+    p.rect_filled(rect, 0.0, color.gamma_multiply(0.08));
+    let p = p.with_clip_rect(p.clip_rect().intersect(rect));
+    let mut x = rect.left() - rect.height();
+    while x < rect.right() {
+        p.line_segment(
+            [pos2(x, rect.bottom()), pos2(x + rect.height(), rect.top())],
+            Stroke::new(1.0, color.gamma_multiply(0.4)),
+        );
+        x += 7.0;
+    }
+}
+fn stack_dotted(mesh: &mut egui::Mesh, from: Pos2, to: Pos2, color: Color32) {
+    let distance = from.distance(to);
+    if !distance.is_finite() || distance <= 0.0 || distance > 10000.0 {
+        return;
+    }
+    let normal = (to - from).normalized().rot90() * 0.5;
+    let mut d = 0.0;
+    while d < distance {
+        let a = from.lerp(to, d / distance);
+        let b = from.lerp(to, (d + 1.0).min(distance) / distance);
+        let i = mesh.vertices.len() as u32;
+        for point in [a - normal, a + normal, b - normal, b + normal] {
+            mesh.colored_vertex(point, color);
+        }
+        mesh.add_triangle(i, i + 1, i + 2);
+        mesh.add_triangle(i + 1, i + 3, i + 2);
+        d += 4.0;
+    }
+}
+
 fn news_hover_card(ui: &Ui, at: Pos2, item: &tr_data::NewsItem) {
     let when = tr_data::news::format_pub(item.ts, chrono::Utc::now().timestamp());
     let tickers = if item.tickers.is_empty() { String::new() } else { item.tickers.join(" ") };
@@ -2650,6 +3495,173 @@ mod tests {
 
     fn pointer(pos: Pos2, button: egui::PointerButton, pressed: bool) -> egui::Event {
         egui::Event::PointerButton { pos, button, pressed, modifiers: egui::Modifiers::NONE }
+    }
+
+    fn stack_has_text(shapes: &[egui::epaint::ClippedShape], needle: &str) -> bool {
+        fn find(shape: &egui::Shape, needle: &str) -> bool {
+            match shape {
+                egui::Shape::Text(t) => t.galley.job.text.contains(needle),
+                egui::Shape::Vec(v) => v.iter().any(|s| find(s, needle)),
+                _ => false,
+            }
+        }
+        shapes.iter().any(|s| find(&s.shape, needle))
+    }
+    fn stack_chart(worker: &Worker, provenance: Provenance) -> ChartState {
+        let mut c = ChartState::new(101, "BTCUSD Curncy", Timeframe::M5);
+        c.indicators.clear();
+        let last = Timeframe::M5.bucket_start(chrono::Utc::now().timestamp());
+        let bars = Arc::new(
+            (0..160)
+                .map(|i| {
+                    let close = if i < 40 { 100.0 + (i as f64 * 0.4).sin() } else { 100.0 + (i - 40) as f64 };
+                    Bar::new(last - (159 - i) * 300, close, close + 0.5, close - 0.5, close, 1000.0)
+                        .with_provenance(provenance)
+                })
+                .collect::<Vec<_>>(),
+        );
+        c.on_history(c.generation, bars.clone(), SeriesGpu::build(&bars), 0, false, true, false, worker);
+        c.set_trend_stack(Some(true), worker);
+        let lanes = ladder(c.tf, false).into_iter().skip(1).map(|t| (t, Err("offline fixture".into()))).collect();
+        let result = tr_core::indicators::trend_stack(&bars, c.tf, lanes, Default::default());
+        c.on_trend_stack(c.generation, bars.len(), result);
+        c
+    }
+    #[test]
+    fn trend_stack_cloud_breaks_at_nan_and_reuses_cached_mesh() {
+        let (worker, _) = Worker::test_channel();
+        let mut c = stack_chart(&worker, Provenance::Real);
+        c.stack.as_mut().unwrap().sigma[100] = f64::NAN;
+        let rect = Rect::from_min_size(pos2(0.0, 0.0), vec2(1000.0, 400.0));
+        let strip = Rect::from_min_size(pos2(0.0, 400.0), vec2(1000.0, 36.0));
+        let v = Viewport::fit_last(160, 160, 1000.0);
+        let scale = PriceScale::new(95.0, 230.0, false, 400.0);
+        c.prepare_stack_paint(rect, strip, &v, &scale);
+        let egui::Shape::Mesh(mesh) = c.stack_paint.cloud.last().unwrap() else { panic!("cloud mesh") };
+        let mesh = mesh.clone();
+        let gap = v.x_center(100) as f32;
+        assert!(!mesh.indices.is_empty());
+        for triangle in mesh.indices.chunks_exact(3) {
+            let xs = triangle.iter().map(|i| mesh.vertices[*i as usize].pos.x).collect::<Vec<_>>();
+            assert!(
+                !(xs.iter().copied().fold(f32::INFINITY, f32::min) < gap
+                    && xs.iter().copied().fold(f32::NEG_INFINITY, f32::max) > gap)
+            );
+        }
+        c.prepare_stack_paint(rect, strip, &v, &scale);
+        let egui::Shape::Mesh(again) = c.stack_paint.cloud.last().unwrap() else { panic!("cloud mesh") };
+        assert!(Arc::ptr_eq(&mesh, again));
+    }
+
+    #[test]
+    fn trend_stack_sample_bars_paint_refusal_and_no_lanes() {
+        let (worker, _) = Worker::test_channel();
+        let ctx = egui::Context::default();
+        let mut c = stack_chart(&worker, Provenance::Sample);
+        let out = chart_frame(&ctx, &mut c, &worker, vec![]);
+        assert!(stack_has_text(&out.shapes, "TREND STACK REFUSED"));
+        assert!(!stack_has_text(&out.shapes, "STACK 1/1"));
+        assert!(!stack_has_text(&out.shapes, "▲"));
+        assert!(!stack_has_text(&out.shapes, "▼"));
+        assert!(c.stack.is_none());
+        assert!(c.stack_paint.cloud.is_empty());
+        assert!(c.stack_paint.lanes.is_empty());
+    }
+    #[test]
+    fn trend_stack_stale_series_paints_held_not_a_score() {
+        let (worker, _) = Worker::test_channel();
+        let ctx = egui::Context::default();
+        let mut c = stack_chart(&worker, Provenance::Real);
+        let mut bars = c.bars.as_ref().clone();
+        for b in &mut bars {
+            b.ts -= 86_400;
+        }
+        c.bars = Arc::new(bars);
+        let out = chart_frame(&ctx, &mut c, &worker, vec![]);
+        assert!(stack_has_text(&out.shapes, "STACK HELD · STALE"));
+        assert!(!stack_has_text(&out.shapes, "STACK 3/4"));
+        assert!(!stack_has_text(&out.shapes, "STACK 1/1"));
+        assert!(!c.stack_countdown(chrono::Utc::now().timestamp()));
+    }
+    #[test]
+    fn trend_stack_closed_session_has_no_pulse_or_countdown() {
+        let (worker, _) = Worker::test_channel();
+        let mut c = stack_chart(&worker, Provenance::Real);
+        c.sec = tr_data::security("AAPL");
+        let wall = |day, h, m| {
+            tr_core::ny::to_utc(chrono::NaiveDate::from_ymd_opt(2026, 11, day).unwrap().and_hms_opt(h, m, 0).unwrap())
+        };
+        let mut bars = c.bars.as_ref().clone();
+        bars.last_mut().unwrap().ts = wall(6, 15, 55);
+        c.bars = Arc::new(bars);
+        let sunday = wall(8, 18, 0);
+        assert_eq!(c.stack_freshness(sunday), Some(Freshness::Closed));
+        assert!(!c.stack_motion_allowed(sunday));
+        assert!(!c.stack_countdown(sunday));
+        assert!(c.stack_hud(sunday).0.contains("SESSION CLOSED"));
+        assert!(c.stack_pulse.is_none());
+    }
+    #[test]
+    fn trend_stack_response_for_an_old_generation_or_length_is_dropped() {
+        let (worker, _) = Worker::test_channel();
+        let mut c = stack_chart(&worker, Provenance::Real);
+        let result = c.stack.clone().unwrap();
+        let revision = c.stack_revision;
+        c.on_trend_stack(c.generation + 1, c.bars.len(), Ok(result.clone()));
+        c.on_trend_stack(c.generation, c.bars.len() - 1, Ok(result));
+        assert_eq!(c.stack_revision, revision);
+        assert!(c.stack.is_some());
+        c.set_timeframe(Timeframe::H1, &worker);
+        assert!(c.stack.is_none());
+        c.previous_stack_lanes = Some((vec![egui::Shape::Noop], Instant::now()));
+        c.set_symbol("AAPL", &worker);
+        assert!(c.previous_stack_lanes.is_none(), "a symbol switch must discard the old fade image");
+    }
+    #[test]
+    fn lane_click_switches_timeframe_and_keeps_the_layer_on() {
+        let (worker, _) = Worker::test_channel();
+        let ctx = egui::Context::default();
+        let mut c = stack_chart(&worker, Provenance::Real);
+        let out = chart_frame(&ctx, &mut c, &worker, vec![]);
+        let pos = out
+            .shapes
+            .iter()
+            .find_map(|shape| match &shape.shape {
+                egui::Shape::Text(t) if t.galley.job.text == "1H" && t.pos.y > 700.0 => {
+                    Some(t.pos + t.galley.size() * 0.5)
+                }
+                _ => None,
+            })
+            .expect("hour lane label");
+        chart_frame(&ctx, &mut c, &worker, vec![egui::Event::PointerMoved(pos)]);
+        chart_frame(&ctx, &mut c, &worker, vec![pointer(pos, egui::PointerButton::Primary, true)]);
+        chart_frame(&ctx, &mut c, &worker, vec![pointer(pos, egui::PointerButton::Primary, false)]);
+        assert_eq!(c.tf, Timeframe::H1);
+        assert!(c.show_stack);
+    }
+    #[test]
+    fn interval_step_respects_archive_and_bounds() {
+        let (worker, _) = Worker::test_channel();
+        let mut c = ChartState::new(1, "AAPL", Timeframe::M1);
+        c.step_timeframe(-1, &worker);
+        assert_eq!(c.tf, Timeframe::M1);
+        c.set_timeframe(Timeframe::MN1, &worker);
+        c.step_timeframe(1, &worker);
+        assert_eq!(c.tf, Timeframe::MN1);
+        c.archive = true;
+        c.set_timeframe(Timeframe::D1, &worker);
+        c.step_timeframe(-1, &worker);
+        assert_eq!(c.tf, Timeframe::D1);
+        c.step_timeframe(1, &worker);
+        assert_eq!(c.tf, Timeframe::W1);
+        c.flip_intraday(&worker);
+        assert_eq!(c.tf, Timeframe::W1);
+        c.archive = false;
+        c.set_timeframe(Timeframe::M15, &worker);
+        c.flip_intraday(&worker);
+        assert_eq!(c.tf, Timeframe::D1);
+        c.flip_intraday(&worker);
+        assert_eq!(c.tf, Timeframe::M15);
     }
 
     #[test]

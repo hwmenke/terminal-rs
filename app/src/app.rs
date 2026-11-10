@@ -508,6 +508,7 @@ impl PaneKind {
                 show_box: c.show_box,
                 show_rs: c.show_rs,
                 show_volume_ctx: c.show_volume_ctx,
+                show_stack: c.show_stack,
             },
             PaneKind::Feed { filter } => {
                 PaneSettings::Feed((*filter != FeedFilter::default()).then(|| (*filter).into()))
@@ -621,6 +622,7 @@ impl PaneKind {
                 show_box,
                 show_rs,
                 show_volume_ctx,
+                show_stack,
             } => {
                 let mut c = ChartState::new(0, &symbol, tf);
                 c.archive = archive;
@@ -641,6 +643,7 @@ impl PaneKind {
                 c.show_box = show_box;
                 c.show_rs = show_rs;
                 c.show_volume_ctx = show_volume_ctx;
+                c.show_stack = show_stack;
                 PaneKind::Chart(Box::new(c))
             }
             PaneSettings::Feed(f) => PaneKind::Feed { filter: f.map(Into::into).unwrap_or_default() },
@@ -1295,6 +1298,10 @@ impl TerminalApp {
             Command::SymbolFunction(s, f @ (Function::NewPanel(_) | Function::Split { .. })) => {
                 self.apply_with_symbol(f, Some(s));
             }
+            Command::SymbolFunction(s, Function::TrendStack(on)) => {
+                self.open_security(&s);
+                self.with_chart(|c, w| c.set_trend_stack(Some(on.unwrap_or(true)), w));
+            }
             Command::SymbolFunction(s, Function::Review) => self.open_review(Some(&s)),
             Command::SymbolFunction(s, Function::Desk) => self.open_desk(Some(&s)),
             Command::SymbolFunction(s, Function::Journal(extra)) => self.open_journal(Some(&s), &extra),
@@ -1348,11 +1355,17 @@ impl TerminalApp {
 
     fn apply_with_symbol(&mut self, f: Function, symbol: Option<String>) {
         match f {
+            Function::TrendStack(on) => self.with_chart(|c, w| c.set_trend_stack(on, w)),
             Function::Timeframe(tf) => self.with_chart(|c, w| c.set_timeframe(tf, w)),
             Function::ChartType(t) => self.with_chart(|c, _| c.chart_type = t),
             Function::Indicator(spec) => self.with_chart(|c, w| c.toggle_indicator(spec, w)),
             Function::IndicatorPicker(q) => self.palette.open_scoped(crate::palette::Kind::Indicator, &q),
-            Function::ClearIndicators => self.with_chart(|c, _| c.clear_indicators()),
+            Function::ClearIndicators => self.with_chart(|c, w| {
+                c.clear_indicators();
+                if c.show_stack {
+                    c.set_trend_stack(Some(true), w);
+                }
+            }),
             Function::Compare(s) => self.with_chart(|c, w| c.set_compare(s, w)),
             Function::LogScale => self.with_chart(|c, _| c.log = !c.log),
             Function::Range(r) => self.with_chart(|c, w| c.set_range(r, w)),
@@ -1832,6 +1845,11 @@ impl TerminalApp {
                 Response::Indicators { pane, generation, built } => {
                     if let Some(c) = self.chart_mut(pane) {
                         c.on_indicators(generation, built);
+                    }
+                }
+                Response::TrendStack { pane, generation, base_len, result } => {
+                    if let Some(c) = self.chart_mut(pane) {
+                        c.on_trend_stack(generation, base_len, result);
                     }
                 }
                 Response::DailyStrength { pane, generation, base_len, result } => {

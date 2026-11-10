@@ -6,6 +6,8 @@
 //! call [`adaptive_trend_research`] so sample, unverified or empty series are
 //! refused — never a silent fallback. Python is not vendored into the runtime.
 
+use super::ma::rma;
+use super::momentum::efficiency_ratio;
 use super::volatility::atr;
 use super::{NAN, Ohlcv};
 use crate::{Bar, Provenance};
@@ -46,6 +48,7 @@ pub struct AdaptiveTrendParams {
     pub atr_n: usize,
     pub confirm_mult: f64,
     pub min_hold: usize,
+    pub session_atr: bool,
 }
 
 impl Default for AdaptiveTrendParams {
@@ -64,6 +67,7 @@ impl Default for AdaptiveTrendParams {
             atr_n: 20,
             confirm_mult: 0.25,
             min_hold: 10,
+            session_atr: false,
         }
     }
 }
@@ -103,6 +107,8 @@ pub struct AdaptiveTrend {
     pub entry_long: Vec<bool>,
     pub entry_short: Vec<bool>,
     pub atr: Vec<f64>,
+    pub confidence: Vec<f64>,
+    pub sigma: Vec<f64>,
 }
 
 impl AdaptiveTrend {
@@ -122,6 +128,8 @@ impl AdaptiveTrend {
             entry_long: vec![false; len],
             entry_short: vec![false; len],
             atr: vec![NAN; len],
+            confidence: vec![NAN; len],
+            sigma: vec![NAN; len],
         }
     }
 
@@ -190,6 +198,10 @@ pub fn adaptive_trend_research(bars: &[Bar], p: AdaptiveTrendParams) -> Result<A
 
 /// Adaptive Trend on any OHLCV. Warm-up positions are NaN / flat (state 0).
 pub fn adaptive_trend(o: &Ohlcv, p: AdaptiveTrendParams) -> AdaptiveTrend {
+    adaptive_trend_with(o, p, None)
+}
+
+pub fn adaptive_trend_with(o: &Ohlcv, p: AdaptiveTrendParams, starts: Option<&[bool]>) -> AdaptiveTrend {
     let len = o.len();
     if len == 0 {
         return AdaptiveTrend::empty(0);
@@ -198,7 +210,10 @@ pub fn adaptive_trend(o: &Ohlcv, p: AdaptiveTrendParams) -> AdaptiveTrend {
     let sb = adaptive_ma(&hlc3, p.sb_er, p.sb_fast, p.sb_slow, p.method);
     let mb = adaptive_ma(&hlc3, p.mb_er, p.mb_fast, p.mb_slow, p.method);
     let lb = adaptive_ma(&hlc3, p.lb_er, p.lb_fast, p.lb_slow, p.method);
-    let a = atr(o, p.atr_n);
+    let a = match starts.filter(|_| p.session_atr) {
+        Some(starts) => atr_session(o, p.atr_n, starts),
+        None => atr(o, p.atr_n),
+    };
 
     let sb_slope = diff(&sb);
     let mb_slope = diff(&mb);
@@ -245,7 +260,26 @@ pub fn adaptive_trend(o: &Ohlcv, p: AdaptiveTrendParams) -> AdaptiveTrend {
         }
     }
 
+    let er = efficiency_ratio(&hlc3, p.mb_er);
+    let confidence = (0..len)
+        .map(|i| {
+            if !mb[i].is_finite() || !a[i].is_finite() || !er[i].is_finite() {
+                return NAN;
+            }
+            let state = medium_state[i];
+            if state == 0 {
+                return 0.0;
+            }
+            let separation = if a[i] > 0.0 { ((sb[i] - mb[i]).abs() / (2.0 * a[i])).clamp(0.0, 1.0) } else { 0.0 };
+            let agree = (u8::from(short_state[i] == state) + u8::from(long_state[i] == state)) as f64 / 2.0;
+            (0.40 * er[i] + 0.35 * separation + 0.25 * agree).clamp(0.0, 1.0)
+        })
+        .collect();
+    let residual: Vec<_> = o.close.iter().zip(&mb).map(|(c, m)| (c - m).powi(2)).collect();
+    let sigma = rma(&residual, p.atr_n.saturating_mul(2)).into_iter().map(f64::sqrt).collect();
     AdaptiveTrend {
+        confidence,
+        sigma,
         sb,
         mb,
         lb,
@@ -261,6 +295,25 @@ pub fn adaptive_trend(o: &Ohlcv, p: AdaptiveTrendParams) -> AdaptiveTrend {
         entry_short,
         atr: a,
     }
+}
+
+/// New York calendar session boundaries, including the first observed bar.
+pub fn session_starts(ts: &[i64]) -> Vec<bool> {
+    ts.iter().enumerate().map(|(i, t)| i == 0 || crate::ny::date_key(*t) != crate::ny::date_key(ts[i - 1])).collect()
+}
+
+/// Wilder ATR with the overnight gap omitted at session starts.
+pub fn atr_session(o: &Ohlcv, n: usize, starts: &[bool]) -> Vec<f64> {
+    let tr: Vec<_> = (0..o.len())
+        .map(|i| {
+            if i == 0 || starts.get(i).copied().unwrap_or(false) || !o.close[i - 1].is_finite() {
+                o.high[i] - o.low[i]
+            } else {
+                o.high[i].max(o.close[i - 1]) - o.low[i].min(o.close[i - 1])
+            }
+        })
+        .collect();
+    rma(&tr, n)
 }
 
 /// Efficiency-ratio adaptive MA. KAMA squares the scaled constant; ADMA does not.
@@ -406,6 +459,64 @@ mod tests {
             c.push(*c.last().unwrap() - 1.6);
         }
         c
+    }
+
+    #[test]
+    fn adaptive_trend_without_session_starts_matches_existing_goldens() {
+        let o = Ohlcv::new(&series(&rise_then_fall(80, 80), Provenance::Real));
+        let a = adaptive_trend(&o, Default::default());
+        let b = adaptive_trend_with(&o, Default::default(), None);
+        assert_eq!(format!("{a:?}"), format!("{b:?}"));
+    }
+    #[test]
+    fn session_atr_ignores_the_overnight_gap() {
+        let bars = series(&[100.0, 100.0, 105.0, 105.0], Provenance::Real);
+        let o = Ohlcv::new(&bars);
+        let starts = [true, false, true, false];
+        assert_eq!(atr_session(&o, 2, &starts)[2], 1.0);
+        assert!(atr(&o, 2)[2] > atr_session(&o, 2, &starts)[2]);
+        assert!(session_starts(&o.ts).iter().all(|s| *s));
+        let closes = rise_then_fall(38, 0);
+        let last = *closes.last().unwrap();
+        let mut sessions = series(&closes, Provenance::Real);
+        for (i, b) in sessions.iter_mut().enumerate() {
+            b.ts = 1_793_629_800 + i as i64 * 300;
+        }
+        let gap = sessions.len();
+        sessions.push(
+            Bar::new(1_793_716_200, last * 1.05, last * 1.05 + 0.5, last * 1.05 - 0.5, last * 1.05, 1000.0)
+                .with_provenance(Provenance::Real),
+        );
+        let o = Ohlcv::new(&sessions);
+        let plain = adaptive_trend(&o, Default::default());
+        let session = adaptive_trend_with(
+            &o,
+            AdaptiveTrendParams { session_atr: true, ..Default::default() },
+            Some(&session_starts(&o.ts)),
+        );
+        assert_eq!(session.medium_state[gap], 1);
+        assert!(session.mrt[gap] > plain.mrt[gap], "session gap-open MRT should be tighter");
+    }
+    #[test]
+    fn confidence_is_zero_when_flat_nan_in_warmup_and_bounded() {
+        let o = Ohlcv::new(&series(&rise_then_fall(80, 80), Provenance::Real));
+        let t = adaptive_trend(&o, Default::default());
+        assert!(t.confidence[..20].iter().all(|v| v.is_nan()));
+        for (c, state) in t.confidence.iter().zip(t.medium_state) {
+            if c.is_finite() {
+                assert!((0.0..=1.0).contains(c));
+                if state == 0 {
+                    assert_eq!(*c, 0.0);
+                }
+            }
+        }
+    }
+    #[test]
+    fn sigma_is_nan_until_its_window_fills_and_never_negative() {
+        let o = Ohlcv::new(&series(&rise_then_fall(80, 80), Provenance::Real));
+        let t = adaptive_trend(&o, Default::default());
+        assert!(t.sigma[..58].iter().all(|v| v.is_nan()));
+        assert!(t.sigma[58..].iter().all(|v| v.is_finite() && *v >= 0.0));
     }
 
     #[test]
