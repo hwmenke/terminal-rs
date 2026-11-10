@@ -368,6 +368,12 @@ pub(super) fn static_items() -> Vec<Item> {
         Item::new(Kind::Panel, "New session path", "NEW SPATH", Target::Run("NEW SPATH".into()))
             .keywords("panel pane spath typical session path mean band"),
     );
+    for command in ["RRG", "RRG WL", "RRG WEEKLY", "NEW RRG"] {
+        v.push(
+            Item::new(Kind::Panel, "Relative rotation graph", command, Target::Run(command.into()))
+                .keywords("rotation sectors leadership research archive"),
+        );
+    }
     v.push(
         Item::new(Kind::Panel, "New session breadth", "NEW BRD", Target::Run("NEW BRD".into()))
             .keywords("panel pane breadth open vwap participation"),

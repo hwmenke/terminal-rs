@@ -93,6 +93,12 @@ pub enum Request {
         spec: String,
         timeframe: String,
     },
+    /// Relative rotation, using only the local daily research archive.
+    Rotation {
+        pane: PaneId,
+        generation: u64,
+        query: tr_data::rotation::RotationQuery,
+    },
     /// Share of a list at or above the 09:30 open and session VWAP.
     Breadth {
         pane: PaneId,
@@ -486,6 +492,11 @@ pub enum Response {
         pane: PaneId,
         generation: u64,
         result: Result<tr_data::session_path::SessionPath, String>,
+    },
+    Rotation {
+        pane: PaneId,
+        generation: u64,
+        result: Result<tr_data::rotation::RotationReport, String>,
     },
     Breadth {
         pane: PaneId,
@@ -1184,6 +1195,44 @@ async fn research_scan(
             source,
         },
     })
+}
+
+/// Rotation deliberately has no bridge, provider or display-cache path.
+async fn research_rotation(
+    s: &Shared,
+    query: &tr_data::rotation::RotationQuery,
+) -> anyhow::Result<tr_data::rotation::RotationReport> {
+    let query = query.clone();
+    let limit = tr_data::rotation::fetch_limit(query.cadence);
+    let bench = query.benchmark.clone();
+    let symbols = query.symbols.clone();
+    // Service::db runs SQLite on spawn_blocking; compute stays off the UI thread too.
+    let (benchmark, named) = s
+        .history
+        .db(move |db| {
+            let benchmark = db.daily_window(&bench, None, limit)?;
+            let named = symbols
+                .into_iter()
+                .map(|symbol| {
+                    let bars = db.daily_window(&symbol, None, limit).map_err(|e| format!("{e:#}"));
+                    (symbol, bars)
+                })
+                .collect::<Vec<_>>();
+            Ok((benchmark, named))
+        })
+        .await?;
+    if benchmark.is_empty() {
+        anyhow::bail!(
+            "Rotation refused: no daily history for {} in the local research archive. Sample/display prices are never used.",
+            query.benchmark
+        );
+    }
+    let expected = tr_data::history::calendar::last_expected_session(chrono::Utc::now());
+    tokio::task::spawn_blocking(move || {
+        tr_data::rotation::build_report(&benchmark, named, &query, "Local Yahoo daily research archive", expected)
+    })
+    .await?
+    .map_err(anyhow::Error::msg)
 }
 
 /// Load one name from the local archive, then Whats-News. Sample/display bars never enter.
@@ -2157,6 +2206,10 @@ async fn handle(s: &Arc<Shared>, req: Request) {
                 pane,
                 result: research_cash_levels(s, &symbol).await.map_err(|e| format!("{e:#}")),
             });
+        }
+        Request::Rotation { pane, generation, query } => {
+            let result = research_rotation(s, &query).await.map_err(|e| format!("{e:#}"));
+            send(Response::Rotation { pane, generation, result });
         }
         Request::Breadth { pane, generation, spec, timeframe, symbols } => {
             send(Response::Breadth {
@@ -3758,6 +3811,63 @@ mod tests {
         assert!(snap.stats.source.contains("Local Yahoo"));
         assert_eq!(snap.stats.ticker, "AAPL");
         assert_eq!(snap.conditional.by_horizon[0].baseline.count, snap.stats.bars.saturating_sub(5));
+    }
+
+    #[tokio::test]
+    async fn rotation_uses_the_research_archive_and_never_sample_fallback() {
+        let (s, _) = shared(Arc::new(tr_data::sample::SampleProvider::at(0, 10)), None);
+        let query = tr_data::rotation::parse_query("AAPL MSFT", &[]).unwrap();
+        let error = research_rotation(&s, &query).await.unwrap_err().to_string();
+        assert!(error.contains("refused"));
+        assert!(!error.to_ascii_lowercase().contains("fallback"));
+        struct RotationArchive;
+        #[async_trait::async_trait]
+        impl tr_data::history::DailyHistory for RotationArchive {
+            async fn daily(
+                &self,
+                _: &str,
+                _: Option<chrono::NaiveDate>,
+                _: chrono::NaiveDate,
+            ) -> Result<Vec<Bar>, tr_data::history::Failure> {
+                let start = chrono::NaiveDate::from_ymd_opt(2024, 1, 2).unwrap();
+                Ok((0..400)
+                    .map(|i| {
+                        Bar::new(
+                            (start + chrono::Duration::days(i)).and_hms_opt(0, 0, 0).unwrap().and_utc().timestamp(),
+                            100.0,
+                            101.0,
+                            99.0,
+                            100.0,
+                            1000.0,
+                        )
+                        .with_provenance(tr_core::Provenance::Real)
+                    })
+                    .collect())
+            }
+        }
+        let (mut s, _) = shared(Arc::new(tr_data::sample::SampleProvider::at(0, 10)), None);
+        Arc::get_mut(&mut s).unwrap().history = Arc::new(tr_data::history::Service::new(
+            tr_data::history::Archive::memory().unwrap(),
+            Arc::new(RotationArchive),
+            tr_data::history::Policy { spacing: Duration::ZERO, ..Default::default() },
+        ));
+        s.history
+            .run(
+                "ADD",
+                ["SPY", "AAPL", "MSFT"]
+                    .into_iter()
+                    .flat_map(|s| tr_data::history::universe::resolve(s).unwrap())
+                    .collect(),
+                |_| {},
+            )
+            .await
+            .unwrap();
+        s.history.run("REFRESH", vec![], |_| {}).await.unwrap();
+        let report = research_rotation(&s, &query).await.unwrap();
+        assert!(report.provenance.is_verified());
+        assert!(report.source.contains("Local Yahoo"));
+        assert_eq!(report.tracks.len(), 2);
+        assert_eq!(report.dates.len(), 260);
     }
 
     #[tokio::test]

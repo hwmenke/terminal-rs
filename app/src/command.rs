@@ -335,6 +335,10 @@ pub enum Function {
     SessionPath {
         spec: String,
     },
+    /// Relative rotation from the verified daily research archive.
+    Rotation {
+        spec: String,
+    },
     /// Share of a list at or above the open and session VWAP (`BRD`, `AAPL BRD MSFT`).
     Breadth {
         spec: String,
@@ -663,6 +667,7 @@ fn parse_function(head: &str, rest: &[&str]) -> Option<Function> {
         "LOOKALIKE" | "LOOKALIKES" | "KNN" | "ANALOG" | "ANALOGUE" | "NN" => Function::Lookalike { spec: joined() },
         "ICMP" | "ICOMPARE" | "ICOMP" => Function::IntradayCompare { spec: joined() },
         "SPATH" | "SESSIONPATH" | "TPATH" => Function::SessionPath { spec: joined() },
+        "RRG" | "ROT" | "ROTATION" | "ROTATE" => Function::Rotation { spec: joined() },
         "BRD" | "BREADTH" | "SBREADTH" => Function::Breadth { spec: joined() },
         "VPACE" | "VOLPACE" | "CUMVOL" => Function::VolumePace { spec: joined() },
         "RVAR" | "REALVOL" | "REALIZEDVOL" => Function::RealizedVol { spec: joined() },
@@ -928,6 +933,7 @@ fn describe(f: &Function) -> String {
             "Session path: today versus the mean of prior sessions, each percent from its own 09:30 open".into()
         }
         Function::SessionPath { spec } => format!("Session path versus prior 09:30 opens ({spec})"),
+        Function::Rotation { spec } => format!("Relative rotation graph from the verified research archive ({spec})"),
         Function::Breadth { spec } if spec.is_empty() => {
             "Session breadth: share of the watchlist at or above the 09:30 open and session VWAP".into()
         }
@@ -1025,6 +1031,17 @@ fn describe(f: &Function) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rrg_and_aliases_parse() {
+        for cmd in ["RRG", "ROT", "ROTATION", "ROTATE"] {
+            assert_eq!(parse(cmd), Some(Command::Function(Function::Rotation { spec: String::new() })));
+        }
+        assert_eq!(
+            parse("AAPL RRG MSFT VS QQQ"),
+            Some(Command::SymbolFunction("AAPL US Equity".into(), Function::Rotation { spec: "MSFT VS QQQ".into() }))
+        );
+    }
 
     #[test]
     fn plan_command_parses_be_and_trail_forms() {

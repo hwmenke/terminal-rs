@@ -34,6 +34,7 @@ pub mod portable;
 pub mod price_alerts;
 pub mod realized_vol;
 pub mod relative_path;
+pub mod rotation;
 pub mod rss;
 pub mod sample;
 pub mod session_alerts;

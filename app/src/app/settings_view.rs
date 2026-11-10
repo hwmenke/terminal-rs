@@ -211,6 +211,7 @@ impl TerminalApp {
 
     pub(super) fn refresh_whats_news_panes(&mut self) {
         self.command_catalogue = Default::default();
+        self.reload_rotation_panes();
         let desk: Vec<(crate::dock::PaneId, String)> = self
             .panes
             .iter()

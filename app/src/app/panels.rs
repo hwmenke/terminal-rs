@@ -147,6 +147,7 @@ impl TerminalApp {
             | PaneKind::Lookalike(_)
             | PaneKind::IntradayCompare(_)
             | PaneKind::SessionPath(_)
+            | PaneKind::Rotation(_)
             | PaneKind::Breadth(_)
             | PaneKind::VolumePace(_)
             | PaneKind::RealizedVol(_)
@@ -176,6 +177,9 @@ impl TerminalApp {
         }
         if matches!(self.panes[i].kind, PaneKind::SessionPath(_)) {
             actions.extend(self.session_path_pane(ui, id));
+        }
+        if matches!(self.panes[i].kind, PaneKind::Rotation(_)) {
+            actions.extend(self.rotation_pane(ui, id));
         }
         if matches!(self.panes[i].kind, PaneKind::Breadth(_)) {
             actions.extend(self.breadth_pane(ui, id));

@@ -249,6 +249,10 @@ gets the native title bar with traffic lights, window vibrancy behind the sideba
   session's close versus its own 09:30 open. Today is left out of the mean.
   A missing bucket does not vote, and the line past the last print is not a
   forecast. Sample bars are refused. See [Session path](docs/SESSION_PATH.md).
+- **Rotation graph** — `RRG` animates sector, watchlist or typed-name relative
+  strength and momentum against a benchmark, using only verified local daily
+  research history. Replay, quadrant filters and dated hollow stale heads make
+  archive gaps visible. See [Rotation](docs/ROTATION.md).
 - **Session breadth** — `BRD` (or `AAPL BRD MSFT NVDA`, `BRD 15m`) charts the
   share of a list at or above each name's own 09:30 open, and the share at or
   above each name's session VWAP. The rate stays blank below five names. A
@@ -431,6 +435,7 @@ Settings › Hotkeys. On Linux and Windows ⌘ is Ctrl and ⌥ is Alt.
 | `CMP MSFT` · `LOG` · `CANDLE` `BAR` `LINE` `AREA` | compare · log scale · chart type |
 | `ICMP` · `AAPL ICMP MSFT NVDA` · `AAPL ICMP 1m` · `NEW ICMP` | Intraday compare: percent from each 09:30 open, SPY on the same clock |
 | `SPATH` · `AAPL SPATH 20 15m` · `NEW SPATH` | Today versus the typical path of prior sessions, percent from each 09:30 open |
+| `RRG` · `RRG WL` · `RRG WEEKLY` · `NVDA RRG AMD AVGO VS SMH TAIL 20` · `NEW RRG` | Animated relative rotation from the verified daily research archive |
 | `BRD` · `AAPL BRD MSFT NVDA` · `BRD 15m` · `NEW BRD` | Share of a list at or above each 09:30 open and session VWAP |
 | `VPACE` · `AAPL VPACE 20 15m` · `NEW VPACE` | Cumulative volume versus the usual pace of prior sessions |
 | `GFILL` · `AAPL GFILL 40 15m` · `NEW GFILL` | Open versus the prior cash close, and how often that gap had filled |

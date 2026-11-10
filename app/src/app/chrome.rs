@@ -729,6 +729,17 @@ impl TerminalApp {
             if nav_row(
                 ui,
                 Icon::Chart,
+                "Rotation",
+                Some("RRG"),
+                is_focused(&PaneKind::Rotation(Box::new(super::rotation::RotationPane::new("")))),
+            )
+            .clicked()
+            {
+                out.push(SidebarCmd::Function(Function::Rotation { spec: String::new() }));
+            }
+            if nav_row(
+                ui,
+                Icon::Chart,
                 "Volume pace",
                 Some("VPACE"),
                 is_focused(&PaneKind::VolumePace(Box::new(super::volume_pace::VolumePacePane::new(
