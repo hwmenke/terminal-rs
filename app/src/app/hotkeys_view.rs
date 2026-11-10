@@ -280,6 +280,7 @@ impl TerminalApp {
                         ],
                         "Price, VWAP, RVOL, session path/pace/gap/extreme/relative, and setup alerts",
                     ),
+                    (&["NVDA PLAN 142.5 STOP 138.2 TARGET 151.1 RISK 300", "PLANS", "UNPLAN NVDA"], "Arm, view, or cancel a quote-only entry → stop/target plan"),
                     (&["UNALERT AAPL"], "Remove price/setup alerts for a name"),
                     (&["WL", "WL ADD SOLUSD CRNCY"], "Watchlist"),
                     (

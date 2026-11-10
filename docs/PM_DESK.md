@@ -1,5 +1,7 @@
 # PM Desk and risk planning
 
+Arm the risk planner as a quote-only entry → stop/target bracket with [trade plans](TRADE_PLANS.md).
+
 `DESK` (aliases `PMDESK`, `RISK`; `AAPL DESK` preselects a name) opens a **watchlist
 planning pane**. It is not the brokerage `PORT` blotter. `PORT` / `ACCT` / `POS` /
 `ORD` / `ACTV` are unchanged.

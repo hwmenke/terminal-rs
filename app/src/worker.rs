@@ -288,6 +288,18 @@ pub enum Request {
     Alerts,
     MarkAlertsSeen,
     /// Snapshot of persistent price/setup rules and fired events.
+    TradePlans,
+    ArmTradePlan(tr_data::trade_plans::PlanDraft),
+    CancelTradePlan {
+        id: String,
+    },
+    RemoveTradePlan {
+        query: String,
+    },
+    CancelTradePlansFor {
+        query: String,
+    },
+    MarkTradePlansSeen,
     PriceAlerts,
     AddPriceAlert {
         symbol: String,
@@ -591,6 +603,8 @@ pub enum Response {
     Politicians(Vec<PoliticianSummary>),
     Alerts(Vec<Alert>),
     NewAlerts(Vec<NewTradeAlert>),
+    TradePlanFeed(tr_data::trade_plans::PlanBatch),
+    NewTradePlanEvents(Vec<tr_data::trade_plans::PlanEvent>),
     PriceAlertFeed(tr_data::price_alerts::AlertBatch),
     NewPriceAlerts(Vec<tr_data::price_alerts::FiredAlert>),
     IntradayScan {
@@ -633,6 +647,8 @@ struct Shared {
     news: std::sync::Mutex<tr_data::news::NewsCache>,
     price_alerts: std::sync::Mutex<tr_data::price_alerts::Store>,
     price_alerts_path: PathBuf,
+    trade_plans: std::sync::Mutex<tr_data::trade_plans::Store>,
+    trade_plans_path: PathBuf,
     db: Mutex<Db>,
     out: mpsc::Sender<Response>,
     ctx: egui::Context,
@@ -642,6 +658,14 @@ impl Shared {
     fn send(&self, r: Response) {
         let _ = self.out.send(r);
         self.ctx.request_repaint();
+    }
+
+    fn persist_trade_plans(&self) {
+        self.trade_plans.lock().expect("trade plans").save(&self.trade_plans_path);
+    }
+
+    fn trade_plan_snapshot(&self, now: i64) -> tr_data::trade_plans::PlanBatch {
+        self.trade_plans.lock().expect("trade plans").snapshot(now, false, self.provider.name() == "sample", Vec::new())
     }
 
     fn persist_price_alerts(&self) {
@@ -706,6 +730,10 @@ impl Worker {
             news: Default::default(),
             price_alerts: std::sync::Mutex::new(tr_data::price_alerts::Store::load(&dir.join("price_alerts.json"))),
             price_alerts_path: dir.join("price_alerts.json"),
+            trade_plans: std::sync::Mutex::new(tr_data::trade_plans::Store::load(&tr_data::trade_plans::store_path(
+                &dir,
+            ))),
+            trade_plans_path: tr_data::trade_plans::store_path(&dir),
             db: Mutex::new(db),
             out,
             ctx,
@@ -766,6 +794,7 @@ impl Worker {
             loop {
                 tick.tick().await;
                 evaluate_price_alerts(&s).await;
+                evaluate_trade_plans(&s).await;
             }
         });
 
@@ -1001,9 +1030,8 @@ fn with_spy_for_oneil(
     spy: Option<&[tr_core::Bar]>,
 ) -> (Vec<(String, Vec<tr_core::Bar>)>, bool) {
     let needs_spy = name == "ONEIL_LENS" || name == "ALL";
-    let added_spy = needs_spy
-        && !bars.iter().any(|(symbol, _)| tr_data::security(symbol).ticker == "SPY")
-        && spy.is_some();
+    let added_spy =
+        needs_spy && !bars.iter().any(|(symbol, _)| tr_data::security(symbol).ticker == "SPY") && spy.is_some();
     if added_spy {
         bars.push(("SPY".into(), spy.unwrap().to_vec()));
     }
@@ -1048,7 +1076,9 @@ async fn research_scan(
                     scan.skipped.extend(histories.data.skipped);
                     strip_spy_from_scan(&mut scan, added_spy);
                     for row in &mut scan.results {
-                        if let Some(original) = snapshot.data.results.iter().find(|original| original.symbol == row.symbol) {
+                        if let Some(original) =
+                            snapshot.data.results.iter().find(|original| original.symbol == row.symbol)
+                        {
                             // Keep Rust setup tags for ALL; HTTP service fields still attach below for other scans.
                             let setups = std::mem::take(&mut row.service.setups);
                             let setup_count = row.service.setup_count;
@@ -1122,8 +1152,8 @@ async fn research_scan(
         let name = scan_name;
         let (histories, added_spy) = with_spy_for_oneil(&name, histories.into_iter().collect(), spy.as_deref());
         let mut scan = tr_data::whats_news::scan_histories(&name, histories.clone(), tr_core::Provenance::Cached)?;
-        let benchmark_available = spy.is_some()
-            && tr_data::whats_news::apply_spy_benchmark(&mut scan, &histories, spy.as_deref()).is_ok();
+        let benchmark_available =
+            spy.is_some() && tr_data::whats_news::apply_spy_benchmark(&mut scan, &histories, spy.as_deref()).is_ok();
         if !benchmark_available {
             let _ = tr_data::whats_news::apply_spy_benchmark(&mut scan, &[], None);
         }
@@ -1995,7 +2025,10 @@ async fn handle(s: &Arc<Shared>, req: Request) {
                     let result = desk_daily(s, bridge, &symbol).await;
                     (symbol, result)
                 }
-            })).buffered(tr_data::news::FETCH_CONCURRENCY).collect::<Vec<_>>().await;
+            }))
+            .buffered(tr_data::news::FETCH_CONCURRENCY)
+            .collect::<Vec<_>>()
+            .await;
             for (symbol, result) in results {
                 match result {
                     Ok(bars) => {
@@ -2461,6 +2494,39 @@ async fn handle(s: &Arc<Shared>, req: Request) {
             let _ = db.mark_alerts_seen();
             s.send(Response::Alerts(db.alerts(false, 200).unwrap_or_default()));
         }
+        Request::TradePlans => {
+            s.send(Response::TradePlanFeed(s.trade_plan_snapshot(chrono::Utc::now().timestamp())));
+        }
+        Request::ArmTradePlan(draft) => {
+            let result = s.trade_plans.lock().expect("trade plans").arm(draft, chrono::Utc::now().timestamp());
+            match result {
+                Ok(_) => {
+                    s.persist_trade_plans();
+                    evaluate_trade_plans(s).await;
+                }
+                Err(error) => s.send(Response::Status(error)),
+            }
+        }
+        Request::CancelTradePlan { id } => {
+            s.trade_plans.lock().expect("trade plans").cancel(&id);
+            s.persist_trade_plans();
+            s.send(Response::TradePlanFeed(s.trade_plan_snapshot(chrono::Utc::now().timestamp())));
+        }
+        Request::RemoveTradePlan { query } => {
+            s.trade_plans.lock().expect("trade plans").remove(&query);
+            s.persist_trade_plans();
+            s.send(Response::TradePlanFeed(s.trade_plan_snapshot(chrono::Utc::now().timestamp())));
+        }
+        Request::CancelTradePlansFor { query } => {
+            s.trade_plans.lock().expect("trade plans").cancel_symbol(&query);
+            s.persist_trade_plans();
+            s.send(Response::TradePlanFeed(s.trade_plan_snapshot(chrono::Utc::now().timestamp())));
+        }
+        Request::MarkTradePlansSeen => {
+            s.trade_plans.lock().expect("trade plans").mark_seen();
+            s.persist_trade_plans();
+            s.send(Response::TradePlanFeed(s.trade_plan_snapshot(chrono::Utc::now().timestamp())));
+        }
         Request::PriceAlerts => {
             s.send(Response::PriceAlertFeed(s.price_alert_snapshot(chrono::Utc::now().timestamp())));
         }
@@ -2507,7 +2573,10 @@ async fn handle(s: &Arc<Shared>, req: Request) {
             s.persist_price_alerts();
             s.send(Response::PriceAlertFeed(s.price_alert_snapshot(chrono::Utc::now().timestamp())));
         }
-        Request::EvaluatePriceAlerts => evaluate_price_alerts(s).await,
+        Request::EvaluatePriceAlerts => {
+            evaluate_price_alerts(s).await;
+            evaluate_trade_plans(s).await;
+        }
         Request::IntradayScan { group, symbols, generation } => {
             let board = intraday_scan(s, &symbols).await;
             s.send(Response::IntradayScan { group, board, generation });
@@ -3043,6 +3112,54 @@ mod combo_acquisition_tests {
     }
 }
 
+async fn evaluate_trade_plans(s: &Shared) {
+    use tr_data::price_alerts::{AlertFailure, PriceTick};
+    use tr_data::trade_plans::{EvalInput, evaluate};
+    let now = chrono::Utc::now().timestamp();
+    if s.provider.name() == "sample" {
+        let outcome = evaluate(
+            &mut s.trade_plans.lock().expect("trade plans"),
+            EvalInput { now, sample_provider: true, prices: Vec::new(), failures: Vec::new() },
+        );
+        s.send(Response::TradePlanFeed(outcome.batch));
+        return;
+    }
+    let symbols = s.trade_plans.lock().expect("trade plans").active_symbols();
+    if symbols.is_empty() {
+        s.send(Response::TradePlanFeed(s.trade_plan_snapshot(now)));
+        return;
+    }
+    let mut prices = Vec::new();
+    let mut failures = Vec::new();
+    let mut fetch_failed = false;
+    match s.provider.quotes(&symbols).await {
+        Ok(quotes) => {
+            for key in &symbols {
+                if let Some(q) = quotes.iter().find(|q| q.symbol == *key || tr_data::security(&q.symbol).key() == *key)
+                {
+                    prices.push(PriceTick { symbol: key.clone(), price: q.last, ts: q.ts, provenance: q.provenance });
+                }
+            }
+        }
+        Err(error) => {
+            fetch_failed = true;
+            for symbol in symbols {
+                failures.push(AlertFailure { symbol, error: format!("{error:#}") });
+            }
+        }
+    }
+    let mut outcome = evaluate(
+        &mut s.trade_plans.lock().expect("trade plans"),
+        EvalInput { now, sample_provider: false, prices, failures },
+    );
+    outcome.batch.stale |= fetch_failed;
+    s.persist_trade_plans();
+    if !outcome.fired.is_empty() {
+        s.send(Response::NewTradePlanEvents(outcome.fired));
+    }
+    s.send(Response::TradePlanFeed(outcome.batch));
+}
+
 async fn evaluate_price_alerts(s: &Shared) {
     use tr_data::price_alerts::{
         AlertFailure, AlertKind, EvalInput, PriceTick, evaluate, rvol_tick, setup_tick, vwap_tick,
@@ -3456,6 +3573,8 @@ mod tests {
                 news: Default::default(),
                 price_alerts: Default::default(),
                 price_alerts_path: PathBuf::new(),
+                trade_plans: Default::default(),
+                trade_plans_path: PathBuf::new(),
                 db: Mutex::new(Db::open_in_memory().unwrap()),
                 out,
                 ctx: egui::Context::default(),
@@ -3548,7 +3667,8 @@ mod tests {
     async fn holding_history_returns_separate_spy_and_preserves_partial_results() {
         let (mut s, rx) = shared(Arc::new(tr_data::sample::SampleProvider::at(0, 10)), None);
         Arc::get_mut(&mut s).unwrap().history = Arc::new(tr_data::history::Service::new(
-            tr_data::history::Archive::memory().unwrap(), Arc::new(ArchivePrices),
+            tr_data::history::Archive::memory().unwrap(),
+            Arc::new(ArchivePrices),
             tr_data::history::Policy { spacing: Duration::ZERO, ..Default::default() },
         ));
         s.whats_news.send_replace((0, tr_data::whats_news::Config { enabled: false, ..Default::default() }));
@@ -3569,7 +3689,9 @@ mod tests {
         s.history.run("REFRESH", vec![], |_| {}).await.unwrap();
         for symbols in [vec!["AAPL US Equity".into()], vec!["AAPL US Equity".into(), "SPY US Equity".into()]] {
             handle(&s, Request::HoldingHistory { pane: 1, generation: 8, symbols: symbols.clone() }).await;
-            let Response::WhatsNews { response, .. } = rx.try_recv().unwrap() else { panic!("expected archive envelope") };
+            let Response::WhatsNews { response, .. } = rx.try_recv().unwrap() else {
+                panic!("expected archive envelope")
+            };
             let Response::HoldingHistory { rows, spy, error, .. } = *response else {
                 panic!("expected holdings response")
             };
@@ -4139,6 +4261,8 @@ mod tests {
             news: Default::default(),
             price_alerts: Default::default(),
             price_alerts_path: PathBuf::new(),
+            trade_plans: Default::default(),
+            trade_plans_path: PathBuf::new(),
             db: Mutex::new(Db::open_in_memory().unwrap()),
             out,
             ctx: egui::Context::default(),
@@ -4237,6 +4361,115 @@ mod tests {
         let persisted: Store = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
         assert_eq!(persisted, installed);
         std::fs::remove_file(path).unwrap();
+    }
+
+    fn plan_draft() -> tr_data::trade_plans::PlanDraft {
+        tr_data::trade_plans::PlanDraft {
+            symbol: "NVDA".into(),
+            entry: 100.0,
+            stop: 90.0,
+            target: Some(120.0),
+            dollar_risk: 300.0,
+            shares: 30.0,
+            stop_source: "command".into(),
+        }
+    }
+
+    #[tokio::test]
+    async fn sample_trade_plans_are_not_invented() {
+        let (s, rx) = shared(Arc::new(tr_data::sample::SampleProvider::at(0, 10)), None);
+        handle(&s, Request::ArmTradePlan(plan_draft())).await;
+        handle(&s, Request::EvaluatePriceAlerts).await;
+        let before = s.trade_plans.lock().unwrap().clone();
+        assert_eq!(before.plans[0].last_price, None);
+        let mut feeds = 0;
+        while let Ok(response) = rx.try_recv() {
+            match response {
+                Response::NewTradePlanEvents(_) => panic!("sample must never invent plan events"),
+                Response::TradePlanFeed(batch) => {
+                    feeds += 1;
+                    assert!(batch.sample);
+                    assert!(batch.events.is_empty());
+                    assert_eq!(batch.plans[0].status, tr_data::trade_plans::PlanStatus::Armed);
+                }
+                _ => {}
+            }
+        }
+        assert_eq!(feeds, 2);
+        assert_eq!(*s.trade_plans.lock().unwrap(), before);
+    }
+
+    struct PlanQuotes {
+        calls: std::sync::atomic::AtomicUsize,
+        fail: bool,
+    }
+    #[async_trait::async_trait]
+    impl tr_data::MarketData for PlanQuotes {
+        fn name(&self) -> &str {
+            "plan test quotes"
+        }
+        async fn history(&self, _: &str, _: Timeframe, _: Option<i64>, _: usize) -> anyhow::Result<Vec<Bar>> {
+            panic!("plans must only acquire quotes");
+        }
+        async fn quotes(&self, symbols: &[String]) -> anyhow::Result<Vec<tr_data::Quote>> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if self.fail {
+                anyhow::bail!("offline quote failure");
+            }
+            Ok(symbols
+                .iter()
+                .map(|symbol| tr_data::Quote {
+                    symbol: tr_data::security(symbol).ticker,
+                    last: 99.0,
+                    prev_close: 98.0,
+                    ts: chrono::Utc::now().timestamp(),
+                    provenance: tr_core::Provenance::Real,
+                    spark: vec![],
+                    stats: Default::default(),
+                })
+                .collect())
+        }
+    }
+
+    #[tokio::test]
+    async fn trade_plans_evaluate_without_any_price_rule() {
+        let provider = Arc::new(PlanQuotes { calls: Default::default(), fail: false });
+        let (s, rx) = shared(provider.clone(), None);
+        assert!(s.price_alerts.lock().unwrap().rules.is_empty());
+        handle(&s, Request::EvaluatePriceAlerts).await;
+        assert_eq!(provider.calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+        s.trade_plans.lock().unwrap().arm(plan_draft(), 10).unwrap();
+        handle(&s, Request::EvaluatePriceAlerts).await;
+        assert_eq!(provider.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        let feeds: Vec<_> = rx
+            .try_iter()
+            .filter_map(|r| match r {
+                Response::TradePlanFeed(b) => Some(b),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(feeds.len(), 2);
+        assert_eq!(feeds[1].plans[0].last_price, Some(99.0));
+        assert!(!feeds[1].sample);
+        assert!(feeds[1].failures.is_empty());
+    }
+
+    #[tokio::test]
+    async fn trade_plan_quote_fetch_error_holds_state_and_reports_stale() {
+        let (s, rx) = shared(Arc::new(PlanQuotes { calls: Default::default(), fail: true }), None);
+        s.trade_plans.lock().unwrap().arm(plan_draft(), 10).unwrap();
+        let before = s.trade_plans.lock().unwrap().clone();
+        evaluate_trade_plans(&s).await;
+        assert_eq!(*s.trade_plans.lock().unwrap(), before);
+        match rx.try_recv().unwrap() {
+            Response::TradePlanFeed(batch) => {
+                assert!(batch.stale);
+                assert_eq!(batch.failures.len(), 1);
+                assert!(batch.failures[0].error.contains("offline quote failure"));
+            }
+            _ => panic!("expected feed"),
+        }
+        assert!(rx.try_recv().is_err());
     }
 
     #[tokio::test]

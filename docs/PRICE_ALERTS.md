@@ -1,5 +1,7 @@
 # Price and setup alerts
 
+For linked entry → stop/target monitoring, see [trade plans](TRADE_PLANS.md).
+
 `ALERTS` (aliases `ALRT`, `ALERT`) opens the existing alerts pane. It now lists
 **price levels** and **SCAN setup changes** above congressional filings. A fired
 row is timestamped; click the name or message to open that chart in one step.

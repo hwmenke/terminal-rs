@@ -42,6 +42,7 @@ pub mod session_brief;
 pub mod session_extreme;
 pub mod session_path;
 pub mod stats;
+pub mod trade_plans;
 pub mod treasury;
 pub mod volume_pace;
 pub mod whats_news;
