@@ -7,6 +7,7 @@ use tr_chart::drawings::Tool;
 use tr_chart::scene::ChartType;
 pub use tr_core::indicators::registry::Spec as IndicatorSpec;
 use tr_core::{Security, Timeframe, YellowKey};
+use tr_data::trade_plans::{TrailKind, TrailSpec};
 
 /// Bound search, shaping and command parsing work for pasted input.
 pub const MAX_INPUT_BYTES: usize = 4096;
@@ -237,7 +238,12 @@ pub enum Function {
         stop: f64,
         target: Option<f64>,
         risk: Option<f64>,
+        breakeven: Option<f64>,
+        trail: Option<TrailSpec>,
     },
+    TrailPlan(Option<TrailSpec>),
+    BreakevenPlan(Option<f64>),
+    MovePlanStop(f64),
     Plans,
     CancelPlans(String),
     /// `AAPL ALERT 150` / `AAPL ALERT VWAP` / `AAPL ALERT RVOL 2` / `AAPL ALERT SETUP NEAR_HIGH`.
@@ -490,27 +496,49 @@ fn parse_alert_kind(rest: &[&str]) -> Option<tr_data::price_alerts::AlertKind> {
     (level.is_finite() && level > 0.0).then_some(AlertKind::Price { side: PriceSide::Above, level })
 }
 
+fn positive_plan_value(s: &str) -> Option<f64> {
+    s.parse::<f64>().ok().filter(|v| v.is_finite() && *v > 0.0)
+}
+fn parse_breakeven(s: &str) -> Option<f64> {
+    positive_plan_value(s.strip_suffix(['R', 'r']).unwrap_or(s)).filter(|r| *r <= 20.0)
+}
+fn parse_trail(s: &str) -> Option<TrailSpec> {
+    let (kind, number) = if let Some(n) = s.strip_suffix(['R', 'r']) {
+        (TrailKind::R, n)
+    } else if let Some(n) = s.strip_suffix('%') {
+        (TrailKind::Percent, n)
+    } else {
+        (TrailKind::Price, s)
+    };
+    let value = positive_plan_value(number)?;
+    if (kind == TrailKind::R && value > 20.0) || (kind == TrailKind::Percent && value >= 50.0) {
+        return None;
+    }
+    Some(TrailSpec { kind, value, source: "command".into() })
+}
 fn parse_plan(rest: &[&str]) -> Option<Function> {
-    let positive = |s: &str| s.parse::<f64>().ok().filter(|v| v.is_finite() && *v > 0.0);
-    let entry = positive(rest.first()?)?;
+    let entry = positive_plan_value(rest.first()?)?;
     if !rest.get(1)?.eq_ignore_ascii_case("STOP") {
         return None;
     }
-    let stop = positive(rest.get(2)?)?;
+    let stop = positive_plan_value(rest.get(2)?)?;
     let mut target = None;
     let mut risk = None;
+    let mut breakeven = None;
+    let mut trail = None;
     for pair in rest[3..].chunks(2) {
         let [keyword, value] = pair else {
             return None;
         };
-        let value = positive(value)?;
         match keyword.to_ascii_uppercase().as_str() {
-            "TARGET" | "TGT" if target.is_none() => target = Some(value),
-            "RISK" if risk.is_none() => risk = Some(value),
+            "TARGET" | "TGT" if target.is_none() => target = Some(positive_plan_value(value)?),
+            "RISK" if risk.is_none() => risk = Some(positive_plan_value(value)?),
+            "BE" | "BREAKEVEN" if breakeven.is_none() => breakeven = Some(parse_breakeven(value)?),
+            "TRAIL" if trail.is_none() => trail = Some(parse_trail(value)?),
             _ => return None,
         }
     }
-    Some(Function::ArmPlan { entry, stop, target, risk })
+    Some(Function::ArmPlan { entry, stop, target, risk, breakeven, trail })
 }
 
 fn parse_function(head: &str, rest: &[&str]) -> Option<Function> {
@@ -553,6 +581,15 @@ fn parse_function(head: &str, rest: &[&str]) -> Option<Function> {
         "TRACK" => Function::Track(joined()),
         "UNTRACK" => Function::Untrack(joined()),
         "PLAN" => parse_plan(rest)?,
+        "TRAIL" if rest.len() == 1 => {
+            Function::TrailPlan(if rest[0].eq_ignore_ascii_case("OFF") { None } else { Some(parse_trail(rest[0])?) })
+        }
+        "BREAKEVEN" if rest.len() == 1 => Function::BreakevenPlan(if rest[0].eq_ignore_ascii_case("OFF") {
+            None
+        } else {
+            Some(parse_breakeven(rest[0])?)
+        }),
+        "MOVESTOP" if rest.len() == 1 => Function::MovePlanStop(positive_plan_value(rest[0])?),
         "PLANS" if rest.is_empty() => Function::Plans,
         "UNPLAN" if !rest.is_empty() => Function::CancelPlans(joined()),
         "ALRT" | "ALERTS" => Function::Alerts,
@@ -766,6 +803,9 @@ fn describe(f: &Function) -> String {
         Function::Alerts => {
             "Alerts: price levels, session VWAP crosses, session RVOL, session path/pace/gap/extreme/relative, setup changes, and tracked filings".into()
         }
+        Function::TrailPlan(_) => "Set or clear a quote plan's trail (places no orders)".into(),
+        Function::BreakevenPlan(_) => "Set or clear a quote plan's breakeven rule (places no orders)".into(),
+        Function::MovePlanStop(_) => "Tighten a triggered quote plan's stop (places no orders)".into(),
         Function::ArmPlan { .. } => "Arm an entry → stop/target quote plan (places no orders)".into(),
         Function::Plans => "Open trade plans in Alerts".into(),
         Function::CancelPlans(q) => format!("Cancel active trade plans for {q}"),
@@ -987,6 +1027,101 @@ mod tests {
     use super::*;
 
     #[test]
+    fn plan_command_parses_be_and_trail_forms() {
+        for (args, be, kind, value) in [
+            ("BE 1 TRAIL 2R", 1.0, TrailKind::R, 2.0),
+            ("TRAIL 3% BREAKEVEN 1.5R", 1.5, TrailKind::Percent, 3.0),
+            ("BE 1 TRAIL 4.2", 1.0, TrailKind::Price, 4.2),
+            ("RISK 300 TRAIL 2r TARGET 130 be 1r", 1.0, TrailKind::R, 2.0),
+        ] {
+            let cmd = format!("NVDA PLAN 100 STOP 90 {args}");
+            let Some(Command::SymbolFunction(_, Function::ArmPlan { breakeven, trail, .. })) = parse(&cmd) else {
+                panic!("{cmd}")
+            };
+            assert_eq!(breakeven, Some(be));
+            assert_eq!(trail, Some(TrailSpec { kind, value, source: "command".into() }));
+        }
+        for args in [
+            "BE 1 BE 2",
+            "BE 1 BREAKEVEN 2",
+            "TRAIL 1R TRAIL 2R",
+            "BE 0",
+            "BE NaN",
+            "BE 21",
+            "TRAIL -1",
+            "TRAIL 50%",
+            "TRAIL 21R",
+            "TRAIL INF",
+            "BE OFF",
+            "TRAIL OFF",
+            "TRAIL 2R extra",
+        ] {
+            assert!(parse(&format!("NVDA PLAN 100 STOP 90 {args}")).is_none(), "{args}");
+        }
+    }
+
+    #[test]
+    fn trail_breakeven_movestop_commands_parse() {
+        for (text, function) in [
+            (
+                "TRAIL 1.5R",
+                Function::TrailPlan(Some(TrailSpec { kind: TrailKind::R, value: 1.5, source: "command".into() })),
+            ),
+            (
+                "TRAIL 3%",
+                Function::TrailPlan(Some(TrailSpec { kind: TrailKind::Percent, value: 3.0, source: "command".into() })),
+            ),
+            (
+                "TRAIL 4.2",
+                Function::TrailPlan(Some(TrailSpec { kind: TrailKind::Price, value: 4.2, source: "command".into() })),
+            ),
+            ("TRAIL OFF", Function::TrailPlan(None)),
+            ("BREAKEVEN 1r", Function::BreakevenPlan(Some(1.0))),
+            ("breakeven off", Function::BreakevenPlan(None)),
+            ("MOVESTOP 145", Function::MovePlanStop(145.0)),
+        ] {
+            assert_eq!(parse(text), Some(Command::Function(function.clone())));
+            assert_eq!(
+                parse(&format!("NVDA {text}")),
+                Some(Command::SymbolFunction("NVDA US Equity".into(), function.clone()))
+            );
+            assert!(describe(&function).ends_with("(places no orders)"));
+        }
+        for text in [
+            "TRAIL 0",
+            "TRAIL NaN",
+            "TRAIL 21R",
+            "BREAKEVEN 0",
+            "BREAKEVEN 21",
+            "BREAKEVEN 1RR",
+            "MOVESTOP 0",
+            "MOVESTOP OFF",
+            "MOVESTOP 1 extra",
+        ] {
+            assert!(parse(&format!("NVDA {text}")).is_none(), "{text}");
+        }
+    }
+
+    #[test]
+    fn bare_be_still_parses_as_a_security() {
+        assert_eq!(parse("BE"), Some(Command::Symbol("BE US Equity".into())));
+        assert_eq!(
+            parse("BE PLAN 100 STOP 90 BE 1"),
+            Some(Command::SymbolFunction(
+                "BE US Equity".into(),
+                Function::ArmPlan {
+                    entry: 100.0,
+                    stop: 90.0,
+                    target: None,
+                    risk: None,
+                    breakeven: Some(1.0),
+                    trail: None
+                }
+            ))
+        );
+    }
+
+    #[test]
     fn plan_command_parses_levels_target_and_risk() {
         for (command, target, risk) in [
             ("NVDA PLAN 142.5 STOP 138.2 TARGET 151.1 RISK 300", Some(151.1), Some(300.0)),
@@ -998,7 +1133,7 @@ mod tests {
                 parse(command),
                 Some(Command::SymbolFunction(
                     "NVDA US Equity".into(),
-                    Function::ArmPlan { entry: 142.5, stop: 138.2, target, risk }
+                    Function::ArmPlan { entry: 142.5, stop: 138.2, target, risk, breakeven: None, trail: None }
                 ))
             );
         }

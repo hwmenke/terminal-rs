@@ -290,6 +290,10 @@ pub enum Request {
     /// Snapshot of persistent price/setup rules and fired events.
     TradePlans,
     ArmTradePlan(tr_data::trade_plans::PlanDraft),
+    UpdateTradePlan {
+        query: String,
+        change: tr_data::trade_plans::PlanChange,
+    },
     CancelTradePlan {
         id: String,
     },
@@ -2507,6 +2511,30 @@ async fn handle(s: &Arc<Shared>, req: Request) {
                 Err(error) => s.send(Response::Status(error)),
             }
         }
+        Request::UpdateTradePlan { query, change } => {
+            // A sample provider cannot authorize a manual move using a previously saved quote.
+            let manual = matches!(change, tr_data::trade_plans::PlanChange::MoveStop(_));
+            let result = if s.provider.name() == "sample" && manual {
+                Err("moving a stop needs a fresh verified observed quote; sample provider cannot move stops".into())
+            } else {
+                s.trade_plans.lock().expect("trade plans").update(&query, change, chrono::Utc::now().timestamp())
+            };
+            match result {
+                Ok(plan) => {
+                    s.persist_trade_plans();
+                    if manual {
+                        s.send(Response::Status(format!(
+                            "{} {} {:.2} — observed quote, no order was changed",
+                            tr_data::security(&plan.symbol).ticker,
+                            tr_data::trade_plans::stop_label(&plan),
+                            plan.stop
+                        )));
+                    }
+                    evaluate_trade_plans(s).await;
+                }
+                Err(error) => s.send(Response::Status(error)),
+            }
+        }
         Request::CancelTradePlan { id } => {
             s.trade_plans.lock().expect("trade plans").cancel(&id);
             s.persist_trade_plans();
@@ -4372,7 +4400,129 @@ mod tests {
             dollar_risk: 300.0,
             shares: 30.0,
             stop_source: "command".into(),
+            breakeven_at_r: None,
+            trail: None,
         }
+    }
+
+    #[tokio::test]
+    async fn update_trade_plan_persists_and_reports_errors() {
+        use tr_data::trade_plans::{PlanChange, Store, TrailKind, TrailSpec};
+        let (mut s, rx) = shared(Arc::new(PlanQuotes { calls: Default::default(), fail: true }), None);
+        let path = std::env::temp_dir().join(format!("tr-r2-update-plan-{}.json", std::process::id()));
+        Arc::get_mut(&mut s).unwrap().trade_plans_path = path.clone();
+        let now = chrono::Utc::now().timestamp();
+        {
+            let mut store = s.trade_plans.lock().unwrap();
+            store.arm(plan_draft(), now - 4).unwrap();
+            let mut other = plan_draft();
+            other.symbol = "MSFT".into();
+            store.arm(other, now - 4).unwrap();
+            for (price, ts) in [(99.0, now - 3), (100.0, now - 2), (110.0, now - 1)] {
+                tr_data::trade_plans::evaluate(
+                    &mut store,
+                    tr_data::trade_plans::EvalInput {
+                        now,
+                        sample_provider: false,
+                        prices: vec![tr_data::price_alerts::PriceTick {
+                            symbol: "NVDA US Equity".into(),
+                            price,
+                            ts,
+                            provenance: tr_core::Provenance::Real,
+                        }],
+                        failures: vec![],
+                    },
+                );
+            }
+        }
+        let other = s.trade_plans.lock().unwrap().plans[0].clone();
+        let nvda = "NVDA".to_owned();
+        for change in [
+            PlanChange::Trail(Some(TrailSpec { kind: TrailKind::R, value: 1.5, source: "command".into() })),
+            PlanChange::Breakeven(Some(1.0)),
+            PlanChange::MoveStop(105.0),
+            PlanChange::Trail(None),
+            PlanChange::Breakeven(None),
+        ] {
+            handle(&s, Request::UpdateTradePlan { query: nvda.clone(), change }).await;
+            let saved = Store::load(&path);
+            assert_eq!(saved, *s.trade_plans.lock().unwrap());
+            assert_eq!(saved.plans[0], other);
+            let responses = rx.try_iter().collect::<Vec<_>>();
+            assert!(responses.iter().any(|r| matches!(r, Response::TradePlanFeed(_))));
+            if saved.plans[1].stop_manual {
+                assert!(saved.plans[1].breakeven_seen);
+            }
+            assert!(!responses.iter().any(|r| matches!(r, Response::NewTradePlanEvents(_))));
+            if responses.iter().any(|r| matches!(r, Response::Status(_))) {
+                assert!(responses.iter().any(
+                    |r| matches!(r, Response::Status(text) if text.contains("observed quote, no order was changed"))
+                ));
+            }
+        }
+        let before = std::fs::read(&path).unwrap();
+        for (query, change, reason) in [
+            ("NVDA", PlanChange::MoveStop(100.0), "strictly tighter"),
+            ("NVDA", PlanChange::MoveStop(110.0), "adverse side"),
+            ("MSFT", PlanChange::MoveStop(95.0), "cancel and re-arm"),
+            ("NVDA", PlanChange::Breakeven(Some(0.0)), "breakeven R"),
+            (
+                "NVDA",
+                PlanChange::Trail(Some(TrailSpec { kind: TrailKind::Percent, value: 50.0, source: "command".into() })),
+                "below 50%",
+            ),
+            ("MISSING", PlanChange::Trail(None), "no active trade plan"),
+        ] {
+            handle(&s, Request::UpdateTradePlan { query: query.into(), change }).await;
+            assert_eq!(std::fs::read(&path).unwrap(), before);
+            let responses = rx.try_iter().collect::<Vec<_>>();
+            assert_eq!(responses.len(), 1);
+            assert!(matches!(&responses[0], Response::Status(text) if text.contains(reason)), "{reason}");
+        }
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn sample_provider_never_moves_plan_stops() {
+        use tr_data::trade_plans::{PlanChange, TrailKind, TrailSpec};
+        let (s, rx) = shared(Arc::new(tr_data::sample::SampleProvider::at(0, 10)), None);
+        let now = chrono::Utc::now().timestamp();
+        {
+            let mut store = s.trade_plans.lock().unwrap();
+            let mut draft = plan_draft();
+            draft.breakeven_at_r = Some(1.0);
+            draft.trail = Some(TrailSpec { kind: TrailKind::R, value: 1.0, source: "command".into() });
+            store.arm(draft, now - 3).unwrap();
+            for (price, ts) in [(99.0, now - 2), (100.0, now - 1)] {
+                tr_data::trade_plans::evaluate(
+                    &mut store,
+                    tr_data::trade_plans::EvalInput {
+                        now,
+                        sample_provider: false,
+                        prices: vec![tr_data::price_alerts::PriceTick {
+                            symbol: "NVDA US Equity".into(),
+                            price,
+                            ts,
+                            provenance: tr_core::Provenance::Real,
+                        }],
+                        failures: vec![],
+                    },
+                );
+            }
+        }
+        let before = s.trade_plans.lock().unwrap().clone();
+        evaluate_trade_plans(&s).await;
+        handle(&s, Request::EvaluatePriceAlerts).await;
+        handle(&s, Request::UpdateTradePlan { query: "NVDA".into(), change: PlanChange::MoveStop(95.0) }).await;
+        assert_eq!(*s.trade_plans.lock().unwrap(), before);
+        let responses = rx.try_iter().collect::<Vec<_>>();
+        assert!(!responses.iter().any(|r| matches!(r, Response::NewTradePlanEvents(_))));
+        assert!(responses.iter().any(|r| matches!(r, Response::TradePlanFeed(batch) if batch.sample)));
+        assert!(
+            responses
+                .iter()
+                .any(|r| matches!(r, Response::Status(text) if text.contains("sample provider cannot move stops")))
+        );
     }
 
     #[tokio::test]

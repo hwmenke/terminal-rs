@@ -39,6 +39,7 @@ impl PlanStatus {
 pub enum PlanEventKind {
     Entry,
     OneR,
+    Breakeven,
     Target,
     Stop,
     Invalidated,
@@ -48,11 +49,75 @@ impl PlanEventKind {
         match self {
             Self::Entry => "entry",
             Self::OneR => "one_r",
+            Self::Breakeven => "breakeven",
             Self::Target => "target",
             Self::Stop => "stop",
             Self::Invalidated => "invalidated",
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub enum TrailKind {
+    R,
+    Percent,
+    Price,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TrailSpec {
+    pub kind: TrailKind,
+    pub value: f64,
+    #[serde(default)]
+    pub source: String,
+}
+impl TrailSpec {
+    pub fn distance(&self, plan: &TradePlan, high_water: f64) -> f64 {
+        match self.kind {
+            TrailKind::R => self.value * (plan.entry - plan.initial_stop()).abs(),
+            TrailKind::Percent => self.value / 100.0 * high_water,
+            TrailKind::Price => self.value,
+        }
+    }
+    fn validate(&self, entry: f64, long: bool) -> Result<(), String> {
+        if !self.value.is_finite() || self.value <= 0.0 {
+            return Err("trail must be finite and positive".into());
+        }
+        match self.kind {
+            TrailKind::R if self.value > 20.0 => Err("R trail must be at most 20R".into()),
+            TrailKind::Percent if self.value >= 50.0 => Err("percent trail must be below 50%".into()),
+            TrailKind::Price if long && self.value >= entry => Err("price trail must be below entry for a long".into()),
+            _ => Ok(()),
+        }
+    }
+}
+impl std::fmt::Display for TrailSpec {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{}{}",
+            self.value,
+            match self.kind {
+                TrailKind::R => "R",
+                TrailKind::Percent => "%",
+                TrailKind::Price => "",
+            }
+        )
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum PlanChange {
+    Trail(Option<TrailSpec>),
+    Breakeven(Option<f64>),
+    MoveStop(f64),
+}
+
+fn validate_breakeven(value: Option<f64>) -> Result<(), String> {
+    if value.is_some_and(|r| !r.is_finite() || r <= 0.0 || r > 20.0) {
+        return Err("breakeven R must be finite and in (0, 20]".into());
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -64,6 +129,10 @@ pub struct PlanDraft {
     pub dollar_risk: f64,
     pub shares: f64,
     pub stop_source: String,
+    #[serde(default)]
+    pub breakeven_at_r: Option<f64>,
+    #[serde(default)]
+    pub trail: Option<TrailSpec>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -77,6 +146,10 @@ pub struct TradePlan {
     pub dollar_risk: f64,
     pub shares: f64,
     pub stop_source: String,
+    #[serde(default)]
+    pub breakeven_at_r: Option<f64>,
+    #[serde(default)]
+    pub trail: Option<TrailSpec>,
     pub status: PlanStatus,
     pub entry_side: Option<PriceSide>,
     pub last_price: Option<f64>,
@@ -87,6 +160,27 @@ pub struct TradePlan {
     pub triggered_price: Option<f64>,
     pub closed_at: Option<i64>,
     pub closed_price: Option<f64>,
+    #[serde(default)]
+    pub initial_stop: Option<f64>,
+    #[serde(default)]
+    pub high_water: Option<f64>,
+    #[serde(default)]
+    pub breakeven_seen: bool,
+    #[serde(default)]
+    pub stop_moved_at: Option<i64>,
+    #[serde(default)]
+    pub stop_manual: bool,
+}
+impl TradePlan {
+    pub fn initial_stop(&self) -> f64 {
+        self.initial_stop.unwrap_or(self.stop)
+    }
+    fn tighter(&self, candidate: f64, than: f64) -> bool {
+        if self.long { candidate > than } else { candidate < than }
+    }
+    fn at_breakeven(&self) -> bool {
+        self.stop == self.entry || self.tighter(self.stop, self.entry)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -180,6 +274,10 @@ impl Store {
                 return Err("target must be on the profit side of entry".into());
             }
         }
+        validate_breakeven(draft.breakeven_at_r)?;
+        if let Some(trail) = &draft.trail {
+            trail.validate(draft.entry, long)?;
+        }
         if self.plans.iter().any(|p| p.symbol == symbol && p.status.active()) {
             return Err("cancel the existing plan first".into());
         }
@@ -203,6 +301,13 @@ impl Store {
             dollar_risk: draft.dollar_risk,
             shares: draft.shares,
             stop_source: draft.stop_source,
+            initial_stop: Some(draft.stop),
+            breakeven_at_r: draft.breakeven_at_r,
+            trail: draft.trail,
+            high_water: None,
+            breakeven_seen: false,
+            stop_moved_at: None,
+            stop_manual: false,
             status: PlanStatus::Armed,
             entry_side: None,
             last_price: None,
@@ -217,6 +322,58 @@ impl Store {
         self.plans.insert(0, plan.clone());
         self.trim();
         Ok(plan)
+    }
+    pub fn update(&mut self, query: &str, change: PlanChange, now: i64) -> Result<TradePlan, String> {
+        let mut matching = self.plans.iter_mut().filter(|p| p.status.active() && matches_query(p, query));
+        let plan = matching.next().ok_or("no active trade plan matches that ticker or id")?;
+        if matching.next().is_some() {
+            return Err("more than one active trade plan matches; use a plan id".into());
+        }
+        match change {
+            PlanChange::Trail(trail) => {
+                if let Some(spec) = &trail {
+                    spec.validate(plan.entry, plan.long)?;
+                    if plan.status == PlanStatus::Triggered {
+                        plan.high_water = plan.last_price;
+                    }
+                }
+                plan.trail = trail;
+            }
+            PlanChange::Breakeven(r) => {
+                validate_breakeven(r)?;
+                plan.breakeven_at_r = r;
+                if r.is_some() && !plan.at_breakeven() {
+                    plan.breakeven_seen = false;
+                }
+            }
+            PlanChange::MoveStop(stop) => {
+                if plan.status != PlanStatus::Triggered {
+                    return Err("cancel and re-arm to change an armed plan's stop".into());
+                }
+                let price = plan
+                    .last_price
+                    .filter(|p| p.is_finite() && *p > 0.0)
+                    .ok_or("moving a stop needs an observed quote")?;
+                if plan.last_tick_ts.is_none_or(|ts| price_alerts::is_stale(ts, now)) {
+                    return Err("moving a stop needs a fresh verified observed quote".into());
+                }
+                if !stop.is_finite() || stop <= 0.0 || !plan.tighter(stop, plan.stop) {
+                    return Err("stop must be finite, positive and strictly tighter than the current stop".into());
+                }
+                if !plan.tighter(price, stop) {
+                    return Err("stop must be strictly on the adverse side of the last observed quote".into());
+                }
+                // Freeze the risk basis when a legacy plan first opts into management.
+                plan.initial_stop = Some(plan.initial_stop());
+                plan.stop = stop;
+                plan.stop_manual = true;
+                plan.stop_moved_at = Some(now);
+                if plan.at_breakeven() {
+                    plan.breakeven_seen = true;
+                }
+            }
+        }
+        Ok(plan.clone())
     }
     pub fn cancel(&mut self, id: &str) -> bool {
         if let Some(p) = self.plans.iter_mut().find(|p| p.id == id && p.status.active()) {
@@ -319,8 +476,25 @@ pub struct EvalOutcome {
 pub fn open_r(plan: &TradePlan) -> Option<f64> {
     (plan.status == PlanStatus::Triggered).then(|| plan.last_price.map(|p| observed_r(plan, p))).flatten()
 }
+pub fn planned_r(plan: &TradePlan, level: f64) -> f64 {
+    (level - plan.entry) / (plan.entry - plan.initial_stop())
+}
 fn observed_r(plan: &TradePlan, price: f64) -> f64 {
-    (price - plan.entry) / (plan.entry - plan.stop)
+    planned_r(plan, price)
+}
+pub fn locked_r(plan: &TradePlan) -> Option<f64> {
+    (plan.stop != plan.initial_stop()).then(|| planned_r(plan, plan.stop))
+}
+pub fn stop_label(plan: &TradePlan) -> &'static str {
+    if plan.stop == plan.initial_stop() {
+        "stop"
+    } else if plan.stop == plan.entry {
+        "breakeven stop"
+    } else if plan.stop_manual {
+        "manual stop"
+    } else {
+        "trailing stop"
+    }
 }
 
 pub fn evaluate(store: &mut Store, input: EvalInput) -> EvalOutcome {
@@ -373,6 +547,7 @@ pub fn evaluate(store: &mut Store, input: EvalInput) -> EvalOutcome {
                     plan.status = PlanStatus::Triggered;
                     plan.triggered_at = Some(tick.ts);
                     plan.triggered_price = Some(p);
+                    plan.high_water = Some(p);
                     Some(PlanEventKind::Entry)
                 } else {
                     None
@@ -391,11 +566,40 @@ pub fn evaluate(store: &mut Store, input: EvalInput) -> EvalOutcome {
         } else if plan.target.is_some_and(fav) {
             plan.status = PlanStatus::TargetHit;
             Some(PlanEventKind::Target)
-        } else if !plan.one_r_seen && fav(plan.entry + (plan.entry - plan.stop)) {
-            plan.one_r_seen = true;
-            Some(PlanEventKind::OneR)
         } else {
-            None
+            let high = plan.high_water.map_or(p, |old| if plan.long { old.max(p) } else { old.min(p) });
+            plan.high_water = Some(high);
+            let mut candidate = plan.stop;
+            let mut tighten = |value| {
+                if plan.tighter(value, candidate) {
+                    candidate = value;
+                }
+            };
+            if plan.breakeven_at_r.is_some_and(|r| planned_r(plan, p) >= r) {
+                tighten(plan.entry);
+            }
+            if let Some(trail) = &plan.trail {
+                let distance = trail.distance(plan, high);
+                tighten(if plan.long { high - distance } else { high + distance });
+            }
+            if candidate.is_finite()
+                && candidate > 0.0
+                && plan.tighter(candidate, plan.stop)
+                && plan.tighter(p, candidate)
+            {
+                plan.initial_stop = Some(plan.initial_stop());
+                plan.stop = candidate;
+                plan.stop_moved_at = Some(tick.ts);
+            }
+            if !plan.one_r_seen && planned_r(plan, p) >= 1.0 {
+                plan.one_r_seen = true;
+                Some(PlanEventKind::OneR)
+            } else if !plan.breakeven_seen && plan.at_breakeven() {
+                plan.breakeven_seen = true;
+                Some(PlanEventKind::Breakeven)
+            } else {
+                None
+            }
         };
         plan.last_price = Some(p);
         plan.last_tick_ts = Some(tick.ts);
@@ -422,20 +626,41 @@ pub fn evaluate(store: &mut Store, input: EvalInput) -> EvalOutcome {
                         .target
                         .map(|t| format!(", target {t:.2} ({:.2}R)", observed_r(plan, t)))
                         .unwrap_or_default();
+                    let be = plan.breakeven_at_r.map(|r| format!(", BE at +{r}R")).unwrap_or_default();
+                    let trail = plan.trail.as_ref().map(|s| format!(", trail {s}")).unwrap_or_default();
                     format!(
-                        "{ticker} entry {:.2} triggered at {p:.2} — plan {size}, stop {:.2}{target} at observed quote, not a fill",
+                        "{ticker} entry {:.2} triggered at {p:.2} — plan {size}, stop {:.2}{target}{be}{trail} at observed quote, not a fill; no order was changed",
                         plan.entry, plan.stop
                     )
                 }
                 PlanEventKind::OneR => {
-                    format!("{ticker} +1R reached at {p:.2} — {r:+.2}R at observed quote, not a fill")
+                    let be = if !plan.breakeven_seen && plan.at_breakeven() {
+                        plan.breakeven_seen = true;
+                        format!("; stop moved to breakeven {:.2}", plan.entry)
+                    } else {
+                        String::new()
+                    };
+                    format!(
+                        "{ticker} +1R reached at {p:.2} — {r:+.2}R at observed quote, not a fill{be}; no order was changed"
+                    )
                 }
+                PlanEventKind::Breakeven => format!(
+                    "{ticker} stop moved to breakeven {:.2} at {p:.2} — observed quote, no order was changed",
+                    plan.entry
+                ),
                 PlanEventKind::Target => format!(
-                    "{ticker} target {:.2} reached at {p:.2} — {r:+.2}R at observed quote, not a fill",
+                    "{ticker} target {:.2} reached at {p:.2} — {r:+.2}R at observed quote, not a fill; no order was changed",
                     plan.target.unwrap()
                 ),
                 PlanEventKind::Stop => {
-                    format!("{ticker} stop {:.2} traded at {p:.2} — {r:+.2}R at observed quote, not a fill", plan.stop)
+                    let initial = locked_r(plan)
+                        .map(|_| format!(" (initial stop {:.2})", plan.initial_stop()))
+                        .unwrap_or_default();
+                    format!(
+                        "{ticker} {} {:.2} traded at {p:.2} — {r:+.2}R at observed quote, not a fill{initial}; no order was changed",
+                        stop_label(plan),
+                        plan.stop
+                    )
                 }
                 PlanEventKind::Invalidated => {
                     format!("{ticker} stop {:.2} traded before entry — plan disarmed", plan.stop)
@@ -476,6 +701,8 @@ mod tests {
             dollar_risk: 300.0,
             shares: 30.0,
             stop_source: "command".into(),
+            breakeven_at_r: None,
+            trail: None,
         }
     }
     fn armed() -> Store {
@@ -500,6 +727,293 @@ mod tests {
         tick(&mut store, 100.0, 101);
         store
     }
+    fn managed(be: Option<f64>, trail: Option<TrailSpec>, short: bool) -> Store {
+        let mut d = draft();
+        d.breakeven_at_r = be;
+        d.trail = trail;
+        d.target = Some(if short { 70.0 } else { 130.0 });
+        if short {
+            d.stop = 110.0;
+        }
+        let mut s = Store::default();
+        s.arm(d, 10).unwrap();
+        tick(&mut s, if short { 101.0 } else { 99.0 }, 100);
+        let entry = tick(&mut s, 100.0, 101);
+        assert_eq!(entry.fired[0].kind, PlanEventKind::Entry);
+        assert_eq!(s.plans[0].high_water, Some(100.0));
+        assert_eq!(s.plans[0].stop, if short { 110.0 } else { 90.0 });
+        s
+    }
+    fn trail(kind: TrailKind, value: f64) -> TrailSpec {
+        TrailSpec { kind, value, source: "test".into() }
+    }
+
+    #[test]
+    fn legacy_plan_json_without_new_fields_loads_and_evaluates_unchanged() {
+        let json = r#"{"version":1,"plans":[{"id":"legacy","symbol":"NVDA US Equity","long":true,"entry":100.0,"stop":90.0,"target":120.0,"dollar_risk":300.0,"shares":30.0,"stop_source":"command","status":"Triggered","entry_side":"Above","last_price":100.0,"last_tick_ts":101,"one_r_seen":false,"created_at":10,"triggered_at":101,"triggered_price":100.0,"closed_at":null,"closed_price":null}],"events":[]}"#;
+        let mut s: Store = serde_json::from_str(json).unwrap();
+        assert_eq!(s.version, 1);
+        assert_eq!(s.plans[0].initial_stop, None);
+        assert_eq!(s.plans[0].initial_stop(), 90.0);
+        assert!(s.plans[0].trail.is_none());
+        assert!(tick(&mut s, 90.0, 102).fired[0].message.contains("-1.00R"));
+    }
+
+    #[test]
+    fn arm_rejects_invalid_breakeven_and_trail_specs() {
+        for value in [f64::NAN, f64::INFINITY, 0.0, -1.0, 20.1] {
+            let mut d = draft();
+            d.breakeven_at_r = Some(value);
+            assert!(Store::default().arm(d, 10).is_err());
+            let mut s = triggered();
+            let before = s.clone();
+            assert!(s.update("NVDA", PlanChange::Breakeven(Some(value)), 102).is_err());
+            assert_eq!(s, before);
+        }
+        for kind in [TrailKind::R, TrailKind::Percent, TrailKind::Price] {
+            let limit = match kind {
+                TrailKind::R => 20.1,
+                TrailKind::Percent => 50.0,
+                TrailKind::Price => 100.0,
+            };
+            for value in [f64::NAN, f64::INFINITY, 0.0, -1.0, limit] {
+                let spec = trail(kind, value);
+                let mut d = draft();
+                d.trail = Some(spec.clone());
+                assert!(Store::default().arm(d, 10).is_err());
+                let mut s = triggered();
+                let before = s.clone();
+                assert!(s.update("NVDA", PlanChange::Trail(Some(spec)), 102).is_err());
+                assert_eq!(s, before);
+            }
+        }
+    }
+
+    #[test]
+    fn breakeven_moves_stop_to_entry_once_at_threshold() {
+        let mut s = managed(Some(1.0), None, false);
+        assert!(tick(&mut s, 109.0, 102).fired.is_empty());
+        assert_eq!(s.plans[0].stop, 90.0);
+        let out = tick(&mut s, 110.0, 103);
+        assert_eq!(out.fired.len(), 1);
+        assert_eq!(out.fired[0].kind, PlanEventKind::OneR);
+        assert!(out.fired[0].message.contains("stop moved to breakeven 100.00"));
+        assert!(out.fired[0].message.contains("observed quote"));
+        assert!(out.fired[0].message.contains("no order was changed"));
+        assert_eq!(s.plans[0].stop, 100.0);
+        assert_eq!(s.plans[0].stop_moved_at, Some(103));
+        assert!(s.plans[0].breakeven_seen);
+        assert!(tick(&mut s, 111.0, 104).fired.is_empty());
+        assert!(!s.events.iter().any(|e| e.kind == PlanEventKind::Breakeven));
+    }
+
+    #[test]
+    fn breakeven_event_fires_alone_when_threshold_differs_from_one_r() {
+        let mut s = managed(Some(0.5), None, false);
+        let out = tick(&mut s, 105.0, 102);
+        assert_eq!(out.fired.len(), 1);
+        assert_eq!(out.fired[0].kind, PlanEventKind::Breakeven);
+        assert!(out.fired[0].message.contains("observed quote, no order was changed"));
+        assert_eq!(tick(&mut s, 110.0, 103).fired[0].kind, PlanEventKind::OneR);
+        assert!(tick(&mut s, 112.0, 104).fired.is_empty());
+        // Persisted event ids still dedupe a reset flag.
+        s.plans[0].breakeven_seen = false;
+        assert!(tick(&mut s, 113.0, 105).fired.is_empty());
+    }
+
+    #[test]
+    fn trail_r_ratchets_up_and_never_down() {
+        let mut s = managed(None, Some(trail(TrailKind::R, 1.0)), false);
+        for (i, (price, stop)) in
+            [(105.0, 95.0), (112.0, 102.0), (108.0, 102.0), (115.0, 105.0)].into_iter().enumerate()
+        {
+            let out = tick(&mut s, price, 102 + i as i64);
+            assert_eq!(s.plans[0].stop, stop);
+            assert!(out.fired.iter().all(|e| e.kind == PlanEventKind::OneR));
+        }
+        assert_eq!(s.plans[0].high_water, Some(115.0));
+    }
+
+    #[test]
+    fn trail_percent_and_price_distances() {
+        for (kind, value, expected) in [(TrailKind::Percent, 10.0, 103.5), (TrailKind::Price, 4.2, 110.8)] {
+            let mut s = managed(None, Some(trail(kind, value)), false);
+            tick(&mut s, 115.0, 102);
+            assert!((s.plans[0].stop - expected).abs() < 1e-9);
+            tick(&mut s, 114.0, 103);
+            assert!((s.plans[0].stop - expected).abs() < 1e-9);
+        }
+    }
+
+    #[test]
+    fn trailed_stop_out_reports_positive_r_against_initial_stop() {
+        let mut s = managed(None, Some(trail(TrailKind::R, 1.0)), false);
+        tick(&mut s, 115.0, 102);
+        let out = tick(&mut s, 104.0, 103);
+        assert_eq!(s.plans[0].status, PlanStatus::Stopped);
+        let message = &out.fired[0].message;
+        for text in [
+            "trailing stop 105.00",
+            "+0.40R",
+            "initial stop 90.00",
+            "observed quote, not a fill",
+            "no order was changed",
+        ] {
+            assert!(message.contains(text), "{message}");
+        }
+        // Corrected acceptance sequence, including an unsized plan.
+        let mut s = managed(Some(1.0), Some(trail(TrailKind::R, 1.0)), false);
+        s.plans[0].dollar_risk = 0.0;
+        s.plans[0].shares = 0.0;
+        tick(&mut s, 110.0, 102);
+        assert_eq!(s.plans[0].stop, 100.0);
+        tick(&mut s, 118.0, 103);
+        assert_eq!(s.plans[0].stop, 108.0);
+        let out = tick(&mut s, 107.0, 104);
+        assert!(out.fired[0].message.contains("trailing stop 108.00 traded at 107.00 — +0.70R"));
+    }
+
+    #[test]
+    fn stop_check_uses_pre_tick_stop_and_target_wins_same_tick() {
+        let mut s = managed(Some(1.0), Some(trail(TrailKind::Price, 0.0001)), false);
+        let out = tick(&mut s, 115.0, 102);
+        assert_eq!(s.plans[0].status, PlanStatus::Triggered);
+        assert_eq!(out.fired[0].kind, PlanEventKind::OneR);
+        let stop = s.plans[0].stop;
+        let high = s.plans[0].high_water;
+        assert_eq!(tick(&mut s, 131.0, 103).fired[0].kind, PlanEventKind::Target);
+        assert_eq!(s.plans[0].stop, stop);
+        assert_eq!(s.plans[0].high_water, high);
+        // Even rounding a tiny distance to the quote cannot make a stop at the quote.
+        let mut s = managed(None, Some(trail(TrailKind::Price, f64::MIN_POSITIVE)), false);
+        tick(&mut s, 105.0, 102);
+        assert_eq!(s.plans[0].stop, 90.0);
+    }
+
+    #[test]
+    fn short_plan_trail_and_breakeven_mirror() {
+        let mut s = managed(Some(0.5), Some(trail(TrailKind::R, 1.0)), true);
+        assert_eq!(tick(&mut s, 95.0, 102).fired[0].kind, PlanEventKind::Breakeven);
+        assert_eq!(s.plans[0].stop, 100.0);
+        tick(&mut s, 88.0, 103);
+        assert_eq!(s.plans[0].stop, 98.0);
+        tick(&mut s, 92.0, 104);
+        assert_eq!(s.plans[0].stop, 98.0);
+        tick(&mut s, 85.0, 105);
+        assert_eq!(s.plans[0].stop, 95.0);
+        assert_eq!(s.plans[0].high_water, Some(85.0));
+        assert!(tick(&mut s, 96.0, 106).fired[0].message.contains("+0.40R"));
+    }
+
+    #[test]
+    fn stale_unverified_sample_and_duplicate_ticks_do_not_move_stop_or_high_water() {
+        let mut s = managed(Some(0.5), Some(trail(TrailKind::R, 1.0)), false);
+        let before = s.clone();
+        for (sample_provider, provenance, ts, now, price) in [
+            (true, Provenance::Real, 102, 102, 115.0),
+            (false, Provenance::Sample, 102, 102, 115.0),
+            (false, Provenance::Missing, 102, 102, 115.0),
+            (false, Provenance::Real, 102, 2000, 115.0),
+            (false, Provenance::Real, 101, 102, 115.0),
+            (false, Provenance::Real, 100, 102, 115.0),
+            (false, Provenance::Real, 102, 102, f64::NAN),
+            (false, Provenance::Real, 102, 102, f64::INFINITY),
+            (false, Provenance::Real, 102, 102, 0.0),
+            (false, Provenance::Real, 102, 102, -1.0),
+        ] {
+            let out = evaluate(
+                &mut s,
+                EvalInput {
+                    now,
+                    sample_provider,
+                    prices: vec![PriceTick { symbol: "NVDA US Equity".into(), price, ts, provenance }],
+                    failures: vec![],
+                },
+            );
+            assert_eq!(s, before);
+            assert!(out.fired.is_empty());
+        }
+        let out = evaluate(&mut s, EvalInput { now: 102, sample_provider: false, prices: vec![], failures: vec![] });
+        assert!(out.fired.is_empty());
+        assert_eq!(s, before);
+    }
+
+    #[test]
+    fn move_stop_validates_tighten_only_adverse_side_and_triggered_only() {
+        let mut s = armed();
+        assert_eq!(
+            s.update("NVDA", PlanChange::MoveStop(95.0), 102).unwrap_err(),
+            "cancel and re-arm to change an armed plan's stop"
+        );
+        let mut s = triggered();
+        let before = s.clone();
+        for stop in [80.0, 90.0, 100.0, 101.0, f64::NAN, f64::INFINITY, 0.0] {
+            assert!(s.update("NVDA", PlanChange::MoveStop(stop), 102).is_err());
+            assert_eq!(s, before);
+        }
+        assert!(s.update("NVDA", PlanChange::MoveStop(95.0), 2000).is_err());
+        assert_eq!(s, before);
+        let p = s.update("NVDA", PlanChange::MoveStop(95.0), 102).unwrap();
+        assert!(p.stop_manual);
+        assert_eq!(p.stop_moved_at, Some(102));
+        assert_eq!(stop_label(&p), "manual stop");
+        tick(&mut s, 105.0, 103);
+        let p = s.update("NVDA", PlanChange::MoveStop(100.0), 104).unwrap();
+        assert!(p.breakeven_seen);
+        assert_eq!(stop_label(&p), "breakeven stop");
+        assert!(tick(&mut s, 106.0, 105).fired.is_empty());
+        let mut s = managed(None, None, true);
+        tick(&mut s, 95.0, 102);
+        assert!(s.update("NVDA", PlanChange::MoveStop(94.0), 103).is_err());
+        let p = s.update("NVDA", PlanChange::MoveStop(98.0), 103).unwrap();
+        assert!(p.breakeven_seen);
+        assert_eq!(stop_label(&p), "manual stop");
+    }
+
+    #[test]
+    fn attaching_trail_resets_high_water_to_last_price() {
+        let mut s = managed(None, None, false);
+        tick(&mut s, 120.0, 102);
+        tick(&mut s, 110.0, 103);
+        s.update("NVDA", PlanChange::Trail(Some(trail(TrailKind::R, 1.0))), 104).unwrap();
+        assert_eq!(s.plans[0].high_water, Some(110.0));
+        tick(&mut s, 109.0, 104);
+        assert_eq!(s.plans[0].status, PlanStatus::Triggered);
+        assert_eq!(s.plans[0].stop, 100.0);
+    }
+
+    #[test]
+    fn removing_rules_never_loosens_stop() {
+        let mut s = managed(Some(1.0), Some(trail(TrailKind::R, 1.0)), false);
+        tick(&mut s, 118.0, 102);
+        s.update("NVDA", PlanChange::Trail(None), 103).unwrap();
+        s.update("NVDA", PlanChange::Breakeven(None), 103).unwrap();
+        assert_eq!(s.plans[0].stop, 108.0);
+        s.update("NVDA", PlanChange::Breakeven(Some(2.0)), 103).unwrap();
+        assert!(s.plans[0].breakeven_seen);
+        tick(&mut s, 115.0, 103);
+        assert_eq!(s.plans[0].stop, 108.0);
+        let before = s.clone();
+        assert!(s.update("MSFT", PlanChange::Trail(None), 104).is_err());
+        assert_eq!(s, before);
+    }
+
+    #[test]
+    fn locked_r_and_planned_r_use_initial_stop() {
+        let mut s = managed(None, None, false);
+        assert_eq!(locked_r(&s.plans[0]), None);
+        tick(&mut s, 118.0, 102);
+        // A legacy plan opting into management freezes its original risk, too.
+        s.plans[0].initial_stop = None;
+        let p = s.update("NVDA", PlanChange::MoveStop(105.0), 103).unwrap();
+        assert_eq!(p.initial_stop(), 90.0);
+        assert_eq!(locked_r(&p), Some(0.5));
+        assert_eq!(planned_r(&p, 130.0), 3.0);
+        assert_eq!(open_r(&p), Some(1.8));
+        let out = tick(&mut s, 119.0, 104);
+        assert_eq!(out.fired.len(), 0);
+    }
+
     #[test]
     fn arm_validates_levels_target_side_and_duplicates() {
         for value in [f64::NAN, f64::INFINITY, 0.0, -1.0] {
@@ -851,6 +1365,6 @@ mod tests {
         assert_eq!(open_r(&s.plans[0]), None);
         s.plans[0].status = PlanStatus::Triggered;
         s.plans[0].stop = 110.0;
-        assert_eq!(open_r(&s.plans[0]), Some(-0.45));
+        assert_eq!(open_r(&s.plans[0]), Some(0.45));
     }
 }

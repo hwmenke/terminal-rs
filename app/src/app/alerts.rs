@@ -251,7 +251,7 @@ impl TerminalApp {
     }
 
     fn trade_plans_section(&mut self, ui: &mut Ui, out: &mut Vec<Action>) {
-        use tr_data::trade_plans::{PlanStatus, open_r};
+        use tr_data::trade_plans::{PlanChange, PlanStatus, locked_r, open_r, planned_r, stop_label};
         ui.add_space(6.0);
         ui.label(RichText::new("TRADE PLANS").font(mono(11.0)).color(muted()));
         if self.trade_plans.sample || self.provider.eq_ignore_ascii_case("sample") {
@@ -319,20 +319,33 @@ impl TerminalApp {
                         };
                         let target = plan
                             .target
-                            .map(|p| format!("  target {p:.2} ({:.1}R)", (p - plan.entry) / (plan.entry - plan.stop)))
+                            .map(|p| format!("  target {p:.2} ({:.1}R)", planned_r(plan, p)))
                             .unwrap_or_default();
                         let size = if plan.dollar_risk == 0.0 {
                             "size not set".into()
                         } else {
                             format!("{:.0} sh  ${:.0} risk", plan.shares, plan.dollar_risk)
                         };
+                        let moved = locked_r(plan).map(|r| format!(" (initial {:.2}) · locks {r:+.2}R", plan.initial_stop())).unwrap_or_default();
                         ui.label(
                             RichText::new(format!(
-                                "entry {:.2}{direction}  stop {:.2}{target}  {size}",
-                                plan.entry, plan.stop
-                            ))
-                            .font(mono(12.0)),
-                        );
+                                "entry {:.2}{direction}  {} {:.2}{moved}{target}  {size}",
+                                plan.entry, stop_label(plan), plan.stop
+                            )).font(mono(12.0)),
+                        ).on_hover_text("at observed quote, not a fill; no order was changed\ntrail measured from observed quotes; moves while the app was closed are not backfilled");
+                        if let Some(r) = plan.breakeven_at_r {
+                            ui.label(RichText::new(format!("BE@{r}R")).font(mono(11.0)).color(muted()));
+                        }
+                        if let Some(trail) = &plan.trail {
+                            ui.label(RichText::new(format!("trail {trail}")).font(mono(11.0)).color(muted())).on_hover_text(&trail.source);
+                        }
+                        if plan.status == PlanStatus::Triggered
+                            && plan.last_price.is_some_and(|p| if plan.long { p > plan.entry } else { p < plan.entry })
+                            && (if plan.long { plan.stop < plan.entry } else { plan.stop > plan.entry })
+                            && ui.small_button("Stop→BE").on_hover_text("Move the plan stop to entry using the observed quote; no order was changed").clicked()
+                        {
+                            self.worker.send(Request::UpdateTradePlan { query: plan.id.clone(), change: PlanChange::MoveStop(plan.entry) });
+                        }
                         if plan.status.active() {
                             if ui.small_button("Cancel").clicked() {
                                 self.worker.send(Request::CancelTradePlan { id: plan.id.clone() });
@@ -352,7 +365,7 @@ impl TerminalApp {
                         .map(|ts| ts.format("%H:%M UTC").to_string())
                         .unwrap_or_default();
                     let observation = if let Some(r) = open_r(plan) {
-                        format!("open R {r:+.2} as of {as_of} — at observed quote, not a fill")
+                        format!("open R {r:+.2} as of {as_of}")
                     } else if plan.last_price.is_none() {
                         "awaiting first verified quote".into()
                     } else if plan.status == PlanStatus::Armed {
@@ -360,7 +373,7 @@ impl TerminalApp {
                     } else {
                         format!("as of {as_of}")
                     };
-                    ui.label(RichText::new(observation).font(mono(11.0)).color(muted()));
+                    ui.label(RichText::new(format!("{observation} — at observed quote, not a fill; no order was changed")).font(mono(11.0)).color(muted()));
                 });
             }
         });
@@ -609,11 +622,107 @@ mod tests {
                     dollar_risk: 300.0,
                     shares: 30.0,
                     stop_source: "command".into(),
+                    breakeven_at_r: None,
+                    trail: None,
                 },
                 100,
             )
             .unwrap();
         store
+    }
+
+    #[test]
+    fn trade_plan_row_shows_trail_initial_stop_and_locked_r() {
+        use tr_data::trade_plans::{PlanStatus, TrailKind, TrailSpec};
+        let ctx = egui::Context::default();
+        let mut app = test_app();
+        let mut store = plan_store();
+        let plan = &mut store.plans[0];
+        plan.status = PlanStatus::Triggered;
+        plan.breakeven_at_r = Some(1.0);
+        plan.trail = Some(TrailSpec { kind: TrailKind::R, value: 2.0, source: "command".into() });
+        plan.stop = 105.0;
+        plan.last_price = Some(115.0);
+        plan.last_tick_ts = Some(chrono::Utc::now().timestamp());
+        app.trade_plans = store.snapshot(chrono::Utc::now().timestamp(), false, false, vec![]);
+        let shapes = paint(&ctx, &mut app, vec![]);
+        for label in [
+            "trailing stop 105.00",
+            "initial 90.00",
+            "locks +0.50R",
+            "BE@1R",
+            "trail 2R",
+            "open R +1.50",
+            "target 120.00 (2.0R)",
+            "at observed quote, not a fill",
+            "no order was changed",
+        ] {
+            assert!(galley_contains(&shapes, label), "missing {label}");
+        }
+    }
+
+    #[test]
+    fn stop_to_be_button_sends_move_stop_only_when_in_profit() {
+        use tr_data::trade_plans::{PlanChange, PlanStatus};
+        for long in [true, false] {
+            let ctx = egui::Context::default();
+            let mut app = test_app();
+            let (worker, mut requests) = crate::worker::Worker::test_channel();
+            app.worker = worker;
+            let mut store = plan_store();
+            let plan = &mut store.plans[0];
+            plan.long = long;
+            plan.stop = if long { 90.0 } else { 110.0 };
+            plan.status = PlanStatus::Triggered;
+            plan.last_price = Some(if long { 105.0 } else { 95.0 });
+            let id = plan.id.clone();
+            app.trade_plans = store.snapshot(chrono::Utc::now().timestamp(), false, false, vec![]);
+            let shapes = paint(&ctx, &mut app, vec![]);
+            assert!(galley_contains(&shapes, "Stop→BE"));
+            click(&ctx, &mut app, &shapes, "Stop→BE");
+            assert!(std::iter::from_fn(|| requests.try_recv().ok()).any(
+                |r| matches!(r, Request::UpdateTradePlan { query, change: PlanChange::MoveStop(100.0) } if query == id)
+            ));
+            for mode in 0..5 {
+                let plan = &mut app.trade_plans.plans[0];
+                plan.status = if mode == 0 { PlanStatus::Armed } else { PlanStatus::Triggered };
+                plan.last_price = match mode {
+                    1 => None,
+                    2 => Some(100.0),
+                    3 => Some(if long { 95.0 } else { 105.0 }),
+                    _ => Some(if long { 105.0 } else { 95.0 }),
+                };
+                plan.stop = if mode == 4 {
+                    100.0
+                } else if long {
+                    90.0
+                } else {
+                    110.0
+                };
+                let shapes = paint(&ctx, &mut app, vec![]);
+                assert!(!galley_contains(&shapes, "Stop→BE"), "mode {mode}");
+            }
+        }
+    }
+
+    #[test]
+    fn stop_management_commands_dispatch_only_the_named_plan() {
+        use tr_data::trade_plans::{PlanChange, TrailKind};
+        let mut app = test_app();
+        let (worker, mut requests) = crate::worker::Worker::test_channel();
+        app.worker = worker;
+        app.execute("NVDA PLAN 100 STOP 90 BE 1 TRAIL 2R");
+        assert!(std::iter::from_fn(|| requests.try_recv().ok()).any(|r| matches!(r, Request::ArmTradePlan(d) if d.breakeven_at_r == Some(1.0) && d.trail.as_ref().is_some_and(|t| t.kind == TrailKind::R && t.value == 2.0))));
+        for (cmd, expected) in [
+            ("NVDA BREAKEVEN 1", PlanChange::Breakeven(Some(1.0))),
+            ("MSFT MOVESTOP 145", PlanChange::MoveStop(145.0)),
+            ("NVDA TRAIL OFF", PlanChange::Trail(None)),
+            ("MSFT BREAKEVEN OFF", PlanChange::Breakeven(None)),
+        ] {
+            app.execute(cmd);
+            let query_expected = tr_data::security(cmd.split_whitespace().next().unwrap()).key();
+            assert!(std::iter::from_fn(|| requests.try_recv().ok()).any(|r| matches!(r, Request::UpdateTradePlan { query, change } if query == query_expected && change == expected)), "{cmd}");
+        }
     }
 
     #[test]

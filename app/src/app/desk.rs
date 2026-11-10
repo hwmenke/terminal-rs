@@ -7,6 +7,49 @@ use tr_data::whats_news::{
     size_position,
 };
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TrailChoice {
+    Off,
+    R1,
+    R2,
+    Atr,
+}
+impl TrailChoice {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Off => "Off",
+            Self::R1 => "1R",
+            Self::R2 => "2R",
+            Self::Atr => "ATR×",
+        }
+    }
+    fn available(self, row: &MemberRow) -> bool {
+        self != Self::Atr || row.atr14.is_some_and(|atr| atr.is_finite() && atr > 0.0)
+    }
+    fn spec(self, mult: f64, row: &MemberRow) -> Result<Option<tr_data::trade_plans::TrailSpec>, String> {
+        use tr_data::trade_plans::{TrailKind, TrailSpec};
+        if !self.available(row) {
+            return Err("ATR trail needs a verified ATR(14) value".into());
+        }
+        Ok(match self {
+            Self::Off => None,
+            Self::R1 | Self::R2 => Some(TrailSpec {
+                kind: TrailKind::R,
+                value: if self == Self::R1 { 1.0 } else { 2.0 },
+                source: "desk".into(),
+            }),
+            Self::Atr => {
+                let atr = row.atr14.unwrap();
+                Some(TrailSpec {
+                    kind: TrailKind::Price,
+                    value: mult * atr,
+                    source: format!("desk {mult}×ATR14 {atr} as of {}", row.last_date.as_deref().unwrap_or("unknown")),
+                })
+            }
+        })
+    }
+}
+
 pub struct DeskPane {
     pub group: String,
     pub selected: Option<String>,
@@ -21,6 +64,8 @@ pub struct DeskPane {
     pub has_target: bool,
     pub dollar_risk: f64,
     pub atr_mult: f64,
+    pub be_at_1r: bool,
+    pub trail_choice: TrailChoice,
     pub user_stop: Option<f64>,
 }
 
@@ -40,6 +85,8 @@ impl DeskPane {
             has_target: false,
             dollar_risk: 250.0,
             atr_mult: ATR_MULT,
+            be_at_1r: false,
+            trail_choice: TrailChoice::Off,
             user_stop: None,
         }
     }
@@ -366,6 +413,29 @@ impl TerminalApp {
                             let _ = ui.add_enabled(false, egui::Button::new("Buy…")).on_disabled_hover_text(reason);
                         }
                     }
+                    ui.checkbox(&mut pane.be_at_1r, "BE at +1R")
+                        .on_hover_text("Move the plan stop to entry at +1R observed quote; no order was changed");
+                    ui.label("Trail");
+                    egui::ComboBox::from_id_salt("plan-trail")
+                        .selected_text(if pane.trail_choice == TrailChoice::Atr {
+                            format!("ATR×{}", pane.atr_mult)
+                        } else {
+                            pane.trail_choice.label().into()
+                        })
+                        .show_ui(ui, |ui| {
+                            for choice in [TrailChoice::Off, TrailChoice::R1, TrailChoice::R2, TrailChoice::Atr] {
+                                let label = if choice == TrailChoice::Atr {
+                                    format!("ATR×{}", pane.atr_mult)
+                                } else {
+                                    choice.label().into()
+                                };
+                                ui.add_enabled_ui(choice.available(&row), |ui| {
+                                    ui.selectable_value(&mut pane.trail_choice, choice, label)
+                                })
+                                .inner
+                                .on_disabled_hover_text("ATR trail needs a verified ATR(14) value");
+                            }
+                        });
                     let draft = pane.plan().and_then(|plan| {
                         if let Some(reason) = &row.skip {
                             return Err(reason.clone());
@@ -381,6 +451,8 @@ impl TerminalApp {
                             dollar_risk: plan.dollar_risk,
                             shares: plan.whole_shares,
                             stop_source: plan.stop_source.label().into(),
+                            breakeven_at_r: pane.be_at_1r.then_some(1.0),
+                            trail: pane.trail_choice.spec(pane.atr_mult, &row)?,
                         })
                     });
                     let arm = ui
@@ -659,6 +731,60 @@ mod tests {
         };
         paint(ctx, app, id, vec![egui::Event::PointerMoved(pos), pointer(true)]);
         paint(ctx, app, id, vec![pointer(false)]).1
+    }
+
+    #[test]
+    fn desk_arm_plan_carries_breakeven_and_atr_trail() {
+        use tr_data::trade_plans::TrailKind;
+        let ctx = egui::Context::default();
+        let mut app = test_app();
+        let (worker, mut requests) = Worker::test_channel();
+        app.worker = worker;
+        app.open_desk(None);
+        let id = app.focus;
+        let pane = match &mut app.panes.iter_mut().find(|p| p.id == id).unwrap().kind {
+            PaneKind::Desk(pane) => pane,
+            _ => unreachable!(),
+        };
+        assert!(!pane.be_at_1r);
+        assert_eq!(pane.trail_choice, TrailChoice::Off);
+        pane.accept(
+            pane.generation,
+            Ok(Snapshot {
+                failures: vec![],
+                source: "test".into(),
+                provenance: Provenance::Real,
+                data: vec![row("NVDA US Equity", 0.0)],
+            }),
+        );
+        pane.be_at_1r = true;
+        pane.trail_choice = TrailChoice::Atr;
+        pane.atr_mult = 3.0;
+        let (shapes, _) = paint(&ctx, &mut app, id, vec![]);
+        click(&ctx, &mut app, id, &shapes);
+        let draft = std::iter::from_fn(|| requests.try_recv().ok())
+            .find_map(|r| match r {
+                Request::ArmTradePlan(d) => Some(d),
+                _ => None,
+            })
+            .expect("arm request");
+        assert_eq!(draft.breakeven_at_r, Some(1.0));
+        let spec = draft.trail.unwrap();
+        assert_eq!(spec.kind, TrailKind::Price);
+        assert_eq!(spec.value, 3.0 * 2.0);
+        assert_eq!(spec.source, "desk 3×ATR14 2 as of 2026-10-24");
+        let pane = match &mut app.panes.iter_mut().find(|p| p.id == id).unwrap().kind {
+            PaneKind::Desk(p) => p,
+            _ => unreachable!(),
+        };
+        let row = &mut pane.rows.as_mut().unwrap().data[0];
+        row.atr14 = None;
+        assert!(!TrailChoice::Atr.available(row));
+        assert!(TrailChoice::Atr.spec(3.0, row).is_err());
+        assert!(TrailChoice::R1.available(row));
+        let (shapes, _) = paint(&ctx, &mut app, id, vec![]);
+        click(&ctx, &mut app, id, &shapes);
+        assert!(!std::iter::from_fn(|| requests.try_recv().ok()).any(|r| matches!(r, Request::ArmTradePlan(_))));
     }
 
     #[test]

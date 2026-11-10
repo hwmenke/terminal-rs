@@ -1311,9 +1311,13 @@ impl TerminalApp {
             Command::SymbolFunction(s, Function::JournalNote { date, text }) => {
                 self.add_journal_note(Some(&s), &date, &text)
             }
-            Command::SymbolFunction(s, Function::ArmPlan { entry, stop, target, risk }) => {
-                self.arm_trade_plan(Some(s), entry, stop, target, risk);
+            Command::SymbolFunction(s, Function::ArmPlan { entry, stop, target, risk, breakeven, trail }) => {
+                self.arm_trade_plan(Some(s), entry, stop, target, risk, (breakeven, trail));
             }
+            Command::SymbolFunction(
+                s,
+                f @ (Function::TrailPlan(_) | Function::BreakevenPlan(_) | Function::MovePlanStop(_)),
+            ) => self.apply_with_symbol(f, Some(s)),
             Command::SymbolFunction(s, Function::SetPriceAlert(kind)) => self.set_price_alert(Some(s), kind),
             Command::SymbolFunction(s, Function::ClearPriceAlert(_)) => self.clear_price_alert(&s),
             Command::SymbolFunction(s, f) => {
@@ -1356,7 +1360,18 @@ impl TerminalApp {
                 self.worker.send(Request::EvaluatePriceAlerts);
                 self.open_panel(PaneKind::Alerts);
             }
-            Function::ArmPlan { entry, stop, target, risk } => self.arm_trade_plan(symbol, entry, stop, target, risk),
+            Function::ArmPlan { entry, stop, target, risk, breakeven, trail } => {
+                self.arm_trade_plan(symbol, entry, stop, target, risk, (breakeven, trail))
+            }
+            Function::TrailPlan(trail) => {
+                self.update_trade_plan(symbol, tr_data::trade_plans::PlanChange::Trail(trail))
+            }
+            Function::BreakevenPlan(r) => {
+                self.update_trade_plan(symbol, tr_data::trade_plans::PlanChange::Breakeven(r))
+            }
+            Function::MovePlanStop(stop) => {
+                self.update_trade_plan(symbol, tr_data::trade_plans::PlanChange::MoveStop(stop))
+            }
             Function::CancelPlans(query) => {
                 self.worker.send(Request::CancelTradePlansFor { query });
                 self.open_panel(PaneKind::Alerts);
@@ -1945,6 +1960,7 @@ impl TerminalApp {
         stop: f64,
         target: Option<f64>,
         risk: Option<f64>,
+        (breakeven_at_r, trail): (Option<f64>, Option<tr_data::trade_plans::TrailSpec>),
     ) {
         let Some(symbol) = symbol.or_else(|| self.focused_symbol()) else {
             self.status = "PLAN needs a ticker: NVDA PLAN 142.5 STOP 138.2 TARGET 151.1 RISK 300".into();
@@ -1959,7 +1975,18 @@ impl TerminalApp {
             dollar_risk: risk.unwrap_or(0.0),
             shares,
             stop_source: "command".into(),
+            breakeven_at_r,
+            trail,
         }));
+        self.open_panel(PaneKind::Alerts);
+    }
+
+    fn update_trade_plan(&mut self, symbol: Option<String>, change: tr_data::trade_plans::PlanChange) {
+        let Some(query) = symbol.or_else(|| self.focused_symbol()) else {
+            self.status = "Plan management needs a ticker: NVDA TRAIL 1R / BREAKEVEN 1 / MOVESTOP 145".into();
+            return;
+        };
+        self.worker.send(Request::UpdateTradePlan { query, change });
         self.open_panel(PaneKind::Alerts);
     }
 
