@@ -442,6 +442,7 @@ Settings › Hotkeys. On Linux and Windows ⌘ is Ctrl and ⌥ is Alt.
 | `NEW BOOK` · `SPLIT DOWN NEWS` · `POP` · `LINK GREEN` · `TITLE Desk` · `CLOSE` | add, split, pop out, link, rename, close panes |
 | `LAYOUT 4` · `LAYOUT SAVE Macro` · `LAYOUT Macro` · `LAYOUT RENAME Rates` · `LAYOUT DUP` · `LAYOUT DEL` · `LAYOUT EXPORT` | grid preset · saved layouts |
 | `THEME BLOOMBERG` · `THEME NEXT` · `THEME SYSTEM` · `THEME EDIT` · `THEME COMPACT` · `LAYOUT THEME ON` | themes |
+| `NVDA PLAN 100 STOP 90 BE 1 TRAIL 2R` · `NVDA TRAIL OFF` · `NVDA BREAKEVEN 1` · `NVDA MOVESTOP 105` | Manage quote-plan stops (places no orders); [trade plans](docs/TRADE_PLANS.md) |
 | `DESK` · `AAPL DESK` · `NEW DESK` | PM Desk: watchlist leaders, group performance, position size |
 | `JOURNAL` · `AAPL JOURNAL` · `AAPL NOTE 2026-10-24 wait` · `NEW JOURNAL` | Trade journal: setup, checklist, $ risk, $ and R outcome, date notes |
 | `STATS` · `AAPL STATS` · `AAPL COND RSI(14) < 30` | Historical risk/returns and what followed a condition |
