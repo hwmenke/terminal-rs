@@ -17,6 +17,13 @@ use crate::congress_view::FeedFilter;
 use crate::dock::{Node, PaneId};
 use crate::layout::Layout;
 
+fn rotation_tail() -> u8 {
+    10
+}
+fn rotation_table() -> bool {
+    true
+}
+
 pub const FORMAT_VERSION: u32 = 1;
 
 /// Colour link groups: panes in the same group follow one security.
@@ -182,6 +189,15 @@ pub enum PaneSettings {
         spec: String,
         #[serde(default)]
         tf: String,
+    },
+    /// Relative rotation graph and its saved view preferences.
+    Rotation {
+        #[serde(default)]
+        spec: String,
+        #[serde(default = "rotation_tail")]
+        tail: u8,
+        #[serde(default = "rotation_table")]
+        table: bool,
     },
     /// Share of a list at or above the 09:30 open and session VWAP.
     Breadth {
@@ -644,6 +660,19 @@ mod tests {
     use super::*;
     use crate::dock::Zone;
     use crate::prefs::PanelDefaults;
+
+    #[test]
+    fn rotation_settings_round_trip() {
+        let settings = PaneSettings::Rotation { spec: "WL Growth VS QQQ WEEKLY".into(), tail: 20, table: false };
+        assert_eq!(serde_json::from_str::<PaneSettings>(&serde_json::to_string(&settings).unwrap()).unwrap(), settings);
+    }
+    #[test]
+    fn rotation_settings_default_when_fields_missing() {
+        assert_eq!(
+            serde_json::from_str::<PaneSettings>(r#"{"Rotation":{}}"#).unwrap(),
+            PaneSettings::Rotation { spec: String::new(), tail: 10, table: true }
+        );
+    }
 
     #[test]
     fn intraday_scan_is_its_own_layout_pane_and_watchlist_still_loads() {

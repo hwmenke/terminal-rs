@@ -377,6 +377,10 @@ impl TerminalApp {
                         "Today versus the typical path of prior sessions, percent from each 09:30 open",
                     ),
                     (
+                        &["RRG", "RRG WL", "RRG WEEKLY"],
+                        "Rotation: Space replay; arrows/Home/End scrub; T tail; 1–4 quadrants; L table; R reload; A HIST ADD skipped; j/k select; Enter chart",
+                    ),
+                    (
                         &["BRD", "AAPL BRD MSFT NVDA"],
                         "Share of the list at or above each 09:30 open and session VWAP",
                     ),

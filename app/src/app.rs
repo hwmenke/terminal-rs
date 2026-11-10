@@ -27,6 +27,7 @@ mod portfolio_view;
 mod realized_vol;
 mod relative_path;
 mod research;
+mod rotation;
 mod session_breadth;
 mod session_brief;
 mod session_extreme;
@@ -113,6 +114,7 @@ pub enum PaneKind {
     SessionPath(Box<session_path::SessionPathPane>),
     /// Share of a list at or above the 09:30 open and session VWAP (`BRD`).
     Breadth(Box<session_breadth::BreadthPane>),
+    Rotation(Box<rotation::RotationPane>),
     /// Cumulative volume versus the usual pace of prior sessions (`VPACE`).
     VolumePace(Box<volume_pace::VolumePacePane>),
     RealizedVol(Box<realized_vol::RealizedVolPane>),
@@ -350,6 +352,7 @@ impl PaneKind {
                 }
             }
             PaneKind::Breadth(_) => "Breadth".into(),
+            PaneKind::Rotation(_) => "Rotation".into(),
             PaneKind::VolumePace(p) => {
                 if p.symbol.trim().is_empty() {
                     "Pace".into()
@@ -437,6 +440,7 @@ impl PaneKind {
             PaneKind::IntradayCompare(_) => "ICMP",
             PaneKind::SessionPath(_) => "SPATH",
             PaneKind::Breadth(_) => "BRD",
+            PaneKind::Rotation(_) => "RRG",
             PaneKind::VolumePace(_) => "VPACE",
             PaneKind::RealizedVol(_) => "RVAR",
             PaneKind::Autocorr(_) => "ACOR",
@@ -561,6 +565,9 @@ impl PaneKind {
             }
             PaneKind::SessionPath(p) => {
                 PaneSettings::SessionPath { symbol: p.symbol.clone(), spec: p.spec.clone(), tf: p.tf.clone() }
+            }
+            PaneKind::Rotation(p) => {
+                PaneSettings::Rotation { spec: p.spec.clone(), tail: p.tail as u8, table: p.show_table }
             }
             PaneKind::Breadth(b) => PaneSettings::Breadth { spec: b.spec.clone(), tf: b.tf.clone() },
             PaneKind::VolumePace(p) => {
@@ -712,6 +719,12 @@ impl PaneKind {
                     pane.tf = tf;
                 }
                 PaneKind::SessionPath(Box::new(pane))
+            }
+            PaneSettings::Rotation { spec, tail, table } => {
+                let mut p = rotation::RotationPane::new(spec);
+                p.tail = *tr_data::rotation::TAILS.iter().min_by_key(|t| t.abs_diff(tail as usize)).unwrap();
+                p.show_table = table;
+                PaneKind::Rotation(Box::new(p))
             }
             PaneSettings::Breadth { spec, tf } => {
                 let mut pane = session_breadth::BreadthPane::new(spec);
@@ -1297,6 +1310,7 @@ impl TerminalApp {
                 self.open_intraday_compare(Some(&s), &spec)
             }
             Command::SymbolFunction(s, Function::SessionPath { spec }) => self.open_session_path(Some(&s), &spec),
+            Command::SymbolFunction(s, Function::Rotation { spec }) => self.open_rotation(Some(&s), &spec),
             Command::SymbolFunction(s, Function::Breadth { spec }) => self.open_breadth(Some(&s), &spec),
             Command::SymbolFunction(s, Function::VolumePace { spec }) => self.open_volume_pace(Some(&s), &spec),
             Command::SymbolFunction(s, Function::RealizedVol { spec }) => self.open_realized_vol(Some(&s), &spec),
@@ -1518,6 +1532,7 @@ impl TerminalApp {
             Function::Lookalike { spec } => self.open_lookalike(symbol.as_deref(), &spec),
             Function::IntradayCompare { spec } => self.open_intraday_compare(symbol.as_deref(), &spec),
             Function::SessionPath { spec } => self.open_session_path(symbol.as_deref(), &spec),
+            Function::Rotation { spec } => self.open_rotation(symbol.as_deref(), &spec),
             Function::Breadth { spec } => self.open_breadth(symbol.as_deref(), &spec),
             Function::VolumePace { spec } => self.open_volume_pace(symbol.as_deref(), &spec),
             Function::RealizedVol { spec } => self.open_realized_vol(symbol.as_deref(), &spec),
@@ -1604,6 +1619,7 @@ impl TerminalApp {
                     }
                 }
                 Response::HistoryChanged => {
+                    self.reload_rotation_panes();
                     self.command_catalogue = Default::default();
                     let desk: Vec<(crate::dock::PaneId, String)> = self
                         .panes
@@ -1702,6 +1718,13 @@ impl TerminalApp {
                 }
                 Response::SessionPath { pane, generation, result } => {
                     if let Some(PaneKind::SessionPath(p)) =
+                        self.panes.iter_mut().find(|p| p.id == pane).map(|p| &mut p.kind)
+                    {
+                        p.accept(generation, result);
+                    }
+                }
+                Response::Rotation { pane, generation, result } => {
+                    if let Some(PaneKind::Rotation(p)) =
                         self.panes.iter_mut().find(|p| p.id == pane).map(|p| &mut p.kind)
                     {
                         p.accept(generation, result);
@@ -2157,6 +2180,9 @@ impl TerminalApp {
         let cmd_focused = focused == Some(cmd_id);
         let other_text_focused = ctx.text_edit_focused() && !cmd_focused;
         if other_text_focused {
+            return;
+        }
+        if !cmd_focused && !self.focus_cmd && self.cmd.is_empty() && self.rotation_keys(ctx) {
             return;
         }
         if !cmd_focused && !self.focus_cmd && self.cmd.is_empty() && self.workflow_keys(ctx) {

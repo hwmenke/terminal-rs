@@ -23,7 +23,7 @@ use crate::widgets::{self, Icon};
 use crate::worker::{Request, Worker};
 
 /// Panels offered by the + menus: label and command word.
-pub const PANELS: [(&str, &str); 28] = [
+pub const PANELS: [(&str, &str); 29] = [
     ("Chart", "CHART"),
     ("Watchlist", "WL"),
     ("News", "NEWS"),
@@ -41,6 +41,7 @@ pub const PANELS: [(&str, &str); 28] = [
     ("Session compare", "ICMP"),
     ("Session path", "SPATH"),
     ("Session breadth", "BRD"),
+    ("Rotation", "RRG"),
     ("Volume pace", "VPACE"),
     ("Realized volatility", "RVAR"),
     ("Return autocorrelation", "ACOR"),
@@ -458,6 +459,11 @@ impl TerminalApp {
                 }
                 p.request(id, &self.worker);
                 PaneKind::SessionPath(p)
+            }
+            PaneKind::Rotation(mut p) => {
+                let symbols = self.rotation_watchlist(&p.spec);
+                p.request(id, &self.worker, &symbols);
+                PaneKind::Rotation(p)
             }
             PaneKind::Breadth(mut b) => {
                 let symbols: Vec<String> = self
@@ -1025,6 +1031,10 @@ impl TerminalApp {
                 let symbol = symbol.map(|s| tr_data::security(s).key()).or(current).unwrap_or_default();
                 let spec = words.get(1..).unwrap_or(&[]).join(" ");
                 PaneKind::SessionPath(Box::new(super::session_path::SessionPathPane::new(symbol, spec)))
+            }
+            "RRG" | "ROT" | "ROTATION" | "ROTATE" => {
+                let spec = super::rotation::prepend_symbol(symbol, &words[1..].join(" "));
+                PaneKind::Rotation(Box::new(super::rotation::RotationPane::new(spec)))
             }
             "BRD" | "BREADTH" | "SBREADTH" => {
                 // Tickers and a bar size stay in the spec. They are not a single focused name.
@@ -2097,6 +2107,27 @@ mod tests {
     fn groups(n: &Node) -> (Rect, Vec<crate::dock::Group>) {
         let area = Rect::from_min_size(pos2(0.0, 0.0), vec2(1000.0, 600.0));
         (area, n.layout(area, 6.0).0)
+    }
+
+    #[test]
+    fn new_rrg_opens_default_pane() {
+        let mut app = crate::app::tests::test_app();
+        app.execute("NEW RRG");
+        assert!(app.panes.iter().any(
+            |p| matches!(&p.kind,PaneKind::Rotation(r) if r.spec.is_empty() && r.tail==10 && r.show_table && r.loading)
+        ));
+        app.execute("SPLIT DOWN RRG");
+        assert_eq!(app.panes.iter().filter(|p| matches!(p.kind, PaneKind::Rotation(_))).count(), 2);
+        assert!(PANELS.contains(&("Rotation", "RRG")));
+        let PaneKind::Rotation(p) = &mut app.pane_mut(app.focus).unwrap().kind else { panic!() };
+        p.spec = "AAPL MSFT VS QQQ WEEKLY TAIL 20".into();
+        p.tail = 30;
+        p.show_table = false;
+        app.save_layout();
+        let doc = app.store.load("Default").unwrap();
+        let mut restored = crate::app::tests::test_app();
+        restored.apply_doc(doc);
+        assert!(restored.panes.iter().any(|p|matches!(&p.kind,PaneKind::Rotation(r) if r.spec=="AAPL MSFT VS QQQ WEEKLY TAIL 20" && r.tail==30 && !r.show_table && r.loading)));
     }
 
     #[test]
