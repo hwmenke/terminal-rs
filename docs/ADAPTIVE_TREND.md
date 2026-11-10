@@ -66,3 +66,16 @@ LB 40/2/120, min-hold 10 bars).
 unseen holdout; see [BACKTEST.md](BACKTEST.md). Historical lookalikes are
 documented in [LOOKALIKE.md](LOOKALIKE.md).
 This study does not place live orders or change STATS / SCAN.
+
+## Intraday session ATR and Trend Stack
+
+Intraday ADTREND now uses session ATR: at the first observed bar of each New
+York calendar date, true range is high − low rather than including the prior
+session's close. This keeps gap-open trails from widening on an overnight gap.
+Its HUD appends `· session ATR`. Daily ADTREND and the backtest calculation keep
+the original ATR and golden-vector output; the saved `ADTREND 20 0.25 0` spec
+and registry parameters are unchanged.
+
+[`TSTACK`](TREND_STACK.md) adds confidence, MB ± σ / ± 2σ envelopes and completed
+native-timeframe regime lanes independently of the classic lines. Both layers
+refuse sample and unverified inputs.

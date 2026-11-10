@@ -972,6 +972,15 @@ impl TerminalApp {
         let current = given.clone().or_else(|| self.focused_symbol());
         let d = &self.prefs.panels;
         Some(match head.as_str() {
+            "TSTACK" | "STACK" | "MTF" | "REGIME" => {
+                let mut settings = crate::layouts::chart_settings(current.as_deref().unwrap_or("AAPL US Equity"), d);
+                if let PaneSettings::Chart { tf, show_stack, archive, .. } = &mut settings {
+                    *archive = self.peek_chart().is_some_and(|c| c.archive);
+                    *tf = if *archive { tr_core::Timeframe::D1 } else { tr_core::Timeframe::M5 };
+                    *show_stack = true;
+                }
+                PaneKind::from_settings(settings)
+            }
             "CHART" | "GP" | "G" | "GRAPH" => PaneKind::from_settings(crate::layouts::chart_settings(
                 current.as_deref().unwrap_or("AAPL US Equity"),
                 d,
@@ -2107,6 +2116,27 @@ mod tests {
     fn groups(n: &Node) -> (Rect, Vec<crate::dock::Group>) {
         let area = Rect::from_min_size(pos2(0.0, 0.0), vec2(1000.0, 600.0));
         (area, n.layout(area, 6.0).0)
+    }
+
+    #[test]
+    fn new_and_split_tstack_open_five_minute_charts_and_preserve_archive_source() {
+        let mut app = crate::app::tests::test_app();
+        for command in ["NEW TSTACK NVDA", "SPLIT DOWN TSTACK AAPL"] {
+            app.execute(command);
+            let PaneKind::Chart(c) = &app.pane_mut(app.focus).unwrap().kind else { panic!("stack chart") };
+            assert_eq!(c.tf, tr_core::Timeframe::M5);
+            assert!(c.show_stack);
+            assert!(!c.archive);
+            let settings = app.pane_mut(app.focus).unwrap().kind.settings();
+            assert!(matches!(PaneKind::from_settings(settings),PaneKind::Chart(c) if c.show_stack));
+        }
+        if let PaneKind::Chart(c) = &mut app.pane_mut(app.focus).unwrap().kind {
+            c.archive = true;
+        }
+        app.execute("NEW TSTACK MSFT");
+        assert!(
+            matches!(&app.pane_mut(app.focus).unwrap().kind,PaneKind::Chart(c) if c.archive && c.tf==tr_core::Timeframe::D1 && c.show_stack)
+        );
     }
 
     #[test]

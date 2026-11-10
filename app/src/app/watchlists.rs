@@ -1015,7 +1015,8 @@ impl TerminalApp {
                 && self.peek_chart().is_some_and(|c| c.watch_group.is_some())
                 && ((plain && matches!(key, Key::OpenBracket | Key::CloseBracket))
                     || (m.alt && !m.shift && !m.ctrl && !m.command && matches!(key, Key::ArrowDown | Key::ArrowUp)));
-            if !(save || list_nav || step) {
+            let interval = self.focused_is_chart() && plain && matches!(key, Key::Comma | Key::Period | Key::Backslash);
+            if !(save || list_nav || step || interval) {
                 continue;
             }
             ctx.input_mut(|i| {
@@ -1026,6 +1027,9 @@ impl TerminalApp {
                     Key::K => Some("k"),
                     Key::OpenBracket => Some("["),
                     Key::CloseBracket => Some("]"),
+                    Key::Comma => Some(","),
+                    Key::Period => Some("."),
+                    Key::Backslash => Some("\\"),
                     _ => None,
                 };
                 if let Some(text) = text {
@@ -1034,7 +1038,19 @@ impl TerminalApp {
             });
             ctx.memory_mut(|mem| mem.move_focus(egui::FocusDirection::None));
             consumed = true;
-            if save {
+            if interval {
+                if key == Key::Backslash && self.peek_chart().is_some_and(|c| c.archive) {
+                    self.status = "Archive charts are daily and higher".into();
+                } else {
+                    self.with_chart(|c, w| {
+                        if key == Key::Backslash {
+                            c.flip_intraday(w);
+                        } else {
+                            c.step_timeframe(if key == Key::Comma { -1 } else { 1 }, w);
+                        }
+                    });
+                }
+            } else if save {
                 if m.shift {
                     if let Some(item) = self.selected_member() {
                         let group = self.watchlists.last_used.clone();
@@ -1214,6 +1230,47 @@ mod tests {
         output.textures_delta.clear();
         output.shapes
     }
+    #[test]
+    fn comma_period_backslash_step_intervals_without_typing_into_the_command_line() {
+        let (mut app, _, chart, _) = fixture();
+        app.focus = chart;
+        let ctx = egui::Context::default();
+        app.with_chart(|c, w| c.set_timeframe(tr_core::Timeframe::M5, w));
+        for (k, t, want) in [
+            (Key::Period, ".", tr_core::Timeframe::M15),
+            (Key::Comma, ",", tr_core::Timeframe::M5),
+            (Key::Backslash, "\\", tr_core::Timeframe::D1),
+            (Key::Backslash, "\\", tr_core::Timeframe::M5),
+        ] {
+            frame(&ctx, &mut app, vec![key(k, Modifiers::NONE), Event::Text(t.into())]);
+            assert!(app.cmd.is_empty());
+            assert_eq!(app.peek_chart().unwrap().tf, want);
+            frame(
+                &ctx,
+                &mut app,
+                vec![Event::Key {
+                    key: k,
+                    physical_key: None,
+                    pressed: false,
+                    repeat: false,
+                    modifiers: Modifiers::NONE,
+                }],
+            );
+        }
+    }
+    #[test]
+    fn interval_keys_are_ignored_while_the_command_line_has_text() {
+        let (mut app, _, chart, _) = fixture();
+        app.focus = chart;
+        app.cmd = "AAPL".into();
+        let ctx = egui::Context::default();
+        app.focus_cmd = true;
+        frame(&ctx, &mut app, vec![]);
+        frame(&ctx, &mut app, vec![key(Key::Period, Modifiers::NONE), Event::Text(".".into())]);
+        assert_eq!(app.peek_chart().unwrap().tf, tr_core::Timeframe::D1);
+        assert!(app.cmd.starts_with("AAPL"));
+    }
+
     #[test]
     fn keyboard_scan_enter_updates_active_chart_and_linked_panes_keeps_focus_and_saves_origin() {
         let (mut app, mut requests, chart, list) = fixture();

@@ -15,6 +15,8 @@
 use crate::Bar;
 
 mod adaptive;
+mod trend_stack;
+pub use trend_stack::*;
 mod desk;
 pub use desk::*;
 mod levels;

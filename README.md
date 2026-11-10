@@ -230,6 +230,19 @@ gets the native title bar with traffic lights, window vibrancy behind the sideba
   Trend on the chart: SB/MB/LB baselines, destination bands, medium-regime flips
   and MRT/LRT trailing-stop guides. Sample / unverified bars are refused. See
   [Adaptive Trend](docs/ADAPTIVE_TREND.md).
+- **Adaptive Trend Stack** — `TSTACK` (`STACK`, `MTF`, `REGIME`) adds completed
+  native-timeframe regime lanes, a confidence cloud and a verified `STACK n/m`
+  chip. Sample data is refused; stale lanes are excluded. Intraday ADTREND uses
+  session ATR, leaving daily output unchanged. See [Trend Stack](docs/TREND_STACK.md).
+
+  | Input | Chart action |
+  | --- | --- |
+  | `TSTACK ON` / `TSTACK OFF` | Enable / disable; saved with layout |
+  | `NEW TSTACK NVDA` / `SPLIT DOWN TSTACK NVDA` | Open a 5m stacked chart |
+  | `,` / `.` | Shorter / longer interval (empty command line) |
+  | `\` | Last intraday interval ⇄ 1D; archive uses D/W/M only |
+  | Click lane label or cell | Jump to that interval |
+
 - **Strategy backtests** — `BACKTEST` (or `AAPL BACKTEST`, `AAPL BT ADTREND`)
   compares declared strategies to buy-and-hold on a chronological holdout, with
   commission and slippage, next-open fills, CAGR and **completed-trade** win
