@@ -23,7 +23,7 @@ use crate::widgets::{self, Icon};
 use crate::worker::{Request, Worker};
 
 /// Panels offered by the + menus: label and command word.
-pub const PANELS: [(&str, &str); 29] = [
+pub const PANELS: [(&str, &str); 30] = [
     ("Chart", "CHART"),
     ("Watchlist", "WL"),
     ("News", "NEWS"),
@@ -42,6 +42,7 @@ pub const PANELS: [(&str, &str); 29] = [
     ("Session path", "SPATH"),
     ("Session breadth", "BRD"),
     ("Rotation", "RRG"),
+    ("Trend Wall", "TWALL"),
     ("Volume pace", "VPACE"),
     ("Realized volatility", "RVAR"),
     ("Return autocorrelation", "ACOR"),
@@ -459,6 +460,11 @@ impl TerminalApp {
                 }
                 p.request(id, &self.worker);
                 PaneKind::SessionPath(p)
+            }
+            PaneKind::TrendWall(mut p) => {
+                let symbols = self.wall_watchlist(&p.spec);
+                p.request(id, &self.worker, &symbols);
+                PaneKind::TrendWall(p)
             }
             PaneKind::Rotation(mut p) => {
                 let symbols = self.rotation_watchlist(&p.spec);
@@ -1040,6 +1046,11 @@ impl TerminalApp {
                 let symbol = symbol.map(|s| tr_data::security(s).key()).or(current).unwrap_or_default();
                 let spec = words.get(1..).unwrap_or(&[]).join(" ");
                 PaneKind::SessionPath(Box::new(super::session_path::SessionPathPane::new(symbol, spec)))
+            }
+            "TWALL" | "TGRID" | "STACKS" | "MTFGRID" => {
+                let mut p = super::trend_wall::TrendWallPane::new(words[1..].join(" "));
+                p.spec = super::rotation::prepend_symbol(symbol, &p.spec);
+                PaneKind::TrendWall(Box::new(p))
             }
             "RRG" | "ROT" | "ROTATION" | "ROTATE" => {
                 let spec = super::rotation::prepend_symbol(symbol, &words[1..].join(" "));
@@ -2110,6 +2121,21 @@ fn tab_menu(ui: &mut Ui, pid: PaneId, link: Option<Link>, cmds: &mut Vec<GroupCm
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn new_twall_opens_default_pane() {
+        let mut app = crate::app::tests::test_app();
+        app.execute("NEW TWALL");
+        assert!(
+            matches!(&app.pane_mut(app.focus).unwrap().kind, PaneKind::TrendWall(p) if !p.daily && p.loading && p.spec.is_empty())
+        );
+        app.execute("SPLIT DOWN TWALL D");
+        assert!(matches!(&app.pane_mut(app.focus).unwrap().kind, PaneKind::TrendWall(p) if p.daily && p.loading));
+        assert_eq!(app.panes.iter().filter(|p| matches!(p.kind, PaneKind::TrendWall(_))).count(), 2);
+        assert!(PANELS.contains(&("Trend Wall", "TWALL")));
+        let settings = app.pane_mut(app.focus).unwrap().kind.settings();
+        assert_eq!(PaneKind::from_settings(settings.clone()).settings(), settings);
+    }
+
     use super::*;
     use crate::dock::Node;
 

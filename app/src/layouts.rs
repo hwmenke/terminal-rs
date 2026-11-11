@@ -192,6 +192,15 @@ pub enum PaneSettings {
         #[serde(default)]
         tf: String,
     },
+    /// Native Trend Stack wall and its saved view preferences.
+    TrendWall {
+        #[serde(default)]
+        spec: String,
+        #[serde(default)]
+        daily: bool,
+        #[serde(default)]
+        sort: tr_data::stack_wall::Sort,
+    },
     /// Relative rotation graph and its saved view preferences.
     Rotation {
         #[serde(default)]
@@ -660,6 +669,17 @@ impl Store {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn trend_wall_settings_round_trip() {
+        let settings =
+            PaneSettings::TrendWall { spec: "WL Growth".into(), daily: true, sort: tr_data::stack_wall::Sort::Cushion };
+        assert_eq!(serde_json::from_str::<PaneSettings>(&serde_json::to_string(&settings).unwrap()).unwrap(), settings);
+        assert_eq!(
+            serde_json::from_str::<PaneSettings>(r#"{"TrendWall":{}}"#).unwrap(),
+            PaneSettings::TrendWall { spec: String::new(), daily: false, sort: Default::default() }
+        );
+    }
+
     use super::*;
     use crate::dock::Zone;
     use crate::prefs::PanelDefaults;
