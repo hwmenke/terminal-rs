@@ -86,6 +86,15 @@ pub fn previous_session(date: NaiveDate) -> NaiveDate {
     d
 }
 
+/// First trading session strictly after `date`.
+pub fn next_session(date: NaiveDate) -> NaiveDate {
+    let mut d = date.succ_opt().unwrap();
+    while !is_session(d) {
+        d = d.succ_opt().unwrap();
+    }
+    d
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -107,5 +116,15 @@ mod tests {
         expected("2027-01-01T22:00:00Z", "2026-12-31");
         expected("2025-01-09T22:00:00Z", "2025-01-08"); // Carter closure
         assert!(is_session(NaiveDate::from_ymd_opt(2021, 12, 31).unwrap()));
+    }
+
+    #[test]
+    fn next_session_skips_weekends_and_closures() {
+        for (from, to) in [("2026-04-02", "2026-04-06"), ("2026-07-02", "2026-07-06"), ("2026-12-31", "2027-01-04")] {
+            let from = from.parse().unwrap();
+            let to = to.parse().unwrap();
+            assert_eq!(next_session(from), to);
+            assert_eq!(previous_session(to), from);
+        }
     }
 }

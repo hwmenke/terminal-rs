@@ -18,6 +18,7 @@ pub mod backtest;
 pub mod cache;
 pub mod cash_levels;
 pub mod cash_session;
+pub mod closed;
 pub mod crypto;
 pub mod earnings;
 pub mod edge;

@@ -219,6 +219,8 @@ struct RailPaint {
 
 #[derive(Default)]
 struct EdgePaint {
+    closed_thru: String,
+    forming_excluded: bool,
     cells: Vec<(String, String, String)>,
     footer: String,
     extent: f64,
@@ -1053,10 +1055,10 @@ impl ChartState {
         self.show_edge = on.unwrap_or(!self.show_edge);
         if self.show_edge {
             self.set_trend_stack(Some(true), w);
-            self.refresh_edge();
+            self.refresh_edge(chrono::Utc::now().timestamp());
         }
     }
-    fn refresh_edge(&mut self) {
+    fn refresh_edge(&mut self, now: i64) {
         if !self.show_edge {
             return;
         }
@@ -1064,13 +1066,12 @@ impl ChartState {
         self.edge = if let Err(e) = gate {
             Some(Err(e))
         } else if let Some(stack) = &self.stack {
-            // The current bucket is conservatively pending until a successor bucket exists.
-            let now = chrono::Utc::now().timestamp();
-            let n = self.bars.len()
-                - usize::from(
-                    !self.archive
-                        && self.bars.last().is_some_and(|b| self.tf.bucket_start(b.ts) == self.tf.bucket_start(now)),
-                );
+            let n = tr_data::closed::closed_len(
+                self.tf,
+                &self.bars,
+                self.sec.class,
+                if self.archive { Some(now) } else { self.last_refresh },
+            );
             let state: Vec<_> =
                 stack.medium.iter().zip(&stack.confidence).take(n).map(|(&s, c)| c.is_finite().then_some(s)).collect();
             Some(tr_data::edge::regime_edge(
@@ -1085,6 +1086,12 @@ impl ChartState {
         };
         self.edge_paint = EdgePaint::default();
         if let Some(Ok(report)) = &self.edge {
+            self.edge_paint.closed_thru = self
+                .bars
+                .get(report.bars.saturating_sub(1))
+                .map(|b| format!("CLOSED THRU {}", tr_data::stats::bar_date(b.ts)))
+                .unwrap_or_default();
+            self.edge_paint.forming_excluded = report.bars < self.bars.len();
             for cell in &report.cells {
                 let (mean, detail, tooltip) = if let Some(s) = &cell.stats {
                     (
@@ -1202,7 +1209,7 @@ impl ChartState {
             }
         }
         self.stack_revision = self.stack_revision.wrapping_add(1);
-        self.refresh_edge();
+        self.refresh_edge(chrono::Utc::now().timestamp());
         self.tint_ref = None;
         self.stack_paint.key.clear();
     }
@@ -2528,7 +2535,7 @@ impl ChartState {
     fn paint_edge_card(&self, ui: &mut Ui, price: Rect) {
         let rect = Rect::from_min_size(
             pos2((price.right() - 452.0).max(price.left() + 4.0), price.top() + 28.0),
-            vec2((price.width().min(448.0) - 8.0).max(0.0), 240.0_f32.min((price.height() - 32.0).max(0.0))),
+            vec2((price.width().min(448.0) - 8.0).max(0.0), 280.0_f32.min((price.height() - 32.0).max(0.0))),
         );
         if let Some(Err(error)) = &self.edge {
             crate::widgets::unavailable_card(
@@ -2565,11 +2572,22 @@ impl ChartState {
             );
             crate::widgets::chip(&mut child, crate::widgets::ChipKind::Neutral, "PENDING");
         }
+        let mut chips = ui.new_child(
+            UiBuilder::new()
+                .max_rect(Rect::from_min_size(rect.left_top() + vec2(8.0, 26.0), vec2(rect.width() - 16.0, 18.0)))
+                .id_salt((self.id, "edge-closed")),
+        );
+        chips.horizontal(|ui| {
+            crate::widgets::chip(ui, crate::widgets::ChipKind::Neutral, &self.edge_paint.closed_thru);
+            if self.edge_paint.forming_excluded {
+                crate::widgets::chip(ui, crate::widgets::ChipKind::Caution, "FORMING EXCLUDED");
+            }
+        });
         let col_width = (rect.width() - 40.0) / 3.0;
         let extent = self.edge_paint.extent.max(1e-8) * 1.08;
         for (col, h) in ["1 bar", "5 bars", "20 bars"].iter().enumerate() {
             p.text(
-                pos2(rect.left() + 40.0 + (col as f32 + 0.5) * col_width, rect.top() + 30.0),
+                pos2(rect.left() + 40.0 + (col as f32 + 0.5) * col_width, rect.top() + 56.0),
                 Align2::CENTER_CENTER,
                 *h,
                 mono(10.0),
@@ -2577,7 +2595,7 @@ impl ChartState {
             );
         }
         for (row, (regime, label)) in [(1, "UP"), (0, "FLAT"), (-1, "DN")].into_iter().enumerate() {
-            let top = rect.top() + 44.0 + row as f32 * 48.0;
+            let top = rect.top() + 70.0 + row as f32 * 48.0;
             let row_rect = Rect::from_min_size(pos2(rect.left() + 4.0, top), vec2(rect.width() - 8.0, 47.0));
             if report.current_regime == Some(regime) {
                 p.rect_filled(row_rect, 2.0, stack_color(regime).gamma_multiply(0.12));
@@ -2630,7 +2648,7 @@ impl ChartState {
             }
         }
         p.text(
-            pos2(rect.right() - 8.0, rect.top() + 200.0),
+            pos2(rect.right() - 8.0, rect.top() + 236.0),
             Align2::RIGHT_CENTER,
             &self.edge_paint.footer,
             mono(9.0),
@@ -4250,12 +4268,12 @@ mod tests {
         let (worker, _) = Worker::test_channel();
         let mut c = stack_chart(&worker, Provenance::Real);
         c.show_edge = true;
-        c.refresh_edge();
+        c.refresh_edge(chrono::Utc::now().timestamp());
         assert!(matches!(c.edge, Some(Ok(_))));
         let mut bars = (*c.bars).clone();
         bars[0].provenance = Provenance::Cached;
         c.bars = Arc::new(bars);
-        c.refresh_edge();
+        c.refresh_edge(chrono::Utc::now().timestamp());
         assert!(matches!(c.edge, Some(Err(_))));
         let mut c = stack_chart(&worker, Provenance::Real);
         c.show_edge = true;
@@ -4268,10 +4286,42 @@ mod tests {
             b.ts += shift;
         }
         c.bars = Arc::new(bars);
-        c.refresh_edge();
+        c.last_refresh = Some(now);
+        c.refresh_edge(now + tf.seconds() * 10);
         let r = c.edge.as_ref().unwrap().as_ref().unwrap();
         assert_eq!(r.bars, c.bars.len() - 1);
         assert!(r.completed.iter().all(|o| o.index + o.horizon < r.bars));
+    }
+    #[test]
+    fn archive_weekly_edge_excludes_forming_state_and_close() {
+        let now = "2026-11-11T22:00:00Z".parse::<chrono::DateTime<chrono::Utc>>().unwrap().timestamp();
+        let last = Timeframe::W1.bucket_start(now);
+        let mut bars: Vec<_> = (0..300)
+            .map(|i| {
+                let c = 100.0 + i as f64 * 0.05 + (i as f64 * 0.37).sin();
+                Bar::new(last - (299 - i) * Timeframe::W1.seconds(), c, c + 1.0, c - 1.0, c, 1.0)
+                    .with_provenance(Provenance::Real)
+            })
+            .collect();
+        let mut c = ChartState::new(1, "AAPL", Timeframe::W1);
+        c.archive = true;
+        c.show_edge = true;
+        c.bars = Arc::new(bars.clone());
+        c.stack = Some(tr_core::indicators::trend_stack(&bars, c.tf, vec![], Default::default()).unwrap());
+        c.refresh_edge(now);
+        let before = c.edge.clone().unwrap().unwrap();
+        assert_eq!(before.bars, bars.len() - 1);
+        let stack = c.stack.as_ref().unwrap();
+        let i = before.bars - 1;
+        assert_eq!(before.current_regime, stack.confidence[i].is_finite().then_some(stack.medium[i]));
+        assert!(c.edge_paint.forming_excluded);
+        assert!(c.edge_paint.closed_thru.starts_with("CLOSED THRU"));
+        bars.last_mut().unwrap().close *= 3.0;
+        bars.last_mut().unwrap().high *= 3.0;
+        c.bars = Arc::new(bars.clone());
+        c.stack = Some(tr_core::indicators::trend_stack(&bars, c.tf, vec![], Default::default()).unwrap());
+        c.refresh_edge(now);
+        assert_eq!(before, c.edge.unwrap().unwrap());
     }
     #[test]
     fn tint_buffer_is_neutral_for_refused_stale_or_sample_stack() {

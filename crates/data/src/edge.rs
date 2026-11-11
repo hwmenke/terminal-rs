@@ -186,18 +186,23 @@ mod tests {
     fn edge_is_lookahead_free() {
         let b = bars(400);
         let short = report(&b[..250]);
-        let full = report(&b);
-        for outcome in &short.completed {
-            assert_eq!(
-                Some(outcome),
-                full.completed.iter().find(|o| o.index == outcome.index && o.horizon == outcome.horizon)
-            );
-        }
-        for h in [1, 5, 20] {
-            assert_eq!(
-                short.completed.iter().filter(|o| o.horizon == h).count(),
-                full.completed.iter().filter(|o| o.horizon == h && o.index + h < 250).count()
-            );
+        for n in [251, 270, 400] {
+            let full = report(&b[..n]);
+            for outcome in &short.completed {
+                assert_eq!(
+                    Some(outcome),
+                    full.completed.iter().find(|o| o.index == outcome.index && o.horizon == outcome.horizon)
+                );
+            }
+            for h in [1, 5, 20] {
+                assert_eq!(
+                    short.completed.iter().filter(|o| o.horizon == h).count(),
+                    full.completed.iter().filter(|o| o.horizon == h && o.index + h < 250).count()
+                );
+            }
+            for flip in short.flip_outcomes.iter().filter(|f| f.value.is_some()) {
+                assert_eq!(Some(flip), full.flip_outcomes.iter().find(|f| f.index == flip.index));
+            }
         }
     }
     #[test]
