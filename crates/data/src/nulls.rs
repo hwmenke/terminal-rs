@@ -42,7 +42,7 @@ impl SplitMix64 {
         z ^ (z >> 31)
     }
 
-    fn below(&mut self, bound: usize) -> usize {
+    pub(crate) fn below(&mut self, bound: usize) -> usize {
         let bound = bound as u64;
         let threshold = bound.wrapping_neg() % bound;
         loop {

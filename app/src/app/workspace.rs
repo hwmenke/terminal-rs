@@ -526,6 +526,15 @@ impl TerminalApp {
                 p.request(id, &self.worker);
                 PaneKind::SessionExtreme(p)
             }
+            PaneKind::SessionClock(mut p) => {
+                if p.symbol.trim().is_empty() {
+                    if let Some(sym) = self.focused_symbol() {
+                        p.symbol = sym;
+                    }
+                }
+                p.request(id, &self.worker);
+                PaneKind::SessionClock(p)
+            }
             PaneKind::RelativePath(mut p) => {
                 if p.symbol.trim().is_empty() {
                     if let Some(sym) = self.focused_symbol() {
@@ -1091,6 +1100,12 @@ impl TerminalApp {
                 let symbol = symbol.map(|s| tr_data::security(s).key()).or(current).unwrap_or_default();
                 let spec = words.get(1..).unwrap_or(&[]).join(" ");
                 PaneKind::SessionExtreme(Box::new(super::session_extreme::SessionExtremePane::new(symbol, spec)))
+            }
+            "CLOCK" => {
+                // The bucket size stays in the spec; the ticker follows the focused security.
+                let symbol = symbol.map(|s| tr_data::security(s).key()).or(current).unwrap_or_default();
+                let spec = words.get(1..).unwrap_or(&[]).join(" ");
+                PaneKind::SessionClock(Box::new(super::session_clock::SessionClockPane::new(symbol, spec)))
             }
             "RPATH" | "RELPATH" => {
                 // A count and a bar size stay in the spec. They are not tickers.

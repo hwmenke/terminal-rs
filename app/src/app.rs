@@ -31,6 +31,7 @@ mod research;
 mod rotation;
 mod session_breadth;
 mod session_brief;
+mod session_clock;
 mod session_extreme;
 mod session_path;
 mod settings_view;
@@ -128,6 +129,7 @@ pub enum PaneKind {
     GapFill(Box<gap_fill::GapFillPane>),
     /// When the session high and low print (`XTRM`).
     SessionExtreme(Box<session_extreme::SessionExtremePane>),
+    SessionClock(Box<session_clock::SessionClockPane>),
     /// This name's percent from the 09:30 open minus SPY (`RPATH`).
     RelativePath(Box<relative_path::RelativePathPane>),
     /// Path, pace, gap, extreme, and versus SPY for one name (`BRIEF`).
@@ -408,6 +410,13 @@ impl PaneKind {
                     format!("{} High", tr_data::security(&p.symbol).ticker)
                 }
             }
+            PaneKind::SessionClock(p) => {
+                if p.symbol.trim().is_empty() {
+                    "CLOCK".into()
+                } else {
+                    format!("{} CLOCK", tr_data::security(&p.symbol).ticker)
+                }
+            }
             PaneKind::RelativePath(p) => {
                 if p.symbol.trim().is_empty() {
                     "SPY path".into()
@@ -468,6 +477,7 @@ impl PaneKind {
             PaneKind::Autocorr(_) => "ACOR",
             PaneKind::GapFill(_) => "GFILL",
             PaneKind::SessionExtreme(_) => "XTRM",
+            PaneKind::SessionClock(_) => "CLOCK",
             PaneKind::RelativePath(_) => "RPATH",
             PaneKind::SessionBrief(_) => "BRIEF",
             PaneKind::Settings => "PDF",
@@ -487,6 +497,7 @@ impl PaneKind {
             PaneKind::RealizedVol(p) => Some(&p.symbol),
             PaneKind::Autocorr(p) => Some(&p.symbol),
             PaneKind::SessionBrief(p) => Some(&p.symbol),
+            PaneKind::SessionClock(p) => Some(&p.symbol),
             _ => None,
         }
     }
@@ -614,6 +625,9 @@ impl PaneKind {
             }
             PaneKind::SessionExtreme(p) => {
                 PaneSettings::SessionExtreme { symbol: p.symbol.clone(), spec: p.spec.clone(), tf: p.tf.clone() }
+            }
+            PaneKind::SessionClock(p) => {
+                PaneSettings::SessionClock { symbol: p.symbol.clone(), spec: p.spec.clone(), tf: p.tf.clone() }
             }
             PaneKind::RelativePath(p) => {
                 PaneSettings::RelativePath { symbol: p.symbol.clone(), spec: p.spec.clone(), tf: p.tf.clone() }
@@ -818,6 +832,13 @@ impl PaneKind {
                     pane.tf = tf;
                 }
                 PaneKind::SessionExtreme(Box::new(pane))
+            }
+            PaneSettings::SessionClock { symbol, spec, tf } => {
+                let mut pane = session_clock::SessionClockPane::new(symbol, spec);
+                if !tf.is_empty() {
+                    pane.tf = tf;
+                }
+                PaneKind::SessionClock(Box::new(pane))
             }
             PaneSettings::RelativePath { symbol, spec, tf } => {
                 let mut pane = relative_path::RelativePathPane::new(symbol, spec);
@@ -1386,6 +1407,7 @@ impl TerminalApp {
             Command::SymbolFunction(s, Function::IntradayDesk) => self.open_intraday_desk(Some(&s)),
             Command::SymbolFunction(s, Function::GapFill { spec }) => self.open_gap_fill(Some(&s), &spec),
             Command::SymbolFunction(s, Function::SessionExtreme { spec }) => self.open_session_extreme(Some(&s), &spec),
+            Command::SymbolFunction(s, Function::SessionClock { spec }) => self.open_session_clock(Some(&s), &spec),
             Command::SymbolFunction(s, Function::RelativePath { spec }) => self.open_relative_path(Some(&s), &spec),
             Command::SymbolFunction(s, Function::SessionBrief) => self.open_session_brief(Some(&s)),
             Command::SymbolFunction(s, Function::CashLevels) => self.open_cash_levels(Some(&s)),
@@ -1511,7 +1533,7 @@ impl TerminalApp {
                     }
                     None => {
                         self.status = format!(
-                            "Unknown panel {spec:?}; try CHART, NEWS, BOOK, WEI, GC, CONG, WL, DESK, JOURNAL, STATS, BACKTEST, IBT, ICMP, SPATH, BRD, VPACE, GFILL, XTRM, RPATH, LOOKALIKE, PORT"
+                            "Unknown panel {spec:?}; try CHART, NEWS, BOOK, WEI, GC, CONG, WL, DESK, JOURNAL, STATS, BACKTEST, IBT, ICMP, SPATH, BRD, VPACE, GFILL, XTRM, CLOCK, RPATH, LOOKALIKE, PORT"
                         )
                     }
                 }
@@ -1623,6 +1645,7 @@ impl TerminalApp {
             Function::Autocorr { spec } => self.open_autocorr(symbol.as_deref(), &spec),
             Function::GapFill { spec } => self.open_gap_fill(symbol.as_deref(), &spec),
             Function::SessionExtreme { spec } => self.open_session_extreme(symbol.as_deref(), &spec),
+            Function::SessionClock { spec } => self.open_session_clock(symbol.as_deref(), &spec),
             Function::RelativePath { spec } => self.open_relative_path(symbol.as_deref(), &spec),
             Function::SessionBrief => self.open_session_brief(symbol.as_deref()),
             Function::CashLevels => self.open_cash_levels(symbol.as_deref()),
@@ -1869,6 +1892,13 @@ impl TerminalApp {
                 }
                 Response::SessionExtreme { pane, generation, result } => {
                     if let Some(PaneKind::SessionExtreme(p)) =
+                        self.panes.iter_mut().find(|p| p.id == pane).map(|p| &mut p.kind)
+                    {
+                        p.accept(generation, result);
+                    }
+                }
+                Response::SessionClock { pane, generation, result } => {
+                    if let Some(PaneKind::SessionClock(p)) =
                         self.panes.iter_mut().find(|p| p.id == pane).map(|p| &mut p.kind)
                     {
                         p.accept(generation, result);
@@ -2292,6 +2322,9 @@ impl TerminalApp {
         if other_text_focused {
             return;
         }
+        if !cmd_focused && !self.focus_cmd && self.cmd.is_empty() && self.clock_keys(ctx) {
+            return;
+        }
         if !cmd_focused
             && !self.focus_cmd
             && self.cmd.is_empty()
@@ -2562,6 +2595,7 @@ impl TerminalApp {
                 _ => {}
             }
         }
+        self.session_clock_periodic(&visible);
         self.trend_wall_periodic(&visible);
         self.broker_periodic(&visible);
         if let Some((q, at)) = &self.search_pending
@@ -2999,6 +3033,7 @@ mod tests {
             PaneSettings::Research(Some("DARVAS_BREAKOUT".into())),
             PaneSettings::Desk { group: "Growth".into(), selected: Some("AAPL US Equity".into()) },
             PaneSettings::SessionBrief { symbol: "AAPL US Equity".into() },
+            PaneSettings::SessionClock { symbol: "AAPL US Equity".into(), spec: "1h".into(), tf: "30m".into() },
             PaneSettings::Backtest {
                 symbol: "AAPL US Equity".into(),
                 spec: "ADTREND".into(),

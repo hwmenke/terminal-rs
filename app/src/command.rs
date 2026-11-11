@@ -372,6 +372,10 @@ pub enum Function {
     SessionExtreme {
         spec: String,
     },
+    /// Weekday by cash-bucket returns (`CLOCK`, `AAPL CLOCK 1h`).
+    SessionClock {
+        spec: String,
+    },
     /// Percent from the 09:30 open minus SPY (`RPATH`, `AAPL RPATH 20 15m`).
     RelativePath {
         spec: String,
@@ -714,6 +718,7 @@ fn parse_function(head: &str, rest: &[&str]) -> Option<Function> {
         "ACOR" | "AUTOCORR" | "SERIALCORR" => Function::Autocorr { spec: joined() },
         "GFILL" | "GAPFILL" => Function::GapFill { spec: joined() },
         "XTRM" | "EXTREME" => Function::SessionExtreme { spec: joined() },
+        "CLOCK" => Function::SessionClock { spec: joined() },
         "RPATH" | "RELPATH" => Function::RelativePath { spec: joined() },
         "BRIEF" | "SBRIEF" if rest.is_empty() => Function::SessionBrief,
         "MARKS" | "SMARKS" if rest.is_empty() => Function::CashLevels,
@@ -1013,6 +1018,7 @@ fn describe(f: &Function) -> String {
             "Session extreme: when the high and the low print, against completed prior sessions".into()
         }
         Function::SessionExtreme { spec } => format!("Session extreme versus completed sessions ({spec})"),
+        Function::SessionClock { spec } => format!("Session Clock: weekday by cash-bucket returns ({spec})"),
         Function::RelativePath { spec } if spec.is_empty() => {
             "Relative path: percent from the 09:30 open minus SPY, against prior sessions".into()
         }

@@ -104,6 +104,50 @@ pub fn unavailable_card(ui: &Ui, rect: Rect, state: &tr_data::FeedState) -> bool
     ui.interact(r, ui.id().with("unavailable-card"), Sense::click()).on_hover_text("Retry this feed").clicked()
 }
 
+/// Fixed five-step symmetric diverging ramp. The outer steps start at ±scale,
+/// the middle step spans ±scale/5. A printed key must accompany its use.
+pub fn heat_ramp(value: f64, scale: f64) -> Color32 {
+    let colors = [
+        Color32::from_rgb(150, 48, 64),
+        Color32::from_rgb(101, 61, 70),
+        Color32::from_rgb(65, 69, 78),
+        Color32::from_rgb(40, 95, 85),
+        Color32::from_rgb(24, 126, 102),
+    ];
+    let scale = scale.abs().max(f64::EPSILON);
+    let index = if value <= -scale {
+        0
+    } else if value < -scale / 5.0 {
+        1
+    } else if value <= scale / 5.0 {
+        2
+    } else if value < scale {
+        3
+    } else {
+        4
+    };
+    colors[index]
+}
+
+/// Printed thresholds in the same units as the heatmap, with no implicit rescaling.
+pub fn heat_key(ui: &mut Ui, scale: f64, unit: &str) {
+    let scale = scale.abs().max(f64::EPSILON);
+    ui.horizontal_wrapped(|ui| {
+        ui.label(egui::RichText::new(format!("Mean {unit}")).font(theme::mono(10.0)).color(theme::muted()));
+        for (value, label) in [
+            (-scale, format!("≤−{scale:.0}")),
+            (-scale / 2.0, format!("−{scale:.0}…−{:.0}", scale / 5.0)),
+            (0.0, format!("±{:.0}", scale / 5.0)),
+            (scale / 2.0, format!("+{:.0}…+{scale:.0}", scale / 5.0)),
+            (scale, format!("≥+{scale:.0}")),
+        ] {
+            let (r, _) = ui.allocate_exact_size(vec2(12.0, 12.0), Sense::hover());
+            ui.painter().rect_filled(r, 2.0, heat_ramp(value, scale));
+            ui.label(egui::RichText::new(label).font(theme::mono(9.0)).color(theme::muted()));
+        }
+    });
+}
+
 /// macOS-style segmented control. Returns the index clicked this frame.
 pub fn segmented(
     ui: &mut Ui,
