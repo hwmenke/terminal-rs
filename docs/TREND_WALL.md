@@ -51,9 +51,12 @@ lanes use verified native history and share TSTACK's 160-entry cache and interva
 TTLs. The chart's verified base history also seeds the persistent native cache.
 No intraday prices are resampled, interpolated or carried forward. Refresh uses the
 existing UI periodic tick and 5m TTL during the regular session. Freshness is checked
-again while waiting for responses; a failed refresh may retain a desaturated,
-explicitly stale ribbon of actual past observations, with scores removed and the
-failure available on hover. It never extends that ribbon into missing slots.
+again while waiting for responses. A failed refresh keeps a normal ribbon with a
+`RETRY` chip only while its observations remain within their freshness windows.
+Once stale, all ribbon cells and forming caps are dropped; a hatched
+`STALE · last HH:MM ET` replaces them, with the failure available on hover.
+Different native keys fetch independently. Four wall fetch permits bound wall
+acquisition, while chart TSTACK requests bypass that semaphore.
 
 Archive mode reads only the local research archive, including while markets are
 closed or offline. Missing archive symbols stay unavailable; no bridge or market

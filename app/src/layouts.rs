@@ -97,6 +97,14 @@ pub enum PaneSettings {
         show_volume_ctx: bool,
         #[serde(default)]
         show_stack: bool,
+        #[serde(default)]
+        stack_ladder: Option<Vec<Timeframe>>,
+        #[serde(default)]
+        stack_tint: bool,
+        #[serde(default)]
+        stack_session: bool,
+        #[serde(default = "yes")]
+        show_rail: bool,
     },
     /// Congress feed with its filter (`None` = unfiltered).
     Feed(Option<FeedSettings>),
@@ -510,6 +518,10 @@ pub fn chart_settings(symbol: &str, d: &crate::prefs::PanelDefaults) -> PaneSett
         show_rs: false,
         show_volume_ctx: false,
         show_stack: false,
+        stack_ladder: None,
+        stack_tint: false,
+        stack_session: false,
+        show_rail: true,
     }
 }
 
@@ -670,6 +682,27 @@ impl Store {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn stack_settings_round_trip_and_old_layouts_load_auto_tint_off_rail_on() {
+        let mut settings = chart_settings("AAPL", &Default::default());
+        if let PaneSettings::Chart { stack_ladder, stack_tint, stack_session, show_rail, .. } = &mut settings {
+            *stack_ladder = Some(vec![Timeframe::M5, Timeframe::M30, Timeframe::H4]);
+            *stack_tint = true;
+            *stack_session = true;
+            *show_rail = false;
+        }
+        let mut json = serde_json::to_value(&settings).unwrap();
+        assert_eq!(serde_json::from_value::<PaneSettings>(json.clone()).unwrap(), settings);
+        let chart = json.get_mut("Chart").unwrap().as_object_mut().unwrap();
+        for key in ["stack_ladder", "stack_tint", "stack_session", "show_rail"] {
+            chart.remove(key);
+        }
+        assert!(matches!(
+            serde_json::from_value::<PaneSettings>(json).unwrap(),
+            PaneSettings::Chart { stack_ladder: None, stack_tint: false, stack_session: false, show_rail: true, .. }
+        ));
+    }
+
+    #[test]
     fn trend_wall_settings_round_trip() {
         let settings =
             PaneSettings::TrendWall { spec: "WL Growth".into(), daily: true, sort: tr_data::stack_wall::Sort::Cushion };
@@ -697,7 +730,14 @@ mod tests {
         old.get_mut("Chart").unwrap().as_object_mut().unwrap().remove("show_stack");
         assert!(matches!(
             serde_json::from_value::<PaneSettings>(old).unwrap(),
-            PaneSettings::Chart { show_stack: false, .. }
+            PaneSettings::Chart {
+                show_stack: false,
+                stack_ladder: None,
+                stack_tint: false,
+                stack_session: false,
+                show_rail: true,
+                ..
+            }
         ));
     }
 
@@ -915,6 +955,10 @@ mod tests {
                 show_rs: false,
                 show_volume_ctx: false,
                 show_stack: false,
+                stack_ladder: None,
+                stack_tint: false,
+                stack_session: false,
+                show_rail: true,
             }],
         );
         let back = LayoutDoc::from_json(&doc.to_json()).unwrap();

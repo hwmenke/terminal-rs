@@ -9,7 +9,7 @@ use egui::{
 };
 use std::time::{Duration, Instant};
 use tr_chart::drawings::{self, Anchor, AnnotationStore, Drawing, Shape, Tool};
-use tr_chart::gpu::{ChartCallback, Frame, LineKind, LineRef, Reveal, Style};
+use tr_chart::gpu::{ChartCallback, Frame, LineKind, LineRef, Reveal, Style, TintRef};
 use tr_chart::scale;
 use tr_chart::scene::{self, ChartType, Overlay, PricePane, SeriesGpu};
 use tr_chart::viewport::{PriceScale, Viewport};
@@ -209,6 +209,14 @@ struct StackPaint {
     lanes: Vec<egui::Shape>,
 }
 
+#[derive(Default)]
+struct RailPaint {
+    data_key: Vec<u64>,
+    cells: Vec<tr_data::truth_rail::RailCell>,
+    mesh_key: Vec<u64>,
+    mesh: Arc<egui::Mesh>,
+}
+
 pub struct ChartState {
     pub id: PaneId,
     pub archive: bool,
@@ -242,6 +250,14 @@ pub struct ChartState {
     pub compare: Option<String>,
     pub show_spy_strength: bool,
     pub show_stack: bool,
+    pub stack_ladder: Option<Vec<Timeframe>>,
+    pub stack_config_revision: u64,
+    pub stack_tint: bool,
+    pub stack_session: bool,
+    pub show_rail: bool,
+    tint_ref: Option<TintRef>,
+    tint_revision: u64,
+    rail_paint: RailPaint,
     stack: Option<TrendStack>,
     stack_error: Option<String>,
     last_intraday_tf: Timeframe,
@@ -343,6 +359,14 @@ impl ChartState {
             compare: None,
             show_spy_strength: false,
             show_stack: false,
+            stack_ladder: None,
+            stack_config_revision: 0,
+            stack_tint: false,
+            stack_session: false,
+            show_rail: true,
+            tint_ref: None,
+            tint_revision: u64::MAX,
+            rail_paint: Default::default(),
             stack: None,
             stack_error: None,
             last_intraday_tf: if tf.is_intraday() { tf } else { Timeframe::M5 },
@@ -446,6 +470,8 @@ impl ChartState {
     pub fn load(&mut self, w: &Worker) {
         self.generation += 1;
         self.stack = None;
+        self.tint_ref = None;
+        self.rail_paint = Default::default();
         self.stack_error = None;
         self.stack_pulse = None;
         self.stack_paint = Default::default();
@@ -619,6 +645,9 @@ impl ChartState {
             let previous_lanes =
                 (self.show_stack && !self.stack_paint.lanes.is_empty()).then(|| self.stack_paint.lanes.clone());
             self.tf = tf;
+            if self.stack_ladder.as_ref().is_some_and(|frames| frames.first() != Some(&tf)) {
+                self.stack_ladder = None;
+            }
             if tf.is_intraday() {
                 self.last_intraday_tf = tf;
             }
@@ -878,9 +907,76 @@ impl ChartState {
                 tf: self.tf,
                 archive: self.archive,
                 base: self.bars.clone(),
-                params: self.stack_params(),
+                params: AdaptiveTrendParams { session_reset: self.stack_session, ..self.stack_params() },
+                ladder: self.stack_ladder.clone(),
+                config_revision: self.stack_config_revision,
             });
         }
+    }
+
+    fn stack_frames(&self) -> Vec<Timeframe> {
+        self.stack_ladder.clone().unwrap_or_else(|| ladder(self.tf, self.archive))
+    }
+
+    pub fn set_stack_ladder(&mut self, frames: Option<Vec<Timeframe>>, w: &Worker) {
+        if let Some(frames) = &frames {
+            let Some(&base) = frames.first() else { return };
+            if let Err(e) = tr_core::indicators::ladder_custom(base, frames, self.archive) {
+                self.error = Some(e);
+                return;
+            }
+            self.set_timeframe(base, w);
+        }
+        self.stack_ladder = frames;
+        self.stack_tint = self.stack_ladder.is_some() || self.stack_tint;
+        // A configuration revision rejects old stack responses without invalidating candle history.
+        self.stack_config_revision = self.stack_config_revision.wrapping_add(1);
+        self.stack = None;
+        self.tint_ref = None;
+        self.set_trend_stack(Some(true), w);
+    }
+
+    pub fn set_stack_tint(&mut self, on: Option<bool>, w: &Worker) {
+        self.stack_tint = on.unwrap_or(!self.stack_tint);
+        if self.stack_tint && !self.show_stack {
+            self.set_trend_stack(Some(true), w);
+        }
+    }
+
+    pub fn set_stack_session(&mut self, on: Option<bool>, w: &Worker) {
+        self.stack_session = on.unwrap_or(!self.stack_session);
+        self.stack_config_revision = self.stack_config_revision.wrapping_add(1);
+        self.stack = None;
+        self.tint_ref = None;
+        self.set_trend_stack(Some(true), w);
+    }
+
+    fn tint_allowed(&self, now: i64) -> bool {
+        self.show_stack
+            && self.provenance.is_verified()
+            && self.stack_error.is_none()
+            && !matches!(self.stack_freshness(now), Some(Freshness::Stale { .. }))
+            && self.stack.as_ref().is_some_and(|s| {
+                s.base_len == self.bars.len()
+                    && self.bars.last().is_some_and(|b| b.ts == s.base_last_ts)
+                    && s.lanes.iter().all(|l| {
+                        !matches!(l.status, LaneStatus::Refused(_) | LaneStatus::Stale { .. })
+                            && (l.provenance.is_verified() || matches!(l.status, LaneStatus::Unavailable(_)))
+                    })
+                    && s.lanes.iter().all(|l| !self.lane_stale(l, now))
+            })
+    }
+
+    fn tint_buffer(&self, now: i64) -> Vec<f32> {
+        if !self.tint_allowed(now) {
+            return vec![0.0; self.bars.len()];
+        }
+        let lane = &self.stack.as_ref().unwrap().lanes[0];
+        lane.state
+            .iter()
+            .zip(&lane.conf)
+            .map(|(sign, conf)| if conf.is_finite() { *sign as f32 * conf.clamp(0.0, 1.0) } else { 0.0 })
+            .collect()
     }
 
     pub fn set_trend_stack(&mut self, on: Option<bool>, w: &Worker) {
@@ -962,6 +1058,7 @@ impl ChartState {
             }
         }
         self.stack_revision = self.stack_revision.wrapping_add(1);
+        self.tint_ref = None;
         self.stack_paint.key.clear();
     }
 
@@ -1498,17 +1595,20 @@ impl ChartState {
         }
         let body =
             Rect::from_min_max(pos2(rect.left(), header.bottom() + warning_h), pos2(rect.right(), range_row.top()));
-        let plot_all = Rect::from_min_max(body.min, pos2(body.right() - AXIS_W, body.bottom() - TIME_H));
+        let plot_area = Rect::from_min_max(body.min, pos2(body.right() - AXIS_W, body.bottom() - TIME_H));
+        let rail_h = if self.show_rail && self.tf.is_intraday() && plot_area.height() >= 160.0 { 5.0 } else { 0.0 };
+        let plot_all = Rect::from_min_max(plot_area.min, pos2(plot_area.right(), plot_area.bottom() - rail_h));
+        let rail_rect = Rect::from_min_max(pos2(plot_area.left(), plot_all.bottom()), plot_area.max);
         if plot_all.width() < 40.0 || plot_all.height() < 40.0 {
             return clicked;
         }
 
         let stack_h = if self.show_stack && plot_all.width() >= 220.0 && plot_all.height() >= 160.0 {
-            ladder(self.tf, self.archive).len() as f32 * 8.0 + 4.0
+            self.stack_frames().len() as f32 * 8.0 + 4.0
         } else {
             0.0
         };
-        let Some(gpu) = self.gpu.clone().filter(|g| !g.is_empty()) else {
+        let Some(mut gpu) = self.gpu.clone().filter(|g| !g.is_empty()) else {
             let msg = self.error.clone().unwrap_or_else(|| {
                 if self.loading {
                     format!("Loading {} {}…", self.symbol, self.tf)
@@ -1562,7 +1662,7 @@ impl ChartState {
             Rect::from_min_max(pos2(price_rect.right(), price_rect.top()), pos2(body.right(), price_rect.bottom()));
         let axis_resp = ui.interact(axis_rect, ui.id().with((self.id, "paxis")), Sense::click_and_drag());
         let time_rect =
-            Rect::from_min_max(pos2(plot_all.left(), plot_all.bottom()), pos2(plot_all.right(), body.bottom()));
+            Rect::from_min_max(pos2(plot_all.left(), plot_area.bottom()), pos2(plot_all.right(), body.bottom()));
         let time_resp = ui.interact(time_rect, ui.id().with((self.id, "taxis")), Sense::click_and_drag());
         if plot_resp.clicked() || plot_resp.drag_started() || axis_resp.clicked() || time_resp.clicked() {
             clicked = true;
@@ -1686,7 +1786,20 @@ impl ChartState {
         let reveal_t =
             crate::anim::progress(ui.ctx(), egui::Id::new(("chart-reveal", self.id)), self.reveal_key, REVEAL_SECS);
         let reveal = Reveal { opacity: ui.opacity(), ..Reveal::sweep(reveal_t, v.left(), v.visible_bars()) };
+        let tint_allowed = self.tint_allowed(chrono::Utc::now().timestamp());
+        if tint_allowed && (self.tint_ref.is_none() || self.tint_revision != self.stack_revision) {
+            self.tint_ref = Some(TintRef {
+                key: scene::next_key(),
+                version: self.stack_revision,
+                values: Arc::new(self.tint_buffer(chrono::Utc::now().timestamp())),
+            });
+            self.tint_revision = self.stack_revision;
+        }
+        gpu.bars.tint = self.tint_ref.clone();
+        let tint_mix = ui.ctx().animate_bool_with_time(egui::Id::new(("regime-tint", self.id)), self.stack_tint, 0.2);
         let style = Style {
+            tint_mix: if tint_allowed { tint_mix } else { 0.0 },
+            neutral: theme::rgba(theme::grid()),
             up: theme::rgba(theme::candle_up()),
             down: theme::rgba(theme::candle_down()),
             color: theme::rgba(amber()),
@@ -1778,6 +1891,32 @@ impl ChartState {
             if let Some(tf) = self.paint_stack_lanes(ui, stack_rect, &v, hover, &reveal) {
                 self.set_timeframe(tf, w);
                 return true;
+            }
+        }
+        if rail_h > 0.0 {
+            self.paint_truth_rail(ui, rail_rect, &v);
+        }
+        if self.show_stack {
+            if let Some(frames) = &self.stack_ladder {
+                let label = format!("LADDER {}", frames.iter().map(|tf| tf.label()).collect::<Vec<_>>().join("·"));
+                let r = Rect::from_min_size(pos2(price_rect.left() + 6.0, price_rect.top() + 20.0), vec2(180.0, 15.0));
+                ui.painter().text(r.min, Align2::LEFT_TOP, label, mono(10.0), amber());
+                if ui
+                    .interact(r, ui.id().with((self.id, "auto-ladder")), Sense::click())
+                    .on_hover_text("Restore AUTO ladder")
+                    .clicked()
+                {
+                    self.set_stack_ladder(None, w);
+                }
+            }
+            if self.stack_session && self.tf.is_intraday() {
+                ui.painter().text(
+                    pos2(price_rect.left() + 6.0, price_rect.top() + 36.0),
+                    Align2::LEFT_TOP,
+                    "ANCHORED 09:30",
+                    mono(10.0),
+                    amber(),
+                );
             }
         }
         // ---- axes ----
@@ -2082,6 +2221,15 @@ impl ChartState {
         if ui.checkbox(&mut stack_on, "Trend Stack").changed() {
             self.set_trend_stack(Some(stack_on), w);
         }
+        let mut tint = self.stack_tint;
+        if ui.checkbox(&mut tint, "Regime Candles").changed() {
+            self.set_stack_tint(Some(tint), w);
+        }
+        let mut session = self.stack_session;
+        if ui.checkbox(&mut session, "Anchor base at 09:30").changed() {
+            self.set_stack_session(Some(session), w);
+        }
+        ui.checkbox(&mut self.show_rail, "Truth Rail");
         let adaptive_on = self.indicators.iter().any(|s| s.code == "ADTREND");
         if ui
             .checkbox(&mut adaptive_on.clone(), "Adaptive Trend")
@@ -2382,6 +2530,139 @@ impl ChartState {
         ly
     }
 
+    fn paint_truth_rail(&mut self, ui: &Ui, rect: Rect, v: &Viewport) {
+        use tr_data::truth_rail::{RailKind, rail_cells};
+        let now = chrono::Utc::now().timestamp();
+        let stale = matches!(self.stack_freshness(now), Some(Freshness::Stale { .. }));
+        let data_key = vec![self.gpu.as_ref().map_or(0, |g| g.bars.key), self.bars.len() as u64, stale as u64];
+        if self.rail_paint.data_key != data_key {
+            self.rail_paint.cells = rail_cells(self.tf, &self.bars, self.sec.class, now);
+            self.rail_paint.data_key = data_key;
+            self.rail_paint.mesh_key.clear();
+        }
+        let tail_end = self
+            .bars
+            .last()
+            .map(|b| {
+                rect.left()
+                    + v.x_center(self.bars.len() - 1) as f32
+                    + (now - b.ts).max(0) as f32 / self.tf.seconds() as f32 * v.bar_px as f32
+            })
+            .unwrap_or(rect.right())
+            .min(rect.right())
+            .floor();
+        let key = vec![
+            rect.left().to_bits() as u64,
+            rect.top().to_bits() as u64,
+            rect.width().to_bits() as u64,
+            v.left().to_bits(),
+            v.bar_px.to_bits(),
+            if stale { tail_end.to_bits() as u64 } else { 0 },
+            u32::from_le_bytes(theme::up().to_array()) as u64,
+            u32::from_le_bytes(theme::down().to_array()) as u64,
+            u32::from_le_bytes(amber().to_array()) as u64,
+        ];
+        if self.rail_paint.mesh_key != key {
+            let mut mesh = egui::Mesh::default();
+            // Resolve provenance, hatches and notches into one quad per pixel column.
+            let mut columns = vec![Color32::TRANSPARENT; rect.width().ceil() as usize];
+            for (x, color) in columns.iter_mut().enumerate() {
+                let index = v.index_at(x as f64).floor();
+                if index >= 0.0 && index < self.bars.len() as f64 {
+                    *color = match self.rail_paint.cells[index as usize].kind {
+                        RailKind::Real => theme::up(),
+                        RailKind::Cached => Color32::from_rgb(35, 110, 125),
+                        _ => theme::down().gamma_multiply(if x % 6 < 3 { 1.0 } else { 0.15 }),
+                    };
+                } else if stale && index >= self.bars.len() as f64 && rect.left() + (x as f32) < tail_end {
+                    *color = amber().gamma_multiply(if x % 6 < 3 { 0.9 } else { 0.15 });
+                }
+            }
+            let (lo, hi) = v.visible_range(self.bars.len());
+            for cell in &self.rail_paint.cells[lo..hi] {
+                if !cell.holes.is_empty() {
+                    let x = v.x_of(cell.bar as f64).floor() as isize;
+                    for xx in x..x + 2 {
+                        if xx >= 0
+                            && let Some(color) = columns.get_mut(xx as usize)
+                        {
+                            *color = theme::down();
+                        }
+                    }
+                }
+            }
+            for (x, color) in columns.into_iter().enumerate() {
+                if color != Color32::TRANSPARENT {
+                    mesh.add_colored_rect(
+                        Rect::from_min_size(pos2(rect.left() + x as f32, rect.top()), vec2(1.0, 5.0)),
+                        color,
+                    );
+                }
+            }
+            self.rail_paint.mesh = Arc::new(mesh);
+            self.rail_paint.mesh_key = key;
+        }
+        let painter = ui.painter_at(rect);
+        painter.add(egui::Shape::Mesh(self.rail_paint.mesh.clone()));
+        if let Some(Freshness::Stale { lag_secs }) = self.stack_freshness(now) {
+            ui.painter().text(
+                pos2(rect.right() - 3.0, rect.top() - 2.0),
+                Align2::RIGHT_BOTTOM,
+                format!("STALE {}m", (lag_secs + 59) / 60),
+                mono(10.0),
+                amber(),
+            );
+        }
+        let fetch_age =
+            self.last_refresh.map(|t| format!("{}s", now.saturating_sub(t).max(0))).unwrap_or_else(|| "unknown".into());
+        let response = ui.interact(rect, ui.id().with((self.id, "truth-rail")), Sense::hover());
+        if let Some(at) = response.hover_pos() {
+            let local = (at.x - rect.left()) as f64;
+            let index = v.index_at(local).floor();
+            let cell = self
+                .rail_paint
+                .cells
+                .iter()
+                .find(|c| !c.holes.is_empty() && (v.x_of(c.bar as f64) - local).abs() < 3.0)
+                .or_else(|| {
+                    (index >= 0.0 && index < self.bars.len() as f64).then(|| &self.rail_paint.cells[index as usize])
+                });
+            if cell.is_none() && !stale {
+                return;
+            }
+            let label = if let Some(cell) = cell {
+                let holes = if cell.holes.is_empty() {
+                    String::new()
+                } else {
+                    format!(
+                        "\n{} missing buckets: {} ET",
+                        cell.holes.len(),
+                        cell.holes
+                            .iter()
+                            .map(|ts| tr_core::ny::civil(*ts).format("%H:%M").to_string())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    )
+                };
+                format!(
+                    "{} · {} ET · fetch age {}{}",
+                    self.bars[cell.bar].provenance.label(),
+                    tr_core::ny::civil(cell.ts).format("%Y-%m-%d %H:%M"),
+                    fetch_age,
+                    holes
+                )
+            } else {
+                format!(
+                    "STALE · last {} ET · fetch age {}",
+                    self.bars.last().map(|b| tr_core::ny::civil(b.ts).format("%H:%M").to_string()).unwrap_or_default(),
+                    fetch_age
+                )
+            };
+            response.on_hover_text(label);
+        }
+        ui.ctx().request_repaint_after(Duration::from_secs(1));
+    }
+
     fn paint_stack_hud(&self, p: &egui::Painter, rect: Rect, ly: f32) -> f32 {
         let now = chrono::Utc::now().timestamp();
         let (label, color) = self.stack_hud(now);
@@ -2410,7 +2691,7 @@ impl ChartState {
     fn paint_stack_loading(&self, ui: &Ui, rect: Rect) {
         let p = ui.painter_at(rect);
         let phase = (ui.input(|i| i.time) as f32 * 0.8).fract();
-        for (k, tf) in ladder(self.tf, self.archive).iter().enumerate() {
+        for (k, tf) in self.stack_frames().iter().enumerate() {
             let y = rect.top() + 2.0 + k as f32 * 8.0;
             p.text(
                 pos2(rect.left() + 2.0, y + 3.5),
@@ -3527,6 +3808,70 @@ mod tests {
         c.on_trend_stack(c.generation, bars.len(), result);
         c
     }
+    #[test]
+    fn tint_buffer_is_neutral_for_refused_stale_or_sample_stack() {
+        let (worker, _) = Worker::test_channel();
+        let mut c = stack_chart(&worker, Provenance::Real);
+        let now = chrono::Utc::now().timestamp();
+        assert!(c.tint_allowed(now));
+        assert!(c.tint_buffer(now).iter().any(|v| *v != 0.0));
+        for status in [LaneStatus::Refused("SAMPLE".into()), LaneStatus::Stale { lag_secs: 60 }] {
+            let old = c.stack.as_ref().unwrap().lanes[0].status.clone();
+            c.stack.as_mut().unwrap().lanes[0].status = status;
+            assert!(c.tint_buffer(now).iter().all(|v| *v == 0.0));
+            c.stack.as_mut().unwrap().lanes[0].status = old;
+        }
+        for provenance in [Provenance::Sample, Provenance::Missing] {
+            c.provenance = provenance;
+            assert!(c.tint_buffer(now).iter().all(|v| *v == 0.0));
+        }
+        c.provenance = Provenance::Real;
+        assert!(c.tint_buffer(now + 3600).iter().all(|v| *v == 0.0));
+        c.stack_error = Some("refused".into());
+        assert!(c.tint_buffer(now).iter().all(|v| *v == 0.0));
+    }
+
+    #[test]
+    fn custom_ladder_switches_base_and_rejects_archive_intraday() {
+        let (worker, mut requests) = Worker::test_channel();
+        let mut c = stack_chart(&worker, Provenance::Real);
+        while requests.try_recv().is_ok() {}
+        let generation = c.generation;
+        c.set_stack_ladder(Some(vec![Timeframe::M5, Timeframe::M30, Timeframe::H4]), &worker);
+        assert_eq!(c.generation, generation, "ladder changes must not invalidate the worker's candle history");
+        assert!(c.stack_tint);
+        assert_eq!(c.stack_frames(), vec![Timeframe::M5, Timeframe::M30, Timeframe::H4]);
+        assert!(
+            matches!(requests.try_recv().unwrap(),Request::TrendStack {ladder:Some(frames),..} if frames==c.stack_frames())
+        );
+        c.set_stack_ladder(None, &worker);
+        assert_eq!(c.stack_frames(), ladder(c.tf, false));
+        c.archive = true;
+        c.set_stack_ladder(Some(vec![Timeframe::M5, Timeframe::H1]), &worker);
+        assert!(c.error.as_ref().unwrap().contains("archive"));
+    }
+
+    #[test]
+    fn truth_rail_hover_reuses_mesh_and_is_independent_of_stack() {
+        let (worker, _) = Worker::test_channel();
+        let mut c = stack_chart(&worker, Provenance::Sample);
+        c.show_stack = false;
+        let ctx = egui::Context::default();
+        let rect = Rect::from_min_size(pos2(10.0, 200.0), vec2(500.0, 5.0));
+        let v = Viewport::fit_last(c.bars.len(), 100, 500.0);
+        let mut frame = |events| {
+            ctx.run_ui(egui::RawInput { events, ..Default::default() }, |ui| c.paint_truth_rail(ui, rect, &v))
+                .textures_delta
+                .clear();
+            c.rail_paint.mesh.clone()
+        };
+        let first = frame(vec![]);
+        let hover = frame(vec![egui::Event::PointerMoved(rect.center())]);
+        assert!(Arc::ptr_eq(&first, &hover));
+        assert!(first.vertices.len() <= rect.width().ceil() as usize * 4);
+        assert!(c.rail_paint.cells.iter().all(|cell| cell.kind == tr_data::truth_rail::RailKind::Hatched));
+    }
+
     #[test]
     fn trend_stack_cloud_breaks_at_nan_and_reuses_cached_mesh() {
         let (worker, _) = Worker::test_channel();

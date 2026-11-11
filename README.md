@@ -232,12 +232,16 @@ gets the native title bar with traffic lights, window vibrancy behind the sideba
   [Adaptive Trend](docs/ADAPTIVE_TREND.md).
 - **Adaptive Trend Stack** — `TSTACK` (`STACK`, `MTF`, `REGIME`) adds completed
   native-timeframe regime lanes, a confidence cloud and a verified `STACK n/m`
-  chip. Sample data is refused; stale lanes are excluded. Intraday ADTREND uses
+  chip. Regime Candles tint completed states; the independent Truth Rail exposes
+  provenance, missing buckets and stale tails. Sample data is refused; stale lanes are excluded. Intraday ADTREND uses
   session ATR, leaving daily output unchanged. See [Trend Stack](docs/TREND_STACK.md).
 
   | Input | Chart action |
   | --- | --- |
   | `TSTACK ON` / `TSTACK OFF` | Enable / disable; saved with layout |
+  | `TSTACK 5m 30m 4H` / `TSTACK AUTO` | Native custom ladder / restore defaults |
+  | `TSTACK TINT` / `TSTACK SESSION` | Regime Candles / 09:30 base anchor |
+  | `RAIL [ON\|OFF]` | Intraday provenance strip, holes and stale tail |
   | `NEW TSTACK NVDA` / `SPLIT DOWN TSTACK NVDA` | Open a 5m stacked chart |
   | `,` / `.` | Shorter / longer interval (empty command line) |
   | `\` | Last intraday interval ⇄ 1D; archive uses D/W/M only |

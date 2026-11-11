@@ -15,7 +15,7 @@ use tr_congress::performance::{self, Performance, TradeReturn};
 use tr_congress::refresh::{self, HttpSource, NewTradeAlert, RefreshConfig};
 use tr_congress::{Db, Politician, Trade};
 use tr_core::indicators::registry::{Input, Plot, Tone};
-use tr_core::indicators::{AdaptiveTrendParams, LaneStatus, TrendStack, ladder, score, trend_stack};
+use tr_core::indicators::{AdaptiveTrendParams, LaneStatus, TrendStack, ladder, ladder_custom, score, trend_stack};
 use tr_core::{Bar, Security, Series, Timeframe};
 use tr_data::{BarCache, Provider, Quote, SearchHit, YieldCurves};
 
@@ -62,6 +62,8 @@ pub enum Request {
         archive: bool,
         base: Arc<Vec<Bar>>,
         params: AdaptiveTrendParams,
+        ladder: Option<Vec<Timeframe>>,
+        config_revision: u64,
     },
     DailyStrength {
         pane: PaneId,
@@ -487,6 +489,7 @@ pub enum Response {
         generation: u64,
         base_len: usize,
         result: Result<TrendStack, String>,
+        config_revision: u64,
     },
     DailyStrength {
         pane: PaneId,
@@ -681,6 +684,13 @@ pub struct Worker {
 /// Bars per pane tagged with the load generation they belong to.
 type SeriesMap = HashMap<PaneId, (u64, Arc<Vec<Bar>>)>;
 
+type LaneKey = (String, Timeframe, bool);
+#[derive(Default)]
+struct LaneSlot {
+    value: tokio::sync::OnceCell<Result<Arc<Vec<Bar>>, String>>,
+    completed: std::sync::atomic::AtomicI64,
+}
+
 struct Shared {
     history: Arc<tr_data::history::Service>,
     whats_news: tokio::sync::watch::Sender<(u64, tr_data::whats_news::Config)>,
@@ -692,7 +702,8 @@ struct Shared {
     /// combined window instead of stitching broken week boundaries.
     archive_daily: std::sync::Mutex<SeriesMap>,
     wall_generations: std::sync::Mutex<HashMap<PaneId, u64>>,
-    stack_lanes: Mutex<HashMap<(String, Timeframe, bool), (i64, Arc<Vec<Bar>>)>>,
+    stack_lanes: std::sync::Mutex<HashMap<LaneKey, Arc<LaneSlot>>>,
+    wall_fetches: tokio::sync::Semaphore,
     cache: std::sync::Mutex<Option<BarCache>>,
     news: std::sync::Mutex<tr_data::news::NewsCache>,
     price_alerts: std::sync::Mutex<tr_data::price_alerts::Store>,
@@ -777,6 +788,7 @@ impl Worker {
             series: Default::default(),
             archive_daily: Default::default(),
             stack_lanes: Default::default(),
+            wall_fetches: tokio::sync::Semaphore::new(4),
             wall_generations: Default::default(),
             cache: std::sync::Mutex::new(cache),
             news: Default::default(),
@@ -1040,16 +1052,78 @@ fn store_verified_history(s: &Shared, symbol: &str, tf: Timeframe, bars: &[Bar])
     }
 }
 
-/// Shared chart/wall native lane acquisition. The lock coalesces concurrent cold requests.
-/// Wall archive reads are strictly local. Only archive daily bars may aggregate into W/M.
-async fn stack_lane_bars(s: &Shared, symbol: &str, tf: Timeframe, archive: bool, now: i64) -> Result<Vec<Bar>, String> {
+/// Coalesce only the same native key. Never hold the map lock across an await.
+async fn stack_lane_bars(
+    s: &Shared,
+    symbol: &str,
+    tf: Timeframe,
+    archive: bool,
+    now: i64,
+) -> Result<Arc<Vec<Bar>>, String> {
+    use std::sync::atomic::Ordering;
+    let now = now.max(chrono::Utc::now().timestamp());
     let key = (symbol.to_string(), tf, archive);
     let ttl = tr_data::intraday::refresh_ttl_secs(tf).unwrap_or(900);
-    let mut cache = s.stack_lanes.lock().await;
-    if let Some((_, bars)) = cache.get(&key).filter(|(at, _)| *at <= now && now - *at < ttl) {
-        return Ok(bars.as_ref().clone());
+    let slot = {
+        let mut cache = s.stack_lanes.lock().expect("native lanes");
+        if let Some(slot) = cache.get(&key) {
+            let at = slot.completed.load(Ordering::Acquire);
+            if slot.value.get().is_some() && (at > now || now - at >= ttl) {
+                cache.remove(&key);
+            }
+        }
+        while cache.len() >= 160 && !cache.contains_key(&key) {
+            let oldest = cache
+                .iter()
+                .filter(|(_, slot)| slot.value.get().is_some())
+                .min_by_key(|(_, slot)| slot.completed.load(Ordering::Acquire))
+                .map(|(k, _)| k.clone());
+            if let Some(oldest) = oldest {
+                cache.remove(&oldest);
+            } else {
+                break;
+            }
+        }
+        cache.entry(key.clone()).or_default().clone()
+    };
+    let result = slot
+        .value
+        .get_or_init(|| async {
+            let result = fetch_stack_lane(s, symbol, tf, archive, now).await;
+            // Completion time, rather than request start, controls the TTL.
+            slot.completed.store(chrono::Utc::now().timestamp(), Ordering::Release);
+            result.map(Arc::new)
+        })
+        .await
+        .clone();
+    let mut cache = s.stack_lanes.lock().expect("native lanes");
+    if result.is_err() && cache.get(&key).is_some_and(|current| Arc::ptr_eq(current, &slot)) {
+        cache.remove(&key);
     }
-    // The chart already owns/fetched its base; share that verified native history too.
+    // A burst may temporarily contain more than 160 in-flight slots. Prune only completed ones.
+    while cache.len() > 160 {
+        let oldest = cache
+            .iter()
+            .filter(|(_, slot)| slot.value.get().is_some())
+            .min_by_key(|(_, slot)| slot.completed.load(Ordering::Acquire))
+            .map(|(key, _)| key.clone());
+        if let Some(oldest) = oldest {
+            cache.remove(&oldest);
+        } else {
+            break;
+        }
+    }
+    result
+}
+
+async fn fetch_stack_lane(
+    s: &Shared,
+    symbol: &str,
+    tf: Timeframe,
+    archive: bool,
+    now: i64,
+) -> Result<Vec<Bar>, String> {
+    let ttl = tr_data::intraday::refresh_ttl_secs(tf).unwrap_or(900);
     let cached_base = if !archive && tf == Timeframe::M5 {
         s.cache.lock().ok().and_then(|c| {
             c.as_ref().and_then(|c| {
@@ -1078,9 +1152,6 @@ async fn stack_lane_bars(s: &Shared, symbol: &str, tf: Timeframe, archive: bool,
         s.provider.history_for_analysis(symbol, tf, None, 400, "Trend Stack").await.map_err(|e| format!("{e:#}"))
     };
     let mut bars = result?;
-    if bars.is_empty() {
-        return Ok(bars);
-    }
     Bar::require_verified(&bars, "Trend Stack")?;
     bars.sort_by_key(|b| b.ts);
     bars.reverse();
@@ -1092,14 +1163,19 @@ async fn stack_lane_bars(s: &Shared, symbol: &str, tf: Timeframe, archive: bool,
     if !archive {
         store_verified_history(s, symbol, tf, &bars);
     }
-    if cache.len() >= 160
-        && !cache.contains_key(&key)
-        && let Some(oldest) = cache.iter().min_by_key(|(_, (at, _))| *at).map(|(k, _)| k.clone())
-    {
-        cache.remove(&oldest);
-    }
-    cache.insert(key, (now, Arc::new(bars.clone())));
     Ok(bars)
+}
+
+/// Wall acquisition is bounded independently of chart requests.
+async fn stack_wall_lane_bars(
+    s: &Shared,
+    symbol: &str,
+    tf: Timeframe,
+    archive: bool,
+    now: i64,
+) -> Result<Arc<Vec<Bar>>, String> {
+    let _permit = s.wall_fetches.acquire().await.map_err(|e| e.to_string())?;
+    stack_lane_bars(s, symbol, tf, archive, now).await
 }
 
 /// Preserve the chart's pre-existing verified bridge fallback without putting bridge
@@ -1110,12 +1186,12 @@ async fn stack_chart_lane_bars(
     tf: Timeframe,
     archive: bool,
     now: i64,
-) -> Result<Vec<Bar>, String> {
+) -> Result<Arc<Vec<Bar>>, String> {
     let result = stack_lane_bars(s, symbol, tf, archive, now).await;
     if archive && result.is_err() {
         let config = s.whats_news.borrow().1.clone();
         let bars = desk_daily(s, &config.bridge(), symbol).await.map_err(|e| format!("{e:#}"))?;
-        Ok(if tf == Timeframe::D1 { bars } else { tf.resample(&bars) })
+        Ok(Arc::new(if tf == Timeframe::D1 { bars } else { tf.resample(&bars) }))
     } else {
         result
     }
@@ -2217,16 +2293,19 @@ async fn handle(s: &Arc<Shared>, req: Request) {
                             tr_data::cash_session::exchange_zone(&symbol).as_deref(),
                         )?;
                     }
-                    let base = stack_lane_bars(s, &symbol, tf, daily, now).await?;
+                    let base = stack_wall_lane_bars(s, &symbol, tf, daily, now).await?;
                     // Validate before filtering, so a discarded off-session bar cannot hide taint.
                     Bar::require_verified(&base, "Trend Wall")?;
-                    let base = if daily { base } else { tr_data::intraday::regular_only(base) };
+                    let base = if daily { base } else { tr_data::intraday::regular_only(base.as_ref().clone()).into() };
                     if base.is_empty() {
                         return Err("No regular-session native bars".to_string());
                     }
                     let mut lanes = Vec::new();
                     for lane_tf in ladder(tf, daily).into_iter().filter(|t| *t != tf) {
-                        lanes.push((lane_tf, stack_lane_bars(s, &symbol, lane_tf, daily, now).await));
+                        lanes.push((
+                            lane_tf,
+                            stack_wall_lane_bars(s, &symbol, lane_tf, daily, now).await.map(|b| b.as_ref().clone()),
+                        ));
                     }
                     let symbol = symbol.clone();
                     tokio::task::spawn_blocking(move || {
@@ -2258,9 +2337,20 @@ async fn handle(s: &Arc<Shared>, req: Request) {
                 send(Response::TrendWallDone { pane, generation, error: None });
             }
         }
-        Request::TrendStack { pane, generation, symbol, tf, archive, base, params } => {
+        Request::TrendStack {
+            pane,
+            generation,
+            symbol,
+            tf,
+            archive,
+            base,
+            params,
+            ladder: custom,
+            config_revision,
+        } => {
             if s.provider.name() == "sample" {
                 send(Response::TrendStack {
+                    config_revision,
                     pane,
                     generation,
                     base_len: base.len(),
@@ -2269,15 +2359,37 @@ async fn handle(s: &Arc<Shared>, req: Request) {
                 return;
             }
             if let Err(error) = tr_core::indicators::require_adaptive_bars(&base, "Trend Stack") {
-                send(Response::TrendStack { pane, generation, base_len: base.len(), result: Err(error) });
+                send(Response::TrendStack {
+                    config_revision,
+                    pane,
+                    generation,
+                    base_len: base.len(),
+                    result: Err(error),
+                });
                 return;
             }
-            let frames = ladder(tf, archive);
+            let frames = match custom
+                .as_deref()
+                .map(|frames| ladder_custom(tf, frames, archive))
+                .unwrap_or_else(|| Ok(ladder(tf, archive)))
+            {
+                Ok(frames) => frames,
+                Err(error) => {
+                    send(Response::TrendStack {
+                        config_revision,
+                        pane,
+                        generation,
+                        base_len: base.len(),
+                        result: Err(error),
+                    });
+                    return;
+                }
+            };
             // Base/cloud first: no network or main-thread maths. Higher lanes fill later.
             let initial = frames.iter().copied().filter(|t| *t != tf).map(|t| (t, Err("Loading…".into()))).collect();
             let b = base.clone();
             if let Ok(result) = tokio::task::spawn_blocking(move || trend_stack(&b, tf, initial, params)).await {
-                send(Response::TrendStack { pane, generation, base_len: base.len(), result });
+                send(Response::TrendStack { config_revision, pane, generation, base_len: base.len(), result });
             }
             let now = chrono::Utc::now().timestamp();
             let mut lanes = Vec::new();
@@ -2290,7 +2402,10 @@ async fn handle(s: &Arc<Shared>, req: Request) {
                 store_verified_history(s, &symbol, tf, &base);
             }
             for lane_tf in frames.into_iter().filter(|t| *t != tf) {
-                lanes.push((lane_tf, stack_chart_lane_bars(s, &symbol, lane_tf, archive, now).await));
+                lanes.push((
+                    lane_tf,
+                    stack_chart_lane_bars(s, &symbol, lane_tf, archive, now).await.map(|b| b.as_ref().clone()),
+                ));
             }
             let base_len = base.len();
             let class = tr_data::security(&symbol).class;
@@ -2298,7 +2413,7 @@ async fn handle(s: &Arc<Shared>, req: Request) {
                 if let Ok(stack) = &mut result {
                     mark_stack_freshness(stack, class, archive, now);
                 }
-                send(Response::TrendStack { pane, generation, base_len, result });
+                send(Response::TrendStack { config_revision, pane, generation, base_len, result });
             }
         }
         Request::DailyStrength { pane, generation, archive, base } => {
@@ -3889,6 +4004,197 @@ where
 mod tests {
     use super::*;
 
+    struct LaneProvider {
+        calls: std::sync::atomic::AtomicUsize,
+        started: tokio::sync::Notify,
+        release: tokio::sync::Semaphore,
+        fail: std::sync::atomic::AtomicBool,
+        frames: std::sync::Mutex<Vec<Timeframe>>,
+    }
+    #[async_trait::async_trait]
+    impl tr_data::MarketData for LaneProvider {
+        fn name(&self) -> &str {
+            "lane test"
+        }
+        async fn history(&self, _: &str, _: Timeframe, _: Option<i64>, _: usize) -> anyhow::Result<Vec<Bar>> {
+            panic!("custom lanes must use history_for_analysis");
+        }
+        async fn history_for_analysis(
+            &self,
+            symbol: &str,
+            tf: Timeframe,
+            _: Option<i64>,
+            _: usize,
+            _: &str,
+        ) -> anyhow::Result<Vec<Bar>> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.frames.lock().unwrap().push(tf);
+            if symbol == "SLOW" {
+                self.started.notify_one();
+                self.release.acquire().await.unwrap().forget();
+            }
+            if self.fail.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                anyhow::bail!("offline fixture");
+            }
+            Ok(stack_fixture(400, tf, tr_core::Provenance::Real))
+        }
+    }
+    fn lane_provider() -> Arc<LaneProvider> {
+        Arc::new(LaneProvider {
+            calls: Default::default(),
+            started: Default::default(),
+            release: tokio::sync::Semaphore::new(0),
+            fail: Default::default(),
+            frames: Default::default(),
+        })
+    }
+    #[tokio::test]
+    async fn cold_wall_fetch_does_not_block_another_key() {
+        let provider = lane_provider();
+        let (s, _) = shared(provider.clone(), None);
+        let now = chrono::Utc::now().timestamp();
+        let held = s.clone();
+        let wall = tokio::spawn(async move { stack_wall_lane_bars(&held, "SLOW", Timeframe::M5, false, now).await });
+        provider.started.notified().await;
+        let fast =
+            tokio::time::timeout(Duration::from_secs(2), stack_chart_lane_bars(&s, "FAST", Timeframe::M30, false, now))
+                .await
+                .expect("unrelated key blocked by wall")
+                .unwrap();
+        assert_eq!(fast.len(), 400);
+        provider.release.add_permits(1);
+        wall.await.unwrap().unwrap();
+    }
+    #[tokio::test]
+    async fn concurrent_same_key_fetches_once() {
+        let provider = lane_provider();
+        let (s, _) = shared(provider.clone(), None);
+        let now = chrono::Utc::now().timestamp();
+        let one = s.clone();
+        let first = tokio::spawn(async move { stack_lane_bars(&one, "SLOW", Timeframe::H1, false, now).await });
+        provider.started.notified().await;
+        let two = s.clone();
+        let second = tokio::spawn(async move { stack_lane_bars(&two, "SLOW", Timeframe::H1, false, now).await });
+        tokio::task::yield_now().await;
+        provider.release.add_permits(1);
+        let (a, b) = tokio::time::timeout(Duration::from_secs(2), async {
+            (first.await.unwrap().unwrap(), second.await.unwrap().unwrap())
+        })
+        .await
+        .unwrap();
+        assert!(Arc::ptr_eq(&a, &b));
+        assert_eq!(provider.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+    #[tokio::test]
+    async fn failed_fetch_is_not_cached() {
+        let provider = lane_provider();
+        provider.fail.store(true, std::sync::atomic::Ordering::SeqCst);
+        let (s, _) = shared(provider.clone(), None);
+        let now = chrono::Utc::now().timestamp();
+        assert!(stack_lane_bars(&s, "FAST", Timeframe::M30, false, now).await.is_err());
+        assert!(s.stack_lanes.lock().unwrap().is_empty());
+        assert!(stack_lane_bars(&s, "FAST", Timeframe::M30, false, now).await.is_ok());
+        assert_eq!(provider.calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+    #[tokio::test]
+    async fn cancelled_fetch_does_not_poison_key() {
+        let provider = lane_provider();
+        let (s, _) = shared(provider.clone(), None);
+        let now = chrono::Utc::now().timestamp();
+        let one = s.clone();
+        let first = tokio::spawn(async move { stack_lane_bars(&one, "SLOW", Timeframe::H1, false, now).await });
+        provider.started.notified().await;
+        // Queue the successor before cancellation, exercising OnceCell handover.
+        let two = s.clone();
+        let second = tokio::spawn(async move { stack_lane_bars(&two, "SLOW", Timeframe::H1, false, now).await });
+        tokio::task::yield_now().await;
+        first.abort();
+        assert!(first.await.unwrap_err().is_cancelled());
+        provider.started.notified().await;
+        provider.release.add_permits(1);
+        assert_eq!(tokio::time::timeout(Duration::from_secs(2), second).await.unwrap().unwrap().unwrap().len(), 400);
+        assert_eq!(provider.calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+    #[tokio::test]
+    async fn lane_cache_evicts_completed_slots_without_removing_pending_initializers() {
+        let provider = lane_provider();
+        let (s, _) = shared(provider, None);
+        let pending = Arc::new(LaneSlot::default());
+        let key = ("PENDING".to_string(), Timeframe::H1, false);
+        {
+            let mut cache = s.stack_lanes.lock().unwrap();
+            cache.insert(key.clone(), pending.clone());
+            for i in 0..160 {
+                let slot = LaneSlot {
+                    value: tokio::sync::OnceCell::new_with(Some(Ok(Arc::new(Vec::new())))),
+                    completed: std::sync::atomic::AtomicI64::new(i),
+                };
+                cache.insert((format!("DONE{i}"), Timeframe::H1, false), Arc::new(slot));
+            }
+        }
+        stack_lane_bars(&s, "FAST", Timeframe::M30, false, chrono::Utc::now().timestamp()).await.unwrap();
+        let cache = s.stack_lanes.lock().unwrap();
+        assert_eq!(cache.len(), 160);
+        assert!(Arc::ptr_eq(cache.get(&key).unwrap(), &pending));
+    }
+
+    #[tokio::test]
+    async fn chart_lanes_bypass_wall_semaphore() {
+        let provider = lane_provider();
+        let (s, _) = shared(provider.clone(), None);
+        let now = chrono::Utc::now().timestamp();
+        let permits = s.wall_fetches.acquire_many(4).await.unwrap();
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(20),
+                stack_wall_lane_bars(&s, "WALL", Timeframe::M30, false, now)
+            )
+            .await
+            .is_err()
+        );
+        assert!(
+            tokio::time::timeout(
+                Duration::from_secs(2),
+                stack_chart_lane_bars(&s, "CHART", Timeframe::M30, false, now)
+            )
+            .await
+            .unwrap()
+            .is_ok()
+        );
+        drop(permits);
+        assert_eq!(provider.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+    #[tokio::test]
+    async fn custom_ladder_lanes_fetch_native_never_resample() {
+        let provider = lane_provider();
+        let (s, rx) = shared(provider.clone(), None);
+        let mut request = stack_request(false);
+        if let Request::TrendStack { ladder, .. } = &mut request {
+            *ladder = Some(vec![Timeframe::M5, Timeframe::M30, Timeframe::H4]);
+        }
+        handle(&s, request).await;
+        let stack = last_stack(&rx).unwrap();
+        assert_eq!(
+            stack.lanes.iter().map(|l| l.tf).collect::<Vec<_>>(),
+            vec![Timeframe::M5, Timeframe::M30, Timeframe::H4]
+        );
+        assert_eq!(*provider.frames.lock().unwrap(), vec![Timeframe::M30, Timeframe::H4]);
+        assert!(stack.lanes.iter().all(|l| l.provenance.is_verified()));
+    }
+    #[tokio::test]
+    async fn sample_provider_custom_ladder_makes_zero_fetches() {
+        let provider =
+            Arc::new(StackPrices { calls: Default::default(), name: "sample", provenance: tr_core::Provenance::Real });
+        let (s, rx) = shared(provider.clone(), None);
+        let mut request = stack_request(false);
+        if let Request::TrendStack { ladder, .. } = &mut request {
+            *ladder = Some(vec![Timeframe::M5, Timeframe::M30, Timeframe::H4]);
+        }
+        handle(&s, request).await;
+        assert!(last_stack(&rx).unwrap_err().contains("SAMPLE"));
+        assert_eq!(provider.calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
     struct StackPrices {
         calls: std::sync::atomic::AtomicUsize,
         name: &'static str,
@@ -3925,6 +4231,8 @@ mod tests {
             archive,
             base: Arc::new(stack_fixture(400, tf, tr_core::Provenance::Real)),
             params: Default::default(),
+            ladder: None,
+            config_revision: 0,
         }
     }
     fn last_stack(rx: &mpsc::Receiver<Response>) -> Result<TrendStack, String> {
@@ -3967,7 +4275,7 @@ mod tests {
             matches!(&responses[0], Response::TrendWallDone { error: Some(e), .. } if e.contains("REFUSED") && e.contains("SAMPLE"))
         );
         assert_eq!(provider.calls.load(std::sync::atomic::Ordering::SeqCst), 0);
-        assert!(s.stack_lanes.lock().await.is_empty());
+        assert!(s.stack_lanes.lock().unwrap().is_empty());
     }
     #[tokio::test]
     async fn trend_wall_unverified_symbol_is_refused_row_not_cached() {
@@ -3982,7 +4290,7 @@ mod tests {
         handle(&s, request).await;
         let responses = wall_responses(&rx);
         assert!(responses.iter().any(|r| matches!(r, Response::TrendWallRow { row, .. } if matches!(row.status, LaneStatus::Refused(_)) && row.score.is_none())));
-        assert!(s.stack_lanes.lock().await.is_empty());
+        assert!(s.stack_lanes.lock().unwrap().is_empty());
         assert!(
             s.cache.lock().unwrap().as_ref().unwrap().load("AAPL US Equity", Timeframe::M5, 400).unwrap().is_empty()
         );
@@ -4073,7 +4381,7 @@ mod tests {
         handle(&s, stack_request(false)).await;
         assert!(last_stack(&rx).unwrap_err().contains("SAMPLE"));
         assert_eq!(provider.calls.load(std::sync::atomic::Ordering::SeqCst), 0);
-        assert!(s.stack_lanes.lock().await.is_empty());
+        assert!(s.stack_lanes.lock().unwrap().is_empty());
     }
     #[tokio::test]
     async fn trend_stack_lanes_are_cached_until_their_ttl() {
@@ -4086,12 +4394,12 @@ mod tests {
             assert_eq!(last_stack(&rx).unwrap().lanes.len(), 4);
         }
         assert_eq!(provider.calls.load(std::sync::atomic::Ordering::SeqCst), 3);
-        assert_eq!(s.stack_lanes.lock().await.len(), 3);
+        assert_eq!(s.stack_lanes.lock().unwrap().len(), 3);
         assert!(
             s.cache.lock().unwrap().as_ref().unwrap().fetched_at("BTCUSD Curncy", Timeframe::H1).unwrap().is_some()
         );
-        for (at, _) in s.stack_lanes.lock().await.values_mut() {
-            *at -= 1000;
+        for slot in s.stack_lanes.lock().unwrap().values() {
+            slot.completed.fetch_sub(1000, std::sync::atomic::Ordering::SeqCst);
         }
         handle(&s, stack_request(false)).await;
         assert_eq!(provider.calls.load(std::sync::atomic::Ordering::SeqCst), 6);
@@ -4108,7 +4416,7 @@ mod tests {
         let stack = last_stack(&rx).unwrap();
         assert_eq!(stack.score.unwrap().scored, 1);
         assert!(stack.lanes.iter().skip(1).all(|l| matches!(l.status, LaneStatus::Refused(_))));
-        assert!(s.stack_lanes.lock().await.is_empty());
+        assert!(s.stack_lanes.lock().unwrap().is_empty());
         assert!(
             s.cache.lock().unwrap().as_ref().unwrap().load("BTCUSD Curncy", Timeframe::H1, 400).unwrap().is_empty()
         );
@@ -4184,6 +4492,7 @@ mod tests {
                 series: Default::default(),
                 archive_daily: Default::default(),
                 stack_lanes: Default::default(),
+                wall_fetches: tokio::sync::Semaphore::new(4),
                 wall_generations: Default::default(),
                 cache: std::sync::Mutex::new(cache),
                 news: Default::default(),
@@ -4931,6 +5240,7 @@ mod tests {
             series: Default::default(),
             archive_daily: Default::default(),
             stack_lanes: Default::default(),
+            wall_fetches: tokio::sync::Semaphore::new(4),
             wall_generations: Default::default(),
             cache: std::sync::Mutex::new(None),
             news: Default::default(),

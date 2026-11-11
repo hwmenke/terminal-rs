@@ -2147,10 +2147,13 @@ mod tests {
     #[test]
     fn new_and_split_tstack_open_five_minute_charts_and_preserve_archive_source() {
         let mut app = crate::app::tests::test_app();
-        for command in ["NEW TSTACK NVDA", "SPLIT DOWN TSTACK AAPL"] {
+        for command in ["NEW TSTACK NVDA", "SPLIT DOWN TSTACK AAPL", "NEW TSTACK D"] {
             app.execute(command);
             let PaneKind::Chart(c) = &app.pane_mut(app.focus).unwrap().kind else { panic!("stack chart") };
             assert_eq!(c.tf, tr_core::Timeframe::M5);
+            if command == "NEW TSTACK D" {
+                assert_eq!(c.symbol, "D US Equity");
+            }
             assert!(c.show_stack);
             assert!(!c.archive);
             let settings = app.pane_mut(app.focus).unwrap().kind.settings();
