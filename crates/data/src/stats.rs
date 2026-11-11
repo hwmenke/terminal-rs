@@ -172,12 +172,12 @@ pub struct ResearchSnapshot {
 pub fn require_research_bars(bars: &[Bar], operation: &str) -> Result<(), String> {
     if bars.is_empty() {
         return Err(format!(
-            "{operation} refused: no daily history in the research archive. Sample or display prices are never used."
+            "{operation} refused: no history in the research archive. Sample or display prices are never used."
         ));
     }
     Bar::require_verified(bars, operation)?;
     if bars.windows(2).any(|w| w[0].ts >= w[1].ts) {
-        return Err(format!("{operation} refused: daily bars must have unique ascending dates"));
+        return Err(format!("{operation} refused: history bars must have unique ascending timestamps"));
     }
     if bars.iter().any(|b| {
         ![b.open, b.high, b.low, b.close, b.volume].iter().all(|v| v.is_finite())
@@ -555,7 +555,7 @@ pub fn forward_returns(closes: &[f64], h: usize) -> Vec<Option<f64>> {
         .collect()
 }
 
-fn describe(values: &[f64], horizon: usize) -> ReturnStats {
+pub(crate) fn describe(values: &[f64], horizon: usize) -> ReturnStats {
     let empty = ReturnStats {
         count: 0,
         effective_count: 0.0,
@@ -1009,7 +1009,7 @@ mod tests {
             let err = compute_conditional("X", "X", bars, &[], &[5], "test", "Conditional returns").unwrap_err();
             assert!(err.contains(needle), "{err}");
         }
-        assert!(require_research_bars(&[], "Statistics").unwrap_err().contains("no daily history"));
+        assert!(require_research_bars(&[], "Statistics").unwrap_err().contains("no history"));
     }
 
     #[test]

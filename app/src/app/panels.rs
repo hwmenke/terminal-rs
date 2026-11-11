@@ -2,7 +2,7 @@
 
 use std::time::Instant;
 
-use egui::{Align2, Color32, Rect, RichText, Sense, Stroke, Ui, UiBuilder, pos2, vec2};
+use egui::{Align2, Rect, RichText, Sense, Stroke, Ui, UiBuilder, pos2, vec2};
 use tr_data::OrderBook;
 
 use super::{PaneKind, TerminalApp};
@@ -55,8 +55,24 @@ impl TerminalApp {
                     self.worker.send(Request::MarkAlertsSeen);
                 }
             }
-            PaneKind::Wei => actions.extend(markets_view::wei(ui, &self.quotes, self.wei_updated.as_deref())),
-            PaneKind::Curve => actions.extend(markets_view::curve(ui, self.curves.as_deref())),
+            PaneKind::Health => self.health_pane(ui),
+            PaneKind::Wei => actions.extend(markets_view::wei(
+                ui,
+                &self.quotes,
+                self.wei_updated.as_deref(),
+                &self.quote_states,
+                &self.worker,
+            )),
+            PaneKind::Curve => {
+                widgets::stale_chip(ui, &self.curve_state);
+                if self.curves.is_none() && self.curve_state.is_down() {
+                    if widgets::unavailable_card(ui, ui.available_rect_before_wrap(), &self.curve_state) {
+                        self.worker.send(Request::RetryFeed { feed: tr_data::Feed::Curve, pane: None });
+                    }
+                } else {
+                    actions.extend(markets_view::curve(ui, self.curves.as_deref()));
+                }
+            }
             PaneKind::Search { query } => {
                 let hits = if self.net_hits.0 == *query { self.net_hits.1.as_slice() } else { &[] };
                 let (a, changed) = markets_view::search(ui, query, hits);
@@ -83,12 +99,15 @@ impl TerminalApp {
                 let (a, refetch) = super::options_view::options_chain(ui, o);
                 actions.extend(a);
                 if refetch {
-                    o.fetched = None;
+                    o.fetched = Some(Instant::now());
+                    self.worker.send(Request::Options { pane: id, symbol: o.symbol.clone(), expiration: o.expiration });
                 }
             }
             PaneKind::OrderBook(b) => {
-                if let Some(a) = order_book(ui, b) {
-                    actions.push(a);
+                let (action, retry) = order_book(ui, b);
+                actions.extend(action);
+                if retry {
+                    self.worker.send(Request::RetryFeed { feed: tr_data::Feed::Book, pane: Some(id) });
                 }
             }
             PaneKind::Portfolio(pp) => {
@@ -399,8 +418,27 @@ fn fmt_size(q: f64) -> String {
 }
 
 /// Price ladder: asks above, bids below, depth bars by cumulative size.
-fn order_book(ui: &mut Ui, b: &mut super::BookPane) -> Option<Action> {
+fn order_book(ui: &mut Ui, b: &mut super::BookPane) -> (Option<Action>, bool) {
     let mut action = None;
+    if b.feed_state.is_down() || (b.book.is_none() && b.error.is_some()) {
+        let state = if b.feed_state.is_down() {
+            b.feed_state.clone()
+        } else {
+            tr_data::FeedState::Unsupported { reason: b.error.clone().unwrap_or_default() }
+        };
+        if widgets::unavailable_card(ui, ui.available_rect_before_wrap(), &state) {
+            return (None, true);
+        }
+        return (None, false);
+    }
+    let mut shown = b.feed_state.clone();
+    if let tr_data::FeedState::Stale { age_secs, .. } = &mut shown {
+        *age_secs = (chrono::Utc::now().timestamp() - b.last_ok.unwrap_or(chrono::Utc::now().timestamp())).max(0);
+    }
+    widgets::stale_chip(ui, &shown);
+    if matches!(shown, tr_data::FeedState::Stale { .. }) {
+        ui.multiply_opacity(0.55);
+    }
     let key = tr_data::security(&b.symbol);
     let book: Option<OrderBook> = b.book.as_ref().map(|x| x.grouped(b.group));
     ui.horizontal_wrapped(|ui| {
@@ -412,10 +450,8 @@ fn order_book(ui: &mut Ui, b: &mut super::BookPane) -> Option<Action> {
         if let Some(bk) = &book {
             ui.label(RichText::new(&bk.source).font(ui_font(11.5)).color(muted()));
             if bk.simulated {
-                ui.label(
-                    RichText::new(" SIMULATED ").font(ui_font(10.5)).color(Color32::BLACK).background_color(amber()),
-                )
-                .on_hover_text("No free public order book for this market (or offline); levels are synthetic.");
+                widgets::chip(ui, widgets::ChipKind::Caution, "SIMULATED")
+                    .on_hover_text("Explicit sample mode; levels are synthetic.");
             }
         }
     });
@@ -444,7 +480,7 @@ fn order_book(ui: &mut Ui, b: &mut super::BookPane) -> Option<Action> {
     }
     let Some(book) = book else {
         ui.add(egui::Spinner::new());
-        return action;
+        return (action, false);
     };
     let rect = ui.available_rect_before_wrap();
     let d = key.decimals(book.mid().unwrap_or(1.0));
@@ -513,7 +549,7 @@ fn order_book(ui: &mut Ui, b: &mut super::BookPane) -> Option<Action> {
     }
     ui.allocate_rect(rect, Sense::hover());
     ui.ctx().request_repaint_after(std::time::Duration::from_millis(500));
-    action
+    (action, false)
 }
 
 #[cfg(test)]
@@ -527,5 +563,40 @@ mod tests {
         assert!((fx[1] - 1e-4).abs() < 1e-12);
         assert_eq!(fmt_size(1_500.0), "1.50K");
         assert_eq!(fmt_size(0.5), "0.50000");
+    }
+}
+
+#[cfg(test)]
+mod feed_tests {
+    use super::*;
+    #[test]
+    fn unavailable_book_paints_zero_price_levels() {
+        let mut b = super::super::BookPane::new("AAPL", 20, 0.0);
+        b.book = Some(OrderBook {
+            symbol: "AAPL".into(),
+            bids: vec![(123.45, 1234.0)],
+            asks: vec![(124.56, 2345.0)],
+            source: "fixture".into(),
+            simulated: false,
+        });
+        b.feed_state = tr_data::FeedState::Unsupported { reason: "No public order book for AAPL".into() };
+        let ctx = egui::Context::default();
+        let mut output = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(600.0, 400.0))),
+                ..Default::default()
+            },
+            |ui| {
+                order_book(ui, &mut b);
+            },
+        );
+        output.textures_delta.clear();
+        let texts: Vec<_> = output
+            .shapes
+            .iter()
+            .filter_map(|s| if let egui::Shape::Text(t) = &s.shape { Some(t.galley.job.text.clone()) } else { None })
+            .collect();
+        assert!(texts.iter().any(|t| t == "NO REAL DATA"));
+        assert!(texts.iter().all(|t| !t.chars().any(|c| c.is_ascii_digit())));
     }
 }

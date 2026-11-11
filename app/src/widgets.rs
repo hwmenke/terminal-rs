@@ -9,6 +9,101 @@ use egui::{
 use crate::anim;
 use crate::theme::{self, ui_font};
 
+#[derive(Clone, Copy)]
+pub enum ChipKind {
+    Caution,
+    Unavailable,
+    Neutral,
+}
+
+/// Shared compact chrome for feed and study annotations.
+pub fn chip(ui: &mut Ui, kind: ChipKind, text: &str) -> Response {
+    let color = match kind {
+        ChipKind::Caution => theme::amber(),
+        ChipKind::Unavailable => Color32::from_rgb(225, 74, 83),
+        ChipKind::Neutral => theme::muted(),
+    };
+    let galley = ui.painter().layout_no_wrap(text.into(), theme::mono(10.0), color);
+    let (r, response) = ui.allocate_exact_size(vec2(galley.size().x + 12.0, 16.0), Sense::hover());
+    ui.painter().rect_stroke(r, 4.0, Stroke::new(1.0, color), StrokeKind::Inside);
+    ui.painter().galley(pos2(r.left() + 6.0, r.center().y - galley.size().y / 2.0), galley, color);
+    response
+}
+
+pub fn age_label(seconds: i64) -> String {
+    let s = seconds.max(0);
+    if s < 60 {
+        format!("{s}s")
+    } else if s < 3600 {
+        format!("{}m", s / 60)
+    } else {
+        format!("{}h", s / 3600)
+    }
+}
+
+pub fn stale_chip(ui: &mut Ui, state: &tr_data::FeedState) {
+    if let tr_data::FeedState::Stale { age_secs, source, reason, retry_at } = state {
+        let retry =
+            retry_at.map(|t| format!(" · retry {}s", (t - chrono::Utc::now().timestamp()).max(0))).unwrap_or_default();
+        chip(ui, ChipKind::Caution, &format!("STALE {} · {source}{retry}", age_label(*age_secs))).on_hover_text(reason);
+        ui.ctx().request_repaint_after(std::time::Duration::from_secs(1));
+    }
+}
+
+pub fn data_card(p: &egui::Painter, rect: Rect, title: &str, color: Color32, selected: bool) {
+    p.rect_filled(rect, 4.0, if selected { theme::control() } else { theme::card() });
+    p.rect_stroke(rect, 4.0, Stroke::new(1.0, theme::border()), StrokeKind::Inside);
+    p.hline(rect.x_range(), rect.top() + 0.5, Stroke::new(1.0, color));
+    p.text(rect.min + vec2(8.0, 14.0), Align2::LEFT_CENTER, title, theme::mono(11.0), color);
+}
+
+pub fn card_footer(p: &egui::Painter, rect: Rect, hint: &str) {
+    p.hline(rect.x_range(), rect.bottom() - 24.0, Stroke::new(1.0, theme::border()));
+    p.text(rect.left_bottom() + vec2(8.0, -12.0), Align2::LEFT_CENTER, hint, theme::mono(9.0), theme::muted());
+}
+
+/// No ladder, prices or placeholder market values are painted in an unavailable card.
+pub fn unavailable_card(ui: &Ui, rect: Rect, state: &tr_data::FeedState) -> bool {
+    let r = Rect::from_center_size(rect.center(), vec2(rect.width().min(410.0), rect.height().min(150.0)));
+    let p = ui.painter_at(rect);
+    let red = Color32::from_rgb(225, 74, 83);
+    data_card(&p, r, "NO REAL DATA", red, false);
+    let mut job = egui::text::LayoutJob::simple(
+        state.reason().into(),
+        ui_font(12.0),
+        theme::text(),
+        (r.width() - 32.0).max(20.0),
+    );
+    job.wrap.max_rows = 3;
+    let reason = p.layout_job(job);
+    p.galley(pos2(r.center().x - reason.size().x / 2.0, r.top() + 38.0), reason, theme::text());
+    if let Some(at) = state.retry_at() {
+        let seconds = (at - chrono::Utc::now().timestamp()).max(0);
+        let center = pos2(r.left() + 20.0, r.bottom() - 38.0);
+        p.circle_stroke(center, 7.0, Stroke::new(1.0, theme::border()));
+        let angle = (seconds as f32 / 120.0).clamp(0.0, 1.0) * std::f32::consts::TAU;
+        p.add(Shape::line(
+            (0..=24)
+                .map(|i| {
+                    let a = angle * i as f32 / 24.0;
+                    center + vec2(a.sin(), -a.cos()) * 7.0
+                })
+                .collect(),
+            Stroke::new(1.5, red),
+        ));
+        p.text(
+            center + vec2(14.0, 0.0),
+            Align2::LEFT_CENTER,
+            format!("retry in {seconds}s"),
+            theme::mono(10.0),
+            theme::muted(),
+        );
+        ui.ctx().request_repaint_after(std::time::Duration::from_secs(1));
+    }
+    card_footer(&p, r, "R retry · HEALTH details");
+    ui.interact(r, ui.id().with("unavailable-card"), Sense::click()).on_hover_text("Retry this feed").clicked()
+}
+
 /// macOS-style segmented control. Returns the index clicked this frame.
 pub fn segmented(
     ui: &mut Ui,
@@ -375,5 +470,45 @@ mod tests {
             let _ = icon_button(ui, Icon::Sidebar, "Sidebar", false);
         });
         out.textures_delta.clear();
+    }
+}
+
+#[cfg(test)]
+mod feed_tests {
+    use super::*;
+    #[test]
+    fn unavailable_card_and_stale_chip_paint_headlessly() {
+        let ctx = egui::Context::default();
+        let mut output = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(640.0, 480.0))),
+                ..Default::default()
+            },
+            |ui| {
+                stale_chip(
+                    ui,
+                    &tr_data::FeedState::Stale {
+                        age_secs: 240,
+                        source: "Yahoo".into(),
+                        reason: "offline".into(),
+                        retry_at: None,
+                    },
+                );
+                unavailable_card(
+                    ui,
+                    Rect::from_min_size(pos2(0.0, 50.0), vec2(600.0, 300.0)),
+                    &tr_data::FeedState::Unsupported { reason: "No public order book".into() },
+                );
+            },
+        );
+        output.textures_delta.clear();
+        let texts: Vec<_> = output
+            .shapes
+            .iter()
+            .filter_map(|s| if let Shape::Text(t) = &s.shape { Some(t.galley.job.text.clone()) } else { None })
+            .collect();
+        assert!(texts.iter().any(|t| t == "NO REAL DATA"));
+        assert!(texts.iter().any(|t| t.contains("STALE 4m · Yahoo")));
+        assert!(texts.iter().all(|t| !t.contains("0.00")));
     }
 }

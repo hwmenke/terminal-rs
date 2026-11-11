@@ -15,6 +15,7 @@ mod compare;
 mod demo;
 mod desk;
 mod gap_fill;
+mod health_view;
 mod hotkeys_view;
 mod journal;
 mod lookalike;
@@ -52,6 +53,7 @@ use serde::{Deserialize, Serialize};
 use tr_chart::drawings::Tool;
 use tr_congress::Trade;
 use tr_congress::db::{Alert, PoliticianSummary};
+use tr_data::health::{DataMode, Feed, FeedState, Snapshot};
 use tr_data::{OrderBook, Quote, SearchHit, YieldCurves};
 
 use crate::anim;
@@ -89,6 +91,7 @@ pub enum PaneKind {
     Research(Box<research::ResearchPane>),
     Watchlist,
     Help,
+    Health,
     Wei,
     Curve,
     Search {
@@ -137,6 +140,7 @@ pub struct OptionsPane {
     /// Selected expiration (`None` = nearest).
     pub expiration: Option<i64>,
     pub chain: Option<Box<tr_data::OptionChain>>,
+    pub feed_state: FeedState,
     /// Greeks per call and put, aligned with the chain's contracts.
     pub call_greeks: Vec<Option<tr_core::options::Greeks>>,
     pub put_greeks: Vec<Option<tr_core::options::Greeks>>,
@@ -156,6 +160,7 @@ impl OptionsPane {
             symbol: symbol.into(),
             expiration: None,
             chain: None,
+            feed_state: Default::default(),
             call_greeks: Vec::new(),
             put_greeks: Vec::new(),
             rate: 0.04,
@@ -246,13 +251,24 @@ pub struct BookPane {
     /// Price bucket; 0 = raw levels.
     pub group: f64,
     pub book: Option<OrderBook>,
+    pub feed_state: FeedState,
+    pub last_ok: Option<i64>,
     pub error: Option<String>,
     pub fetched: Option<Instant>,
 }
 
 impl BookPane {
     pub fn new(symbol: &str, depth: usize, group: f64) -> Self {
-        Self { symbol: symbol.into(), depth, group, book: None, error: None, fetched: None }
+        Self {
+            symbol: symbol.into(),
+            depth,
+            group,
+            book: None,
+            feed_state: Default::default(),
+            last_ok: None,
+            error: None,
+            fetched: None,
+        }
     }
 }
 
@@ -288,6 +304,7 @@ impl PaneKind {
             }
             PaneKind::Watchlist => "Watchlist".into(),
             PaneKind::Help => "Help".into(),
+            PaneKind::Health => "Feed Health".into(),
             PaneKind::Wei => "World Markets".into(),
             PaneKind::Curve => "Yield Curve".into(),
             PaneKind::Search { query } if query.is_empty() => "Search".into(),
@@ -427,6 +444,7 @@ impl PaneKind {
             }
             PaneKind::Watchlist => "WL",
             PaneKind::Help => "HELP",
+            PaneKind::Health => "HEALTH",
             PaneKind::Wei => "WEI",
             PaneKind::Curve => "GC",
             PaneKind::Search { .. } => "SECF",
@@ -517,6 +535,7 @@ impl PaneKind {
                 stack_tint: c.stack_tint,
                 stack_session: c.stack_session,
                 show_rail: c.show_rail,
+                show_edge: c.show_edge,
             },
             PaneKind::Feed { filter } => {
                 PaneSettings::Feed((*filter != FeedFilter::default()).then(|| (*filter).into()))
@@ -534,6 +553,7 @@ impl PaneKind {
             }
             PaneKind::Watchlist => PaneSettings::Watchlist,
             PaneKind::Help => PaneSettings::Help,
+            PaneKind::Health => PaneSettings::Health,
             PaneKind::Wei => PaneSettings::Wei,
             PaneKind::Curve => PaneSettings::Curve,
             PaneKind::Search { query } => PaneSettings::Search(query.clone()),
@@ -636,6 +656,7 @@ impl PaneKind {
                 stack_tint,
                 stack_session,
                 show_rail,
+                show_edge,
             } => {
                 let mut c = ChartState::new(0, &symbol, tf);
                 c.archive = archive;
@@ -662,6 +683,8 @@ impl PaneKind {
                 c.stack_tint = stack_tint;
                 c.stack_session = stack_session;
                 c.show_rail = show_rail;
+                c.show_edge = show_edge;
+                c.show_stack |= show_edge;
                 PaneKind::Chart(Box::new(c))
             }
             PaneSettings::Feed(f) => PaneKind::Feed { filter: f.map(Into::into).unwrap_or_default() },
@@ -673,6 +696,7 @@ impl PaneKind {
             PaneSettings::Research(scan) => PaneKind::Research(Box::new(research::ResearchPane::new(scan))),
             PaneSettings::Watchlist | PaneSettings::IntradayScan => PaneKind::Watchlist,
             PaneSettings::Help => PaneKind::Help,
+            PaneSettings::Health => PaneKind::Health,
             PaneSettings::Wei => PaneKind::Wei,
             PaneSettings::Curve => PaneKind::Curve,
             PaneSettings::Search(q) => PaneKind::Search { query: q },
@@ -908,6 +932,12 @@ pub struct Drag {
 pub struct TerminalApp {
     worker: Worker,
     provider: String,
+    data_mode: DataMode,
+    health: Snapshot,
+    quote_states: HashMap<String, FeedState>,
+    curve_state: FeedState,
+    last_health: Option<Instant>,
+    health_selected: Feed,
     panes: Vec<Pane>,
     dock: Node,
     focus: PaneId,
@@ -1101,6 +1131,12 @@ impl TerminalApp {
             holding_risk: Default::default(),
             trading: Default::default(),
             demo,
+            data_mode: worker.mode(),
+            health: worker.health().unwrap_or_else(|| tr_data::HealthBoard::new(&provider).snapshot()),
+            quote_states: Default::default(),
+            curve_state: Default::default(),
+            last_health: None,
+            health_selected: Feed::Bars,
             worker,
             provider,
             panes: Vec::new(),
@@ -1383,6 +1419,7 @@ impl TerminalApp {
             Function::StackLadder(frames) => self.with_chart(|c, w| c.set_stack_ladder(frames, w)),
             Function::StackTint(on) => self.with_chart(|c, w| c.set_stack_tint(on, w)),
             Function::StackSession(on) => self.with_chart(|c, w| c.set_stack_session(on, w)),
+            Function::StackEdge(on) => self.with_chart(|c, w| c.set_stack_edge(on, w)),
             Function::TruthRail(on) => self.with_chart(|c, _| c.show_rail = on.unwrap_or(!c.show_rail)),
             Function::TrendStack(on) => self.with_chart(|c, w| c.set_trend_stack(on, w)),
             Function::Timeframe(tf) => self.with_chart(|c, w| c.set_timeframe(tf, w)),
@@ -1541,6 +1578,10 @@ impl TerminalApp {
                 }
             }
             Function::Help => self.open_panel(PaneKind::Help),
+            Function::Health => {
+                self.worker.send(Request::Health);
+                self.open_panel(PaneKind::Health);
+            }
             Function::Wei => {
                 self.last_wei = None;
                 self.open_panel(PaneKind::Wei);
@@ -1651,6 +1692,10 @@ impl TerminalApp {
                     if changed {
                         self.refresh_whats_news_panes();
                     }
+                }
+                Response::Health(snapshot) => self.health = snapshot,
+                Response::Feed { feed, pane, symbol, generation, state } => {
+                    self.on_feed(feed, pane, symbol, generation, state)
                 }
                 Response::HistoryStatus(result) => {
                     for pane in &mut self.panes {
@@ -1981,6 +2026,7 @@ impl TerminalApp {
                         match book {
                             Ok(book) => {
                                 b.book = Some(book);
+                                b.last_ok = Some(chrono::Utc::now().timestamp());
                                 b.error = None;
                             }
                             Err(e) => b.error = Some(e),
@@ -2246,6 +2292,18 @@ impl TerminalApp {
         if other_text_focused {
             return;
         }
+        if !cmd_focused
+            && !self.focus_cmd
+            && self.cmd.is_empty()
+            && presses.iter().any(|(k, m)| *k == Key::R && !m.any())
+            && self.retry_focused()
+        {
+            ctx.input_mut(|i| {
+                i.consume_key(Modifiers::NONE, Key::R);
+                i.events.retain(|e| !matches!(e, Event::Text(t) if t.eq_ignore_ascii_case("r")));
+            });
+            return;
+        }
         if !cmd_focused && !self.focus_cmd && self.cmd.is_empty() && self.rotation_keys(ctx) {
             return;
         }
@@ -2437,6 +2495,12 @@ impl TerminalApp {
 
     fn periodic(&mut self) {
         let visible = self.visible_panes();
+        if visible.iter().any(|&i| matches!(self.panes[i].kind, PaneKind::Health))
+            && self.last_health.is_none_or(|t| t.elapsed() >= Duration::from_secs(1))
+        {
+            self.worker.send(Request::Health);
+            self.last_health = Some(Instant::now());
+        }
         let shown = |f: &dyn Fn(&PaneKind) -> bool| visible.iter().any(|&i| f(&self.panes[i].kind));
         let visible_wl = self.sidebar_open || shown(&|k| matches!(k, PaneKind::Watchlist));
         if visible_wl && self.last_quotes.is_none_or(|t| t.elapsed() > Duration::from_secs(20)) {
@@ -2477,7 +2541,10 @@ impl TerminalApp {
                     c.news_fetched = Some(Instant::now());
                     self.worker.send(Request::News { pane: p.id, symbols: Some(vec![c.symbol.clone()]) });
                 }
-                PaneKind::Options(o) if o.fetched.is_none_or(|t| t.elapsed() > Duration::from_secs(30)) => {
+                PaneKind::Options(o)
+                    if health_view::auto_retry_ready(&o.feed_state)
+                        && o.fetched.is_none_or(|t| t.elapsed() > Duration::from_secs(30)) =>
+                {
                     o.fetched = Some(Instant::now());
                     self.worker.send(Request::Options {
                         pane: p.id,
@@ -2485,7 +2552,10 @@ impl TerminalApp {
                         expiration: o.expiration,
                     });
                 }
-                PaneKind::OrderBook(b) if b.fetched.is_none_or(|t| t.elapsed() > Duration::from_millis(1000)) => {
+                PaneKind::OrderBook(b)
+                    if health_view::auto_retry_ready(&b.feed_state)
+                        && b.fetched.is_none_or(|t| t.elapsed() > Duration::from_millis(1000)) =>
+                {
                     b.fetched = Some(Instant::now());
                     self.worker.send(Request::OrderBook { pane: p.id, symbol: b.symbol.clone(), depth: b.depth });
                 }
@@ -2766,6 +2836,12 @@ mod tests {
             demo,
             worker,
             provider: "sample".into(),
+            data_mode: DataMode::ExplicitSample,
+            health: tr_data::HealthBoard::new("sample").snapshot(),
+            quote_states: Default::default(),
+            curve_state: Default::default(),
+            last_health: None,
+            health_selected: Feed::Bars,
             panes: Vec::new(),
             dock: Node::default(),
             focus: 0,

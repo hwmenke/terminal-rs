@@ -43,6 +43,8 @@ pub struct TrendStack {
     pub mb: Vec<f64>,
     pub confidence: Vec<f64>,
     pub medium: Vec<i8>,
+    pub entry_long: Vec<bool>,
+    pub entry_short: Vec<bool>,
     pub score: Option<StackScore>,
 }
 
@@ -240,6 +242,8 @@ pub fn trend_stack(
         mb: base_trend.mb,
         confidence: base_trend.confidence,
         medium: base_trend.medium_state,
+        entry_long: base_trend.entry_long,
+        entry_short: base_trend.entry_short,
         score,
     })
 }

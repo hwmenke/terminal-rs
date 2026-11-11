@@ -105,6 +105,8 @@ pub enum PaneSettings {
         stack_session: bool,
         #[serde(default = "yes")]
         show_rail: bool,
+        #[serde(default)]
+        show_edge: bool,
     },
     /// Congress feed with its filter (`None` = unfiltered).
     Feed(Option<FeedSettings>),
@@ -118,6 +120,7 @@ pub enum PaneSettings {
     /// Watchlist pane showing the intraday scan. Older layouts store plain `Watchlist`.
     IntradayScan,
     Help,
+    Health,
     Wei,
     Curve,
     Search(String),
@@ -522,6 +525,7 @@ pub fn chart_settings(symbol: &str, d: &crate::prefs::PanelDefaults) -> PaneSett
         stack_tint: false,
         stack_session: false,
         show_rail: true,
+        show_edge: false,
     }
 }
 
@@ -682,6 +686,20 @@ impl Store {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn edge_layout_round_trip_defaults_off() {
+        let mut settings = chart_settings("AAPL", &Default::default());
+        if let PaneSettings::Chart { show_edge, .. } = &mut settings {
+            *show_edge = true;
+        }
+        let mut value = serde_json::to_value(&settings).unwrap();
+        assert_eq!(serde_json::from_value::<PaneSettings>(value.clone()).unwrap(), settings);
+        value["Chart"].as_object_mut().unwrap().remove("show_edge");
+        assert!(matches!(
+            serde_json::from_value::<PaneSettings>(value).unwrap(),
+            PaneSettings::Chart { show_edge: false, .. }
+        ));
+    }
+    #[test]
     fn stack_settings_round_trip_and_old_layouts_load_auto_tint_off_rail_on() {
         let mut settings = chart_settings("AAPL", &Default::default());
         if let PaneSettings::Chart { stack_ladder, stack_tint, stack_session, show_rail, .. } = &mut settings {
@@ -736,6 +754,7 @@ mod tests {
                 stack_tint: false,
                 stack_session: false,
                 show_rail: true,
+                show_edge: false,
                 ..
             }
         ));
@@ -959,6 +978,7 @@ mod tests {
                 stack_tint: false,
                 stack_session: false,
                 show_rail: true,
+                show_edge: false,
             }],
         );
         let back = LayoutDoc::from_json(&doc.to_json()).unwrap();

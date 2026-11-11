@@ -21,6 +21,9 @@ const VISIBLE_ROWS: usize = 10;
 /// Function codes offered by the palette: code, description (empty uses the command
 /// line's own hint), extra search words, and the action whose shortcut is shown.
 const COMMANDS: &[(&str, &str, &str, Option<Action>)] = &[
+    ("TSTACK EDGE", "Regime-conditional forward returns and confidence intervals", "quant edge hit rate flips", None),
+    ("ZBAND", "Rolling sample-sigma bands and z readout", "statistics sigma bands", None),
+    ("HEALTH", "Real data feed health", "src source offline stale retry", None),
     ("PORT", "", "portfolio prtu brokerage holdings value", Some(Action::Portfolio)),
     ("ACCT", "", "accounts balances brokerage", None),
     ("POS", "", "positions holdings brokerage", Some(Action::Positions)),

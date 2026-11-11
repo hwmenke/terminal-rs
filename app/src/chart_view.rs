@@ -217,7 +217,16 @@ struct RailPaint {
     mesh: Arc<egui::Mesh>,
 }
 
+#[derive(Default)]
+struct EdgePaint {
+    cells: Vec<(String, String, String)>,
+    footer: String,
+    extent: f64,
+}
+
 pub struct ChartState {
+    pub feed_state: tr_data::FeedState,
+    feed_observed: i64,
     pub id: PaneId,
     pub archive: bool,
     /// Named watchlist used by bracket / Alt+arrow quick-switching.
@@ -255,6 +264,10 @@ pub struct ChartState {
     pub stack_tint: bool,
     pub stack_session: bool,
     pub show_rail: bool,
+    pub show_edge: bool,
+    edge: Option<Result<tr_data::edge::EdgeReport, String>>,
+    edge_paint: EdgePaint,
+    zband_paint: StackPaint,
     tint_ref: Option<TintRef>,
     tint_revision: u64,
     rail_paint: RailPaint,
@@ -364,11 +377,17 @@ impl ChartState {
             stack_tint: false,
             stack_session: false,
             show_rail: true,
+            show_edge: false,
+            edge: None,
+            edge_paint: Default::default(),
+            zband_paint: Default::default(),
             tint_ref: None,
             tint_revision: u64::MAX,
             rail_paint: Default::default(),
             stack: None,
             stack_error: None,
+            feed_state: Default::default(),
+            feed_observed: 0,
             last_intraday_tf: if tf.is_intraday() { tf } else { Timeframe::M5 },
             stack_pulse: None,
             stack_paint: Default::default(),
@@ -466,9 +485,30 @@ impl ChartState {
         self.bars.is_empty()
     }
 
+    pub fn on_feed(&mut self, generation: Option<u64>, state: tr_data::FeedState) {
+        if generation.is_some_and(|g| g != self.generation) {
+            return;
+        }
+        if !matches!(state, tr_data::FeedState::Unknown) {
+            self.loading = false;
+        }
+        self.feed_state = state;
+        self.feed_observed = chrono::Utc::now().timestamp();
+    }
+    pub fn feed_display(&self) -> tr_data::FeedState {
+        let mut state = self.feed_state.clone();
+        if let tr_data::FeedState::Stale { age_secs, .. } = &mut state {
+            *age_secs += (chrono::Utc::now().timestamp() - self.feed_observed).max(0);
+        }
+        state
+    }
+
     /// (Re)load history for the current symbol and timeframe.
     pub fn load(&mut self, w: &Worker) {
         self.generation += 1;
+        self.edge = None;
+        self.zband_paint = Default::default();
+        self.feed_state = Default::default();
         self.stack = None;
         self.tint_ref = None;
         self.rail_paint = Default::default();
@@ -698,6 +738,11 @@ impl ChartState {
     }
 
     pub fn toggle_indicator(&mut self, spec: IndicatorSpec, w: &Worker) {
+        if spec.code == "ADTREND" {
+            self.stack_config_revision = self.stack_config_revision.wrapping_add(1);
+            self.stack = None;
+            self.edge = None;
+        }
         if let Some(i) = self.indicators.iter().position(|s| s.same_kind(&spec)) {
             if self.indicators[i] == spec {
                 self.indicators.remove(i);
@@ -712,12 +757,22 @@ impl ChartState {
 
     /// Remove every instance of the indicator `code` (all moving averages of one kind).
     fn remove_indicator(&mut self, code: &str, w: &Worker) {
+        if code == "ADTREND" {
+            self.stack_config_revision = self.stack_config_revision.wrapping_add(1);
+            self.stack = None;
+            self.edge = None;
+        }
+        self.zband_paint.key.clear();
         self.indicators.retain(|s| s.code != code);
         self.built.retain(|b| b.spec.code != code);
         self.request_indicators(w);
     }
 
     pub fn clear_indicators(&mut self) {
+        self.stack_config_revision = self.stack_config_revision.wrapping_add(1);
+        self.stack = None;
+        self.edge = None;
+        self.zband_paint = Default::default();
         self.indicators.clear();
         self.built.clear();
     }
@@ -985,10 +1040,99 @@ impl ChartState {
         if self.show_stack {
             self.request_trend_stack(w);
         } else {
+            self.show_edge = false;
+            self.edge = None;
             self.stack = None;
             self.stack_pulse = None;
             self.stack_paint = Default::default();
             self.previous_stack_lanes = None;
+        }
+    }
+
+    pub fn set_stack_edge(&mut self, on: Option<bool>, w: &Worker) {
+        self.show_edge = on.unwrap_or(!self.show_edge);
+        if self.show_edge {
+            self.set_trend_stack(Some(true), w);
+            self.refresh_edge();
+        }
+    }
+    fn refresh_edge(&mut self) {
+        if !self.show_edge {
+            return;
+        }
+        let gate = tr_data::stats::require_research_bars(&self.bars, "TSTACK Edge");
+        self.edge = if let Err(e) = gate {
+            Some(Err(e))
+        } else if let Some(stack) = &self.stack {
+            // The current bucket is conservatively pending until a successor bucket exists.
+            let now = chrono::Utc::now().timestamp();
+            let n = self.bars.len()
+                - usize::from(
+                    !self.archive
+                        && self.bars.last().is_some_and(|b| self.tf.bucket_start(b.ts) == self.tf.bucket_start(now)),
+                );
+            let state: Vec<_> =
+                stack.medium.iter().zip(&stack.confidence).take(n).map(|(&s, c)| c.is_finite().then_some(s)).collect();
+            Some(tr_data::edge::regime_edge(
+                &self.bars[..n],
+                &state,
+                &stack.entry_long[..n],
+                &stack.entry_short[..n],
+                &[1, 5, 20],
+            ))
+        } else {
+            self.stack_error.clone().map(Err)
+        };
+        self.edge_paint = EdgePaint::default();
+        if let Some(Ok(report)) = &self.edge {
+            for cell in &report.cells {
+                let (mean, detail, tooltip) = if let Some(s) = &cell.stats {
+                    (
+                        format!("{:+.0}bp", s.mean * 1e4),
+                        format!("hit {:.0}% · n {}", s.hit_rate * 100.0, cell.n),
+                        format!(
+                            "median {:+.0}bp · std {:.0}bp\nn {} → n_eff {:.1}\nCI [{:+.0}, {:+.0}]bp · t {}\nhit Wilson [{:.0}, {:.0}]%\nΔ {:+.0}bp · Welch t {}",
+                            s.median * 1e4,
+                            s.std * 1e4,
+                            cell.n,
+                            cell.n_eff,
+                            s.ci95.0 * 1e4,
+                            s.ci95.1 * 1e4,
+                            s.t.map(|v| format!("{v:.1}")).unwrap_or_else(|| "—".into()),
+                            s.hit_ci95.0 * 100.0,
+                            s.hit_ci95.1 * 100.0,
+                            s.delta.unwrap_or(0.0) * 1e4,
+                            s.welch_t.map(|v| format!("{v:.1}")).unwrap_or_else(|| "—".into())
+                        ),
+                    )
+                } else {
+                    (
+                        String::new(),
+                        format!("n {}", cell.n),
+                        format!("n {} → n_eff {:.1} · statistics suppressed", cell.n, cell.n_eff),
+                    )
+                };
+                let span = cell
+                    .span
+                    .map(|(a, b)| format!("\n{} – {}", tr_data::stats::bar_date(a), tr_data::stats::bar_date(b)))
+                    .unwrap_or_default();
+                self.edge_paint.cells.push((mean, detail, tooltip + &span));
+                if let Some(s) = &cell.stats {
+                    self.edge_paint.extent = self.edge_paint.extent.max(s.ci95.0.abs()).max(s.ci95.1.abs());
+                }
+            }
+            let c = &report.flips;
+            self.edge_paint.footer = if let Some(s) = &c.stats {
+                format!(
+                    "FLIPS 5b · hit {:.0}% · n {} · t {} · vs base {:+.0}bp",
+                    s.hit_rate * 100.0,
+                    c.n,
+                    s.t.map(|t| format!("{t:.1}")).unwrap_or_else(|| "—".into()),
+                    s.delta.unwrap_or(0.0) * 1e4
+                )
+            } else {
+                format!("FLIPS 5b · n {} · LOW N", c.n)
+            };
         }
     }
 
@@ -1058,6 +1202,7 @@ impl ChartState {
             }
         }
         self.stack_revision = self.stack_revision.wrapping_add(1);
+        self.refresh_edge();
         self.tint_ref = None;
         self.stack_paint.key.clear();
     }
@@ -1264,6 +1409,11 @@ impl ChartState {
         if generation != self.generation {
             return;
         }
+        if !from_cache && prepended == 0 {
+            self.on_feed(Some(generation), tr_data::FeedState::Live { last_ok: chrono::Utc::now().timestamp() });
+        }
+        self.edge = None;
+        self.zband_paint.key.clear();
         if live {
             self.last_live = Some(std::time::Instant::now());
         }
@@ -1352,6 +1502,7 @@ impl ChartState {
     pub fn on_indicators(&mut self, generation: u64, built: Vec<BuiltIndicator>) {
         if generation == self.generation {
             // An in-flight computation may finish after a study was removed.
+            self.zband_paint.key.clear();
             self.built = built.into_iter().filter(|b| self.indicators.contains(&b.spec)).collect();
         }
     }
@@ -1556,6 +1707,17 @@ impl ChartState {
         if let Some(error) = &self.error {
             ui.interact(range_row, ui.id().with((self.id, "refresh_error")), Sense::hover()).on_hover_text(error);
         }
+        if matches!(self.feed_state, tr_data::FeedState::Stale { .. }) {
+            let mut chip_ui = ui.new_child(
+                UiBuilder::new()
+                    .max_rect(Rect::from_min_size(
+                        pos2(rect.left() + 8.0, header.bottom() + 2.0),
+                        vec2((rect.width() - 16.0).max(0.0), 16.0),
+                    ))
+                    .id_salt((self.id, "stale-chip")),
+            );
+            crate::widgets::stale_chip(&mut chip_ui, &self.feed_display());
+        }
         let status = match (&self.error, self.loading, self.paging) {
             (Some(_), _, _) => "STALE / ERR · retry pending".into(),
             (_, true, _) => "loading…".into(),
@@ -1593,8 +1755,15 @@ impl ChartState {
                 Color32::WHITE,
             );
         }
-        let body =
-            Rect::from_min_max(pos2(rect.left(), header.bottom() + warning_h), pos2(rect.right(), range_row.top()));
+        let body = Rect::from_min_max(
+            pos2(
+                rect.left(),
+                header.bottom()
+                    + warning_h
+                    + if matches!(self.feed_state, tr_data::FeedState::Stale { .. }) { 20.0 } else { 0.0 },
+            ),
+            pos2(rect.right(), range_row.top()),
+        );
         let plot_area = Rect::from_min_max(body.min, pos2(body.right() - AXIS_W, body.bottom() - TIME_H));
         let rail_h = if self.show_rail && self.tf.is_intraday() && plot_area.height() >= 160.0 { 5.0 } else { 0.0 };
         let plot_all = Rect::from_min_max(plot_area.min, pos2(plot_area.right(), plot_area.bottom() - rail_h));
@@ -1616,7 +1785,18 @@ impl ChartState {
                     "No bars available".into()
                 }
             });
-            painter.text(plot_all.center(), Align2::CENTER_CENTER, msg, mono(13.0), amber_dim());
+            if self.feed_state.is_down() || self.error.is_some() {
+                let state = if self.feed_state.is_down() {
+                    self.feed_state.clone()
+                } else {
+                    tr_data::FeedState::Unsupported { reason: msg }
+                };
+                if crate::widgets::unavailable_card(ui, plot_all, &state) {
+                    w.send(Request::RetryFeed { feed: tr_data::Feed::Bars, pane: Some(self.id) });
+                }
+            } else {
+                painter.text(plot_all.center(), Align2::CENTER_CENTER, msg, mono(13.0), amber_dim());
+            }
             if self.show_stack {
                 self.paint_stack_hud(&painter, plot_all, plot_all.top() + 4.0);
                 if stack_h > 0.0 {
@@ -1852,6 +2032,8 @@ impl ChartState {
             let y = price_rect.top() + scale.y_of(*t) as f32;
             price_painter.hline(price_rect.x_range(), y, Stroke::new(1.0, theme::grid()));
         }
+        self.prepare_zband_paint(price_rect, &v, &scale);
+        ui.painter_at(price_rect).extend(self.zband_paint.cloud.iter().cloned());
         if self.show_stack {
             self.prepare_stack_paint(price_rect, stack_rect, &v, &scale);
             self.paint_stack_cloud(ui, price_rect, &v, &scale, &reveal);
@@ -2055,6 +2237,10 @@ impl ChartState {
             }
         }
         self.paint_legend(ui, price_rect, hovered_bar.unwrap_or(len.saturating_sub(1)), &sub_rects);
+        if self.show_edge {
+            self.paint_flip_outcomes(ui, price_rect, &v, &scale);
+            self.paint_edge_card(ui, price_rect);
+        }
         if matches!(self.sec.class, tr_core::AssetClass::Equity | tr_core::AssetClass::Etf) {
             clicked |= self.trade_buttons(ui, plot_all);
         }
@@ -2339,6 +2525,228 @@ impl ChartState {
         }
     }
 
+    fn paint_edge_card(&self, ui: &mut Ui, price: Rect) {
+        let rect = Rect::from_min_size(
+            pos2((price.right() - 452.0).max(price.left() + 4.0), price.top() + 28.0),
+            vec2((price.width().min(448.0) - 8.0).max(0.0), 240.0_f32.min((price.height() - 32.0).max(0.0))),
+        );
+        if let Some(Err(error)) = &self.edge {
+            crate::widgets::unavailable_card(
+                ui,
+                rect,
+                &tr_data::FeedState::Unsupported {
+                    reason: "Edge requires verified, consistently sourced history".into(),
+                },
+            );
+            ui.interact(rect, ui.id().with((self.id, "edge-refusal")), Sense::hover()).on_hover_text(error);
+            return;
+        }
+        let p = ui.painter_at(price);
+        if rect.width() < 330.0 || rect.height() < 220.0 {
+            p.text(rect.right_top() + vec2(-4.0, 4.0), Align2::RIGHT_TOP, "EDGE · widen pane", mono(10.0), muted());
+            return;
+        }
+        let Some(Ok(report)) = &self.edge else {
+            p.text(
+                rect.right_top() + vec2(-4.0, 4.0),
+                Align2::RIGHT_TOP,
+                "EDGE · waiting for closed verified bars",
+                mono(10.0),
+                muted(),
+            );
+            return;
+        };
+        crate::widgets::data_card(&p, rect, "TSTACK EDGE", muted(), false);
+        if report.flip_outcomes.iter().any(|f| f.value.is_none()) {
+            let mut child = ui.new_child(
+                UiBuilder::new()
+                    .max_rect(Rect::from_min_size(pos2(rect.right() - 68.0, rect.top() + 6.0), vec2(64.0, 16.0)))
+                    .id_salt((self.id, "edge-pending")),
+            );
+            crate::widgets::chip(&mut child, crate::widgets::ChipKind::Neutral, "PENDING");
+        }
+        let col_width = (rect.width() - 40.0) / 3.0;
+        let extent = self.edge_paint.extent.max(1e-8) * 1.08;
+        for (col, h) in ["1 bar", "5 bars", "20 bars"].iter().enumerate() {
+            p.text(
+                pos2(rect.left() + 40.0 + (col as f32 + 0.5) * col_width, rect.top() + 30.0),
+                Align2::CENTER_CENTER,
+                *h,
+                mono(10.0),
+                muted(),
+            );
+        }
+        for (row, (regime, label)) in [(1, "UP"), (0, "FLAT"), (-1, "DN")].into_iter().enumerate() {
+            let top = rect.top() + 44.0 + row as f32 * 48.0;
+            let row_rect = Rect::from_min_size(pos2(rect.left() + 4.0, top), vec2(rect.width() - 8.0, 47.0));
+            if report.current_regime == Some(regime) {
+                p.rect_filled(row_rect, 2.0, stack_color(regime).gamma_multiply(0.12));
+            }
+            p.text(pos2(rect.left() + 6.0, top + 23.0), Align2::LEFT_CENTER, label, mono(10.0), stack_color(regime));
+            for col in 0..3 {
+                let index = col * 3 + row;
+                let Some(cell) = report.cells.get(index) else { continue };
+                let Some((mean, detail, tooltip)) = self.edge_paint.cells.get(index) else { continue };
+                let r =
+                    Rect::from_min_size(pos2(rect.left() + 40.0 + col as f32 * col_width, top), vec2(col_width, 47.0));
+                let ink = stack_color(regime);
+                let axis = |x: f64| r.center().x + (x / extent) as f32 * (r.width() / 2.0 - 8.0);
+                p.text(pos2(r.right() - 4.0, top + 6.0), Align2::RIGHT_CENTER, mean, mono(10.0), ink);
+                if cell.low_n {
+                    let mut child = ui.new_child(
+                        UiBuilder::new()
+                            .max_rect(Rect::from_min_size(pos2(r.left() + 2.0, top - 2.0), vec2(44.0, 16.0)))
+                            .id_salt((self.id, "edge-low-n", index)),
+                    );
+                    crate::widgets::chip(&mut child, crate::widgets::ChipKind::Caution, "LOW N");
+                }
+                if let Some(s) = &cell.stats {
+                    let y = top + 22.0;
+                    p.vline(axis(0.0), y - 5.0..=y + 5.0, Stroke::new(1.0, theme::border()));
+                    let a = pos2(axis(s.ci95.0), y);
+                    let b = pos2(axis(s.ci95.1), y);
+                    if !cell.low_n && (s.ci95.0 > 0.0 || s.ci95.1 < 0.0) {
+                        p.line_segment([a, b], Stroke::new(2.0, ink));
+                    } else {
+                        p.rect_stroke(
+                            Rect::from_min_max(a - vec2(0.0, 1.0), b + vec2(0.0, 1.0)),
+                            0.0,
+                            Stroke::new(1.0, ink),
+                            StrokeKind::Inside,
+                        );
+                    }
+                    for at in [a, b] {
+                        p.line_segment([at - vec2(0.0, 3.0), at + vec2(0.0, 3.0)], Stroke::new(1.0, ink));
+                    }
+                    let center = pos2(axis(s.mean), y);
+                    if !cell.low_n && (s.ci95.0 > 0.0 || s.ci95.1 < 0.0) {
+                        p.circle_filled(center, 3.0, ink);
+                    } else {
+                        p.circle_stroke(center, 3.0, Stroke::new(1.0, ink));
+                    }
+                }
+                p.text(pos2(r.right() - 4.0, top + 38.0), Align2::RIGHT_CENTER, detail, mono(9.0), muted());
+                ui.interact(r, ui.id().with((self.id, "edge-cell", index)), Sense::hover()).on_hover_text(tooltip);
+            }
+        }
+        p.text(
+            pos2(rect.right() - 8.0, rect.top() + 200.0),
+            Align2::RIGHT_CENTER,
+            &self.edge_paint.footer,
+            mono(9.0),
+            text(),
+        );
+        crate::widgets::card_footer(&p, rect, "mean ± 95% CI · n_eff = n/h · descriptive");
+    }
+
+    fn paint_flip_outcomes(&self, ui: &Ui, rect: Rect, v: &Viewport, scale: &PriceScale) {
+        let Some(Ok(report)) = &self.edge else { return };
+        let p = ui.painter_at(rect);
+        let (lo, hi) = v.visible_range(self.bars.len());
+        let draw = |index: usize, direction: i8, value: Option<f64>| {
+            if index < lo || index >= hi {
+                return;
+            }
+            let bar = &self.bars[index];
+            let at = pos2(
+                rect.left() + v.x_center(index) as f32,
+                rect.top()
+                    + scale.y_of(if direction > 0 { bar.low } else { bar.high }) as f32
+                    + if direction > 0 { 7.0 } else { -7.0 },
+            );
+            if !at.y.is_finite() {
+                return;
+            }
+            if let Some(value) = value {
+                let color = stack_color(direction);
+                p.circle_filled(at, 2.5, color);
+                let tick = at + vec2(7.0, 0.0);
+                if value > 0.0 {
+                    p.circle_filled(tick, 2.5, color);
+                } else {
+                    p.circle_stroke(tick, 2.5, Stroke::new(1.0, color));
+                }
+            } else {
+                p.circle_stroke(at, 4.0, Stroke::new(1.0, muted()));
+            }
+        };
+        for f in &report.flip_outcomes {
+            draw(f.index, f.direction, f.value);
+        }
+        if let Some(stack) = &self.stack {
+            for i in report.bars..self.bars.len() {
+                if stack.entry_long.get(i) == Some(&true) {
+                    draw(i, 1, None);
+                } else if stack.entry_short.get(i) == Some(&true) {
+                    draw(i, -1, None);
+                }
+            }
+        }
+    }
+
+    fn prepare_zband_paint(&mut self, rect: Rect, v: &Viewport, scale: &PriceScale) {
+        if !self.built.iter().any(|b| b.spec.code == "ZBAND" && b.refused.is_none()) {
+            self.zband_paint.cloud.clear();
+            return;
+        }
+        let key = [
+            self.gpu.as_ref().map_or(0, |g| g.bars.key),
+            v.left().to_bits(),
+            v.bar_px.to_bits(),
+            scale.lo.to_bits(),
+            scale.hi.to_bits(),
+            u64::from(scale.log),
+            rect.left().to_bits() as u64,
+            rect.top().to_bits() as u64,
+            rect.width().to_bits() as u64,
+            rect.height().to_bits() as u64,
+            u32::from_le_bytes(theme::text().to_array()) as u64,
+        ];
+        if self.zband_paint.key.as_slice() == key.as_slice() {
+            return;
+        }
+        let mut cloud = Vec::new();
+        let (lo, hi) = v.visible_range(self.bars.len());
+        for band in self.built.iter().filter(|b| b.spec.code == "ZBAND" && b.overlays.len() == 5) {
+            let mut mesh = egui::Mesh::default();
+            let mut previous: Option<(u32, f32)> = None;
+            let rgba = band.overlays[2].1.color;
+            let color = Color32::from_rgb((rgba[0] * 255.0) as u8, (rgba[1] * 255.0) as u8, (rgba[2] * 255.0) as u8);
+            for i in lo..hi {
+                let values: [f64; 5] = std::array::from_fn(|k| {
+                    band.overlays[k].1.line.pyramid.data.get(i).map_or(f64::NAN, |p| p[1] as f64)
+                });
+                if values.iter().any(|v| !v.is_finite()) {
+                    previous = None;
+                    continue;
+                }
+                let x = rect.left() + v.x_center(i) as f32;
+                if previous.is_some_and(|(_, px)| x - px < 2.0) && i + 1 < hi {
+                    continue;
+                }
+                let base = mesh.vertices.len() as u32;
+                // Duplicate shared boundaries so the inner fill can have its own opacity.
+                for (upper, lower, alpha) in [(0, 1, 0.045), (1, 3, 0.13), (3, 4, 0.045)] {
+                    for k in [upper, lower] {
+                        mesh.colored_vertex(
+                            pos2(x, rect.top() + scale.y_of(values[k]) as f32),
+                            color.gamma_multiply(alpha),
+                        );
+                    }
+                }
+                if let Some((prev, _)) = previous {
+                    for k in [0, 2, 4] {
+                        mesh.add_triangle(prev + k, prev + k + 1, base + k);
+                        mesh.add_triangle(prev + k + 1, base + k + 1, base + k);
+                    }
+                }
+                previous = Some((base, x));
+            }
+            cloud.push(egui::Shape::mesh(mesh));
+        }
+        self.zband_paint = StackPaint { key: key.to_vec(), cloud, lanes: Vec::new() };
+    }
+
     fn paint_legend(&self, ui: &Ui, price_rect: Rect, i: usize, sub_rects: &[(Rect, usize, PriceScale)]) {
         let Some(b) = self.bars.get(i) else { return };
         let p = ui.painter_at(price_rect);
@@ -2403,7 +2811,12 @@ impl ChartState {
                 .filter_map(|(_, o)| value_at(&o.line).map(|v| format!("{v:.prec$}", prec = dec.min(4))))
                 .collect();
             let c = bi.overlays.get(bi.overlays.len() / 2).map_or(text(), |o| opaque(&o.1));
-            let title = if bi.spec.code == "VWAP" {
+            let title = if bi.spec.code == "ZBAND" {
+                match bi.z_readout.as_ref().and_then(|z| z.get(i)).filter(|z| z.is_finite()) {
+                    Some(z) => format!("{} · z {z:+.1}", bi.spec.label()),
+                    None => format!("{} · z —", bi.spec.label()),
+                }
+            } else if bi.spec.code == "VWAP" {
                 bi.overlays.first().map(|(n, _)| n.clone()).unwrap_or_else(|| bi.spec.label())
             } else {
                 bi.spec.label()
@@ -3807,6 +4220,58 @@ mod tests {
         let result = tr_core::indicators::trend_stack(&bars, c.tf, lanes, Default::default());
         c.on_trend_stack(c.generation, bars.len(), result);
         c
+    }
+    #[test]
+    fn edge_error_card_paints_zero_digits() {
+        let ctx = egui::Context::default();
+        let mut c = ChartState::new(1, "AAPL", Timeframe::D1);
+        c.show_edge = true;
+        c.edge = Some(Err("TSTACK Edge refused: SAMPLE DATA".into()));
+        let mut output = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(800.0, 600.0))),
+                ..Default::default()
+            },
+            |ui| c.paint_edge_card(ui, Rect::from_min_size(pos2(0.0, 0.0), vec2(800.0, 500.0))),
+        );
+        output.textures_delta.clear();
+        assert!(stack_has_text(&output.shapes, "NO REAL DATA"));
+        fn digits(s: &egui::Shape) -> bool {
+            match s {
+                egui::Shape::Text(t) => t.galley.job.text.chars().any(|c| c.is_ascii_digit()),
+                egui::Shape::Vec(v) => v.iter().any(digits),
+                _ => false,
+            }
+        }
+        assert!(!output.shapes.iter().any(|s| digits(&s.shape)));
+    }
+    #[test]
+    fn edge_refuses_mixed_cache_and_pending_bar_never_completes_an_outcome() {
+        let (worker, _) = Worker::test_channel();
+        let mut c = stack_chart(&worker, Provenance::Real);
+        c.show_edge = true;
+        c.refresh_edge();
+        assert!(matches!(c.edge, Some(Ok(_))));
+        let mut bars = (*c.bars).clone();
+        bars[0].provenance = Provenance::Cached;
+        c.bars = Arc::new(bars);
+        c.refresh_edge();
+        assert!(matches!(c.edge, Some(Err(_))));
+        let mut c = stack_chart(&worker, Provenance::Real);
+        c.show_edge = true;
+        c.archive = false;
+        let now = chrono::Utc::now().timestamp();
+        let tf = c.tf;
+        let mut bars = (*c.bars).clone();
+        let shift = tf.bucket_start(now) - bars.last().unwrap().ts;
+        for b in &mut bars {
+            b.ts += shift;
+        }
+        c.bars = Arc::new(bars);
+        c.refresh_edge();
+        let r = c.edge.as_ref().unwrap().as_ref().unwrap();
+        assert_eq!(r.bars, c.bars.len() - 1);
+        assert!(r.completed.iter().all(|o| o.index + o.horizon < r.bars));
     }
     #[test]
     fn tint_buffer_is_neutral_for_refused_stale_or_sample_stack() {

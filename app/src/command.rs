@@ -218,6 +218,7 @@ pub enum Function {
     StackTint(Option<bool>),
     StackSession(Option<bool>),
     TruthRail(Option<bool>),
+    StackEdge(Option<bool>),
     ChartType(ChartType),
     /// Add or remove an indicator (any code from the catalog: `RSI`, `BB 20 2.5`, `ICHIMOKU`).
     Indicator(IndicatorSpec),
@@ -301,6 +302,7 @@ pub enum Function {
     Title(String),
     ClosePane,
     Help,
+    Health,
     /// World equity indices / markets overview.
     Wei,
     /// US Treasury yield curve.
@@ -636,6 +638,7 @@ fn parse_function(head: &str, rest: &[&str]) -> Option<Function> {
             [arg] if arg.eq_ignore_ascii_case("ON") => Function::TrendStack(Some(true)),
             [arg] if arg.eq_ignore_ascii_case("OFF") => Function::TrendStack(Some(false)),
             [arg] if arg.eq_ignore_ascii_case("AUTO") => Function::StackLadder(None),
+            [arg, tail @ ..] if arg.eq_ignore_ascii_case("EDGE") => Function::StackEdge(parse_switch(tail)?),
             [arg, tail @ ..] if arg.eq_ignore_ascii_case("TINT") => Function::StackTint(parse_switch(tail)?),
             [arg, tail @ ..] if arg.eq_ignore_ascii_case("SESSION") => Function::StackSession(parse_switch(tail)?),
             _ => {
@@ -673,6 +676,7 @@ fn parse_function(head: &str, rest: &[&str]) -> Option<Function> {
         "CLOSE" => Function::ClosePane,
         "HELP" | "?" | "H" => Function::Help,
         "WEI" | "MARKETS" | "WORLD" => Function::Wei,
+        "HEALTH" | "SRC" => Function::Health,
         "GC" | "YCRV" | "CURVE" | "YC" => Function::Curve,
         "SECF" | "SEARCH" | "FIND" => Function::Search(joined()),
         "PORT" | "PORTFOLIO" | "PRTU" => Function::Portfolio(PortView::Summary, words().join(" ")),
@@ -819,6 +823,7 @@ fn describe(f: &Function) -> String {
         Function::StackLadder(frames) => format!("Trend Stack ladder {}", frames.as_ref().map(|f| f.iter().map(|t| t.label()).collect::<Vec<_>>().join("·")).unwrap_or_else(|| "AUTO".into())),
         Function::StackTint(_) => "Regime Candle tint".into(),
         Function::StackSession(_) => "Trend Stack session anchor".into(),
+        Function::StackEdge(_) => "Trend Stack regime Edge study".into(),
         Function::TruthRail(_) => "Truth Rail".into(),
         Function::TrendStack(on) => format!("Trend Stack{}", match on { None => " toggle", Some(true) => " on", Some(false) => " off" }),
         Function::Timeframe(tf) => format!(
@@ -905,6 +910,7 @@ fn describe(f: &Function) -> String {
         Function::ClosePane => "Close focused pane".into(),
         Function::Help => "Help".into(),
         Function::Wei => "World markets overview".into(),
+        Function::Health => "Real data feed health".into(),
         Function::Curve => "US Treasury yield curve".into(),
         Function::Search(q) => format!("Search securities: {q}"),
         Function::Portfolio(v, a) if a.is_empty() => match v {
@@ -1078,6 +1084,23 @@ fn describe(f: &Function) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn tstack_edge_command() {
+        for (text, on) in [("TSTACK EDGE", None), ("TSTACK EDGE ON", Some(true)), ("TSTACK EDGE OFF", Some(false))] {
+            assert_eq!(parse(text), Some(Command::Function(Function::StackEdge(on))));
+        }
+        assert_eq!(
+            parse("AAPL TSTACK EDGE ON"),
+            Some(Command::SymbolFunction("AAPL US Equity".into(), Function::StackEdge(Some(true))))
+        );
+        assert!(matches!(parse("EDGE"), Some(Command::Symbol(_))));
+    }
+    #[test]
+    fn health_command_and_src_alias() {
+        assert_eq!(parse("HEALTH"), Some(Command::Function(Function::Health)));
+        assert_eq!(parse("SRC"), Some(Command::Function(Function::Health)));
+        assert!(matches!(parse("SRC US Equity"), Some(Command::Symbol(_))));
+    }
     #[test]
     fn tstack_ladder_tokens_parse() {
         use Timeframe::*;

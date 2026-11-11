@@ -44,6 +44,9 @@ impl SampleProvider {
 
 #[async_trait]
 impl MarketData for SampleProvider {
+    fn mode(&self) -> crate::DataMode {
+        crate::DataMode::ExplicitSample
+    }
     fn name(&self) -> &str {
         "sample"
     }
