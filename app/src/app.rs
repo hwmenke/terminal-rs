@@ -37,6 +37,7 @@ mod settings_writer;
 mod stats;
 mod theming;
 mod trading;
+mod trend_wall;
 mod volume_pace;
 mod watchlists;
 mod workspace;
@@ -115,6 +116,7 @@ pub enum PaneKind {
     /// Share of a list at or above the 09:30 open and session VWAP (`BRD`).
     Breadth(Box<session_breadth::BreadthPane>),
     Rotation(Box<rotation::RotationPane>),
+    TrendWall(Box<trend_wall::TrendWallPane>),
     /// Cumulative volume versus the usual pace of prior sessions (`VPACE`).
     VolumePace(Box<volume_pace::VolumePacePane>),
     RealizedVol(Box<realized_vol::RealizedVolPane>),
@@ -353,6 +355,7 @@ impl PaneKind {
             }
             PaneKind::Breadth(_) => "Breadth".into(),
             PaneKind::Rotation(_) => "Rotation".into(),
+            PaneKind::TrendWall(_) => "Trend Wall".into(),
             PaneKind::VolumePace(p) => {
                 if p.symbol.trim().is_empty() {
                     "Pace".into()
@@ -441,6 +444,7 @@ impl PaneKind {
             PaneKind::SessionPath(_) => "SPATH",
             PaneKind::Breadth(_) => "BRD",
             PaneKind::Rotation(_) => "RRG",
+            PaneKind::TrendWall(_) => "TWALL",
             PaneKind::VolumePace(_) => "VPACE",
             PaneKind::RealizedVol(_) => "RVAR",
             PaneKind::Autocorr(_) => "ACOR",
@@ -567,6 +571,7 @@ impl PaneKind {
             PaneKind::SessionPath(p) => {
                 PaneSettings::SessionPath { symbol: p.symbol.clone(), spec: p.spec.clone(), tf: p.tf.clone() }
             }
+            PaneKind::TrendWall(p) => PaneSettings::TrendWall { spec: p.spec.clone(), daily: p.daily, sort: p.sort },
             PaneKind::Rotation(p) => {
                 PaneSettings::Rotation { spec: p.spec.clone(), tail: p.tail as u8, table: p.show_table }
             }
@@ -722,6 +727,12 @@ impl PaneKind {
                     pane.tf = tf;
                 }
                 PaneKind::SessionPath(Box::new(pane))
+            }
+            PaneSettings::TrendWall { spec, daily, sort } => {
+                let mut p = trend_wall::TrendWallPane::new(spec);
+                p.daily = daily;
+                p.sort = sort;
+                PaneKind::TrendWall(Box::new(p))
             }
             PaneSettings::Rotation { spec, tail, table } => {
                 let mut p = rotation::RotationPane::new(spec);
@@ -1317,6 +1328,7 @@ impl TerminalApp {
                 self.open_intraday_compare(Some(&s), &spec)
             }
             Command::SymbolFunction(s, Function::SessionPath { spec }) => self.open_session_path(Some(&s), &spec),
+            Command::SymbolFunction(s, Function::TrendWall { spec }) => self.open_trend_wall(Some(&s), &spec),
             Command::SymbolFunction(s, Function::Rotation { spec }) => self.open_rotation(Some(&s), &spec),
             Command::SymbolFunction(s, Function::Breadth { spec }) => self.open_breadth(Some(&s), &spec),
             Command::SymbolFunction(s, Function::VolumePace { spec }) => self.open_volume_pace(Some(&s), &spec),
@@ -1545,6 +1557,7 @@ impl TerminalApp {
             Function::Lookalike { spec } => self.open_lookalike(symbol.as_deref(), &spec),
             Function::IntradayCompare { spec } => self.open_intraday_compare(symbol.as_deref(), &spec),
             Function::SessionPath { spec } => self.open_session_path(symbol.as_deref(), &spec),
+            Function::TrendWall { spec } => self.open_trend_wall(symbol.as_deref(), &spec),
             Function::Rotation { spec } => self.open_rotation(symbol.as_deref(), &spec),
             Function::Breadth { spec } => self.open_breadth(symbol.as_deref(), &spec),
             Function::VolumePace { spec } => self.open_volume_pace(symbol.as_deref(), &spec),
@@ -1734,6 +1747,20 @@ impl TerminalApp {
                         self.panes.iter_mut().find(|p| p.id == pane).map(|p| &mut p.kind)
                     {
                         p.accept(generation, result);
+                    }
+                }
+                Response::TrendWallRow { pane, generation, index, row } => {
+                    if let Some(PaneKind::TrendWall(p)) =
+                        self.panes.iter_mut().find(|p| p.id == pane).map(|p| &mut p.kind)
+                    {
+                        p.accept(generation, index, row);
+                    }
+                }
+                Response::TrendWallDone { pane, generation, error } => {
+                    if let Some(PaneKind::TrendWall(p)) =
+                        self.panes.iter_mut().find(|p| p.id == pane).map(|p| &mut p.kind)
+                    {
+                        p.done(generation, error);
                     }
                 }
                 Response::Rotation { pane, generation, result } => {
@@ -2203,6 +2230,9 @@ impl TerminalApp {
         if !cmd_focused && !self.focus_cmd && self.cmd.is_empty() && self.rotation_keys(ctx) {
             return;
         }
+        if !cmd_focused && !self.focus_cmd && self.cmd.is_empty() && self.wall_keys(ctx) {
+            return;
+        }
         if !cmd_focused && !self.focus_cmd && self.cmd.is_empty() && self.workflow_keys(ctx) {
             return;
         }
@@ -2443,6 +2473,7 @@ impl TerminalApp {
                 _ => {}
             }
         }
+        self.trend_wall_periodic(&visible);
         self.broker_periodic(&visible);
         if let Some((q, at)) = &self.search_pending
             && at.elapsed() > Duration::from_millis(300)

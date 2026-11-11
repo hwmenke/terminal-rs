@@ -373,6 +373,12 @@ pub(super) fn static_items() -> Vec<Item> {
         Item::new(Kind::Panel, "New session path", "NEW SPATH", Target::Run("NEW SPATH".into()))
             .keywords("panel pane spath typical session path mean band"),
     );
+    for command in ["TWALL", "TWALL D", "NEW TWALL", "SPLIT DOWN TWALL"] {
+        v.push(
+            Item::new(Kind::Panel, "Trend Wall", command, Target::Run(command.into()))
+                .keywords("stack tgrid stacks mtfgrid watchlist breadth native session"),
+        );
+    }
     for command in ["RRG", "RRG WL", "RRG WEEKLY", "NEW RRG"] {
         v.push(
             Item::new(Kind::Panel, "Relative rotation graph", command, Target::Run(command.into()))

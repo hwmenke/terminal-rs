@@ -729,6 +729,17 @@ impl TerminalApp {
             if nav_row(
                 ui,
                 Icon::Chart,
+                "Trend Wall",
+                Some("TWALL"),
+                is_focused(&PaneKind::TrendWall(Box::new(super::trend_wall::TrendWallPane::new("")))),
+            )
+            .clicked()
+            {
+                out.push(SidebarCmd::Function(Function::TrendWall { spec: String::new() }));
+            }
+            if nav_row(
+                ui,
+                Icon::Chart,
                 "Rotation",
                 Some("RRG"),
                 is_focused(&PaneKind::Rotation(Box::new(super::rotation::RotationPane::new("")))),

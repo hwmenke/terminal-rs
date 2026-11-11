@@ -48,6 +48,12 @@ pub enum Request {
         generation: u64,
         symbols: Vec<String>,
     },
+    TrendWall {
+        pane: PaneId,
+        generation: u64,
+        symbols: Vec<String>,
+        daily: bool,
+    },
     TrendStack {
         pane: PaneId,
         generation: u64,
@@ -465,6 +471,17 @@ pub enum Response {
         generation: u64,
         result: Result<tr_data::whats_news::Snapshot<Vec<tr_data::whats_news::MemberRow>>, String>,
     },
+    TrendWallRow {
+        pane: PaneId,
+        generation: u64,
+        index: usize,
+        row: tr_data::stack_wall::Row,
+    },
+    TrendWallDone {
+        pane: PaneId,
+        generation: u64,
+        error: Option<String>,
+    },
     TrendStack {
         pane: PaneId,
         generation: u64,
@@ -674,6 +691,7 @@ struct Shared {
     /// Daily source rows for archive panes so weekly/monthly paging can resample the
     /// combined window instead of stitching broken week boundaries.
     archive_daily: std::sync::Mutex<SeriesMap>,
+    wall_generations: std::sync::Mutex<HashMap<PaneId, u64>>,
     stack_lanes: Mutex<HashMap<(String, Timeframe, bool), (i64, Arc<Vec<Bar>>)>>,
     cache: std::sync::Mutex<Option<BarCache>>,
     news: std::sync::Mutex<tr_data::news::NewsCache>,
@@ -759,6 +777,7 @@ impl Worker {
             series: Default::default(),
             archive_daily: Default::default(),
             stack_lanes: Default::default(),
+            wall_generations: Default::default(),
             cache: std::sync::Mutex::new(cache),
             news: Default::default(),
             price_alerts: std::sync::Mutex::new(tr_data::price_alerts::Store::load(&dir.join("price_alerts.json"))),
@@ -1019,6 +1038,99 @@ fn store_verified_history(s: &Shared, symbol: &str, tf: Timeframe, bars: &[Bar])
         let _ = cache.store(symbol, tf, bars);
         let _ = cache.note_fetch(symbol, tf, chrono::Utc::now().timestamp());
     }
+}
+
+/// Shared chart/wall native lane acquisition. The lock coalesces concurrent cold requests.
+/// Wall archive reads are strictly local. Only archive daily bars may aggregate into W/M.
+async fn stack_lane_bars(s: &Shared, symbol: &str, tf: Timeframe, archive: bool, now: i64) -> Result<Vec<Bar>, String> {
+    let key = (symbol.to_string(), tf, archive);
+    let ttl = tr_data::intraday::refresh_ttl_secs(tf).unwrap_or(900);
+    let mut cache = s.stack_lanes.lock().await;
+    if let Some((_, bars)) = cache.get(&key).filter(|(at, _)| *at <= now && now - *at < ttl) {
+        return Ok(bars.as_ref().clone());
+    }
+    // The chart already owns/fetched its base; share that verified native history too.
+    let cached_base = if !archive && tf == Timeframe::M5 {
+        s.cache.lock().ok().and_then(|c| {
+            c.as_ref().and_then(|c| {
+                let at = c.fetched_at(symbol, tf).ok().flatten()?;
+                if at > now || now - at >= ttl {
+                    return None;
+                }
+                c.load(symbol, tf, 400).ok().filter(|b| !b.is_empty() && Bar::provenance(b).is_verified())
+            })
+        })
+    } else {
+        None
+    };
+    let result = if let Some(bars) = cached_base {
+        Ok(bars)
+    } else if archive {
+        let ticker = tr_data::whats_news::archive_ticker(symbol);
+        s.history.db(move |db| db.daily(&ticker)).await.map_err(|e| format!("{e:#}")).and_then(|bars| {
+            if bars.is_empty() {
+                return Err("No daily history in the local research archive".into());
+            }
+            Bar::require_verified(&bars, "Trend Stack archive")?;
+            Ok(if tf == Timeframe::D1 { bars } else { tf.resample(&bars) })
+        })
+    } else {
+        s.provider.history_for_analysis(symbol, tf, None, 400, "Trend Stack").await.map_err(|e| format!("{e:#}"))
+    };
+    let mut bars = result?;
+    if bars.is_empty() {
+        return Ok(bars);
+    }
+    Bar::require_verified(&bars, "Trend Stack")?;
+    bars.sort_by_key(|b| b.ts);
+    bars.reverse();
+    bars.dedup_by_key(|b| b.ts);
+    bars.reverse();
+    if bars.len() > 400 {
+        bars.drain(..bars.len() - 400);
+    }
+    if !archive {
+        store_verified_history(s, symbol, tf, &bars);
+    }
+    if cache.len() >= 160
+        && !cache.contains_key(&key)
+        && let Some(oldest) = cache.iter().min_by_key(|(_, (at, _))| *at).map(|(k, _)| k.clone())
+    {
+        cache.remove(&oldest);
+    }
+    cache.insert(key, (now, Arc::new(bars.clone())));
+    Ok(bars)
+}
+
+/// Preserve the chart's pre-existing verified bridge fallback without putting bridge
+/// data into the wall's local-archive cache namespace.
+async fn stack_chart_lane_bars(
+    s: &Shared,
+    symbol: &str,
+    tf: Timeframe,
+    archive: bool,
+    now: i64,
+) -> Result<Vec<Bar>, String> {
+    let result = stack_lane_bars(s, symbol, tf, archive, now).await;
+    if archive && result.is_err() {
+        let config = s.whats_news.borrow().1.clone();
+        let bars = desk_daily(s, &config.bridge(), symbol).await.map_err(|e| format!("{e:#}"))?;
+        Ok(if tf == Timeframe::D1 { bars } else { tf.resample(&bars) })
+    } else {
+        result
+    }
+}
+
+fn claim_wall(s: &Shared, pane: PaneId, generation: u64) -> bool {
+    let mut generations = s.wall_generations.lock().expect("wall generations");
+    if generations.get(&pane).is_some_and(|g| *g > generation) {
+        return false;
+    }
+    generations.insert(pane, generation);
+    true
+}
+fn wall_current(s: &Shared, pane: PaneId, generation: u64) -> bool {
+    s.wall_generations.lock().expect("wall generations").get(&pane) == Some(&generation)
 }
 
 fn mark_stack_freshness(stack: &mut TrendStack, class: tr_core::AssetClass, archive: bool, now: i64) {
@@ -2077,6 +2189,75 @@ async fn handle(s: &Arc<Shared>, req: Request) {
                 });
             }
         }
+        Request::TrendWall { pane, generation, symbols, daily } => {
+            if !wall_current(s, pane, generation) {
+                return;
+            }
+            if s.provider.name() == "sample" {
+                send(Response::TrendWallDone {
+                    pane,
+                    generation,
+                    error: Some("TREND WALL REFUSED · WARNING: SAMPLE DATA".into()),
+                });
+                return;
+            }
+            let tf = if daily { Timeframe::D1 } else { Timeframe::M5 };
+            for (index, symbol) in symbols.into_iter().take(tr_data::stack_wall::MAX_SYMBOLS).enumerate() {
+                if !wall_current(s, pane, generation) {
+                    return;
+                }
+                let now = chrono::Utc::now().timestamp();
+                let result = async {
+                    if !daily {
+                        if !tr_data::cash_session::is_cash(&tr_data::security(&symbol)) {
+                            return Err("Trend Wall refused: requires US cash-session symbols".into());
+                        }
+                        tr_data::cash_session::require_us_session(
+                            &symbol,
+                            tr_data::cash_session::exchange_zone(&symbol).as_deref(),
+                        )?;
+                    }
+                    let base = stack_lane_bars(s, &symbol, tf, daily, now).await?;
+                    // Validate before filtering, so a discarded off-session bar cannot hide taint.
+                    Bar::require_verified(&base, "Trend Wall")?;
+                    let base = if daily { base } else { tr_data::intraday::regular_only(base) };
+                    if base.is_empty() {
+                        return Err("No regular-session native bars".to_string());
+                    }
+                    let mut lanes = Vec::new();
+                    for lane_tf in ladder(tf, daily).into_iter().filter(|t| *t != tf) {
+                        lanes.push((lane_tf, stack_lane_bars(s, &symbol, lane_tf, daily, now).await));
+                    }
+                    let symbol = symbol.clone();
+                    tokio::task::spawn_blocking(move || {
+                        let mut stack = trend_stack(&base, tf, lanes, Default::default())?;
+                        mark_stack_freshness(&mut stack, tr_data::security(&symbol).class, daily, now);
+                        Ok(tr_data::stack_wall::build_row(&symbol, &stack, &base, now))
+                    })
+                    .await
+                    .map_err(|e| e.to_string())?
+                }
+                .await;
+                if !wall_current(s, pane, generation) {
+                    return;
+                }
+                let row = result.unwrap_or_else(|error| {
+                    let status = if error.to_ascii_lowercase().contains("refus")
+                        || error.contains("UNVERIFIED")
+                        || error.contains("SAMPLE")
+                    {
+                        LaneStatus::Refused(error)
+                    } else {
+                        LaneStatus::Unavailable(error)
+                    };
+                    tr_data::stack_wall::Row::failure(symbol, status, daily)
+                });
+                send(Response::TrendWallRow { pane, generation, index, row });
+            }
+            if wall_current(s, pane, generation) {
+                send(Response::TrendWallDone { pane, generation, error: None });
+            }
+        }
         Request::TrendStack { pane, generation, symbol, tf, archive, base, params } => {
             if s.provider.name() == "sample" {
                 send(Response::TrendStack {
@@ -2100,56 +2281,17 @@ async fn handle(s: &Arc<Shared>, req: Request) {
             }
             let now = chrono::Utc::now().timestamp();
             let mut lanes = Vec::new();
-            // Async lock also coalesces concurrent requests for a cold native lane.
-            let mut cache = s.stack_lanes.lock().await;
-            let daily = if archive {
-                let config = s.whats_news.borrow().1.clone();
-                Some(desk_daily(s, &config.bridge(), &symbol).await.map_err(|e| format!("{e:#}")))
-            } else {
-                None
-            };
-            for lane_tf in frames.into_iter().filter(|t| *t != tf) {
-                let key = (symbol.clone(), lane_tf, archive);
-                let ttl = tr_data::intraday::refresh_ttl_secs(lane_tf).unwrap_or(900);
-                let result = if let Some((_, bars)) = cache.get(&key).filter(|(at, _)| now - *at < ttl) {
-                    Ok(bars.as_ref().clone())
-                } else {
-                    let result = if let Some(daily) = &daily {
-                        daily
-                            .as_ref()
-                            .map(|bars| if lane_tf == Timeframe::D1 { bars.clone() } else { lane_tf.resample(bars) })
-                            .map_err(Clone::clone)
-                    } else {
-                        s.provider
-                            .history_for_analysis(&symbol, lane_tf, None, 400, "Trend Stack")
-                            .await
-                            .map_err(|e| format!("{e:#}"))
-                    };
-                    match result {
-                        Ok(mut bars) if !bars.is_empty() && Bar::provenance(&bars).is_verified() => {
-                            bars.sort_by_key(|b| b.ts);
-                            if bars.len() > 400 {
-                                bars.drain(..bars.len() - 400);
-                            }
-                            if !archive {
-                                store_verified_history(s, &symbol, lane_tf, &bars);
-                            }
-                            if cache.len() >= 64
-                                && !cache.contains_key(&key)
-                                && let Some(oldest) =
-                                    cache.iter().min_by_key(|(_, (at, _))| *at).map(|(k, _)| k.clone())
-                            {
-                                cache.remove(&oldest);
-                            }
-                            cache.insert(key, (now, Arc::new(bars.clone())));
-                            Ok(bars)
-                        }
-                        other => other,
-                    }
-                };
-                lanes.push((lane_tf, result));
+            // The chart's verified base also seeds the persistent native cache for a wall.
+            if !archive
+                && tf == Timeframe::M5
+                && (!tr_data::cash_session::is_cash(&tr_data::security(&symbol))
+                    || base.iter().all(|b| tr_data::intraday::in_regular_session(b.ts)))
+            {
+                store_verified_history(s, &symbol, tf, &base);
             }
-            drop(cache);
+            for lane_tf in frames.into_iter().filter(|t| *t != tf) {
+                lanes.push((lane_tf, stack_chart_lane_bars(s, &symbol, lane_tf, archive, now).await));
+            }
             let base_len = base.len();
             let class = tr_data::security(&symbol).class;
             if let Ok(mut result) = tokio::task::spawn_blocking(move || trend_stack(&base, tf, lanes, params)).await {
@@ -2788,6 +2930,7 @@ async fn handle(s: &Arc<Shared>, req: Request) {
         }
         Request::RefreshCongress => congress_refresh(s).await,
         Request::Forget(pane) => {
+            s.wall_generations.lock().expect("wall generations").remove(&pane);
             s.series.lock().expect("series lock").remove(&pane);
             s.archive_daily.lock().expect("archive daily lock").remove(&pane);
         }
@@ -2896,7 +3039,9 @@ fn begin_request(s: &Shared, req: &Request) -> bool {
         Request::History { pane, generation, .. }
         | Request::ExtendedHistory { pane, generation, .. }
         | Request::ArchiveHistory { pane, generation, .. } => claim_series(s, *pane, *generation),
+        Request::TrendWall { pane, generation, .. } => claim_wall(s, *pane, *generation),
         Request::Forget(pane) => {
+            s.wall_generations.lock().expect("wall generations").remove(pane);
             s.series.lock().expect("series lock").remove(pane);
             s.archive_daily.lock().expect("archive daily lock").remove(pane);
             false
@@ -3797,6 +3942,129 @@ mod tests {
             .last()
             .unwrap()
     }
+    fn wall_request(generation: u64, daily: bool) -> Request {
+        Request::TrendWall { pane: 31, generation, symbols: vec!["AAPL US Equity".into()], daily }
+    }
+    fn wall_responses(rx: &mpsc::Receiver<Response>) -> Vec<Response> {
+        rx.try_iter()
+            .map(|r| match r {
+                Response::WhatsNews { response, .. } => *response,
+                r => r,
+            })
+            .collect()
+    }
+    #[tokio::test]
+    async fn trend_wall_refuses_sample_provider_without_fetching() {
+        let provider =
+            Arc::new(StackPrices { calls: Default::default(), name: "sample", provenance: tr_core::Provenance::Real });
+        let (s, rx) = shared(provider.clone(), None);
+        let request = wall_request(1, false);
+        assert!(begin_request(&s, &request));
+        handle(&s, request).await;
+        let responses = wall_responses(&rx);
+        assert_eq!(responses.len(), 1);
+        assert!(
+            matches!(&responses[0], Response::TrendWallDone { error: Some(e), .. } if e.contains("REFUSED") && e.contains("SAMPLE"))
+        );
+        assert_eq!(provider.calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert!(s.stack_lanes.lock().await.is_empty());
+    }
+    #[tokio::test]
+    async fn trend_wall_unverified_symbol_is_refused_row_not_cached() {
+        let provider = Arc::new(StackPrices {
+            calls: Default::default(),
+            name: "fixture",
+            provenance: tr_core::Provenance::Missing,
+        });
+        let (s, rx) = shared(provider.clone(), Some(BarCache::open_in_memory().unwrap()));
+        let request = wall_request(1, false);
+        assert!(begin_request(&s, &request));
+        handle(&s, request).await;
+        let responses = wall_responses(&rx);
+        assert!(responses.iter().any(|r| matches!(r, Response::TrendWallRow { row, .. } if matches!(row.status, LaneStatus::Refused(_)) && row.score.is_none())));
+        assert!(s.stack_lanes.lock().await.is_empty());
+        assert!(
+            s.cache.lock().unwrap().as_ref().unwrap().load("AAPL US Equity", Timeframe::M5, 400).unwrap().is_empty()
+        );
+        assert_eq!(provider.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+    #[tokio::test]
+    async fn trend_wall_daily_never_calls_the_market_provider() {
+        let provider =
+            Arc::new(StackPrices { calls: Default::default(), name: "fixture", provenance: tr_core::Provenance::Real });
+        let (mut s, rx) = shared(provider.clone(), None);
+        Arc::get_mut(&mut s).unwrap().history = Arc::new(tr_data::history::Service::new(
+            tr_data::history::Archive::memory().unwrap(),
+            Arc::new(ArchivePrices),
+            tr_data::history::Policy { spacing: Duration::ZERO, ..Default::default() },
+        ));
+        // A missing archive must not fall through to a bridge or market provider.
+        let request = wall_request(1, true);
+        assert!(begin_request(&s, &request));
+        handle(&s, request).await;
+        assert!(wall_responses(&rx).iter().any(
+            |r| matches!(r, Response::TrendWallRow { row, .. } if matches!(row.status, LaneStatus::Unavailable(_)))
+        ));
+        // Seed only through the in-memory DailyHistory fixture; no HTTP in this test.
+        s.history.run("ADD", tr_data::history::universe::resolve("AAPL").unwrap(), |_| {}).await.unwrap();
+        s.history.run("REFRESH", vec![], |_| {}).await.unwrap();
+        let request = wall_request(2, true);
+        assert!(begin_request(&s, &request));
+        handle(&s, request).await;
+        let responses = wall_responses(&rx);
+        let row = responses
+            .iter()
+            .find_map(|r| if let Response::TrendWallRow { row, .. } = r { Some(row) } else { None })
+            .unwrap();
+        assert!(row.daily);
+        assert!(row.provenance.is_verified());
+        assert_eq!(
+            row.lanes.iter().map(|l| l.tf).collect::<Vec<_>>(),
+            vec![Timeframe::D1, Timeframe::W1, Timeframe::MN1]
+        );
+        assert_eq!(provider.calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+    #[tokio::test]
+    async fn trend_wall_reuses_stack_lane_cache_with_chart() {
+        let provider =
+            Arc::new(StackPrices { calls: Default::default(), name: "fixture", provenance: tr_core::Provenance::Real });
+        let (s, rx) = shared(provider.clone(), Some(BarCache::open_in_memory().unwrap()));
+        let mut chart = stack_request(false);
+        if let Request::TrendStack { symbol, base, .. } = &mut chart {
+            *symbol = "AAPL US Equity".into();
+            *base = Arc::new(tr_data::intraday::regular_only(stack_fixture(
+                2000,
+                Timeframe::M5,
+                tr_core::Provenance::Real,
+            )));
+        }
+        handle(&s, chart).await;
+        assert_eq!(last_stack(&rx).unwrap().lanes.len(), 4);
+        let calls = provider.calls.load(std::sync::atomic::Ordering::SeqCst);
+        let request = wall_request(1, false);
+        assert!(begin_request(&s, &request));
+        handle(&s, request).await;
+        assert!(wall_responses(&rx).iter().any(|r| matches!(r, Response::TrendWallRow { .. })));
+        assert_eq!(provider.calls.load(std::sync::atomic::Ordering::SeqCst), calls);
+    }
+    #[tokio::test]
+    async fn trend_wall_drops_stale_generation() {
+        let provider =
+            Arc::new(StackPrices { calls: Default::default(), name: "fixture", provenance: tr_core::Provenance::Real });
+        let (s, rx) = shared(provider.clone(), None);
+        let old = wall_request(1, false);
+        let current = wall_request(2, false);
+        assert!(begin_request(&s, &old));
+        assert!(begin_request(&s, &current));
+        assert!(!begin_request(&s, &old));
+        handle(&s, old).await;
+        assert!(wall_responses(&rx).is_empty());
+        assert_eq!(provider.calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert!(!begin_request(&s, &Request::Forget(31)));
+        handle(&s, current).await;
+        assert!(wall_responses(&rx).is_empty());
+    }
+
     #[tokio::test]
     async fn trend_stack_refuses_the_sample_provider_without_fetching() {
         let provider =
@@ -3916,6 +4184,7 @@ mod tests {
                 series: Default::default(),
                 archive_daily: Default::default(),
                 stack_lanes: Default::default(),
+                wall_generations: Default::default(),
                 cache: std::sync::Mutex::new(cache),
                 news: Default::default(),
                 price_alerts: Default::default(),
@@ -4662,6 +4931,7 @@ mod tests {
             series: Default::default(),
             archive_daily: Default::default(),
             stack_lanes: Default::default(),
+            wall_generations: Default::default(),
             cache: std::sync::Mutex::new(None),
             news: Default::default(),
             price_alerts: Default::default(),
