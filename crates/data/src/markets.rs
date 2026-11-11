@@ -110,11 +110,15 @@ impl MarketData for Markets {
         for r in [c, g, y] {
             match r {
                 Ok(q) => out.extend(q),
-                Err(e) => errors.push(format!("{e:#}")),
+                Err(e) => errors.push(e),
             }
         }
         if out.is_empty() && !errors.is_empty() {
-            return Err(anyhow!(errors.join("; ")));
+            // Preserve the typed cooldown cause for Guarded and the health board.
+            if let Some(i) = errors.iter().position(|e| e.chain().any(|c| c.is::<crate::yahoo::RateLimited>())) {
+                return Err(errors.swap_remove(i));
+            }
+            return Err(anyhow!(errors.iter().map(|e| format!("{e:#}")).collect::<Vec<_>>().join("; ")));
         }
         Ok(out)
     }

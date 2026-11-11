@@ -29,7 +29,14 @@ pub const CONGRESS_REFRESH_MIN: u64 = 30;
 /// Seconds between price, session-VWAP, session-signal, and setup rule evaluations (`TR_PRICE_ALERT_SECS`; 0 disables).
 pub const PRICE_ALERT_EVAL_SECS: u64 = 20;
 
+use tr_data::health::{DataMode, DownKind, Feed, FeedState, Snapshot, Unavailable};
+
 pub enum Request {
+    Health,
+    RetryFeed {
+        feed: Feed,
+        pane: Option<PaneId>,
+    },
     HistoryStatus,
     HistoryTask(String),
     ConfigureWhatsNews {
@@ -435,6 +442,8 @@ pub struct BuiltIndicator {
     pub refused: Option<String>,
     /// Last-bar HUD for research overlays (regimes and trailing stops).
     pub note: Option<String>,
+    /// Preserve double precision for z readouts; price geometry uses f32.
+    pub z_readout: Option<Arc<Vec<f64>>>,
 }
 
 pub struct Profile {
@@ -447,6 +456,14 @@ pub struct Profile {
 }
 
 pub enum Response {
+    Feed {
+        feed: Feed,
+        pane: Option<PaneId>,
+        symbol: Option<String>,
+        generation: Option<u64>,
+        state: FeedState,
+    },
+    Health(Snapshot),
     HistoryStatus(Result<tr_data::history::Status, String>),
     HistoryChanged,
     WhatsNews {
@@ -676,6 +693,8 @@ pub enum Response {
 }
 
 pub struct Worker {
+    data_mode: DataMode,
+    health_board: Option<Arc<tr_data::HealthBoard>>,
     tx: tokio::sync::mpsc::UnboundedSender<Request>,
     pub rx: mpsc::Receiver<Response>,
     _rt: tokio::runtime::Runtime,
@@ -698,6 +717,8 @@ struct Shared {
     /// Authoritative bars per chart pane (history, paging and live ticks all merge here),
     /// tagged with the pane's load generation.
     series: std::sync::Mutex<SeriesMap>,
+    feed_requests: std::sync::Mutex<HashMap<(Feed, Option<PaneId>), FeedRequest>>,
+    followers: std::sync::Mutex<std::collections::HashSet<(PaneId, u64, bool)>>,
     /// Daily source rows for archive panes so weekly/monthly paging can resample the
     /// combined window instead of stitching broken week boundaries.
     archive_daily: std::sync::Mutex<SeriesMap>,
@@ -715,7 +736,107 @@ struct Shared {
     ctx: egui::Context,
 }
 
+#[derive(Clone)]
+enum FeedRequest {
+    Bars { pane: PaneId, generation: u64, symbol: String, tf: Timeframe, limit: usize, extended: bool },
+    Quotes(Vec<String>),
+    Options { pane: PaneId, symbol: String, expiration: Option<i64> },
+    Book { pane: PaneId, symbol: String, depth: usize },
+    Curve,
+}
+impl FeedRequest {
+    fn capture(req: &Request) -> Option<(Feed, Option<PaneId>, Self)> {
+        Some(match req {
+            Request::History { pane, generation, symbol, tf, limit }
+            | Request::ExtendedHistory { pane, generation, symbol, tf, limit } => (
+                Feed::Bars,
+                Some(*pane),
+                Self::Bars {
+                    pane: *pane,
+                    generation: *generation,
+                    symbol: symbol.clone(),
+                    tf: *tf,
+                    limit: *limit,
+                    extended: matches!(req, Request::ExtendedHistory { .. }),
+                },
+            ),
+            Request::Quotes(symbols) => (Feed::Quotes, None, Self::Quotes(symbols.clone())),
+            Request::Options { pane, symbol, expiration } => (
+                Feed::Options,
+                Some(*pane),
+                Self::Options { pane: *pane, symbol: symbol.clone(), expiration: *expiration },
+            ),
+            Request::OrderBook { pane, symbol, depth } => {
+                (Feed::Book, Some(*pane), Self::Book { pane: *pane, symbol: symbol.clone(), depth: *depth })
+            }
+            Request::YieldCurves => (Feed::Curve, None, Self::Curve),
+            _ => return None,
+        })
+    }
+    fn request(self) -> Request {
+        match self {
+            Self::Bars { pane, generation, symbol, tf, limit, extended: false } => {
+                Request::History { pane, generation, symbol, tf, limit }
+            }
+            Self::Bars { pane, generation, symbol, tf, limit, extended: true } => {
+                Request::ExtendedHistory { pane, generation, symbol, tf, limit }
+            }
+            Self::Quotes(s) => Request::Quotes(s),
+            Self::Options { pane, symbol, expiration } => Request::Options { pane, symbol, expiration },
+            Self::Book { pane, symbol, depth } => Request::OrderBook { pane, symbol, depth },
+            Self::Curve => Request::YieldCurves,
+        }
+    }
+}
 impl Shared {
+    fn sample_mode(&self) -> bool {
+        self.provider.mode() == DataMode::ExplicitSample
+    }
+    fn feed(
+        &self,
+        feed: Feed,
+        pane: Option<PaneId>,
+        symbol: Option<String>,
+        generation: Option<u64>,
+        state: FeedState,
+    ) {
+        self.send(Response::Feed { feed, pane, symbol, generation, state });
+    }
+    fn result_state<T>(&self, feed: Feed, result: &anyhow::Result<T>) -> FeedState {
+        match result {
+            Ok(_) => FeedState::Live { last_ok: chrono::Utc::now().timestamp() },
+            Err(e) => {
+                let down = e.downcast_ref::<Unavailable>().cloned().unwrap_or_else(|| Unavailable {
+                    feed,
+                    kind: DownKind::Offline,
+                    reason: format!("{e:#}"),
+                    since: chrono::Utc::now().timestamp(),
+                    retry_at: Some(chrono::Utc::now().timestamp() + 15),
+                });
+                if down.kind == DownKind::Unsupported {
+                    FeedState::Unsupported { reason: down.reason }
+                } else {
+                    FeedState::Unavailable(down)
+                }
+            }
+        }
+    }
+    fn bars_failed(&self, pane: PaneId, generation: u64, symbol: &str, tf: Timeframe, error: anyhow::Error) {
+        let Some(bars) = current_series(self, pane, generation) else { return };
+        let result: anyhow::Result<()> = Err(error);
+        let mut state = self.result_state(Feed::Bars, &result);
+        if !bars.is_empty() && bars.iter().all(|b| b.provenance.is_verified()) {
+            let fetched = self
+                .cache
+                .lock()
+                .ok()
+                .and_then(|c| c.as_ref().and_then(|c| c.fetched_at(symbol, tf).ok().flatten()))
+                .unwrap_or_else(|| bars.last().unwrap().ts);
+            state = state.stale(fetched, self.provider.name(), chrono::Utc::now().timestamp());
+        }
+        self.feed(Feed::Bars, Some(pane), Some(symbol.into()), Some(generation), state);
+    }
+
     fn send(&self, r: Response) {
         let _ = self.out.send(r);
         self.ctx.request_repaint();
@@ -726,7 +847,7 @@ impl Shared {
     }
 
     fn trade_plan_snapshot(&self, now: i64) -> tr_data::trade_plans::PlanBatch {
-        self.trade_plans.lock().expect("trade plans").snapshot(now, false, self.provider.name() == "sample", Vec::new())
+        self.trade_plans.lock().expect("trade plans").snapshot(now, false, self.sample_mode(), Vec::new())
     }
 
     fn persist_price_alerts(&self) {
@@ -734,12 +855,7 @@ impl Shared {
     }
 
     fn price_alert_snapshot(&self, now: i64) -> tr_data::price_alerts::AlertBatch {
-        self.price_alerts.lock().expect("price alerts").snapshot(
-            now,
-            false,
-            self.provider.name() == "sample",
-            Vec::new(),
-        )
+        self.price_alerts.lock().expect("price alerts").snapshot(now, false, self.sample_mode(), Vec::new())
     }
 }
 
@@ -760,6 +876,8 @@ pub fn data_dir() -> PathBuf {
 
 impl Worker {
     pub fn spawn(ctx: egui::Context, provider: Provider) -> anyhow::Result<Self> {
+        let data_mode = provider.mode();
+        let health_board = provider.health();
         let dir = data_dir();
         std::fs::create_dir_all(&dir)?;
         let db = Db::open(dir.join("congress.sqlite3")).or_else(|e| {
@@ -786,6 +904,8 @@ impl Worker {
             whats_news,
             provider,
             series: Default::default(),
+            feed_requests: Default::default(),
+            followers: Default::default(),
             archive_daily: Default::default(),
             stack_lanes: Default::default(),
             wall_fetches: tokio::sync::Semaphore::new(4),
@@ -814,6 +934,22 @@ impl Worker {
                 }
                 let s = s.clone();
                 tokio::spawn(async move { handle(&s, req).await });
+            }
+        });
+
+        let s = shared.clone();
+        rt.spawn(async move {
+            let mut previous = None;
+            let mut interval = tokio::time::interval(Duration::from_secs(1));
+            loop {
+                interval.tick().await;
+                if let Some(board) = s.provider.health() {
+                    let snapshot = board.snapshot();
+                    if previous.as_ref() != Some(&snapshot) {
+                        previous = Some(snapshot.clone());
+                        s.send(Response::Health(snapshot));
+                    }
+                }
             }
         });
 
@@ -879,7 +1015,7 @@ impl Worker {
                 congress_refresh(&s).await;
             }
         });
-        Ok(Self { tx, rx, _rt: rt })
+        Ok(Self { data_mode, health_board, tx, rx, _rt: rt })
     }
 
     #[cfg(test)]
@@ -894,7 +1030,14 @@ impl Worker {
         let (tx, requests) = tokio::sync::mpsc::unbounded_channel();
         let (out, rx) = mpsc::channel();
         let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
-        (Self { tx, rx, _rt: rt }, requests, out)
+        (Self { data_mode: DataMode::ExplicitSample, health_board: None, tx, rx, _rt: rt }, requests, out)
+    }
+
+    pub fn mode(&self) -> DataMode {
+        self.data_mode
+    }
+    pub fn health(&self) -> Option<Snapshot> {
+        self.health_board.as_ref().map(|b| b.snapshot())
     }
 
     pub fn send(&self, req: Request) {
@@ -946,6 +1089,7 @@ pub fn build_indicators(
                         overlays: Vec::new(),
                         refused: Some(error),
                         note: None,
+                        z_readout: None,
                     };
                 }
             }
@@ -984,7 +1128,9 @@ pub fn build_indicators(
                 }
                 note
             });
-            BuiltIndicator { spec: spec.clone(), overlays, refused: None, note }
+            let z_readout = (spec.code == "ZBAND")
+                .then(|| Arc::new(tr_core::indicators::registry::zband(&input.d.close, spec.params[0] as usize).z));
+            BuiltIndicator { spec: spec.clone(), overlays, refused: None, note, z_readout }
         })
         .collect()
 }
@@ -1620,7 +1766,7 @@ async fn research_intraday_backtest(
             sec.ticker
         );
     }
-    if s.provider.name() == "sample" {
+    if s.sample_mode() {
         anyhow::bail!(
             "Intraday backtest refused: sample / offline display mode does not feed this pane. Sample prices are never used."
         );
@@ -1657,7 +1803,7 @@ async fn research_intraday_compare(
     spec: &str,
     timeframe: &str,
 ) -> anyhow::Result<tr_data::intraday_compare::CompareChart> {
-    if s.provider.name() == "sample" {
+    if s.sample_mode() {
         anyhow::bail!(
             "Intraday compare refused: sample / offline display mode does not feed this pane. Sample prices are never used."
         );
@@ -1703,7 +1849,7 @@ async fn research_session_path(
     spec: &str,
     timeframe: &str,
 ) -> anyhow::Result<tr_data::session_path::SessionPath> {
-    if s.provider.name() == "sample" {
+    if s.sample_mode() {
         anyhow::bail!(
             "Session path refused: sample / offline display mode does not feed this pane. Sample prices are never used."
         );
@@ -1732,7 +1878,7 @@ async fn research_volume_pace(
     spec: &str,
     timeframe: &str,
 ) -> anyhow::Result<tr_data::volume_pace::VolumePace> {
-    if s.provider.name() == "sample" {
+    if s.sample_mode() {
         anyhow::bail!(
             "Volume pace refused: sample / offline display mode does not feed this pane. Sample prices are never used."
         );
@@ -1760,7 +1906,7 @@ async fn research_realized_vol(
     spec: &str,
     timeframe: &str,
 ) -> anyhow::Result<tr_data::realized_vol::RealizedVol> {
-    if s.provider.name() == "sample" {
+    if s.sample_mode() {
         anyhow::bail!(
             "Realized volatility refused: sample / offline display mode does not feed this pane. Sample prices are never used."
         );
@@ -1792,7 +1938,7 @@ async fn research_autocorr(
     spec: &str,
     timeframe: &str,
 ) -> anyhow::Result<tr_data::autocorr::Autocorr> {
-    if s.provider.name() == "sample" {
+    if s.sample_mode() {
         anyhow::bail!(
             "Return autocorrelation refused: sample / offline display mode does not feed this pane. Sample prices are never used."
         );
@@ -1826,7 +1972,7 @@ async fn research_gap_fill(
     spec: &str,
     timeframe: &str,
 ) -> anyhow::Result<tr_data::gap_fill::GapFill> {
-    if s.provider.name() == "sample" {
+    if s.sample_mode() {
         anyhow::bail!(
             "Gap fill refused: sample / offline display mode does not feed this pane. Sample prices are never used."
         );
@@ -1855,7 +2001,7 @@ async fn research_session_extreme(
     spec: &str,
     timeframe: &str,
 ) -> anyhow::Result<tr_data::session_extreme::SessionExtreme> {
-    if s.provider.name() == "sample" {
+    if s.sample_mode() {
         anyhow::bail!(
             "Session extreme refused: sample / offline display mode does not feed this pane. Sample prices are never used."
         );
@@ -1884,7 +2030,7 @@ async fn research_relative_path(
     spec: &str,
     timeframe: &str,
 ) -> anyhow::Result<tr_data::relative_path::RelativePath> {
-    if s.provider.name() == "sample" {
+    if s.sample_mode() {
         anyhow::bail!(
             "Relative path refused: sample / offline display mode does not feed this pane. Sample prices are never used."
         );
@@ -1918,7 +2064,7 @@ async fn research_relative_path(
 /// Five session reads from one verified 5-minute history. Sample substitution is refused.
 /// A missing SPY history blanks only the versus-SPY line.
 async fn research_session_brief(s: &Shared, symbol: &str) -> anyhow::Result<tr_data::session_brief::SessionBrief> {
-    if s.provider.name() == "sample" {
+    if s.sample_mode() {
         anyhow::bail!(
             "Session brief refused: sample / offline display mode does not feed this pane. Sample prices are never used."
         );
@@ -1950,7 +2096,7 @@ async fn research_session_brief(s: &Shared, symbol: &str) -> anyhow::Result<tr_d
 
 /// Verified 5-minute bars for the chart's cash levels. Sample substitution is refused.
 async fn research_cash_levels(s: &Shared, symbol: &str) -> anyhow::Result<tr_data::cash_levels::CashLevels> {
-    if s.provider.name() == "sample" {
+    if s.sample_mode() {
         anyhow::bail!(
             "Cash levels refused: sample / offline display mode does not feed this chart. Sample prices are never used."
         );
@@ -1976,7 +2122,7 @@ async fn research_breadth(
     timeframe: &str,
     watchlist: &[String],
 ) -> anyhow::Result<tr_data::session_breadth::Breadth> {
-    if s.provider.name() == "sample" {
+    if s.sample_mode() {
         anyhow::bail!(
             "Session breadth refused: sample / offline display mode does not feed this pane. Sample prices are never used."
         );
@@ -2154,10 +2300,35 @@ async fn research_desk(
 }
 
 async fn handle(s: &Arc<Shared>, req: Request) {
+    handle_inner(s, req, false).await;
+}
+async fn handle_inner(s: &Arc<Shared>, req: Request, force: bool) {
+    if let Request::RetryFeed { feed, pane } = req {
+        let requests: Vec<_> = s
+            .feed_requests
+            .lock()
+            .expect("feed requests")
+            .iter()
+            .filter(|((f, p), _)| {
+                (*f == feed || (feed == Feed::Ticks && *f == Feed::Bars)) && (pane.is_none() || *p == pane)
+            })
+            .map(|(_, r)| r.clone())
+            .collect();
+        for request in requests {
+            Box::pin(handle_inner(s, request.request(), true)).await;
+        }
+        return;
+    }
     let (epoch, config) = s.whats_news.borrow().clone();
     let send = |response| s.send(Response::WhatsNews { epoch, response: Box::new(response) });
     match req {
         Request::ConfigureWhatsNews { .. } => unreachable!("configured in dispatcher"),
+        Request::RetryFeed { .. } => unreachable!("handled above"),
+        Request::Health => {
+            if let Some(board) = s.provider.health() {
+                s.send(Response::Health(board.snapshot()));
+            }
+        }
         Request::HistoryStatus => {
             s.send(Response::HistoryStatus(s.history.status().await.map_err(|e| format!("{e:#}"))))
         }
@@ -2269,7 +2440,7 @@ async fn handle(s: &Arc<Shared>, req: Request) {
             if !wall_current(s, pane, generation) {
                 return;
             }
-            if s.provider.name() == "sample" {
+            if s.sample_mode() {
                 send(Response::TrendWallDone {
                     pane,
                     generation,
@@ -2348,7 +2519,7 @@ async fn handle(s: &Arc<Shared>, req: Request) {
             ladder: custom,
             config_revision,
         } => {
-            if s.provider.name() == "sample" {
+            if s.sample_mode() {
                 send(Response::TrendStack {
                     config_revision,
                     pane,
@@ -2717,7 +2888,7 @@ async fn handle(s: &Arc<Shared>, req: Request) {
             }
             // A fresh intraday series is painted from disk and not fetched again.
             // Daily and higher always refresh: the cold-start path depends on that.
-            let fresh = if s.provider.name() == "sample" {
+            let fresh = if force || s.sample_mode() {
                 None
             } else if let Ok(cache) = s.cache.lock()
                 && let Some(cache) = cache.as_ref()
@@ -2739,6 +2910,9 @@ async fn handle(s: &Arc<Shared>, req: Request) {
                 if !store_series(s, pane, generation, bars.clone()) {
                     return;
                 }
+                if !store_series(s, pane, generation, bars.clone()) {
+                    return;
+                }
                 let gpu = build_gpu(bars.clone()).await;
                 s.send(Response::History {
                     pane,
@@ -2752,15 +2926,25 @@ async fn handle(s: &Arc<Shared>, req: Request) {
                     exhausted: false,
                     live: false,
                 });
+                let last_ok = s
+                    .cache
+                    .lock()
+                    .ok()
+                    .and_then(|c| c.as_ref().and_then(|c| c.fetched_at(&symbol, tf).ok().flatten()))
+                    .unwrap_or(chrono::Utc::now().timestamp());
+                s.feed(Feed::Bars, Some(pane), Some(symbol.clone()), Some(generation), FeedState::Live { last_ok });
                 follow_quotes(s.clone(), pane, generation, symbol, tf, false);
                 return;
             }
             // Paint from the disk cache immediately, then refresh from the network.
             let cached = s.cache.lock().ok().and_then(|c| c.as_ref().and_then(|c| c.load(&symbol, tf, limit).ok()));
-            if let Some(bars) = cached.filter(|b| {
-                s.provider.name() != "sample" && !b.is_empty() && b.iter().all(|b| b.provenance.is_verified())
-            }) {
+            if let Some(bars) =
+                cached.filter(|b| !s.sample_mode() && !b.is_empty() && b.iter().all(|b| b.provenance.is_verified()))
+            {
                 let bars = Arc::new(bars);
+                if !store_series(s, pane, generation, bars.clone()) {
+                    return;
+                }
                 let gpu = build_gpu(bars.clone()).await;
                 s.send(Response::History {
                     pane,
@@ -2776,6 +2960,23 @@ async fn handle(s: &Arc<Shared>, req: Request) {
                 });
             }
             match s.provider.history(&symbol, tf, None, limit).await {
+                Ok(bars) if !s.sample_mode() && bars.iter().any(|b| !b.provenance.is_verified()) => {
+                    s.bars_failed(
+                        pane,
+                        generation,
+                        &symbol,
+                        tf,
+                        Unavailable {
+                            feed: Feed::Bars,
+                            kind: DownKind::Rejected,
+                            reason: "Rejected SAMPLE or UNVERIFIED bars in live mode".into(),
+                            since: chrono::Utc::now().timestamp(),
+                            retry_at: Some(chrono::Utc::now().timestamp() + 15),
+                        }
+                        .into(),
+                    );
+                    retry_intraday(s.clone(), pane, generation, symbol, tf, false);
+                }
                 Ok(bars) if !bars.is_empty() => {
                     store_verified_history(s, &symbol, tf, &bars);
                     let exhausted = bars.len() < limit / 2;
@@ -2799,11 +3000,27 @@ async fn handle(s: &Arc<Shared>, req: Request) {
                     follow_quotes(s.clone(), pane, generation, symbol, tf, false);
                 }
                 Ok(_) => {
+                    s.bars_failed(
+                        pane,
+                        generation,
+                        &symbol,
+                        tf,
+                        Unavailable {
+                            feed: Feed::Bars,
+                            kind: DownKind::Empty,
+                            reason: format!("No real bars for {symbol}"),
+                            since: chrono::Utc::now().timestamp(),
+                            retry_at: Some(chrono::Utc::now().timestamp() + 15),
+                        }
+                        .into(),
+                    );
                     s.send(Response::HistoryError { pane, generation, error: format!("no data for {symbol}") });
                     retry_intraday(s.clone(), pane, generation, symbol, tf, false);
                 }
                 Err(e) => {
-                    s.send(Response::HistoryError { pane, generation, error: format!("{e:#}") });
+                    let message = format!("{e:#}");
+                    s.bars_failed(pane, generation, &symbol, tf, e);
+                    s.send(Response::HistoryError { pane, generation, error: message });
                     retry_intraday(s.clone(), pane, generation, symbol, tf, false);
                 }
             }
@@ -2888,10 +3105,26 @@ async fn handle(s: &Arc<Shared>, req: Request) {
             };
             s.send(Response::Markers { pane, symbol, trades });
         }
-        Request::Quotes(symbols) => match s.provider.quotes(&symbols).await {
-            Ok(q) => s.send(Response::Quotes(q)),
-            Err(e) => s.send(Response::Status(format!("quotes: {e:#}"))),
-        },
+        Request::Quotes(symbols) => {
+            let result = s.provider.quotes(&symbols).await;
+            for symbol in &symbols {
+                let state = if result.as_ref().is_ok_and(|q| !q.iter().any(|q| &q.symbol == symbol)) {
+                    FeedState::Unavailable(Unavailable {
+                        feed: Feed::Quotes,
+                        kind: DownKind::Empty,
+                        reason: format!("No real quote for {symbol}"),
+                        since: chrono::Utc::now().timestamp(),
+                        retry_at: Some(chrono::Utc::now().timestamp() + 15),
+                    })
+                } else {
+                    s.result_state(Feed::Quotes, &result)
+                };
+                s.feed(Feed::Quotes, None, Some(symbol.clone()), None, state);
+            }
+            if let Ok(quotes) = result {
+                s.send(Response::Quotes(quotes));
+            }
+        }
         Request::Latest { limit } => {
             let t = s.db.lock().await.latest_trades(limit).unwrap_or_default();
             s.send(Response::Latest(t));
@@ -2948,7 +3181,7 @@ async fn handle(s: &Arc<Shared>, req: Request) {
         Request::UpdateTradePlan { query, change } => {
             // A sample provider cannot authorize a manual move using a previously saved quote.
             let manual = matches!(change, tr_data::trade_plans::PlanChange::MoveStop(_));
-            let result = if s.provider.name() == "sample" && manual {
+            let result = if s.sample_mode() && manual {
                 Err("moving a stop needs a fresh verified observed quote; sample provider cannot move stops".into())
             } else {
                 s.trade_plans.lock().expect("trade plans").update(&query, change, chrono::Utc::now().timestamp())
@@ -3045,14 +3278,18 @@ async fn handle(s: &Arc<Shared>, req: Request) {
         }
         Request::RefreshCongress => congress_refresh(s).await,
         Request::Forget(pane) => {
+            s.feed_requests.lock().expect("feed requests").retain(|(_, id), _| *id != Some(pane));
             s.wall_generations.lock().expect("wall generations").remove(&pane);
             s.series.lock().expect("series lock").remove(&pane);
             s.archive_daily.lock().expect("archive daily lock").remove(&pane);
         }
-        Request::YieldCurves => match s.provider.yield_curves().await {
-            Ok(c) => s.send(Response::Curves(Box::new(c))),
-            Err(e) => s.send(Response::Status(format!("yield curve: {e:#}"))),
-        },
+        Request::YieldCurves => {
+            let result = s.provider.yield_curves().await;
+            s.feed(Feed::Curve, None, None, None, s.result_state(Feed::Curve, &result));
+            if let Ok(curves) = result {
+                s.send(Response::Curves(Box::new(curves)));
+            }
+        }
         Request::Portfolio(generation, request_id, creds) => {
             let result = match creds {
                 None => Ok(tr_broker::sample::portfolio()),
@@ -3085,7 +3322,9 @@ async fn handle(s: &Arc<Shared>, req: Request) {
             s.send(Response::BrokerDisconnected(result.map(|()| id).map_err(|e| format!("{e:#}"))));
         }
         Request::Options { pane, symbol, expiration } => {
-            let chain = s.provider.options(&symbol, expiration).await.map(Box::new).map_err(|e| format!("{e:#}"));
+            let result = s.provider.options(&symbol, expiration).await;
+            s.feed(Feed::Options, Some(pane), Some(symbol.clone()), None, s.result_state(Feed::Options, &result));
+            let chain = result.map(Box::new).map_err(|e| format!("{e:#}"));
             s.send(Response::Options { pane, symbol, chain });
         }
         Request::News { pane, symbols } => {
@@ -3093,7 +3332,9 @@ async fn handle(s: &Arc<Shared>, req: Request) {
             s.send(Response::News { pane, symbols, batch });
         }
         Request::OrderBook { pane, symbol, depth } => {
-            let book = s.provider.order_book(&symbol, depth).await.map_err(|e| format!("{e:#}"));
+            let result = s.provider.order_book(&symbol, depth).await;
+            s.feed(Feed::Book, Some(pane), Some(symbol.clone()), None, s.result_state(Feed::Book, &result));
+            let book = result.map_err(|e| format!("{e:#}"));
             s.send(Response::OrderBook { pane, symbol, book });
         }
         Request::Search(query) => {
@@ -3146,7 +3387,7 @@ async fn trade(t: TradeRequest) -> TradeResponse {
 /// Run lifecycle changes synchronously in dispatcher order. A closed pane cannot
 /// be resurrected by an older history task that happens to start or finish later.
 fn begin_request(s: &Shared, req: &Request) -> bool {
-    match req {
+    let accepted = match req {
         Request::ConfigureWhatsNews { epoch, config } => {
             s.whats_news.send_replace((*epoch, config.clone()));
             false
@@ -3156,13 +3397,26 @@ fn begin_request(s: &Shared, req: &Request) -> bool {
         | Request::ArchiveHistory { pane, generation, .. } => claim_series(s, *pane, *generation),
         Request::TrendWall { pane, generation, .. } => claim_wall(s, *pane, *generation),
         Request::Forget(pane) => {
+            s.feed_requests.lock().expect("feed requests").retain(|(_, id), _| *id != Some(*pane));
             s.wall_generations.lock().expect("wall generations").remove(pane);
             s.series.lock().expect("series lock").remove(pane);
             s.archive_daily.lock().expect("archive daily lock").remove(pane);
             false
         }
         _ => true,
+    };
+    if accepted && let Some((feed, pane, mut request)) = FeedRequest::capture(req) {
+        let mut requests = s.feed_requests.lock().expect("feed requests");
+        if let FeedRequest::Quotes(symbols) = &mut request
+            && let Some(FeedRequest::Quotes(previous)) = requests.get(&(feed, pane))
+        {
+            symbols.extend(previous.iter().cloned());
+            symbols.sort();
+            symbols.dedup();
+        }
+        requests.insert((feed, pane), request);
     }
+    accepted
 }
 
 /// Register a load for `generation`; generations only move forward, since request
@@ -3223,11 +3477,8 @@ fn follow_quotes(s: Arc<Shared>, pane: PaneId, generation: u64, symbol: String, 
 }
 
 fn retry_intraday(s: Arc<Shared>, pane: PaneId, generation: u64, symbol: String, tf: Timeframe, extended: bool) {
-    if tf.is_intraday() && !s.provider.has_live_feed(&symbol, tf) {
-        schedule_intraday_refresh(s, pane, generation, symbol, tf, extended);
-    }
+    poll_intraday(s, pane, generation, symbol, tf, extended, true);
 }
-
 fn schedule_intraday_refresh(
     s: Arc<Shared>,
     pane: PaneId,
@@ -3236,16 +3487,38 @@ fn schedule_intraday_refresh(
     tf: Timeframe,
     extended: bool,
 ) {
+    poll_intraday(s, pane, generation, symbol, tf, extended, false);
+}
+fn poll_intraday(
+    s: Arc<Shared>,
+    pane: PaneId,
+    generation: u64,
+    symbol: String,
+    tf: Timeframe,
+    extended: bool,
+    mut failed: bool,
+) {
     let Some(ttl) = tr_data::intraday::refresh_ttl_secs(tf).filter(|ttl| *ttl > 0) else { return };
+    if !s.followers.lock().expect("followers").insert((pane, generation, false)) {
+        return;
+    }
     tokio::spawn(async move {
-        tokio::time::sleep(Duration::from_secs(ttl as u64)).await;
-        if current_series(&s, pane, generation).is_none() {
-            return;
+        loop {
+            let down = s.provider.health().is_some_and(|h| h.snapshot()[Feed::Bars as usize].state.is_down());
+            tokio::time::sleep(Duration::from_secs(if failed || down { 15 } else { ttl as u64 })).await;
+            if current_series(&s, pane, generation).is_none() {
+                break;
+            }
+            let before = s.provider.health().map(|h| h.snapshot()[Feed::Bars as usize].failed);
+            refresh_intraday(&s, pane, generation, &symbol, tf, extended).await;
+            failed = s.provider.health().is_some_and(|h| Some(h.snapshot()[Feed::Bars as usize].failed) != before)
+                || current_series(&s, pane, generation).is_some_and(|b| b.is_empty());
+            if !failed && !extended && s.provider.has_live_feed(&symbol, tf) {
+                start_live(s.clone(), pane, generation, symbol.clone(), tf);
+                break;
+            }
         }
-        refresh_intraday(&s, pane, generation, &symbol, tf, extended).await;
-        if current_series(&s, pane, generation).is_some() {
-            schedule_intraday_refresh(s, pane, generation, symbol, tf, extended);
-        }
+        s.followers.lock().expect("followers").remove(&(pane, generation, false));
     });
 }
 
@@ -3283,7 +3556,7 @@ async fn load_extended(s: &Arc<Shared>, pane: PaneId, generation: u64, symbol: S
         },
         Err(e) => {
             s.send(Response::HistoryError { pane, generation, error: format!("{e:#}") });
-            if s.provider.name() != "sample" {
+            if !s.sample_mode() {
                 retry_intraday(s.clone(), pane, generation, symbol, tf, true);
             }
         }
@@ -3320,17 +3593,20 @@ async fn refresh_intraday(s: &Shared, pane: PaneId, generation: u64, symbol: &st
     let bars = match fetched {
         Ok(bars) => bars,
         Err(error) => {
+            let message = format!("{error:#}");
+            s.bars_failed(pane, generation, symbol, tf, error);
             if current_series(s, pane, generation).is_some() {
                 s.send(Response::HistoryError {
                     pane,
                     generation,
-                    error: format!("Refresh failed; retry on next poll: {error:#}"),
+                    error: format!("Refresh failed; retry on next poll: {message}"),
                 });
             }
             return;
         }
     };
     if bars.is_empty() || !bars.iter().all(|b| b.provenance.is_verified()) {
+        s.bars_failed(pane, generation, symbol, tf, anyhow::anyhow!("Refresh returned no verified bars"));
         if current_series(s, pane, generation).is_some() {
             s.send(Response::HistoryError {
                 pane,
@@ -3382,7 +3658,13 @@ async fn refresh_intraday(s: &Shared, pane: PaneId, generation: u64, symbol: &st
 /// Merge the provider's live feed (if any) into the pane's series, publishing at most
 /// four updates a second. Stops when the pane reloads, closes or the feed ends.
 fn start_live(s: Arc<Shared>, pane: PaneId, generation: u64, symbol: String, tf: Timeframe) {
-    let Some(mut feed) = s.provider.live(&symbol, tf) else { return };
+    if !s.followers.lock().expect("followers").insert((pane, generation, true)) {
+        return;
+    }
+    let Some(mut feed) = s.provider.live(&symbol, tf) else {
+        s.followers.lock().expect("followers").remove(&(pane, generation, true));
+        return;
+    };
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(Duration::from_millis(250));
         let mut dirty = false;
@@ -3420,6 +3702,10 @@ fn start_live(s: Arc<Shared>, pane: PaneId, generation: u64, symbol: String, tf:
                     });
                 }
             }
+        }
+        s.followers.lock().expect("followers").remove(&(pane, generation, true));
+        if current_series(&s, pane, generation).is_some() {
+            retry_intraday(s.clone(), pane, generation, symbol.clone(), tf, false);
         }
         tracing::debug!("live feed for pane {pane} ({symbol}) stopped");
     });
@@ -3498,7 +3784,7 @@ async fn profile(s: &Shared, query: &str) -> Option<Profile> {
 
 async fn intraday_scan(s: &Shared, symbols: &[String]) -> tr_data::iscan::Board {
     let now = chrono::Utc::now().timestamp();
-    let sample = s.provider.name() == "sample";
+    let sample = s.sample_mode();
     let spy_key = tr_data::security(tr_data::iscan::BENCHMARK).key();
     let spy = if sample {
         Err("sample bars are not ranked".into())
@@ -3581,7 +3867,7 @@ async fn evaluate_trade_plans(s: &Shared) {
     use tr_data::price_alerts::{AlertFailure, PriceTick};
     use tr_data::trade_plans::{EvalInput, evaluate};
     let now = chrono::Utc::now().timestamp();
-    if s.provider.name() == "sample" {
+    if s.sample_mode() {
         let outcome = evaluate(
             &mut s.trade_plans.lock().expect("trade plans"),
             EvalInput { now, sample_provider: true, prices: Vec::new(), failures: Vec::new() },
@@ -3632,7 +3918,7 @@ async fn evaluate_price_alerts(s: &Shared) {
     use tr_data::session_alerts::{self, SessionSignal};
     use tr_data::whats_news::archive_ticker;
     let now = chrono::Utc::now().timestamp();
-    let sample = s.provider.name() == "sample";
+    let sample = s.sample_mode();
     let rules = s.price_alerts.lock().expect("price alerts").rules.clone();
     if sample {
         let outcome = evaluate(
@@ -3876,7 +4162,7 @@ async fn fetch_news(s: &Arc<Shared>, symbols: Option<Vec<String>>) -> tr_data::n
         NewsBatch, NewsFailure, TOP_CACHE_KEY, assemble_batch, bound_symbols, dedup_headlines, is_stale,
     };
     let now = chrono::Utc::now().timestamp();
-    if s.provider.name() == "sample" {
+    if s.sample_mode() {
         return NewsBatch::sample_isolated(now);
     }
     match symbols {
@@ -4202,6 +4488,9 @@ mod tests {
     }
     #[async_trait::async_trait]
     impl tr_data::MarketData for StackPrices {
+        fn mode(&self) -> DataMode {
+            if self.name == "sample" { DataMode::ExplicitSample } else { DataMode::Live }
+        }
         fn name(&self) -> &str {
             self.name
         }
@@ -4490,6 +4779,8 @@ mod tests {
                 whats_news: tokio::sync::watch::channel((0, Default::default())).0,
                 provider,
                 series: Default::default(),
+                feed_requests: Default::default(),
+                followers: Default::default(),
                 archive_daily: Default::default(),
                 stack_lanes: Default::default(),
                 wall_fetches: tokio::sync::Semaphore::new(4),
@@ -4799,6 +5090,107 @@ mod tests {
         let _ = std::fs::remove_file(path);
     }
 
+    struct BrokenFeed;
+    #[async_trait::async_trait]
+    impl tr_data::MarketData for BrokenFeed {
+        fn name(&self) -> &str {
+            "broken fixture"
+        }
+        async fn history(&self, _: &str, _: Timeframe, _: Option<i64>, _: usize) -> anyhow::Result<Vec<Bar>> {
+            anyhow::bail!("injected offline")
+        }
+    }
+    #[tokio::test]
+    async fn failed_refresh_with_cache_sends_stale_with_real_bars() {
+        let now = chrono::Utc::now().timestamp();
+        let mut cache = BarCache::open_in_memory().unwrap();
+        let real = Bar::new(now - 86400, 10.0, 11.0, 9.0, 10.0, 1.0).with_provenance(tr_core::Provenance::Real);
+        cache.store("AAPL", Timeframe::D1, &[real]).unwrap();
+        cache.note_fetch("AAPL", Timeframe::D1, now - 600).unwrap();
+        let (s, rx) = shared(Arc::new(tr_data::Guarded::new(BrokenFeed)), Some(cache));
+        let req = Request::History { pane: 1, generation: 1, symbol: "AAPL".into(), tf: Timeframe::D1, limit: 20 };
+        assert!(begin_request(&s, &req));
+        handle(&s, req).await;
+        let responses: Vec<_> = rx.try_iter().collect();
+        assert_eq!(responses.iter().filter(|r| matches!(r, Response::History { .. })).count(), 1);
+        assert!(responses.iter().any(|r| matches!(r, Response::History { bars, from_cache: true, .. } if bars.iter().all(|b| b.provenance == tr_core::Provenance::Cached))));
+        assert!(responses.iter().any(|r| matches!(r, Response::Feed { feed: Feed::Bars, pane: Some(1), generation: Some(1), state: FeedState::Stale { age_secs, .. }, .. } if *age_secs >= 600)));
+        assert_eq!(current_series(&s, 1, 1).unwrap()[0].provenance, tr_core::Provenance::Cached);
+    }
+    #[tokio::test]
+    async fn failed_refresh_without_cache_sends_unavailable_and_no_history() {
+        for provenance in [None, Some(tr_core::Provenance::Sample), Some(tr_core::Provenance::Missing)] {
+            let mut cache = BarCache::open_in_memory().unwrap();
+            if let Some(p) = provenance {
+                cache.store("AAPL", Timeframe::D1, &[Bar::new(1, 1.0, 1.0, 1.0, 1.0, 1.0).with_provenance(p)]).unwrap();
+            }
+            let (s, rx) = shared(Arc::new(tr_data::Guarded::new(BrokenFeed)), Some(cache));
+            let req = Request::History { pane: 1, generation: 1, symbol: "AAPL".into(), tf: Timeframe::D1, limit: 20 };
+            assert!(begin_request(&s, &req));
+            handle(&s, req).await;
+            let responses: Vec<_> = rx.try_iter().collect();
+            assert!(!responses.iter().any(|r| matches!(r, Response::History { .. })));
+            assert!(
+                responses
+                    .iter()
+                    .any(|r| matches!(r, Response::Feed { feed: Feed::Bars, state: FeedState::Unavailable(_), .. }))
+            );
+        }
+    }
+    #[tokio::test]
+    async fn quotes_and_curve_errors_emit_feed_state_not_values() {
+        let (s, rx) = shared(Arc::new(tr_data::Guarded::new(BrokenFeed)), None);
+        handle(&s, Request::Quotes(vec!["AAPL".into()])).await;
+        handle(&s, Request::YieldCurves).await;
+        let responses: Vec<_> = rx.try_iter().collect();
+        assert_eq!(responses.len(), 2);
+        assert!(responses.iter().all(|r| matches!(
+            r,
+            Response::Feed { feed: Feed::Quotes | Feed::Curve, state: FeedState::Unavailable(_), .. }
+        )));
+    }
+    #[tokio::test]
+    async fn retry_feed_reissues_only_current_pane_and_forget_retires_it() {
+        let (s, rx) = shared(Arc::new(tr_data::Guarded::new(BrokenFeed)), None);
+        for generation in [2, 1] {
+            let request = Request::History { pane: 1, generation, symbol: "AAPL".into(), tf: Timeframe::D1, limit: 20 };
+            if begin_request(&s, &request) {
+                handle(&s, request).await;
+            }
+        }
+        rx.try_iter().for_each(drop);
+        handle(&s, Request::RetryFeed { feed: Feed::Bars, pane: Some(1) }).await;
+        let responses: Vec<_> = rx.try_iter().collect();
+        assert!(responses.iter().any(|r| matches!(r, Response::Feed { generation: Some(2), .. })));
+        begin_request(&s, &Request::Forget(1));
+        handle(&s, Request::RetryFeed { feed: Feed::Bars, pane: Some(1) }).await;
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn retry_feed_bypasses_fresh_cache_without_duplicate_pollers() {
+        let provider = Arc::new(OfflinePrices { calls: Default::default(), provenance: tr_core::Provenance::Real });
+        let mut cache = BarCache::open_in_memory().unwrap();
+        let symbol = "USDBRL Curncy";
+        cache
+            .store(
+                symbol,
+                Timeframe::M5,
+                &[Bar::new(1, 5.0, 5.0, 5.0, 5.0, 1.0).with_provenance(tr_core::Provenance::Real)],
+            )
+            .unwrap();
+        cache.note_fetch(symbol, Timeframe::M5, chrono::Utc::now().timestamp()).unwrap();
+        let (s, rx) = shared(provider.clone(), Some(cache));
+        let request = Request::History { pane: 1, generation: 1, symbol: symbol.into(), tf: Timeframe::M5, limit: 20 };
+        assert!(begin_request(&s, &request));
+        handle(&s, request).await;
+        assert_eq!(provider.calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+        rx.try_iter().for_each(drop);
+        handle(&s, Request::RetryFeed { feed: Feed::Bars, pane: Some(1) }).await;
+        assert_eq!(provider.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(s.followers.lock().unwrap().len(), 1);
+        assert!(rx.try_iter().any(|r| matches!(r, Response::History { from_cache: false, .. })));
+    }
     #[tokio::test]
     async fn startup_refetches_sample_cache_and_does_not_publish_it_as_real() {
         use tr_core::Provenance;
@@ -5134,16 +5526,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn fallback_sample_results_are_not_written_to_the_bar_cache() {
+    async fn live_sample_results_are_rejected_and_not_written_to_the_bar_cache() {
         let provider = Arc::new(OfflinePrices { calls: Default::default(), provenance: tr_core::Provenance::Sample });
         let (s, rx) = shared(provider, Some(BarCache::open_in_memory().unwrap()));
         let req =
             Request::History { pane: 1, generation: 1, symbol: "USDBRL Curncy".into(), tf: Timeframe::D1, limit: 6000 };
         assert!(begin_request(&s, &req));
         handle(&s, req).await;
-        assert!(
-            matches!(rx.try_recv(), Ok(Response::History { bars, from_cache: false, .. }) if Bar::provenance(&bars) == tr_core::Provenance::Sample)
-        );
+        let responses: Vec<_> = rx.try_iter().collect();
+        assert!(!responses.iter().any(|r| matches!(r, Response::History { .. })));
+        assert!(responses.iter().any(|r| matches!(
+            r,
+            Response::Feed { state: FeedState::Unavailable(Unavailable { kind: DownKind::Rejected, .. }), .. }
+        )));
         assert!(
             s.cache.lock().unwrap().as_ref().unwrap().load("USDBRL Curncy", Timeframe::D1, 6000).unwrap().is_empty()
         );
@@ -5177,6 +5572,26 @@ mod tests {
         assert_eq!(&a[1..], &[50.0, 50.0, 55.0, 55.0]);
     }
 
+    #[test]
+    fn zband_readout_preserves_precision_and_refuses_sample() {
+        let bars: Vec<_> = (0..40)
+            .map(|i| {
+                let c = 1e9 + i as f64 * 0.01;
+                Bar::new(i, c, c, c, c, 1.0).with_provenance(tr_core::Provenance::Real)
+            })
+            .collect();
+        let palette = crate::themes::terminal_light().palette(theme::DEFAULT_ACCENT);
+        let specs = [IndicatorSpec::new("ZBAND", &[20.0]).unwrap()];
+        let built = build_indicators(&bars, Timeframe::D1, &specs, &palette);
+        let z = built[0].z_readout.as_ref().unwrap()[39];
+        let manual = tr_core::indicators::registry::zband(&bars.iter().map(|b| b.close).collect::<Vec<_>>(), 20);
+        assert_eq!(z, manual.z[39]);
+        assert!(z > 1.0 && z < 2.0);
+        let sample: Vec<_> = bars.iter().copied().map(|b| b.with_provenance(tr_core::Provenance::Sample)).collect();
+        let refused = build_indicators(&sample, Timeframe::D1, &specs, &palette);
+        assert!(refused[0].z_readout.is_none());
+        assert!(refused[0].overlays.is_empty());
+    }
     #[test]
     fn indicators_build_expected_overlays() {
         let bars = tr_core::sample::generate("X", Timeframe::D1, 300, 1_790_000_000);
@@ -5238,6 +5653,8 @@ mod tests {
             whats_news: tokio::sync::watch::channel((0, Default::default())).0,
             provider: std::sync::Arc::new(tr_data::sample::SampleProvider::at(0, 10)),
             series: Default::default(),
+            feed_requests: Default::default(),
+            followers: Default::default(),
             archive_daily: Default::default(),
             stack_lanes: Default::default(),
             wall_fetches: tokio::sync::Semaphore::new(4),

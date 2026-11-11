@@ -391,6 +391,70 @@ fn nth(name: &'static str, values: Vec<f64>, k: u8) -> Output {
     out(name, values, Plot::Line, Tone::Series(k))
 }
 
+/// Causal rolling sample-sigma bands; warm-up and non-finite windows stay absent.
+#[derive(Debug)]
+pub struct ZBand {
+    pub mean: Vec<f64>,
+    pub sigma: Vec<f64>,
+    pub z: Vec<f64>,
+    pub upper_one: Vec<f64>,
+    pub lower_one: Vec<f64>,
+    pub upper_two: Vec<f64>,
+    pub lower_two: Vec<f64>,
+}
+pub fn zband(closes: &[f64], n: usize) -> ZBand {
+    let len = closes.len();
+    let mut out = ZBand {
+        mean: vec![f64::NAN; len],
+        sigma: vec![f64::NAN; len],
+        z: vec![f64::NAN; len],
+        upper_one: vec![f64::NAN; len],
+        lower_one: vec![f64::NAN; len],
+        upper_two: vec![f64::NAN; len],
+        lower_two: vec![f64::NAN; len],
+    };
+    if n < 2 {
+        return out;
+    }
+    let (mut count, mut mean, mut m2) = (0usize, 0.0, 0.0);
+    for (i, &x) in closes.iter().enumerate() {
+        if i >= n {
+            let old = closes[i - n];
+            if old.is_finite() {
+                if count > 1 {
+                    let next = mean - (old - mean) / (count - 1) as f64;
+                    m2 -= (old - mean) * (old - next);
+                    mean = next;
+                    count -= 1;
+                } else {
+                    count = 0;
+                    mean = 0.0;
+                    m2 = 0.0;
+                }
+            }
+        }
+        if x.is_finite() {
+            count += 1;
+            let delta = x - mean;
+            mean += delta / count as f64;
+            m2 += delta * (x - mean);
+        }
+        if i + 1 >= n && count == n {
+            let sigma = (m2.max(0.0) / (n - 1) as f64).sqrt();
+            out.mean[i] = mean;
+            out.sigma[i] = sigma;
+            if sigma > 0.0 {
+                out.z[i] = (x - mean) / sigma;
+            }
+            out.upper_one[i] = mean + sigma;
+            out.lower_one[i] = mean - sigma;
+            out.upper_two[i] = mean + 2.0 * sigma;
+            out.lower_two[i] = mean - 2.0 * sigma;
+        }
+    }
+    out
+}
+
 fn bands(b: Bands, middle: &'static str) -> Vec<Output> {
     vec![
         out("Upper", b.upper, Plot::Line, Tone::Dim),
@@ -1156,6 +1220,18 @@ fn catalog() -> Vec<Def> {
         pane("VAR", "Variance", sta, |i, p| one("Variance", variance(i.c(), n(p, 0))))
             .alias(&["VARIANCE"])
             .n("Length", 20.0),
+        overlay("ZBAND", "Z Bands", sta, |i, p| {
+            let b = zband(i.c(), n(p, 0));
+            vec![
+                out("+2σ", b.upper_two, Plot::Line, Tone::Dim),
+                out("+1σ", b.upper_one, Plot::Line, Tone::Dim),
+                line("Basis", b.mean),
+                out("−1σ", b.lower_one, Plot::Line, Tone::Dim),
+                out("−2σ", b.lower_two, Plot::Line, Tone::Dim),
+            ]
+        })
+        .int("Length", 20.0, 2.0, MAX_LENGTH)
+        .research(),
         pane("ZSCORE", "Z-Score", sta, |i, p| one("Z", zscore(i.c(), n(p, 0))))
             .int("Length", 20.0, 2.0, MAX_LENGTH)
             .levels(&[-2.0, 0.0, 2.0]),
@@ -1230,6 +1306,29 @@ mod tests {
             .collect()
     }
 
+    #[test]
+    fn zband_matches_manual_sigma() {
+        let closes: Vec<_> = (1..=80).map(|i| i as f64).collect();
+        let b = zband(&closes, 20);
+        assert!(b.mean[..19].iter().all(|v| v.is_nan()));
+        for i in 19..80 {
+            let window = &closes[i - 19..=i];
+            let mean = window.iter().sum::<f64>() / 20.0;
+            let sigma = (window.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / 19.0).sqrt();
+            assert!((b.mean[i] - mean).abs() < 1e-12);
+            assert!((b.sigma[i] - sigma).abs() < 1e-12);
+            assert!((b.z[i] - (closes[i] - mean) / sigma).abs() < 1e-12);
+            assert!((b.upper_two[i] - (mean + 2.0 * sigma)).abs() < 1e-12);
+        }
+        let short = zband(&closes[..40], 20);
+        assert_eq!(&b.z[19..40], &short.z[19..]);
+        assert!(zband(&[5.0; 30], 20).z.iter().all(|v| v.is_nan()));
+        let mut hole = closes.clone();
+        hole[30] = f64::NAN;
+        let holed = zband(&hole, 20);
+        assert!(holed.z[30..50].iter().all(|v| v.is_nan()));
+        assert!(holed.z[50].is_finite());
+    }
     #[test]
     fn codes_and_aliases_are_unique_and_uppercase() {
         let mut seen = HashSet::new();

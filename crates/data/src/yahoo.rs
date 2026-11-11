@@ -1218,7 +1218,7 @@ mod coordination_tests {
         };
         assert!(error.is::<RateLimited>());
         assert!(
-            crate::Fallback::new(provider.clone())
+            crate::Guarded::new(provider.clone())
                 .history("AAPL", Timeframe::M5, None, 10)
                 .await
                 .unwrap_err()

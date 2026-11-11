@@ -1069,7 +1069,12 @@ impl TerminalApp {
     }
 
     pub(super) fn status_bar(&mut self, ui: &Ui, rect: Rect) {
-        let link_rect = Rect::from_min_max(rect.min, pos2(rect.right(), rect.top() + 22.0));
+        let strip = Rect::from_min_max(
+            pos2((rect.right() - 300.0).max(rect.left()), rect.top()),
+            pos2(rect.right(), rect.top() + 22.0),
+        );
+        self.health_strip(ui, strip);
+        let link_rect = Rect::from_min_max(rect.min, pos2(strip.left(), rect.top() + 22.0));
         let health = &self.whats_news_health;
         let label = if health.connected() {
             format!(

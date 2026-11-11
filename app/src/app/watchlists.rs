@@ -488,16 +488,32 @@ impl TerminalApp {
         if let Some(g) = self.watchlists.group(&group) {
             egui::ScrollArea::both().show_rows(ui, 22.0, g.members.len(), |ui, range| {
                 for m in &g.members[range] {
-                    let label = member_text(m, self.quotes.get(&m.symbol), Utc::now());
+                    let mut label = member_text(m, self.quotes.get(&m.symbol), Utc::now());
+                    let stale =
+                        self.quote_states.get(&m.symbol).is_some_and(|s| matches!(s, tr_data::FeedState::Stale { .. }));
+                    if stale && !label.contains("STALE") {
+                        let age = self.quotes.get(&m.symbol).map_or(0, |q| Utc::now().timestamp() - q.ts);
+                        label.push_str(&format!(" · STALE {}", crate::widgets::age_label(age)));
+                    }
                     let warning = label.contains("STALE") || label.contains("SAMPLE") || label.contains("UNVERIFIED");
-                    let r = ui.selectable_label(
-                        false,
-                        RichText::new(label).monospace().color(if warning {
-                            crate::theme::amber()
-                        } else {
-                            crate::theme::text()
-                        }),
-                    );
+                    let mut shown = self.quote_states.get(&m.symbol).cloned().unwrap_or_default();
+                    if let tr_data::FeedState::Stale { age_secs, .. } = &mut shown {
+                        *age_secs = self.quotes.get(&m.symbol).map_or(*age_secs, |q| Utc::now().timestamp() - q.ts);
+                    }
+                    let r = ui
+                        .horizontal(|ui| {
+                            let r = ui.selectable_label(
+                                false,
+                                RichText::new(label).monospace().color(if warning {
+                                    crate::theme::amber().gamma_multiply(if stale { 0.55 } else { 1.0 })
+                                } else {
+                                    crate::theme::text()
+                                }),
+                            );
+                            crate::widgets::stale_chip(ui, &shown);
+                            r
+                        })
+                        .inner;
                     if r.clicked() {
                         out.push(Action::WatchChart(group.clone(), m.symbol.clone(), !m.origins.is_empty()));
                     }

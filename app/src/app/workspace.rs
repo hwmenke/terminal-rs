@@ -23,7 +23,7 @@ use crate::widgets::{self, Icon};
 use crate::worker::{Request, Worker};
 
 /// Panels offered by the + menus: label and command word.
-pub const PANELS: [(&str, &str); 30] = [
+pub const PANELS: [(&str, &str); 31] = [
     ("Chart", "CHART"),
     ("Watchlist", "WL"),
     ("News", "NEWS"),
@@ -31,6 +31,7 @@ pub const PANELS: [(&str, &str); 30] = [
     ("Options", "OMON"),
     ("Portfolio", "PORT"),
     ("World Markets", "WEI"),
+    ("Feed Health", "HEALTH"),
     ("Yield Curve", "GC"),
     ("Congress Feed", "CONG"),
     ("Politicians", "POL"),
@@ -1143,6 +1144,7 @@ impl TerminalApp {
             "SECF" | "SEARCH" => PaneKind::Search { query: words[1..].join(" ") },
             "PREFS" | "SETTINGS" | "PDF" => PaneKind::Settings,
             "HELP" => PaneKind::Help,
+            "HEALTH" | "SRC" => PaneKind::Health,
             _ => return None,
         })
     }

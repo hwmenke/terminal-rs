@@ -611,7 +611,7 @@ mod tests {
             assert!(err.contains(needle), "{err}");
             assert!(err.contains("Lookalikes") || err.contains("refused"), "{err}");
         }
-        assert!(require_lookalike_bars(&[], "Lookalikes").unwrap_err().contains("no daily history"));
+        assert!(require_lookalike_bars(&[], "Lookalikes").unwrap_err().contains("no history"));
     }
 
     #[test]

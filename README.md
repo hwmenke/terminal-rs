@@ -78,7 +78,7 @@ gets the native title bar with traffic lights, window vibrancy behind the sideba
   2s10s / 3m10y / 5s30s), **news** (`NEWS` / `AAPL CN` / `TOP`; watchlist or scanner-leader
   headlines, Yahoo / CoinDesk, chart catalyst markers) and
   **order book** depth (`BTCUSD CRNCY OB`; live Binance book, Coinbase fallback; markets without a
-  free public book show a clearly marked simulation).
+  free public book show an Unsupported card).
 - **Market data behind a trait** (`tr_data::MarketData`), routed per asset class to free sources:
 
   | Asset class | History | Quotes | Live |
@@ -90,8 +90,10 @@ gets the native title bar with traffic lights, window vibrancy behind the sideba
 
   No keys are required. `TR_PROVIDER=sample` runs fully offline on deterministic, class-aware sample
   data (BTCUSD near 65,000, EURUSD near 1.09, US10Y near 4.2%) **with simulated live ticks**, and
-  the live router falls back to sample data when a source is unreachable. Bars are cached in SQLite
-  so charts paint from disk on start. Older history pages in as you scroll left.
+  live mode returns real data or an explicit **NO REAL DATA** card. Verified cached bars remain visible
+  with a **STALE** chip when refresh fails. `HEALTH` (`SRC`) shows feed diagnostics; `R` retries the
+  focused failed feed. Startup failures stay offline. [Real-data guarantee](docs/REAL_DATA.md).
+  Bars are cached in SQLite; older history pages in as you scroll left.
 - **Congress trades** (key feature)
   - Ingests Periodic Transaction Reports from the **Senate eFD** (efdsearch.senate.gov: agreement
     + CSRF session, DataTables search API, HTML transaction tables) and the **House Clerk**
