@@ -13,6 +13,7 @@ forecasts or trading actions.
 | `TSTACK AUTO` / click `LADDER …` | Restore the default ladder |
 | `TSTACK TINT [ON\|OFF]` | Toggle Regime Candles with a 200 ms fade |
 | `TSTACK SESSION [ON\|OFF]` | Reset base-lane KAMA/cloud at 09:30 ET; higher lanes stay continuous |
+| `TSTACK EDGE [ON\|OFF]` | Toggle the closed-bar regime-outcome and rotation-null card |
 | `RAIL [ON\|OFF]` | Toggle the independent intraday Truth Rail |
 | `AAPL TSTACK` | Load AAPL and enable the layer |
 | `NEW TSTACK NVDA`, `SPLIT DOWN TSTACK NVDA` | Open a 5m stacked chart (1D from an archive chart) |
@@ -95,6 +96,39 @@ only scored lanes. The intraday countdown tracks the existing refresh TTL; it
 stops on stale or closed sessions. A newly completed regime flip can pulse once
 for 1.2 seconds on a current real series; archive, cached-only and stale series
 never pulse.
+
+## Edge Proof
+
+`TSTACK EDGE` uses only the closed prefix, with the current row taken from the last
+closed state. `CLOSED THRU` shows its endpoint; `FORMING EXCLUDED` identifies a pending
+tail, including archive weeks/months in progress. Live closure uses the data refresh
+clock, so a stale partial bar cannot mature just because wall time advances. The stack
+itself continues to use all displayed bars. Sample, missing and mixed real/cache history
+are refused with zero numeric study output; consistently verified cached history is allowed.
+
+For each regime and 1/5/20-bar horizon, the tested statistic D is conditional mean
+return minus the baseline over warm entries with completed outcomes. The rotation null
+holds returns fixed and moves the whole warm signal block, including both entry flags,
+circularly. It preserves serial structure away from one artificial junction per rotation;
+that seam and changes over time limit its interpretation. Admissible offsets are
+`[max(20, 2 × h_max), W − max(20, 2 × h_max)]`. Up to 999 offsets are used, sampled
+without replacement when needed by a deterministic inline generator, with a roughly
+15-million-operation budget. Fewer than 99 usable offsets means `NULL N/A`.
+
+The card's Benjamini–Hochberg step-up q adjusts all available cell and flip p values
+together (up to ten tests). q is descriptive for these historical comparisons, rather
+than a promise about future returns. The header shows test and pass counts at `BH 0.10`.
+A solid mean dot and CI require q ≤ 0.10, no LOW N, and three known purged chronological
+folds agreeing with D's sign. Four equal-count folds drop outcomes crossing fold edges;
+folds with fewer than eight effective selected outcomes stay unknown. A four-segment
+strip shows their signs or grey unknowns. The grey null band behind the mean/CI translates
+the 2.5–97.5 percentiles of null D by the baseline. Hover shows p, q, the null interval
+and fold detail. The FLIPS footer tests its signed five-bar mean minus the baseline.
+
+Reports and formatted labels are cached by closed count, first/last closed timestamps,
+parameters and horizons within the chart generation/timeframe. A live tick reuses the
+cached report; closing a bar or paging history changes the key. Provenance is rechecked
+before reuse. Painting performs no statistical computation or network request.
 
 ## Data guarantees and failure states
 

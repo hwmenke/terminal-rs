@@ -33,6 +33,7 @@ pub mod journal;
 pub mod lookalike;
 pub mod markets;
 pub mod news;
+pub mod nulls;
 pub mod portable;
 pub mod price_alerts;
 pub mod realized_vol;
