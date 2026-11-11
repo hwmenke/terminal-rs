@@ -214,6 +214,10 @@ impl Range {
 pub enum Function {
     Timeframe(Timeframe),
     TrendStack(Option<bool>),
+    StackLadder(Option<Vec<Timeframe>>),
+    StackTint(Option<bool>),
+    StackSession(Option<bool>),
+    TruthRail(Option<bool>),
     ChartType(ChartType),
     /// Add or remove an indicator (any code from the catalog: `RSI`, `BB 20 2.5`, `ICHIMOKU`).
     Indicator(IndicatorSpec),
@@ -418,6 +422,15 @@ pub enum ReviewOverlay {
     Volume,
 }
 
+fn parse_switch(rest: &[&str]) -> Option<Option<bool>> {
+    match rest {
+        [] => Some(None),
+        [arg] if arg.eq_ignore_ascii_case("ON") => Some(Some(true)),
+        [arg] if arg.eq_ignore_ascii_case("OFF") => Some(Some(false)),
+        _ => None,
+    }
+}
+
 fn num<T: std::str::FromStr>(t: Option<&&str>) -> Option<T> {
     t.and_then(|s| s.parse().ok())
 }
@@ -618,12 +631,23 @@ fn parse_function(head: &str, rest: &[&str]) -> Option<Function> {
         }
         "LAYOUT" | "GRID" | "LP" => Function::Layout(joined()),
         "LAYOUTS" => Function::Layouts,
-        "TSTACK" | "STACK" | "MTF" | "REGIME" => Function::TrendStack(match rest {
-            [] => None,
-            [arg] if arg.eq_ignore_ascii_case("ON") => Some(true),
-            [arg] if arg.eq_ignore_ascii_case("OFF") => Some(false),
-            _ => return None,
-        }),
+        "TSTACK" | "STACK" | "MTF" | "REGIME" => match rest {
+            [] => Function::TrendStack(None),
+            [arg] if arg.eq_ignore_ascii_case("ON") => Function::TrendStack(Some(true)),
+            [arg] if arg.eq_ignore_ascii_case("OFF") => Function::TrendStack(Some(false)),
+            [arg] if arg.eq_ignore_ascii_case("AUTO") => Function::StackLadder(None),
+            [arg, tail @ ..] if arg.eq_ignore_ascii_case("TINT") => Function::StackTint(parse_switch(tail)?),
+            [arg, tail @ ..] if arg.eq_ignore_ascii_case("SESSION") => Function::StackSession(parse_switch(tail)?),
+            _ => {
+                if !rest.iter().all(|s| s.chars().any(|c| c.is_ascii_digit())) {
+                    return None;
+                }
+                let frames = rest.iter().map(|s| s.parse::<Timeframe>()).collect::<Result<Vec<_>, _>>().ok()?;
+                tr_core::indicators::ladder_custom(*frames.first()?, &frames, false).ok()?;
+                Function::StackLadder(Some(frames))
+            }
+        },
+        "RAIL" => Function::TruthRail(parse_switch(rest)?),
         "NEW" | "ADD" => Function::NewPanel(joined()),
         "SPLIT" | "SPLITV" | "SPLITH" => {
             let w = words();
@@ -745,8 +769,14 @@ pub fn parse(input: &str) -> Option<Command> {
         [us, k, ..] if us.eq_ignore_ascii_case("US") && YellowKey::parse(k).is_some() => true,
         _ => false,
     };
-    if !keyed && let Some(f) = parse_function(head, rest) {
-        return Some(Command::Function(f));
+    if !keyed {
+        if let Some(f) = parse_function(head, rest) {
+            return Some(Command::Function(f));
+        }
+        // Invalid stack arguments must not become a ticker followed by an interval.
+        if ["TSTACK", "STACK", "MTF", "REGIME", "RAIL"].iter().any(|word| head.eq_ignore_ascii_case(word)) {
+            return None;
+        }
     }
     let (sec, used) = Security::resolve_tokens(&tokens)?;
     match tokens[used..].split_first() {
@@ -786,6 +816,10 @@ pub fn hint(input: &str) -> String {
 
 fn describe(f: &Function) -> String {
     match f {
+        Function::StackLadder(frames) => format!("Trend Stack ladder {}", frames.as_ref().map(|f| f.iter().map(|t| t.label()).collect::<Vec<_>>().join("·")).unwrap_or_else(|| "AUTO".into())),
+        Function::StackTint(_) => "Regime Candle tint".into(),
+        Function::StackSession(_) => "Trend Stack session anchor".into(),
+        Function::TruthRail(_) => "Truth Rail".into(),
         Function::TrendStack(on) => format!("Trend Stack{}", match on { None => " toggle", Some(true) => " on", Some(false) => " off" }),
         Function::Timeframe(tf) => format!(
             "Interval {}",
@@ -1044,6 +1078,42 @@ fn describe(f: &Function) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn tstack_ladder_tokens_parse() {
+        use Timeframe::*;
+        assert_eq!(parse("TSTACK 5m 30m 4H"), Some(Command::Function(Function::StackLadder(Some(vec![M5, M30, H4])))));
+        assert_eq!(parse("TSTACK 1D 1W 1M"), Some(Command::Function(Function::StackLadder(Some(vec![D1, W1, MN1])))));
+        assert_eq!(parse("TSTACK AUTO"), Some(Command::Function(Function::StackLadder(None))));
+        assert_eq!(parse("TSTACK TINT"), Some(Command::Function(Function::StackTint(None))));
+        assert_eq!(parse("TSTACK TINT ON"), Some(Command::Function(Function::StackTint(Some(true)))));
+        assert_eq!(parse("TSTACK SESSION OFF"), Some(Command::Function(Function::StackSession(Some(false)))));
+        assert_eq!(parse("RAIL OFF"), Some(Command::Function(Function::TruthRail(Some(false)))));
+    }
+    #[test]
+    fn custom_ladder_rejects_descending_duplicate_sub_base_and_bare_letters() {
+        for text in [
+            "TSTACK 30m 5m",
+            "TSTACK 5m 5m",
+            "TSTACK D W",
+            "TSTACK 1D W",
+            "TSTACK 5m",
+            "TSTACK 7m 30m",
+            "TSTACK TINT ON EXTRA",
+            "RAIL ON EXTRA",
+        ] {
+            assert!(parse(text).is_none(), "{text}");
+        }
+    }
+    #[test]
+    fn new_tstack_d_is_still_a_symbol() {
+        assert_eq!(parse("NEW TSTACK D"), Some(Command::Function(Function::NewPanel("TSTACK D".into()))));
+        for ticker in ["D", "W", "M"] {
+            let (sec, used) = Security::resolve_tokens(&[ticker]).unwrap();
+            assert_eq!(sec.ticker, ticker);
+            assert_eq!(used, 1);
+        }
+    }
+
     #[test]
     fn twall_and_aliases_parse() {
         for alias in ["TWALL", "TGRID", "STACKS", "MTFGRID"] {

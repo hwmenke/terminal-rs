@@ -133,3 +133,57 @@ impl Headless {
         out
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::gpu::{Style, TintRef};
+    use crate::scene::{ChartType, PricePane, SeriesGpu, next_key, price_pane};
+    use crate::viewport::{PriceScale, Viewport};
+    use std::sync::Arc;
+    use tr_core::{Bar, Provenance};
+
+    #[test]
+    fn regime_tint_changes_candle_pixels_only_when_enabled() {
+        // Same adapter gate as tests/render.rs, including software adapters.
+        let Some(mut h) = Headless::new(160, 200) else {
+            eprintln!("no wgpu adapter; skipping");
+            return;
+        };
+        let bars: Vec<_> =
+            (0..4).map(|i| Bar::new(i * 300, 10.0, 14.0, 8.0, 12.0, 100.0).with_provenance(Provenance::Real)).collect();
+        let mut series = SeriesGpu::build(&bars);
+        let v = Viewport { right: 4.0, bar_px: 40.0, width_px: 160.0 };
+        let tint = TintRef { key: next_key(), version: 1, values: Arc::new(vec![-1.0; 4]) };
+        let render = |h: &mut Headless, series: &SeriesGpu, mix, ct| {
+            let pane = price_pane(&PricePane {
+                series,
+                chart_type: ct,
+                show_volume: true,
+                overlays: &[],
+                viewport: &v,
+                height_px: 200.0,
+                log: false,
+                manual_scale: Some(PriceScale::new(0.0, 20.0, false, 200.0)),
+                style: Style { tint_mix: mix, ..Default::default() },
+            });
+            h.render(&mut [Frame { pane: 1, frame_no: 0, cmds: pane.cmds }]);
+            h.read_pixels()
+        };
+        let plain = render(&mut h, &series, 0.0, ChartType::Candles);
+        series.bars.tint = Some(tint);
+        assert_eq!(plain, render(&mut h, &series, 0.0, ChartType::Candles));
+        let on = render(&mut h, &series, 1.0, ChartType::Candles);
+        let changed: Vec<_> =
+            plain.chunks_exact(4).zip(on.chunks_exact(4)).enumerate().filter(|(_, (a, b))| a != b).collect();
+        assert!(changed.len() > 100);
+        for (pixel, (before, after)) in changed {
+            assert!((59..=121).contains(&(pixel / 160)), "volume/background changed at {pixel}");
+            assert!(before[1] > before[0]);
+            assert!(after[0] > after[1]);
+        }
+        assert_eq!(plain, render(&mut h, &series, 0.0, ChartType::Candles));
+        // Neither volume nor a close-price line consumes the candle tint.
+        assert_eq!(render(&mut h, &series, 0.0, ChartType::Line), render(&mut h, &series, 1.0, ChartType::Line));
+    }
+}

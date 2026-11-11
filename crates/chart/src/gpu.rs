@@ -29,6 +29,8 @@ pub struct Uniforms {
     pub params: [f32; 4],
     pub extra: [f32; 4],
     pub anim: [f32; 4],
+    pub neutral: [f32; 4],
+    pub tint: [f32; 4],
 }
 
 /// Load-in sweep for a pane. Bars right of `front` (a fractional bar index) are hidden
@@ -87,6 +89,8 @@ pub struct Style {
     /// in points and scaled by this; pane sizes in [`PaneTransform`] are physical.
     pub pixels_per_point: f32,
     pub reveal: Reveal,
+    pub tint_mix: f32,
+    pub neutral: [f32; 4],
 }
 
 impl Default for Style {
@@ -105,6 +109,8 @@ impl Default for Style {
             baseline: 0.0,
             pixels_per_point: 1.0,
             reveal: Reveal::DONE,
+            tint_mix: 0.0,
+            neutral: [0.25, 0.25, 0.25, 1.0],
         }
     }
 }
@@ -129,8 +135,18 @@ impl Uniforms {
             ],
             extra: [s.vol_frac, s.vol_max, s.hist_width_bars, s.baseline],
             anim: [rel(r.front), r.ramp.max(1e-3), rel(r.line_front), r.opacity],
+            neutral: s.neutral,
+            tint: [s.tint_mix, 0.0, 0.0, 0.0],
         }
     }
+}
+
+/// One signed completed-regime confidence per level-0 bar, uploaded per revision.
+#[derive(Clone)]
+pub struct TintRef {
+    pub key: u64,
+    pub version: u64,
+    pub values: Arc<Vec<f32>>,
 }
 
 /// Shared handle to an uploaded-on-demand bar pyramid.
@@ -139,6 +155,7 @@ pub struct SeriesRef {
     pub key: u64,
     pub version: u64,
     pub pyramid: Arc<BarPyramid>,
+    pub tint: Option<TintRef>,
 }
 
 #[derive(Clone)]
@@ -193,6 +210,7 @@ enum Pipe {
 }
 
 struct Resolved {
+    tint_key: Option<u64>,
     pipe: Pipe,
     key: (bool, u64),
     slot: u32,
@@ -210,6 +228,7 @@ pub struct ChartRenderer {
     uniform_buf: wgpu::Buffer,
     uniform_bg: wgpu::BindGroup,
     storage_bgl: wgpu::BindGroupLayout,
+    neutral_bg: wgpu::BindGroup,
     /// (is_line, key) -> uploaded buffer
     buffers: HashMap<(bool, u64), GpuBuffer>,
     panes: HashMap<u64, Vec<Resolved>>,
@@ -263,7 +282,7 @@ impl ChartRenderer {
         });
         let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("chart-layout"),
-            bind_group_layouts: &[Some(&uniform_bgl), Some(&storage_bgl)],
+            bind_group_layouts: &[Some(&uniform_bgl), Some(&storage_bgl), Some(&storage_bgl)],
             immediate_size: 0,
         });
         let make = |module: &wgpu::ShaderModule, entry: &str| {
@@ -311,6 +330,16 @@ impl ChartRenderer {
                 }),
             }],
         });
+        let neutral_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("neutral-tint"),
+            contents: bytemuck::cast_slice(&[0.0f32]),
+            usage: wgpu::BufferUsages::STORAGE,
+        });
+        let neutral_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("neutral-tint"),
+            layout: &storage_bgl,
+            entries: &[wgpu::BindGroupEntry { binding: 0, resource: neutral_buffer.as_entire_binding() }],
+        });
         Self {
             candle: make(&bar_mod, "vs_candle"),
             volume: make(&bar_mod, "vs_volume"),
@@ -322,6 +351,7 @@ impl ChartRenderer {
             uniform_buf,
             uniform_bg,
             storage_bgl,
+            neutral_bg,
             buffers: HashMap::new(),
             panes: HashMap::new(),
             frame_no: u64::MAX,
@@ -378,11 +408,20 @@ impl ChartRenderer {
             }
             let slot = self.next_slot as u32;
             self.next_slot += 1;
+            let mut tint_key = None;
             let (pipe, key, range, uniforms) = match cmd {
                 DrawCmd::Candles { data, range, uniforms } | DrawCmd::Volume { data, range, uniforms } => {
                     self.ensure(device, false, data.key, data.version, || {
                         bytemuck::cast_slice::<GpuBar, u8>(&data.pyramid.data).to_vec()
                     });
+                    if matches!(cmd, DrawCmd::Candles { .. })
+                        && let Some(tint) = &data.tint
+                    {
+                        self.ensure(device, true, tint.key, tint.version, || {
+                            bytemuck::cast_slice(tint.values.as_slice()).to_vec()
+                        });
+                        tint_key = Some(tint.key);
+                    }
                     let pipe = if matches!(cmd, DrawCmd::Candles { .. }) { Pipe::Candle } else { Pipe::Volume };
                     (pipe, (false, data.key), *range, uniforms)
                 }
@@ -401,7 +440,7 @@ impl ChartRenderer {
                 }
             };
             queue.write_buffer(&self.uniform_buf, slot as u64 * SLOT, bytemuck::bytes_of(uniforms));
-            resolved.push(Resolved { pipe, key, slot, range });
+            resolved.push(Resolved { pipe, key, slot, range, tint_key });
         }
         self.panes.insert(frame.pane, resolved);
     }
@@ -426,6 +465,12 @@ impl ChartRenderer {
             pass.set_pipeline(pipeline);
             pass.set_bind_group(0, &self.uniform_bg, &[d.slot * SLOT as u32]);
             pass.set_bind_group(1, &buf.bind_group, &[]);
+            let tint = d
+                .tint_key
+                .and_then(|key| self.buffers.get(&(true, key)))
+                .map(|b| &b.bind_group)
+                .unwrap_or(&self.neutral_bg);
+            pass.set_bind_group(2, tint, &[]);
             pass.draw(0..verts, d.range.0..d.range.1);
         }
     }

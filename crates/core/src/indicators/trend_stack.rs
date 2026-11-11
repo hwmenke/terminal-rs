@@ -62,6 +62,20 @@ pub fn ladder(tf: Timeframe, archive: bool) -> Vec<Timeframe> {
     frames.into_iter().filter(|t| !archive || !t.is_intraday()).collect()
 }
 
+/// Validate native intervals; token validation belongs to the command parser.
+pub fn ladder_custom(base: Timeframe, frames: &[Timeframe], archive: bool) -> Result<Vec<Timeframe>, String> {
+    if !(2..=4).contains(&frames.len())
+        || frames.first() != Some(&base)
+        || frames.windows(2).any(|w| w[0] >= w[1])
+        || (archive && frames.iter().any(|tf| tf.is_intraday()))
+    {
+        return Err(
+            "TSTACK expects 2–4 ascending native intervals starting at the chart interval; archive: 1D/1W/1M".into()
+        );
+    }
+    Ok(frames.to_vec())
+}
+
 /// A native bar j becomes observable only at the open of its successor j+1.
 /// The final native bar is never used here, including across session gaps.
 pub fn align_completed<T: Copy>(base_ts: &[i64], lane_ts: &[i64], lane: &[T], empty: T) -> Vec<T> {
@@ -108,7 +122,19 @@ pub fn trend_stack(
     let calculate = |bars: &[Bar], tf: Timeframe| {
         let mut params = p;
         params.session_atr = tf.is_intraday();
-        let starts = tf.is_intraday().then(|| session_starts(&bars.iter().map(|b| b.ts).collect::<Vec<_>>()));
+        params.session_reset = p.session_reset && tf == base_tf && tf.is_intraday();
+        let starts = tf.is_intraday().then(|| {
+            let ts: Vec<_> = bars.iter().map(|b| b.ts).collect();
+            let mut starts = session_starts(&ts);
+            if params.session_reset {
+                for i in 1..ts.len() {
+                    let wall = crate::ny::civil(ts[i]);
+                    let open = crate::ny::to_utc(wall.date().and_hms_opt(9, 30, 0).unwrap());
+                    starts[i] |= ts[i - 1] < open && ts[i] >= open;
+                }
+            }
+            starts
+        });
         adaptive_trend_with(&Ohlcv::new(bars), params, starts.as_deref())
     };
     let base_trend = calculate(base, base_tf);
@@ -177,6 +203,18 @@ pub fn trend_stack(
                         }
                         lane.since = align_completed(&base_ts, &ts, &since, None);
                         lane.age = align_completed(&base_ts, &ts, &age, 0);
+                        if p.session_reset && tf == base_tf && tf.is_intraday() {
+                            for i in 0..base.len() {
+                                if !t.confidence[i].is_finite() {
+                                    lane.state[i] = 0;
+                                    lane.conf[i] = f32::NAN;
+                                    lane.completed_ts[i] = None;
+                                    lane.since[i] = None;
+                                    lane.age[i] = 0;
+                                    lane.trails[i] = f64::NAN;
+                                }
+                            }
+                        }
                         lane.forming = t.medium_state.last().copied().zip(conf.last().copied());
                         lane.last_bar_ts = ts.last().copied();
                         lane.since_ts = lane.since.last().copied().flatten();
@@ -237,6 +275,54 @@ mod tests {
     fn stack(base: &[Bar], lanes: Vec<(Timeframe, Result<Vec<Bar>, String>)>) -> TrendStack {
         trend_stack(base, Timeframe::M5, lanes, Default::default()).unwrap()
     }
+    #[test]
+    fn session_anchor_resets_at_0930_and_keeps_higher_lanes_continuous() {
+        let day = chrono::NaiveDate::from_ymd_opt(2026, 11, 9).unwrap();
+        let open = crate::ny::to_utc(day.and_hms_opt(9, 30, 0).unwrap());
+        let next = crate::ny::to_utc((day + chrono::Duration::days(1)).and_hms_opt(8, 0, 0).unwrap());
+        let mut base = bars(174, 300, Provenance::Real);
+        for (i, b) in base.iter_mut().enumerate() {
+            b.ts = if i < 78 { open + i as i64 * 300 } else { next + (i - 78) as i64 * 300 };
+        }
+        let native = bars(200, 3600, Provenance::Real);
+        let plain = stack(&base, vec![(Timeframe::H1, Ok(native.clone()))]);
+        let anchored = trend_stack(
+            &base,
+            Timeframe::M5,
+            vec![(Timeframe::H1, Ok(native))],
+            AdaptiveTrendParams { session_reset: true, ..Default::default() },
+        )
+        .unwrap();
+        let reset = 96; // 18 premarket prints after 08:00, then 09:30.
+        let fresh = stack(&base[reset..], vec![]);
+        for (got, want) in
+            [(&anchored.mb, &fresh.mb), (&anchored.sigma, &fresh.sigma), (&anchored.confidence, &fresh.confidence)]
+        {
+            assert_eq!(
+                got[reset..].iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                want.iter().map(|v| v.to_bits()).collect::<Vec<_>>()
+            );
+        }
+        assert!(anchored.lanes[0].conf[reset..reset + 20].iter().all(|v| v.is_nan()));
+        assert!(anchored.lanes[0].completed_ts[reset..reset + 20].iter().all(Option::is_none));
+        assert_eq!(anchored.lanes[1].state, plain.lanes[1].state);
+        assert_eq!(
+            anchored.lanes[1].conf.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+            plain.lanes[1].conf.iter().map(|v| v.to_bits()).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn custom_ladder_rejects_descending_duplicate_and_sub_base() {
+        use Timeframe::*;
+        assert_eq!(ladder_custom(M5, &[M5, M30, H4], false).unwrap(), vec![M5, M30, H4]);
+        for frames in [vec![M5, H1, M30], vec![M5, M5], vec![M1, M5], vec![M5], vec![M5, M15, M30, H1, H4]] {
+            assert!(ladder_custom(M5, &frames, false).is_err());
+        }
+        assert!(ladder_custom(M5, &[M5, D1], true).is_err());
+        assert!(ladder_custom(D1, &[D1, W1, MN1], true).is_ok());
+    }
+
     #[test]
     fn ladder_matches_the_documented_frames_and_archive_stays_daily_or_higher() {
         use Timeframe::*;

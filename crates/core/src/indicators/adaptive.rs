@@ -49,6 +49,7 @@ pub struct AdaptiveTrendParams {
     pub confirm_mult: f64,
     pub min_hold: usize,
     pub session_atr: bool,
+    pub session_reset: bool,
 }
 
 impl Default for AdaptiveTrendParams {
@@ -68,6 +69,7 @@ impl Default for AdaptiveTrendParams {
             confirm_mult: 0.25,
             min_hold: 10,
             session_atr: false,
+            session_reset: false,
         }
     }
 }
@@ -205,6 +207,48 @@ pub fn adaptive_trend_with(o: &Ohlcv, p: AdaptiveTrendParams, starts: Option<&[b
     let len = o.len();
     if len == 0 {
         return AdaptiveTrend::empty(0);
+    }
+    if p.session_reset
+        && let Some(starts) = starts
+    {
+        let mut out = AdaptiveTrend::empty(len);
+        let cuts: Vec<_> = std::iter::once(0)
+            .chain((1..len).filter(|i| starts.get(*i) == Some(&true)))
+            .chain(std::iter::once(len))
+            .collect();
+        for w in cuts.windows(2) {
+            let (a, b) = (w[0], w[1]);
+            let slice = Ohlcv {
+                ts: o.ts[a..b].to_vec(),
+                open: o.open[a..b].to_vec(),
+                high: o.high[a..b].to_vec(),
+                low: o.low[a..b].to_vec(),
+                close: o.close[a..b].to_vec(),
+                volume: o.volume[a..b].to_vec(),
+            };
+            let part = adaptive_trend_with(
+                &slice,
+                AdaptiveTrendParams { session_reset: false, ..p },
+                Some(&vec![false; b - a]),
+            );
+            out.sb[a..b].copy_from_slice(&part.sb);
+            out.mb[a..b].copy_from_slice(&part.mb);
+            out.lb[a..b].copy_from_slice(&part.lb);
+            out.sdb[a..b].copy_from_slice(&part.sdb);
+            out.mrt[a..b].copy_from_slice(&part.mrt);
+            out.mdb[a..b].copy_from_slice(&part.mdb);
+            out.lrt[a..b].copy_from_slice(&part.lrt);
+            out.ldb[a..b].copy_from_slice(&part.ldb);
+            out.short_state[a..b].copy_from_slice(&part.short_state);
+            out.medium_state[a..b].copy_from_slice(&part.medium_state);
+            out.long_state[a..b].copy_from_slice(&part.long_state);
+            out.entry_long[a..b].copy_from_slice(&part.entry_long);
+            out.entry_short[a..b].copy_from_slice(&part.entry_short);
+            out.atr[a..b].copy_from_slice(&part.atr);
+            out.confidence[a..b].copy_from_slice(&part.confidence);
+            out.sigma[a..b].copy_from_slice(&part.sigma);
+        }
+        return out;
     }
     let hlc3 = o.hlc3();
     let sb = adaptive_ma(&hlc3, p.sb_er, p.sb_fast, p.sb_slow, p.method);
@@ -459,6 +503,94 @@ mod tests {
             c.push(*c.last().unwrap() - 1.6);
         }
         c
+    }
+
+    #[test]
+    fn session_reset_emits_nan_until_warm_and_matches_fresh_series_goldens() {
+        let bars = series(&rise_then_fall(100, 100), Provenance::Real);
+        let o = Ohlcv::new(&bars);
+        let mut starts = vec![false; bars.len()];
+        starts[0] = true;
+        starts[100] = true;
+        let p = AdaptiveTrendParams { session_atr: true, session_reset: true, ..Default::default() };
+        let reset = adaptive_trend_with(&o, p, Some(&starts));
+        assert!(reset.mb[100..119].iter().all(|v| v.is_nan()));
+        assert!(reset.sigma[100..139].iter().all(|v| v.is_nan()));
+        assert!(reset.confidence[100..120].iter().all(|v| v.is_nan()));
+        for (a, b) in [(0, 100), (100, 200)] {
+            let fresh =
+                adaptive_trend_with(&Ohlcv::new(&bars[a..b]), AdaptiveTrendParams { session_reset: false, ..p }, None);
+            assert_eq!(
+                reset.sb[a..b].iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                fresh.sb.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                "sb"
+            );
+            assert_eq!(
+                reset.mb[a..b].iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                fresh.mb.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                "mb"
+            );
+            assert_eq!(
+                reset.lb[a..b].iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                fresh.lb.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                "lb"
+            );
+            assert_eq!(
+                reset.sdb[a..b].iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                fresh.sdb.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                "sdb"
+            );
+            assert_eq!(
+                reset.mrt[a..b].iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                fresh.mrt.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                "mrt"
+            );
+            assert_eq!(
+                reset.mdb[a..b].iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                fresh.mdb.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                "mdb"
+            );
+            assert_eq!(
+                reset.lrt[a..b].iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                fresh.lrt.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                "lrt"
+            );
+            assert_eq!(
+                reset.ldb[a..b].iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                fresh.ldb.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                "ldb"
+            );
+            assert_eq!(
+                reset.atr[a..b].iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                fresh.atr.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                "atr"
+            );
+            assert_eq!(
+                reset.confidence[a..b].iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                fresh.confidence.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                "confidence"
+            );
+            assert_eq!(
+                reset.sigma[a..b].iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                fresh.sigma.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                "sigma"
+            );
+            assert_eq!(reset.short_state[a..b], fresh.short_state, "short_state");
+            assert_eq!(reset.medium_state[a..b], fresh.medium_state, "medium_state");
+            assert_eq!(reset.long_state[a..b], fresh.long_state, "long_state");
+            assert_eq!(reset.entry_long[a..b], fresh.entry_long, "entry_long");
+            assert_eq!(reset.entry_short[a..b], fresh.entry_short, "entry_short");
+        }
+    }
+    #[test]
+    fn session_reset_off_matches_existing_goldens() {
+        let bars = series(&rise_then_fall(80, 80), Provenance::Real);
+        let o = Ohlcv::new(&bars);
+        let mut starts = vec![false; bars.len()];
+        starts[80] = true;
+        let p = AdaptiveTrendParams { session_reset: false, ..Default::default() };
+        let with = adaptive_trend_with(&o, p, Some(&starts));
+        assert_eq!(format!("{with:?}"), format!("{:?}", adaptive_trend(&o, p)));
     }
 
     #[test]

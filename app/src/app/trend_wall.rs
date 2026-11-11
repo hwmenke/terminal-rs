@@ -97,7 +97,7 @@ impl TrendWallPane {
         }
         if matches!(row.status, LaneStatus::Unavailable(_))
             && self.rows[index].provenance.is_verified()
-            && let Some(ts) = self.rows[index].last_bar_ts
+            && self.rows[index].last_bar_ts.is_some()
             && !self.daily
         {
             let error = match &row.status {
@@ -105,9 +105,7 @@ impl TrendWallPane {
                 _ => unreachable!(),
             };
             row = self.rows[index].clone();
-            row.status = LaneStatus::Stale { lag_secs: chrono::Utc::now().timestamp().saturating_sub(ts).max(0) };
-            row.note = Some(error);
-            row.clear_score();
+            row.failed_refresh(error, chrono::Utc::now().timestamp());
         }
         row.age(chrono::Utc::now().timestamp());
         self.rows[index] = row;
@@ -512,7 +510,8 @@ fn paint_wall(ui: &mut Ui, p: &mut TrendWallPane) -> Option<(String, Timeframe, 
                         }
                     }
                 }
-                if matches!(row.status, LaneStatus::Refused(_) | LaneStatus::Warming { .. }) {
+                if matches!(row.status, LaneStatus::Refused(_) | LaneStatus::Warming { .. } | LaneStatus::Stale { .. })
+                {
                     let c = if matches!(row.status, LaneStatus::Refused(_)) { theme::down() } else { muted() };
                     let mut x = plot.left();
                     while x + 18.0 < plot.right() {
@@ -572,6 +571,22 @@ fn paint_wall(ui: &mut Ui, p: &mut TrendWallPane) -> Option<(String, Timeframe, 
                     mono(11.0),
                     text(),
                 );
+            }
+            if matches!(row.status, LaneStatus::Stale { .. }) {
+                painter.text(
+                    pos2(plot.left() + 5.0, y + 10.0),
+                    Align2::LEFT_CENTER,
+                    format!(
+                        "STALE · last {} ET",
+                        row.last_bar_ts
+                            .map(|ts| tr_core::ny::civil(ts).format("%H:%M").to_string())
+                            .unwrap_or_default()
+                    ),
+                    mono(10.0),
+                    theme::down(),
+                );
+            } else if row.note.is_some() {
+                painter.text(pos2(plot.left() + 5.0, y + 10.0), Align2::LEFT_CENTER, "RETRY", mono(10.0), amber());
             }
             if !matches!(row.status, LaneStatus::Ready | LaneStatus::Stale { .. }) {
                 painter.text(

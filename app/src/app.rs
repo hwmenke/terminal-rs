@@ -513,6 +513,10 @@ impl PaneKind {
                 show_rs: c.show_rs,
                 show_volume_ctx: c.show_volume_ctx,
                 show_stack: c.show_stack,
+                stack_ladder: c.stack_ladder.clone(),
+                stack_tint: c.stack_tint,
+                stack_session: c.stack_session,
+                show_rail: c.show_rail,
             },
             PaneKind::Feed { filter } => {
                 PaneSettings::Feed((*filter != FeedFilter::default()).then(|| (*filter).into()))
@@ -628,6 +632,10 @@ impl PaneKind {
                 show_rs,
                 show_volume_ctx,
                 show_stack,
+                stack_ladder,
+                stack_tint,
+                stack_session,
+                show_rail,
             } => {
                 let mut c = ChartState::new(0, &symbol, tf);
                 c.archive = archive;
@@ -649,6 +657,11 @@ impl PaneKind {
                 c.show_rs = show_rs;
                 c.show_volume_ctx = show_volume_ctx;
                 c.show_stack = show_stack;
+                c.stack_ladder =
+                    stack_ladder.filter(|frames| tr_core::indicators::ladder_custom(tf, frames, archive).is_ok());
+                c.stack_tint = stack_tint;
+                c.stack_session = stack_session;
+                c.show_rail = show_rail;
                 PaneKind::Chart(Box::new(c))
             }
             PaneSettings::Feed(f) => PaneKind::Feed { filter: f.map(Into::into).unwrap_or_default() },
@@ -1367,6 +1380,10 @@ impl TerminalApp {
 
     fn apply_with_symbol(&mut self, f: Function, symbol: Option<String>) {
         match f {
+            Function::StackLadder(frames) => self.with_chart(|c, w| c.set_stack_ladder(frames, w)),
+            Function::StackTint(on) => self.with_chart(|c, w| c.set_stack_tint(on, w)),
+            Function::StackSession(on) => self.with_chart(|c, w| c.set_stack_session(on, w)),
+            Function::TruthRail(on) => self.with_chart(|c, _| c.show_rail = on.unwrap_or(!c.show_rail)),
             Function::TrendStack(on) => self.with_chart(|c, w| c.set_trend_stack(on, w)),
             Function::Timeframe(tf) => self.with_chart(|c, w| c.set_timeframe(tf, w)),
             Function::ChartType(t) => self.with_chart(|c, _| c.chart_type = t),
@@ -1874,9 +1891,11 @@ impl TerminalApp {
                         c.on_indicators(generation, built);
                     }
                 }
-                Response::TrendStack { pane, generation, base_len, result } => {
+                Response::TrendStack { pane, generation, base_len, result, config_revision } => {
                     if let Some(c) = self.chart_mut(pane) {
-                        c.on_trend_stack(generation, base_len, result);
+                        if c.stack_config_revision == config_revision {
+                            c.on_trend_stack(generation, base_len, result);
+                        }
                     }
                 }
                 Response::DailyStrength { pane, generation, base_len, result } => {

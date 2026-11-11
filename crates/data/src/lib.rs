@@ -46,6 +46,7 @@ pub mod stack_wall;
 pub mod stats;
 pub mod trade_plans;
 pub mod treasury;
+pub mod truth_rail;
 pub mod volume_pace;
 pub mod whats_news;
 pub mod yahoo;

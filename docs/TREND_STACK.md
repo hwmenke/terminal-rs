@@ -9,6 +9,11 @@ forecasts or trading actions.
 | --- | --- |
 | `TSTACK`, `STACK`, `MTF`, `REGIME` | Toggle the focused chart layer |
 | `TSTACK ON`, `TSTACK OFF` | Explicit enable / disable |
+| `TSTACK 5m 30m 4H` | Set 2–4 ascending native intervals, switch the chart to the first, enable tint |
+| `TSTACK AUTO` / click `LADDER …` | Restore the default ladder |
+| `TSTACK TINT [ON\|OFF]` | Toggle Regime Candles with a 200 ms fade |
+| `TSTACK SESSION [ON\|OFF]` | Reset base-lane KAMA/cloud at 09:30 ET; higher lanes stay continuous |
+| `RAIL [ON\|OFF]` | Toggle the independent intraday Truth Rail |
 | `AAPL TSTACK` | Load AAPL and enable the layer |
 | `NEW TSTACK NVDA`, `SPLIT DOWN TSTACK NVDA` | Open a 5m stacked chart (1D from an archive chart) |
 | `,` / `.` | Shorter / longer interval |
@@ -19,8 +24,31 @@ forecasts or trading actions.
 Interval keys require chart focus, an empty command line and no focused text
 field. Archive charts step only through D/W/M; `\` reports “Archive charts are
 daily and higher.” The existing typed intervals and header controls still work.
-Only the `show_stack` flag is saved; calculations and lane prices stay in memory.
-Older layouts load with the layer off.
+Stack visibility, custom ladder, tint, session anchor and rail visibility are saved;
+calculations and lane prices stay in memory. Older layouts load AUTO, tint/anchor off,
+rail on and the stack layer off. Ladder tokens require a digit (`1D`, not `D`),
+so `NEW TSTACK D` still names ticker D. Archive ladders allow only 1D/1W/1M.
+
+## Regime Candles and Truth Rail
+
+Tint uses the completed base lane's medium regime and confidence. Long/short use
+up/down hues, flat or warming uses grid grey. Saturation is `0.35 + 0.65 × confidence`;
+a candle closing against its regime is 60% as bright. Wicks share the body colour.
+Refused, stale and sample stacks disable tint immediately. One f32 per bar is uploaded
+on stack changes; toggles only change a uniform, with no additional draw calls.
+
+The 5 px Truth Rail sits between plot and time labels, independently of TSTACK, on
+intraday charts at least 160 px tall. Real bars are solid up-colour, cached bars dim
+cyan, sample/unverified bars red hatched. A red notch before an actual bar reports
+all missing opens at that boundary; hover lists their ET times and count, plus bar
+provenance and fetch age. A hatched amber tail reaches toward now only after the
+existing freshness window expires and displays `STALE …m`. Rail metadata never
+creates, fills or changes prices. Its single cached mesh is reused during hover.
+
+`TSTACK SESSION` re-seeds the base calculation at the first observed bar on/after
+09:30 ET (also on date changes). Warm-up observations/cloud remain empty; no prior
+session state enters the new session. Extended-hours bars before the open form a
+separate segment. Higher native lanes keep their continuous baseline.
 
 ## Reading the layer
 
@@ -94,7 +122,10 @@ ARCHIVE` and use only daily and higher lanes.
 - Stale intraday lane: aged by its own asset clock, desaturated and excluded.
 - Closed session: normal colours with `SESSION CLOSED`; no countdown or pulse.
 
-The worker caches at most 64 native-lane entries with at most 400 bars each.
+The worker caches at most 160 completed native-lane entries with at most 400 bars each.
+Concurrent requests for a key share a cancellable OnceCell and return shared bars.
+Different keys never hold a map lock across fetches; failures are removed, and only
+completed slots are evicted. Wall fetches have four permits; chart lanes bypass them.
 Intraday TTLs use `refresh_ttl_secs`; daily/higher TTL is 900 seconds. Only verified
 market fetches write through to `BarCache` and `note_fetch`. No derived values
 are persisted. Existing history refreshes and the 1.5-second live-tick throttle

@@ -65,7 +65,7 @@ impl Row {
     }
     /// Re-evaluate on the UI's existing tick too, so an in-flight refresh cannot leave a live vote behind.
     pub fn age(&mut self, now: i64) -> bool {
-        if !matches!(self.status, LaneStatus::Ready | LaneStatus::Stale { .. }) {
+        if !self.provenance.is_verified() || matches!(self.status, LaneStatus::Refused(_)) {
             return false;
         }
         let lag = self
@@ -95,9 +95,24 @@ impl Row {
             let changed = !matches!(self.status, LaneStatus::Stale { .. });
             self.status = LaneStatus::Stale { lag_secs };
             self.clear_score();
+            self.clear_ribbon();
             return changed;
         }
         false
+    }
+    pub fn clear_ribbon(&mut self) {
+        for lane in &mut self.lanes {
+            lane.cells.clear();
+            lane.forming = None;
+        }
+    }
+    pub fn failed_refresh(&mut self, error: String, now: i64) {
+        self.note = Some(error);
+        self.age(now);
+        if matches!(self.status, LaneStatus::Stale { .. } | LaneStatus::Refused(_)) {
+            self.clear_score();
+            self.clear_ribbon();
+        }
     }
     pub fn clear_score(&mut self) {
         self.score = None;
@@ -161,8 +176,7 @@ pub fn build_row(symbol: &str, stack: &TrendStack, base: &[Bar], now: i64) -> Ro
         })
         .unwrap_or(LaneStatus::Ready);
     for lane in &stack.lanes {
-        let valid =
-            lane.provenance.is_verified() && matches!(lane.status, LaneStatus::Ready | LaneStatus::Stale { .. });
+        let valid = lane.provenance.is_verified() && lane.status == LaneStatus::Ready;
         let cells = row
             .clock
             .iter()
@@ -219,6 +233,9 @@ pub fn build_row(symbol: &str, stack: &TrendStack, base: &[Bar], now: i64) -> Ro
         }
     }
     row.age(now);
+    if matches!(row.status, LaneStatus::Stale { .. } | LaneStatus::Refused(_)) {
+        row.clear_ribbon();
+    }
     if !row.scored() {
         row.clear_score();
     }
@@ -318,6 +335,21 @@ mod tests {
         build_row("AAPL", &trend_stack(base, Timeframe::M5, vec![], Default::default()).unwrap(), base, now)
     }
     #[test]
+    fn failed_refresh_past_freshness_emits_no_ribbon_cells() {
+        let (bars, _) = fixture();
+        let mut current = row(&bars[..70], bars[69].ts + 300);
+        assert!(current.scored());
+        current.failed_refresh("offline".into(), bars[69].ts + 300);
+        assert!(current.scored());
+        assert!(current.note.as_deref() == Some("offline"));
+        assert!(current.lanes[0].cells.iter().any(Option::is_some));
+        current.failed_refresh("offline again".into(), bars[69].ts + 1800);
+        assert!(matches!(current.status, LaneStatus::Stale { .. }));
+        assert!(current.score.is_none());
+        assert!(current.lanes.iter().all(|l| l.cells.is_empty() && l.forming.is_none()));
+    }
+
+    #[test]
     fn row_slots_follow_the_session_clock_and_leave_missing_bars_empty() {
         let (mut bars, now) = fixture();
         let missing = [10, 23, 50];
@@ -389,7 +421,7 @@ mod tests {
         let (bars, now) = fixture();
         let mut r = row(&bars, now);
         assert!(r.scored());
-        let observed = r.lanes[0].cells.iter().filter(|c| c.is_some()).count();
+        assert!(r.lanes[0].cells.iter().any(Option::is_some));
         r.lanes.push(Ribbon {
             tf: Timeframe::H1,
             status: LaneStatus::Ready,
@@ -401,11 +433,11 @@ mod tests {
         assert!(!r.scored());
         assert!(r.score.is_none());
         assert!(breadth(&vec![r.clone(); 5]).is_empty());
-        assert_eq!(r.lanes[0].cells.iter().filter(|c| c.is_some()).count(), observed);
+        assert!(r.lanes[0].cells.is_empty());
         assert!(!r.age(now + 1)); // Updating the age label does not rebuild unchanged geometry.
     }
     #[test]
-    fn old_daily_observations_remain_visible_but_never_score() {
+    fn old_daily_observations_drop_ribbons_and_never_score() {
         let (mut bars, _) = fixture();
         let end = chrono::NaiveDate::from_ymd_opt(2026, 11, 10).unwrap();
         for (i, bar) in bars.iter_mut().enumerate() {
@@ -419,7 +451,7 @@ mod tests {
         assert!(matches!(stale.status, LaneStatus::Stale { .. }));
         assert!(stale.score.is_none());
         assert!(breadth(&vec![stale.clone(); 6]).is_empty());
-        assert!(stale.lanes[0].cells.iter().any(Option::is_some));
+        assert!(stale.lanes[0].cells.is_empty());
         // Closed weekends do not demand a nonexistent Saturday or Sunday daily bar.
         let friday = chrono::NaiveDate::from_ymd_opt(2026, 11, 13).unwrap();
         let daily_ts = friday.and_hms_opt(0, 0, 0).unwrap().and_utc().timestamp();
