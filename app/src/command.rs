@@ -262,6 +262,10 @@ pub enum Function {
     StackSession(Option<bool>),
     TruthRail(Option<bool>),
     StackEdge(Option<bool>),
+    TrendCone {
+        on: Option<bool>,
+        spec: Option<(usize, usize)>,
+    },
     ChartType(ChartType),
     /// Add or remove an indicator (any code from the catalog: `RSI`, `BB 20 2.5`, `ICHIMOKU`).
     Indicator(IndicatorSpec),
@@ -478,6 +482,20 @@ pub enum ReviewOverlay {
     Volume,
 }
 
+fn parse_cone(rest: &[&str]) -> Option<Function> {
+    if rest.len() <= 1 {
+        return Some(Function::TrendCone { on: parse_switch(rest)?, spec: None });
+    }
+    let [h, l] = rest else {
+        return None;
+    };
+    let (h, l) = (h.parse::<usize>().ok()?, l.parse::<usize>().ok()?);
+    if !(1..=120).contains(&h) || !(1..=100).contains(&l) {
+        return None;
+    }
+    Some(Function::TrendCone { on: Some(true), spec: Some((h, l)) })
+}
+
 fn parse_switch(rest: &[&str]) -> Option<Option<bool>> {
     match rest {
         [] => Some(None),
@@ -679,6 +697,7 @@ fn parse_function(head: &str, rest: &[&str]) -> Option<Function> {
         "ISCAN" | "INTRADAY" => Function::Intraday,
         "IDESK" | "IDASH" => Function::IntradayDesk,
         "COCKPIT" | "CKPT" => Function::Cockpit { spec: joined() },
+        "CONE" | "TRENDCONE" => parse_cone(rest)?,
         "AVWAP" => Function::AnchoredVwap(match words().as_slice() {
             [] => AnchorCmd::Arm,
             [w] if w == "OPEN" => AnchorCmd::Open,
@@ -701,6 +720,7 @@ fn parse_function(head: &str, rest: &[&str]) -> Option<Function> {
             [arg] if arg.eq_ignore_ascii_case("ON") => Function::TrendStack(Some(true)),
             [arg] if arg.eq_ignore_ascii_case("OFF") => Function::TrendStack(Some(false)),
             [arg] if arg.eq_ignore_ascii_case("AUTO") => Function::StackLadder(None),
+            [arg, tail @ ..] if arg.eq_ignore_ascii_case("CONE") => parse_cone(tail)?,
             [arg, tail @ ..] if arg.eq_ignore_ascii_case("EDGE") => Function::StackEdge(parse_switch(tail)?),
             [arg, tail @ ..] if arg.eq_ignore_ascii_case("TINT") => Function::StackTint(parse_switch(tail)?),
             [arg, tail @ ..] if arg.eq_ignore_ascii_case("SESSION") => Function::StackSession(parse_switch(tail)?),
@@ -887,6 +907,7 @@ fn describe(f: &Function) -> String {
         Function::StackLadder(frames) => format!("Trend Stack ladder {}", frames.as_ref().map(|f| f.iter().map(|t| t.label()).collect::<Vec<_>>().join("·")).unwrap_or_else(|| "AUTO".into())),
         Function::StackTint(_) => "Regime Candle tint".into(),
         Function::StackSession(_) => "Trend Stack session anchor".into(),
+        Function::TrendCone { .. } => "Trend Cone · regime path quantiles + walk-forward coverage".into(),
         Function::StackEdge(_) => "Trend Stack regime Edge study".into(),
         Function::TruthRail(_) => "Truth Rail".into(),
         Function::TrendStack(on) => format!("Trend Stack{}", match on { None => " toggle", Some(true) => " on", Some(false) => " off" }),
@@ -1910,5 +1931,28 @@ mod combo_tests {
         ] {
             assert!(parse_alert_kind(&args.split_whitespace().collect::<Vec<_>>()).is_none(), "{args}");
         }
+    }
+
+    #[test]
+    fn cone_commands_aliases_parameters_and_symbol_prefix() {
+        for name in ["CONE", "TRENDCONE", "TSTACK CONE"] {
+            for (suffix, on) in [("", None), (" ON", Some(true)), (" OFF", Some(false))] {
+                assert_eq!(
+                    parse(&format!("{name}{suffix}")),
+                    Some(Command::Function(Function::TrendCone { on, spec: None }))
+                );
+            }
+        }
+        assert_eq!(
+            parse("AAPL CONE 30 7"),
+            Some(Command::SymbolFunction(
+                "AAPL US Equity".into(),
+                Function::TrendCone { on: Some(true), spec: Some((30, 7)) }
+            ))
+        );
+        for input in ["CONE 0 5", "CONE 121 5", "CONE 20 0", "CONE 20 101", "CONE 20", "CONE 20 5 extra"] {
+            assert!(parse(input).is_none(), "{input}");
+        }
+        assert!(matches!(parse("ZZUNKNOWN"), Some(Command::Symbol(_))));
     }
 }

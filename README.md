@@ -268,6 +268,17 @@ gets the native title bar with traffic lights, window vibrancy behind the sideba
   | `AVWAP CLEAR` / click flag + `Del` | Remove all / one anchor (max 4 per name) |
   | `⇧ Click` / menu "Center linked charts here" | Scroll linked charts to that time |
 
+- **Trend Cone (Edge v2)** — `CONE` / **Alt+C** toggles a forward
+  P10/25/50/75/90 fan from the last closed bar, coloured by the current TSTACK
+  medium regime, with a grey unconditional fan underneath. Gradient fills,
+  a bold median and horizon price labels make it readable intraday or daily.
+  `CONE 20 5` sets horizon bars and mean stationary-bootstrap block length;
+  `CONE ON|OFF`, `TRENDCONE` and `TSTACK CONE` also work. The adjacent card
+  reports walk-forward central 50%/80% coverage versus nominal, with n.
+  Completed log-return paths only; deterministic bootstrap and causal calibration
+  run in the worker and cache by input. Sample/unverified history is refused.
+  Settings save with layouts. See [Trend Cone](docs/TRENDCONE.md).
+
 - **Strategy backtests** — `BACKTEST` (or `AAPL BACKTEST`, `AAPL BT ADTREND`)
   compares declared strategies to buy-and-hold on a chronological holdout, with
   commission and slippage, next-open fills, CAGR and **completed-trade** win

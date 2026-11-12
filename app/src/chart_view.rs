@@ -27,6 +27,7 @@ use crate::worker::{BuiltIndicator, PaneId, Request, Worker, archive_page, initi
 use tr_data::anchored_vwap::AvwapKey;
 
 mod cockpit;
+mod trend_cone;
 pub use cockpit::{LinkBus, LinkPublish, resolve_hover};
 
 const AXIS_W: f32 = 66.0;
@@ -302,6 +303,7 @@ pub struct ChartState {
     pub stack_session: bool,
     pub show_rail: bool,
     pub show_edge: bool,
+    cone: trend_cone::ConeState,
     edge: Option<Result<Arc<tr_data::edge::EdgeReport>, String>>,
     edge_cache: Option<(EdgeKey, Arc<tr_data::edge::EdgeReport>)>,
     edge_paint: EdgePaint,
@@ -440,6 +442,7 @@ impl ChartState {
             stack_session: false,
             show_rail: true,
             show_edge: false,
+            cone: Default::default(),
             edge: None,
             edge_paint: Default::default(),
             edge_cache: None,
@@ -583,6 +586,7 @@ impl ChartState {
     /// (Re)load history for the current symbol and timeframe.
     pub fn load(&mut self, w: &Worker) {
         self.generation += 1;
+        self.cone.invalidate();
         self.edge = None;
         self.zband_paint = Default::default();
         self.feed_state = Default::default();
@@ -908,6 +912,9 @@ impl ChartState {
         self.glide(|s| {
             if let Some(v) = s.viewport.as_mut() {
                 *v = Viewport::fit_last(s.bars.len(), DEFAULT_VISIBLE, v.width_px);
+                if s.cone.enabled {
+                    trend_cone::reserve(v, s.bars.len(), s.cone.params.horizon);
+                }
             }
             s.manual_scale = None;
         });
@@ -973,6 +980,9 @@ impl ChartState {
         self.glide(|s| {
             if let Some(v) = s.viewport.as_mut() {
                 v.right = s.bars.len() as f64 + 3.0;
+                if s.cone.enabled {
+                    trend_cone::reserve(v, s.bars.len(), s.cone.params.horizon);
+                }
                 v.clamp(s.bars.len());
             }
         });
@@ -1629,6 +1639,12 @@ impl ChartState {
             }
         }
         self.apply_range();
+        if old_len == 0
+            && self.cone.enabled
+            && let Some(v) = &mut self.viewport
+        {
+            trend_cone::reserve(v, new_len, self.cone.params.horizon);
+        }
         if old_len == 0 && !crate::anim::reduced() {
             if let (Some(mut from), Some(to)) = (self.interval_glide.take(), self.viewport) {
                 from.right = to.right;
@@ -1808,6 +1824,7 @@ impl ChartState {
         let mut clicked = false;
         self.link_out = LinkPublish::default();
         self.request_avwap(w);
+        self.request_cone(w);
 
         // Controls live in the tab strip when it has room; otherwise a slim header row.
         let header_h = if self.controls_in_strip { 0.0 } else { HEADER_H };
@@ -2183,7 +2200,7 @@ impl ChartState {
                 self.shown_scale = Some((a, b, s.log));
                 s
             }
-            None => self.ease_scale(ui.ctx(), scene::autoscale(&pane)),
+            None => self.ease_scale(ui.ctx(), self.cone_scale(scene::autoscale(&pane), &v)),
         });
         let out = scene::price_pane(&pane);
         let mut scale = out.scale;
@@ -2369,6 +2386,7 @@ impl ChartState {
         let click = plot_resp.interact_pointer_pos().filter(|_| plot_resp.clicked() && drawing_click);
         self.paint_drawings(ui, price_rect, &v, &scale, hover, click);
         self.paint_avwap(ui, price_rect, &v, &scale, hover);
+        self.paint_cone(ui, price_rect, &v, &scale);
 
         // ---- congress markers ----
         self.hover_marker = None;
@@ -6266,5 +6284,114 @@ mod tests {
         let text = paint(&mut current);
         assert!(!text.contains("STALE"), "{text}");
         assert!(!text.contains("SESSION CLOSED"), "{text}");
+    }
+
+    fn cone_requests(rx: &mut tokio::sync::mpsc::UnboundedReceiver<Request>) -> Vec<tr_data::trend_cone::ConeKey> {
+        let mut out = Vec::new();
+        while let Ok(r) = rx.try_recv() {
+            if let Request::TrendCone { key, .. } = r {
+                out.push(key);
+            }
+        }
+        out
+    }
+    fn cone_result(
+        c: &ChartState,
+        key: &tr_data::trend_cone::ConeKey,
+    ) -> Result<Arc<tr_data::trend_cone::ConeReport>, String> {
+        tr_data::trend_cone::report(
+            &c.bars,
+            c.tf,
+            c.sec.class,
+            if c.archive { Some(chrono::Utc::now().timestamp()) } else { c.last_refresh },
+            key.params,
+            key.trend,
+        )
+        .map(Arc::new)
+    }
+    #[test]
+    fn cone_unchanged_and_forming_only_ticks_reuse_report_but_old_revisions_invalidate() {
+        let (w, mut rx) = Worker::test_channel();
+        let mut c = stack_chart(&w, Provenance::Real);
+        c.set_trend_cone(Some(true), None, &w);
+        let key = cone_requests(&mut rx).pop().unwrap();
+        c.on_trend_cone(key.clone(), cone_result(&c, &key));
+        c.request_cone(&w);
+        assert!(cone_requests(&mut rx).is_empty());
+        Arc::make_mut(&mut c.bars).last_mut().unwrap().close *= 2.0;
+        c.request_cone(&w);
+        assert!(cone_requests(&mut rx).is_empty());
+        Arc::make_mut(&mut c.bars)[10].close += 1.0;
+        c.request_cone(&w);
+        // Throttle immediately removes the old report; it cannot paint stale geometry.
+        assert!(c.cone.result.is_none());
+        c.cone.sent.as_mut().unwrap().1 = Instant::now() - Duration::from_secs(1);
+        c.request_cone(&w);
+        assert_eq!(cone_requests(&mut rx).len(), 1);
+        c.on_trend_cone(key, Err("old failure".into()));
+        assert!(c.cone.result.is_none());
+    }
+    #[test]
+    fn cone_sample_and_unverified_refusal_paints_no_numbers_lines_or_fan() {
+        fn forbidden(shape: &egui::Shape) -> bool {
+            match shape {
+                egui::Shape::Text(t) => t.galley.job.text.chars().any(|c| c.is_ascii_digit()),
+                egui::Shape::Mesh(_) | egui::Shape::LineSegment { .. } => true,
+                egui::Shape::Vec(v) => v.iter().any(forbidden),
+                _ => false,
+            }
+        }
+        let ctx = egui::Context::default();
+        let (w, mut rx) = Worker::test_channel();
+        for provenance in [Provenance::Sample, Provenance::Missing] {
+            let mut c = stack_chart(&w, provenance);
+            c.set_trend_cone(Some(true), None, &w);
+            let key = cone_requests(&mut rx).pop().unwrap();
+            c.on_trend_cone(key.clone(), cone_result(&c, &key));
+            let mut out = ctx.run_ui(egui::RawInput::default(), |ui| {
+                c.paint_cone(
+                    ui,
+                    Rect::from_min_size(Pos2::ZERO, vec2(900.0, 600.0)),
+                    &Viewport::fit_last(160, 160, 900.0),
+                    &PriceScale::new(90.0, 240.0, false, 600.0),
+                )
+            });
+            out.textures_delta.clear();
+            assert!(stack_has_text(&out.shapes, "Trend Cone refused"));
+            assert!(!out.shapes.iter().any(|s| forbidden(&s.shape)));
+        }
+    }
+    #[test]
+    fn cone_paints_two_gradient_fans_prices_and_coverage_and_caches_geometry() {
+        let ctx = egui::Context::default();
+        let (w, mut rx) = Worker::test_channel();
+        let mut c = stack_chart(&w, Provenance::Real);
+        c.set_trend_cone(Some(true), None, &w);
+        let key = cone_requests(&mut rx).pop().unwrap();
+        c.on_trend_cone(key.clone(), cone_result(&c, &key));
+        assert!(matches!(c.cone.result, Some(Ok(_))));
+        let out = chart_frame(&ctx, &mut c, &w, vec![]);
+        assert!(stack_has_text(&out.shapes, "P90"));
+        assert!(stack_has_text(&out.shapes, "P10"));
+        assert!(stack_has_text(&out.shapes, "WALK-FORWARD"));
+        assert!(stack_has_text(&out.shapes, "CLOSED THRU"));
+        let meshes: Vec<_> = c
+            .cone
+            .paint
+            .shapes
+            .iter()
+            .filter_map(|s| if let egui::Shape::Mesh(m) = s { Some(m) } else { None })
+            .collect();
+        assert_eq!(meshes.len(), 2);
+        assert!(meshes.iter().all(|m| m.vertices.iter().any(|v| v.color != m.vertices[0].color)));
+        let cached = meshes[0].clone();
+        chart_frame(&ctx, &mut c, &w, vec![]);
+        let mesh =
+            c.cone.paint.shapes.iter().find_map(|s| if let egui::Shape::Mesh(m) = s { Some(m) } else { None }).unwrap();
+        assert!(Arc::ptr_eq(&cached, mesh));
+        assert!(cone_requests(&mut rx).is_empty());
+        c.set_trend_cone(Some(false), None, &w);
+        let out = chart_frame(&ctx, &mut c, &w, vec![]);
+        assert!(!stack_has_text(&out.shapes, "WALK-FORWARD"));
     }
 }
