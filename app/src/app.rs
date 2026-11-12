@@ -547,6 +547,16 @@ impl PaneKind {
                 stack_session: c.stack_session,
                 show_rail: c.show_rail,
                 show_edge: c.show_edge,
+                avwap: {
+                    let mut store = c.avwap_store.clone();
+                    let key = tr_chart::drawings::store_key(&c.symbol);
+                    if c.avwap_anchors.is_empty() {
+                        store.remove(&key);
+                    } else {
+                        store.insert(key, c.avwap_anchors.clone());
+                    }
+                    store
+                },
             },
             PaneKind::Feed { filter } => {
                 PaneSettings::Feed((*filter != FeedFilter::default()).then(|| (*filter).into()))
@@ -671,8 +681,20 @@ impl PaneKind {
                 stack_session,
                 show_rail,
                 show_edge,
+                avwap,
             } => {
                 let mut c = ChartState::new(0, &symbol, tf);
+                c.avwap_store = avwap
+                    .into_iter()
+                    .map(|(k, mut v)| {
+                        v.sort_unstable();
+                        v.dedup();
+                        v.truncate(tr_data::anchored_vwap::MAX_ANCHORS);
+                        (k, v)
+                    })
+                    .filter(|(_, v)| !v.is_empty())
+                    .collect();
+                c.restore_anchors();
                 c.archive = archive;
                 c.watch_group = watch_group;
                 c.chart_type = chart_type;
@@ -1050,6 +1072,8 @@ pub struct TerminalApp {
     smoke_done: bool,
     /// Frame-time readout (F12): smoothed CPU time of `ui()` and interval between frames.
     show_perf: bool,
+    /// Time Link cursors and Lens windows exchanged between linked charts each frame.
+    link_bus: crate::chart_view::LinkBus,
     perf_cpu_ms: f64,
     perf_dt_ms: f64,
     last_frame: Option<Instant>,
@@ -1231,6 +1255,7 @@ impl TerminalApp {
             started: Instant::now(),
             smoke_done: false,
             show_perf: std::env::var_os("TR_FPS").is_some(),
+            link_bus: Default::default(),
             perf_cpu_ms: 0.0,
             perf_dt_ms: 0.0,
             last_frame: None,
@@ -1405,6 +1430,7 @@ impl TerminalApp {
             Command::SymbolFunction(s, Function::RealizedVol { spec }) => self.open_realized_vol(Some(&s), &spec),
             Command::SymbolFunction(s, Function::Autocorr { spec }) => self.open_autocorr(Some(&s), &spec),
             Command::SymbolFunction(s, Function::IntradayDesk) => self.open_intraday_desk(Some(&s)),
+            Command::SymbolFunction(s, Function::Cockpit { spec }) => self.open_cockpit(Some(&s), &spec),
             Command::SymbolFunction(s, Function::GapFill { spec }) => self.open_gap_fill(Some(&s), &spec),
             Command::SymbolFunction(s, Function::SessionExtreme { spec }) => self.open_session_extreme(Some(&s), &spec),
             Command::SymbolFunction(s, Function::SessionClock { spec }) => self.open_session_clock(Some(&s), &spec),
@@ -1515,6 +1541,8 @@ impl TerminalApp {
             Function::Earnings => self.open_watchlist(true),
             Function::Intraday => self.open_intraday(),
             Function::IntradayDesk => self.open_intraday_desk(symbol.as_deref()),
+            Function::Cockpit { spec } => self.open_cockpit(symbol.as_deref(), &spec),
+            Function::AnchoredVwap(cmd) => self.anchored_vwap_command(cmd),
             Function::WatchCommand(line) => self.watch_command(&line),
             Function::Layout(arg) => self.layout_command(&arg),
             Function::Layouts => {
@@ -1971,6 +1999,11 @@ impl TerminalApp {
                         if c.stack_config_revision == config_revision {
                             c.on_trend_stack(generation, base_len, result);
                         }
+                    }
+                }
+                Response::AnchoredVwap { pane, key, result } => {
+                    if let Some(c) = self.chart_mut(pane) {
+                        c.on_anchored_vwap(key, result);
                     }
                 }
                 Response::DailyStrength { pane, generation, base_len, result } => {
@@ -2442,6 +2475,7 @@ impl TerminalApp {
             | A::DrawHorizontal
             | A::DrawVertical
             | A::DrawFib
+            | A::DrawAnchoredVwap
             | A::ResetView
             | A::JumpLatest
             | A::LogScale
@@ -2492,6 +2526,7 @@ impl TerminalApp {
             A::DrawHorizontal => self.with_chart(|c, _| c.start_tool(Tool::Horizontal)),
             A::DrawVertical => self.with_chart(|c, _| c.start_tool(Tool::Vertical)),
             A::DrawFib => self.with_chart(|c, _| c.start_tool(Tool::Fib)),
+            A::DrawAnchoredVwap => self.anchored_vwap_command(command::AnchorCmd::Arm),
             A::ResetView => self.with_chart(|c, _| c.reset_view()),
             A::JumpLatest => self.with_chart(|c, _| c.jump_latest()),
             A::LogScale => self.with_chart(|c, _| c.log = !c.log),
@@ -2774,10 +2809,12 @@ impl eframe::App for TerminalApp {
                 SidebarCmd::Layout(op) => self.layout_op(op),
             }
         }
+        self.link_bus.begin_frame();
         actions.extend(self.render_dock(ui, area, gap));
         actions.extend(self.render_windows(&ctx));
         self.run_actions(actions);
         self.sync_linked_review_levels();
+        self.sync_linked_anchors();
         self.trading_windows(&ctx);
         self.toasts(&ctx);
 
@@ -2947,6 +2984,7 @@ mod tests {
             started: Instant::now(),
             smoke_done: false,
             show_perf: false,
+            link_bus: Default::default(),
             perf_cpu_ms: 0.0,
             perf_dt_ms: 0.0,
             last_frame: None,

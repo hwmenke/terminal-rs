@@ -210,6 +210,49 @@ impl Range {
     }
 }
 
+/// Anchored VWAP subcommands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AnchorCmd {
+    /// Arm the one-click anchor tool.
+    Arm,
+    /// Today's cash open.
+    Open,
+    /// The latest session's high bar.
+    High,
+    /// The latest session's low bar.
+    Low,
+    /// Remove every anchor for the symbol.
+    Clear,
+}
+
+/// Default Cockpit ladder: fast, middle (main chart) and slow.
+pub const COCKPIT_LADDER: [Timeframe; 3] = [Timeframe::M1, Timeframe::M5, Timeframe::M15];
+
+/// Validate a `COCKPIT` ladder: empty for the default, else three strictly ascending
+/// intraday intervals.
+pub fn cockpit_ladder(spec: &str) -> Result<[Timeframe; 3], String> {
+    let tokens: Vec<&str> = spec.split_whitespace().collect();
+    if tokens.is_empty() {
+        return Ok(COCKPIT_LADDER);
+    }
+    let usage = "COCKPIT needs three ascending intraday intervals, e.g. COCKPIT 1m 5m 15m";
+    if tokens.len() != 3 {
+        return Err(usage.into());
+    }
+    let mut frames = [Timeframe::M1; 3];
+    for (slot, token) in frames.iter_mut().zip(&tokens) {
+        let tf = token.parse::<Timeframe>().map_err(|_| format!("COCKPIT: unknown interval {token}"))?;
+        if !tf.is_intraday() {
+            return Err(format!("COCKPIT: {} is not an intraday interval", tf.label()));
+        }
+        *slot = tf;
+    }
+    if !frames.windows(2).all(|w| w[0].seconds() < w[1].seconds()) {
+        return Err(format!("COCKPIT: intervals must be strictly ascending · {usage}"));
+    }
+    Ok(frames)
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum Function {
     Timeframe(Timeframe),
@@ -267,6 +310,13 @@ pub enum Function {
     Intraday,
     /// Saved 2×2 desk: 5-minute chart, ISCAN, breadth, and volume pace (`IDESK`).
     IntradayDesk,
+    /// `COCKPIT [fast mid slow]` (`CKPT`): three linked native intraday charts. The ladder
+    /// is checked by [`cockpit_ladder`] when applied, so a bad one gets a status message.
+    Cockpit {
+        spec: String,
+    },
+    /// `AVWAP`, `AVWAP OPEN|HIGH|LOW|CLEAR`.
+    AnchoredVwap(AnchorCmd),
     WatchCommand(String),
     /// `LAYOUT 1|2|2H|3|4|6` preset, `LAYOUT <name>` switch, or a layout subcommand
     /// (`SAVE`, `SAVEAS`, `NEW`, `RENAME`, `DUP`, `DEL`, `EXPORT`, `IMPORT`).
@@ -628,6 +678,15 @@ fn parse_function(head: &str, rest: &[&str]) -> Option<Function> {
         "EARN" | "EARNINGS" | "ECAL" => Function::Earnings,
         "ISCAN" | "INTRADAY" => Function::Intraday,
         "IDESK" | "IDASH" => Function::IntradayDesk,
+        "COCKPIT" | "CKPT" => Function::Cockpit { spec: joined() },
+        "AVWAP" => Function::AnchoredVwap(match words().as_slice() {
+            [] => AnchorCmd::Arm,
+            [w] if w == "OPEN" => AnchorCmd::Open,
+            [w] if w == "HIGH" => AnchorCmd::High,
+            [w] if w == "LOW" => AnchorCmd::Low,
+            [w] if w == "CLEAR" => AnchorCmd::Clear,
+            _ => return None,
+        }),
         "W" | "WL" | "WATCH" | "WATCHLIST" | "MON" => {
             if rest.is_empty() {
                 Function::Watchlist
@@ -783,7 +842,7 @@ pub fn parse(input: &str) -> Option<Command> {
             return Some(Command::Function(f));
         }
         // Invalid stack arguments must not become a ticker followed by an interval.
-        if ["TSTACK", "STACK", "MTF", "REGIME", "RAIL"].iter().any(|word| head.eq_ignore_ascii_case(word)) {
+        if ["TSTACK", "STACK", "MTF", "REGIME", "RAIL", "AVWAP"].iter().any(|word| head.eq_ignore_ascii_case(word)) {
             return None;
         }
     }
@@ -886,6 +945,20 @@ fn describe(f: &Function) -> String {
         Function::IntradayDesk => {
             "Intraday desk: 5-minute chart, ISCAN, breadth, and volume pace, saved as the Intraday layout".into()
         }
+        Function::Cockpit { spec } => match cockpit_ladder(spec) {
+            Ok(frames) => format!(
+                "Intraday Cockpit: linked native {} charts with Time Link, Lens and anchored VWAP",
+                frames.iter().map(|t| t.label()).collect::<Vec<_>>().join(" · ")
+            ),
+            Err(e) => e,
+        },
+        Function::AnchoredVwap(cmd) => match cmd {
+            AnchorCmd::Arm => "Anchored VWAP: click a bar to anchor (verified bars only)".into(),
+            AnchorCmd::Open => "Anchored VWAP from today's cash open".into(),
+            AnchorCmd::High => "Anchored VWAP from the latest session's high bar".into(),
+            AnchorCmd::Low => "Anchored VWAP from the latest session's low bar".into(),
+            AnchorCmd::Clear => "Remove this name's anchored VWAPs".into(),
+        },
         Function::WatchCommand(s) => format!("Watchlists: {s}"),
         Function::Layout(l) if l.trim().is_empty() => "Saved layouts".into(),
         Function::Layout(l) => format!("Layout {l}"),
@@ -1133,6 +1206,66 @@ mod tests {
             assert!(parse(text).is_none(), "{text}");
         }
     }
+    #[test]
+    fn cockpit_and_alias_parse_with_and_without_ladder() {
+        for alias in ["COCKPIT", "CKPT", "cockpit"] {
+            assert_eq!(parse(alias), Some(Command::Function(Function::Cockpit { spec: String::new() })));
+        }
+        assert_eq!(
+            parse("AAPL COCKPIT"),
+            Some(Command::SymbolFunction("AAPL US Equity".into(), Function::Cockpit { spec: String::new() }))
+        );
+        assert_eq!(parse("CKPT 5m 15m 1h"), Some(Command::Function(Function::Cockpit { spec: "5m 15m 1h".into() })));
+        assert_eq!(
+            parse("NVDA COCKPIT 1m 5m 30m"),
+            Some(Command::SymbolFunction("NVDA US Equity".into(), Function::Cockpit { spec: "1m 5m 30m".into() }))
+        );
+        use Timeframe::*;
+        assert_eq!(cockpit_ladder(""), Ok([M1, M5, M15]));
+        assert_eq!(cockpit_ladder("5m 15m 1h"), Ok([M5, M15, H1]));
+        assert!(hint("COCKPIT").contains("1m · 5m · 15m"));
+    }
+
+    #[test]
+    fn cockpit_rejects_descending_duplicate_and_daily_ladders() {
+        for spec in ["15m 5m 1m", "5m 5m 15m", "1m 5m 1D", "1D 1W 1M", "1m 5m", "1m 5m 15m 1h", "1m 5m 7q"] {
+            assert!(cockpit_ladder(spec).is_err(), "{spec}");
+            // The command still parses, so the app can answer with a status message.
+            let parsed = parse(&format!("COCKPIT {spec}"));
+            assert_eq!(parsed, Some(Command::Function(Function::Cockpit { spec: spec.into() })));
+            assert!(hint(&format!("COCKPIT {spec}")).starts_with("COCKPIT"), "{spec}");
+        }
+    }
+
+    #[test]
+    fn avwap_subcommands_parse() {
+        for (text, cmd) in [
+            ("AVWAP", AnchorCmd::Arm),
+            ("AVWAP OPEN", AnchorCmd::Open),
+            ("avwap high", AnchorCmd::High),
+            ("AVWAP LOW", AnchorCmd::Low),
+            ("AVWAP CLEAR", AnchorCmd::Clear),
+        ] {
+            assert_eq!(parse(text), Some(Command::Function(Function::AnchoredVwap(cmd))), "{text}");
+        }
+        assert_eq!(
+            parse("AAPL AVWAP OPEN"),
+            Some(Command::SymbolFunction("AAPL US Equity".into(), Function::AnchoredVwap(AnchorCmd::Open)))
+        );
+        assert!(parse("AVWAP FOO").is_none());
+        assert!(parse("AVWAP OPEN EXTRA").is_none());
+    }
+
+    #[test]
+    fn unknown_tickers_still_parse_as_symbols_after_cockpit_and_avwap() {
+        for ticker in ["CKP", "COCK", "AVW", "AVWA", "COCKPITS"] {
+            assert_eq!(parse(ticker), Some(Command::Symbol(format!("{ticker} US Equity"))), "{ticker}");
+        }
+        assert!(matches!(parse("COCKPIT US Equity"), Some(Command::Symbol(_))));
+        assert!(matches!(parse("AVWAP US Equity"), Some(Command::Symbol(_))));
+        assert!(matches!(parse("CKPT US Equity"), Some(Command::Symbol(_))));
+    }
+
     #[test]
     fn new_tstack_d_is_still_a_symbol() {
         assert_eq!(parse("NEW TSTACK D"), Some(Command::Function(Function::NewPanel("TSTACK D".into()))));

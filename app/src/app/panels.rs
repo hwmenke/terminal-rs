@@ -18,13 +18,24 @@ impl TerminalApp {
         let mut actions = Vec::new();
         let id = self.panes[i].id;
         let dragging = self.drag.is_some_and(|d| d.active);
+        let link = self.panes[i].link;
         if let PaneKind::Chart(c) = &mut self.panes[i].kind {
             c.hover_enabled = !dragging;
             if focused {
                 self.watch_ui.active_chart = Some(id);
             }
+            // Time Link: hand the chart its group's cursor and the finer chart's window.
+            c.link_in = link.map(|l| self.link_bus.feed(l, id, &c.symbol, c.tf));
             let clicked = c.show(ui, rect, focused, &self.worker);
             actions.append(&mut c.actions);
+            let out = std::mem::take(&mut c.link_out);
+            let symbol = c.symbol.clone();
+            if let Some(l) = link {
+                self.link_bus.publish(l, id, &symbol, c.tf, &out);
+                if let Some(ts) = out.center {
+                    self.center_linked(l, id, &symbol, ts);
+                }
+            }
             return (actions, clicked);
         }
         let freshness = self.congress_freshness();

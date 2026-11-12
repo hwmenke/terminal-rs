@@ -18,6 +18,7 @@ use crate::layouts::{LayoutDoc, Link, PaneSettings, SavedPane, WindowGeometry};
 
 /// Saved name of the 2×2 intraday desk (`IDESK`).
 const INTRADAY_DESK: &str = "Intraday";
+const COCKPIT: &str = "Cockpit";
 use crate::theme::{self, amber, dp, mono, muted, text, ui_font};
 use crate::widgets::{self, Icon};
 use crate::worker::{Request, Worker};
@@ -1247,6 +1248,119 @@ impl TerminalApp {
         self.status = format!("{ticker}: intraday desk — 5-minute chart, scan, breadth, and volume pace");
     }
 
+    /// Replace the workspace with the saved Cockpit: three native intraday charts of one
+    /// name in the Blue link group (middle interval large, slow top-right, fast
+    /// bottom-right), TSTACK and RAIL on. The previous layout is kept under its own name.
+    pub(super) fn open_cockpit(&mut self, symbol: Option<&str>, spec: &str) {
+        let frames = match crate::command::cockpit_ladder(spec) {
+            Ok(frames) => frames,
+            Err(e) => {
+                self.status = e;
+                return;
+            }
+        };
+        let key = symbol
+            .map(|s| tr_data::security(s).key())
+            .filter(|s| !s.is_empty())
+            .or_else(|| self.focused_symbol())
+            .unwrap_or_else(|| tr_data::security("AAPL").key());
+        if !self.layout_name.eq_ignore_ascii_case(COCKPIT) {
+            self.save_layout();
+        }
+        for p in std::mem::take(&mut self.panes) {
+            self.worker.send(Request::Forget(p.id));
+        }
+        self.dock = Node::default();
+        let [fast, mid, slow] = frames;
+        let chip = format!("COCKPIT {} · {} · {}", fast.label(), mid.label(), slow.label());
+        // `Node::preset(MainRight2, ..)` puts the first pane left, then top-right, bottom-right.
+        let mut ids = Vec::new();
+        for tf in [mid, slow, fast] {
+            let mut chart = crate::layouts::chart_settings(&key, &self.prefs.panels);
+            if let PaneSettings::Chart { tf: t, show_stack, show_rail, .. } = &mut chart {
+                *t = tf;
+                *show_stack = true;
+                *show_rail = true;
+            }
+            let id = self.new_pane(PaneKind::from_settings(chart));
+            if let Some(p) = self.pane_mut(id) {
+                p.link = Some(Link::Blue);
+                if tf == mid
+                    && let PaneKind::Chart(c) = &mut p.kind
+                {
+                    c.cockpit_chip = Some(chip.clone());
+                }
+            }
+            ids.push(id);
+        }
+        self.dock = Node::preset(Layout::MainRight2, &ids);
+        self.preset = Some(Layout::MainRight2);
+        self.focus = ids[0];
+        self.layout_name = COCKPIT.into();
+        self.save_layout();
+        self.save_settings();
+        let ticker = tr_data::security(&key).ticker;
+        self.status = format!("{ticker}: {chip} — native linked charts, Time Link, Lens, Alt+A anchors VWAP");
+    }
+
+    /// `AVWAP …` on the focused chart, then copied to its linked charts of the same name.
+    pub(super) fn anchored_vwap_command(&mut self, cmd: crate::command::AnchorCmd) {
+        let mut status = None;
+        self.with_chart(|c, _| status = Some(c.anchor_command(cmd)));
+        self.status = match status {
+            Some(Ok(s)) | Some(Err(s)) => s,
+            None => "AVWAP needs a chart".into(),
+        };
+        self.sync_linked_anchors();
+    }
+
+    /// A chart that edited its anchors pushes them to every chart in its link group that
+    /// shows the same security. Other names and unlinked panes are untouched.
+    pub(super) fn sync_linked_anchors(&mut self) {
+        let mut sources = Vec::new();
+        for p in &mut self.panes {
+            if let PaneKind::Chart(c) = &mut p.kind
+                && std::mem::take(&mut c.avwap_dirty)
+                && let Some(link) = p.link
+            {
+                sources.push((p.id, link, c.symbol.clone(), c.avwap_anchors.clone()));
+            }
+        }
+        for (id, link, symbol, anchors) in sources {
+            for p in &mut self.panes {
+                if p.id != id
+                    && p.link == Some(link)
+                    && let PaneKind::Chart(c) = &mut p.kind
+                    && c.symbol == symbol
+                {
+                    c.set_avwap_anchors(anchors.clone());
+                }
+            }
+        }
+    }
+
+    /// Scroll every other chart in `link` showing `symbol` so `ts` is centred.
+    pub(super) fn center_linked(&mut self, link: Link, source: PaneId, symbol: &str, ts: i64) {
+        let mut n = 0;
+        for p in &mut self.panes {
+            if p.id != source
+                && p.link == Some(link)
+                && let PaneKind::Chart(c) = &mut p.kind
+                && c.symbol == symbol
+            {
+                c.center_on_ts(ts);
+                n += 1;
+            }
+        }
+        if n > 0 {
+            self.status = format!(
+                "Centred {n} linked chart{} on {} ET",
+                if n == 1 { "" } else { "s" },
+                tr_core::ny::civil(ts).format("%Y-%m-%d %H:%M")
+            );
+        }
+    }
+
     /// Draw the prior close, open, opening range, and VWAP on this name's chart.
     pub(super) fn open_cash_levels(&mut self, symbol: Option<&str>) {
         let key = symbol
@@ -2364,5 +2478,260 @@ mod tests {
         assert!(app.panes.iter().any(|p| matches!(&p.kind, PaneKind::Chart(c) if c.symbol == "MSFT US Equity")));
         assert!(app.panes.iter().any(|p| matches!(&p.kind, PaneKind::VolumePace(v) if v.symbol == "MSFT US Equity")));
         assert!(app.panes.iter().any(|p| matches!(&p.kind, PaneKind::Breadth(b) if b.spec.is_empty())));
+    }
+
+    fn charts(app: &TerminalApp) -> Vec<(PaneId, Option<Link>, String, tr_core::Timeframe)> {
+        app.panes
+            .iter()
+            .filter_map(|p| match &p.kind {
+                PaneKind::Chart(c) => Some((p.id, p.link, c.symbol.clone(), c.tf)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn chart(app: &mut TerminalApp, id: PaneId) -> &mut crate::chart_view::ChartState {
+        match &mut app.pane_mut(id).unwrap().kind {
+            PaneKind::Chart(c) => c,
+            _ => panic!("chart pane"),
+        }
+    }
+
+    #[test]
+    fn cockpit_opens_three_linked_native_charts_and_saves_the_layout() {
+        use tr_core::Timeframe::*;
+        let mut app = crate::app::tests::test_app();
+        let (worker, mut requests) = Worker::test_channel();
+        app.worker = worker;
+        app.execute("AAPL COCKPIT");
+        assert_eq!(app.layout_name, "Cockpit");
+        let got = charts(&app);
+        assert_eq!(got.len(), 3);
+        // Middle interval is the main (left) pane, then slow top-right, fast bottom-right.
+        assert_eq!(got.iter().map(|c| c.3).collect::<Vec<_>>(), vec![M5, M15, M1]);
+        assert!(got.iter().all(|c| c.1 == Some(Link::Blue) && c.2 == "AAPL US Equity"));
+        assert_eq!(app.dock, Node::preset(Layout::MainRight2, &got.iter().map(|c| c.0).collect::<Vec<_>>()));
+        assert_eq!(app.focus, got[0].0);
+        for p in &app.panes {
+            let PaneKind::Chart(c) = &p.kind else { panic!() };
+            assert!(c.show_stack && c.show_rail);
+        }
+        assert_eq!(chart(&mut app, got[0].0).cockpit_chip.as_deref(), Some("COCKPIT 1m · 5m · 15m"));
+        // Each pane asks for its own native interval; nothing is resampled from another lane.
+        let mut native = Vec::new();
+        while let Ok(r) = requests.try_recv() {
+            if let Request::History { pane, symbol, tf, .. } = r {
+                native.push((pane, symbol, tf));
+            }
+        }
+        native.sort();
+        let mut want: Vec<_> = got.iter().map(|c| (c.0, c.2.clone(), c.3)).collect();
+        want.sort();
+        assert_eq!(native, want);
+        let saved = app.store.load("Cockpit").unwrap();
+        let mut tfs: Vec<_> = saved
+            .panes
+            .iter()
+            .filter_map(|p| match &p.settings {
+                PaneSettings::Chart { tf, show_stack: true, .. } if p.link == Some(Link::Blue) => Some(*tf),
+                _ => None,
+            })
+            .collect();
+        tfs.sort_by_key(|t| t.seconds());
+        assert_eq!(tfs, vec![M1, M5, M15]);
+
+        // Custom ladder, and a bad one changes nothing.
+        app.execute("NVDA CKPT 5m 15m 1h");
+        assert_eq!(charts(&app).iter().map(|c| c.3).collect::<Vec<_>>(), vec![M15, H1, M5]);
+        let before = charts(&app);
+        for bad in ["COCKPIT 15m 5m 1m", "COCKPIT 5m 5m 15m", "COCKPIT 1m 5m 1D"] {
+            app.execute(bad);
+            assert!(app.status.starts_with("COCKPIT"), "{bad}: {}", app.status);
+            assert_eq!(charts(&app), before, "{bad}");
+        }
+    }
+
+    #[test]
+    fn cockpit_keeps_the_previous_layout_under_its_name() {
+        let mut app = crate::app::tests::test_app();
+        app.layout_name = "Scratch".into();
+        let help = app.new_pane(PaneKind::Help);
+        app.dock = Node::leaf(help);
+        app.focus = help;
+        app.save_layout();
+        app.execute("MSFT COCKPIT");
+        assert_eq!(app.layout_name, "Cockpit");
+        assert!(app.store.exists("Scratch") && app.store.exists("Cockpit"));
+        let scratch = app.store.load("Scratch").unwrap();
+        assert!(scratch.panes.iter().any(|p| matches!(p.settings, PaneSettings::Help)));
+        assert!(scratch.panes.iter().all(|p| !matches!(p.settings, PaneSettings::Chart { .. })));
+        // Re-running inside the Cockpit does not overwrite another layout.
+        app.execute("AAPL COCKPIT");
+        assert!(app.store.load("Scratch").unwrap().panes.iter().any(|p| matches!(p.settings, PaneSettings::Help)));
+        app.switch_layout("Scratch");
+        assert!(app.panes.iter().any(|p| matches!(p.kind, PaneKind::Help)));
+        app.switch_layout("Cockpit");
+        assert_eq!(charts(&app).len(), 3);
+        assert!(charts(&app).iter().all(|c| c.2 == "AAPL US Equity" && c.1 == Some(Link::Blue)));
+    }
+
+    #[test]
+    fn anchors_propagate_to_linked_charts_of_the_same_symbol_only() {
+        let mut app = crate::app::tests::test_app();
+        let add = |app: &mut TerminalApp, symbol: &str, link: Option<Link>| {
+            let id = app.new_pane(PaneKind::Chart(Box::new(crate::chart_view::ChartState::new(
+                0,
+                symbol,
+                tr_core::Timeframe::M5,
+            ))));
+            app.pane_mut(id).unwrap().link = link;
+            id
+        };
+        let a = add(&mut app, "AAPL", Some(Link::Blue));
+        let b = add(&mut app, "AAPL", Some(Link::Blue));
+        let other_name = add(&mut app, "MSFT", Some(Link::Blue));
+        let other_group = add(&mut app, "AAPL", Some(Link::Red));
+        let unlinked = add(&mut app, "AAPL", None);
+        let anchors = vec![1_790_000_000, 1_790_003_600];
+        let c = chart(&mut app, a);
+        c.avwap_anchors = anchors.clone();
+        c.avwap_dirty = true;
+        app.sync_linked_anchors();
+        assert_eq!(chart(&mut app, b).avwap_anchors, anchors);
+        for id in [other_name, other_group, unlinked] {
+            assert!(chart(&mut app, id).avwap_anchors.is_empty(), "pane {id}");
+        }
+        assert!(!chart(&mut app, a).avwap_dirty, "propagated once");
+        assert!(!chart(&mut app, b).avwap_dirty, "a copy does not echo back");
+        // AVWAP CLEAR on the focused chart clears its linked twin too.
+        app.focus = b;
+        app.execute("AVWAP CLEAR");
+        assert!(chart(&mut app, a).avwap_anchors.is_empty());
+        assert!(app.status.contains("cleared"));
+    }
+
+    #[test]
+    fn pane_settings_round_trip_keeps_avwap_anchors() {
+        let mut c = crate::chart_view::ChartState::new(0, "AAPL", tr_core::Timeframe::M5);
+        c.avwap_anchors = vec![1_790_000_000];
+        c.avwap_store.insert("MSFT US Equity".into(), vec![1_790_100_000, 1_790_200_000]);
+        let settings = PaneKind::Chart(Box::new(c)).settings();
+        let PaneSettings::Chart { avwap, .. } = &settings else { panic!() };
+        assert_eq!(avwap.get("AAPL US Equity"), Some(&vec![1_790_000_000]));
+        let json = serde_json::to_string(&settings).unwrap();
+        let back: PaneSettings = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, settings);
+        let PaneKind::Chart(restored) = PaneKind::from_settings(back) else { panic!() };
+        assert_eq!(restored.avwap_anchors, vec![1_790_000_000]);
+        assert_eq!(restored.avwap_store.get("MSFT US Equity").map(Vec::len), Some(2));
+        assert_eq!(PaneKind::Chart(restored).settings(), settings);
+        // A chart without anchors does not write the field at all.
+        let plain = PaneKind::Chart(Box::new(crate::chart_view::ChartState::new(0, "AAPL", tr_core::Timeframe::M5)));
+        assert!(!serde_json::to_string(&plain.settings()).unwrap().contains("avwap"));
+    }
+
+    #[test]
+    fn older_layout_without_avwap_field_loads() {
+        let mut settings = crate::layouts::chart_settings("AAPL US Equity", &Default::default());
+        let PaneSettings::Chart { avwap, .. } = &mut settings else { panic!() };
+        avwap.insert("AAPL US Equity".into(), vec![1]);
+        let mut value = serde_json::to_value(&settings).unwrap();
+        let fields = value.get_mut("Chart").and_then(|v| v.as_object_mut()).expect("chart object");
+        assert!(fields.remove("avwap").is_some());
+        let old: PaneSettings = serde_json::from_value(value).unwrap();
+        let PaneSettings::Chart { avwap, symbol, .. } = &old else { panic!() };
+        assert!(avwap.is_empty());
+        assert_eq!(symbol, "AAPL US Equity");
+        let PaneKind::Chart(c) = PaneKind::from_settings(old) else { panic!() };
+        assert!(c.avwap_anchors.is_empty());
+    }
+
+    #[test]
+    fn shift_click_requests_jump_on_linked_charts() {
+        use crate::worker::Response;
+        use tr_chart::scene::SeriesGpu;
+        let mut app = crate::app::tests::test_app();
+        let (worker, mut requests, responses) = Worker::test_channel_with_responses();
+        app.worker = worker;
+        let add = |app: &mut TerminalApp, symbol: &str, tf: tr_core::Timeframe, link: Link| {
+            let id = app.new_pane(PaneKind::Chart(Box::new(crate::chart_view::ChartState::new(0, symbol, tf))));
+            app.pane_mut(id).unwrap().link = Some(link);
+            id
+        };
+        let five = add(&mut app, "AAPL", tr_core::Timeframe::M5, Link::Blue);
+        let one = add(&mut app, "AAPL", tr_core::Timeframe::M1, Link::Blue);
+        let other_name = add(&mut app, "MSFT", tr_core::Timeframe::M1, Link::Blue);
+        let other_group = add(&mut app, "AAPL", tr_core::Timeframe::M1, Link::Red);
+        // Real 5-minute bars for the source chart only, delivered through the drain.
+        let date = chrono::NaiveDate::from_ymd_opt(2026, 11, 10).unwrap();
+        while let Ok(r) = requests.try_recv() {
+            if let Request::History { pane, generation, symbol, tf, .. } = r
+                && pane == five
+            {
+                let bars = std::sync::Arc::new(
+                    tr_data::intraday::regular_opens(date, tf)
+                        .into_iter()
+                        .map(|ts| {
+                            tr_core::Bar::new(ts, 100.0, 101.0, 99.0, 100.5, 1000.0)
+                                .with_provenance(tr_core::Provenance::Real)
+                        })
+                        .collect::<Vec<_>>(),
+                );
+                let gpu = SeriesGpu::build(&bars);
+                responses
+                    .send(Response::History {
+                        pane,
+                        generation,
+                        symbol,
+                        tf,
+                        bars,
+                        gpu,
+                        prepended: 0,
+                        from_cache: false,
+                        exhausted: true,
+                        live: false,
+                    })
+                    .unwrap();
+            }
+        }
+        app.drain();
+        assert!(!chart(&mut app, five).is_empty());
+        let ctx = egui::Context::default();
+        let rect = Rect::from_min_size(pos2(0.0, 0.0), vec2(1000.0, 700.0));
+        let i = app.idx(five).unwrap();
+        let frame = |app: &mut TerminalApp, events: Vec<egui::Event>| {
+            app.link_bus.begin_frame();
+            ctx.run_ui(
+                egui::RawInput {
+                    time: Some(ctx.input(|i| i.time) + 0.2),
+                    screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(1100.0, 800.0))),
+                    events,
+                    ..Default::default()
+                },
+                |ui| {
+                    app.render_content(ui, i, rect, true);
+                },
+            )
+            .textures_delta
+            .clear();
+        };
+        frame(&mut app, vec![]);
+        let pos = pos2(400.0, 400.0);
+        let press = |pressed| egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::SHIFT,
+        };
+        frame(&mut app, vec![egui::Event::PointerMoved(pos)]);
+        frame(&mut app, vec![press(true)]);
+        frame(&mut app, vec![press(false)]);
+        let target = chart(&mut app, one).pending_jump().expect("linked 1m chart jumps");
+        let bars_ts: Vec<i64> = tr_data::intraday::regular_opens(date, tr_core::Timeframe::M5);
+        assert!(bars_ts.contains(&target), "the jump is to the clicked bar's open");
+        assert!(app.status.starts_with("Centred 1 linked chart"));
+        assert_eq!(chart(&mut app, other_name).pending_jump(), None);
+        assert_eq!(chart(&mut app, other_group).pending_jump(), None);
+        assert_eq!(chart(&mut app, five).pending_jump(), None);
     }
 }

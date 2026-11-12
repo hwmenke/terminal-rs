@@ -249,6 +249,25 @@ gets the native title bar with traffic lights, window vibrancy behind the sideba
   | `\` | Last intraday interval ⇄ 1D; archive uses D/W/M only |
   | Click lane label or cell | Jump to that interval |
 
+- **Intraday Cockpit** — `COCKPIT` (`CKPT`, `AAPL COCKPIT`, `COCKPIT 5m 15m 1h`)
+  replaces the workspace with three native intraday charts of one name in the
+  Blue link group (TSTACK and RAIL on), saved as the `Cockpit` layout; the
+  previous layout is saved first. Each chart loads its own interval; nothing is
+  resampled. On any linked charts of the same name, hovering paints a ghost
+  cursor on the others, each chart brackets the finer chart's visible window
+  (Lens), and `⇧ Click` centres them all. Anchored VWAP (`Alt+A` or `AVWAP`, then
+  click a bar; `AVWAP OPEN|HIGH|LOW|CLEAR`) draws ±1σ/±2σ volume-weighted bands,
+  follows linked charts and saves per name with the layout. Sample or unverified
+  bars get a refusal and no line or number. See [Cockpit](docs/COCKPIT.md).
+
+  | Input | Chart action |
+  | --- | --- |
+  | `COCKPIT` / `AAPL COCKPIT` | 1m · 5m · 15m linked native charts |
+  | `Alt+A` / `AVWAP` | Arm the anchor tool; one click anchors at that bar's open |
+  | `AVWAP OPEN` / `HIGH` / `LOW` | Anchor at the cash open or the session's high / low bar |
+  | `AVWAP CLEAR` / click flag + `Del` | Remove all / one anchor (max 4 per name) |
+  | `⇧ Click` / menu "Center linked charts here" | Scroll linked charts to that time |
+
 - **Strategy backtests** — `BACKTEST` (or `AAPL BACKTEST`, `AAPL BT ADTREND`)
   compares declared strategies to buy-and-hold on a chronological holdout, with
   commission and slippage, next-open fills, CAGR and **completed-trade** win
