@@ -864,6 +864,13 @@ pub(super) fn click_owner(linked: bool, shift: bool, avwap_armed: bool) -> Click
     }
 }
 
+/// Whether drawing tools/selection see this click: only when the cockpit left it to the
+/// chart. A Time Link centre or an AVWAP anchor click is consumed and places no drawing point
+/// (the drawing tool itself stays armed).
+pub(super) fn drawing_gets_click(owner: Option<ClickOwner>) -> bool {
+    matches!(owner, None | Some(ClickOwner::Chart))
+}
+
 /// Ghost band fill: the link colour at about 12% alpha.
 pub(super) fn ghost_fill(c: Color32) -> Color32 {
     Color32::from_rgba_unmultiplied(c.r(), c.g(), c.b(), 31)

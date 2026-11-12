@@ -2075,8 +2075,9 @@ impl ChartState {
         self.viewport = Some(v);
         let click_owner = self.cockpit_input(ui, &plot_resp, price_rect, &v);
         clicked |= click_owner.is_some();
-        // A Shift+click on a time-linked chart only centres; drawing tools ignore it.
-        let drawing_click = click_owner != Some(cockpit::ClickOwner::TimeLink);
+        // A Shift+click on a time-linked chart only centres and an armed AVWAP click only
+        // anchors; drawing tools ignore both.
+        let drawing_click = cockpit::drawing_gets_click(click_owner);
 
         // Page older history when the left edge approaches loaded data.
         if !self.paging && !self.loading && !self.exhausted && v.left() < v.visible_bars() * 0.3 {
@@ -4771,6 +4772,51 @@ mod tests {
         assert_eq!(click_owner(false, true, true), ClickOwner::AnchorTool);
         assert_eq!(click_owner(true, false, true), ClickOwner::AnchorTool);
         assert_eq!(click_owner(true, false, false), ClickOwner::Chart);
+    }
+
+    #[test]
+    fn drawing_tool_only_gets_clicks_left_to_the_chart() {
+        use cockpit::{ClickOwner, click_owner, drawing_gets_click};
+        assert!(drawing_gets_click(None));
+        assert!(drawing_gets_click(Some(ClickOwner::Chart)));
+        assert!(!drawing_gets_click(Some(ClickOwner::TimeLink)));
+        assert!(!drawing_gets_click(Some(ClickOwner::AnchorTool)));
+        // AVWAP armed (with a drawing tool also armed): the anchor click is not a drawing click.
+        assert!(!drawing_gets_click(Some(click_owner(false, false, true))));
+        assert!(!drawing_gets_click(Some(click_owner(true, true, true))));
+    }
+
+    #[test]
+    fn avwap_anchor_click_with_a_drawing_tool_anchors_only() {
+        let ctx = egui::Context::default();
+        let (worker, _) = Worker::test_channel();
+        let mut c = cockpit_chart(&worker, Timeframe::M5, Provenance::Real, &[]);
+        chart_frame(&ctx, &mut c, &worker, vec![]);
+        let v = c.viewport.unwrap();
+        let pos = pos2(10.0 + v.x_center(20) as f32, 400.0);
+        let click = |c: &mut ChartState| {
+            let press = |pressed| egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed,
+                modifiers: egui::Modifiers::NONE,
+            };
+            chart_frame(&ctx, c, &worker, vec![egui::Event::PointerMoved(pos)]);
+            chart_frame(&ctx, c, &worker, vec![press(true)]);
+            chart_frame(&ctx, c, &worker, vec![press(false)]);
+        };
+        let anchors = c.avwap_anchors.len();
+        c.arm_avwap();
+        c.draw.tool = Some(Tool::Horizontal);
+        click(&mut c);
+        assert_eq!(c.avwap_anchors.len(), anchors + 1, "the click anchored");
+        assert!(!c.avwap_is_armed(), "the AVWAP tool disarms");
+        assert!(c.drawings.is_empty(), "no drawing point was placed");
+        assert_eq!(c.draw.tool, Some(Tool::Horizontal), "the drawing tool stays armed");
+        // The next click goes to the drawing tool.
+        click(&mut c);
+        assert_eq!(c.drawings.len(), 1);
+        assert_eq!(c.avwap_anchors.len(), anchors + 1);
     }
 
     #[test]
