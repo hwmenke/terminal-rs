@@ -24,6 +24,10 @@ use crate::congress_view::Action;
 use crate::theme::{self, amber, amber_dim, mono, muted, text, ui_font};
 use crate::widgets;
 use crate::worker::{BuiltIndicator, PaneId, Request, Worker, archive_page, initial_limit};
+use tr_data::anchored_vwap::AvwapKey;
+
+mod cockpit;
+pub use cockpit::{LinkBus, LinkPublish, resolve_hover};
 
 const AXIS_W: f32 = 66.0;
 const TIME_H: f32 = 16.0;
@@ -371,6 +375,30 @@ pub struct ChartState {
     review: Option<tr_data::whats_news::ReviewContext>,
     pending_latest: bool,
     pending_jump_ts: Option<i64>,
+    /// Anchored VWAP anchors (UTC bar-open seconds) for the current symbol.
+    pub avwap_anchors: Vec<i64>,
+    /// Anchors for names this pane has visited, keyed by [`drawings::store_key`].
+    pub avwap_store: std::collections::BTreeMap<String, Vec<i64>>,
+    /// Anchors were edited here; the app copies them to linked charts of the symbol.
+    pub avwap_dirty: bool,
+    avwap_armed: bool,
+    avwap_selected: Option<usize>,
+    avwap: Option<(AvwapKey, Result<Arc<tr_data::anchored_vwap::AvwapReport>, String>)>,
+    avwap_sent: Option<(AvwapKey, Instant)>,
+    avwap_paint: cockpit::AvwapPaint,
+    /// Last anchor-placement problem (for example the four-anchor cap).
+    avwap_notice: Option<String>,
+    /// Bar time under the last right-click, for the context menu's Cockpit items.
+    link_menu_ts: Option<i64>,
+    /// Time Link input fed by the app before `show` (link colour, ghost cursor, lens).
+    pub link_in: Option<cockpit::LinkFeed>,
+    /// What this chart published during `show` (hover span, visible window, centre request).
+    pub link_out: cockpit::LinkPublish,
+    /// Plot geometry from the last paint; the app resolves the next frame's Time Link hover
+    /// from it before any linked chart paints.
+    pub link_geom: Option<cockpit::LinkGeom>,
+    /// Header chip on the Cockpit's main chart.
+    pub cockpit_chip: Option<String>,
 }
 
 impl ChartState {
@@ -473,6 +501,20 @@ impl ChartState {
             review: None,
             pending_latest: false,
             pending_jump_ts: None,
+            avwap_anchors: Vec::new(),
+            avwap_store: Default::default(),
+            avwap_dirty: false,
+            avwap_armed: false,
+            avwap_selected: None,
+            avwap: None,
+            avwap_sent: None,
+            avwap_paint: Default::default(),
+            avwap_notice: None,
+            link_menu_ts: None,
+            link_in: None,
+            link_out: Default::default(),
+            link_geom: None,
+            cockpit_chip: None,
         }
     }
 
@@ -581,6 +623,9 @@ impl ChartState {
         self.built.clear();
         self.last_live = None;
         self.review = None;
+        self.avwap = None;
+        self.avwap_sent = None;
+        self.avwap_paint = Default::default();
         if Security::parse(&self.symbol).is_none() {
             self.loading = false;
             self.exhausted = true;
@@ -638,8 +683,10 @@ impl ChartState {
         if !same {
             self.commit_drawings();
             self.drawing_undo = None;
+            self.stash_anchors();
             self.symbol = sec.key();
             self.sec = sec;
+            self.restore_anchors();
             self.earnings = None;
             self.ex_dividend = None;
             self.draw = DrawState::default();
@@ -823,12 +870,17 @@ impl ChartState {
     }
 
     pub fn start_tool(&mut self, tool: Tool) {
+        self.avwap_armed = false;
         self.draw.tool = Some(tool);
         self.draw.pending = None;
     }
 
     /// Esc: cancel an in-progress drawing, then deselect. Returns whether it consumed the key.
     pub fn cancel(&mut self) -> bool {
+        self.avwap_notice = None;
+        if self.cancel_avwap() {
+            return true;
+        }
         if self.draw.tool.is_some() || self.draw.selected.is_some() {
             self.draw = DrawState::default();
             true
@@ -838,6 +890,9 @@ impl ChartState {
     }
 
     pub fn delete_selected(&mut self) -> bool {
+        if self.delete_selected_anchor() {
+            return true;
+        }
         match self.draw.selected.take() {
             Some(i) if i < self.drawings.len() => {
                 self.drawing_undo = Some(self.drawings.clone());
@@ -1751,6 +1806,8 @@ impl ChartState {
         let r = theme::CARD_RADIUS.saturating_sub(1);
         painter.rect_filled(rect, CornerRadius { nw: 0, ne: 0, sw: r, se: r }, theme::card());
         let mut clicked = false;
+        self.link_out = LinkPublish::default();
+        self.request_avwap(w);
 
         // Controls live in the tab strip when it has room; otherwise a slim header row.
         let header_h = if self.controls_in_strip { 0.0 } else { HEADER_H };
@@ -2016,6 +2073,10 @@ impl ChartState {
         let mut v = v;
         v.clamp(len);
         self.viewport = Some(v);
+        let click_owner = self.cockpit_input(ui, &plot_resp, price_rect, &v);
+        clicked |= click_owner.is_some();
+        // A Shift+click on a time-linked chart only centres; drawing tools ignore it.
+        let drawing_click = click_owner != Some(cockpit::ClickOwner::TimeLink);
 
         // Page older history when the left edge approaches loaded data.
         if !self.paging && !self.loading && !self.exhausted && v.left() < v.visible_bars() * 0.3 {
@@ -2148,6 +2209,7 @@ impl ChartState {
         }
         self.prepare_zband_paint(price_rect, &v, &scale);
         ui.painter_at(price_rect).extend(self.zband_paint.cloud.iter().cloned());
+        self.paint_lens(ui, price_rect, &v);
         if self.show_stack {
             self.prepare_stack_paint(price_rect, stack_rect, &v, &scale);
             self.paint_stack_cloud(ui, price_rect, &v, &scale, &reveal);
@@ -2303,7 +2365,9 @@ impl ChartState {
         self.paint_alert_levels(ui, price_rect, &scale);
         self.paint_opening_range(ui, price_rect, &scale);
         self.paint_prior_session(ui, price_rect, &scale);
-        self.paint_drawings(ui, price_rect, &v, &scale, hover, &plot_resp);
+        let click = plot_resp.interact_pointer_pos().filter(|_| plot_resp.clicked() && drawing_click);
+        self.paint_drawings(ui, price_rect, &v, &scale, hover, click);
+        self.paint_avwap(ui, price_rect, &v, &scale, hover);
 
         // ---- congress markers ----
         self.hover_marker = None;
@@ -2350,7 +2414,14 @@ impl ChartState {
                 ui.ctx().set_cursor_icon(CursorIcon::Crosshair);
             }
         }
-        self.paint_legend(ui, price_rect, hovered_bar.unwrap_or(len.saturating_sub(1)), &sub_rects);
+        let ghost = self.paint_link_ghost(ui, price_rect, plot_all, time_rect, &v, &scale);
+        let cursor_price =
+            hover.filter(|p| price_rect.contains(*p)).map(|p| scale.price_at((p.y - price_rect.top()) as f64));
+        self.publish_link(hovered_bar, cursor_price, &v);
+        self.link_geom =
+            Some(cockpit::LinkGeom { plot_id: plot_resp.id, plot: plot_all, price_rect, viewport: v, scale, len });
+        self.paint_legend(ui, price_rect, hovered_bar.or(ghost).unwrap_or(len.saturating_sub(1)), &sub_rects);
+        self.paint_cockpit_chip(ui, price_rect);
         if self.show_edge {
             self.paint_flip_outcomes(ui, price_rect, &v, &scale);
             self.paint_edge_card(ui, price_rect);
@@ -2486,6 +2557,7 @@ impl ChartState {
                 ui.close();
             }
         });
+        self.cockpit_menu(ui);
         ui.checkbox(&mut self.log, "Log Scale");
         ui.checkbox(&mut self.magnet, "Magnet");
         ui.checkbox(&mut self.show_volume, "Volume");
@@ -3889,7 +3961,8 @@ impl ChartState {
         v: &Viewport,
         s: &PriceScale,
         hover: Option<Pos2>,
-        resp: &egui::Response,
+        // Where a primary click landed this frame, unless another layer consumed it.
+        click: Option<Pos2>,
     ) {
         let p = ui.painter_at(rect);
         let pointer_anchor = |this: &Self, pos: Pos2| -> Anchor {
@@ -3904,7 +3977,7 @@ impl ChartState {
         };
 
         // Placement.
-        if let (Some(tool), true, Some(pos)) = (self.draw.tool, resp.clicked(), resp.interact_pointer_pos()) {
+        if let (Some(tool), Some(pos)) = (self.draw.tool, click) {
             let a = pointer_anchor(self, pos);
             if tool.points() == 1 {
                 self.drawings.push(Drawing::new(tool, a, a));
@@ -3915,16 +3988,16 @@ impl ChartState {
             } else {
                 self.draw.pending = Some(a);
             }
-        } else if self.draw.tool.is_none() && resp.clicked() {
+        } else if self.draw.tool.is_none()
+            && let Some(pos) = click
+        {
             // Selection by proximity.
-            self.draw.selected = resp.interact_pointer_pos().and_then(|pos| {
-                self.drawings.iter().enumerate().find_map(|(i, d)| {
-                    let near = self
-                        .drawing_shapes(d, rect, v, s)
-                        .iter()
-                        .any(|(sh, _)| drawings::distance(sh, [pos.x as f64, pos.y as f64]) < 6.0);
-                    near.then_some(i)
-                })
+            self.draw.selected = self.drawings.iter().enumerate().find_map(|(i, d)| {
+                let near = self
+                    .drawing_shapes(d, rect, v, s)
+                    .iter()
+                    .any(|(sh, _)| drawings::distance(sh, [pos.x as f64, pos.y as f64]) < 6.0);
+                near.then_some(i)
             });
         }
 
@@ -4379,6 +4452,429 @@ mod tests {
         c.on_trend_stack(c.generation, bars.len(), result);
         c
     }
+    fn cockpit_chart(worker: &Worker, tf: Timeframe, provenance: Provenance, skip: &[usize]) -> ChartState {
+        let mut c = ChartState::new(7, "AAPL", tf);
+        c.indicators.clear();
+        let date = chrono::NaiveDate::from_ymd_opt(2026, 11, 10).unwrap();
+        let bars = Arc::new(
+            tr_data::intraday::regular_opens(date, tf)
+                .into_iter()
+                .enumerate()
+                .filter(|(i, _)| !skip.contains(i))
+                .map(|(i, ts)| {
+                    let p = 100.0 + i as f64;
+                    Bar::new(ts, p, p + 0.5, p - 0.5, p + 0.25, 1000.0 + i as f64).with_provenance(provenance)
+                })
+                .collect::<Vec<_>>(),
+        );
+        c.on_history(c.generation, bars.clone(), SeriesGpu::build(&bars), 0, false, false, false, worker);
+        c
+    }
+
+    fn ny_ts(h: u32, m: u32) -> i64 {
+        tr_core::ny::to_utc(chrono::NaiveDate::from_ymd_opt(2026, 11, 10).unwrap().and_hms_opt(h, m, 0).unwrap())
+    }
+
+    fn rect_fills(shapes: &[egui::epaint::ClippedShape], fill: Color32) -> Vec<Rect> {
+        fn walk(shape: &egui::Shape, fill: Color32, out: &mut Vec<Rect>) {
+            match shape {
+                egui::Shape::Rect(r) if r.fill == fill => out.push(r.rect),
+                egui::Shape::Vec(v) => v.iter().for_each(|s| walk(s, fill, out)),
+                _ => {}
+            }
+        }
+        let mut out = Vec::new();
+        shapes.iter().for_each(|s| walk(&s.shape, fill, &mut out));
+        out
+    }
+
+    fn feed(c: &ChartState, span: Option<(i64, i64)>, lens: Option<(i64, i64)>) -> cockpit::LinkFeed {
+        cockpit::LinkFeed {
+            color: crate::layouts::Link::Blue.color(),
+            cursor: span.map(|span| cockpit::LinkCursor {
+                source: 99,
+                symbol: c.symbol.clone(),
+                span,
+                price: Some(104.0),
+                label: "T10:00".into(),
+            }),
+            lens: lens.map(|window| cockpit::Lens { window, label: "1m".into() }),
+        }
+    }
+
+    fn avwap_requests(rx: &mut tokio::sync::mpsc::UnboundedReceiver<Request>) -> Vec<AvwapKey> {
+        let mut out = Vec::new();
+        while let Ok(r) = rx.try_recv() {
+            if let Request::AnchoredVwap { key, .. } = r {
+                out.push(key);
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn link_bus_routes_same_symbol_cursor_and_next_finer_window() {
+        use crate::layouts::Link;
+        let mut bus = LinkBus::default();
+        let cursor = |source| cockpit::LinkCursor {
+            source,
+            symbol: "AAPL US Equity".into(),
+            span: (60, 120),
+            price: None,
+            label: "x".into(),
+        };
+        let publish = |bus: &mut LinkBus, pane, tf, cursor: Option<cockpit::LinkCursor>, w| {
+            bus.publish(Link::Blue, pane, "AAPL US Equity", tf, &LinkPublish { cursor, window: Some(w), center: None });
+        };
+        bus.begin_frame();
+        publish(&mut bus, 1, Timeframe::M1, Some(cursor(1)), (0, 600));
+        publish(&mut bus, 2, Timeframe::M5, None, (0, 3000));
+        publish(&mut bus, 3, Timeframe::M15, None, (0, 9000));
+        let slow = bus.feed(Link::Blue, 3, "AAPL US Equity", Timeframe::M15);
+        assert_eq!(slow.cursor.as_ref().map(|c| c.source), Some(1));
+        assert_eq!(slow.lens.as_ref().map(|l| (l.label.as_str(), l.window)), Some(("5m", (0, 3000))));
+        let fast = bus.feed(Link::Blue, 1, "AAPL US Equity", Timeframe::M1);
+        assert!(fast.cursor.is_none(), "the source never ghosts itself");
+        assert!(fast.lens.is_none(), "nothing finer than 1m");
+        assert!(bus.feed(Link::Blue, 3, "MSFT US Equity", Timeframe::M15).cursor.is_none());
+        assert!(bus.feed(Link::Red, 3, "AAPL US Equity", Timeframe::M15).cursor.is_none());
+        // Next frame: a chart drawn before the source still sees last frame's cursor,
+        // and the cursor disappears once the source stops hovering.
+        bus.begin_frame();
+        assert!(bus.feed(Link::Blue, 2, "AAPL US Equity", Timeframe::M5).cursor.is_some());
+        publish(&mut bus, 1, Timeframe::M1, None, (0, 600));
+        assert!(bus.feed(Link::Blue, 2, "AAPL US Equity", Timeframe::M5).cursor.is_none());
+    }
+
+    #[test]
+    fn linked_cursor_paints_band_and_time_pill_without_local_hover() {
+        let ctx = egui::Context::default();
+        let (worker, _) = Worker::test_channel();
+        let mut c = cockpit_chart(&worker, Timeframe::M5, Provenance::Real, &[]);
+        let color = crate::layouts::Link::Blue.color();
+        // A 15m bar at 10:00 hovered on another chart covers the 10:00, 10:05 and 10:10 bars here.
+        c.link_in = Some(feed(&c, Some((ny_ts(10, 0), ny_ts(10, 15))), None));
+        let out = chart_frame(&ctx, &mut c, &worker, vec![]);
+        let bands = rect_fills(&out.shapes, cockpit::ghost_fill(color));
+        assert_eq!(bands.len(), 1, "one ghost band");
+        let v = c.viewport.unwrap();
+        assert!((bands[0].width() - 3.0 * v.bar_px as f32).abs() < 1.5, "{} vs {}", bands[0].width(), v.bar_px);
+        assert!(stack_has_text(&out.shapes, "T10:00"), "time pill");
+        assert!(stack_has_text(&out.shapes, "O108.00"), "legend follows bar hi - 1");
+        assert_eq!(c.link_out.cursor, None, "no local hover is published");
+        // The legend returns to the last bar once the cursor leaves.
+        c.link_in = Some(feed(&c, None, None));
+        let out = chart_frame(&ctx, &mut c, &worker, vec![]);
+        assert!(rect_fills(&out.shapes, cockpit::ghost_fill(color)).is_empty());
+        assert!(!stack_has_text(&out.shapes, "O108.00"));
+        // A pane being dragged shows no ghost.
+        c.link_in = Some(feed(&c, Some((ny_ts(10, 0), ny_ts(10, 15))), None));
+        c.hover_enabled = false;
+        let out = chart_frame(&ctx, &mut c, &worker, vec![]);
+        assert!(rect_fills(&out.shapes, cockpit::ghost_fill(color)).is_empty());
+    }
+
+    #[test]
+    fn linked_cursor_with_no_matching_bar_paints_no_band() {
+        let ctx = egui::Context::default();
+        let (worker, _) = Worker::test_channel();
+        // The 10:00 bucket (index 6) is missing; nothing is filled in.
+        let mut c = cockpit_chart(&worker, Timeframe::M5, Provenance::Real, &[6]);
+        let color = crate::layouts::Link::Blue.color();
+        for span in [(ny_ts(10, 1), ny_ts(10, 2)), (ny_ts(8, 0), ny_ts(8, 1)), (ny_ts(16, 30), ny_ts(16, 31))] {
+            c.link_in = Some(feed(&c, Some(span), None));
+            let out = chart_frame(&ctx, &mut c, &worker, vec![]);
+            assert!(rect_fills(&out.shapes, cockpit::ghost_fill(color)).is_empty(), "{span:?}");
+            assert!(!stack_has_text(&out.shapes, "T10:00"));
+        }
+        // A different symbol in the same group is ignored.
+        let mut f = feed(&c, Some((ny_ts(10, 5), ny_ts(10, 10))), None);
+        f.cursor.as_mut().unwrap().symbol = "MSFT US Equity".into();
+        c.link_in = Some(f);
+        let out = chart_frame(&ctx, &mut c, &worker, vec![]);
+        assert!(rect_fills(&out.shapes, cockpit::ghost_fill(color)).is_empty());
+    }
+
+    #[test]
+    fn lens_bracket_tracks_the_finer_window() {
+        let ctx = egui::Context::default();
+        let (worker, _) = Worker::test_channel();
+        let mut c = cockpit_chart(&worker, Timeframe::M5, Provenance::Real, &[]);
+        let color = crate::layouts::Link::Blue.color();
+        c.link_in = Some(feed(&c, None, Some((ny_ts(10, 0), ny_ts(10, 15)))));
+        let out = chart_frame(&ctx, &mut c, &worker, vec![]);
+        let a = rect_fills(&out.shapes, cockpit::lens_fill(color));
+        assert_eq!(a.len(), 1);
+        // The interval control also reads "1m"; the lens label sits at the bracket's bottom-left.
+        let label_at = |shapes: &[egui::epaint::ClippedShape], r: Rect| {
+            shapes.iter().any(|s| match &s.shape {
+                egui::Shape::Text(t) => {
+                    t.galley.job.text == "1m" && (t.pos.x - r.left() - 3.0).abs() < 1.0 && t.pos.y > r.center().y
+                }
+                _ => false,
+            })
+        };
+        assert!(label_at(&out.shapes, a[0]));
+        let bar_px = c.viewport.unwrap().bar_px as f32;
+        assert!((a[0].width() - 3.0 * bar_px).abs() < 1.5);
+        c.link_in = Some(feed(&c, None, Some((ny_ts(11, 0), ny_ts(11, 30)))));
+        let out = chart_frame(&ctx, &mut c, &worker, vec![]);
+        let b = rect_fills(&out.shapes, cockpit::lens_fill(color));
+        assert!((b[0].width() - 6.0 * bar_px).abs() < 1.5);
+        assert!((b[0].left() - a[0].left() - 12.0 * bar_px).abs() < 1.5, "the bracket moves with the window");
+        assert!(label_at(&out.shapes, b[0]) && !label_at(&out.shapes, a[0]));
+        // A window outside the loaded bars draws no bracket.
+        c.link_in = Some(feed(&c, None, Some((ny_ts(17, 0), ny_ts(17, 30)))));
+        let out = chart_frame(&ctx, &mut c, &worker, vec![]);
+        assert!(rect_fills(&out.shapes, cockpit::lens_fill(color)).is_empty());
+        // The chart publishes its own visible window for coarser charts.
+        assert_eq!(c.link_out.window, Some((ny_ts(9, 30), ny_ts(16, 0))));
+    }
+
+    #[test]
+    fn avwap_refusal_paints_zero_digits() {
+        fn digits(s: &egui::Shape) -> bool {
+            match s {
+                egui::Shape::Text(t) => t.galley.job.text.chars().any(|c| c.is_ascii_digit()),
+                egui::Shape::Vec(v) => v.iter().any(digits),
+                _ => false,
+            }
+        }
+        fn lines(s: &egui::Shape) -> bool {
+            match s {
+                egui::Shape::LineSegment { .. } | egui::Shape::Mesh(_) => true,
+                egui::Shape::Vec(v) => v.iter().any(lines),
+                _ => false,
+            }
+        }
+        let ctx = egui::Context::default();
+        let (worker, _) = Worker::test_channel();
+        for provenance in [Provenance::Sample, Provenance::Missing] {
+            let mut c = cockpit_chart(&worker, Timeframe::M5, provenance, &[]);
+            c.anchor_at_bar(6).unwrap();
+            let key = c.avwap_key(chrono::Utc::now().timestamp()).unwrap();
+            let refusal = Bar::require_verified(&c.bars, "Anchored VWAP").unwrap_err();
+            c.on_anchored_vwap(key, Err(refusal));
+            let v = Viewport::fit_last(c.bars.len(), 160, 900.0);
+            let scale = PriceScale { lo: 90.0, hi: 200.0, log: false, height_px: 600.0 };
+            let mut output = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(1000.0, 700.0))),
+                    ..Default::default()
+                },
+                |ui| c.paint_avwap(ui, Rect::from_min_size(pos2(0.0, 0.0), vec2(900.0, 600.0)), &v, &scale, None),
+            );
+            output.textures_delta.clear();
+            assert!(stack_has_text(&output.shapes, "Anchored VWAP refused"));
+            assert!(!output.shapes.iter().any(|s| digits(&s.shape)), "no numbers on a refusal");
+            assert!(!output.shapes.iter().any(|s| lines(&s.shape)), "no line or band on a refusal");
+        }
+    }
+
+    #[test]
+    fn avwap_request_is_not_resent_for_an_unchanged_key() {
+        let (worker, mut rx) = Worker::test_channel();
+        let mut c = cockpit_chart(&worker, Timeframe::M5, Provenance::Real, &[]);
+        avwap_requests(&mut rx);
+        c.request_avwap(&worker);
+        assert!(avwap_requests(&mut rx).is_empty(), "no anchors, no request");
+        c.anchor_at_bar(6).unwrap();
+        c.request_avwap(&worker);
+        c.request_avwap(&worker);
+        let sent = avwap_requests(&mut rx);
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].anchors, vec![ny_ts(10, 0)]);
+        // A live tick on the forming bar waits for the throttle; an anchor edit does not.
+        let mut bars = (*c.bars).clone();
+        bars.last_mut().unwrap().close += 0.1;
+        c.bars = Arc::new(bars);
+        c.request_avwap(&worker);
+        assert!(avwap_requests(&mut rx).is_empty(), "throttled tick");
+        c.anchor_at_bar(12).unwrap();
+        c.request_avwap(&worker);
+        assert_eq!(avwap_requests(&mut rx).len(), 1);
+        c.request_avwap(&worker);
+        assert!(avwap_requests(&mut rx).is_empty());
+    }
+
+    #[test]
+    fn avwap_response_for_an_old_key_is_dropped() {
+        let (worker, mut rx) = Worker::test_channel();
+        let mut c = cockpit_chart(&worker, Timeframe::M5, Provenance::Real, &[]);
+        c.anchor_at_bar(6).unwrap();
+        c.request_avwap(&worker);
+        let old = avwap_requests(&mut rx).pop().unwrap();
+        let bars = c.bars.clone();
+        let report = |key: &AvwapKey| Ok(Arc::new(tr_data::anchored_vwap::build(&bars, &key.anchors, key.closed_len)));
+        let stale = report(&old);
+        c.anchor_at_bar(12).unwrap();
+        c.on_anchored_vwap(old.clone(), stale);
+        assert!(c.avwap.is_none(), "a response for the old anchors is dropped");
+        c.request_avwap(&worker);
+        let current = avwap_requests(&mut rx).pop().unwrap();
+        let fresh = report(&current);
+        c.on_anchored_vwap(current.clone(), fresh);
+        assert_eq!(c.avwap.as_ref().map(|(k, _)| k), Some(&current));
+        // A reload (new generation) also invalidates it.
+        let mut stale_gen = current.clone();
+        stale_gen.generation += 1;
+        let r = report(&stale_gen);
+        c.avwap = None;
+        c.on_anchored_vwap(stale_gen, r);
+        assert!(c.avwap.is_none());
+    }
+
+    #[test]
+    fn anchor_click_snaps_to_bar_open_and_caps_at_four() {
+        let ctx = egui::Context::default();
+        let (worker, _) = Worker::test_channel();
+        let mut c = cockpit_chart(&worker, Timeframe::M5, Provenance::Real, &[]);
+        chart_frame(&ctx, &mut c, &worker, vec![]);
+        let v = c.viewport.unwrap();
+        let click = |c: &mut ChartState, i: usize| {
+            // Off-centre inside the bar: the anchor still snaps to the bar's open.
+            let pos = pos2(10.0 + (v.x_center(i) + v.bar_px * 0.3) as f32, 400.0);
+            c.arm_avwap();
+            assert!(c.avwap_is_armed());
+            chart_frame(&ctx, c, &worker, vec![egui::Event::PointerMoved(pos)]);
+            chart_frame(&ctx, c, &worker, vec![pointer(pos, egui::PointerButton::Primary, true)]);
+            chart_frame(&ctx, c, &worker, vec![pointer(pos, egui::PointerButton::Primary, false)]);
+            chart_frame(&ctx, c, &worker, vec![egui::Event::PointerMoved(pos2(500.0, 300.0))]);
+            assert!(!c.avwap_is_armed(), "one click disarms");
+        };
+        click(&mut c, 6);
+        assert_eq!(c.avwap_anchors, vec![ny_ts(10, 0)]);
+        assert!(c.avwap_dirty, "the app propagates the edit");
+        for i in [20, 30, 40] {
+            click(&mut c, i);
+        }
+        assert_eq!(c.avwap_anchors.len(), 4);
+        click(&mut c, 50);
+        assert_eq!(c.avwap_anchors.len(), 4, "a fifth anchor is refused");
+        assert!(!c.avwap_anchors.contains(&c.bars[50].ts));
+        assert!(c.avwap_notice.as_deref().is_some_and(|n| n.contains("at most 4")));
+        // Anchors are per symbol: a switch stores them and restores on return.
+        c.set_symbol("MSFT", &worker);
+        assert!(c.avwap_anchors.is_empty());
+        c.set_symbol("AAPL", &worker);
+        assert_eq!(c.avwap_anchors.len(), 4);
+    }
+
+    #[test]
+    fn shift_click_on_a_time_linked_chart_wins_over_tools() {
+        use cockpit::{ClickOwner, click_owner};
+        // Shift on a linked chart always centres, even with the AVWAP tool armed.
+        assert_eq!(click_owner(true, true, false), ClickOwner::TimeLink);
+        assert_eq!(click_owner(true, true, true), ClickOwner::TimeLink);
+        // Without a link Shift is an ordinary click.
+        assert_eq!(click_owner(false, true, false), ClickOwner::Chart);
+        assert_eq!(click_owner(false, true, true), ClickOwner::AnchorTool);
+        assert_eq!(click_owner(true, false, true), ClickOwner::AnchorTool);
+        assert_eq!(click_owner(true, false, false), ClickOwner::Chart);
+    }
+
+    #[test]
+    fn shift_click_with_a_drawing_tool_centres_only() {
+        let ctx = egui::Context::default();
+        let (worker, _) = Worker::test_channel();
+        let mut c = cockpit_chart(&worker, Timeframe::M5, Provenance::Real, &[]);
+        chart_frame(&ctx, &mut c, &worker, vec![]);
+        let v = c.viewport.unwrap();
+        let pos = pos2(10.0 + v.x_center(20) as f32, 400.0);
+        let click = |c: &mut ChartState, modifiers: egui::Modifiers| {
+            let press =
+                |pressed| egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed, modifiers };
+            chart_frame(&ctx, c, &worker, vec![egui::Event::PointerMoved(pos)]);
+            chart_frame(&ctx, c, &worker, vec![press(true)]);
+            chart_frame(&ctx, c, &worker, vec![press(false)]);
+        };
+        // Linked + Shift: the linked charts are centred and no drawing point is placed.
+        c.link_in = Some(feed(&c, None, None));
+        c.start_tool(Tool::Horizontal);
+        click(&mut c, egui::Modifiers::SHIFT);
+        assert_eq!(c.link_out.center, Some(c.bars[20].ts));
+        assert!(c.drawings.is_empty(), "the drawing tool ignored the Shift+click");
+        assert_eq!(c.draw.tool, Some(Tool::Horizontal), "the tool stays armed");
+        // A two-point tool does not take a first point either.
+        c.start_tool(Tool::Trendline);
+        click(&mut c, egui::Modifiers::SHIFT);
+        assert!(c.draw.pending.is_none() && c.drawings.is_empty());
+        // A plain click on the linked chart draws.
+        c.start_tool(Tool::Horizontal);
+        click(&mut c, egui::Modifiers::NONE);
+        assert_eq!(c.drawings.len(), 1);
+        assert_eq!(c.link_out.center, None);
+        // Without a link, Shift+click is an ordinary drawing click.
+        c.link_in = None;
+        c.start_tool(Tool::Horizontal);
+        click(&mut c, egui::Modifiers::SHIFT);
+        assert_eq!(c.drawings.len(), 2);
+        assert_eq!(c.link_out.center, None);
+    }
+
+    #[test]
+    fn resolve_hover_picks_the_chart_under_the_pointer_from_last_frame_rects() {
+        let viewport = Viewport::fit_last(100, 100, 1000.0);
+        let geom = |n: u64, x: f32| cockpit::LinkGeom {
+            plot_id: egui::Id::new(n),
+            plot: Rect::from_min_size(pos2(x, 0.0), vec2(1000.0, 600.0)),
+            price_rect: Rect::from_min_size(pos2(x, 0.0), vec2(1000.0, 400.0)),
+            viewport,
+            scale: PriceScale { lo: 100.0, hi: 200.0, log: false, height_px: 400.0 },
+            len: 100,
+        };
+        let panes = [(1, geom(1, 0.0)), (2, geom(2, 1000.0))];
+        let all = |_: egui::Id| true;
+        // Pointer over the second chart's price pane: its bar and cursor price.
+        let p = pos2(1000.0 + viewport.x_center(42) as f32, 200.0);
+        let (id, bar) = resolve_hover(panes, p, all).unwrap();
+        assert_eq!(id, 2);
+        let (i, price) = bar.unwrap();
+        assert_eq!(i, 42);
+        assert!((price.unwrap() - 150.0).abs() < 1e-6);
+        // Below the price pane (an oscillator): the bar, but no price.
+        let p = pos2(viewport.x_center(7) as f32, 500.0);
+        assert_eq!(resolve_hover(panes, p, all), Some((1, Some((7, None)))));
+        // Outside every plot, or covered by another widget/layer: nothing.
+        assert_eq!(resolve_hover(panes, pos2(500.0, 700.0), all), None);
+        assert_eq!(resolve_hover(panes, pos2(500.0, 200.0), |id| id != egui::Id::new(1)), None);
+    }
+
+    #[test]
+    fn seeded_hover_reaches_charts_painted_before_the_hovered_one_on_the_same_frame() {
+        use crate::layouts::Link;
+        let sym = "AAPL US Equity";
+        let cursor =
+            |source, span| cockpit::LinkCursor { source, symbol: sym.into(), span, price: None, label: "x".into() };
+        let publish = |bus: &mut LinkBus, pane, c: Option<cockpit::LinkCursor>| {
+            bus.publish(Link::Blue, pane, sym, Timeframe::M1, &LinkPublish { cursor: c, window: None, center: None })
+        };
+        let mut bus = LinkBus::default();
+        // Frame 1: the pointer arrives on pane 2. Pane 1 paints first and already sees it.
+        bus.begin_frame();
+        bus.seed_hover(Some((Link::Blue, Some(cursor(2, (60, 120))))));
+        assert_eq!(bus.feed(Link::Blue, 1, sym, Timeframe::M5).cursor, Some(cursor(2, (60, 120))));
+        assert!(!publish(&mut bus, 1, None), "a non-hovered chart changes nothing");
+        assert!(!publish(&mut bus, 2, Some(cursor(2, (60, 120)))), "the paint agrees with the seed");
+        // Frame 2: the hovered chart's paint resolves another bar (it zoomed). Later charts get
+        // the new one; the change asks for a repaint so earlier charts catch up.
+        bus.begin_frame();
+        bus.seed_hover(Some((Link::Blue, Some(cursor(2, (60, 120))))));
+        assert!(publish(&mut bus, 2, Some(cursor(2, (120, 180)))));
+        assert_eq!(bus.feed(Link::Blue, 3, sym, Timeframe::M5).cursor, Some(cursor(2, (120, 180))));
+        // Frame 3: the pointer leaves every linked chart; the ghost is gone for all charts at once.
+        bus.begin_frame();
+        bus.seed_hover(None);
+        assert_eq!(bus.feed(Link::Blue, 1, sym, Timeframe::M5).cursor, None);
+        assert!(!publish(&mut bus, 2, None));
+        // Over a chart but not over a bar also withdraws the cursor.
+        bus.begin_frame();
+        bus.seed_hover(Some((Link::Blue, Some(cursor(2, (60, 120))))));
+        bus.begin_frame();
+        bus.seed_hover(Some((Link::Blue, None)));
+        assert_eq!(bus.feed(Link::Blue, 1, sym, Timeframe::M5).cursor, None);
+    }
+
     #[test]
     fn edge_error_card_paints_zero_digits() {
         let ctx = egui::Context::default();

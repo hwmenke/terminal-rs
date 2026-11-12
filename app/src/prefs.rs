@@ -265,6 +265,7 @@ pub enum Action {
     DrawHorizontal,
     DrawVertical,
     DrawFib,
+    DrawAnchoredVwap,
     ResetView,
     JumpLatest,
     LogScale,
@@ -281,7 +282,7 @@ pub enum Action {
 }
 
 impl Action {
-    pub const ALL: [Action; 55] = [
+    pub const ALL: [Action; 56] = [
         Action::Help,
         Action::Congress,
         Action::Politicians,
@@ -324,6 +325,7 @@ impl Action {
         Action::DrawHorizontal,
         Action::DrawVertical,
         Action::DrawFib,
+        Action::DrawAnchoredVwap,
         Action::ResetView,
         Action::JumpLatest,
         Action::LogScale,
@@ -384,6 +386,7 @@ impl Action {
             Action::DrawHorizontal => "Draw horizontal line".into(),
             Action::DrawVertical => "Draw vertical line".into(),
             Action::DrawFib => "Draw Fibonacci retracement".into(),
+            Action::DrawAnchoredVwap => "Anchor VWAP on a clicked bar".into(),
             Action::ResetView => "Reset chart view".into(),
             Action::JumpLatest => "Jump to the latest candle".into(),
             Action::LogScale => "Toggle log scale".into(),
@@ -414,6 +417,7 @@ impl Action {
             | A::DrawHorizontal
             | A::DrawVertical
             | A::DrawFib
+            | A::DrawAnchoredVwap
             | A::ResetView
             | A::JumpLatest
             | A::LogScale
@@ -615,6 +619,7 @@ impl Default for Keymap {
         bind(Action::DrawHorizontal, "Alt+H");
         bind(Action::DrawVertical, "Alt+V");
         bind(Action::DrawFib, "Alt+F");
+        bind(Action::DrawAnchoredVwap, "Alt+A");
         bind(Action::ResetView, "Alt+R");
         bind(Action::JumpLatest, "End");
         bind(Action::LogScale, "Alt+L");

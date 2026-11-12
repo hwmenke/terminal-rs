@@ -13,6 +13,7 @@
 //! unavailability; synthetic data requires explicit sample mode.
 
 pub mod alpaca;
+pub mod anchored_vwap;
 pub mod autocorr;
 pub mod backtest;
 pub mod cache;
@@ -49,6 +50,7 @@ pub mod session_extreme;
 pub mod session_path;
 pub mod stack_wall;
 pub mod stats;
+pub mod time_link;
 pub mod trade_plans;
 pub mod treasury;
 pub mod truth_rail;

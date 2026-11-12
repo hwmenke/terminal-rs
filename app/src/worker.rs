@@ -78,6 +78,16 @@ pub enum Request {
         archive: bool,
         base: Arc<Vec<Bar>>,
     },
+    /// Anchored VWAP on the chart's own loaded bars. `key` carries the generation,
+    /// interval and anchors; `as_of` is the chart's last refresh (now for archive charts)
+    /// and decides the forming bar through `closed_len`. Never fetches prices.
+    AnchoredVwap {
+        pane: PaneId,
+        key: tr_data::anchored_vwap::AvwapKey,
+        class: tr_core::AssetClass,
+        bars: Arc<Vec<Bar>>,
+        as_of: Option<i64>,
+    },
     HoldingHistory {
         pane: PaneId,
         generation: u64,
@@ -521,6 +531,12 @@ pub enum Response {
         generation: u64,
         base_len: usize,
         result: Result<LineRef, String>,
+    },
+    /// Anchored VWAP for the chart state described by `key` (generation, anchors, bars).
+    AnchoredVwap {
+        pane: PaneId,
+        key: tr_data::anchored_vwap::AvwapKey,
+        result: Result<Arc<tr_data::anchored_vwap::AvwapReport>, String>,
     },
     HoldingHistory {
         pane: PaneId,
@@ -2355,6 +2371,22 @@ async fn research_desk(
     Ok(tr_data::whats_news::Snapshot { failures: vec![], data: rows, provenance, source })
 }
 
+/// Verified gate first, then `closed_len` on the feed's clock, then the sums off the async
+/// runtime. Sample or unverified bars return the shared refusal and no numbers.
+async fn anchored_vwap(
+    class: tr_core::AssetClass,
+    bars: Arc<Vec<Bar>>,
+    key: &tr_data::anchored_vwap::AvwapKey,
+    as_of: Option<i64>,
+) -> Result<Arc<tr_data::anchored_vwap::AvwapReport>, String> {
+    Bar::require_verified(&bars, "Anchored VWAP")?;
+    let closed = tr_data::closed::closed_len(key.tf, &bars, class, as_of);
+    let anchors = key.anchors.clone();
+    tokio::task::spawn_blocking(move || tr_data::anchored_vwap::report(&bars, &anchors, closed).map(Arc::new))
+        .await
+        .map_err(|e| format!("Anchored VWAP task failed: {e}"))?
+}
+
 async fn handle(s: &Arc<Shared>, req: Request) {
     handle_inner(s, req, false).await;
 }
@@ -2673,6 +2705,9 @@ async fn handle_inner(s: &Arc<Shared>, req: Request, force: bool) {
                 base_len: base.len(),
                 result: result.map_err(|e: anyhow::Error| format!("{e:#}")),
             });
+        }
+        Request::AnchoredVwap { pane, key, class, bars, as_of } => {
+            s.send(Response::AnchoredVwap { pane, result: anchored_vwap(class, bars, &key, as_of).await, key });
         }
         Request::HoldingHistory { pane, generation, symbols } => {
             let bridge = config.bridge();
@@ -4918,6 +4953,49 @@ mod tests {
             }),
             rx,
         )
+    }
+
+    #[tokio::test]
+    async fn sample_and_unverified_bars_are_refused() {
+        use tr_data::anchored_vwap::AvwapKey;
+        let (s, rx) = shared(Arc::new(tr_data::sample::SampleProvider::at(0, 10)), None);
+        let fixture = |p: tr_core::Provenance| {
+            Arc::new(
+                (0..5).map(|i| Bar::new(i * 60, 10.0, 11.0, 9.0, 10.0, 100.0).with_provenance(p)).collect::<Vec<_>>(),
+            )
+        };
+        let run = async |p: tr_core::Provenance| {
+            let bars = fixture(p);
+            let key = AvwapKey::new(3, Timeframe::M1, &[0], &bars, 4);
+            handle(
+                &s,
+                Request::AnchoredVwap {
+                    pane: 7,
+                    key: key.clone(),
+                    class: tr_core::AssetClass::Equity,
+                    bars,
+                    as_of: None,
+                },
+            )
+            .await;
+            rx.try_iter()
+                .find_map(|r| match r {
+                    Response::AnchoredVwap { pane: 7, key: k, result } => Some((k == key, result)),
+                    _ => None,
+                })
+                .expect("anchored vwap response")
+        };
+        for p in [tr_core::Provenance::Sample, tr_core::Provenance::Missing] {
+            let (same, result) = run(p).await;
+            assert!(same);
+            let error = result.unwrap_err();
+            assert!(error.contains("Anchored VWAP refused"), "{error}");
+        }
+        // Verified bars compute; without an observation time the last bar stays forming.
+        let (_, result) = run(tr_core::Provenance::Real).await;
+        let report = result.unwrap();
+        assert_eq!((report.n, report.closed), (5, 4));
+        assert!(report.lines[0].as_ref().unwrap().vwap.iter().all(|v| (v - 10.0).abs() < 1e-12));
     }
 
     struct ArchivePrices;

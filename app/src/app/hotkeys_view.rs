@@ -297,6 +297,10 @@ impl TerminalApp {
                         "Intraday desk: 5-minute chart, ISCAN, breadth, and volume pace for one name, saved as the Intraday layout",
                     ),
                     (
+                        &["COCKPIT", "CKPT", "AAPL COCKPIT", "COCKPIT 5m 15m 1h"],
+                        "Intraday Cockpit: three linked native intraday charts (TSTACK + RAIL), saved as the Cockpit layout",
+                    ),
+                    (
                         &["DESK", "AAPL DESK", "NEW DESK"],
                         "PM Desk: watchlist leaders, group performance, position size (not PORT)",
                     ),
@@ -410,6 +414,14 @@ impl TerminalApp {
                         "Draw the prior cash close, 09:30 open, opening range, and session VWAP on the chart",
                     ),
                     (&["TL", "HL", "VL", "FIB", "MAGNET"], "Drawing tools and snapping"),
+                    (
+                        &["AVWAP", "AVWAP OPEN", "AVWAP HIGH", "AVWAP LOW", "AVWAP CLEAR"],
+                        "Anchored VWAP (Alt+A, click a bar; ≤4 per name, linked charts follow; Del removes a selected flag); verified bars only",
+                    ),
+                    (
+                        &["⇧ Click"],
+                        "Centre every linked chart of the same name on that bar; hovering shows a ghost cursor on them",
+                    ),
                     (&["CLEAR DRAW", "UNDO DRAW"], "Remove all drawings on this name, or undo the last delete"),
                     (&["REVIEW", "AAPL REVIEW"], "Linked daily + weekly archive charts for candidate review"),
                     (&["LATEST", "END"], "Jump to the latest candle (keeps zoom)"),

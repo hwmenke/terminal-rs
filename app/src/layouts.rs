@@ -3,7 +3,7 @@
 //! `<data dir>/layouts/` (`~/Library/Application Support/terminal-rs/layouts` on macOS),
 //! so they can be shared, hand-edited, imported and exported.
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
@@ -107,6 +107,13 @@ pub enum PaneSettings {
         show_rail: bool,
         #[serde(default)]
         show_edge: bool,
+        /// Anchored VWAP anchors (UTC bar opens) per security, keyed like drawings.
+        #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+        avwap: BTreeMap<String, Vec<i64>>,
+        /// `COCKPIT 1m · 5m · 15m` header chip on the Cockpit's main chart. Older layouts
+        /// without the field load with no chip.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cockpit_chip: Option<String>,
     },
     /// Congress feed with its filter (`None` = unfiltered).
     Feed(Option<FeedSettings>),
@@ -535,6 +542,8 @@ pub fn chart_settings(symbol: &str, d: &crate::prefs::PanelDefaults) -> PaneSett
         stack_session: false,
         show_rail: true,
         show_edge: false,
+        avwap: BTreeMap::new(),
+        cockpit_chip: None,
     }
 }
 
@@ -988,6 +997,8 @@ mod tests {
                 stack_session: false,
                 show_rail: true,
                 show_edge: false,
+                avwap: BTreeMap::new(),
+                cockpit_chip: None,
             }],
         );
         let back = LayoutDoc::from_json(&doc.to_json()).unwrap();
