@@ -4534,6 +4534,46 @@ mod tests {
         assert!(r.completed.iter().all(|o| o.index + o.horizon < r.bars));
     }
     #[test]
+    fn live_hourly_edge_excludes_cash_open_bar_at_a_1015_refresh() {
+        let stamp = |s: &str| s.parse::<chrono::DateTime<chrono::Utc>>().unwrap().timestamp();
+        let last = stamp("2026-11-11T14:30:00Z"); // 09:30 EST
+        let now = stamp("2026-11-11T15:15:00Z"); // 10:15 EST
+        let date = tr_core::ny::civil(last).date();
+        let mut opens = vec![last];
+        let mut day = date;
+        for _ in 0..30 {
+            day = tr_data::history::calendar::previous_session(day);
+            opens.extend(tr_data::intraday::regular_opens(day, Timeframe::H1));
+        }
+        opens.sort_unstable();
+        let bars: Vec<_> = opens
+            .into_iter()
+            .enumerate()
+            .map(|(i, ts)| {
+                let close = 100.0 + i as f64 * 0.05 + (i as f64 * 0.37).sin();
+                Bar::new(ts, close, close + 1.0, close - 1.0, close, 1.0).with_provenance(Provenance::Real)
+            })
+            .collect();
+        let mut c = ChartState::new(1, "AAPL", Timeframe::H1);
+        c.show_edge = true;
+        c.bars = Arc::new(bars);
+        c.last_refresh = Some(now);
+        c.stack = Some(tr_core::indicators::trend_stack(&c.bars, c.tf, vec![], Default::default()).unwrap());
+        c.refresh_edge(now);
+        let report = c.edge.as_ref().unwrap().as_ref().unwrap();
+        assert_eq!(report.bars, c.bars.len() - 1);
+        assert!(c.edge_paint.forming_excluded);
+        assert!(report.completed.iter().all(|o| o.index + o.horizon < report.bars));
+
+        // Wall time alone cannot close a bar from a stale observation.
+        c.refresh_edge(stamp("2026-11-11T15:31:00Z"));
+        assert_eq!(c.edge.as_ref().unwrap().as_ref().unwrap().bars, c.bars.len() - 1);
+        c.last_refresh = Some(stamp("2026-11-11T15:30:00Z"));
+        c.refresh_edge(c.last_refresh.unwrap());
+        assert_eq!(c.edge.as_ref().unwrap().as_ref().unwrap().bars, c.bars.len());
+        assert!(!c.edge_paint.forming_excluded);
+    }
+    #[test]
     fn archive_weekly_edge_excludes_forming_state_and_close() {
         let now = "2026-11-11T22:00:00Z".parse::<chrono::DateTime<chrono::Utc>>().unwrap().timestamp();
         let last = Timeframe::W1.bucket_start(now);
