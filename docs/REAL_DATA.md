@@ -46,10 +46,13 @@ The optional prior-day high/low MARKS extension is deferred (the first phase-one
 
 `TSTACK EDGE [ON|OFF]` enables a cached regime-outcome card (and TSTACK). The rows are
 UP/FLAT/DN; columns are 1/5/20 bars. Outcomes use the state known at entry close and only
-completed forward returns. Warm-up states are excluded. Live charts conservatively leave
-the current timeframe bucket pending until its successor bucket, so a forming close cannot
-complete a study outcome. Turning TSTACK off also hides Edge; the Edge layout flag defaults
-off for older layouts.
+completed forward returns. Warm-up states are excluded. The shared `closed_len` rule uses
+the feed's last refresh clock for live bars and the current clock for archive bars. A bar
+with a successor is closed; the final bar must have ended. Equity daily bars retain the
+15-minute post-close grace, and weekly/monthly bars wait until the next session belongs
+to a later bucket. Crypto uses UTC bucket ends. `CLOSED THRU` identifies the final included
+bar; `FORMING EXCLUDED` marks a dropped tail. Turning TSTACK off also hides Edge; the Edge
+layout flag defaults off for older layouts.
 
 The verified research gate runs before any calculation. Edge also explicitly refuses mixed
 real/cache inputs, because the existing provenance combiner treats that mix as Cached.
@@ -58,21 +61,42 @@ with no numeric study output; hover exposes the precise refusal.
 
 Each cell reports mean bps, a shared-scale 95% CI, positive-return hit-rate and count.
 The uncertainty estimate uses `n_eff = n/h`, sample standard deviation, and a normal 1.96
-multiplier. Below eight effective observations all statistics are suppressed; below thirty,
+multiplier. Below eight effective observations return summaries are suppressed; below thirty,
 LOW N and hollow uncertainty bars remain. Hover includes median, standard deviation,
 raw/effective counts, CI, Wilson hit interval, Welch-style baseline comparison and dates.
-These are descriptive historical estimates: overlapping returns and multiple cells limit
-the interpretation of these heuristic intervals. Block-bootstrap intervals, walk-forward
-splits and multiple-comparison treatment remain future work.
+These are descriptive historical estimates; the CI still uses an overlap heuristic.
 
-The footer summarizes signed five-bar flip returns. Completed wins get filled ticks and
+Edge Proof tests `D = mean(return | regime) − mean(return over warm completed entries)`.
+Its null circularly rotates the entire warm signal block (state and both entry flags
+together), with returns fixed. Offsets range from `L` through `W−L`, with
+`L = max(20, 2 × largest horizon)`. It uses all admissible offsets up to 999, otherwise a
+deterministic sample without replacement seeded by closed count and endpoint timestamps;
+the work budget caps `n × offsets × 3` at about 15 million. Below 99 usable offsets it
+shows `NULL N/A`. The two-sided rotation p is `(1 + extreme count)/(offset count + 1)`.
+The grey band is the 2.5–97.5 percentile of null D, translated by the baseline onto the
+raw-mean CI axis. Rotation preserves serial structure away from its seam, but introduces
+one artificial junction per rotation; changes over time can also weaken the null.
+
+Benjamini–Hochberg step-up adjustment covers every available cell/flip p in the card.
+The header reports the number of tests, `BH 0.10`, and passes. q is descriptive within
+this family of historical comparisons, not a guarantee of future performance. A solid
+dot/whisker requires q ≤ 0.10, at least thirty effective observations, and at least three
+known chronological folds agreeing with the observed D's sign. Four equal-count folds
+of warm completed entries purge outcomes reaching the next fold edge; a fold is known
+only with at least eight effective selected observations. The stability strip shows fold
+signs, with grey for unknown; hover adds p, q, the null interval and fold counts/dates.
+
+The footer summarizes signed five-bar flip returns and their rotation p/q, using signed
+mean minus the unconditional five-bar baseline as D. Completed wins get filled ticks and
 losses open ticks; unfinished flips stay grey rings. The entry flags are carried directly
 from the existing causal adaptive-trend result, including its session-reset behavior.
 
 `ZBAND [n]` (default 20) plots the trailing mean and ±1/±2 sample-sigma bands, with two-tone
 fill and a hover z readout. Its rolling update uses no future bars. The worker refuses
-unverified inputs. Edge labels/reports and band meshes are cached; no study calculation or
-network request runs on paint.
+unverified inputs. Edge reports and labels are cached by closed count, first/last closed
+timestamps, parameters and horizons (scoped to chart generation/timeframe). Live ticks
+reuse that report; history paging or a newly closed bar changes the key. Provenance gates
+still run before reuse. No study calculation or network request runs on paint.
 
 Timing targets (2 ms compute / 0.1 ms paint and the strip budget) have not been
 benchmarked; validation covers correctness and headless painting. Edge reuses the
@@ -103,6 +127,7 @@ extension. Extra compilation/test dependencies touched are `yahoo.rs` (Guarded r
 - `crates/core/src/indicators/registry.rs`
 - `crates/core/src/indicators/trend_stack.rs`
 - `crates/data/src/edge.rs`
+- `crates/data/src/nulls.rs`
 - `crates/data/src/health.rs`
 - `crates/data/src/lib.rs`
 - `crates/data/src/lookalike.rs`

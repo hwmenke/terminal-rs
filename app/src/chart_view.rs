@@ -217,11 +217,44 @@ struct RailPaint {
     mesh: Arc<egui::Mesh>,
 }
 
+#[derive(Clone, PartialEq)]
+struct EdgeKey {
+    n: usize,
+    first_ts: i64,
+    last_ts: i64,
+    params: AdaptiveTrendParams,
+    horizons: [usize; 3],
+    generation: u64,
+    tf: Timeframe,
+}
+
 #[derive(Default)]
 struct EdgePaint {
+    key: Option<EdgeKey>,
+    closed_thru: String,
+    forming_excluded: bool,
     cells: Vec<(String, String, String)>,
     footer: String,
+    footer_tooltip: String,
     extent: f64,
+}
+
+fn edge_proof_tooltip(cell: &tr_data::edge::EdgeCell) -> String {
+    let probability = |p: Option<f64>| p.map(|p| format!("{p:.4}")).unwrap_or_else(|| "NULL N/A".into());
+    let band = cell
+        .null_band
+        .map(|(a, b)| format!("[{:+.1}, {:+.1}]bp", a * 1e4, b * 1e4))
+        .unwrap_or_else(|| "NULL N/A".into());
+    let mut text = format!("\np {} · q {}\nrotation null D {band}", probability(cell.p), probability(cell.q));
+    for (i, fold) in cell.folds.iter().enumerate() {
+        let delta = fold.delta.map(|d| format!("Δ {:+.1}bp", d * 1e4)).unwrap_or_else(|| "unknown".into());
+        let span = fold
+            .span
+            .map(|(a, b)| format!(" · {} – {}", tr_data::stats::bar_date(a), tr_data::stats::bar_date(b)))
+            .unwrap_or_default();
+        text.push_str(&format!("\nfold {} · n {} · {delta}{span}", i + 1, fold.n));
+    }
+    text
 }
 
 pub struct ChartState {
@@ -265,7 +298,8 @@ pub struct ChartState {
     pub stack_session: bool,
     pub show_rail: bool,
     pub show_edge: bool,
-    edge: Option<Result<tr_data::edge::EdgeReport, String>>,
+    edge: Option<Result<Arc<tr_data::edge::EdgeReport>, String>>,
+    edge_cache: Option<(EdgeKey, Arc<tr_data::edge::EdgeReport>)>,
     edge_paint: EdgePaint,
     zband_paint: StackPaint,
     tint_ref: Option<TintRef>,
@@ -380,6 +414,7 @@ impl ChartState {
             show_edge: false,
             edge: None,
             edge_paint: Default::default(),
+            edge_cache: None,
             zband_paint: Default::default(),
             tint_ref: None,
             tint_revision: u64::MAX,
@@ -1053,40 +1088,90 @@ impl ChartState {
         self.show_edge = on.unwrap_or(!self.show_edge);
         if self.show_edge {
             self.set_trend_stack(Some(true), w);
-            self.refresh_edge();
+            self.refresh_edge(chrono::Utc::now().timestamp());
         }
     }
-    fn refresh_edge(&mut self) {
+    fn refresh_edge(&mut self, now: i64) {
         if !self.show_edge {
             return;
         }
-        let gate = tr_data::stats::require_research_bars(&self.bars, "TSTACK Edge");
+        // Recheck provenance before reusing a report, even when its time key matches.
+        let gate = tr_data::stats::require_research_bars(&self.bars, "TSTACK Edge").and_then(|()| {
+            if self.bars.iter().any(|b| b.provenance != self.bars[0].provenance) {
+                Err("TSTACK Edge refused: mixed real/cache history".into())
+            } else {
+                Ok(())
+            }
+        });
+        let mut paint_key = None;
         self.edge = if let Err(e) = gate {
             Some(Err(e))
         } else if let Some(stack) = &self.stack {
-            // The current bucket is conservatively pending until a successor bucket exists.
-            let now = chrono::Utc::now().timestamp();
-            let n = self.bars.len()
-                - usize::from(
-                    !self.archive
-                        && self.bars.last().is_some_and(|b| self.tf.bucket_start(b.ts) == self.tf.bucket_start(now)),
-                );
+            let n = tr_data::closed::closed_len(
+                self.tf,
+                &self.bars,
+                self.sec.class,
+                if self.archive { Some(now) } else { self.last_refresh },
+            );
+            let key = EdgeKey {
+                n,
+                first_ts: self.bars[0].ts,
+                last_ts: self.bars[..n].last().map(|b| b.ts).unwrap_or(0),
+                params: AdaptiveTrendParams { session_reset: self.stack_session, ..self.stack_params() },
+                horizons: [1, 5, 20],
+                generation: self.generation,
+                tf: self.tf,
+            };
+            if let Some((cached_key, report)) = &self.edge_cache {
+                if cached_key == &key && self.edge_paint.key.as_ref() == Some(&key) {
+                    self.edge = Some(Ok(report.clone()));
+                    self.edge_paint.forming_excluded = n < self.bars.len();
+                    return;
+                }
+            }
             let state: Vec<_> =
                 stack.medium.iter().zip(&stack.confidence).take(n).map(|(&s, c)| c.is_finite().then_some(s)).collect();
-            Some(tr_data::edge::regime_edge(
-                &self.bars[..n],
-                &state,
-                &stack.entry_long[..n],
-                &stack.entry_short[..n],
-                &[1, 5, 20],
-            ))
+            let result = if let Some((cached_key, report)) = &self.edge_cache {
+                (cached_key == &key).then(|| Ok(report.clone()))
+            } else {
+                None
+            }
+            .unwrap_or_else(|| {
+                tr_data::edge::regime_edge(
+                    &self.bars[..n],
+                    &state,
+                    &stack.entry_long[..n],
+                    &stack.entry_short[..n],
+                    &key.horizons,
+                )
+                .map(Arc::new)
+            });
+            if let Ok(report) = &result {
+                self.edge_cache = Some((key.clone(), report.clone()));
+                paint_key = Some(key);
+            }
+            Some(result)
         } else {
             self.stack_error.clone().map(Err)
         };
         self.edge_paint = EdgePaint::default();
+        self.edge_paint.key = paint_key;
         if let Some(Ok(report)) = &self.edge {
+            self.edge_paint.closed_thru = self
+                .bars
+                .get(report.bars.saturating_sub(1))
+                .map(|b| {
+                    format!(
+                        "CLOSED THRU {} · {} tests · BH 0.10 · {} pass",
+                        tr_data::stats::bar_date(b.ts),
+                        report.cells.iter().chain(std::iter::once(&report.flips)).filter(|c| c.p.is_some()).count(),
+                        report.cells.iter().chain(std::iter::once(&report.flips)).filter(|c| c.passes()).count()
+                    )
+                })
+                .unwrap_or_default();
+            self.edge_paint.forming_excluded = report.bars < self.bars.len();
             for cell in &report.cells {
-                let (mean, detail, tooltip) = if let Some(s) = &cell.stats {
+                let (mut mean, mut detail, mut tooltip) = if let Some(s) = &cell.stats {
                     (
                         format!("{:+.0}bp", s.mean * 1e4),
                         format!("hit {:.0}% · n {}", s.hit_rate * 100.0, cell.n),
@@ -1112,6 +1197,15 @@ impl ChartState {
                         format!("n {} → n_eff {:.1} · statistics suppressed", cell.n, cell.n_eff),
                     )
                 };
+                let q = cell
+                    .q
+                    .map(|q| format!("q {}", format!("{q:.2}").trim_start_matches('0')))
+                    .unwrap_or_else(|| "NULL N/A".into());
+                mean.push_str(&format!(" {q}"));
+                if cell.low_n {
+                    detail.push_str(" · LOW N");
+                }
+                tooltip.push_str(&edge_proof_tooltip(cell));
                 let span = cell
                     .span
                     .map(|(a, b)| format!("\n{} – {}", tr_data::stats::bar_date(a), tr_data::stats::bar_date(b)))
@@ -1119,20 +1213,40 @@ impl ChartState {
                 self.edge_paint.cells.push((mean, detail, tooltip + &span));
                 if let Some(s) = &cell.stats {
                     self.edge_paint.extent = self.edge_paint.extent.max(s.ci95.0.abs()).max(s.ci95.1.abs());
+                    if let Some((a, b)) = cell.null_band {
+                        let baseline = s.mean - s.delta.unwrap_or(0.0);
+                        self.edge_paint.extent =
+                            self.edge_paint.extent.max((baseline + a).abs()).max((baseline + b).abs());
+                    }
                 }
             }
             let c = &report.flips;
             self.edge_paint.footer = if let Some(s) = &c.stats {
                 format!(
-                    "FLIPS 5b · hit {:.0}% · n {} · t {} · vs base {:+.0}bp",
+                    "FLIPS 5b · {:+.0}bp · hit {:.0}% · n {} · Δ {:+.0}bp",
+                    s.mean * 1e4,
                     s.hit_rate * 100.0,
                     c.n,
-                    s.t.map(|t| format!("{t:.1}")).unwrap_or_else(|| "—".into()),
                     s.delta.unwrap_or(0.0) * 1e4
                 )
             } else {
                 format!("FLIPS 5b · n {} · LOW N", c.n)
             };
+            let pq =
+                c.p.zip(c.q).map(|(p, q)| format!(" · p {p:.3} · q {q:.3}")).unwrap_or_else(|| " · NULL N/A".into());
+            self.edge_paint.footer.push_str(&pq);
+            self.edge_paint.footer_tooltip = if let Some(s) = &c.stats {
+                format!(
+                    "n {} → n_eff {:.1}\nCI [{:+.0}, {:+.0}]bp · t {}",
+                    c.n,
+                    c.n_eff,
+                    s.ci95.0 * 1e4,
+                    s.ci95.1 * 1e4,
+                    s.t.map(|t| format!("{t:.1}")).unwrap_or_else(|| "—".into())
+                )
+            } else {
+                format!("n {} → n_eff {:.1} · return statistics suppressed", c.n, c.n_eff)
+            } + &edge_proof_tooltip(c);
         }
     }
 
@@ -1202,7 +1316,7 @@ impl ChartState {
             }
         }
         self.stack_revision = self.stack_revision.wrapping_add(1);
-        self.refresh_edge();
+        self.refresh_edge(chrono::Utc::now().timestamp());
         self.tint_ref = None;
         self.stack_paint.key.clear();
     }
@@ -2528,7 +2642,7 @@ impl ChartState {
     fn paint_edge_card(&self, ui: &mut Ui, price: Rect) {
         let rect = Rect::from_min_size(
             pos2((price.right() - 452.0).max(price.left() + 4.0), price.top() + 28.0),
-            vec2((price.width().min(448.0) - 8.0).max(0.0), 240.0_f32.min((price.height() - 32.0).max(0.0))),
+            vec2((price.width().min(448.0) - 8.0).max(0.0), 300.0_f32.min((price.height() - 32.0).max(0.0))),
         );
         if let Some(Err(error)) = &self.edge {
             crate::widgets::unavailable_card(
@@ -2542,7 +2656,7 @@ impl ChartState {
             return;
         }
         let p = ui.painter_at(price);
-        if rect.width() < 330.0 || rect.height() < 220.0 {
+        if rect.width() < 330.0 || rect.height() < 290.0 {
             p.text(rect.right_top() + vec2(-4.0, 4.0), Align2::RIGHT_TOP, "EDGE · widen pane", mono(10.0), muted());
             return;
         }
@@ -2565,11 +2679,28 @@ impl ChartState {
             );
             crate::widgets::chip(&mut child, crate::widgets::ChipKind::Neutral, "PENDING");
         }
+        p.text(
+            rect.left_top() + vec2(8.0, 34.0),
+            Align2::LEFT_CENTER,
+            &self.edge_paint.closed_thru,
+            mono(9.0),
+            muted(),
+        );
+        let mut chips = ui.new_child(
+            UiBuilder::new()
+                .max_rect(Rect::from_min_size(rect.left_top() + vec2(8.0, 46.0), vec2(rect.width() - 16.0, 18.0)))
+                .id_salt((self.id, "edge-closed")),
+        );
+        chips.horizontal(|ui| {
+            if self.edge_paint.forming_excluded {
+                crate::widgets::chip(ui, crate::widgets::ChipKind::Caution, "FORMING EXCLUDED");
+            }
+        });
         let col_width = (rect.width() - 40.0) / 3.0;
         let extent = self.edge_paint.extent.max(1e-8) * 1.08;
         for (col, h) in ["1 bar", "5 bars", "20 bars"].iter().enumerate() {
             p.text(
-                pos2(rect.left() + 40.0 + (col as f32 + 0.5) * col_width, rect.top() + 30.0),
+                pos2(rect.left() + 40.0 + (col as f32 + 0.5) * col_width, rect.top() + 74.0),
                 Align2::CENTER_CENTER,
                 *h,
                 mono(10.0),
@@ -2577,10 +2708,15 @@ impl ChartState {
             );
         }
         for (row, (regime, label)) in [(1, "UP"), (0, "FLAT"), (-1, "DN")].into_iter().enumerate() {
-            let top = rect.top() + 44.0 + row as f32 * 48.0;
-            let row_rect = Rect::from_min_size(pos2(rect.left() + 4.0, top), vec2(rect.width() - 8.0, 47.0));
+            let top = rect.top() + 86.0 + row as f32 * 54.0;
+            let row_rect = Rect::from_min_size(pos2(rect.left() + 4.0, top), vec2(rect.width() - 8.0, 53.0));
             if report.current_regime == Some(regime) {
-                p.rect_filled(row_rect, 2.0, stack_color(regime).gamma_multiply(0.12));
+                p.rect_stroke(
+                    row_rect,
+                    2.0,
+                    Stroke::new(1.0, stack_color(regime).gamma_multiply(0.3)),
+                    StrokeKind::Inside,
+                );
             }
             p.text(pos2(rect.left() + 6.0, top + 23.0), Align2::LEFT_CENTER, label, mono(10.0), stack_color(regime));
             for col in 0..3 {
@@ -2588,24 +2724,25 @@ impl ChartState {
                 let Some(cell) = report.cells.get(index) else { continue };
                 let Some((mean, detail, tooltip)) = self.edge_paint.cells.get(index) else { continue };
                 let r =
-                    Rect::from_min_size(pos2(rect.left() + 40.0 + col as f32 * col_width, top), vec2(col_width, 47.0));
-                let ink = stack_color(regime);
+                    Rect::from_min_size(pos2(rect.left() + 40.0 + col as f32 * col_width, top), vec2(col_width, 53.0));
+                let solid = cell.passes();
+                let ink = stack_color(regime).gamma_multiply(if solid { 1.0 } else { 0.6 });
                 let axis = |x: f64| r.center().x + (x / extent) as f32 * (r.width() / 2.0 - 8.0);
                 p.text(pos2(r.right() - 4.0, top + 6.0), Align2::RIGHT_CENTER, mean, mono(10.0), ink);
-                if cell.low_n {
-                    let mut child = ui.new_child(
-                        UiBuilder::new()
-                            .max_rect(Rect::from_min_size(pos2(r.left() + 2.0, top - 2.0), vec2(44.0, 16.0)))
-                            .id_salt((self.id, "edge-low-n", index)),
-                    );
-                    crate::widgets::chip(&mut child, crate::widgets::ChipKind::Caution, "LOW N");
-                }
                 if let Some(s) = &cell.stats {
                     let y = top + 22.0;
+                    if let Some((a, b)) = cell.null_band {
+                        // Null D is baseline-relative; translate to the raw-mean CI axis.
+                        let baseline = s.mean - s.delta.unwrap_or(0.0);
+                        p.line_segment(
+                            [pos2(axis(baseline + a), y), pos2(axis(baseline + b), y)],
+                            Stroke::new(7.0, muted().gamma_multiply(0.3)),
+                        );
+                    }
                     p.vline(axis(0.0), y - 5.0..=y + 5.0, Stroke::new(1.0, theme::border()));
                     let a = pos2(axis(s.ci95.0), y);
                     let b = pos2(axis(s.ci95.1), y);
-                    if !cell.low_n && (s.ci95.0 > 0.0 || s.ci95.1 < 0.0) {
+                    if solid {
                         p.line_segment([a, b], Stroke::new(2.0, ink));
                     } else {
                         p.rect_stroke(
@@ -2619,23 +2756,44 @@ impl ChartState {
                         p.line_segment([at - vec2(0.0, 3.0), at + vec2(0.0, 3.0)], Stroke::new(1.0, ink));
                     }
                     let center = pos2(axis(s.mean), y);
-                    if !cell.low_n && (s.ci95.0 > 0.0 || s.ci95.1 < 0.0) {
+                    if solid {
                         p.circle_filled(center, 3.0, ink);
                     } else {
                         p.circle_stroke(center, 3.0, Stroke::new(1.0, ink));
                     }
                 }
-                p.text(pos2(r.right() - 4.0, top + 38.0), Align2::RIGHT_CENTER, detail, mono(9.0), muted());
+                p.text(pos2(r.right() - 4.0, top + 36.0), Align2::RIGHT_CENTER, detail, mono(8.0), muted());
+                let segment = (r.width() - 16.0) / 4.0;
+                for (fold, f) in cell.folds.iter().enumerate() {
+                    let color = f
+                        .delta
+                        .map(|d| {
+                            stack_color(if d > 0.0 {
+                                1
+                            } else if d < 0.0 {
+                                -1
+                            } else {
+                                0
+                            })
+                        })
+                        .unwrap_or_else(muted)
+                        .gamma_multiply(if solid { 1.0 } else { 0.5 });
+                    let x = r.left() + 8.0 + fold as f32 * segment;
+                    p.line_segment([pos2(x, top + 47.0), pos2(x + segment - 2.0, top + 47.0)], Stroke::new(3.0, color));
+                }
                 ui.interact(r, ui.id().with((self.id, "edge-cell", index)), Sense::hover()).on_hover_text(tooltip);
             }
         }
         p.text(
-            pos2(rect.right() - 8.0, rect.top() + 200.0),
+            pos2(rect.right() - 8.0, rect.top() + 264.0),
             Align2::RIGHT_CENTER,
             &self.edge_paint.footer,
-            mono(9.0),
-            text(),
+            mono(8.0),
+            if report.flips.passes() { text() } else { muted() },
         );
+        let footer = Rect::from_min_size(rect.left_top() + vec2(8.0, 254.0), vec2(rect.width() - 16.0, 20.0));
+        ui.interact(footer, ui.id().with((self.id, "edge-flips")), Sense::hover())
+            .on_hover_text(&self.edge_paint.footer_tooltip);
         crate::widgets::card_footer(&p, rect, "mean ± 95% CI · n_eff = n/h · descriptive");
     }
 
@@ -4224,18 +4382,7 @@ mod tests {
     #[test]
     fn edge_error_card_paints_zero_digits() {
         let ctx = egui::Context::default();
-        let mut c = ChartState::new(1, "AAPL", Timeframe::D1);
-        c.show_edge = true;
-        c.edge = Some(Err("TSTACK Edge refused: SAMPLE DATA".into()));
-        let mut output = ctx.run_ui(
-            egui::RawInput {
-                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(800.0, 600.0))),
-                ..Default::default()
-            },
-            |ui| c.paint_edge_card(ui, Rect::from_min_size(pos2(0.0, 0.0), vec2(800.0, 500.0))),
-        );
-        output.textures_delta.clear();
-        assert!(stack_has_text(&output.shapes, "NO REAL DATA"));
+        let (worker, _) = Worker::test_channel();
         fn digits(s: &egui::Shape) -> bool {
             match s {
                 egui::Shape::Text(t) => t.galley.job.text.chars().any(|c| c.is_ascii_digit()),
@@ -4243,19 +4390,131 @@ mod tests {
                 _ => false,
             }
         }
-        assert!(!output.shapes.iter().any(|s| digits(&s.shape)));
+        for provenance in [Provenance::Sample, Provenance::Missing, Provenance::Cached] {
+            // Populate a real cached report first: refusal must hide all old digits.
+            let mut c = stack_chart(&worker, Provenance::Real);
+            c.show_edge = true;
+            c.refresh_edge(chrono::Utc::now().timestamp());
+            let mut bars = (*c.bars).clone();
+            bars[0].provenance = provenance;
+            c.bars = Arc::new(bars);
+            c.refresh_edge(chrono::Utc::now().timestamp());
+            assert!(matches!(c.edge, Some(Err(_))));
+            let mut output = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(800.0, 600.0))),
+                    ..Default::default()
+                },
+                |ui| c.paint_edge_card(ui, Rect::from_min_size(pos2(0.0, 0.0), vec2(800.0, 500.0))),
+            );
+            output.textures_delta.clear();
+            assert!(stack_has_text(&output.shapes, "NO REAL DATA"));
+            assert!(!output.shapes.iter().any(|s| digits(&s.shape)));
+        }
+    }
+    #[test]
+    fn edge_report_cache_reuses_live_prefix_and_invalidates_on_close_history_and_params() {
+        let (worker, _) = Worker::test_channel();
+        let mut c = stack_chart(&worker, Provenance::Real);
+        c.show_edge = true;
+        let last_ts = c.bars.last().unwrap().ts;
+        c.last_refresh = Some(last_ts + 1);
+        c.refresh_edge(last_ts + 1);
+        let before = c.edge.as_ref().unwrap().as_ref().unwrap().clone();
+        let tooltip = c.edge_paint.cells[0].2.clone();
+        let mut bars = (*c.bars).clone();
+        let last = bars.last_mut().unwrap();
+        last.close *= 2.0;
+        last.high = last.close;
+        c.bars = Arc::new(bars);
+        c.stack = Some(tr_core::indicators::trend_stack(&c.bars, c.tf, vec![], Default::default()).unwrap());
+        c.edge = None; // The history/live update path clears its visible report.
+        c.refresh_edge(last_ts + 2);
+        assert!(Arc::ptr_eq(&before, c.edge.as_ref().unwrap().as_ref().unwrap()));
+        assert_eq!(tooltip, c.edge_paint.cells[0].2);
+        c.last_refresh = Some(last_ts + c.tf.seconds());
+        c.refresh_edge(last_ts + c.tf.seconds());
+        let closed = c.edge.as_ref().unwrap().as_ref().unwrap().clone();
+        assert!(!Arc::ptr_eq(&before, &closed));
+        assert_eq!(closed.bars, c.bars.len());
+
+        let mut bars = (*c.bars).clone();
+        let mut earlier = bars[0].clone();
+        earlier.ts -= c.tf.seconds();
+        bars.insert(0, earlier);
+        c.bars = Arc::new(bars);
+        c.stack = Some(tr_core::indicators::trend_stack(&c.bars, c.tf, vec![], Default::default()).unwrap());
+        c.refresh_edge(last_ts + c.tf.seconds());
+        let paged = c.edge.as_ref().unwrap().as_ref().unwrap().clone();
+        assert!(!Arc::ptr_eq(&closed, &paged));
+        assert_eq!(paged.bars, closed.bars + 1);
+        c.stack_session = true;
+        c.refresh_edge(last_ts + c.tf.seconds());
+        assert!(!Arc::ptr_eq(&paged, c.edge.as_ref().unwrap().as_ref().unwrap()));
+    }
+    #[test]
+    fn edge_failing_cells_paint_no_filled_shapes_even_with_one_sided_ci() {
+        let (worker, _) = Worker::test_channel();
+        let mut c = stack_chart(&worker, Provenance::Real);
+        c.show_edge = true;
+        c.refresh_edge(chrono::Utc::now().timestamp());
+        let report = Arc::make_mut(c.edge.as_mut().unwrap().as_mut().unwrap());
+        for cell in &mut report.cells {
+            cell.q = Some(1.0);
+        }
+        let cell = &report.cells[0];
+        assert!(cell.stats.as_ref().unwrap().ci95.0 > 0.0 && !cell.low_n);
+        assert!(!cell.passes());
+        let ctx = egui::Context::default();
+        let paint = |c: &ChartState| {
+            let mut output = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(800.0, 600.0))),
+                    ..Default::default()
+                },
+                |ui| c.paint_edge_card(ui, Rect::from_min_size(Pos2::ZERO, vec2(800.0, 500.0))),
+            );
+            output.textures_delta.clear();
+            output
+        };
+        fn filled(shape: &egui::Shape, region: Rect) -> bool {
+            match shape {
+                egui::Shape::Circle(s) => s.fill != Color32::TRANSPARENT && region.contains(s.center),
+                egui::Shape::Rect(s) => s.fill != Color32::TRANSPARENT && region.contains_rect(s.rect),
+                egui::Shape::Path(s) => s.fill != Color32::TRANSPARENT && s.points.iter().all(|p| region.contains(*p)),
+                egui::Shape::Vec(v) => v.iter().any(|s| filled(s, region)),
+                _ => false,
+            }
+        }
+        let region = Rect::from_min_size(pos2(388.0, 114.0), vec2(400.0, 162.0));
+        let before = c.edge.as_ref().unwrap().as_ref().unwrap().clone();
+        let output = paint(&c);
+        assert!(!output.shapes.iter().any(|s| filled(&s.shape, region)));
+        assert!(Arc::ptr_eq(&before, c.edge.as_ref().unwrap().as_ref().unwrap()));
+        assert!(stack_has_text(&output.shapes, "BH 0.10"));
+
+        // Positive control: the very same painter emits a filled dot for a pass.
+        let report = Arc::make_mut(c.edge.as_mut().unwrap().as_mut().unwrap());
+        let cell = &mut report.cells[0];
+        cell.q = Some(0.01);
+        let delta = cell.stats.as_ref().unwrap().delta.unwrap();
+        for f in &mut cell.folds {
+            f.delta = Some(delta);
+        }
+        assert!(cell.passes());
+        assert!(paint(&c).shapes.iter().any(|s| filled(&s.shape, region)));
     }
     #[test]
     fn edge_refuses_mixed_cache_and_pending_bar_never_completes_an_outcome() {
         let (worker, _) = Worker::test_channel();
         let mut c = stack_chart(&worker, Provenance::Real);
         c.show_edge = true;
-        c.refresh_edge();
+        c.refresh_edge(chrono::Utc::now().timestamp());
         assert!(matches!(c.edge, Some(Ok(_))));
         let mut bars = (*c.bars).clone();
         bars[0].provenance = Provenance::Cached;
         c.bars = Arc::new(bars);
-        c.refresh_edge();
+        c.refresh_edge(chrono::Utc::now().timestamp());
         assert!(matches!(c.edge, Some(Err(_))));
         let mut c = stack_chart(&worker, Provenance::Real);
         c.show_edge = true;
@@ -4268,10 +4527,82 @@ mod tests {
             b.ts += shift;
         }
         c.bars = Arc::new(bars);
-        c.refresh_edge();
+        c.last_refresh = Some(now);
+        c.refresh_edge(now + tf.seconds() * 10);
         let r = c.edge.as_ref().unwrap().as_ref().unwrap();
         assert_eq!(r.bars, c.bars.len() - 1);
         assert!(r.completed.iter().all(|o| o.index + o.horizon < r.bars));
+    }
+    #[test]
+    fn live_hourly_edge_excludes_cash_open_bar_at_a_1015_refresh() {
+        let stamp = |s: &str| s.parse::<chrono::DateTime<chrono::Utc>>().unwrap().timestamp();
+        let last = stamp("2026-11-11T14:30:00Z"); // 09:30 EST
+        let now = stamp("2026-11-11T15:15:00Z"); // 10:15 EST
+        let date = tr_core::ny::civil(last).date();
+        let mut opens = vec![last];
+        let mut day = date;
+        for _ in 0..30 {
+            day = tr_data::history::calendar::previous_session(day);
+            opens.extend(tr_data::intraday::regular_opens(day, Timeframe::H1));
+        }
+        opens.sort_unstable();
+        let bars: Vec<_> = opens
+            .into_iter()
+            .enumerate()
+            .map(|(i, ts)| {
+                let close = 100.0 + i as f64 * 0.05 + (i as f64 * 0.37).sin();
+                Bar::new(ts, close, close + 1.0, close - 1.0, close, 1.0).with_provenance(Provenance::Real)
+            })
+            .collect();
+        let mut c = ChartState::new(1, "AAPL", Timeframe::H1);
+        c.show_edge = true;
+        c.bars = Arc::new(bars);
+        c.last_refresh = Some(now);
+        c.stack = Some(tr_core::indicators::trend_stack(&c.bars, c.tf, vec![], Default::default()).unwrap());
+        c.refresh_edge(now);
+        let report = c.edge.as_ref().unwrap().as_ref().unwrap();
+        assert_eq!(report.bars, c.bars.len() - 1);
+        assert!(c.edge_paint.forming_excluded);
+        assert!(report.completed.iter().all(|o| o.index + o.horizon < report.bars));
+
+        // Wall time alone cannot close a bar from a stale observation.
+        c.refresh_edge(stamp("2026-11-11T15:31:00Z"));
+        assert_eq!(c.edge.as_ref().unwrap().as_ref().unwrap().bars, c.bars.len() - 1);
+        c.last_refresh = Some(stamp("2026-11-11T15:30:00Z"));
+        c.refresh_edge(c.last_refresh.unwrap());
+        assert_eq!(c.edge.as_ref().unwrap().as_ref().unwrap().bars, c.bars.len());
+        assert!(!c.edge_paint.forming_excluded);
+    }
+    #[test]
+    fn archive_weekly_edge_excludes_forming_state_and_close() {
+        let now = "2026-11-11T22:00:00Z".parse::<chrono::DateTime<chrono::Utc>>().unwrap().timestamp();
+        let last = Timeframe::W1.bucket_start(now);
+        let mut bars: Vec<_> = (0..300)
+            .map(|i| {
+                let c = 100.0 + i as f64 * 0.05 + (i as f64 * 0.37).sin();
+                Bar::new(last - (299 - i) * Timeframe::W1.seconds(), c, c + 1.0, c - 1.0, c, 1.0)
+                    .with_provenance(Provenance::Real)
+            })
+            .collect();
+        let mut c = ChartState::new(1, "AAPL", Timeframe::W1);
+        c.archive = true;
+        c.show_edge = true;
+        c.bars = Arc::new(bars.clone());
+        c.stack = Some(tr_core::indicators::trend_stack(&bars, c.tf, vec![], Default::default()).unwrap());
+        c.refresh_edge(now);
+        let before = c.edge.clone().unwrap().unwrap();
+        assert_eq!(before.bars, bars.len() - 1);
+        let stack = c.stack.as_ref().unwrap();
+        let i = before.bars - 1;
+        assert_eq!(before.current_regime, stack.confidence[i].is_finite().then_some(stack.medium[i]));
+        assert!(c.edge_paint.forming_excluded);
+        assert!(c.edge_paint.closed_thru.starts_with("CLOSED THRU"));
+        bars.last_mut().unwrap().close *= 3.0;
+        bars.last_mut().unwrap().high *= 3.0;
+        c.bars = Arc::new(bars.clone());
+        c.stack = Some(tr_core::indicators::trend_stack(&bars, c.tf, vec![], Default::default()).unwrap());
+        c.refresh_edge(now);
+        assert_eq!(before, c.edge.unwrap().unwrap());
     }
     #[test]
     fn tint_buffer_is_neutral_for_refused_stale_or_sample_stack() {

@@ -1,6 +1,17 @@
 //! Causal, descriptive regime outcomes. A return enters only after its horizon completes.
-use crate::stats::{describe, forward_returns, require_research_bars};
+use crate::{
+    nulls::{benjamini_hochberg, rotation_offsets, rotation_test},
+    stats::{describe, forward_returns, require_research_bars},
+};
 use tr_core::Bar;
+
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct EdgeFold {
+    pub n: usize,
+    /// Conditional minus purged fold baseline; absent below eight effective outcomes.
+    pub delta: Option<f64>,
+    pub span: Option<(i64, i64)>,
+}
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct EdgeStats {
@@ -21,9 +32,23 @@ pub struct EdgeCell {
     pub n: usize,
     pub n_eff: f64,
     pub low_n: bool,
-    /// Absent below eight effective observations, including hit-rate and significance.
+    /// Return summaries (including hit-rate and t) are absent below eight effective observations.
     pub stats: Option<EdgeStats>,
     pub span: Option<(i64, i64)>,
+    pub p: Option<f64>,
+    pub q: Option<f64>,
+    /// Percentiles of the baseline-relative rotation statistic D, not the raw mean.
+    pub null_band: Option<(f64, f64)>,
+    pub folds: [EdgeFold; 4],
+}
+impl EdgeCell {
+    pub fn passes(&self) -> bool {
+        let delta = self.stats.as_ref().and_then(|s| s.delta).unwrap_or(0.0);
+        !self.low_n
+            && self.q.is_some_and(|q| q <= 0.10)
+            && delta != 0.0
+            && self.folds.iter().filter(|f| f.delta.is_some_and(|d| d * delta > 0.0)).count() >= 3
+    }
 }
 #[derive(Debug, Clone, PartialEq)]
 pub struct CompletedOutcome {
@@ -78,7 +103,67 @@ fn cell(regime: i8, horizon: usize, values: &[f64], span: Option<(i64, i64)>, ba
             welch_t: base.zip(welch_se).and_then(|((b, _), se)| (se > 0.0).then(|| (mean - b.mean) / se)),
         }
     });
-    EdgeCell { regime, horizon, n: d.count, n_eff: d.effective_count, low_n: d.effective_count < 30.0, stats, span }
+    EdgeCell {
+        regime,
+        horizon,
+        n: d.count,
+        n_eff: d.effective_count,
+        low_n: d.effective_count < 30.0,
+        stats,
+        span,
+        p: None,
+        q: None,
+        null_band: None,
+        folds: Default::default(),
+    }
+}
+
+struct HorizonData {
+    h: usize,
+    known: Vec<(usize, i8, f64)>,
+    mean: Option<f64>,
+}
+fn average(sum: f64, n: usize) -> Option<f64> {
+    (n > 0).then(|| sum / n as f64)
+}
+
+fn purged_folds(data: &HorizonData, bars: &[Bar], regime: i8, flips: Option<(&[bool], &[bool])>) -> [EdgeFold; 4] {
+    std::array::from_fn(|fold| {
+        let start = data.known.len() * fold / 4;
+        let end = data.known.len() * (fold + 1) / 4;
+        if start == end {
+            return EdgeFold::default();
+        }
+        let edge = data.known.get(end).map(|v| v.0).unwrap_or_else(|| data.known[end - 1].0 + 1);
+        let mut sum = 0.0;
+        let mut n = 0;
+        let mut base_sum = 0.0;
+        let mut base_n = 0;
+        let mut span = None;
+        for &(i, state, r) in &data.known[start..end] {
+            if i + data.h >= edge {
+                continue;
+            }
+            base_sum += r;
+            base_n += 1;
+            let value = if let Some((long, short)) = flips {
+                (long[i] || short[i]).then_some(r * if long[i] { 1.0 } else { -1.0 })
+            } else {
+                (state == regime).then_some(r)
+            };
+            if let Some(value) = value {
+                sum += value;
+                n += 1;
+                let first = span.map(|s: (i64, i64)| s.0).unwrap_or(bars[i].ts);
+                span = Some((first, bars[i + data.h].ts));
+            }
+        }
+        EdgeFold {
+            n,
+            delta: (n as f64 / data.h as f64 >= 8.0).then(|| sum / n as f64 - base_sum / base_n as f64),
+            span,
+        }
+    })
 }
 
 /// `None` state is a warm-up bar (non-finite TrendStack confidence). States and entry
@@ -110,6 +195,8 @@ pub fn regime_edge(
     let mut cells = Vec::new();
     let mut baseline = Vec::new();
     let mut completed = Vec::new();
+    let mut data = Vec::new();
+    let mut observed = Vec::new();
     for &h in &horizons {
         let fwd = forward_returns(&closes, h);
         let known: Vec<_> = state.iter().enumerate().filter_map(|(i, s)| Some((i, (*s)?, fwd[i]?))).collect();
@@ -121,13 +208,19 @@ pub fn regime_edge(
             let values: Vec<_> = selected.iter().map(|(_, _, r)| *r).collect();
             let span = selected.first().zip(selected.last()).map(|(a, b)| (bars[a.0].ts, bars[b.0 + h].ts));
             cells.push(cell(regime, h, &values, span, Some(&base)));
+            observed.push(
+                average(values.iter().sum(), values.len())
+                    .zip(average(all.iter().sum(), all.len()))
+                    .map(|(a, b)| a - b),
+            );
         }
-        completed.extend(known.into_iter().map(|(index, regime, value)| CompletedOutcome {
+        completed.extend(known.iter().map(|&(index, regime, value)| CompletedOutcome {
             index,
             horizon: h,
             regime,
             value,
         }));
+        data.push(HorizonData { h, known, mean: average(all.iter().sum(), all.len()) });
         baseline.push(base);
     }
     let flip_returns = forward_returns(&closes, 5);
@@ -149,7 +242,76 @@ pub fn regime_edge(
         .next()
         .zip(flip_outcomes.iter().rev().find(|f| f.value.is_some()))
         .map(|(a, b)| (bars[a.index].ts, bars[b.index + 5].ts));
-    let flips = cell(0, 5, &values, span, Some(&base));
+    let mut flips = cell(0, 5, &values, span, Some(&base));
+    observed.push(
+        average(values.iter().sum(), values.len())
+            .zip(average(base_values.iter().sum(), base_values.len()))
+            .map(|(a, b)| a - b),
+    );
+    if !horizons.contains(&5) {
+        let known = state.iter().enumerate().filter_map(|(i, s)| Some((i, (*s)?, flip_returns[i]?))).collect();
+        data.push(HorizonData { h: 5, known, mean: average(base_values.iter().sum(), base_values.len()) });
+    }
+    for (col, horizon) in data.iter().take(horizons.len()).enumerate() {
+        for row in 0..3 {
+            let c = &mut cells[col * 3 + row];
+            c.folds = purged_folds(horizon, bars, c.regime, None);
+        }
+    }
+    flips.folds = purged_folds(data.iter().find(|d| d.h == 5).unwrap(), bars, 0, Some((entry_long, entry_short)));
+    let warm_start = state.iter().position(Option::is_some).unwrap_or(bars.len());
+    let warm_len = bars.len() - warm_start;
+    let offsets = rotation_offsets(
+        bars.len(),
+        bars[0].ts,
+        bars.last().unwrap().ts,
+        warm_len,
+        *horizons.iter().max().unwrap().max(&5),
+        data.len(),
+    );
+    let nulls = rotation_test(&observed, &offsets, |offset| {
+        let mut ds = vec![None; observed.len()];
+        for (col, horizon) in data.iter().enumerate() {
+            let mut sums = [0.0; 3];
+            let mut counts = [0; 3];
+            let mut flip_sum = 0.0;
+            let mut flip_n = 0;
+            for &(i, _, r) in &horizon.known {
+                // A single source index rotates state AND both entry flags. The
+                // final h signals remain in the block even without an outcome.
+                let source = warm_start + (i - warm_start + offset) % warm_len;
+                if let Some(state) = state[source] {
+                    let row = (1 - state) as usize;
+                    sums[row] += r;
+                    counts[row] += 1;
+                    if horizon.h == 5 && (entry_long[source] || entry_short[source]) {
+                        flip_sum += r * if entry_long[source] { 1.0 } else { -1.0 };
+                        flip_n += 1;
+                    }
+                }
+            }
+            if col < horizons.len() {
+                for row in 0..3 {
+                    ds[col * 3 + row] = average(sums[row], counts[row]).zip(horizon.mean).map(|(a, b)| a - b);
+                }
+            }
+            if horizon.h == 5 {
+                *ds.last_mut().unwrap() = average(flip_sum, flip_n).zip(horizon.mean).map(|(a, b)| a - b);
+            }
+        }
+        ds
+    });
+    for (c, null) in cells.iter_mut().chain(std::iter::once(&mut flips)).zip(nulls) {
+        c.p = null.p;
+        c.null_band = null.band;
+    }
+    let ps: Vec<_> = cells.iter().chain(std::iter::once(&flips)).filter_map(|c| c.p).collect();
+    let mut qs = benjamini_hochberg(&ps).into_iter();
+    for c in cells.iter_mut().chain(std::iter::once(&mut flips)) {
+        if c.p.is_some() {
+            c.q = qs.next();
+        }
+    }
     Ok(EdgeReport {
         bars: bars.len(),
         horizons,
@@ -186,18 +348,23 @@ mod tests {
     fn edge_is_lookahead_free() {
         let b = bars(400);
         let short = report(&b[..250]);
-        let full = report(&b);
-        for outcome in &short.completed {
-            assert_eq!(
-                Some(outcome),
-                full.completed.iter().find(|o| o.index == outcome.index && o.horizon == outcome.horizon)
-            );
-        }
-        for h in [1, 5, 20] {
-            assert_eq!(
-                short.completed.iter().filter(|o| o.horizon == h).count(),
-                full.completed.iter().filter(|o| o.horizon == h && o.index + h < 250).count()
-            );
+        for n in [251, 270, 400] {
+            let full = report(&b[..n]);
+            for outcome in &short.completed {
+                assert_eq!(
+                    Some(outcome),
+                    full.completed.iter().find(|o| o.index == outcome.index && o.horizon == outcome.horizon)
+                );
+            }
+            for h in [1, 5, 20] {
+                assert_eq!(
+                    short.completed.iter().filter(|o| o.horizon == h).count(),
+                    full.completed.iter().filter(|o| o.horizon == h && o.index + h < 250).count()
+                );
+            }
+            for flip in short.flip_outcomes.iter().filter(|f| f.value.is_some()) {
+                assert_eq!(Some(flip), full.flip_outcomes.iter().find(|f| f.index == flip.index));
+            }
         }
     }
     #[test]
@@ -266,5 +433,152 @@ mod tests {
         assert_eq!(r.flips.n, 2);
         assert_eq!(r.flip_outcomes.iter().filter(|f| f.value.is_none()).count(), 5);
         assert_eq!(r.flip_outcomes[1].value, Some(-(b[25].close / b[20].close - 1.0)));
+    }
+
+    fn walk(seed: u64, n: usize, planted: bool) -> (Vec<Bar>, Vec<Option<i8>>, Vec<bool>, Vec<bool>) {
+        let mut rng = crate::nulls::SplitMix64(seed);
+        let mut price = 100.0;
+        let mut state = 0;
+        let mut bars = Vec::new();
+        let mut states = Vec::new();
+        let mut longs = Vec::new();
+        let mut shorts = Vec::new();
+        for i in 0..n {
+            let noise = (rng.next() as f64 / u64::MAX as f64 - 0.5) * 0.008;
+            // Return i-1 -> i depends only on the state already known at i-1.
+            price *= 1.0 + noise + if planted && state == 1 { 0.004 } else { 0.0 };
+            let previous = state;
+            if rng.next() % 16 == 0 {
+                state = (rng.next() % 3) as i8 - 1;
+            }
+            bars.push(Bar::new(i as i64 * 86400, price, price, price, price, 1.0).with_provenance(Provenance::Real));
+            states.push((i >= 20).then_some(state));
+            longs.push(state == 1 && previous != 1);
+            shorts.push(state == -1 && previous != -1);
+        }
+        (bars, states, longs, shorts)
+    }
+
+    #[test]
+    fn rotation_null_calibrates_on_two_hundred_independent_sticky_walks() {
+        let mut passes = 0;
+        let mut tested = 0;
+        for seed in 0..200 {
+            let (b, s, l, short) = walk(0x1234_5678 + seed, 420, false);
+            let r = regime_edge(&b, &s, &l, &short, &[1, 5, 20]).unwrap();
+            for c in &r.cells {
+                if let Some(q) = c.q {
+                    tested += 1;
+                    passes += usize::from(q <= 0.10);
+                }
+            }
+        }
+        assert!(tested >= 1700, "only {tested} cells tested");
+        assert!(passes as f64 / tested as f64 <= 0.10, "{passes}/{tested} null cells passed BH");
+    }
+
+    #[test]
+    fn planted_regime_drift_is_detected_and_report_is_deterministic() {
+        let (b, s, l, short) = walk(712, 1600, true);
+        let r = regime_edge(&b, &s, &l, &short, &[1, 5, 20]).unwrap();
+        assert_eq!(r, regime_edge(&b, &s, &l, &short, &[1, 5, 20]).unwrap());
+        let up = &r.cells[0];
+        assert!(up.passes(), "planted UP: {up:?}");
+        assert!(up.q.unwrap() <= 0.10);
+        assert!(up.folds.iter().filter(|f| f.delta.is_some_and(|d| d > 0.0)).count() >= 3);
+        let ps: Vec<_> = r.cells.iter().chain(std::iter::once(&r.flips)).filter_map(|c| c.p).collect();
+        let qs: Vec<_> = r.cells.iter().chain(std::iter::once(&r.flips)).filter_map(|c| c.q).collect();
+        assert_eq!(qs, benjamini_hochberg(&ps));
+    }
+
+    #[test]
+    fn rotation_matches_direct_whole_block_reference_including_entry_flags() {
+        let (b, s, l, short) = walk(912, 260, false);
+        let r = regime_edge(&b, &s, &l, &short, &[1, 5, 20]).unwrap();
+        let w = b.len() - 20;
+        let returns = |h: usize| forward_returns(&b.iter().map(|b| b.close).collect::<Vec<_>>(), h);
+        let mut up_null = Vec::new();
+        let mut flip_null = Vec::new();
+        for k in 40..=w - 40 {
+            let fwd = returns(1);
+            let base: Vec<_> = (20..b.len()).filter_map(|i| fwd[i]).collect();
+            let selected: Vec<_> =
+                (20..b.len()).filter(|&i| s[20 + (i - 20 + k) % w] == Some(1)).filter_map(|i| fwd[i]).collect();
+            if !selected.is_empty() {
+                up_null.push(
+                    selected.iter().sum::<f64>() / selected.len() as f64 - base.iter().sum::<f64>() / base.len() as f64,
+                );
+            }
+            let fwd = returns(5);
+            let base: Vec<_> = (20..b.len()).filter_map(|i| fwd[i]).collect();
+            let selected: Vec<_> = (20..b.len())
+                .filter_map(|i| {
+                    let source = 20 + (i - 20 + k) % w;
+                    (l[source] || short[source])
+                        .then(|| fwd[i].map(|v| v * if l[source] { 1.0 } else { -1.0 }))
+                        .flatten()
+                })
+                .collect();
+            if !selected.is_empty() {
+                flip_null.push(
+                    selected.iter().sum::<f64>() / selected.len() as f64 - base.iter().sum::<f64>() / base.len() as f64,
+                );
+            }
+        }
+        for (c, values) in [(&r.cells[0], up_null), (&r.flips, flip_null)] {
+            let observed = if c.horizon == 5 {
+                let signed: Vec<_> = r.flip_outcomes.iter().filter_map(|f| f.value).collect();
+                let base: Vec<_> = returns(5).into_iter().enumerate().filter_map(|(i, v)| s[i].and(v)).collect();
+                signed.iter().sum::<f64>() / signed.len() as f64 - base.iter().sum::<f64>() / base.len() as f64
+            } else {
+                c.stats.as_ref().unwrap().delta.unwrap()
+            };
+            let p =
+                (1 + values.iter().filter(|v| v.abs() >= observed.abs()).count()) as f64 / (values.len() + 1) as f64;
+            assert_eq!(c.p, Some(p));
+            let mut values = values;
+            values.sort_by(f64::total_cmp);
+            let percentile = |p: f64| {
+                let at = (values.len() - 1) as f64 * p;
+                values[at.floor() as usize] * (1.0 - at.fract()) + values[at.ceil() as usize] * at.fract()
+            };
+            let band = c.null_band.unwrap();
+            assert!((band.0 - percentile(0.025)).abs() < 1e-12);
+            assert!((band.1 - percentile(0.975)).abs() < 1e-12);
+        }
+    }
+
+    #[test]
+    fn folds_have_equal_entry_counts_then_purge_crossing_outcomes() {
+        let b = bars(200);
+        let data = HorizonData { h: 5, known: (0..195).map(|i| (i, 1, i as f64)).collect(), mean: None };
+        let folds = purged_folds(&data, &b, 1, None);
+        assert_eq!(folds.each_ref().map(|f| f.n), [43, 44, 44, 44]);
+        for (fold, edge) in folds.iter().zip([48, 97, 146, 195]) {
+            assert_eq!(fold.delta, Some(0.0));
+            assert!(fold.span.unwrap().1 < b[edge].ts);
+        }
+        let small = HorizonData { h: 5, known: (0..160).map(|i| (i, 1, 0.0)).collect(), mean: None };
+        assert!(purged_folds(&small, &b, 1, None).iter().all(|f| f.n == 35 && f.delta.is_none()));
+    }
+
+    #[test]
+    fn solid_requires_q_sample_size_and_three_folds_in_observed_direction() {
+        let (b, s, l, short) = walk(712, 1600, true);
+        let mut c = regime_edge(&b, &s, &l, &short, &[1]).unwrap().cells.remove(0);
+        c.q = Some(0.10);
+        assert!(c.passes());
+        c.q = Some(0.1001);
+        assert!(!c.passes());
+        c.q = None;
+        assert!(!c.passes());
+        c.q = Some(0.01);
+        c.low_n = true;
+        assert!(!c.passes());
+        c.low_n = false;
+        c.folds[0].delta = None;
+        assert!(c.passes());
+        c.folds[1].delta = Some(-1.0);
+        assert!(!c.passes());
     }
 }
