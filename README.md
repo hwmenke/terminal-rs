@@ -271,11 +271,13 @@ gets the native title bar with traffic lights, window vibrancy behind the sideba
 - **Trend Cone (Edge v2)** — `CONE` / **Alt+C** toggles a forward
   P10/25/50/75/90 fan from the last closed bar, coloured by the current TSTACK
   medium regime, with a grey unconditional fan underneath. Gradient fills,
-  a bold median and horizon price labels make it readable intraday or daily.
-  `CONE 20 5` sets horizon bars and mean stationary-bootstrap block length;
-  `CONE ON|OFF`, `TRENDCONE` and `TSTACK CONE` also work. The adjacent card
-  reports walk-forward central 50%/80% coverage versus nominal, with n.
-  Completed log-return paths only; deterministic bootstrap and causal calibration
+  a bold median and horizon price/% pills make it readable intraday or daily.
+  Bands are empirical quantiles of completed paths; horizon whiskers show a
+  stationary block bootstrap (Politis–Romano) 90% interval for each edge.
+  `CONE 30` sets the horizon (block = horizon); `CONE 20 10` sets horizon and
+  mean block; `CONE ON|OFF`, `TRENDCONE` and `TSTACK CONE` also work. The card
+  reports walk-forward 50%/80% coverage at the horizon versus nominal, with n
+  and an OK/NARROW/WIDE verdict. Deterministic bootstrap and causal calibration
   run in the worker and cache by input. Sample/unverified history is refused.
   Settings save with layouts. See [Trend Cone](docs/TRENDCONE.md).
 

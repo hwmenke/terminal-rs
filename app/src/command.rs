@@ -483,6 +483,13 @@ pub enum ReviewOverlay {
 }
 
 fn parse_cone(rest: &[&str]) -> Option<Function> {
+    if let [h] = rest
+        && let Ok(h) = h.parse::<usize>()
+    {
+        // `CONE <H>`: mean bootstrap block follows the horizon, since adjacent
+        // H-step paths overlap and stay dependent for about H origins.
+        return (1..=120).contains(&h).then_some(Function::TrendCone { on: Some(true), spec: Some((h, h.min(100))) });
+    }
     if rest.len() <= 1 {
         return Some(Function::TrendCone { on: parse_switch(rest)?, spec: None });
     }
@@ -1950,7 +1957,10 @@ mod combo_tests {
                 Function::TrendCone { on: Some(true), spec: Some((30, 7)) }
             ))
         );
-        for input in ["CONE 0 5", "CONE 121 5", "CONE 20 0", "CONE 20 101", "CONE 20", "CONE 20 5 extra"] {
+        for (input, spec) in [("CONE 30", (30, 30)), ("CONE 120", (120, 100))] {
+            assert_eq!(parse(input), Some(Command::Function(Function::TrendCone { on: Some(true), spec: Some(spec) })));
+        }
+        for input in ["CONE 0 5", "CONE 121 5", "CONE 20 0", "CONE 20 101", "CONE 0", "CONE 121", "CONE 20 5 extra"] {
             assert!(parse(input).is_none(), "{input}");
         }
         assert!(matches!(parse("ZZUNKNOWN"), Some(Command::Symbol(_))));

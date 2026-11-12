@@ -1,6 +1,8 @@
 //! Regime-conditioned predictive path quantiles, with causal walk-forward coverage.
-//! Stationary bootstrap: Politis & Romano (1994). The resampling unit is an entire
-//! completed forward log-return path, not a fitted mean or independent increments.
+//! The fan is the empirical per-step quantile of completed forward log-return
+//! paths. The stationary bootstrap (Politis & Romano 1994) resamples whole path
+//! rows in blocks of adjacent origins to measure how uncertain the horizon edges
+//! are (`Fan::horizon_band`); it never widens or synthesizes the fan itself.
 use crate::{closed::closed_len, nulls::SplitMix64, stats::require_research_bars};
 use tr_core::{
     AssetClass, Bar, Timeframe,
@@ -8,8 +10,11 @@ use tr_core::{
 };
 
 pub const QUANTILES: [f64; 5] = [0.10, 0.25, 0.50, 0.75, 0.90];
+/// Nominal coverage of the central 25–75 and 10–90 bands.
+pub const COVERAGE_NOMINAL: [f64; 2] = [0.50, 0.80];
 pub const MIN_PATHS: usize = 30;
-const MAX_SCORES: usize = 64;
+/// Walk-forward scores at most this many latest H-spaced (non-overlapping) origins.
+pub const MAX_SCORES: usize = 64;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Params {
@@ -20,16 +25,20 @@ pub struct Params {
 }
 impl Default for Params {
     fn default() -> Self {
-        Self { horizon: 20, mean_block: 5, draws: 2048, seed: 0x5452_454e_4443_4f4e }
+        // Overlapping H-step paths are dependent over ~H origins, so the default
+        // mean block equals the default horizon; `CONE <H>` also keeps L = H.
+        Self { horizon: 20, mean_block: 20, draws: 500, seed: 0x5452_454e_4443_4f4e }
     }
 }
 impl Params {
     pub fn validate(self) -> Result<(), String> {
         if !(1..=120).contains(&self.horizon)
             || !(1..=100).contains(&self.mean_block)
-            || !(256..=8192).contains(&self.draws)
+            || !(100..=4096).contains(&self.draws)
         {
-            return Err("Trend Cone refused: horizon 1–120, mean block 1–100, draws 256–8192 required".into());
+            return Err(
+                "Trend Cone refused: horizon 1–120, mean block 1–100, bootstrap replicates 100–4096 required".into()
+            );
         }
         Ok(())
     }
@@ -77,6 +86,9 @@ pub struct Fan {
     /// Price quantiles at steps 0..=horizon. Step zero is the last CLOSED close.
     pub prices: Vec<[f64; 5]>,
     pub paths: usize,
+    /// Stationary-bootstrap 90% interval (5th, 95th replicate percentile) of each
+    /// horizon quantile, in price: sampling uncertainty of the edge, not a forecast.
+    pub horizon_band: [[f64; 2]; 5],
 }
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Coverage {
@@ -97,6 +109,22 @@ impl Coverage {
     }
     pub fn empirical(&self, band: usize) -> Option<f64> {
         (self.n > 0).then(|| self.hits[band] as f64 / self.n as f64)
+    }
+    /// Calibration verdict for central band 0 (50%) or 1 (80%): `0` when the hit
+    /// rate is within two binomial standard errors of nominal, `-1` under-covered
+    /// (bands too narrow), `+1` over-covered (too wide). `None` below 10 outcomes.
+    /// Scored outcomes are non-overlapping, so the binomial SE is a fair yardstick.
+    pub fn verdict(&self, band: usize) -> Option<i8> {
+        let nominal = COVERAGE_NOMINAL[band];
+        let tolerance = 2.0 * (nominal * (1.0 - nominal) / self.n as f64).sqrt();
+        let empirical = self.empirical(band).filter(|_| self.n >= 10)?;
+        Some(if empirical < nominal - tolerance {
+            -1
+        } else if empirical > nominal + tolerance {
+            1
+        } else {
+            0
+        })
     }
 }
 #[derive(Debug, Clone, PartialEq)]
@@ -131,6 +159,13 @@ struct Path {
 
 /// Gate the complete input before slicing; compute TSTACK afresh on closed bars only.
 /// No fetch, resampling of chart bars, interpolation or sample fallback is involved.
+///
+/// TSTACK's medium state is computed once over the closed prefix and reused for
+/// every walk-forward origin. That is causal: every ingredient (adaptive MAs,
+/// Wilder ATR, backward slopes, trailing efficiency ratio, sticky min-hold state,
+/// per-session restarts) reads only bars `..=i` to produce state `i`, so it equals
+/// the state a run truncated at `i` would see. `tstack_state_is_prefix_invariant`
+/// pins this down.
 pub fn report(
     bars: &[Bar],
     tf: Timeframe,
@@ -178,7 +213,15 @@ fn build(bars: &[Bar], states: &[Option<i8>], params: Params) -> Result<ConeRepo
     let anchor = bars.last().unwrap();
     let conditional = fan(&selected, anchor.close, params, params.seed);
     let unconditional = fan(&all, anchor.close, params, params.seed ^ 0x4241_5345);
-    if conditional.prices.iter().chain(&unconditional.prices).flatten().any(|v| !v.is_finite() || *v <= 0.0) {
+    let bands = conditional.horizon_band.iter().chain(&unconditional.horizon_band).flatten();
+    if conditional
+        .prices
+        .iter()
+        .chain(&unconditional.prices)
+        .flatten()
+        .chain(bands)
+        .any(|v| !v.is_finite() || *v <= 0.0)
+    {
         return Err("Trend Cone refused: non-finite projected price".into());
     }
     let mut coverage = Coverage::default();
@@ -195,9 +238,8 @@ fn build(bars: &[Bar], states: &[Option<i8>], params: Params) -> Result<ConeRepo
         if conditional_train.len() < MIN_PATHS {
             continue;
         }
-        let seed = params.seed ^ bars[t].ts as u64;
-        let conditional = horizon_quantiles(&conditional_train, params, seed);
-        let unconditional = horizon_quantiles(&train, params, seed ^ 0x4241_5345);
+        let conditional = horizon_quantiles(&conditional_train, h);
+        let unconditional = horizon_quantiles(&train, h);
         let realized = bars[t + h].close.ln() - bars[t].close.ln();
         coverage.observe(conditional, realized);
         baseline_coverage.observe(unconditional, realized);
@@ -233,36 +275,61 @@ fn block_length(rng: &mut SplitMix64, mean: usize) -> usize {
     let u = (rng.next() >> 11) as f64 * (1.0 / (1_u64 << 53) as f64);
     ((-u).ln_1p() / (-1.0 / mean as f64).ln_1p()).floor() as usize + 1
 }
-fn bootstrap_indices(n: usize, params: Params, seed: u64) -> Vec<usize> {
-    let mut rng = SplitMix64(seed);
-    let mut indices = Vec::with_capacity(params.draws);
-    while indices.len() < params.draws {
-        let start = (rng.next() % n as u64) as usize;
-        let length = block_length(&mut rng, params.mean_block).min(params.draws - indices.len());
+/// One stationary-bootstrap replicate: `len` row indices into a library of `n`
+/// origin-ordered rows, in geometric blocks of adjacent rows with circular wrap.
+fn bootstrap_indices(rng: &mut SplitMix64, n: usize, len: usize, mean_block: usize) -> Vec<usize> {
+    let mut indices = Vec::with_capacity(len);
+    while indices.len() < len {
+        let start = rng.below(n);
+        let length = block_length(rng, mean_block).min(len - indices.len());
         indices.extend((0..length).map(|k| (start + k) % n));
     }
     indices
 }
+/// Linear interpolation at `(len−1)p` of an ascending slice.
+fn quantile_sorted(sorted: &[f64], p: f64) -> f64 {
+    let at = (sorted.len() - 1) as f64 * p;
+    sorted[at.floor() as usize] * (1.0 - at.fract()) + sorted[at.ceil() as usize] * at.fract()
+}
 fn quantiles(values: &mut [f64]) -> [f64; 5] {
     values.sort_by(f64::total_cmp);
-    QUANTILES.map(|p| {
-        let at = (values.len() - 1) as f64 * p;
-        values[at.floor() as usize] * (1.0 - at.fract()) + values[at.ceil() as usize] * at.fract()
-    })
+    QUANTILES.map(|p| quantile_sorted(values, p))
 }
-fn horizon_quantiles(paths: &[&Path], params: Params, seed: u64) -> [f64; 5] {
-    let mut samples: Vec<_> =
-        bootstrap_indices(paths.len(), params, seed).iter().map(|&i| paths[i].log[params.horizon - 1]).collect();
+/// Empirical horizon quantiles of a training library (log space). Deterministic.
+fn horizon_quantiles(paths: &[&Path], h: usize) -> [f64; 5] {
+    let mut samples: Vec<_> = paths.iter().map(|p| p.log[h - 1]).collect();
     quantiles(&mut samples)
 }
+/// The fan is the empirical per-step quantile of the completed-path library:
+/// exact, with no Monte Carlo noise. (Resampling rows and re-taking quantiles
+/// would only reproduce these values plus noise.) The stationary bootstrap answers
+/// what the plain quantiles cannot: how stable are the horizon edges, given that
+/// overlapping paths are strongly dependent? Each replicate redraws a library of
+/// the same size in blocks of adjacent origins; the 5th–95th percentile of each
+/// replicate's quantile is reported as `horizon_band`.
 fn fan(paths: &[&Path], anchor: f64, params: Params, seed: u64) -> Fan {
-    let indices = bootstrap_indices(paths.len(), params, seed);
+    let h = params.horizon;
     let mut prices = vec![[anchor; 5]];
-    for k in 0..params.horizon {
-        let mut values: Vec<_> = indices.iter().map(|&i| paths[i].log[k]).collect();
-        prices.push(quantiles(&mut values).map(|r| (anchor.ln() + r).exp()));
+    for k in 0..h {
+        let mut values: Vec<_> = paths.iter().map(|p| p.log[k]).collect();
+        prices.push(quantiles(&mut values).map(|r| anchor * r.exp()));
     }
-    Fan { prices, paths: paths.len() }
+    let mut rng = SplitMix64(seed);
+    let mut replicates: [Vec<f64>; 5] = Default::default();
+    let mut values = Vec::with_capacity(paths.len());
+    for _ in 0..params.draws {
+        values.clear();
+        let rows = bootstrap_indices(&mut rng, paths.len(), paths.len(), params.mean_block);
+        values.extend(rows.iter().map(|&i| paths[i].log[h - 1]));
+        for (out, q) in replicates.iter_mut().zip(quantiles(&mut values)) {
+            out.push(q);
+        }
+    }
+    let horizon_band = replicates.map(|mut r| {
+        r.sort_by(f64::total_cmp);
+        [anchor * quantile_sorted(&r, 0.05).exp(), anchor * quantile_sorted(&r, 0.95).exp()]
+    });
+    Fan { prices, paths: paths.len(), horizon_band }
 }
 
 #[cfg(test)]
@@ -278,14 +345,91 @@ mod tests {
             .collect()
     }
     fn params() -> Params {
-        Params { horizon: 5, draws: 512, ..Params::default() }
+        Params { horizon: 5, mean_block: 5, draws: 200, ..Params::default() }
     }
     #[test]
     fn seeded_bootstrap_and_report_are_deterministic() {
         let b = bars(600);
         let s = vec![Some(1); b.len()];
         assert_eq!(build(&b, &s, params()).unwrap(), build(&b, &s, params()).unwrap());
-        assert_ne!(bootstrap_indices(100, params(), 1), bootstrap_indices(100, params(), 2));
+        let draw = |seed| bootstrap_indices(&mut SplitMix64(seed), 100, 100, 5);
+        assert_eq!(draw(1), draw(1));
+        assert_ne!(draw(1), draw(2));
+        let other_seed = build(&b, &s, Params { seed: 7, ..params() }).unwrap();
+        let base = build(&b, &s, params()).unwrap();
+        // The seed only moves the bootstrap uncertainty band, never the fan or scores.
+        assert_eq!(other_seed.conditional.prices, base.conditional.prices);
+        assert_eq!(other_seed.forecasts, base.forecasts);
+        assert_ne!(other_seed.conditional.horizon_band, base.conditional.horizon_band);
+    }
+    #[test]
+    fn fan_is_the_exact_empirical_path_quantile() {
+        let b = bars(400);
+        let r = build(&b, &vec![Some(1); b.len()], params()).unwrap();
+        let anchor = b.last().unwrap().close;
+        for k in 1..=5 {
+            let mut logs: Vec<_> = (0..b.len() - 5).map(|i| (b[i + k].close / b[i].close).ln()).collect();
+            logs.sort_by(f64::total_cmp);
+            for (q, p) in QUANTILES.iter().enumerate() {
+                let expected = anchor * quantile_sorted(&logs, *p).exp();
+                assert!((r.conditional.prices[k][q] - expected).abs() < 1e-9 * expected, "k={k} q={q}");
+            }
+        }
+    }
+    #[test]
+    fn bootstrap_band_brackets_each_horizon_edge_and_widens_with_dependence() {
+        let b = bars(600);
+        let s = vec![Some(1); b.len()];
+        let r = build(&b, &s, params()).unwrap();
+        let end = r.conditional.prices.last().unwrap();
+        for (q, [lo, hi]) in r.conditional.horizon_band.iter().enumerate() {
+            assert!(lo <= hi && *lo <= end[q] * 1.000_001 && end[q] <= hi * 1.000_001, "q={q}");
+        }
+        assert!(r.conditional.horizon_band.iter().any(|[lo, hi]| hi > lo));
+        // Path rows from adjacent origins overlap; longer blocks keep that
+        // dependence and must report more edge uncertainty than i.i.d. rows.
+        let width = |r: &ConeReport| r.conditional.horizon_band.iter().map(|[lo, hi]| hi - lo).sum::<f64>();
+        let iid = build(&b, &s, Params { mean_block: 1, ..params() }).unwrap();
+        let blocky = build(&b, &s, Params { mean_block: 60, ..params() }).unwrap();
+        assert!(width(&blocky) > 1.1 * width(&iid), "{} vs {}", width(&blocky), width(&iid));
+    }
+    #[test]
+    fn tstack_state_is_prefix_invariant() {
+        // The cone reuses one TSTACK pass for every walk-forward origin. That is
+        // only legitimate if state i equals the state of a run truncated at i.
+        for (tf, step, session_reset) in
+            [(Timeframe::D1, 86_400, false), (Timeframe::M5, 300, false), (Timeframe::M5, 300, true)]
+        {
+            let b: Vec<_> = bars(420)
+                .into_iter()
+                .enumerate()
+                .map(|(i, mut bar)| {
+                    bar.ts = 1_700_000_000 + i as i64 * step;
+                    bar
+                })
+                .collect();
+            let trend = AdaptiveTrendParams { session_reset, ..AdaptiveTrendParams::default() };
+            let full = trend_stack(&b, tf, vec![], trend).unwrap();
+            for t in (60..b.len()).step_by(17) {
+                let prefix = trend_stack(&b[..=t], tf, vec![], trend).unwrap();
+                assert_eq!(prefix.medium[t], full.medium[t], "{tf:?} reset={session_reset} t={t}");
+                assert_eq!(
+                    prefix.confidence[t].to_bits(),
+                    full.confidence[t].to_bits(),
+                    "{tf:?} reset={session_reset} t={t}"
+                );
+            }
+        }
+    }
+    #[test]
+    fn coverage_verdict_uses_binomial_tolerance() {
+        let cov = |n, hits| Coverage { n, hits: [hits, hits], below: [0; 5] };
+        assert_eq!(cov(9, 9).verdict(0), None);
+        assert_eq!(cov(100, 50).verdict(0), Some(0));
+        assert_eq!(cov(100, 39).verdict(0), Some(-1)); // 2 SE = 10 points
+        assert_eq!(cov(100, 61).verdict(0), Some(1));
+        assert_eq!(cov(100, 73).verdict(1), Some(0)); // 2 SE = 8 points
+        assert_eq!(cov(100, 71).verdict(1), Some(-1));
     }
     #[test]
     fn coverage_math_has_a_known_answer_including_ties() {
@@ -313,6 +457,7 @@ mod tests {
         assert_eq!(r.coverage.hits, [52, 52]);
         assert_eq!(r.coverage.below, [52; 5]);
         assert!(r.forecasts.iter().all(|f| f.conditional == [0.0; 5]));
+        assert_eq!(r.conditional.horizon_band, [[100.0; 2]; 5]);
     }
     #[test]
     fn forming_bar_never_changes_anchor_samples_regime_or_score() {
@@ -384,6 +529,12 @@ mod tests {
         let f = a.forecasts.last().unwrap();
         let prefix = build(&b[..=f.origin], &s[..=f.origin], params()).unwrap();
         assert_eq!(f.training_paths, prefix.conditional.paths);
+        // A cone built on history truncated at the origin reproduces the forecast.
+        for q in 0..5 {
+            let truncated = prefix.conditional.prices[5][q];
+            let scored = b[f.origin].close * f.conditional[q].exp();
+            assert!((truncated - scored).abs() < 1e-9 * scored, "q={q}");
+        }
     }
     #[test]
     fn geometric_block_lengths_match_mean_and_survival_and_wrap_circularly() {
@@ -394,7 +545,8 @@ mod tests {
         assert!((mean - 5.0).abs() < 0.07, "{mean}");
         assert!((survival - 0.8_f64.powi(5)).abs() < 0.008, "{survival}");
         assert_eq!(block_length(&mut rng, 1), 1);
-        let indices = bootstrap_indices(3, Params { mean_block: 100, ..params() }, 1);
+        let indices = bootstrap_indices(&mut SplitMix64(1), 3, 512, 100);
+        assert_eq!(indices.len(), 512);
         assert!(indices.windows(2).filter(|w| w[1] == (w[0] + 1) % 3).count() > 450);
         assert!(indices.windows(2).any(|w| w == [2, 0]));
     }

@@ -1824,7 +1824,9 @@ impl ChartState {
         let mut clicked = false;
         self.link_out = LinkPublish::default();
         self.request_avwap(w);
-        self.request_cone(w);
+        if let Some(wait) = self.request_cone(w) {
+            ui.ctx().request_repaint_after(wait);
+        }
 
         // Controls live in the tab strip when it has room; otherwise a slim header row.
         let header_h = if self.controls_in_strip { 0.0 } else { HEADER_H };
@@ -6316,17 +6318,21 @@ mod tests {
         c.set_trend_cone(Some(true), None, &w);
         let key = cone_requests(&mut rx).pop().unwrap();
         c.on_trend_cone(key.clone(), cone_result(&c, &key));
-        c.request_cone(&w);
+        assert_eq!(c.request_cone(&w), None);
         assert!(cone_requests(&mut rx).is_empty());
         Arc::make_mut(&mut c.bars).last_mut().unwrap().close *= 2.0;
-        c.request_cone(&w);
+        assert_eq!(c.request_cone(&w), None);
         assert!(cone_requests(&mut rx).is_empty());
         Arc::make_mut(&mut c.bars)[10].close += 1.0;
-        c.request_cone(&w);
+        // Throttled: nothing is sent yet, but the caller is told when to repaint so
+        // the deferred request cannot be lost on an otherwise idle UI.
+        let wait = c.request_cone(&w).expect("throttled request must ask for a repaint");
+        assert!(wait > Duration::ZERO && wait <= Duration::from_millis(300));
+        assert!(cone_requests(&mut rx).is_empty());
         // Throttle immediately removes the old report; it cannot paint stale geometry.
         assert!(c.cone.result.is_none());
         c.cone.sent.as_mut().unwrap().1 = Instant::now() - Duration::from_secs(1);
-        c.request_cone(&w);
+        assert_eq!(c.request_cone(&w), None);
         assert_eq!(cone_requests(&mut rx).len(), 1);
         c.on_trend_cone(key, Err("old failure".into()));
         assert!(c.cone.result.is_none());
@@ -6375,6 +6381,10 @@ mod tests {
         assert!(stack_has_text(&out.shapes, "P10"));
         assert!(stack_has_text(&out.shapes, "WALK-FORWARD"));
         assert!(stack_has_text(&out.shapes, "CLOSED THRU"));
+        assert!(stack_has_text(&out.shapes, "50% band"));
+        assert!(stack_has_text(&out.shapes, "80% band"));
+        assert!(stack_has_text(&out.shapes, "whiskers"));
+        assert!(stack_has_text(&out.shapes, "BASE"));
         let meshes: Vec<_> = c
             .cone
             .paint

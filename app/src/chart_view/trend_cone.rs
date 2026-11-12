@@ -25,23 +25,47 @@ pub(super) struct ConePaint {
     key: Vec<u64>,
     palette: Option<theme::Palette>,
     pub(super) shapes: Vec<egui::Shape>,
-    labels: Vec<(Pos2, String, Color32)>,
-    card: String,
+    labels: Vec<ConeLabel>,
+    card: egui::text::LayoutJob,
     tooltip: String,
     card_pos: Pos2,
 }
+struct ConeLabel {
+    at: Pos2,
+    align: Align2,
+    text: String,
+    color: Color32,
+    /// Draw on a card-coloured pill so the price stays legible over candles.
+    pill: bool,
+}
+
+/// Label column to the right of the horizon (price + percent pills).
+const LABEL_ROOM: f64 = 150.0;
+const CARD_W: f32 = 300.0;
 
 /// Keep the fan and horizon tags in the ordinary indexed viewport. Panning and
 /// zooming still work normally; End / reset restores this reservation.
 pub(super) fn reserve(v: &mut Viewport, n: usize, horizon: usize) {
-    v.bar_px = v.bar_px.min((v.width_px - 100.0).max(20.0) / (horizon + 45) as f64);
-    v.right = n as f64 + horizon as f64 + 100.0 / v.bar_px;
+    v.bar_px = v.bar_px.min((v.width_px - LABEL_ROOM).max(20.0) / (horizon + 45) as f64);
+    v.right = n as f64 + horizon as f64 + LABEL_ROOM / v.bar_px;
 }
-fn score(c: &Coverage) -> String {
-    match (c.empirical(0), c.empirical(1)) {
-        (Some(a), Some(b)) => format!("50% → {:.0}%   80% → {:.0}%   n={}", a * 100.0, b * 100.0, c.n),
-        _ => "50% → —   80% → —   n=0".into(),
-    }
+/// One coverage row: nominal → empirical, a colour-coded binomial verdict and the
+/// grey baseline's hit rate on the same origins.
+fn coverage_row(job: &mut egui::text::LayoutJob, band: usize, c: &Coverage, base: &Coverage) {
+    let nominal = tr_data::trend_cone::COVERAGE_NOMINAL[band] * 100.0;
+    let pct = |c: &Coverage| c.empirical(band).map_or("—".to_string(), |e| format!("{:.0}%", e * 100.0));
+    append(job, &format!("  {nominal:.0}% band → {:>4}", pct(c)), theme::text());
+    let (word, color) = match c.verdict(band) {
+        Some(0) => ("  OK  ", theme::up()),
+        Some(-1) => ("  NARROW", theme::down()),
+        Some(_) => ("  WIDE", theme::amber()),
+        None => ("  n<10", theme::muted()),
+    };
+    append(job, word, color);
+    append(job, &format!("   base {}\n", pct(base)), theme::muted());
+}
+fn append(job: &mut egui::text::LayoutJob, text: &str, color: Color32) {
+    job.append(text, 0.0, egui::TextFormat { font_id: mono(10.0), color, ..Default::default() });
 }
 impl ChartState {
     pub fn cone_settings(&self) -> Option<(usize, usize)> {
@@ -67,7 +91,8 @@ impl ChartState {
             if let Some(v) = &mut self.viewport {
                 reserve(v, self.bars.len(), self.cone.params.horizon);
             }
-            self.request_cone(w);
+            // Commands repaint; `show` re-arms any throttled request on that frame.
+            let _ = self.request_cone(w);
         }
     }
     fn cone_key(&mut self, now: i64) -> Option<ConeKey> {
@@ -95,20 +120,25 @@ impl ChartState {
         self.cone.input = Some((self.bars.clone(), key.clone()));
         Some(key)
     }
-    pub(super) fn request_cone(&mut self, w: &Worker) {
+    /// Send the cone request for the current input unless it is already in flight
+    /// or answered. A changed input inside the 300 ms throttle is deferred; the
+    /// returned delay tells the caller when to repaint so the deferred request is
+    /// sent even if nothing else wakes the UI.
+    #[must_use]
+    pub(super) fn request_cone(&mut self, w: &Worker) -> Option<Duration> {
+        const THROTTLE: Duration = Duration::from_millis(300);
         let now = chrono::Utc::now().timestamp();
-        let Some(key) = self.cone_key(now) else {
-            return;
-        };
+        let key = self.cone_key(now)?;
         if let Some((sent, at)) = &self.cone.sent {
             if sent == &key {
-                return;
+                return None;
             }
             // Never paint a report for older bars, settings or provenance.
             self.cone.result = None;
             self.cone.paint = Default::default();
-            if at.elapsed() < Duration::from_millis(300) {
-                return;
+            let elapsed = at.elapsed();
+            if elapsed < THROTTLE {
+                return Some(THROTTLE - elapsed);
             }
         }
         w.send(Request::TrendCone {
@@ -119,6 +149,7 @@ impl ChartState {
             as_of: if self.archive { Some(now) } else { self.last_refresh },
         });
         self.cone.sent = Some((key, Instant::now()));
+        None
     }
     pub fn on_trend_cone(&mut self, key: ConeKey, result: Result<Arc<ConeReport>, String>) {
         if self.cone_key(chrono::Utc::now().timestamp()).as_ref() != Some(&key) {
@@ -147,6 +178,11 @@ impl ChartState {
                     hi = hi.max(q[4]);
                 }
             }
+        }
+        if (v.left()..=v.right).contains(&(anchor + r.params.horizon as f64)) {
+            // Keep the outer bootstrap whisker caps on screen too.
+            lo = lo.min(r.conditional.horizon_band[0][0]);
+            hi = hi.max(r.conditional.horizon_band[4][1]);
         }
         PriceScale::padded(lo, hi, 0.04, scale.log, scale.height_px)
     }
@@ -184,73 +220,124 @@ impl ChartState {
             -1 => theme::down(),
             _ => theme::cyan(),
         };
-        for (fan, base, opacity) in [(&r.unconditional, theme::muted(), 0.26), (&r.conditional, color, 0.72)] {
+        let h = r.params.horizon;
+        let fade = |step: usize| 0.55 + 0.45 * step as f32 / h as f32;
+        // Grey unconditional baseline: one faint P10–P90 sheet with dashed edges
+        // and median, so it reads as sitting behind the regime fan.
+        {
+            let fan = &r.unconditional;
             let mut mesh = egui::Mesh::default();
-            // Four filled strips with colour strongest toward the median, and a
-            // horizontal fade out of the closed-bar origin.
-            for k in 0..r.params.horizon {
+            for k in 0..h {
+                let start = mesh.vertices.len() as u32;
+                for (step, q) in [(k, 0), (k + 1, 0), (k + 1, 4), (k, 4)] {
+                    mesh.colored_vertex(
+                        pos2(x(step), y(fan.prices[step][q])),
+                        theme::muted().gamma_multiply(0.13 * fade(step)),
+                    );
+                }
+                mesh.add_triangle(start, start + 1, start + 2);
+                mesh.add_triangle(start, start + 2, start + 3);
+            }
+            paint.shapes.push(egui::Shape::mesh(mesh));
+            for (q, alpha) in [(0, 0.55), (2, 0.7), (4, 0.55)] {
+                let points: Vec<_> = fan.prices.iter().enumerate().map(|(k, p)| pos2(x(k), y(p[q]))).collect();
+                paint.shapes.extend(egui::Shape::dashed_line(
+                    &points,
+                    Stroke::new(1.0, theme::muted().gamma_multiply(alpha)),
+                    4.0,
+                    3.0,
+                ));
+            }
+        }
+        // Regime fan: four gradient strips, densest at the median and fading in
+        // from the closed-bar origin; the P25–P75 core is clearly heavier.
+        {
+            let fan = &r.conditional;
+            let weight = [0.10_f32, 0.34, 0.58, 0.34, 0.10];
+            let mut mesh = egui::Mesh::default();
+            for k in 0..h {
                 for band in 0..4 {
-                    let intensity = |q: usize| {
-                        if q == 2 {
-                            0.85
-                        } else if q == 1 || q == 3 {
-                            0.5
-                        } else {
-                            0.12
-                        }
-                    };
-                    let vertex_color = |q: usize, step: usize| {
-                        base.gamma_multiply(
-                            opacity * intensity(q) * (0.45 + 0.55 * step as f32 / r.params.horizon as f32),
-                        )
-                    };
                     let start = mesh.vertices.len() as u32;
                     for (step, q) in [(k, band), (k + 1, band), (k + 1, band + 1), (k, band + 1)] {
-                        mesh.colored_vertex(pos2(x(step), y(fan.prices[step][q])), vertex_color(q, step));
+                        mesh.colored_vertex(
+                            pos2(x(step), y(fan.prices[step][q])),
+                            color.gamma_multiply(weight[q] * fade(step)),
+                        );
                     }
                     mesh.add_triangle(start, start + 1, start + 2);
                     mesh.add_triangle(start, start + 2, start + 3);
                 }
             }
             paint.shapes.push(egui::Shape::mesh(mesh));
-            for q in [0, 2, 4] {
-                let points: Vec<_> =
-                    fan.prices.iter().enumerate().map(|(k, prices)| pos2(x(k), y(prices[q]))).collect();
-                paint.shapes.push(egui::Shape::line(
-                    points,
-                    Stroke::new(if q == 2 { 2.2 } else { 1.0 }, base.gamma_multiply(if q == 2 { 0.95 } else { 0.5 })),
-                ));
+            let line = |q: usize| fan.prices.iter().enumerate().map(|(k, p)| pos2(x(k), y(p[q]))).collect::<Vec<_>>();
+            for (q, width, alpha) in [(0, 1.0, 0.6), (4, 1.0, 0.6), (1, 0.8, 0.35), (3, 0.8, 0.35)] {
+                paint.shapes.push(egui::Shape::line(line(q), Stroke::new(width, color.gamma_multiply(alpha))));
             }
+            // Soft glow under a bold median.
+            paint.shapes.push(egui::Shape::line(line(2), Stroke::new(5.0, color.gamma_multiply(0.18))));
+            paint.shapes.push(egui::Shape::line(line(2), Stroke::new(2.2, color)));
         }
-        let end = r.params.horizon;
-        let end_x = x(end);
+        let end_x = x(h);
+        // Closed-bar origin: thin rule plus a ringed dot on the anchor close.
         paint.shapes.push(egui::Shape::line_segment(
             [pos2(x(0), rect.top()), pos2(x(0), rect.bottom())],
-            Stroke::new(1.0, color.gamma_multiply(0.35)),
+            Stroke::new(1.0, color.gamma_multiply(0.3)),
         ));
-        // Spread coincident labels (flat paths included), retaining leaders to exact prices.
-        let mut last_y = rect.top() + 10.0;
-        for q in (0..5).rev() {
-            let p = r.conditional.prices[end][q];
-            let label_y = y(p).clamp(rect.top() + 10.0, (rect.bottom() - 70.0).max(rect.top() + 10.0)).max(last_y);
-            last_y = label_y + 14.0;
-            paint.shapes.push(egui::Shape::line_segment(
-                [pos2(end_x, y(p)), pos2(end_x + 7.0, label_y)],
-                Stroke::new(1.0, color),
-            ));
-            paint.labels.push((
-                pos2(end_x + 9.0, label_y),
-                format!(
-                    "P{:.0} {}",
-                    tr_data::trend_cone::QUANTILES[q] * 100.0,
-                    scale::format_price(p, self.sec.decimals(p))
-                ),
-                if q == 2 { theme::text() } else { color },
-            ));
+        let origin = pos2(x(0), y(r.anchor_price));
+        paint.shapes.push(egui::Shape::circle_filled(origin, 3.5, color));
+        paint.shapes.push(egui::Shape::circle_stroke(origin, 3.5, Stroke::new(1.0, theme::card())));
+        // Bootstrap whiskers: 90% sampling interval of each horizon edge.
+        for (q, [lo, hi]) in r.conditional.horizon_band.iter().enumerate() {
+            let wx = end_x + 3.0;
+            let (top, bottom) = (y(*hi), y(*lo));
+            let stroke = Stroke::new(if q == 2 { 2.0 } else { 1.4 }, color.gamma_multiply(0.85));
+            paint.shapes.push(egui::Shape::line_segment([pos2(wx, top), pos2(wx, bottom)], stroke));
+            for cap in [top, bottom] {
+                paint.shapes.push(egui::Shape::line_segment([pos2(wx - 2.0, cap), pos2(wx + 2.0, cap)], stroke));
+            }
         }
-        paint.labels.push((pos2(end_x, rect.bottom() - 12.0), format!("+{end} bars"), color));
+        // Spread coincident labels (flat paths included), with leaders to exact prices.
+        const ROW: f32 = 16.0;
+        let lo = rect.top() + 10.0;
+        let hi = (rect.bottom() - 24.0 - 5.0 * ROW).max(lo);
+        let mut next_y = lo;
+        for q in (0..5).rev() {
+            let p = r.conditional.prices[h][q];
+            let label_y = y(p).clamp(lo, hi + (4 - q) as f32 * ROW).max(next_y);
+            next_y = label_y + ROW;
+            paint.shapes.push(egui::Shape::line_segment(
+                [pos2(end_x + 6.0, y(p)), pos2(end_x + 12.0, label_y)],
+                Stroke::new(1.0, color.gamma_multiply(0.7)),
+            ));
+            let change = (p / r.anchor_price - 1.0) * 100.0;
+            paint.labels.push(ConeLabel {
+                at: pos2(end_x + 16.0, label_y),
+                align: Align2::LEFT_CENTER,
+                text: format!(
+                    "P{:.0} {} {change:+.1}%",
+                    tr_data::trend_cone::QUANTILES[q] * 100.0,
+                    scale::format_price(p, self.sec.decimals(p)),
+                ),
+                color: if q == 2 { theme::text() } else { color },
+                pill: true,
+            });
+        }
+        paint.labels.push(ConeLabel {
+            at: pos2(end_x - 4.0, y(r.unconditional.prices[h][4]) - 3.0),
+            align: Align2::RIGHT_BOTTOM,
+            text: "BASE".into(),
+            color: theme::muted(),
+            pill: false,
+        });
+        paint.labels.push(ConeLabel {
+            at: pos2(end_x, rect.bottom() - 10.0),
+            align: Align2::CENTER_CENTER,
+            text: format!("+{h} bars"),
+            color,
+            pill: true,
+        });
         paint.card_pos = pos2(
-            (x(0) + 10.0).clamp(rect.left() + 8.0, (rect.right() - 310.0).max(rect.left() + 8.0)),
+            (x(0) + 10.0).clamp(rect.left() + 8.0, (rect.right() - CARD_W - 16.0).max(rect.left() + 8.0)),
             rect.top() + 48.0,
         );
         let regime = match r.regime {
@@ -258,16 +345,14 @@ impl ChartState {
             -1 => "DOWN",
             _ => "FLAT",
         };
-        paint.card = format!(
-            "TREND CONE · {regime} · +{} {} bars\nP10 / 25 / 50 / 75 / 90 · L={} · {} paths\nWALK-FORWARD · nominal → empirical\n{}\nGREY baseline · {}\nCLOSED THRU {}",
-            end,
-            self.tf.label(),
-            r.params.mean_block,
-            r.conditional.paths,
-            score(&r.coverage),
-            score(&r.baseline_coverage),
-            scale::crosshair_label(r.anchor_ts, self.tf)
-        );
+        let card = &mut paint.card;
+        append(card, &format!("TREND CONE · {regime} regime · +{h} {} bars\n", self.tf.label()), color);
+        append(card, &format!("P10/25/50/75/90 of {} completed paths\n", r.conditional.paths), theme::muted());
+        append(card, &format!("WALK-FORWARD @ +{h} · n={} non-overlapping\n", r.coverage.n), theme::text());
+        coverage_row(card, 0, &r.coverage, &r.baseline_coverage);
+        coverage_row(card, 1, &r.coverage, &r.baseline_coverage);
+        append(card, &format!("whiskers: block-bootstrap 90% CI · L={}\n", r.params.mean_block), theme::muted());
+        append(card, &format!("CLOSED THRU {}", scale::crosshair_label(r.anchor_ts, self.tf)), theme::muted());
         let cdf = if r.coverage.n == 0 {
             "—".into()
         } else {
@@ -280,12 +365,28 @@ impl ChartState {
                 .join(" · ")
         };
         paint.tooltip = format!(
-            "Politis–Romano (1994) stationary bootstrap of completed forward log-return path rows.\nGeometric blocks: mean L={}, circular wrap; {} seeded draws, seed {}.\nCurrent TSTACK medium regime at the last closed bar; {} conditional / {} unconditional paths.\nPrice(k,q) = C_closed × exp(Q_q[ln(C_(i+k)/C_i)]). Whole paths stay intact.\nWalk-forward: up to 64 H-spaced outcomes in this regime; at origin t only i+H ≤ t enters training (minimum 30 paths).\nCentral 50% and 80% horizon coverage, inclusive boundaries; n={} (not an independent-path count).\nQuantile CDF coverage (nominal 10/25/50/75/90%): {}\nEmpirical predictive bands, not confidence intervals for the mean. Overlapping training paths are dependent; limited history and regime changes can impair coverage.\nForming bar excluded. No prices are fetched or synthesized. Provenance: {}.",
+            "Fan = empirical per-step quantiles of completed forward log-return paths.\n\
+             Price(k,q) = C_closed × exp(Q_q[ln(C_(i+k)/C_i)]); whole paths stay intact.\n\
+             Regime: TSTACK medium state at the last closed bar (causal: state i uses bars ≤ i).\n\
+             {} conditional / {} unconditional (grey) paths.\n\n\
+             Whiskers at the horizon: Politis–Romano (1994) stationary bootstrap of path rows in\n\
+             geometric blocks of adjacent origins (mean L={}, circular wrap), {} replicates, seed {}.\n\
+             They show how far each edge could move from sampling noise alone; they never widen the fan.\n\n\
+             Walk-forward coverage is scored at the horizon only, on up to {} of the latest H-spaced\n\
+             (non-overlapping) origins in the current regime. At origin t only paths with i+H ≤ t\n\
+             train (minimum {} paths). Inclusive bands; n={}. OK = within ±2 binomial SE of nominal;\n\
+             NARROW = under-covered; WIDE = over-covered.\n\
+             Quantile CDF coverage (nominal 10/25/50/75/90%): {}\n\n\
+             Pointwise predictive bands, not a joint path envelope or a CI for the mean. Overlapping\n\
+             paths are dependent; limited history and regime changes can impair coverage.\n\
+             Forming bar excluded. No prices are fetched or synthesized. Provenance: {}.",
+            r.conditional.paths,
+            r.unconditional.paths,
             r.params.mean_block,
             r.params.draws,
             r.params.seed,
-            r.conditional.paths,
-            r.unconditional.paths,
+            tr_data::trend_cone::MAX_SCORES,
+            tr_data::trend_cone::MIN_PATHS,
             r.coverage.n,
             cdf,
             self.provenance.label()
@@ -323,15 +424,23 @@ impl ChartState {
         self.prepare_cone(rect, v, scale);
         let paint = &self.cone.paint;
         p.extend(paint.shapes.iter().cloned());
-        for (at, label, color) in &paint.labels {
-            p.text(*at, Align2::LEFT_CENTER, label, mono(10.0), *color);
+        for label in &paint.labels {
+            let galley = p.layout_no_wrap(label.text.clone(), mono(10.0), label.color);
+            let at = label.align.anchor_size(label.at, galley.size()).min;
+            if label.pill {
+                let pill = Rect::from_min_size(at, galley.size()).expand2(vec2(4.0, 1.5));
+                p.rect_filled(pill, 3.0, theme::card().gamma_multiply(0.92));
+                p.rect_stroke(pill, 3.0, Stroke::new(1.0, label.color.gamma_multiply(0.45)), StrokeKind::Inside);
+            }
+            p.galley(at, galley, label.color);
         }
-        if !paint.card.is_empty() {
-            let galley =
-                p.layout(paint.card.clone(), mono(10.0), theme::text(), (rect.width() - 24.0).clamp(1.0, 310.0));
+        if !paint.card.text.is_empty() {
+            let mut job = paint.card.clone();
+            job.wrap.max_width = (rect.width() - 24.0).clamp(1.0, CARD_W);
+            let galley = p.layout_job(job);
             let card = Rect::from_min_size(paint.card_pos, galley.size() + vec2(16.0, 12.0));
-            p.rect_filled(card, 5.0, theme::card().gamma_multiply(0.96));
-            p.rect_stroke(card, 5.0, Stroke::new(1.0, theme::cyan()), StrokeKind::Inside);
+            p.rect_filled(card, 5.0, theme::card().gamma_multiply(0.94));
+            p.rect_stroke(card, 5.0, Stroke::new(1.0, theme::border()), StrokeKind::Inside);
             p.galley(card.min + vec2(8.0, 6.0), galley, theme::text());
             ui.interact(card, ui.id().with((self.id, "cone-math")), Sense::hover()).on_hover_text(&paint.tooltip);
         }
