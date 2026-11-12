@@ -31,7 +31,10 @@ impl TerminalApp {
             let out = std::mem::take(&mut c.link_out);
             let symbol = c.symbol.clone();
             if let Some(l) = link {
-                self.link_bus.publish(l, id, &symbol, c.tf, &out);
+                if self.link_bus.publish(l, id, &symbol, c.tf, &out) {
+                    // Charts already painted this frame saw the old cursor.
+                    ui.ctx().request_repaint();
+                }
                 if let Some(ts) = out.center {
                     self.center_linked(l, id, &symbol, ts);
                 }

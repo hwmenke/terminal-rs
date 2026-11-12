@@ -1339,6 +1339,27 @@ impl TerminalApp {
         }
     }
 
+    /// Time Link: resolve which linked chart the pointer is over from last frame's plot
+    /// geometry and egui's hit test, and publish its cursor before any chart paints, so every
+    /// chart in the group shows the ghost on the same frame regardless of paint order.
+    pub(super) fn seed_link_hover(&mut self, ctx: &egui::Context) {
+        let dragging = self.drag.is_some_and(|d| d.active);
+        let pointer = ctx.input(|i| i.pointer.hover_pos()).filter(|_| !dragging);
+        let panes = self.panes.iter().filter_map(|p| match (&p.kind, p.link) {
+            (PaneKind::Chart(c), Some(_)) => c.link_geom.map(|g| (p.id, g)),
+            _ => None,
+        });
+        let hit = pointer.and_then(|pos| {
+            crate::chart_view::resolve_hover(panes, pos, |id| ctx.read_response(id).is_some_and(|r| r.hovered()))
+        });
+        let seed = hit.and_then(|(id, bar)| {
+            let p = self.panes.iter().find(|p| p.id == id)?;
+            let PaneKind::Chart(c) = &p.kind else { return None };
+            Some((p.link?, bar.and_then(|(i, price)| c.link_cursor(i, price))))
+        });
+        self.link_bus.seed_hover(seed);
+    }
+
     /// Scroll every other chart in `link` showing `symbol` so `ts` is centred.
     pub(super) fn center_linked(&mut self, link: Link, source: PaneId, symbol: &str, ts: i64) {
         let mut n = 0;
@@ -2733,5 +2754,159 @@ mod tests {
         assert_eq!(chart(&mut app, other_name).pending_jump(), None);
         assert_eq!(chart(&mut app, other_group).pending_jump(), None);
         assert_eq!(chart(&mut app, five).pending_jump(), None);
+    }
+
+    #[test]
+    fn linked_ghost_appears_on_the_same_frame_for_charts_painted_first() {
+        use crate::worker::Response;
+        use tr_chart::scene::SeriesGpu;
+        let mut app = crate::app::tests::test_app();
+        let (worker, mut requests, responses) = Worker::test_channel_with_responses();
+        app.worker = worker;
+        let add = |app: &mut TerminalApp, tf: tr_core::Timeframe| {
+            let id = app.new_pane(PaneKind::Chart(Box::new(crate::chart_view::ChartState::new(0, "AAPL", tf))));
+            app.pane_mut(id).unwrap().link = Some(Link::Blue);
+            id
+        };
+        // `first` paints before `second`; the pointer will hover `second`.
+        let first = add(&mut app, tr_core::Timeframe::M15);
+        let second = add(&mut app, tr_core::Timeframe::M5);
+        let date = chrono::NaiveDate::from_ymd_opt(2026, 11, 10).unwrap();
+        while let Ok(r) = requests.try_recv() {
+            if let Request::History { pane, generation, symbol, tf, .. } = r {
+                let bars = std::sync::Arc::new(
+                    tr_data::intraday::regular_opens(date, tf)
+                        .into_iter()
+                        .map(|ts| {
+                            tr_core::Bar::new(ts, 100.0, 101.0, 99.0, 100.5, 1000.0)
+                                .with_provenance(tr_core::Provenance::Real)
+                        })
+                        .collect::<Vec<_>>(),
+                );
+                let gpu = SeriesGpu::build(&bars);
+                let r = Response::History {
+                    pane,
+                    generation,
+                    symbol,
+                    tf,
+                    bars,
+                    gpu,
+                    prepended: 0,
+                    from_cache: false,
+                    exhausted: true,
+                    live: false,
+                };
+                responses.send(r).unwrap();
+            }
+        }
+        app.drain();
+        let ctx = egui::Context::default();
+        let rects = [
+            (app.idx(first).unwrap(), Rect::from_min_size(pos2(0.0, 0.0), vec2(800.0, 600.0))),
+            (app.idx(second).unwrap(), Rect::from_min_size(pos2(0.0, 620.0), vec2(800.0, 600.0))),
+        ];
+        let frame = |app: &mut TerminalApp, events: Vec<egui::Event>| {
+            ctx.run_ui(
+                egui::RawInput {
+                    time: Some(ctx.input(|i| i.time) + 0.2),
+                    screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(900.0, 1300.0))),
+                    events,
+                    ..Default::default()
+                },
+                |ui| {
+                    app.link_bus.begin_frame();
+                    app.seed_link_hover(ui.ctx());
+                    for (i, rect) in rects {
+                        app.render_content(ui, i, rect, false);
+                    }
+                },
+            )
+            .textures_delta
+            .clear();
+        };
+        // What the first chart was fed, and what the second chart's own paint published
+        // (the group's final cursor this frame).
+        let ghost = |app: &mut TerminalApp| {
+            chart(app, first).link_in.as_ref().and_then(|f| f.cursor.as_ref()).map(|c| (c.source, c.span))
+        };
+        let published = |app: &TerminalApp| {
+            let feed = app.link_bus.feed(Link::Blue, PaneId::MAX, "AAPL US Equity", tr_core::Timeframe::M5);
+            feed.cursor.map(|c| (c.source, c.span))
+        };
+        frame(&mut app, vec![]);
+        frame(&mut app, vec![]);
+        assert_eq!(ghost(&mut app), None);
+        // The pointer arrives on the second chart: the first chart, painted earlier in the
+        // same frame, already gets the cursor the second one publishes.
+        frame(&mut app, vec![egui::Event::PointerMoved(pos2(400.0, 820.0))]);
+        let a = published(&app);
+        assert_eq!(a.map(|c| c.0), Some(second), "the second chart hovers a bar");
+        assert_eq!(ghost(&mut app), a);
+        // Moving to another bar updates the first chart on that same frame too.
+        frame(&mut app, vec![egui::Event::PointerMoved(pos2(200.0, 820.0))]);
+        let b = published(&app);
+        assert!(b.is_some() && b != a);
+        assert_eq!(ghost(&mut app), b);
+        // Leaving every chart clears the ghost on the same frame.
+        frame(&mut app, vec![egui::Event::PointerMoved(pos2(850.0, 1250.0))]);
+        assert_eq!(published(&app), None);
+        assert_eq!(ghost(&mut app), None);
+    }
+
+    #[test]
+    fn cockpit_chip_round_trips_with_the_layout() {
+        let mut c = crate::chart_view::ChartState::new(0, "AAPL", tr_core::Timeframe::M5);
+        c.cockpit_chip = Some("COCKPIT 1m · 5m · 15m".into());
+        let settings = PaneKind::Chart(Box::new(c)).settings();
+        let PaneSettings::Chart { cockpit_chip, .. } = &settings else { panic!() };
+        assert_eq!(cockpit_chip.as_deref(), Some("COCKPIT 1m · 5m · 15m"));
+        let json = serde_json::to_string(&settings).unwrap();
+        let back: PaneSettings = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, settings);
+        let PaneKind::Chart(restored) = PaneKind::from_settings(back) else { panic!() };
+        assert_eq!(restored.cockpit_chip.as_deref(), Some("COCKPIT 1m · 5m · 15m"));
+        // A chart without a chip does not write the field.
+        let plain = PaneKind::Chart(Box::new(crate::chart_view::ChartState::new(0, "AAPL", tr_core::Timeframe::M5)));
+        assert!(!serde_json::to_string(&plain.settings()).unwrap().contains("cockpit_chip"));
+
+        // Switching layouts and back keeps the chip on the Cockpit's main chart.
+        let mut app = crate::app::tests::test_app();
+        app.layout_name = "Scratch".into();
+        let help = app.new_pane(PaneKind::Help);
+        app.dock = Node::leaf(help);
+        app.focus = help;
+        app.save_layout();
+        app.execute("AAPL COCKPIT");
+        app.switch_layout("Scratch");
+        app.switch_layout("Cockpit");
+        let chips: Vec<_> = app
+            .panes
+            .iter()
+            .filter_map(|p| match &p.kind {
+                PaneKind::Chart(c) => Some((c.tf, c.cockpit_chip.clone())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(chips.len(), 3);
+        for (tf, chip) in chips {
+            let want = (tf == tr_core::Timeframe::M5).then(|| "COCKPIT 1m · 5m · 15m".to_string());
+            assert_eq!(chip, want, "{tf:?}");
+        }
+    }
+
+    #[test]
+    fn older_layout_without_cockpit_chip_field_loads() {
+        let mut settings = crate::layouts::chart_settings("AAPL US Equity", &Default::default());
+        let PaneSettings::Chart { cockpit_chip, .. } = &mut settings else { panic!() };
+        *cockpit_chip = Some("COCKPIT 1m · 5m · 15m".into());
+        let mut value = serde_json::to_value(&settings).unwrap();
+        let fields = value.get_mut("Chart").and_then(|v| v.as_object_mut()).expect("chart object");
+        assert!(fields.remove("cockpit_chip").is_some());
+        let old: PaneSettings = serde_json::from_value(value).unwrap();
+        let PaneSettings::Chart { cockpit_chip, symbol, .. } = &old else { panic!() };
+        assert_eq!(*cockpit_chip, None);
+        assert_eq!(symbol, "AAPL US Equity");
+        let PaneKind::Chart(c) = PaneKind::from_settings(old) else { panic!() };
+        assert_eq!(c.cockpit_chip, None);
     }
 }

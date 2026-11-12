@@ -27,7 +27,7 @@ use crate::worker::{BuiltIndicator, PaneId, Request, Worker, archive_page, initi
 use tr_data::anchored_vwap::AvwapKey;
 
 mod cockpit;
-pub use cockpit::{LinkBus, LinkPublish};
+pub use cockpit::{LinkBus, LinkPublish, resolve_hover};
 
 const AXIS_W: f32 = 66.0;
 const TIME_H: f32 = 16.0;
@@ -394,6 +394,9 @@ pub struct ChartState {
     pub link_in: Option<cockpit::LinkFeed>,
     /// What this chart published during `show` (hover span, visible window, centre request).
     pub link_out: cockpit::LinkPublish,
+    /// Plot geometry from the last paint; the app resolves the next frame's Time Link hover
+    /// from it before any linked chart paints.
+    pub link_geom: Option<cockpit::LinkGeom>,
     /// Header chip on the Cockpit's main chart.
     pub cockpit_chip: Option<String>,
 }
@@ -510,6 +513,7 @@ impl ChartState {
             link_menu_ts: None,
             link_in: None,
             link_out: Default::default(),
+            link_geom: None,
             cockpit_chip: None,
         }
     }
@@ -2069,7 +2073,10 @@ impl ChartState {
         let mut v = v;
         v.clamp(len);
         self.viewport = Some(v);
-        clicked |= self.cockpit_input(ui, &plot_resp, price_rect, &v);
+        let click_owner = self.cockpit_input(ui, &plot_resp, price_rect, &v);
+        clicked |= click_owner.is_some();
+        // A Shift+click on a time-linked chart only centres; drawing tools ignore it.
+        let drawing_click = click_owner != Some(cockpit::ClickOwner::TimeLink);
 
         // Page older history when the left edge approaches loaded data.
         if !self.paging && !self.loading && !self.exhausted && v.left() < v.visible_bars() * 0.3 {
@@ -2358,7 +2365,8 @@ impl ChartState {
         self.paint_alert_levels(ui, price_rect, &scale);
         self.paint_opening_range(ui, price_rect, &scale);
         self.paint_prior_session(ui, price_rect, &scale);
-        self.paint_drawings(ui, price_rect, &v, &scale, hover, &plot_resp);
+        let click = plot_resp.interact_pointer_pos().filter(|_| plot_resp.clicked() && drawing_click);
+        self.paint_drawings(ui, price_rect, &v, &scale, hover, click);
         self.paint_avwap(ui, price_rect, &v, &scale, hover);
 
         // ---- congress markers ----
@@ -2410,6 +2418,8 @@ impl ChartState {
         let cursor_price =
             hover.filter(|p| price_rect.contains(*p)).map(|p| scale.price_at((p.y - price_rect.top()) as f64));
         self.publish_link(hovered_bar, cursor_price, &v);
+        self.link_geom =
+            Some(cockpit::LinkGeom { plot_id: plot_resp.id, plot: plot_all, price_rect, viewport: v, scale, len });
         self.paint_legend(ui, price_rect, hovered_bar.or(ghost).unwrap_or(len.saturating_sub(1)), &sub_rects);
         self.paint_cockpit_chip(ui, price_rect);
         if self.show_edge {
@@ -3951,7 +3961,8 @@ impl ChartState {
         v: &Viewport,
         s: &PriceScale,
         hover: Option<Pos2>,
-        resp: &egui::Response,
+        // Where a primary click landed this frame, unless another layer consumed it.
+        click: Option<Pos2>,
     ) {
         let p = ui.painter_at(rect);
         let pointer_anchor = |this: &Self, pos: Pos2| -> Anchor {
@@ -3966,7 +3977,7 @@ impl ChartState {
         };
 
         // Placement.
-        if let (Some(tool), true, Some(pos)) = (self.draw.tool, resp.clicked(), resp.interact_pointer_pos()) {
+        if let (Some(tool), Some(pos)) = (self.draw.tool, click) {
             let a = pointer_anchor(self, pos);
             if tool.points() == 1 {
                 self.drawings.push(Drawing::new(tool, a, a));
@@ -3977,16 +3988,16 @@ impl ChartState {
             } else {
                 self.draw.pending = Some(a);
             }
-        } else if self.draw.tool.is_none() && resp.clicked() {
+        } else if self.draw.tool.is_none()
+            && let Some(pos) = click
+        {
             // Selection by proximity.
-            self.draw.selected = resp.interact_pointer_pos().and_then(|pos| {
-                self.drawings.iter().enumerate().find_map(|(i, d)| {
-                    let near = self
-                        .drawing_shapes(d, rect, v, s)
-                        .iter()
-                        .any(|(sh, _)| drawings::distance(sh, [pos.x as f64, pos.y as f64]) < 6.0);
-                    near.then_some(i)
-                })
+            self.draw.selected = self.drawings.iter().enumerate().find_map(|(i, d)| {
+                let near = self
+                    .drawing_shapes(d, rect, v, s)
+                    .iter()
+                    .any(|(sh, _)| drawings::distance(sh, [pos.x as f64, pos.y as f64]) < 6.0);
+                near.then_some(i)
             });
         }
 
@@ -4747,6 +4758,121 @@ mod tests {
         assert!(c.avwap_anchors.is_empty());
         c.set_symbol("AAPL", &worker);
         assert_eq!(c.avwap_anchors.len(), 4);
+    }
+
+    #[test]
+    fn shift_click_on_a_time_linked_chart_wins_over_tools() {
+        use cockpit::{ClickOwner, click_owner};
+        // Shift on a linked chart always centres, even with the AVWAP tool armed.
+        assert_eq!(click_owner(true, true, false), ClickOwner::TimeLink);
+        assert_eq!(click_owner(true, true, true), ClickOwner::TimeLink);
+        // Without a link Shift is an ordinary click.
+        assert_eq!(click_owner(false, true, false), ClickOwner::Chart);
+        assert_eq!(click_owner(false, true, true), ClickOwner::AnchorTool);
+        assert_eq!(click_owner(true, false, true), ClickOwner::AnchorTool);
+        assert_eq!(click_owner(true, false, false), ClickOwner::Chart);
+    }
+
+    #[test]
+    fn shift_click_with_a_drawing_tool_centres_only() {
+        let ctx = egui::Context::default();
+        let (worker, _) = Worker::test_channel();
+        let mut c = cockpit_chart(&worker, Timeframe::M5, Provenance::Real, &[]);
+        chart_frame(&ctx, &mut c, &worker, vec![]);
+        let v = c.viewport.unwrap();
+        let pos = pos2(10.0 + v.x_center(20) as f32, 400.0);
+        let click = |c: &mut ChartState, modifiers: egui::Modifiers| {
+            let press =
+                |pressed| egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed, modifiers };
+            chart_frame(&ctx, c, &worker, vec![egui::Event::PointerMoved(pos)]);
+            chart_frame(&ctx, c, &worker, vec![press(true)]);
+            chart_frame(&ctx, c, &worker, vec![press(false)]);
+        };
+        // Linked + Shift: the linked charts are centred and no drawing point is placed.
+        c.link_in = Some(feed(&c, None, None));
+        c.start_tool(Tool::Horizontal);
+        click(&mut c, egui::Modifiers::SHIFT);
+        assert_eq!(c.link_out.center, Some(c.bars[20].ts));
+        assert!(c.drawings.is_empty(), "the drawing tool ignored the Shift+click");
+        assert_eq!(c.draw.tool, Some(Tool::Horizontal), "the tool stays armed");
+        // A two-point tool does not take a first point either.
+        c.start_tool(Tool::Trendline);
+        click(&mut c, egui::Modifiers::SHIFT);
+        assert!(c.draw.pending.is_none() && c.drawings.is_empty());
+        // A plain click on the linked chart draws.
+        c.start_tool(Tool::Horizontal);
+        click(&mut c, egui::Modifiers::NONE);
+        assert_eq!(c.drawings.len(), 1);
+        assert_eq!(c.link_out.center, None);
+        // Without a link, Shift+click is an ordinary drawing click.
+        c.link_in = None;
+        c.start_tool(Tool::Horizontal);
+        click(&mut c, egui::Modifiers::SHIFT);
+        assert_eq!(c.drawings.len(), 2);
+        assert_eq!(c.link_out.center, None);
+    }
+
+    #[test]
+    fn resolve_hover_picks_the_chart_under_the_pointer_from_last_frame_rects() {
+        let viewport = Viewport::fit_last(100, 100, 1000.0);
+        let geom = |n: u64, x: f32| cockpit::LinkGeom {
+            plot_id: egui::Id::new(n),
+            plot: Rect::from_min_size(pos2(x, 0.0), vec2(1000.0, 600.0)),
+            price_rect: Rect::from_min_size(pos2(x, 0.0), vec2(1000.0, 400.0)),
+            viewport,
+            scale: PriceScale { lo: 100.0, hi: 200.0, log: false, height_px: 400.0 },
+            len: 100,
+        };
+        let panes = [(1, geom(1, 0.0)), (2, geom(2, 1000.0))];
+        let all = |_: egui::Id| true;
+        // Pointer over the second chart's price pane: its bar and cursor price.
+        let p = pos2(1000.0 + viewport.x_center(42) as f32, 200.0);
+        let (id, bar) = resolve_hover(panes, p, all).unwrap();
+        assert_eq!(id, 2);
+        let (i, price) = bar.unwrap();
+        assert_eq!(i, 42);
+        assert!((price.unwrap() - 150.0).abs() < 1e-6);
+        // Below the price pane (an oscillator): the bar, but no price.
+        let p = pos2(viewport.x_center(7) as f32, 500.0);
+        assert_eq!(resolve_hover(panes, p, all), Some((1, Some((7, None)))));
+        // Outside every plot, or covered by another widget/layer: nothing.
+        assert_eq!(resolve_hover(panes, pos2(500.0, 700.0), all), None);
+        assert_eq!(resolve_hover(panes, pos2(500.0, 200.0), |id| id != egui::Id::new(1)), None);
+    }
+
+    #[test]
+    fn seeded_hover_reaches_charts_painted_before_the_hovered_one_on_the_same_frame() {
+        use crate::layouts::Link;
+        let sym = "AAPL US Equity";
+        let cursor =
+            |source, span| cockpit::LinkCursor { source, symbol: sym.into(), span, price: None, label: "x".into() };
+        let publish = |bus: &mut LinkBus, pane, c: Option<cockpit::LinkCursor>| {
+            bus.publish(Link::Blue, pane, sym, Timeframe::M1, &LinkPublish { cursor: c, window: None, center: None })
+        };
+        let mut bus = LinkBus::default();
+        // Frame 1: the pointer arrives on pane 2. Pane 1 paints first and already sees it.
+        bus.begin_frame();
+        bus.seed_hover(Some((Link::Blue, Some(cursor(2, (60, 120))))));
+        assert_eq!(bus.feed(Link::Blue, 1, sym, Timeframe::M5).cursor, Some(cursor(2, (60, 120))));
+        assert!(!publish(&mut bus, 1, None), "a non-hovered chart changes nothing");
+        assert!(!publish(&mut bus, 2, Some(cursor(2, (60, 120)))), "the paint agrees with the seed");
+        // Frame 2: the hovered chart's paint resolves another bar (it zoomed). Later charts get
+        // the new one; the change asks for a repaint so earlier charts catch up.
+        bus.begin_frame();
+        bus.seed_hover(Some((Link::Blue, Some(cursor(2, (60, 120))))));
+        assert!(publish(&mut bus, 2, Some(cursor(2, (120, 180)))));
+        assert_eq!(bus.feed(Link::Blue, 3, sym, Timeframe::M5).cursor, Some(cursor(2, (120, 180))));
+        // Frame 3: the pointer leaves every linked chart; the ghost is gone for all charts at once.
+        bus.begin_frame();
+        bus.seed_hover(None);
+        assert_eq!(bus.feed(Link::Blue, 1, sym, Timeframe::M5).cursor, None);
+        assert!(!publish(&mut bus, 2, None));
+        // Over a chart but not over a bar also withdraws the cursor.
+        bus.begin_frame();
+        bus.seed_hover(Some((Link::Blue, Some(cursor(2, (60, 120))))));
+        bus.begin_frame();
+        bus.seed_hover(Some((Link::Blue, None)));
+        assert_eq!(bus.feed(Link::Blue, 1, sym, Timeframe::M5).cursor, None);
     }
 
     #[test]

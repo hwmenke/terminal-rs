@@ -70,19 +70,75 @@ pub struct LinkBus {
     next: HashMap<Link, LinkFrame>,
 }
 
+/// A chart's plot geometry from its last paint, used to resolve the hover at the start of
+/// the next frame, before any linked chart paints.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct LinkGeom {
+    /// The plot widget's id; egui's hit test says whether it is hovered (nothing on top).
+    pub plot_id: egui::Id,
+    pub plot: Rect,
+    pub price_rect: Rect,
+    pub viewport: Viewport,
+    pub scale: PriceScale,
+    pub len: usize,
+}
+
+/// A hovered bar index and the cursor price when the pointer is over the price pane.
+pub type HoverBar = (usize, Option<f64>);
+
+/// The linked chart under `pointer` and the bar (with cursor price over the price pane) it
+/// hovers, from last frame's geometry, exactly as `show` resolves its own hover. `hovered`
+/// is egui's hit test for a plot widget. `Some((pane, None))` means the pointer is over that
+/// chart but not over a bar.
+pub fn resolve_hover(
+    panes: impl IntoIterator<Item = (PaneId, LinkGeom)>,
+    pointer: Pos2,
+    hovered: impl Fn(egui::Id) -> bool,
+) -> Option<(PaneId, Option<HoverBar>)> {
+    let (id, g) = panes.into_iter().find(|(_, g)| g.plot.contains(pointer) && hovered(g.plot_id))?;
+    let bar = g.viewport.bar_at((pointer.x - g.price_rect.left()) as f64, g.len).map(|i| {
+        let price = g.price_rect.contains(pointer).then(|| g.scale.price_at((pointer.y - g.price_rect.top()) as f64));
+        (i, price)
+    });
+    Some((id, bar))
+}
+
 impl LinkBus {
     pub fn begin_frame(&mut self) {
         self.prev = std::mem::take(&mut self.next);
     }
 
+    /// Publish this frame's hover before any chart paints, so charts painted before the
+    /// hovered one show the ghost on the same frame. `hit` is the hovered chart's link and
+    /// cursor (`None` cursor: over the chart but not a bar). Every other link is withdrawn:
+    /// the pointer hovers one chart at most. The hovered chart's own paint still publishes
+    /// and overrides this for charts painted after it.
+    pub fn seed_hover(&mut self, hit: Option<(Link, Option<LinkCursor>)>) {
+        let links: Vec<Link> = self.prev.iter().filter(|(_, f)| f.cursor.is_some()).map(|(l, _)| *l).collect();
+        for link in links {
+            let frame = self.next.entry(link).or_default();
+            frame.cursor = None;
+            frame.cursor_set = true;
+        }
+        if let Some((link, cursor)) = hit {
+            let frame = self.next.entry(link).or_default();
+            frame.cursor = cursor;
+            frame.cursor_set = true;
+        }
+    }
+
+    /// The cursor `feed` hands a chart of `link` right now (before source filtering).
+    fn current_cursor(&self, link: Link) -> Option<&LinkCursor> {
+        match self.next.get(&link).filter(|f| f.cursor_set) {
+            Some(f) => f.cursor.as_ref(),
+            None => self.prev.get(&link).and_then(|f| f.cursor.as_ref()),
+        }
+    }
+
     pub fn feed(&self, link: Link, pane: PaneId, symbol: &str, tf: Timeframe) -> LinkFeed {
         let next = self.next.get(&link);
         let prev = self.prev.get(&link);
-        let cursor = match next.filter(|f| f.cursor_set) {
-            Some(f) => f.cursor.clone(),
-            None => prev.and_then(|f| f.cursor.clone()),
-        }
-        .filter(|c| c.source != pane && c.symbol == symbol);
+        let cursor = self.current_cursor(link).filter(|c| c.source != pane && c.symbol == symbol).cloned();
         let mut windows: HashMap<PaneId, &(String, Timeframe, (i64, i64))> = HashMap::new();
         for frame in [prev, next].into_iter().flatten() {
             windows.extend(frame.windows.iter().map(|(k, v)| (*k, v)));
@@ -97,7 +153,11 @@ impl LinkBus {
         LinkFeed { color: link.color(), cursor, lens }
     }
 
-    pub fn publish(&mut self, link: Link, pane: PaneId, symbol: &str, tf: Timeframe, out: &LinkPublish) {
+    /// Record what a chart published. Returns whether the group's cursor changed from what
+    /// charts painted earlier this frame were fed; the caller then requests a repaint so
+    /// they catch up on the next frame (a safety net when the frame-start seed missed).
+    pub fn publish(&mut self, link: Link, pane: PaneId, symbol: &str, tf: Timeframe, out: &LinkPublish) -> bool {
+        let before = self.current_cursor(link).cloned();
         let owned_prev = self.prev.get(&link).and_then(|f| f.cursor.as_ref()).is_some_and(|c| c.source == pane);
         let frame = self.next.entry(link).or_default();
         match &out.cursor {
@@ -121,6 +181,7 @@ impl LinkBus {
                 frame.windows.remove(&pane);
             }
         }
+        self.current_cursor(link) != before.as_ref()
     }
 }
 
@@ -359,40 +420,47 @@ impl ChartState {
 
     // ---- input ------------------------------------------------------------------------
 
-    /// Shift+click centres linked charts; an armed click anchors; a click on a flag
-    /// selects it. Returns whether the click was consumed.
-    pub(super) fn cockpit_input(&mut self, ui: &Ui, resp: &egui::Response, price_rect: Rect, v: &Viewport) -> bool {
+    /// Shift+click on a time-linked chart centres linked charts; an armed click anchors;
+    /// a click on a flag selects it. Returns who consumed the click, if anyone.
+    pub(super) fn cockpit_input(
+        &mut self,
+        ui: &Ui,
+        resp: &egui::Response,
+        price_rect: Rect,
+        v: &Viewport,
+    ) -> Option<ClickOwner> {
         let len = self.bars.len();
         let at = |pos: Pos2| v.bar_at((pos.x - price_rect.left()) as f64, len);
         if resp.secondary_clicked() {
             self.link_menu_ts = resp.interact_pointer_pos().and_then(at).map(|i| self.bars[i].ts);
         }
         if !resp.clicked() {
-            return false;
+            return None;
         }
-        let Some(pos) = resp.interact_pointer_pos() else { return false };
+        let pos = resp.interact_pointer_pos()?;
         let shift = ui.input(|i| {
             i.modifiers.shift
                 || i.events.iter().any(|e| matches!(e, egui::Event::PointerButton { modifiers, .. } if modifiers.shift))
         });
-        if shift {
+        let owner = click_owner(self.link_in.is_some(), shift, self.avwap_armed);
+        if owner == ClickOwner::TimeLink {
             if let Some(i) = at(pos) {
                 self.link_out.center = Some(self.bars[i].ts);
             }
-            return true;
+            return Some(owner);
         }
-        if self.avwap_armed {
+        if owner == ClickOwner::AnchorTool {
             self.avwap_armed = false;
             if let Some(i) = at(pos)
                 && let Err(e) = self.anchor_at_bar(i)
             {
                 self.avwap_notice = Some(e);
             }
-            return true;
+            return Some(owner);
         }
         let hit = self.avwap_paint.flags.iter().find(|f| f.pos.distance(pos) < 9.0).map(|f| f.index);
         self.avwap_selected = hit;
-        hit.is_some()
+        hit.map(|_| ClickOwner::Chart)
     }
 
     pub(super) fn cockpit_menu(&mut self, ui: &mut Ui) {
@@ -519,18 +587,20 @@ impl ChartState {
 
     /// Publish this chart's hovered bar and visible window for the link group.
     pub(super) fn publish_link(&mut self, hovered: Option<usize>, price: Option<f64>, v: &Viewport) {
-        let equity = self.equity();
-        self.link_out.cursor = hovered.filter(|_| self.hover_enabled).and_then(|i| {
-            Some(LinkCursor {
-                source: self.id,
-                symbol: self.symbol.clone(),
-                span: time_link::span_of(&self.bars, self.tf, equity, i)?,
-                price,
-                label: tr_chart::scale::crosshair_label(self.bars[i].ts, self.tf),
-            })
-        });
+        self.link_out.cursor = hovered.filter(|_| self.hover_enabled).and_then(|i| self.link_cursor(i, price));
         let (lo, hi) = v.visible_range(self.bars.len());
-        self.link_out.window = time_link::window_of(&self.bars, self.tf, equity, lo, hi);
+        self.link_out.window = time_link::window_of(&self.bars, self.tf, self.equity(), lo, hi);
+    }
+
+    /// The cursor this chart publishes while bar `i` is hovered.
+    pub fn link_cursor(&self, i: usize, price: Option<f64>) -> Option<LinkCursor> {
+        Some(LinkCursor {
+            source: self.id,
+            symbol: self.symbol.clone(),
+            span: time_link::span_of(&self.bars, self.tf, self.equity(), i)?,
+            price,
+            label: tr_chart::scale::crosshair_label(self.bars[i].ts, self.tf),
+        })
     }
 
     // ---- Anchored VWAP paint --------------------------------------------------------------
@@ -767,6 +837,30 @@ impl ChartState {
             StrokeKind::Inside,
         );
         p.galley(r.center() - g.size() * 0.5, g, color);
+    }
+}
+
+/// Who handles a primary click on the plot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ClickOwner {
+    /// Shift+click on a time-linked chart: centre the linked charts and nothing else.
+    TimeLink,
+    /// The armed one-click AVWAP tool.
+    AnchorTool,
+    /// Drawing tools, flag and drawing selection.
+    Chart,
+}
+
+/// Click precedence. Shift on a time-linked chart is consumed by Time Link centring, so an
+/// active drawing tool or the armed AVWAP tool ignores that click. Without a link, Shift
+/// does nothing special.
+pub(super) fn click_owner(linked: bool, shift: bool, avwap_armed: bool) -> ClickOwner {
+    if linked && shift {
+        ClickOwner::TimeLink
+    } else if avwap_armed {
+        ClickOwner::AnchorTool
+    } else {
+        ClickOwner::Chart
     }
 }
 

@@ -557,6 +557,7 @@ impl PaneKind {
                     }
                     store
                 },
+                cockpit_chip: c.cockpit_chip.clone(),
             },
             PaneKind::Feed { filter } => {
                 PaneSettings::Feed((*filter != FeedFilter::default()).then(|| (*filter).into()))
@@ -682,8 +683,10 @@ impl PaneKind {
                 show_rail,
                 show_edge,
                 avwap,
+                cockpit_chip,
             } => {
                 let mut c = ChartState::new(0, &symbol, tf);
+                c.cockpit_chip = cockpit_chip;
                 c.avwap_store = avwap
                     .into_iter()
                     .map(|(k, mut v)| {
@@ -2810,6 +2813,7 @@ impl eframe::App for TerminalApp {
             }
         }
         self.link_bus.begin_frame();
+        self.seed_link_hover(&ctx);
         actions.extend(self.render_dock(ui, area, gap));
         actions.extend(self.render_windows(&ctx));
         self.run_actions(actions);

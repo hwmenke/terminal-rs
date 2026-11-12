@@ -56,6 +56,10 @@ linked chart of the same name, mapped with the same function.
 other linked charts of the same name so that time is centred. A chart still loading keeps
 the request and applies it when its bars arrive.
 
+Click precedence: on a time-linked chart, `Shift+click` only centres the linked charts; an
+active drawing tool or the armed AVWAP tool ignores that click. On an unlinked chart Shift
+does nothing special.
+
 ## Anchored VWAP (`AVWAP`)
 
 - `Alt+A` or `AVWAP` arms a one-click tool; click a bar to anchor at that bar's open.
