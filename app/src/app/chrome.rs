@@ -793,6 +793,20 @@ impl TerminalApp {
             if nav_row(
                 ui,
                 Icon::Chart,
+                "Session Clock",
+                Some("CLOCK"),
+                is_focused(&PaneKind::SessionClock(Box::new(super::session_clock::SessionClockPane::new(
+                    String::new(),
+                    String::new(),
+                )))),
+            )
+            .clicked()
+            {
+                out.push(SidebarCmd::Function(Function::SessionClock { spec: String::new() }));
+            }
+            if nav_row(
+                ui,
+                Icon::Chart,
                 "Relative path",
                 Some("RPATH"),
                 is_focused(&PaneKind::RelativePath(Box::new(super::relative_path::RelativePathPane::new(

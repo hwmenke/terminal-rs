@@ -174,6 +174,7 @@ impl TerminalApp {
             | PaneKind::Autocorr(_)
             | PaneKind::GapFill(_)
             | PaneKind::SessionExtreme(_)
+            | PaneKind::SessionClock(_)
             | PaneKind::RelativePath(_)
             | PaneKind::SessionBrief(_) => {}
         }
@@ -221,6 +222,9 @@ impl TerminalApp {
         }
         if matches!(self.panes[i].kind, PaneKind::SessionExtreme(_)) {
             actions.extend(self.session_extreme_pane(ui, id));
+        }
+        if matches!(self.panes[i].kind, PaneKind::SessionClock(_)) {
+            actions.extend(self.session_clock_pane(ui, id));
         }
         if matches!(self.panes[i].kind, PaneKind::RelativePath(_)) {
             actions.extend(self.relative_path_pane(ui, id));

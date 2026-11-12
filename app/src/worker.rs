@@ -171,6 +171,14 @@ pub enum Request {
         spec: String,
         timeframe: String,
     },
+    /// Weekday by cash-bucket returns.
+    SessionClock {
+        pane: PaneId,
+        generation: u64,
+        symbol: String,
+        spec: String,
+        timeframe: String,
+    },
     /// Percent from the 09:30 open minus SPY.
     RelativePath {
         pane: PaneId,
@@ -580,6 +588,11 @@ pub enum Response {
         pane: PaneId,
         generation: u64,
         result: Result<tr_data::session_extreme::SessionExtreme, String>,
+    },
+    SessionClock {
+        pane: PaneId,
+        generation: u64,
+        result: Result<tr_data::session_clock::SessionClock, String>,
     },
     RelativePath {
         pane: PaneId,
@@ -2023,6 +2036,49 @@ async fn research_session_extreme(
     tr_data::session_extreme::build_extreme(&sec.key(), &bars, &query, &source).map_err(anyhow::Error::msg)
 }
 
+/// CLOCK uses only the research gate; its complete report is built off the UI thread.
+async fn research_session_clock(
+    s: &Shared,
+    symbol: &str,
+    spec: &str,
+    timeframe: &str,
+) -> anyhow::Result<tr_data::session_clock::SessionClock> {
+    if s.sample_mode() {
+        anyhow::bail!("Session Clock refused: sample / offline display mode. Verified real data is required.");
+    }
+    let sec = tr_data::security(symbol);
+    tr_data::cash_session::require_us_session(&sec.ticker, None).map_err(anyhow::Error::msg)?;
+    if !tr_data::cash_session::is_cash(&sec) {
+        anyhow::bail!("Session Clock supports US cash sessions only.");
+    }
+    let query = tr_data::session_clock::parse_query(spec, timeframe).map_err(anyhow::Error::msg)?;
+    let bars = s
+        .provider
+        .history_for_analysis(
+            &sec.key(),
+            query.timeframe,
+            None,
+            tr_data::cash_session::research_fetch_limit(query.timeframe),
+            "Session Clock",
+        )
+        .await?;
+    tr_data::cash_session::require_us_session(&sec.ticker, None).map_err(anyhow::Error::msg)?;
+    Bar::require_verified(&bars, "Session Clock").map_err(anyhow::Error::msg)?;
+    let now = chrono::Utc::now().timestamp();
+    let health_stale = s.provider.health().is_some_and(|h| {
+        matches!(h.snapshot()[Feed::Bars as usize].state, FeedState::Stale { .. } | FeedState::Unavailable(_))
+    });
+    // Cached data has no fresh observation clock. In particular its last print
+    // must not become closed just because the wall clock has advanced.
+    let observed_at = (!health_stale && bars.iter().all(|b| b.provenance == tr_core::Provenance::Real)).then_some(now);
+    let source = s.provider.name().to_owned();
+    tokio::task::spawn_blocking(move || {
+        tr_data::session_clock::build_clock(&sec.key(), &bars, &query, &source, now, observed_at)
+    })
+    .await?
+    .map_err(anyhow::Error::msg)
+}
+
 /// Verified regular-session bars for one cash name and for SPY. Sample substitution is refused.
 async fn research_relative_path(
     s: &Shared,
@@ -2743,6 +2799,13 @@ async fn handle_inner(s: &Arc<Shared>, req: Request, force: bool) {
                 pane,
                 generation,
                 result: research_session_extreme(s, &symbol, &spec, &timeframe).await.map_err(|e| format!("{e:#}")),
+            });
+        }
+        Request::SessionClock { pane, generation, symbol, spec, timeframe } => {
+            send(Response::SessionClock {
+                pane,
+                generation,
+                result: research_session_clock(s, &symbol, &spec, &timeframe).await.map_err(|e| format!("{e:#}")),
             });
         }
         Request::RelativePath { pane, generation, symbol, spec, timeframe } => {
@@ -4289,6 +4352,64 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct ClockProvider {
+        calls: std::sync::atomic::AtomicUsize,
+        provenance: tr_core::Provenance,
+        sample: bool,
+    }
+    #[async_trait::async_trait]
+    impl tr_data::MarketData for ClockProvider {
+        fn name(&self) -> &str {
+            "clock fixture"
+        }
+        fn mode(&self) -> DataMode {
+            if self.sample { DataMode::ExplicitSample } else { DataMode::Live }
+        }
+        async fn history(&self, _: &str, _: Timeframe, _: Option<i64>, _: usize) -> anyhow::Result<Vec<Bar>> {
+            panic!("CLOCK must use history_for_analysis");
+        }
+        async fn history_for_analysis(
+            &self,
+            symbol: &str,
+            tf: Timeframe,
+            end: Option<i64>,
+            limit: usize,
+            operation: &str,
+        ) -> anyhow::Result<Vec<Bar>> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            assert_eq!(symbol, "AAPL US Equity");
+            assert_eq!(end, None);
+            assert_eq!(limit, tr_data::cash_session::research_fetch_limit(tf));
+            assert_eq!(operation, "Session Clock");
+            let date = chrono::NaiveDate::from_ymd_opt(2026, 1, 5).unwrap();
+            let ts = tr_core::ny::to_utc(date.and_hms_opt(9, 30, 0).unwrap());
+            Ok(vec![Bar::new(ts, 100.0, 101.0, 99.0, 100.5, 1.0).with_provenance(self.provenance)])
+        }
+    }
+    #[tokio::test]
+    async fn session_clock_worker_uses_research_gate_and_refuses_sample_daily_and_unverified() {
+        use std::sync::atomic::Ordering;
+        for provenance in [tr_core::Provenance::Real, tr_core::Provenance::Sample, tr_core::Provenance::Missing] {
+            let provider = Arc::new(ClockProvider { calls: Default::default(), provenance, sample: false });
+            let (s, _) = shared(provider.clone(), None);
+            assert!(research_session_clock(&s, "AAPL", "1d", "30m").await.is_err());
+            assert_eq!(provider.calls.load(Ordering::SeqCst), 0);
+            let result = research_session_clock(&s, "AAPL", "1h", "30m").await;
+            assert_eq!(result.is_ok(), provenance.is_verified());
+            assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+            if let Ok(report) = result {
+                assert_eq!(report.timeframe, Timeframe::H1);
+                assert_eq!(report.source, "clock fixture");
+                assert!(report.stale);
+            }
+        }
+        let provider =
+            Arc::new(ClockProvider { calls: Default::default(), provenance: tr_core::Provenance::Real, sample: true });
+        let (s, _) = shared(provider.clone(), None);
+        assert!(research_session_clock(&s, "AAPL", "", "30m").await.unwrap_err().to_string().contains("sample"));
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 0);
+    }
 
     struct LaneProvider {
         calls: std::sync::atomic::AtomicUsize,

@@ -44,6 +44,7 @@ pub mod sample;
 pub mod session_alerts;
 pub mod session_breadth;
 pub mod session_brief;
+pub mod session_clock;
 pub mod session_extreme;
 pub mod session_path;
 pub mod stack_wall;
