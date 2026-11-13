@@ -169,6 +169,14 @@ pub enum PaneSettings {
         #[serde(default)]
         filter: String,
     },
+    StudioDist {
+        #[serde(default)]
+        symbol: String,
+        #[serde(default)]
+        timeframe: Timeframe,
+        #[serde(default)]
+        window: tr_data::studio_dist::Window,
+    },
     /// Statistics / conditional returns for one research symbol.
     Stats {
         #[serde(default)]

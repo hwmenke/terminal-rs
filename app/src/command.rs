@@ -405,6 +405,10 @@ pub enum Function {
     Desk,
     /// Trade journal / checklist (`JOURNAL`, `AAPL JOURNAL`, `AAPL JOURNAL 2026-10-24`).
     Journal(String),
+    /// Distribution Studio for verified daily or intraday log returns.
+    StudioDist {
+        timeframe: Timeframe,
+    },
     /// Historical risk/return and conditional forward returns (`STATS`, `AAPL COND RSI < 30`).
     Stats {
         condition: String,
@@ -822,6 +826,13 @@ fn parse_function(head: &str, rest: &[&str]) -> Option<Function> {
         "JOURNAL" | "JRNL" | "CHECKLIST" | "TRADELOG" => Function::Journal(joined()),
         "STATS" | "STAT" | "STATISTICS" => Function::Stats { condition: joined(), conditional: !rest.is_empty() },
         "COND" | "CDIST" | "CONDRET" => Function::Stats { condition: joined(), conditional: true },
+        "DIST" | "RDIST" => Function::StudioDist {
+            timeframe: match rest {
+                [] => Timeframe::D1,
+                [tf] => tr_data::studio_dist::parse_timeframe(tf).ok()?,
+                _ => return None,
+            },
+        },
         "BACKTEST" | "BT" | "BTEST" => Function::Backtest { spec: joined() },
         "IBT" | "IBACKTEST" | "SETUPBT" => Function::IntradayBacktest { spec: joined() },
         "LOOKALIKE" | "LOOKALIKES" | "KNN" | "ANALOG" | "ANALOGUE" | "NN" => Function::Lookalike { spec: joined() },
@@ -900,7 +911,7 @@ pub fn parse(input: &str) -> Option<Command> {
             return Some(Command::Function(f));
         }
         // Invalid stack arguments must not become a ticker followed by an interval.
-        if ["TSTACK", "STACK", "MTF", "REGIME", "RAIL", "AVWAP", "VAULT", "VLT"]
+        if ["TSTACK", "STACK", "MTF", "REGIME", "RAIL", "AVWAP", "VAULT", "VLT", "DIST", "RDIST"]
             .iter()
             .any(|word| head.eq_ignore_ascii_case(word))
         {
@@ -1111,6 +1122,7 @@ fn describe(f: &Function) -> String {
             }
         }
         Function::Stats { condition, .. } => format!("Conditional returns after {condition}"),
+        Function::StudioDist { timeframe } => format!("Distribution Studio: {} log returns, tails, QQ, drawdowns and regimes", timeframe.label()),
         Function::Backtest { spec } if spec.is_empty() => {
             "Paper backtest: declared strategies vs buy-and-hold on a chronological holdout".into()
         }
@@ -1569,6 +1581,19 @@ mod tests {
         assert_eq!(parse("YTD"), Some(Command::Function(Function::Range(Range::Ytd))));
         assert_eq!(parse("RANGE 5D"), Some(Command::Function(Function::Range(Range::D5))));
         assert_eq!(Range::Y5.timeframe(), Timeframe::W1);
+    }
+
+    #[test]
+    fn distribution_studio_commands() {
+        for alias in ["DIST", "RDIST", "dist"] {
+            assert_eq!(parse(alias), Some(Command::Function(Function::StudioDist { timeframe: Timeframe::D1 })));
+        }
+        assert_eq!(parse("AAPL DIST"), Some(Command::SymbolFunction("AAPL US Equity".into(), Function::StudioDist { timeframe: Timeframe::D1 })));
+        assert_eq!(parse("DIST 1H"), Some(Command::Function(Function::StudioDist { timeframe: Timeframe::H1 })));
+        assert_eq!(parse("AAPL RDIST 30m"), Some(Command::SymbolFunction("AAPL US Equity".into(), Function::StudioDist { timeframe: Timeframe::M30 })));
+        assert_eq!(parse("AAPL US Equity DIST 1m"), Some(Command::SymbolFunction("AAPL US Equity".into(), Function::StudioDist { timeframe: Timeframe::M1 })));
+        for invalid in ["DIST 1W", "AAPL DIST nonsense", "AAPL DIST 1H junk"] { assert_eq!(parse(invalid), None); }
+        assert!(hint("DIST 1H").contains("Distribution Studio"));
     }
 
     #[test]

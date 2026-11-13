@@ -127,6 +127,13 @@ pub enum Request {
         generation: u64,
         symbols: Vec<String>,
     },
+    StudioDist {
+        pane: PaneId,
+        generation: u64,
+        symbol: String,
+        timeframe: Timeframe,
+        window: tr_data::studio_dist::Window,
+    },
     /// Historical statistics and conditional forward returns for one archive symbol.
     Stats {
         pane: PaneId,
@@ -606,6 +613,11 @@ pub enum Response {
         pane: PaneId,
         generation: u64,
         result: Result<tr_data::stats::ResearchSnapshot, String>,
+    },
+    StudioDist {
+        pane: PaneId,
+        generation: u64,
+        result: Result<tr_data::studio_dist::Report, String>,
     },
     Backtest {
         pane: PaneId,
@@ -3266,6 +3278,27 @@ async fn handle_inner(s: &Arc<Shared>, req: Request, force: bool) {
                 result: research_desk(s, &bridge, &symbols).await.map_err(|e| format!("{e:#}")),
             });
         }
+        Request::StudioDist { pane, generation, symbol, timeframe, window } => {
+            let result = async {
+                if s.sample_mode() {
+                    anyhow::bail!("Distribution Studio: sample / demo mode has no real data. Verified bars are required.");
+                }
+                let (bars, source, observed_at) = if timeframe == Timeframe::D1 {
+                    let (bars, source) = crate::app::studio_dist::daily_bars(&s.history, &config.bridge(), &symbol).await?;
+                    (bars, source, Some(chrono::Utc::now().timestamp()))
+                } else {
+                    let (bars, stitch) = analysis_bars(s, &symbol, timeframe, default_limit(timeframe), "Distribution Studio").await?;
+                    let stale = s.provider.health().is_some_and(|h| {
+                        matches!(h.snapshot()[Feed::Bars as usize].state, FeedState::Stale { .. } | FeedState::Unavailable(_))
+                    });
+                    let observed_at = (!stale && stitch.live_ok).then_some(stitch.fetched_at).flatten();
+                    (bars, stitch.label(), observed_at)
+                };
+                crate::app::studio_dist::build_report(symbol, bars, timeframe, window, source, observed_at)
+                    .await.map_err(anyhow::Error::msg)
+            }.await;
+            send(Response::StudioDist { pane, generation, result: result.map_err(|e| format!("{e:#}")) });
+        }
         Request::Stats { pane, generation, symbol, condition, horizons } => {
             let bridge = config.bridge();
             send(Response::Stats {
@@ -5054,6 +5087,39 @@ mod tests {
             sample: false,
         })
     }
+    #[tokio::test]
+    async fn studio_dist_uses_sourced_vault_history_and_refuses_sample_mode() {
+        let bars = vault_day("2026-11-09");
+        let provider = vault_provider(bars.clone());
+        let (s, rx) = shared(provider.clone(), Some(BarCache::open_in_memory().unwrap()));
+        let request = || Request::StudioDist { pane: 55, generation: 7, symbol: "AAPL US Equity".into(), timeframe: Timeframe::M5, window: tr_data::studio_dist::Window::All };
+        handle(&s, request()).await;
+        let Response::WhatsNews { response, .. } = rx.try_recv().unwrap() else { panic!("archive envelope") };
+        let Response::StudioDist { pane, generation, result } = *response else { panic!("distribution report") };
+        assert_eq!((pane, generation), (55, 7));
+        let report = result.unwrap();
+        assert_eq!(report.bars, bars.len());
+        assert!(report.provenance.is_verified());
+        assert!(report.source.contains("VAULT"));
+        assert!(report.observed_at.is_some());
+        provider.fail.store(true, std::sync::atomic::Ordering::SeqCst);
+        handle(&s, request()).await;
+        let Response::WhatsNews { response, .. } = rx.try_recv().unwrap() else { panic!("archive envelope") };
+        let Response::StudioDist { result, .. } = *response else { panic!("vault-only report") };
+        let report = result.unwrap();
+        assert_eq!(report.bars, bars.len() - 1);
+        assert!(report.observed_at.is_none());
+        let sample = Arc::new(VaultProvider { bars: std::sync::Mutex::new(bars), calls: Default::default(), fail: Default::default(), sample: true });
+        let (s, rx) = shared(sample.clone(), None);
+        for timeframe in [Timeframe::D1, Timeframe::M5] {
+            handle(&s, Request::StudioDist { pane: 55, generation: 8, symbol: "AAPL".into(), timeframe, window: tr_data::studio_dist::Window::All }).await;
+            let Response::WhatsNews { response, .. } = rx.try_recv().unwrap() else { panic!("archive envelope") };
+            let Response::StudioDist { result, .. } = *response else { panic!("sample refusal") };
+            assert!(result.unwrap_err().contains("sample"));
+        }
+        assert_eq!(sample.calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
     #[tokio::test]
     async fn analysis_bars_stitches_fresh_and_vault_and_outage_has_no_clock() {
         let first = vault_day("2026-11-09");
