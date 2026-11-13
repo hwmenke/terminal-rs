@@ -311,11 +311,11 @@ impl TerminalApp {
                     ),
                     (
                         &["CORR", "RBETA", "AAPL CORR QQQ", "AAPL CORR QQQ 1H"],
-                        "Relationship Studio: OLS, rolling beta/correlation, ratio z-score and verified peer matrix",
+                        "Relationship Studio: OLS, rolling beta/correlation, ratio z-score and verified peer matrix · tickers: CORR US Equity, RBETA Equity",
                     ),
                     (
                         &["SEASON", "SSN", "AAPL SEASON 30M"],
-                        "Seasonality Studio: month heatmap, calendar profiles and New York clock buckets",
+                        "Seasonality Studio: month heatmap, calendar profiles and New York clock buckets · tickers: SEASON US Equity, SSN Equity",
                     ),
                     (
                         &["STATS", "AAPL STATS", "AAPL COND RSI(14) < 30"],
@@ -323,7 +323,7 @@ impl TerminalApp {
                     ),
                     (
                         &["DIST", "RDIST", "AAPL DIST", "DIST 1H"],
-                        "Distribution Studio: log returns, tail risk, QQ, drawdowns and volatility regimes on verified bars",
+                        "Distribution Studio: log returns, tail risk, QQ, drawdowns and volatility regimes on verified bars · tickers: DIST US Equity, RDIST Equity",
                     ),
                     (
                         &["BACKTEST", "AAPL BACKTEST", "AAPL BT ADTREND"],

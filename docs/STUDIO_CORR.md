@@ -6,6 +6,16 @@
 Daily is the default. The Asset and Benchmark / interval fields and Reload / Apply
 buttons recompute the report. The pane and its inputs survive workspace saves.
 
+`CORR` and `RBETA` are also listed tickers. Only the bare word or the word plus
+valid CORR arguments (`CORR QQQ 1H`) opens the studio; `CORR US Equity`,
+`RBETA Equity` and any other arguments (`CORR 1W`) load the ticker instead.
+
+All series (asset, benchmark, peers) load **concurrently**, at most four at a
+time, and successful loads are cached per (symbol, interval) for 15 minutes
+(daily) or one bar clamped to 1–10 minutes (intraday), so re-opening CORR is
+instant. Failures are never cached and a failed peer shows as unavailable;
+nothing is substituted. Reload bypasses the cache.
+
 The pane shows full-sample OLS, a return scatter with the latest 20 observations
 highlighted, rolling 20/60/120-return beta and correlation, log price ratio and its
 60-price z-score, cumulative regression residual return, and a correlation matrix.
@@ -29,8 +39,11 @@ empty state even when there is a local archive. Matrix peers that cannot be read
 remain visible with an unavailable explanation; no substitute observations enter.
 Sources are available by hovering the report header.
 
-Only exact common closed timestamps are kept, and log returns are differences
-between adjacent common log prices. A missing timestamp therefore makes the next
+Intraday bars join on exact common closed timestamps; daily bars join on the
+UTC calendar date (two sources may stamp the same session at different times of
+day). Log returns are differences between adjacent common log prices, except
+that no return spans a Bar Vault UNVERIFIED JOIN gap in either series; when such
+a gap lies inside the common range the pane shows an amber warning. A missing timestamp therefore makes the next
 return span the same longer interval for both names. Calendar/timezone differences
 can eliminate all overlap. At least four common prices are required. Dropped
 noncommon prices are counted in the header. The matrix uses separate pairwise
@@ -49,8 +62,10 @@ these SEs. Residual annual volatility is s sqrt(periods/year). These are ordinar
 homoskedastic, independent-error estimates; no robust/HAC correction, p-values,
 risk-free rate or predictive significance is claimed.
 
-Daily annualisation uses 252. Intraday annualisation assumes a US cash session:
-252 × 390 minutes / interval minutes (6.5 hourly periods per session). Irregular
+Annualisation uses the same convention as Distribution Studio: daily 252 (crypto
+365); intraday US cash assets 252 × ceil(390 / interval minutes), counting the
+short final bucket (7 hourly bars per session); crypto 365 × 24h / interval;
+other assets 252 × 24h / interval. Irregular
 intersection gaps, missing bars and non-US markets can make this approximation
 unsuitable. Daily data for non-US securities can also have different calendars.
 There is no adjustment performed here: corporate-action/adjustment conventions
@@ -64,9 +79,10 @@ including zero-variance correlations and t-statistics with zero standard error.
 The scatter band is the fitted mean ±2 residual standard errors, not a confidence
 or prediction interval.
 
-The ratio panel uses log(asset close) − log(benchmark close). Its trailing
-60-common-price z-score uses sample standard deviation and includes the current
-observation. It is not a stationarity or cointegration test. Cumulative
+The ratio panel uses log(asset close) − log(benchmark close). Its z-score
+compares today's ratio with the mean and sample standard deviation of the
+**previous** 60 common prices (current observation excluded, so no point uses
+itself or later data). It is not a stationarity or cointegration test. Cumulative
 idiosyncratic return is exp(sum(full-sample OLS residuals)) − 1, starting at zero.
 It uses the full-sample fit (future information for earlier points); the terminal
 sum is approximately zero because OLS includes an intercept. It is descriptive,

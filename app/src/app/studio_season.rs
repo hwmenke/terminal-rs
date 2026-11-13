@@ -75,12 +75,17 @@ impl TerminalApp {
         let i = self.idx(id).expect("season pane");
         let PaneKind::StudioSeason(pane) = &mut self.panes[i].kind else { return vec![] };
         let sample = self.provider.eq_ignore_ascii_case("sample");
-        if pane.generation == 0 {
+        if sample {
+            // Same empty state as DIST / CORR: never send a request for display prices.
+            pane.report = None;
+            pane.loading = false;
+            pane.error = Some("No real data in sample / demo display mode. Seasonality never uses display or demo prices.".into());
+        } else if pane.generation == 0 {
             pane.request(id, &self.worker);
         }
         let mut reload = false;
         ui.horizontal_wrapped(|ui| {
-            ui.label(RichText::new("SEASONALITY STUDIO").font(theme::mono(14.0)).color(theme::amber()));
+            super::studio_dist::studio_title(ui, "SEASONALITY STUDIO");
             if ui.small_button("Reload").clicked() {
                 reload = true;
             }
@@ -97,67 +102,71 @@ impl TerminalApp {
                 }
             }
         });
-        if reload {
+        if reload && !sample {
             pane.request(id, &self.worker);
         }
-        if sample {
-            ui.colored_label(
-                theme::muted(),
-                "No real data in sample mode. Seasonality never uses display or demo prices.",
-            );
-        }
-        if let Some(e) = &pane.error {
-            ui.colored_label(theme::down(), e);
-        }
-        if pane.loading {
-            ui.label("Reading verified closed bars…");
-        }
+        super::studio_dist::studio_states(ui, pane.loading, pane.error.as_deref(), None);
         if let Some(r) = &pane.report {
-            ui.label(
-                RichText::new(format!(
-                    "{} · {} · {} · {} bars {} · {} … {}",
-                    r.symbol,
-                    r.provenance.label(),
-                    r.source,
-                    r.bars,
-                    r.timeframe.label(),
-                    r.start,
-                    r.end
-                ))
-                .small()
-                .color(theme::muted()),
-            );
-            ui.label(
-                RichText::new(format!(
-                    "Source observed {} UTC",
-                    chrono::DateTime::from_timestamp(r.observed_at, 0).unwrap_or_default().format("%Y-%m-%d %H:%M")
-                ))
-                .small()
-                .color(theme::muted()),
-            );
-            ui.label(RichText::new(format!("Grey = n < {MIN_N} or incomplete. Hover for counts and details. All returns are observed; no extrapolation.")).small().color(theme::muted()));
-            ScrollArea::vertical().id_salt((id, "season-scroll")).show(ui, |ui| {
-                if r.timeframe.is_intraday() {
-                    intraday(ui, r);
-                } else {
-                    daily(ui, r);
-                }
-                forwards(ui, r);
-            });
+            ui.push_id(id, |ui| report_view(ui, id, r));
         }
         vec![]
     }
 }
 
+fn report_view(ui: &mut Ui, id: PaneId, r: &SeasonReport) {
+    super::studio_dist::gap_warning(ui, &r.gaps);
+    ui.label(
+        RichText::new(format!(
+            "{} · {} · {} {} bars · {} … {}",
+            tr_data::security(&r.symbol).ticker,
+            r.provenance.label(),
+            r.bars,
+            r.timeframe.label(),
+            r.start,
+            r.end
+        ))
+        .font(theme::mono(11.0))
+        .color(theme::muted()),
+    );
+    ui.label(
+        RichText::new(format!(
+            "{} · observed {} UTC",
+            r.source,
+            chrono::DateTime::from_timestamp(r.observed_at, 0).unwrap_or_default().format("%Y-%m-%d %H:%M")
+        ))
+        .font(theme::mono(10.5))
+        .color(theme::muted()),
+    );
+    ui.label(
+        RichText::new(format!(
+            "Grey = small sample (n < {MIN_N}) or incomplete. Calendar buckets use New York exchange dates. \
+             Hover for counts and details. All returns are observed; no extrapolation."
+        ))
+        .small()
+        .color(theme::muted()),
+    );
+    ScrollArea::vertical().id_salt((id, "season-scroll")).auto_shrink([false, false]).show(ui, |ui| {
+        if r.timeframe.is_intraday() {
+            intraday(ui, r);
+        } else {
+            daily(ui, r);
+        }
+        forwards(ui, r);
+    });
+}
+
 fn pct(v: Option<f64>) -> String {
     v.map(|v| format!("{:+.2}%", v * 100.0)).unwrap_or_else(|| "—".into())
+}
+/// Hit rates are shares, not signed returns.
+fn rate(v: Option<f64>) -> String {
+    v.map(|v| format!("{:.1}%", v * 100.0)).unwrap_or_else(|| "—".into())
 }
 fn num(v: Option<f64>) -> String {
     v.map(|v| format!("{v:.2}")).unwrap_or_else(|| "—".into())
 }
 fn heading(ui: &mut Ui, label: &str) {
-    ui.add_space(10.0);
-    ui.label(RichText::new(label).strong().color(theme::text()));
+    super::studio_dist::studio_heading(ui, label);
 }
 fn color(v: f64) -> Color32 {
     if v >= 0.0 { theme::up() } else { theme::down() }
@@ -176,10 +185,10 @@ fn details(b: &Bucket) -> String {
         b.stats.count,
         pct(b.stats.mean),
         pct(b.stats.median),
-        pct(b.stats.win_rate),
+        rate(b.stats.win_rate),
         num(b.t_stat),
-        pct(b.stats.std),
-        if b.stats.count < MIN_N { "\nToo few observations; shown in grey." } else { "" }
+        b.stats.std.map(|s| format!("{:.2}%", s * 100.0)).unwrap_or_else(|| "—".into()),
+        if b.stats.count < MIN_N { "\nSmall sample (n < 10); shown in grey." } else { "" }
     )
 }
 
@@ -213,17 +222,26 @@ fn daily(ui: &mut Ui, r: &SeasonReport) {
     });
     heading(ui, "MONTH OF YEAR · completed monthly returns");
     profile(ui, &r.month_profile, "Mean monthly return", false);
-    hit_rates(ui, &r.month_profile);
-    profile_table(ui, &r.month_profile, "month-table");
+    hit_rates(ui, &r.month_profile, r.month_baseline.stats.win_rate);
+    profile_table(ui, &r.month_profile, "month-table", Some(&r.month_baseline));
     heading(ui, "DAY OF WEEK · close-to-close daily returns");
     profile(ui, &r.weekdays, "Mean daily return", false);
-    profile_table(ui, &r.weekdays, "weekday-table");
-    heading(ui, "TURN OF MONTH · last 3 + first 3 exchange sessions vs rest");
+    profile_table(ui, &r.weekdays, "weekday-table", Some(&r.baseline));
+    heading(ui, "TURN OF MONTH · last session (−1) through 3rd session (+3) vs rest");
     profile(ui, &r.turn_of_month, "Mean daily return", false);
-    profile_table(ui, &r.turn_of_month, "turn-table");
+    profile_table(ui, &r.turn_of_month, "turn-table", Some(&r.baseline));
     heading(ui, "WEEK OF MONTH · calendar days 1–7, 8–14, 15–21, 22–28, 29–31");
     profile(ui, &r.weeks, "Mean daily return", false);
-    profile_table(ui, &r.weeks, "week-table");
+    profile_table(ui, &r.weeks, "week-table", Some(&r.baseline));
+    ui.label(
+        RichText::new(
+            "Compare each bucket's hit rate and mean with the All row (every return in the sample), not with 50% / 0. \
+             t-stat = mean / (sample sd / √n), one-period non-overlapping returns; many buckets are tested at once, \
+             so |t| ≈ 2 is expected by chance somewhere.",
+        )
+        .small()
+        .color(theme::muted()),
+    );
 }
 
 /// Signed bar plot, with a shared zero axis and median markers.
@@ -303,8 +321,15 @@ fn profile(ui: &mut Ui, buckets: &[Bucket], axis: &str, dense: bool) {
     ui.label(RichText::new(format!("{axis} · cyan marker = median")).small().color(theme::muted()));
 }
 
-fn hit_rates(ui: &mut Ui, buckets: &[Bucket]) {
-    ui.label(RichText::new("Positive monthly returns · hit rate").small().color(theme::muted()));
+fn hit_rates(ui: &mut Ui, buckets: &[Bucket], baseline: Option<f64>) {
+    ui.label(
+        RichText::new(format!(
+            "Share of positive monthly returns · cyan line = all-months baseline {}",
+            rate(baseline)
+        ))
+        .small()
+        .color(theme::muted()),
+    );
     ScrollArea::horizontal().id_salt("season-hit-rate").show(ui, |ui| {
         let (outer, _) = ui.allocate_exact_size(vec2(ui.available_width().max(500.0), 125.0), Sense::hover());
         let plot = Rect::from_min_max(outer.min + vec2(45.0, 14.0), outer.max - vec2(8.0, 22.0));
@@ -318,6 +343,10 @@ fn hit_rates(ui: &mut Ui, buckets: &[Bucket]) {
                 theme::mono(9.0),
                 theme::muted(),
             );
+        }
+        if let Some(v) = baseline {
+            let y = plot.bottom() - plot.height() * v as f32;
+            ui.painter().line_segment([pos2(plot.left(), y), pos2(plot.right(), y)], Stroke::new(1.5, theme::cyan()));
         }
         let w = plot.width() / buckets.len().max(1) as f32;
         for (i, b) in buckets.iter().enumerate() {
@@ -354,24 +383,31 @@ fn hit_rates(ui: &mut Ui, buckets: &[Bucket]) {
     });
 }
 
-fn profile_table(ui: &mut Ui, buckets: &[Bucket], id: &str) {
+fn profile_table(ui: &mut Ui, buckets: &[Bucket], id: &str, baseline: Option<&Bucket>) {
     ScrollArea::horizontal().id_salt(id).show(ui, |ui| {
-        egui::Grid::new(id).striped(true).show(ui, |ui| {
+        egui::Grid::new(id).striped(true).spacing(vec2(14.0, 4.0)).show(ui, |ui| {
             for s in ["Bucket", "Mean", "Median", "Hit rate", "t-stat", "n"] {
-                ui.strong(s);
+                ui.label(RichText::new(s).font(theme::mono(10.0)).color(theme::muted()));
             }
             ui.end_row();
-            for b in buckets {
-                let c = if b.stats.count >= MIN_N { theme::text() } else { theme::muted() };
+            for (i, b) in buckets.iter().chain(baseline).enumerate() {
+                let is_baseline = i == buckets.len();
+                let c = if is_baseline {
+                    theme::cyan()
+                } else if b.stats.count >= MIN_N {
+                    theme::text()
+                } else {
+                    theme::muted()
+                };
                 for s in [
                     b.label.clone(),
                     pct(b.stats.mean),
                     pct(b.stats.median),
-                    pct(b.stats.win_rate),
+                    rate(b.stats.win_rate),
                     num(b.t_stat),
                     b.stats.count.to_string(),
                 ] {
-                    ui.colored_label(c, s);
+                    ui.label(RichText::new(s).font(theme::mono(11.0)).color(c));
                 }
                 ui.end_row();
             }
@@ -450,20 +486,24 @@ fn forwards(ui: &mut Ui, r: &SeasonReport) {
     heading(ui, "WHAT FOLLOWED · current calendar buckets vs every completed outcome");
     let month = math::MONTHS[r.current_month as usize - 1];
     let weekday = math::WEEKDAYS.get(r.current_weekday).copied().unwrap_or("Weekend");
-    ui.label(RichText::new(format!("Current NY month {month} / weekday {weekday}. Forward returns are close-to-close over 5/10/20 observed bars, including overnight gaps. Missing sessions invalidate crossing windows. Overlapping windows share future bars: effective n = n / H is an equivalent count, not independent evidence. t-stat is descriptive, without overlap correction.")).small().color(theme::muted()));
+    ui.label(RichText::new(format!("Current NY month {month} / weekday {weekday}. Forward returns are close-to-close over 5/10/20 observed bars, including overnight gaps. Missing sessions and vault gaps invalidate crossing windows. Overlapping windows share future bars, so naive iid t-statistics would overstate significance; the t-stat column uses only non-overlapping windows (each starting ≥ H bars after the previous one).")).small().color(theme::muted()));
     for f in &r.forwards {
         ui.push_id(f.horizon, |ui| {
             heading(ui, &format!("{} bars forward", f.horizon));
             let bs = [
-                Bucket { label: month.into(), stats: f.month.clone(), t_stat: None },
-                Bucket { label: weekday.into(), stats: f.weekday.clone(), t_stat: None },
-                Bucket { label: "Baseline".into(), stats: f.baseline.clone(), t_stat: None },
+                Bucket { label: month.into(), stats: f.month.clone(), t_stat: f.month_independent.t_stat },
+                Bucket { label: weekday.into(), stats: f.weekday.clone(), t_stat: f.weekday_independent.t_stat },
+                Bucket { label: "Baseline".into(), stats: f.baseline.clone(), t_stat: f.baseline_independent.t_stat },
             ];
-            profile_table(ui, &bs, "forward-table");
+            profile_table(ui, &bs, "forward-table", None);
             ui.label(
                 RichText::new(format!(
-                    "Effective n · month {:.1} · weekday {:.1} · baseline {:.1}",
-                    f.month.effective_count, f.weekday.effective_count, f.baseline.effective_count
+                    "t-stat on non-overlapping {h}-bar windows only · independent n: month {} · weekday {} · baseline {}. \
+                     Mean, median and hit rate use every (overlapping) window.",
+                    f.month_independent.n,
+                    f.weekday_independent.n,
+                    f.baseline_independent.n,
+                    h = f.horizon
                 ))
                 .small()
                 .color(theme::muted()),
@@ -607,6 +647,27 @@ mod tests {
             output.textures_delta.clear();
             assert!(!output.shapes.is_empty());
         }
+    }
+    #[test]
+    fn view_warns_when_series_spans_vault_gap() {
+        let mut bars = Vec::new();
+        for date in ["2026-11-09", "2026-11-12"] {
+            for ts in tr_data::intraday::regular_opens(date.parse().unwrap(), tr_core::Timeframe::M30) {
+                bars.push(
+                    tr_core::Bar::new(ts, 100.0, 101.0, 99.0, 100.5, 10.0).with_provenance(tr_core::Provenance::Real),
+                );
+            }
+        }
+        let gap = (bars[12].ts, bars[13].ts);
+        let now = bars.last().unwrap().ts + 1800;
+        let r = math::compute_with_gaps("X", tr_core::Timeframe::M30, &bars, "unit", now, now, &[gap]).unwrap();
+        assert_eq!(r.gaps, vec![gap]);
+        // No forward window crosses the gap: only same-session windows remain.
+        assert_eq!(r.forwards[0].baseline.count, 2 * (13 - 5));
+        let ctx = egui::Context::default();
+        let mut output = ctx.run_ui(Default::default(), |ui| report_view(ui, 1, &r));
+        output.textures_delta.clear();
+        assert!(format!("{:?}", output.shapes).contains("UNVERIFIED JOIN"));
     }
     #[test]
     fn season_command_and_new_panel_open_studio() {

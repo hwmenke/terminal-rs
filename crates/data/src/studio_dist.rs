@@ -114,8 +114,12 @@ pub struct Underwater {
     pub ts: i64,
     pub depth: f64,
     pub rolling_vol: Option<f64>,
-    /// Lagged 20-return volatility; None until a full preceding window exists.
+    /// Regime of the return ending here, from the lagged 20-return volatility
+    /// against point-in-time (expanding) terciles. None during warm-up or for a
+    /// bar whose return would span a vault gap.
     pub regime: Option<usize>,
+    /// Calm/Normal and Normal/Stressed thresholds in force for this bar.
+    pub thresholds: Option<[f64; 2]>,
 }
 #[derive(Debug, Clone, PartialEq)]
 pub struct RegimeStats {
@@ -147,9 +151,13 @@ pub struct Report {
     pub worst: Vec<ReturnPoint>,
     pub underwater: Vec<Underwater>,
     pub drawdowns: Vec<Drawdown>,
+    /// Expanding terciles as of the latest closed bar (all rolling vols so far).
     pub vol_terciles: Option<[f64; 2]>,
     pub regimes: [RegimeStats; 3],
     pub transitions: [[usize; 3]; 3],
+    /// Vault UNVERIFIED JOIN gaps `(last bar before, first bar after)` inside
+    /// the window. No return spans one; the UI must warn when non-empty.
+    pub gaps: Vec<(i64, i64)>,
 }
 
 /// Input must already be a closed-bar prefix. Gate the entire input before selecting a window.
@@ -160,6 +168,20 @@ pub fn compute(
     window: Window,
     source: &str,
     observed_at: Option<i64>,
+) -> Result<Report, String> {
+    compute_with_gaps(symbol, bars, tf, window, source, observed_at, &[])
+}
+
+/// As [`compute`], excluding any return whose price pair straddles one of the
+/// vault `gaps` (`StitchInfo::gaps`).
+pub fn compute_with_gaps(
+    symbol: &str,
+    bars: &[Bar],
+    tf: Timeframe,
+    window: Window,
+    source: &str,
+    observed_at: Option<i64>,
+    gaps: &[(i64, i64)],
 ) -> Result<Report, String> {
     crate::stats::require_research_bars(bars, "Distribution Studio")?;
     parse_timeframe(tf.label())?;
@@ -176,8 +198,21 @@ pub fn compute(
     if bars.len() < 5 {
         return Err("Distribution Studio needs at least 5 verified closed bars (4 log returns) in this window.".into());
     }
-    let returns: Vec<_> =
-        bars.windows(2).map(|w| ReturnPoint { ts: w[1].ts, value: w[1].close.ln() - w[0].close.ln() }).collect();
+    // Vault "UNVERIFIED JOIN" gaps inside the selected window. No return spans one.
+    let gaps: Vec<(i64, i64)> =
+        gaps.iter().copied().filter(|g| g.1 > bars[0].ts && g.0 < bars[bars.len() - 1].ts).collect();
+    let mut bar_return = vec![None; bars.len()];
+    let mut returns = Vec::with_capacity(bars.len());
+    for i in 1..bars.len() {
+        if spans_gap(&gaps, bars[i - 1].ts, bars[i].ts) {
+            continue;
+        }
+        bar_return[i] = Some(returns.len());
+        returns.push(ReturnPoint { ts: bars[i].ts, value: bars[i].close.ln() - bars[i - 1].close.ln() });
+    }
+    if returns.len() < 4 {
+        return Err("Distribution Studio needs at least 4 log returns that do not span a vault gap.".into());
+    }
     let values: Vec<_> = returns.iter().map(|r| r.value).collect();
     let sec = crate::security(symbol);
     let annual = periods_per_year(tf, sec.class);
@@ -237,21 +272,26 @@ pub fn compute(
         let mean = xs.iter().sum::<f64>() / VOL_WINDOW as f64;
         vol[i] = Some(population_sigma(xs, mean) * (VOL_WINDOW as f64 / (VOL_WINDOW - 1) as f64 * annual).sqrt());
     }
-    let mut vol_sorted: Vec<_> = vol.iter().flatten().copied().collect();
-    vol_sorted.sort_by(f64::total_cmp);
-    let terciles =
-        (!vol_sorted.is_empty()).then(|| [quantile(&vol_sorted, 1.0 / 3.0), quantile(&vol_sorted, 2.0 / 3.0)]);
+    // Expanding (point-in-time) terciles: thresholds[r] use only rolling vols
+    // known when return r begins, i.e. vol[..r]. No future volatility is used.
+    // thresholds has vol.len() + 1 entries; the last one is "as of the latest
+    // closed bar" and would classify the next (not yet observed) return.
+    let thresholds = expanding_terciles(&vol);
+    let terciles = thresholds[vol.len()];
     let mut regime_values: [Vec<f64>; 3] = std::array::from_fn(|_| Vec::new());
     let mut transitions = [[0; 3]; 3];
     let mut previous: Option<usize> = None;
-    let mut underwater = vec![Underwater { ts: bars[0].ts, depth: 0.0, rolling_vol: None, regime: None }];
+    let mut underwater =
+        vec![Underwater { ts: bars[0].ts, depth: 0.0, rolling_vol: None, regime: None, thresholds: None }];
     let mut peak = 0;
     let mut trough = 0;
     let mut drawdowns = Vec::new();
     for i in 1..bars.len() {
-        let r = i - 1;
-        let regime = r.checked_sub(1).and_then(|p| vol[p]).zip(terciles).map(|(v, [a, b])| {
-            if a == b {
+        let r = bar_return[i];
+        let regime = r.and_then(|r| {
+            let v = vol[r.checked_sub(1)?]?;
+            let [a, b] = thresholds[r]?;
+            Some(if a == b {
                 1
             } else if v <= a {
                 0
@@ -259,14 +299,15 @@ pub fn compute(
                 1
             } else {
                 2
-            }
+            })
         });
-        if let Some(k) = regime {
+        if let (Some(k), Some(r)) = (regime, r) {
             regime_values[k].push(values[r]);
             if let Some(p) = previous {
                 transitions[p][k] += 1;
             }
         }
+        // A gap (or warm-up) breaks the adjacency chain for transitions.
         previous = regime;
         if bars[i].close >= bars[peak].close {
             if trough > peak {
@@ -280,8 +321,9 @@ pub fn compute(
         underwater.push(Underwater {
             ts: bars[i].ts,
             depth: bars[i].close / bars[peak].close - 1.0,
-            rolling_vol: vol[r],
+            rolling_vol: r.and_then(|r| vol[r]),
             regime,
+            thresholds: r.and_then(|r| thresholds[r]),
         });
     }
     if trough > peak {
@@ -325,7 +367,66 @@ pub fn compute(
         vol_terciles: terciles,
         regimes,
         transitions,
+        gaps,
     })
+}
+
+/// True when the price pair `(from, to)` straddles a vault UNVERIFIED JOIN gap.
+pub fn spans_gap(gaps: &[(i64, i64)], from: i64, to: i64) -> bool {
+    gaps.iter().any(|&(before, after)| from <= before && to >= after)
+}
+
+/// Minimum number of observed rolling vols before regime thresholds exist.
+pub const REGIME_MIN_HISTORY: usize = VOL_WINDOW;
+
+/// Point-in-time type-7 terciles: entry `r` uses only `vol[..r]` (vols known
+/// before return `r` is realised). Length is `vol.len() + 1`. O(n log n) via a
+/// Fenwick tree over value ranks; ranks are only an index, never a threshold.
+fn expanding_terciles(vol: &[Option<f64>]) -> Vec<Option<[f64; 2]>> {
+    let mut order: Vec<usize> = (0..vol.len()).filter(|&i| vol[i].is_some()).collect();
+    order.sort_by(|&a, &b| vol[a].unwrap().total_cmp(&vol[b].unwrap()).then(a.cmp(&b)));
+    let sorted: Vec<f64> = order.iter().map(|&i| vol[i].unwrap()).collect();
+    let mut rank = vec![0usize; vol.len()];
+    for (k, &i) in order.iter().enumerate() {
+        rank[i] = k;
+    }
+    let n = sorted.len();
+    let mut tree = vec![0usize; n + 1];
+    let mut count = 0usize;
+    // k-th smallest (0-based) inserted value.
+    let kth = |tree: &[usize], mut k: usize| -> f64 {
+        let mut pos = 0;
+        let mut step = n.next_power_of_two();
+        while step > 0 {
+            if pos + step <= n && tree[pos + step] <= k {
+                pos += step;
+                k -= tree[pos];
+            }
+            step /= 2;
+        }
+        sorted[pos]
+    };
+    let at = |tree: &[usize], count: usize, p: f64| -> f64 {
+        let index = (count - 1) as f64 * p;
+        let (lo, hi) = (index.floor() as usize, index.ceil() as usize);
+        let (a, b) = (kth(tree, lo), kth(tree, hi));
+        a + (b - a) * index.fract()
+    };
+    let mut out = Vec::with_capacity(vol.len() + 1);
+    for r in 0..=vol.len() {
+        out.push(
+            (count >= REGIME_MIN_HISTORY).then(|| [at(&tree, count, 1.0 / 3.0), at(&tree, count, 2.0 / 3.0)]),
+        );
+        if r < vol.len() && vol[r].is_some() {
+            let mut i = rank[r] + 1;
+            while i <= n {
+                tree[i] += 1;
+                i += 1 << i.trailing_zeros();
+            }
+            count += 1;
+        }
+    }
+    out
 }
 
 fn episode(bars: &[Bar], peak: usize, trough: usize, recovery: Option<usize>) -> Drawdown {
@@ -352,11 +453,13 @@ fn quantile(xs: &[f64], p: f64) -> f64 {
     xs[lo] + (xs[hi] - xs[lo]) * index.fract()
 }
 
-/// Exact lower-tail integral of the empirical distribution, with fractional boundary weight.
+/// Historical ES: minus the mean of every return at or below the VaR quantile
+/// (the same type-7 quantile as VaR), so ES ≥ VaR always. Sorted input.
 fn expected_shortfall(xs: &[f64], alpha: f64) -> f64 {
-    let mass = xs.len() as f64 * alpha;
-    let whole = mass.floor() as usize;
-    -(xs[..whole].iter().sum::<f64>() + xs[whole.min(xs.len() - 1)] * mass.fract()) / mass
+    let q = quantile(xs, alpha);
+    // The minimum is always ≤ the type-7 quantile, so the tail is never empty.
+    let tail = &xs[..xs.partition_point(|x| *x <= q).max(1)];
+    -tail.iter().sum::<f64>() / tail.len() as f64
 }
 
 pub fn describe(values: &[f64], annual: f64) -> Result<Moments, String> {
@@ -508,13 +611,109 @@ mod tests {
         assert!(m.student_df.is_none());
     }
     #[test]
-    fn empirical_shortfall_fractional_boundary() {
-        near(expected_shortfall(&[-4.0, -2.0, 1.0, 3.0], 0.375), 10.0 / 3.0);
+    fn shortfall_is_mean_of_tail_beyond_var_and_never_below_var() {
+        // q(0.375) on 4 points: index 1.125 → -2 + 3*0.125 = -1.625; tail = {-4, -2}.
+        near(quantile(&[-4.0, -2.0, 1.0, 3.0], 0.375), -1.625);
+        near(expected_shortfall(&[-4.0, -2.0, 1.0, 3.0], 0.375), 3.0);
         near(quantile(&[1.0, 2.0, 3.0, 4.0], 0.25), 1.75);
+        // Deterministic heavy-ish tailed sample: ES ≥ VaR, and equals the tail mean.
+        let xs: Vec<f64> = (0..997).map(|i| ((i * 7919 % 997) as f64 / 997.0 - 0.5).powi(3)).collect();
+        let m = describe(&xs, 252.0).unwrap();
+        for (var, es, a) in [(m.var95, m.cvar95, 0.05), (m.var99, m.cvar99, 0.01)] {
+            assert!(es >= var, "ES {es} < VaR {var}");
+            let tail: Vec<_> = xs.iter().filter(|x| **x <= -var).collect();
+            near(es, -tail.iter().copied().sum::<f64>() / tail.len() as f64);
+            assert!(tail.len() as f64 <= xs.len() as f64 * a + 1.0);
+        }
+    }
+    #[test]
+    fn jarque_bera_matches_chi_square_two_survival() {
+        // χ²(2) survival is exactly exp(-x/2); 5.991 is the 95% critical value.
+        let xs: Vec<f64> = (0..400).map(|i| if i % 20 == 0 { 0.05 } else { (i % 7) as f64 * 0.001 - 0.003 }).collect();
+        let m = describe(&xs, 252.0).unwrap();
+        let n = xs.len() as f64;
+        let mean = xs.iter().sum::<f64>() / n;
+        let m2 = xs.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / n;
+        let m3 = xs.iter().map(|x| (x - mean).powi(3)).sum::<f64>() / n;
+        let m4 = xs.iter().map(|x| (x - mean).powi(4)).sum::<f64>() / n;
+        let (g1, g2) = (m3 / m2.powf(1.5), m4 / (m2 * m2) - 3.0);
+        assert!((m.skew.unwrap() - g1).abs() < 1e-9);
+        assert!((m.excess_kurtosis.unwrap() - g2).abs() < 1e-9);
+        let jb = n / 6.0 * (g1 * g1 + g2 * g2 / 4.0);
+        assert!((m.jarque_bera.unwrap() - jb).abs() < 1e-6 * jb);
+        assert!((m.jb_p_value.unwrap() - (-jb / 2.0).exp()).abs() < 1e-12);
+        assert!(((-5.991_f64 / 2.0).exp() - 0.05).abs() < 1e-4);
+    }
+    fn regime_prices() -> Vec<f64> {
+        // 120 calm returns (±0.2%), then 80 stressed returns (±4%).
+        let mut log = 4.0;
+        let mut out = vec![log];
+        for i in 0..200 {
+            let size = if i < 120 { 0.002 * (1.0 + 0.6 * (i as f64 * 0.23).sin()) } else { 0.04 };
+            log += if i % 2 == 0 { size } else { -size };
+            out.push(log);
+        }
+        out.into_iter().map(f64::exp).collect()
+    }
+    #[test]
+    fn regimes_have_no_look_ahead_prefix_invariance() {
+        let full = bars(&regime_prices());
+        let all = report(&full).unwrap();
+        // A full-sample tercile would put every pre-break return in Calm (the
+        // later stressed vols dominate the upper terciles). Point-in-time terciles
+        // see only the calm past, so the calm era spans all three labels.
+        let pre: Vec<_> = all.underwater[..=120].iter().filter_map(|u| u.regime).collect();
+        assert!(pre.contains(&0) && pre.contains(&2), "{pre:?}");
+        // Classifications for any prefix are unchanged by appending future bars.
+        for k in [60, 121, 140] {
+            let part = report(&full[..k]).unwrap();
+            for (a, b) in part.underwater.iter().zip(&all.underwater) {
+                assert_eq!((a.ts, a.regime, a.thresholds), (b.ts, b.regime, b.thresholds));
+            }
+        }
+        // The first stressed lagged vols exceed every threshold seen so far.
+        assert_eq!(all.underwater[125].regime, Some(2));
+        // Warm-up: 20 returns for the first vol, then REGIME_MIN_HISTORY vols.
+        let first = all.underwater.iter().position(|u| u.regime.is_some()).unwrap();
+        assert_eq!(first, VOL_WINDOW + REGIME_MIN_HISTORY);
+    }
+    #[test]
+    fn expanding_terciles_match_sorted_type7_quantiles() {
+        let vol: Vec<Option<f64>> =
+            (0..90).map(|i| (i >= 3).then(|| ((i * 37 % 89) as f64).sin().abs())).collect();
+        let t = expanding_terciles(&vol);
+        assert_eq!(t.len(), vol.len() + 1);
+        for (r, got) in t.iter().enumerate() {
+            let mut seen: Vec<f64> = vol[..r].iter().flatten().copied().collect();
+            seen.sort_by(f64::total_cmp);
+            if seen.len() < REGIME_MIN_HISTORY {
+                assert!(got.is_none());
+            } else {
+                let [a, b] = got.unwrap();
+                near(a, quantile(&seen, 1.0 / 3.0));
+                near(b, quantile(&seen, 2.0 / 3.0));
+            }
+        }
+    }
+    #[test]
+    fn no_return_spans_a_vault_gap() {
+        let bs = bars(&[100.0, 101.0, 102.0, 103.0, 50.0, 51.0, 52.0, 53.0]);
+        let gap = (bs[3].ts, bs[4].ts);
+        let r = compute_with_gaps("AAPL", &bs, Timeframe::D1, Window::All, "unit", None, &[gap]).unwrap();
+        assert_eq!(r.gaps, vec![gap]);
+        assert_eq!(r.returns.len(), 6);
+        assert!(r.returns.iter().all(|p| p.ts != bs[4].ts));
+        assert!(r.moments.var99 < 0.05, "the -69% gap pair must not be a return");
+        assert!(r.underwater[4].regime.is_none() && r.underwater[4].rolling_vol.is_none());
+        // Gaps outside the window are not reported.
+        let outside = (bs[0].ts - 10 * 86_400, bs[0].ts - 86_400);
+        let r = compute_with_gaps("AAPL", &bs, Timeframe::D1, Window::All, "unit", None, &[outside]).unwrap();
+        assert!(r.gaps.is_empty());
+        assert_eq!(r.returns.len(), 7);
     }
     #[test]
     fn zero_variance_is_honest() {
-        let r = report(&bars(&[10.0; 30])).unwrap();
+        let r = report(&bars(&[10.0; 60])).unwrap();
         assert_eq!(r.moments.sigma, 0.0);
         assert_eq!(r.moments.skew, None);
         assert_eq!(r.moments.jb_p_value, None);
@@ -522,8 +721,9 @@ mod tests {
         assert_eq!(r.moments.tail_ratio, None);
         assert_eq!(r.moments.beyond2, None);
         assert!(r.drawdowns.is_empty());
-        assert_eq!(r.regimes[1].n, 9);
-        assert_eq!(r.transitions[1][1], 8);
+        // 59 returns; regimes from return 39 (20-return vol + 20 vols of history).
+        assert_eq!(r.regimes[1].n, 20);
+        assert_eq!(r.transitions[1][1], 19);
     }
     #[test]
     fn rejects_short_nan_overflow_and_bad_period() {
@@ -585,11 +785,13 @@ mod tests {
         let prices: Vec<_> =
             (0..100).map(|i| (5.0 + (i as f64 * 0.9).sin() * (i / 25 + 1) as f64 * 0.01).exp()).collect();
         let r = report(&bars(&prices)).unwrap();
-        assert!(r.underwater[..=20].iter().all(|p| p.regime.is_none()));
-        assert!(r.underwater[21].regime.is_some());
-        assert_eq!(r.regimes.iter().map(|s| s.n).sum::<usize>(), 79);
-        assert_eq!(r.transitions.iter().flatten().sum::<usize>(), 78);
-        assert!(r.regimes.iter().all(|s| s.n > 0));
+        assert!(r.underwater[..40].iter().all(|p| p.regime.is_none()));
+        assert!(r.underwater[40].regime.is_some());
+        assert_eq!(r.regimes.iter().map(|s| s.n).sum::<usize>(), 60);
+        assert_eq!(r.transitions.iter().flatten().sum::<usize>(), 59);
+        // Volatility steps up every 25 bars, so judged only against its past the
+        // series is mostly Stressed (full-sample terciles would force ~1/3 each).
+        assert!(r.regimes[2].n > r.regimes[0].n, "{:?}", r.regimes);
         let xs: Vec<_> = r.returns[..20].iter().map(|p| p.value).collect();
         near(r.underwater[20].rolling_vol.unwrap(), describe(&xs, 252.0).unwrap().annual_vol);
     }

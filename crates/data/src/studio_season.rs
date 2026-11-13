@@ -8,7 +8,8 @@ use crate::history::calendar::{is_session, last_expected_session, next_session};
 use crate::intraday::{close_minute, regular_bucket, regular_opens};
 use crate::stats::{ReturnStats, describe, require_research_bars};
 
-pub const MIN_N: usize = 3;
+/// Buckets with fewer observations are flagged as small samples (greyed out).
+pub const MIN_N: usize = 10;
 pub const MONTHS: [&str; 12] = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
 pub const WEEKDAYS: [&str; 5] = ["Mon", "Tue", "Wed", "Thu", "Fri"];
 
@@ -20,9 +21,19 @@ pub struct Bucket {
     pub t_stat: Option<f64>,
 }
 
+/// Zero variance up to rounding: constant returns can leave an sd of ~1e-17,
+/// which would otherwise produce an absurd t-statistic.
+fn nonzero_sd(sd: f64, mean: f64) -> bool {
+    sd > 64.0 * f64::EPSILON * mean.abs() && sd > 0.0
+}
+
 fn bucket(label: impl Into<String>, values: &[f64]) -> Bucket {
     let stats = describe(values, 1);
-    let t_stat = stats.std.filter(|s| *s > 0.0).zip(stats.mean).map(|(s, m)| m / s * (stats.count as f64).sqrt());
+    let t_stat = stats
+        .std
+        .zip(stats.mean)
+        .filter(|&(s, m)| nonzero_sd(s, m))
+        .map(|(s, m)| m / s * (stats.count as f64).sqrt());
     Bucket { label: label.into(), stats, t_stat }
 }
 
@@ -46,12 +57,44 @@ pub struct ClockBucket {
     pub weekdays: Vec<Bucket>,
 }
 
+/// Inference on overlapping forward windows: only non-overlapping windows
+/// (greedy, chronological, each starting ≥ H bars after the last kept start)
+/// enter the mean/t-statistic, so observations do not share future bars.
+#[derive(Debug, Clone, PartialEq)]
+pub struct NonOverlap {
+    pub n: usize,
+    pub mean: Option<f64>,
+    /// mean / (sample sd / √n) on the non-overlapping windows; None for n < 2 or zero sd.
+    pub t_stat: Option<f64>,
+}
+
+fn non_overlapping(starts: &[(usize, f64)], h: usize) -> NonOverlap {
+    let mut kept = Vec::new();
+    let mut next = 0usize;
+    for &(i, r) in starts {
+        if i >= next {
+            kept.push(r);
+            next = i + h;
+        }
+    }
+    let n = kept.len();
+    let mean = (n > 0).then(|| kept.iter().sum::<f64>() / n as f64);
+    let t_stat = mean.filter(|_| n > 1).and_then(|m| {
+        let sd = (kept.iter().map(|x| (x - m).powi(2)).sum::<f64>() / (n - 1) as f64).sqrt();
+        nonzero_sd(sd, m).then(|| m / sd * (n as f64).sqrt()).filter(|t| t.is_finite())
+    });
+    NonOverlap { n, mean, t_stat }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct ForwardCompare {
     pub horizon: usize,
     pub month: ReturnStats,
     pub weekday: ReturnStats,
     pub baseline: ReturnStats,
+    pub month_independent: NonOverlap,
+    pub weekday_independent: NonOverlap,
+    pub baseline_independent: NonOverlap,
     /// Actual completed outcomes, retained for distribution charts.
     pub month_values: Vec<f64>,
     pub weekday_values: Vec<f64>,
@@ -77,6 +120,13 @@ pub struct SeasonReport {
     pub weeks: Vec<Bucket>,
     pub clock: Vec<ClockBucket>,
     pub forwards: Vec<ForwardCompare>,
+    /// Every one-period return (daily close-to-close or intraday bar), the
+    /// unconditional reference for weekday / week / turn-of-month buckets.
+    pub baseline: Bucket,
+    /// Every completed calendar month, the reference for month-of-year buckets.
+    pub month_baseline: Bucket,
+    /// Vault UNVERIFIED JOIN gaps inside the analysed range; nothing spans one.
+    pub gaps: Vec<(i64, i64)>,
 }
 
 pub fn parse_timeframe(spec: &str) -> Result<Timeframe, String> {
@@ -122,6 +172,20 @@ pub fn compute_at(
     source: &str,
     observed: i64,
     now: i64,
+) -> Result<SeasonReport, String> {
+    compute_with_gaps(symbol, tf, input, source, observed, now, &[])
+}
+
+/// As [`compute_at`], treating every vault UNVERIFIED JOIN gap as a break: no
+/// return or forward window spans one.
+pub fn compute_with_gaps(
+    symbol: &str,
+    tf: Timeframe,
+    input: &[Bar],
+    source: &str,
+    observed: i64,
+    now: i64,
+    gaps: &[(i64, i64)],
 ) -> Result<SeasonReport, String> {
     parse_timeframe(tf.label())?;
     require_research_bars(input, "Seasonality")?;
@@ -184,8 +248,11 @@ pub fn compute_at(
                 .or_else(|| regular_opens(next_session(dates[i - 1]), tf).first().copied());
             next == Some(bars[i].ts)
         };
+        let adjacent = adjacent && !crate::studio_dist::spans_gap(gaps, bars[i - 1].ts, bars[i].ts);
         breaks[i] = breaks[i - 1] + usize::from(!adjacent);
     }
+    let (first_ts, last_ts) = (bars[0].ts, bars[bars.len() - 1].ts);
+    let gaps: Vec<(i64, i64)> = gaps.iter().copied().filter(|g| g.1 > first_ts && g.0 < last_ts).collect();
     let returns: Vec<Option<f64>> = (0..bars.len())
         .map(|i| {
             let r = if tf.is_intraday() {
@@ -211,7 +278,10 @@ pub fn compute_at(
             weeks[((d.day() - 1) / 7) as usize].push(r);
             let sessions = month_sessions(*d);
             let rank = sessions.iter().position(|day| day == d).unwrap();
-            turn[usize::from(rank >= 3 && rank + 3 < sessions.len())].push(r);
+            // Standard turn-of-month window (Lakonishok–Smidt): the last session
+            // of the month (−1) through the third session of the month (+3).
+            let tom = rank < 3 || rank + 1 == sessions.len();
+            turn[usize::from(!tom)].push(r);
         }
         if tf == Timeframe::D1 {
             month_data.entry((d.year(), d.month())).or_default().push(i);
@@ -284,6 +354,7 @@ pub fn compute_at(
         let mut baseline = Vec::new();
         let mut month = Vec::new();
         let mut weekday = Vec::new();
+        let mut starts: [Vec<(usize, f64)>; 3] = Default::default();
         for i in 0..bars.len().saturating_sub(h) {
             if breaks[i] != breaks[i + h] {
                 continue;
@@ -293,11 +364,14 @@ pub fn compute_at(
                 continue;
             }
             baseline.push(r);
+            starts[2].push((i, r));
             if dates[i].month() == today.month() {
                 month.push(r);
+                starts[0].push((i, r));
             }
             if dates[i].weekday() == today.weekday() {
                 weekday.push(r);
+                starts[1].push((i, r));
             }
         }
         forwards.push(ForwardCompare {
@@ -305,6 +379,9 @@ pub fn compute_at(
             month: describe(&month, h),
             weekday: describe(&weekday, h),
             baseline: describe(&baseline, h),
+            month_independent: non_overlapping(&starts[0], h),
+            weekday_independent: non_overlapping(&starts[1], h),
+            baseline_independent: non_overlapping(&starts[2], h),
             month_values: month,
             weekday_values: weekday,
             baseline_values: baseline,
@@ -325,9 +402,12 @@ pub fn compute_at(
         month_profile: monthly.iter().zip(MONTHS).map(|(v, l)| bucket(l, v)).collect(),
         weekdays: weekdays.iter().zip(WEEKDAYS).map(|(v, l)| bucket(l, v)).collect(),
         weeks: weeks.iter().enumerate().map(|(i, v)| bucket(format!("W{}", i + 1), v)).collect(),
-        turn_of_month: turn.iter().zip(["Last 3 + first 3", "Rest"]).map(|(v, l)| bucket(l, v)).collect(),
+        turn_of_month: turn.iter().zip(["TOM −1…+3", "Rest"]).map(|(v, l)| bucket(l, v)).collect(),
         clock,
         forwards,
+        baseline: bucket("All", &returns.iter().flatten().copied().collect::<Vec<_>>()),
+        month_baseline: bucket("All months", &monthly.concat()),
+        gaps,
     })
 }
 
@@ -372,7 +452,43 @@ mod tests {
         assert!((r.forwards[0].baseline.mean.unwrap() - (1.01_f64.powi(5) - 1.0)).abs() < 1e-12);
         assert_eq!(r.forwards[0].baseline.effective_count, (b.len() - 5) as f64 / 5.0);
         assert_eq!(r.turn_of_month.iter().map(|b| b.stats.count).sum::<usize>(), b.len() - 1);
-        assert_eq!(r.turn_of_month[0].stats.count, 12);
+        // TOM −1…+3: Jan 2–6 (first 3) + Jan 30 (last) and Feb 2–4 + Feb 27 = 8
+        // (Dec 31 is the first bar and has no return).
+        assert_eq!(r.turn_of_month[0].stats.count, 8);
+        assert_eq!(r.baseline.stats.count, b.len() - 1);
+        assert_eq!(r.month_baseline.stats.count, 2);
+    }
+    #[test]
+    fn forward_t_stats_use_only_non_overlapping_windows() {
+        let starts: Vec<(usize, f64)> = (0..20).map(|i| (i, if i % 2 == 0 { 0.02 } else { 0.0 })).collect();
+        // h=5 keeps starts 0, 5, 10, 15 → values 0.02, 0.0, 0.02, 0.0.
+        let n = non_overlapping(&starts, 5);
+        assert_eq!(n.n, 4);
+        assert!((n.mean.unwrap() - 0.01).abs() < 1e-12);
+        let sd = (4.0 * 0.0001_f64 / 3.0).sqrt();
+        assert!((n.t_stat.unwrap() - 0.01 / sd * 2.0).abs() < 1e-9);
+        // Gapped condition: starts 0,1,2 then 9 — 0 and 9 kept for h=5.
+        let gapped = non_overlapping(&[(0, 0.01), (1, 0.02), (2, 0.03), (9, 0.05)], 5);
+        assert_eq!(gapped.n, 2);
+        // In the report, a naive t over all 5-bar windows would use n=count;
+        // the independent count is ≈ count / h.
+        let r = report(&daily()).unwrap();
+        let f = &r.forwards[0];
+        assert_eq!(f.baseline_independent.n, f.baseline.count.div_ceil(5));
+        // Constant growth: zero sd, so no t-stat at all rather than infinity.
+        assert!(f.baseline_independent.t_stat.is_none());
+    }
+    #[test]
+    fn vault_gap_breaks_returns_and_is_reported() {
+        let b = daily();
+        let gap = (b[9].ts, b[10].ts);
+        let r = compute_with_gaps("X", Timeframe::D1, &b, "test", now(), now(), &[gap]).unwrap();
+        assert_eq!(r.gaps, vec![gap]);
+        assert_eq!(r.baseline.stats.count, b.len() - 2);
+        // No 5-bar forward window starting at 5..=9 spans the gap.
+        assert_eq!(r.forwards[0].baseline.count, b.len() - 5 - 5);
+        // January is no longer a complete month.
+        assert!(r.months.iter().find(|c| c.month == 1).unwrap().value.is_none());
     }
     #[test]
     fn incomplete_months_and_missing_sessions_are_not_extrapolated() {

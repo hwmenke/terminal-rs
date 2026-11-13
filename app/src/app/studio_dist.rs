@@ -119,12 +119,13 @@ pub(crate) async fn build_report(
     window: Window,
     source: String,
     observed_at: Option<i64>,
+    gaps: Vec<(i64, i64)>,
 ) -> Result<Report, String> {
     tokio::task::spawn_blocking(move || {
         // Verify even the pending bar: contaminated inputs must never be silently trimmed away.
         tr_data::stats::require_research_bars(&bars, "Distribution Studio")?;
         let closed = tr_data::closed::closed_len(timeframe, &bars, tr_data::security(&symbol).class, observed_at);
-        dist::compute(&symbol, &bars[..closed], timeframe, window, &source, observed_at)
+        dist::compute_with_gaps(&symbol, &bars[..closed], timeframe, window, &source, observed_at, &gaps)
     })
     .await
     .map_err(|e| format!("Distribution Studio worker: {e}"))?
@@ -148,8 +149,8 @@ impl TerminalApp {
         }
         let mut reload = false;
         ui.horizontal_wrapped(|ui| {
-            ui.label(RichText::new("DISTRIBUTION STUDIO").font(mono(14.0)).strong().color(theme::cyan()));
-            reload |= ui.small_button("Refresh").clicked();
+            studio_title(ui, "DISTRIBUTION STUDIO");
+            reload |= ui.small_button("Reload").clicked();
         });
         ui.horizontal_wrapped(|ui| {
             let input = ui.add(egui::TextEdit::singleline(&mut pane.symbol).desired_width(dp(105.0)).hint_text("AAPL"));
@@ -177,58 +178,71 @@ impl TerminalApp {
         if reload && !sample {
             pane.request(id, &self.worker);
         }
-        if pane.loading {
-            ui.label(RichText::new("Reading verified closed bars…").color(muted()));
-        }
-        if let Some(e) = &pane.error {
-            ui.label(RichText::new(e).color(theme::down()));
-        }
+        studio_states(ui, pane.loading, pane.error.as_deref(), None);
         if let Some(r) = &pane.report {
-            ui.label(
-                RichText::new(format!(
-                    "{} · {} · {} closed bars / {} returns · {} to {}",
-                    r.provenance.label(),
-                    r.timeframe.label(),
-                    r.bars,
-                    r.moments.n,
-                    date(r.start),
-                    date(r.end)
-                ))
-                .font(mono(11.0))
-                .color(muted()),
-            );
-            ui.label(RichText::new(&r.source).font(mono(10.5)).color(muted()));
-            ui.label(
-                RichText::new(format!(
-                    "{}: {} · {} shows available coverage; missing bars are never filled.",
-                    if r.timeframe == Timeframe::D1 { "Archive read / closure clock" } else { "Feed observation" },
-                    r.observed_at.map(stamp).unwrap_or_else(|| "unavailable; final bar withheld".into()),
-                    r.window.label()
-                ))
-                .size(11.0)
-                .color(muted()),
-            );
-            egui::ScrollArea::vertical().id_salt((id,"dist-scroll")).auto_shrink([false,false]).show(ui,|ui| {
-                metric_cards(ui,r);
-                ui.add_space(dp(6.0));
-                if ui.available_width()>dp(800.0) {
-                    ui.columns(2,|columns| { histogram(&mut columns[0],r); qq(&mut columns[1],r); });
-                } else { histogram(ui,r); qq(ui,r); }
-                tail_rates(ui,r);
-                underwater(ui,r);
-                volatility(ui,r);
-                drawdown_table(ui,r);
-                regime_table(ui,r);
-                ui.horizontal_wrapped(|ui| {
-                    heading(ui,"BEST / WORST CLOSED BAR RETURNS");
-                    ui.add(egui::DragValue::new(&mut pane.best_k).range(1..=dist::EXTREMES).prefix("k = "));
-                });
-                extremes(ui,r,pane.best_k);
-                ui.label(RichText::new("Descriptive history only. Log-return tails and fitted curves are not forecasts. Overnight gaps remain in intraday close-to-close returns.").size(11.0).color(muted()));
-            });
+            ui.push_id(id, |ui| report_view(ui, id, r, &mut pane.best_k));
         }
         vec![]
     }
+}
+
+/// The whole report below the controls. Split out so it can be rendered headless.
+fn report_view(ui: &mut Ui, id: PaneId, r: &Report, best_k: &mut usize) {
+    gap_warning(ui, &r.gaps);
+    ui.label(
+        RichText::new(format!(
+            "{} · {} · {} closed bars / {} returns · {} to {}",
+            r.provenance.label(),
+            r.timeframe.label(),
+            r.bars,
+            r.moments.n,
+            date(r.start),
+            date(r.end)
+        ))
+        .font(mono(11.0))
+        .color(muted()),
+    );
+    ui.label(RichText::new(&r.source).font(mono(10.5)).color(muted()))
+        .on_hover_text("Data source and vault coverage for this series");
+    ui.label(
+        RichText::new(format!(
+            "{}: {} · {} shows available coverage; missing bars are never filled.",
+            if r.timeframe == Timeframe::D1 { "Archive read / closure clock" } else { "Feed observation" },
+            r.observed_at.map(stamp).unwrap_or_else(|| "unavailable; final bar withheld".into()),
+            r.window.label()
+        ))
+        .size(11.0)
+        .color(muted()),
+    );
+    egui::ScrollArea::vertical().id_salt((id, "dist-scroll")).auto_shrink([false, false]).show(ui, |ui| {
+        metric_cards(ui, r);
+        ui.add_space(dp(6.0));
+        if ui.available_width() > dp(800.0) {
+            ui.columns(2, |columns| {
+                histogram(&mut columns[0], r);
+                qq(&mut columns[1], r);
+            });
+        } else {
+            histogram(ui, r);
+            qq(ui, r);
+        }
+        tail_rates(ui, r);
+        underwater(ui, r);
+        volatility(ui, r);
+        drawdown_table(ui, r);
+        regime_table(ui, r);
+        heading(ui, "BEST / WORST CLOSED BAR RETURNS");
+        ui.add(egui::DragValue::new(best_k).range(1..=dist::EXTREMES).prefix("k = "));
+        extremes(ui, r, *best_k);
+        ui.label(
+            RichText::new(
+                "Descriptive history only. Log-return tails and fitted curves are not forecasts. \
+                 Overnight gaps remain in intraday close-to-close returns; vault gaps do not.",
+            )
+            .size(11.0)
+            .color(muted()),
+        );
+    });
 }
 fn date(ts: i64) -> String {
     tr_data::stats::bar_date(ts)
@@ -245,8 +259,7 @@ fn number(x: Option<f64>) -> String {
     x.map(|v| format!("{v:.3}")).unwrap_or_else(|| "—".into())
 }
 fn heading(ui: &mut Ui, s: &str) {
-    ui.add_space(dp(8.0));
-    ui.label(RichText::new(s).font(mono(11.0)).strong().color(muted()));
+    studio_heading(ui, s);
 }
 fn regime_color(i: usize) -> Color32 {
     [theme::cyan(), theme::amber(), theme::down()][i]
@@ -273,7 +286,18 @@ fn metric_cards(ui: &mut Ui, r: &Report) {
             });
         }
     });
-    ui.label(RichText::new(format!("Volatility: sample σ × √{:.0} periods/year. VaR/CVaR: signed log-loss; negative values mean gains. JB p uses asymptotic χ²(2).",r.annual_periods)).size(11.0).color(muted()));
+    ui.label(
+        RichText::new(format!(
+            "Volatility: sample σ (n−1) × √{:.0} periods/year. VaR/CVaR: historical, horizon = one closed {} bar \
+             (no √h scaling to other horizons); CVaR = mean loss of returns at or beyond VaR, so CVaR ≥ VaR. \
+             Signed log-loss: negative values mean gains. Skew/kurtosis are population moments; \
+             JB p-value is the asymptotic χ²(2) tail (unreliable for small n).",
+            r.annual_periods,
+            r.timeframe.label()
+        ))
+        .size(11.0)
+        .color(muted()),
+    );
 }
 
 /// Shared painter axes. Coordinates stay in f64 until mapped into the viewport.
@@ -382,6 +406,7 @@ fn histogram(ui: &mut Ui, r: &Report) {
         });
     }
     ui.horizontal_wrapped(|ui| {
+        ui.label(RichText::new("x: log return per bar · y: number of returns").size(11.0).color(muted()));
         ui.colored_label(theme::cyan(), "■ Observed");
         ui.colored_label(theme::amber(), "━ Normal");
         ui.colored_label(theme::down(), format!("━ Student-t (MoM df {})", number(r.moments.student_df)));
@@ -520,7 +545,7 @@ fn volatility(ui: &mut Ui, r: &Report) {
     heading(ui, "20-BAR REALIZED VOLATILITY · ANNUALISED");
     let xs = &r.underwater;
     let Some(high) = xs.iter().filter_map(|p| p.rolling_vol).reduce(f64::max) else {
-        ui.label(RichText::new("Needs 21 closed bars for rolling vol; 22 for a lagged regime return.").color(muted()));
+        ui.label(RichText::new("Needs 21 closed bars for rolling vol and 41 before the first point-in-time regime label.").color(muted()));
         return;
     };
     let p = Plot::new(
@@ -531,22 +556,29 @@ fn volatility(ui: &mut Ui, r: &Report) {
         |x| date(xs[(x.round() as usize).min(xs.len() - 1)].ts),
         pct,
     );
-    if let Some([a, b]) = r.vol_terciles {
-        for level in [a, b] {
-            p.line([(0.0, level), ((xs.len() - 1) as f64, level)].into_iter(), theme::amber().gamma_multiply(0.5));
-        }
+    // Point-in-time tercile thresholds as they evolved (no future data).
+    for k in 0..2 {
+        p.line(
+            xs.iter().enumerate().filter_map(|(i, x)| x.thresholds.map(|t| (i as f64, t[k]))),
+            theme::amber().gamma_multiply(0.6),
+        );
     }
     p.line(xs.iter().enumerate().filter_map(|(i, x)| x.rolling_vol.map(|v| (i as f64, v))), theme::cyan());
     if let Some(x) = p.hover_x() {
         let v = &xs[(x.round() as usize).min(xs.len() - 1)];
         p.response.on_hover_ui(|ui| {
             ui.label(format!(
-                "{}\n20-bar ann. vol {}",
+                "{}\n20-bar ann. vol {}\nThresholds then {}",
                 stamp(v.ts),
-                v.rolling_vol.map(pct).unwrap_or_else(|| "warming up".into())
+                v.rolling_vol.map(pct).unwrap_or_else(|| "warming up".into()),
+                v.thresholds.map(|[a, b]| format!("{} / {}", pct(a), pct(b))).unwrap_or_else(|| "warming up".into())
             ));
         });
     }
+    ui.horizontal_wrapped(|ui| {
+        ui.colored_label(theme::cyan(), "━ 20-bar realized vol");
+        ui.colored_label(theme::amber(), "━ expanding tercile thresholds (past data only)");
+    });
 }
 fn drawdown_table(ui: &mut Ui, r: &Report) {
     heading(ui, "TOP 5 DRAWDOWNS · PEAK → RECOVERY OR LATEST BAR");
@@ -574,10 +606,19 @@ fn drawdown_table(ui: &mut Ui, r: &Report) {
 }
 fn regime_table(ui: &mut Ui, r: &Report) {
     heading(ui, "VOLATILITY REGIMES · RETURN STATISTICS");
-    ui.label(RichText::new("Full-window vol terciles are descriptive; labels use the preceding 20-return window. Tied thresholds are Normal. Thresholds use the whole sample, so these are not trading signals.").size(11.0).color(muted()));
+    ui.label(
+        RichText::new(format!(
+            "No look-ahead: each return is labelled from the preceding 20-return volatility against expanding \
+             terciles of the volatilities observed before it (first {} vols are warm-up). Tied thresholds are Normal. \
+             Descriptive history, not a trading signal.",
+            dist::REGIME_MIN_HISTORY
+        ))
+        .size(11.0)
+        .color(muted()),
+    );
     if let Some([a, b]) = r.vol_terciles {
         ui.label(
-            RichText::new(format!("Tercile thresholds: {} / {} annualised", pct(a), pct(b)))
+            RichText::new(format!("Latest thresholds: {} / {} annualised", pct(a), pct(b)))
                 .font(mono(11.0))
                 .color(muted()),
         );
@@ -649,10 +690,100 @@ fn extremes(ui: &mut Ui, r: &Report, k: usize) {
     });
 }
 
+// ---- Shared Studio look (DIST / SEASON / CORR) -------------------------------
+
+/// Pane title: bold cyan mono, as in the other research panes.
+pub(crate) fn studio_title(ui: &mut Ui, s: &str) {
+    ui.label(RichText::new(s).font(mono(14.0)).strong().color(theme::cyan()));
+}
+
+/// Section heading used inside the scroll area of every Studio view.
+pub(crate) fn studio_heading(ui: &mut Ui, s: &str) {
+    ui.add_space(dp(10.0));
+    ui.label(RichText::new(s).font(mono(11.0)).strong().color(theme::amber()));
+}
+
+/// Loading / error / empty state, identical in the three Studio panes.
+pub(crate) fn studio_states(ui: &mut Ui, loading: bool, error: Option<&str>, empty_hint: Option<&str>) {
+    if loading {
+        ui.horizontal(|ui| {
+            ui.spinner();
+            ui.label(RichText::new("Reading verified closed bars…").color(muted()));
+        });
+    } else if let Some(e) = error {
+        egui::Frame::new().fill(theme::card()).inner_margin(dp(8.0)).show(ui, |ui| {
+            ui.label(RichText::new(e).color(theme::down()));
+        });
+    } else if let Some(hint) = empty_hint {
+        ui.label(RichText::new(hint).color(muted()));
+    }
+}
+
+fn ny_day(ts: i64) -> String {
+    tr_core::ny::civil(ts).date().to_string()
+}
+
+/// Text of the vault-gap warning, or None when the series has no gap.
+pub(crate) fn gap_text(gaps: &[(i64, i64)]) -> Option<String> {
+    let (first, last) = (gaps.first()?, gaps.last()?);
+    let span = if gaps.len() == 1 {
+        format!("{} → {}", ny_day(first.0), ny_day(first.1))
+    } else {
+        format!(
+            "{} gaps, first {} → {}, last {} → {}",
+            gaps.len(),
+            ny_day(first.0),
+            ny_day(first.1),
+            ny_day(last.0),
+            ny_day(last.1)
+        )
+    };
+    Some(format!(
+        "⚠ UNVERIFIED JOIN · vault history has a gap ({span}). No return is computed across a gap; \
+         statistics still pool data from both sides of an unverified join."
+    ))
+}
+
+/// Amber banner shown whenever the analysed series spans a Bar Vault gap.
+pub(crate) fn gap_warning(ui: &mut Ui, gaps: &[(i64, i64)]) {
+    if let Some(s) = gap_text(gaps) {
+        egui::Frame::new().fill(theme::amber_dim()).inner_margin(dp(6.0)).corner_radius(3.0).show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.label(RichText::new(s).font(mono(11.0)).strong().color(text()));
+        });
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::layouts::PaneSettings;
+    #[test]
+    fn gap_text_is_absent_without_gaps_and_names_ny_dates() {
+        assert!(gap_text(&[]).is_none());
+        let a = "2026-11-09T20:55:00Z".parse::<chrono::DateTime<chrono::Utc>>().unwrap().timestamp();
+        let b = "2026-11-12T14:30:00Z".parse::<chrono::DateTime<chrono::Utc>>().unwrap().timestamp();
+        let t = gap_text(&[(a, b)]).unwrap();
+        assert!(t.contains("UNVERIFIED JOIN") && t.contains("2026-11-09 → 2026-11-12"), "{t}");
+        assert!(gap_text(&[(a, b), (b + 86_400, b + 3 * 86_400)]).unwrap().contains("2 gaps"));
+    }
+    #[test]
+    fn dist_view_warns_on_vault_gap() {
+        let bars = fixture();
+        let gap = (bars[10].ts, bars[11].ts);
+        let r = dist::compute_with_gaps("AAPL", &bars, Timeframe::D1, Window::All, "unit", None, &[gap]).unwrap();
+        let ctx = egui::Context::default();
+        let mut output = ctx.run_ui(Default::default(), |ui| report_view(ui, r_id(), &r, &mut 5));
+        output.textures_delta.clear();
+        assert!(format!("{:?}", output.shapes).contains("UNVERIFIED JOIN"));
+        let clean = dist::compute("AAPL", &bars, Timeframe::D1, Window::All, "unit", None).unwrap();
+        let mut output = ctx.run_ui(Default::default(), |ui| report_view(ui, r_id(), &clean, &mut 5));
+        output.textures_delta.clear();
+        assert!(!format!("{:?}", output.shapes).contains("UNVERIFIED JOIN"));
+    }
+    fn r_id() -> PaneId {
+        PaneId::default()
+    }
     fn fixture() -> Vec<Bar> {
         (0..30)
             .map(|i| {
@@ -712,7 +843,9 @@ mod tests {
     #[tokio::test]
     async fn pending_intraday_bar_is_excluded_without_fresh_clock() {
         let bars = fixture();
-        let r = build_report("AAPL".into(), bars, Timeframe::H1, Window::All, "vault only".into(), None).await.unwrap();
+        let r = build_report("AAPL".into(), bars, Timeframe::H1, Window::All, "vault only".into(), None, vec![])
+            .await
+            .unwrap();
         assert_eq!(r.bars, 29);
         assert_eq!(r.observed_at, None);
     }
@@ -720,7 +853,9 @@ mod tests {
     async fn pending_sample_bar_is_refused_before_trimming() {
         let mut bars = fixture();
         bars.last_mut().unwrap().provenance = tr_core::Provenance::Sample;
-        assert!(build_report("AAPL".into(), bars, Timeframe::H1, Window::All, "unit".into(), None).await.is_err());
+        assert!(
+            build_report("AAPL".into(), bars, Timeframe::H1, Window::All, "unit".into(), None, vec![]).await.is_err()
+        );
     }
     #[test]
     fn sample_mode_clears_existing_results_and_invalidates_pending_work() {

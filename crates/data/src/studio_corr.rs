@@ -6,12 +6,23 @@ use tr_core::{Bar, Provenance};
 pub const DEFAULT_SET: [&str; 7] = ["SPY", "QQQ", "IWM", "TLT", "GLD", "USO", "UUP"];
 pub const ROLLING_WINDOWS: [usize; 3] = [20, 60, 120];
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct NamedBars {
     pub symbol: String,
     pub bars: Vec<Bar>,
     pub source: String,
     pub error: Option<String>,
+    /// Vault UNVERIFIED JOIN gaps `(last before, first after)`; no return spans one.
+    pub gaps: Vec<(i64, i64)>,
+}
+
+/// How bars are joined and annualised.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Options {
+    pub annual_periods: f64,
+    /// Daily bars join on the UTC calendar date (sources may stamp the same
+    /// session at different times of day); intraday bars join on exact timestamps.
+    pub daily: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -90,16 +101,24 @@ pub struct CorrReport {
     pub rolling: Vec<Rolling>,
     pub path: Vec<PathPoint>,
     pub matrix: Matrix,
+    /// Vault gaps (asset or benchmark) inside the common range; no return spans one.
+    pub gaps: Vec<(i64, i64)>,
 }
 
 /// Both entire input series must pass admission, even rows outside the intersection.
-fn aligned(asset: &[Bar], benchmark: &[Bar]) -> Result<Vec<(i64, f64, f64)>, String> {
+fn aligned(asset: &[Bar], benchmark: &[Bar], daily: bool) -> Result<Vec<(i64, f64, f64)>, String> {
     crate::stats::require_research_bars(asset, "Relationship asset")?;
     crate::stats::require_research_bars(benchmark, "Relationship benchmark")?;
+    let key = |ts: i64| if daily { ts.div_euclid(86_400) } else { ts };
+    if daily
+        && [asset, benchmark].iter().any(|bars| bars.windows(2).any(|w| key(w[0].ts) == key(w[1].ts)))
+    {
+        return Err("Relationship refused: two daily bars share one calendar date".into());
+    }
     let (mut i, mut j) = (0, 0);
     let mut out = Vec::new();
     while i < asset.len() && j < benchmark.len() {
-        match asset[i].ts.cmp(&benchmark[j].ts) {
+        match key(asset[i].ts).cmp(&key(benchmark[j].ts)) {
             std::cmp::Ordering::Less => i += 1,
             std::cmp::Ordering::Greater => j += 1,
             std::cmp::Ordering::Equal => {
@@ -112,11 +131,29 @@ fn aligned(asset: &[Bar], benchmark: &[Bar]) -> Result<Vec<(i64, f64, f64)>, Str
     Ok(out)
 }
 
-fn returns(prices: &[(i64, f64, f64)]) -> Vec<PairReturn> {
+/// Returns between adjacent common prices, skipping any pair that straddles a
+/// vault gap in either series. Gap stamps are compared on the asset's clock,
+/// which for daily joins can differ from the benchmark's by under a day, so a
+/// daily gap check widens to whole dates.
+fn returns(prices: &[(i64, f64, f64)], gaps: &[(i64, i64)]) -> Vec<PairReturn> {
     prices
         .windows(2)
+        .filter(|w| !crate::studio_dist::spans_gap(gaps, w[0].0, w[1].0))
         .map(|w| PairReturn { start: w[0].0, end: w[1].0, asset: w[1].1 - w[0].1, benchmark: w[1].2 - w[0].2 })
         .collect()
+}
+
+fn joined_gaps(a: &NamedBars, b: &NamedBars, daily: bool) -> Vec<(i64, i64)> {
+    let mut gaps: Vec<_> = a.gaps.iter().chain(&b.gaps).copied().collect();
+    if daily {
+        // Day-granular: the asset's stamp for a date may be later/earlier than the benchmark's.
+        for g in &mut gaps {
+            *g = (g.0.div_euclid(86_400) * 86_400 + 86_399, g.1.div_euclid(86_400) * 86_400);
+        }
+    }
+    gaps.sort_unstable();
+    gaps.dedup();
+    gaps
 }
 
 fn finite(x: f64) -> Option<f64> {
@@ -214,7 +251,7 @@ pub fn regress(pairs: &[PairReturn], annual_periods: f64) -> Result<Ols, String>
     Ok(out)
 }
 
-fn matrix(rows: &[NamedBars]) -> Matrix {
+fn matrix(rows: &[NamedBars], daily: bool) -> Matrix {
     let errors: Vec<Option<String>> = rows
         .iter()
         .map(|r| r.error.clone().or_else(|| crate::stats::require_research_bars(&r.bars, "Correlation matrix").err()))
@@ -229,7 +266,8 @@ fn matrix(rows: &[NamedBars]) -> Matrix {
                     if let Some(reason) = errors[i].as_ref().or(errors[j].as_ref()) {
                         return MatrixCell { correlation: None, n: 0, reason: Some(reason.clone()) };
                     }
-                    match aligned(&a.bars, &b.bars).and_then(|p| regress(&returns(&p), 252.0)) {
+                    let gaps = joined_gaps(a, b, daily);
+                    match aligned(&a.bars, &b.bars, daily).and_then(|p| regress(&returns(&p, &gaps), 252.0)) {
                         Ok(m) => MatrixCell {
                             correlation: m.correlation,
                             n: m.n,
@@ -261,13 +299,43 @@ pub fn compute(
     rows: &[NamedBars],
     source: &str,
 ) -> Result<CorrReport, String> {
-    let prices = aligned(asset, other)?;
+    let named = |s: &str, bars: &[Bar]| NamedBars { symbol: s.into(), bars: bars.to_vec(), ..Default::default() };
+    compute_series(
+        &named(symbol, asset),
+        &named(benchmark, other),
+        rows,
+        Options { annual_periods, daily: false },
+        source,
+    )
+}
+
+/// Trailing z-score window for the log price ratio (prior observations only).
+pub const Z_WINDOW: usize = 60;
+
+/// Full relationship report. Gaps on `asset`/`benchmark` (and on every matrix
+/// row) are honoured: no return straddles a vault UNVERIFIED JOIN gap.
+pub fn compute_series(
+    asset: &NamedBars,
+    benchmark: &NamedBars,
+    rows: &[NamedBars],
+    options: Options,
+    source: &str,
+) -> Result<CorrReport, String> {
+    let Options { annual_periods, daily } = options;
+    let (symbol, other) = (&asset.symbol, &benchmark.bars);
+    let prices = aligned(&asset.bars, other, daily)?;
     if prices.len() < 4 {
         return Err(
             "Relationship needs at least 4 common closed price timestamps (3 returns); no fill-forward is used.".into(),
         );
     }
-    let pairs = returns(&prices);
+    let all_gaps = joined_gaps(asset, benchmark, daily);
+    let pairs = returns(&prices, &all_gaps);
+    if pairs.len() < 3 {
+        return Err("Relationship needs at least 3 common returns that do not span a vault gap.".into());
+    }
+    let (first, last) = (prices[0].0, prices[prices.len() - 1].0);
+    let gaps: Vec<_> = all_gaps.iter().copied().filter(|g| g.1 > first && g.0 < last).collect();
     let ols = regress(&pairs, annual_periods)?;
     let rolling = ROLLING_WINDOWS
         .iter()
@@ -283,23 +351,29 @@ pub fn compute(
         })
         .collect::<Result<Vec<_>, String>>()?;
     let mut cumulative = 0.0;
+    let mut next_pair = 0;
     let path = prices
         .iter()
         .enumerate()
         .map(|(i, &(ts, a, b))| {
             let log_ratio = a - b;
-            let z60 = if i >= 59 {
-                let w = &prices[i - 59..=i];
-                let mean = w.iter().map(|p| p.1 - p.2).sum::<f64>() / 60.0;
-                let sd = (w.iter().map(|p| (p.1 - p.2 - mean).powi(2)).sum::<f64>() / 59.0).sqrt();
-                divide(log_ratio - mean, sd)
+            // Strictly trailing: mean/sd of the previous Z_WINDOW ratios, not including today.
+            let z60 = if i >= Z_WINDOW {
+                let w = &prices[i - Z_WINDOW..i];
+                let n = Z_WINDOW as f64;
+                let mean = w.iter().map(|p| p.1 - p.2).sum::<f64>() / n;
+                let sd = (w.iter().map(|p| (p.1 - p.2 - mean).powi(2)).sum::<f64>() / (n - 1.0)).sqrt();
+                if sd > 64.0 * f64::EPSILON * mean.abs().max(1.0) { divide(log_ratio - mean, sd) } else { None }
             } else {
                 None
             };
             let residual_return = match (ols.alpha, ols.beta) {
                 (Some(alpha), Some(beta)) => {
-                    if i > 0 {
-                        cumulative += pairs[i - 1].asset - alpha - beta * pairs[i - 1].benchmark;
+                    // Pairs are a gap-filtered subsequence; match by end timestamp.
+                    if pairs.get(next_pair).is_some_and(|p| p.end == ts) {
+                        let p = &pairs[next_pair];
+                        cumulative += p.asset - alpha - beta * p.benchmark;
+                        next_pair += 1;
                     }
                     finite(cumulative.exp_m1())
                 }
@@ -309,20 +383,21 @@ pub fn compute(
         })
         .collect();
     Ok(CorrReport {
-        symbol: symbol.into(),
-        benchmark: benchmark.into(),
-        provenance: Bar::provenance(asset).combine(Bar::provenance(other)),
+        symbol: symbol.clone(),
+        benchmark: benchmark.symbol.clone(),
+        provenance: Bar::provenance(&asset.bars).combine(Bar::provenance(other)),
         source: source.into(),
         as_of: prices.last().unwrap().0,
         annual_periods,
         aligned_bars: prices.len(),
-        asset_bars: asset.len(),
+        asset_bars: asset.bars.len(),
         benchmark_bars: other.len(),
         returns: pairs,
         ols,
         rolling,
         path,
-        matrix: matrix(rows),
+        matrix: matrix(rows, daily),
+        gaps,
     })
 }
 
@@ -440,21 +515,65 @@ mod tests {
         near(r.ols.downside_beta, 2.0);
         near(r.ols.up_capture, 2.0);
         near(r.ols.down_capture, 2.0);
-        assert!(r.path[58].z60.is_none());
-        assert!(r.path[59].z60.is_some());
+        assert!(r.path[59].z60.is_none());
+        assert!(r.path[60].z60.is_some());
         let ascending = bars(&[0.01; 65]);
         let z = compute("A", "B", &ascending, &bars(&[0.0; 65]), 252.0, &[], "unit").unwrap();
-        near(z.path[59].z60, 29.5 / (60.0_f64 * 61.0 / 12.0).sqrt());
+        // Ratio i×0.01; z at i=60 uses only ratios 0..59: mean 0.295, sd 0.01×√(60·61/12).
+        near(z.path[60].z60, 30.5 / (60.0_f64 * 61.0 / 12.0).sqrt());
+    }
+    #[test]
+    fn ratio_z_score_is_strictly_trailing() {
+        // Appending future prices must not change any earlier z-score.
+        let x: Vec<_> = (0..140).map(|i| ((i * 13 % 17) as f64 - 8.0) * 0.002).collect();
+        let a = bars(&x.iter().map(|r| r * 1.5 + 0.0005).collect::<Vec<_>>());
+        let b = bars(&x);
+        let full = compute("A", "B", &a, &b, 252.0, &[], "unit").unwrap();
+        let part = compute("A", "B", &a[..90], &b[..90], 252.0, &[], "unit").unwrap();
+        for (p, f) in part.path.iter().zip(&full.path) {
+            assert_eq!(p.z60, f.z60);
+        }
+    }
+    #[test]
+    fn daily_join_is_by_date_and_vault_gaps_break_returns() {
+        let (a, b) = sample();
+        // Benchmark stamped at 21:00 UTC on the same dates: a date join, not an index or exact-ts join.
+        let late: Vec<Bar> = b.iter().map(|x| Bar { ts: x.ts + 75_600, ..*x }).collect();
+        let named = |s: &str, bars: &[Bar], gaps: Vec<(i64, i64)>| NamedBars {
+            symbol: s.into(),
+            bars: bars.to_vec(),
+            gaps,
+            ..Default::default()
+        };
+        let opts = Options { annual_periods: 252.0, daily: true };
+        let r = compute_series(&named("A", &a, vec![]), &named("B", &late, vec![]), &[], opts, "unit").unwrap();
+        near(r.ols.beta, 2.0);
+        assert_eq!(r.ols.n, 5);
+        // Intraday semantics (exact timestamps) find no common bars.
+        let intraday = Options { daily: false, ..opts };
+        assert!(compute_series(&named("A", &a, vec![]), &named("B", &late, vec![]), &[], intraday, "unit").is_err());
+        // A vault gap on the benchmark between bars 2 and 3 removes exactly that return.
+        let gap = (late[2].ts, late[3].ts);
+        let r = compute_series(&named("A", &a, vec![]), &named("B", &late, vec![gap]), &[], opts, "unit").unwrap();
+        assert_eq!(r.ols.n, 4);
+        assert_eq!(r.gaps.len(), 1);
+        assert!(r.returns.iter().all(|p| !(p.start == a[2].ts && p.end == a[3].ts)));
+        // Matrix rows honour row gaps too.
+        let rows = vec![named("A", &a, vec![(a[1].ts, a[2].ts)]), named("B", &b, vec![])];
+        assert_eq!(matrix(&rows, false).cells[0][1].n, 4);
     }
     #[test]
     fn matrix_keeps_missing_symbols_and_pair_counts() {
         let (a, b) = sample();
-        let rows = vec![
-            NamedBars { symbol: "A".into(), bars: a.clone(), source: "unit".into(), error: None },
-            NamedBars { symbol: "B".into(), bars: b.clone(), source: "unit".into(), error: None },
-            NamedBars { symbol: "TLT".into(), bars: vec![], source: String::new(), error: Some("no archive".into()) },
-        ];
-        let m = matrix(&rows);
+        let row = |s: &str, bars: Vec<Bar>, error: Option<String>| NamedBars {
+            symbol: s.into(),
+            bars,
+            source: "unit".into(),
+            error,
+            gaps: vec![],
+        };
+        let rows = vec![row("A", a.clone(), None), row("B", b.clone(), None), row("TLT", vec![], Some("no archive".into()))];
+        let m = matrix(&rows, false);
         assert_eq!(m.symbols, ["A", "B", "TLT"]);
         assert_eq!(m.cells[0][1].n, 5);
         near(m.cells[0][0].correlation, 1.0);

@@ -5,6 +5,14 @@ focused symbol. `AAPL DIST 1H` or `DIST 30m` selects intraday returns. The pane
 supports 1m, 5m, 15m, 30m, 1H, 4H and 1D; weekly/monthly bars are refused.
 `NEW DIST 1H` and saved workspaces also restore the pane.
 
+`DIST` and `RDIST` are also listed tickers. Only the bare word or the word plus a
+valid DIST interval (`DIST 1H`) opens the studio; `DIST US Equity`, `RDIST Equity`
+and any other arguments (`DIST 1W`) load the ticker instead.
+
+**Bar Vault gaps.** If the intraday series spans a vault UNVERIFIED JOIN gap, the
+pane shows an amber warning with the gap dates and no return is computed across
+the gap bar pair (the regime transition chain also restarts after it).
+
 The ticker, timeframe and 1Y / 3Y / 5Y / ALL window controls send a fresh worker
 request. Each request increments a generation; stale responses cannot overwrite
 newer selections. Ticker edits apply on Enter or Refresh. Settings save the ticker,
@@ -54,10 +62,12 @@ anchors the first return; a close before the boundary is not pulled into the sam
   `n/6 × (skew² + excess²/4)`; its p-value is `exp(−JB/2)`, the asymptotic χ²(2)
   survival probability. Small samples do not justify a normality conclusion.
 - VaR 95/99 is minus the interpolated 5th/1st percentile (type-7 quantile).
-  CVaR is minus the lower empirical tail integral: the worst `n × alpha` returns,
-  giving a fractional weight to the boundary observation. With very small samples
-  CVaR can therefore equal the worst observed return. Negative VaR/CVaR means gains,
-  not an absolute loss floor. No extrapolation beyond observed tails occurs.
+  CVaR (expected shortfall) is minus the mean of every return at or below that
+  same quantile, so CVaR ≥ VaR always. With very small samples CVaR can equal
+  the worst observed return. Negative VaR/CVaR means gains, not an absolute loss
+  floor. The horizon is one closed bar of the selected interval; nothing is
+  scaled by √h to other horizons, and no Cornish–Fisher or parametric
+  extrapolation beyond observed tails occurs.
 - Tail ratio is `abs(q95) / abs(q05)`; a zero denominator is unavailable.
 - Beyond ±2σ / ±3σ reports shares below/above the mean using population σ,
   alongside the theoretical normal total expectations 4.550% / 0.270%.
@@ -83,17 +93,20 @@ bar), in both observed bars and elapsed calendar days; it is not trough duration
 Drawdowns are reset at the start of the selected window.
 
 Realized volatility is the annualised sample stdev of the latest 20 log returns.
-Full-window volatility terciles define Calm / Normal / Stressed. A return's regime
-uses the **preceding** complete 20-return window, so the first 20 returns have no
-regime. Equal lower/upper thresholds are labelled Normal rather than inventing a
+Regimes have **no look-ahead**. A return's regime compares the volatility of the
+**preceding** complete 20-return window with **expanding (point-in-time)
+terciles** of every rolling volatility observed up to that point; no later bar
+can change an earlier label (tested by prefix invariance). Thresholds need 20
+rolling vols, so the first 40 returns have no regime. The vol chart draws the
+thresholds as they evolved; "Latest thresholds" are those in force now. Equal lower/upper thresholds are labelled Normal rather than inventing a
 split. The ribbon above the drawdown chart is grey during warm-up; the vol chart
 shows the actual rolling values and tercile levels. Regime tables include counts,
 mean return, annualised sample stdev and positive-return share. The transition
 matrix reports adjacent classified-return counts and row-normalized percentages;
 rows with no transitions show `— · n=0`.
 
-These are descriptive regimes: the tercile thresholds use the whole selected
-sample. They are not an out-of-sample strategy, trading recommendation or forecast.
+Per-regime statistics only use returns realised after their label was fixed.
+They remain descriptive history, not a trading recommendation or forecast.
 The top/bottom return table allows k = 1…10 and shows the available observations.
 Charts use theme colours, labelled axes, gridlines and hover readouts. Deep histories
 use extrema-preserving line reduction, sampled QQ ranks and a pixel-resolution

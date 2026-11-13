@@ -299,6 +299,9 @@ pub struct ChartState {
     edge: Option<Result<Arc<tr_data::edge::EdgeReport>, String>>,
     edge_work: Option<Request>,
     edge_pending: Option<EdgeKey>,
+    /// Observation clock of the last `refresh_edge`, so an archive result is
+    /// checked against the same closure clock it was requested with.
+    edge_clock: Option<i64>,
     pub stitch: Option<Arc<tr_data::vault::StitchInfo>>,
     edge_cache: Option<(EdgeKey, Arc<tr_data::edge::EdgeReport>)>,
     edge_paint: EdgePaint,
@@ -442,6 +445,7 @@ impl ChartState {
             edge_paint: Default::default(),
             edge_work: None,
             edge_pending: None,
+            edge_clock: None,
             stitch: None,
             edge_cache: None,
             zband_paint: Default::default(),
@@ -1166,6 +1170,7 @@ impl ChartState {
         if !self.show_edge {
             return;
         }
+        self.edge_clock = Some(now);
         // Recheck provenance before reusing a report, even when its time key matches.
         let gate = tr_data::stats::require_research_bars(&self.bars, "TSTACK Edge").and_then(|()| {
             if self.bars.iter().any(|b| b.provenance != self.bars[0].provenance) && self.stitch.is_none() {
@@ -1355,7 +1360,11 @@ impl ChartState {
                     self.tf,
                     &self.bars,
                     self.sec.class,
-                    if self.archive { Some(chrono::Utc::now().timestamp()) } else { self.last_refresh },
+                    if self.archive {
+                        Some(self.edge_clock.unwrap_or_else(|| chrono::Utc::now().timestamp()))
+                    } else {
+                        self.last_refresh
+                    },
                 )
             || self.bars.iter().any(|b| !b.provenance.is_verified())
             || key.n > self.bars.len()
@@ -1366,7 +1375,7 @@ impl ChartState {
         match result {
             Ok(report) => {
                 self.edge_cache = Some((key, report));
-                self.refresh_edge(chrono::Utc::now().timestamp());
+                self.refresh_edge(self.edge_clock.unwrap_or_else(|| chrono::Utc::now().timestamp()));
             }
             Err(error) => {
                 self.edge = Some(Err(error));

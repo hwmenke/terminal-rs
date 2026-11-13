@@ -12,11 +12,21 @@ pub struct CorrPane {
     pub loading: bool,
     pub error: Option<String>,
     pub report: Option<CorrReport>,
+    /// Next request bypasses the bar cache (set by the Reload button).
+    fresh: bool,
 }
 
 impl CorrPane {
     pub fn new(symbol: impl Into<String>, spec: impl Into<String>) -> Self {
-        Self { symbol: symbol.into(), spec: spec.into(), generation: 0, loading: false, error: None, report: None }
+        Self {
+            symbol: symbol.into(),
+            spec: spec.into(),
+            generation: 0,
+            loading: false,
+            error: None,
+            report: None,
+            fresh: false,
+        }
     }
     pub fn request(&mut self, pane: PaneId, worker: &crate::worker::Worker) {
         self.generation += 1;
@@ -37,6 +47,7 @@ impl CorrPane {
             generation: self.generation,
             symbol: tr_data::security(&self.symbol).key(),
             spec: self.spec.clone(),
+            fresh: std::mem::take(&mut self.fresh),
         });
     }
     pub fn accept(&mut self, generation: u64, result: Result<CorrReport, String>) {
@@ -77,9 +88,60 @@ pub(crate) fn parse_spec(spec: &str) -> Result<(String, Timeframe), String> {
     Ok((tr_data::security(tokens.first().copied().unwrap_or("SPY")).key(), tf))
 }
 
+/// Concurrent symbol loads per CORR request (asset, benchmark and peers).
+pub(crate) const CORR_CONCURRENCY: usize = 4;
+const CACHE_CAPACITY: usize = 64;
+
+/// Verified, closed-bar series for one (symbol, interval), as loaded.
+#[derive(Clone)]
+struct Loaded {
+    bars: Vec<Bar>,
+    source: String,
+    gaps: Vec<(i64, i64)>,
+}
+
+/// Successful real-data loads keyed by (symbol, interval). Failures are never
+/// cached, and nothing synthetic is ever stored. Re-opening CORR inside the TTL
+/// reuses the bars; Reload bypasses the cache.
+#[derive(Default)]
+pub(crate) struct CorrCache {
+    entries: std::sync::Mutex<std::collections::HashMap<(String, Timeframe), (std::time::Instant, Loaded)>>,
+}
+pub(crate) static CORR_CACHE: std::sync::LazyLock<CorrCache> = std::sync::LazyLock::new(CorrCache::default);
+
+/// Daily archives change once a session; intraday entries live about one bar
+/// (1–10 minutes), so a cached series is at most one closed bar behind.
+pub(crate) fn cache_ttl(tf: Timeframe) -> std::time::Duration {
+    std::time::Duration::from_secs(if tf == Timeframe::D1 { 900 } else { tf.seconds().clamp(60, 600) as u64 })
+}
+
+impl CorrCache {
+    fn get(&self, key: &str, tf: Timeframe) -> Option<Loaded> {
+        let entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
+        entries
+            .get(&(key.to_string(), tf))
+            .filter(|(at, _)| at.elapsed() < cache_ttl(tf))
+            .map(|(_, loaded)| loaded.clone())
+    }
+    fn put(&self, key: String, tf: Timeframe, loaded: Loaded) {
+        let mut entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
+        entries.retain(|(_, tf), (at, _)| at.elapsed() < cache_ttl(*tf));
+        if entries.len() >= CACHE_CAPACITY
+            && let Some(oldest) = entries.iter().min_by_key(|(_, (at, _))| *at).map(|(k, _)| k.clone())
+        {
+            entries.remove(&oldest);
+        }
+        entries.insert((key, tf), (std::time::Instant::now(), loaded));
+    }
+}
+
 /// Kept here so the shared worker only registers a request/response arm. The supplied
 /// loader is the existing vault-aware analysis_bars path (history_sourced underneath).
+/// Symbols load concurrently (bounded by [`CORR_CONCURRENCY`]) through `cache`.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn research<F, Fut>(
+    cache: &CorrCache,
+    fresh: bool,
     history: &tr_data::history::Service,
     bridge: &tr_data::whats_news::Bridge,
     sample: bool,
@@ -91,6 +153,7 @@ where
     F: Fn(String, Timeframe) -> Fut,
     Fut: std::future::Future<Output = anyhow::Result<(Vec<Bar>, tr_data::vault::StitchInfo)>>,
 {
+    use futures::StreamExt;
     if sample {
         anyhow::bail!("Relationship Studio: no real data in sample / demo display mode. Sample prices are never used.");
     }
@@ -104,28 +167,39 @@ where
         }
     }
     names.dedup();
-    let mut rows = Vec::new();
-    for key in names {
-        let result = if tf == Timeframe::D1 {
-            daily(history, bridge, &key).await
-        } else {
-            load_intraday(key.clone(), tf).await.and_then(|(mut bars, info)| {
-                tr_data::stats::require_research_bars(&bars, "Relationship intraday").map_err(anyhow::Error::msg)?;
-                let n = tr_data::closed::closed_len(tf, &bars, tr_data::security(&key).class, info.fetched_at);
-                bars.truncate(n);
-                Ok((bars, info.label()))
-            })
-        };
-        match result {
-            Ok((bars, source)) => rows.push(NamedBars { symbol: key, bars, source, error: None }),
-            Err(e) => rows.push(NamedBars {
-                symbol: key,
-                bars: Vec::new(),
-                source: String::new(),
-                error: Some(format!("{e:#}")),
-            }),
+    let load = |key: String| {
+        let load_intraday = &load_intraday;
+        async move {
+            if !fresh && let Some(hit) = cache.get(&key, tf) {
+                return (key, Ok(hit));
+            }
+            let result = if tf == Timeframe::D1 {
+                daily(history, bridge, &key).await.map(|(bars, source)| Loaded { bars, source, gaps: Vec::new() })
+            } else {
+                load_intraday(key.clone(), tf).await.and_then(|(mut bars, info)| {
+                    tr_data::stats::require_research_bars(&bars, "Relationship intraday")
+                        .map_err(anyhow::Error::msg)?;
+                    let n = tr_data::closed::closed_len(tf, &bars, tr_data::security(&key).class, info.fetched_at);
+                    bars.truncate(n);
+                    Ok(Loaded { bars, source: info.label(), gaps: info.gaps })
+                })
+            };
+            if let Ok(loaded) = &result {
+                cache.put(key.clone(), tf, loaded.clone());
+            }
+            (key, result)
         }
-    }
+    };
+    let loaded: Vec<(String, anyhow::Result<Loaded>)> =
+        futures::stream::iter(names.into_iter().map(load)).buffered(CORR_CONCURRENCY).collect().await;
+    let rows: Vec<NamedBars> = loaded
+        .into_iter()
+        .map(|(key, result)| match result {
+            Ok(Loaded { bars, source, gaps }) => NamedBars { symbol: key, bars, source, error: None, gaps },
+            // A failed ticker is listed as unavailable; never substituted.
+            Err(e) => NamedBars { symbol: key, error: Some(format!("{e:#}")), ..Default::default() },
+        })
+        .collect();
     let asset = rows.iter().find(|r| r.symbol == symbol).unwrap();
     let other = rows.iter().find(|r| r.symbol == benchmark).unwrap();
     for row in [asset, other] {
@@ -139,10 +213,13 @@ where
         .map(|r| format!("{}: {}", tr_data::security(&r.symbol).ticker, r.source))
         .collect::<Vec<_>>()
         .join(" · ");
-    let annual = if tf == Timeframe::D1 { 252.0 } else { 252.0 * 390.0 * 60.0 / tf.seconds() as f64 };
-    let a = asset.bars.clone();
-    let b = other.bars.clone();
-    tokio::task::spawn_blocking(move || maths::compute(&symbol, &benchmark, &a, &b, annual, &rows, &source))
+    // Same per-timeframe / asset-class convention as Distribution Studio.
+    let options = maths::Options {
+        annual_periods: tr_data::studio_dist::periods_per_year(tf, tr_data::security(&symbol).class),
+        daily: tf == Timeframe::D1,
+    };
+    let (a, b) = (asset.clone(), other.clone());
+    tokio::task::spawn_blocking(move || maths::compute_series(&a, &b, &rows, options, &source))
         .await?
         .map_err(anyhow::Error::msg)
 }
@@ -193,8 +270,11 @@ impl TerminalApp {
         let PaneKind::StudioCorr(pane) = &mut self.panes[i].kind else { return vec![] };
         let mut reload = false;
         ui.horizontal_wrapped(|ui| {
-            ui.label(RichText::new("RELATIONSHIP STUDIO").font(theme::mono(14.0)).strong().color(theme::cyan()));
-            reload |= ui.small_button("Reload").clicked();
+            super::studio_dist::studio_title(ui, "RELATIONSHIP STUDIO");
+            if ui.small_button("Reload").on_hover_text("Re-read every series, bypassing the short bar cache").clicked() {
+                reload = true;
+                pane.fresh = true;
+            }
         });
         ui.horizontal_wrapped(|ui| {
             ui.label("Asset");
@@ -218,17 +298,9 @@ impl TerminalApp {
         } else if reload || (!pane.loading && pane.report.is_none() && pane.error.is_none()) {
             pane.request(id, &self.worker);
         }
-        if pane.loading {
-            ui.label(RichText::new("Reading verified archive / vault series…").color(theme::muted()));
-        }
-        if let Some(e) = &pane.error {
-            ui.label(RichText::new(e).color(theme::down()));
-        }
+        super::studio_dist::studio_states(ui, pane.loading, pane.error.as_deref(), None);
         if let Some(r) = &pane.report {
-            egui::ScrollArea::vertical()
-                .id_salt(("studio-corr", id))
-                .auto_shrink([false, false])
-                .show(ui, |ui| render(ui, r));
+            ui.push_id(id, |ui| report_view(ui, id, r));
         }
         vec![]
     }
@@ -247,8 +319,13 @@ fn percent(v: Option<f64>) -> String {
     v.map(|v| format!("{:.2}%", v * 100.0)).unwrap_or_else(|| "—".into())
 }
 fn heading(ui: &mut Ui, title: &str) {
-    ui.add_space(8.0);
-    ui.label(RichText::new(title).font(theme::mono(11.0)).color(theme::amber()));
+    super::studio_dist::studio_heading(ui, title);
+}
+
+/// Gap banner pinned above the scrolling report.
+fn report_view(ui: &mut Ui, id: PaneId, r: &CorrReport) {
+    super::studio_dist::gap_warning(ui, &r.gaps);
+    egui::ScrollArea::vertical().id_salt(("studio-corr", id)).auto_shrink([false, false]).show(ui, |ui| render(ui, r));
 }
 
 fn render(ui: &mut Ui, r: &CorrReport) {
@@ -310,7 +387,17 @@ fn render(ui: &mut Ui, r: &CorrReport) {
         ))
         .font(theme::mono(11.5)),
     );
-    ui.label(RichText::new(format!("Classical OLS, no risk-free rate; α SE per bar. Annualisation {:.1} periods/year. Undefined values = —. Capture uses mean log returns on benchmark up/down bars.", r.annual_periods)).font(theme::ui_font(10.5)).color(theme::muted()));
+    ui.label(
+        RichText::new(format!(
+            "OLS of asset on benchmark log returns over common closed timestamps (dates for daily bars); \
+             non-overlapping one-bar returns, classical (iid, n−2) standard errors, no HAC, no risk-free rate. \
+             α / yr = per-bar α × {:.0} periods/year. Capture = mean asset ÷ mean benchmark log return on \
+             benchmark up / down bars. Undefined values = —.",
+            r.annual_periods
+        ))
+        .font(theme::ui_font(10.5))
+        .color(theme::muted()),
+    );
     heading(ui, "RETURN CLOUD · CYAN = MOST RECENT 20");
     scatter(ui, r);
     for correlation in [false, true] {
@@ -327,7 +414,7 @@ fn render(ui: &mut Ui, r: &CorrReport) {
             .iter()
             .enumerate()
             .map(|(i, roll)| PlotLine {
-                label: format!("{}", roll.window),
+                label: format!("{} returns", roll.window),
                 color: theme::series(i),
                 points: roll
                     .points
@@ -349,7 +436,7 @@ fn render(ui: &mut Ui, r: &CorrReport) {
         false,
         true,
     );
-    heading(ui, "RATIO Z-SCORE · TRAILING 60 COMMON PRICES");
+    heading(ui, "RATIO Z-SCORE · VS PRIOR 60 COMMON PRICES (CURRENT EXCLUDED)");
     line_chart(
         ui,
         &[PlotLine {
@@ -371,7 +458,7 @@ fn render(ui: &mut Ui, r: &CorrReport) {
         true,
         true,
     );
-    ui.label(RichText::new("In-sample residuals use the full-sample fit and sum to approximately zero. This path is descriptive and uses future fit information; the ratio z-score is not a cointegration test. Missing timestamps can make a return span several bars.").font(theme::ui_font(10.5)).color(theme::muted()));
+    ui.label(RichText::new("In-sample residuals use the full-sample fit and sum to approximately zero. This path is descriptive and uses future fit information; the ratio z-score is not a cointegration test. Missing timestamps can make a return span several bars; no return spans a vault gap.").font(theme::ui_font(10.5)).color(theme::muted()));
     heading(ui, "CORRELATION MATRIX · PAIRWISE COMMON RETURNS");
     matrix(ui, &r.matrix);
 }
@@ -671,22 +758,28 @@ mod tests {
         }
         let history = history(archive);
         let bridge = tr_data::whats_news::Config { enabled: false, ..Default::default() }.bridge();
-        let r = research(&history, &bridge, false, "AAPL", "", |_, _| async { panic!("daily must use archive") })
-            .await
-            .unwrap();
+        let cache = CorrCache::default();
+        let r = research(&cache, false, &history, &bridge, false, "AAPL", "", |_, _| async {
+            panic!("daily must use archive")
+        })
+        .await
+        .unwrap();
         assert_eq!(r.ols.n, 5);
         assert!(r.source.contains("Local Yahoo daily research archive"));
         assert_eq!(r.matrix.unavailable.len(), 6);
         assert!(r.provenance.is_verified());
-        let err = research(&history, &bridge, true, "AAPL", "", |_, _| async { panic!("sample must not fetch") })
-            .await
-            .unwrap_err();
+        let err = research(&cache, false, &history, &bridge, true, "AAPL", "", |_, _| async {
+            panic!("sample must not fetch")
+        })
+        .await
+        .unwrap_err();
         assert!(err.to_string().contains("no real data"));
         let empty = self::history(tr_data::history::Archive::memory().unwrap());
-        let err =
-            research(&empty, &bridge, false, "AAPL", "", |_, _| async { panic!("daily must not fetch intraday") })
-                .await
-                .unwrap_err();
+        let err = research(&CorrCache::default(), false, &empty, &bridge, false, "AAPL", "", |_, _| async {
+            panic!("daily must not fetch intraday")
+        })
+        .await
+        .unwrap_err();
         assert!(err.to_string().contains("no history"));
     }
     #[tokio::test]
@@ -694,7 +787,7 @@ mod tests {
         let history = history(tr_data::history::Archive::memory().unwrap());
         let bridge = tr_data::whats_news::Config { enabled: false, ..Default::default() }.bridge();
         let start = "2025-01-06T14:30:00Z".parse::<chrono::DateTime<chrono::Utc>>().unwrap().timestamp();
-        let r = research(&history, &bridge, false, "AAPL", "SPY 30m", |key, tf| async move {
+        let r = research(&CorrCache::default(), false, &history, &bridge, false, "AAPL", "SPY 30m", |key, tf| async move {
             assert_eq!(tf, Timeframe::M30);
             if tr_data::security(&key).ticker == "UUP" {
                 anyhow::bail!("missing verified fixture");
@@ -715,6 +808,82 @@ mod tests {
         assert_eq!(r.as_of, start + 4 * 1800);
         assert_eq!(r.matrix.unavailable.len(), 1);
         assert!(r.matrix.unavailable[0].0.starts_with("UUP"));
+    }
+
+    fn intraday_fixture(start: i64, gaps: Vec<(i64, i64)>) -> (Vec<Bar>, tr_data::vault::StitchInfo) {
+        (
+            test_bars(start, 1800),
+            tr_data::vault::StitchInfo {
+                fetched_at: Some(start + 6 * 1800),
+                source: "verified fixture".into(),
+                gaps,
+                ..Default::default()
+            },
+        )
+    }
+
+    #[tokio::test]
+    async fn loads_run_concurrently_bounded_and_are_cached() {
+        use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
+        let history = history(tr_data::history::Archive::memory().unwrap());
+        let bridge = tr_data::whats_news::Config { enabled: false, ..Default::default() }.bridge();
+        let start = "2025-01-06T14:30:00Z".parse::<chrono::DateTime<chrono::Utc>>().unwrap().timestamp();
+        let (calls, live, peak, uup) =
+            (AtomicUsize::new(0), AtomicUsize::new(0), AtomicUsize::new(0), AtomicUsize::new(0));
+        let cache = CorrCache::default();
+        let run = |fresh: bool| {
+            research(&cache, fresh, &history, &bridge, false, "AAPL", "SPY 30m", |key, _| {
+                let (calls, live, peak, uup) = (&calls, &live, &peak, &uup);
+                async move {
+                    calls.fetch_add(1, SeqCst);
+                    let now = live.fetch_add(1, SeqCst) + 1;
+                    peak.fetch_max(now, SeqCst);
+                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                    live.fetch_sub(1, SeqCst);
+                    if tr_data::security(&key).ticker == "UUP" {
+                        uup.fetch_add(1, SeqCst);
+                        anyhow::bail!("UUP feed down");
+                    }
+                    Ok(intraday_fixture(start, vec![]))
+                }
+            })
+        };
+        let first = run(false).await.unwrap();
+        assert_eq!(calls.load(SeqCst), 8); // AAPL, SPY + 6 peers
+        let peak_seen = peak.load(SeqCst);
+        assert!(peak_seen > 1 && peak_seen <= CORR_CONCURRENCY, "peak in-flight {peak_seen}");
+        // Re-open: every successful series is served from cache; the failed one is retried.
+        let second = run(false).await.unwrap();
+        assert_eq!(calls.load(SeqCst), 9);
+        assert_eq!(uup.load(SeqCst), 2);
+        assert_eq!(first.ols, second.ols);
+        assert!(second.matrix.unavailable.iter().any(|(s, e)| s.starts_with("UUP") && e.contains("feed down")));
+        // Reload bypasses the cache.
+        run(true).await.unwrap();
+        assert_eq!(calls.load(SeqCst), 17);
+        assert_eq!(cache_ttl(Timeframe::M1), std::time::Duration::from_secs(60));
+        assert_eq!(cache_ttl(Timeframe::H1), std::time::Duration::from_secs(600));
+    }
+
+    #[tokio::test]
+    async fn vault_gap_is_reported_and_no_return_spans_it() {
+        let history = history(tr_data::history::Archive::memory().unwrap());
+        let bridge = tr_data::whats_news::Config { enabled: false, ..Default::default() }.bridge();
+        let start = "2025-01-06T14:30:00Z".parse::<chrono::DateTime<chrono::Utc>>().unwrap().timestamp();
+        let gap = (start + 2 * 1800, start + 3 * 1800);
+        let r = research(&CorrCache::default(), false, &history, &bridge, false, "AAPL", "SPY 30m", |key, _| async move {
+            let gaps = if tr_data::security(&key).ticker == "AAPL" { vec![gap] } else { vec![] };
+            Ok(intraday_fixture(start, gaps))
+        })
+        .await
+        .unwrap();
+        assert_eq!(r.gaps, vec![gap]);
+        assert_eq!(r.ols.n, 4); // 6 closed common prices → 5 returns, minus the gap pair.
+        assert!(r.returns.iter().all(|p| !(p.start <= gap.0 && p.end >= gap.1)));
+        let ctx = egui::Context::default();
+        let mut output = ctx.run_ui(Default::default(), |ui| report_view(ui, 1, &r));
+        output.textures_delta.clear();
+        assert!(format!("{:?}", output.shapes).contains("UNVERIFIED JOIN"));
     }
     #[test]
     fn painter_renders_narrow_and_wide_without_gui() {

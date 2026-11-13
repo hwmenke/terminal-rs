@@ -5,6 +5,10 @@ for daily research, or `AAPL SEASON 5M`, `15M`, `30M`, or `1H` for intraday.
 `NEW SEASON` creates another pane. The palette and hotkey reference list these
 commands. Ticker and timeframe persist with the workspace; Reload recomputes.
 
+`SEASON` and `SSN` are also listed tickers. Only the bare word or the word plus a
+valid SEASON interval (`SSN 30m`) opens the studio; `SEASON US Equity`,
+`SSN Equity`, and any other arguments (`SEASON 4H`) load the ticker instead.
+
 This pane supports US cash-session equities, ETFs and indices. It does not use
 sample or display prices. Sample mode shows an empty state. Empty history,
 unverified/sample-tainted history, invalid prices, duplicate timestamps and
@@ -40,8 +44,13 @@ There is no annualisation or missing-session fill.
 - **Month of year:** mean, median, positive-return hit rate, sample t-stat and n
   across *complete monthly returns*. Here n counts months/years, not days.
 - **Weekday:** close-to-close daily returns assigned to the ending session.
-- **Turn of month:** the exchange calendar's last three and first three sessions
-  versus other sessions. Missing data cannot change which day belongs to a group.
+- **Turn of month:** the standard −1…+3 window (Lakonishok–Smidt): the last
+  exchange session of a month through the third session of the next, versus
+  other sessions. Missing data cannot change which day belongs to a group.
+- Every daily table ends with an **All** row (every return in the sample; every
+  complete month for the month table) so bucket hit rates and means are read
+  against the actual unconditional baseline, not against 50% / 0. The monthly
+  hit-rate chart draws that baseline as a cyan line.
 - **Week of month:** calendar date bands 1–7, 8–14, 15–21, 22–28 and 29–31.
 
 Daily returns require adjacent exchange sessions. Monthly returns never scale
@@ -71,16 +80,24 @@ forward window crossing it; the last H bars have no completed H-bar outcome.
 Histograms use shared edges and each group's own probability mass, with mean,
 median, hit rate, raw n and effective n alongside them.
 
-Overlapping windows share future observations. Effective n = raw n / H is a
-non-overlapping equivalent, **not** a measured independent sample size or an
-inferential correction. Profile t-stat = mean / (sample stdev / sqrt(n)); it is
-undefined for n < 2 or zero variance. These descriptive t-statistics have no
-serial-dependence or multiple-comparison correction.
+Overlapping windows share future observations, so a naive iid t-statistic over
+all H-bar windows would overstate significance by roughly √H. The forward table's
+t-stat therefore uses **only non-overlapping windows**: scanning chronologically,
+a window is kept when it starts at least H bars after the previously kept one.
+The independent n is printed under each table. Mean, median and hit rate still
+use every completed window. Profile (one-period) t-stat = mean / (sample stdev,
+n−1 / sqrt(n)); those returns do not overlap. Any t-stat is undefined for n < 2
+or (numerically) zero variance. There is no multiple-comparison correction:
+with many buckets, |t| ≈ 2 somewhere is expected by chance.
 
-Every heatmap cell and profile shows n; fewer than **3** observations are grey.
-Sparse forward distributions have counts and grey summaries but no coloured
-curve. Three observations are a display threshold, not evidence of statistical
-significance. Chart medians use cyan markers. Hover reveals bucket details;
+Every heatmap cell and profile shows n; buckets with fewer than **10**
+observations are flagged as small samples (grey). Sparse forward distributions
+have counts and grey summaries but no coloured curve. The threshold is a display
+flag, not evidence of statistical significance.
+
+**Bar Vault gaps.** When intraday history contains a vault UNVERIFIED JOIN gap
+(non-overlapping vault join), the pane shows an amber warning with the gap
+dates, and the gap acts as a session break: no return or forward window spans it. Chart medians use cyan markers. Hover reveals bucket details;
 horizontal scrolling preserves legible labels in narrow docks.
 
 ## Validation and limits

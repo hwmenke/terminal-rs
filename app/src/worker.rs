@@ -134,7 +134,8 @@ pub enum Request {
         timeframe: Timeframe,
         window: tr_data::studio_dist::Window,
     },
-    StudioCorr { pane: PaneId, generation: u64, symbol: String, spec: String },
+    /// `fresh` bypasses the per-(symbol, interval) bar cache (explicit Reload).
+    StudioCorr { pane: PaneId, generation: u64, symbol: String, spec: String, fresh: bool },
     StudioSeason { pane: PaneId, generation: u64, symbol: String, tf: Timeframe },
     /// Historical statistics and conditional forward returns for one archive symbol.
     Stats {
@@ -3291,27 +3292,36 @@ async fn handle_inner(s: &Arc<Shared>, req: Request, force: bool) {
                 if s.sample_mode() {
                     anyhow::bail!("Distribution Studio: sample / demo mode has no real data. Verified bars are required.");
                 }
-                let (bars, source, observed_at) = if timeframe == Timeframe::D1 {
+                let (bars, source, observed_at, gaps) = if timeframe == Timeframe::D1 {
                     let (bars, source) = crate::app::studio_dist::daily_bars(&s.history, &config.bridge(), &symbol).await?;
-                    (bars, source, Some(chrono::Utc::now().timestamp()))
+                    (bars, source, Some(chrono::Utc::now().timestamp()), Vec::new())
                 } else {
                     let (bars, stitch) = analysis_bars(s, &symbol, timeframe, default_limit(timeframe), "Distribution Studio").await?;
                     let stale = s.provider.health().is_some_and(|h| {
                         matches!(h.snapshot()[Feed::Bars as usize].state, FeedState::Stale { .. } | FeedState::Unavailable(_))
                     });
                     let observed_at = (!stale && stitch.live_ok).then_some(stitch.fetched_at).flatten();
-                    (bars, stitch.label(), observed_at)
+                    (bars, stitch.label(), observed_at, stitch.gaps)
                 };
-                crate::app::studio_dist::build_report(symbol, bars, timeframe, window, source, observed_at)
+                crate::app::studio_dist::build_report(symbol, bars, timeframe, window, source, observed_at, gaps)
                     .await.map_err(anyhow::Error::msg)
             }.await;
             send(Response::StudioDist { pane, generation, result: result.map_err(|e| format!("{e:#}")) });
         }
-        Request::StudioCorr { pane, generation, symbol, spec } => {
+        Request::StudioCorr { pane, generation, symbol, spec, fresh } => {
             let bridge = config.bridge();
-            let result = crate::app::studio_corr::research(&s.history, &bridge, s.sample_mode(), &symbol, &spec, |key, tf| async move {
-                analysis_bars(s, &key, tf, default_limit(tf), "Relationship Studio").await
-            }).await.map_err(|e| format!("{e:#}"));
+            let result = crate::app::studio_corr::research(
+                &crate::app::studio_corr::CORR_CACHE,
+                fresh,
+                &s.history,
+                &bridge,
+                s.sample_mode(),
+                &symbol,
+                &spec,
+                |key, tf| async move { analysis_bars(s, &key, tf, default_limit(tf), "Relationship Studio").await },
+            )
+            .await
+            .map_err(|e| format!("{e:#}"));
             send(Response::StudioCorr { pane, generation, result });
         }
         Request::StudioSeason { pane, generation, symbol, tf } => {
@@ -3320,7 +3330,7 @@ async fn handle_inner(s: &Arc<Shared>, req: Request, force: bool) {
                 if !tr_data::cash_session::is_cash(&tr_data::security(&symbol)) {
                     anyhow::bail!("SEASON currently requires a US cash-session equity, ETF or index");
                 }
-                let (bars, source, observed) = if tf == Timeframe::D1 {
+                let (bars, source, observed, gaps) = if tf == Timeframe::D1 {
                     let ticker = tr_data::whats_news::archive_ticker(&symbol);
                     let bars = s.history.db(move |db| db.daily(&ticker)).await?;
                     let (bars, source) = if bars.is_empty() {
@@ -3329,16 +3339,16 @@ async fn handle_inner(s: &Arc<Shared>, req: Request, force: bool) {
                         snapshot.provenance.require_verified("Seasonality archive").map_err(anyhow::Error::msg)?;
                         (snapshot.data, snapshot.source)
                     } else { (bars, "Local Yahoo daily research archive".into()) };
-                    (bars, source, chrono::Utc::now().timestamp())
+                    (bars, source, chrono::Utc::now().timestamp(), Vec::new())
                 } else {
                     let (bars, info) = analysis_bars(s, &symbol, tf, tr_data::cash_session::research_fetch_limit(tf), "Seasonality").await?;
                     // A stale vault must not use wall time to close an observed pending bar.
                     let observed = info.fetched_at.unwrap_or_else(|| bars.last().map(|b| b.ts).unwrap_or(0));
-                    (bars, info.source, observed)
+                    (bars, info.source, observed, info.gaps)
                 };
                 let now = chrono::Utc::now().timestamp();
                 tokio::task::spawn_blocking(move || {
-                    tr_data::studio_season::compute_at(&symbol, tf, &bars, &source, observed.min(now), now)
+                    tr_data::studio_season::compute_with_gaps(&symbol, tf, &bars, &source, observed.min(now), now, &gaps)
                 }).await?.map_err(anyhow::Error::msg)
             }.await.map_err(|e| format!("{e:#}"));
             send(Response::StudioSeason { pane, generation, result });
