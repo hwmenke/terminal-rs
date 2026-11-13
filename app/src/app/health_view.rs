@@ -220,6 +220,9 @@ impl TerminalApp {
                     theme::muted(),
                 );
                 response.on_hover_text(error);
+                if feed == Feed::Bars && ui.small_button("VAULT › · per-symbol session coverage").clicked() {
+                    self.vault_command(crate::command::VaultCmd::Open, self.focused_symbol());
+                }
                 ui.add_space(6.0);
             }
         });

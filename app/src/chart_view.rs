@@ -28,6 +28,7 @@ use tr_data::anchored_vwap::AvwapKey;
 
 mod cockpit;
 mod trend_cone;
+mod vault_footer;
 pub use cockpit::{LinkBus, LinkPublish, resolve_hover};
 
 const AXIS_W: f32 = 66.0;
@@ -222,16 +223,7 @@ struct RailPaint {
     mesh: Arc<egui::Mesh>,
 }
 
-#[derive(Clone, PartialEq)]
-struct EdgeKey {
-    n: usize,
-    first_ts: i64,
-    last_ts: i64,
-    params: AdaptiveTrendParams,
-    horizons: [usize; 3],
-    generation: u64,
-    tf: Timeframe,
-}
+use tr_data::edge::EdgeKey;
 
 #[derive(Default)]
 struct EdgePaint {
@@ -305,6 +297,9 @@ pub struct ChartState {
     pub show_edge: bool,
     cone: trend_cone::ConeState,
     edge: Option<Result<Arc<tr_data::edge::EdgeReport>, String>>,
+    edge_work: Option<Request>,
+    edge_pending: Option<EdgeKey>,
+    pub stitch: Option<Arc<tr_data::vault::StitchInfo>>,
     edge_cache: Option<(EdgeKey, Arc<tr_data::edge::EdgeReport>)>,
     edge_paint: EdgePaint,
     zband_paint: StackPaint,
@@ -445,6 +440,9 @@ impl ChartState {
             cone: Default::default(),
             edge: None,
             edge_paint: Default::default(),
+            edge_work: None,
+            edge_pending: None,
+            stitch: None,
             edge_cache: None,
             zband_paint: Default::default(),
             tint_ref: None,
@@ -586,6 +584,9 @@ impl ChartState {
     /// (Re)load history for the current symbol and timeframe.
     pub fn load(&mut self, w: &Worker) {
         self.generation += 1;
+        self.stitch = None;
+        self.edge_pending = None;
+        self.edge_work = None;
         self.cone.invalidate();
         self.edge = None;
         self.zband_paint = Default::default();
@@ -1142,6 +1143,8 @@ impl ChartState {
         } else {
             self.show_edge = false;
             self.edge = None;
+            self.edge_pending = None;
+            self.edge_work = None;
             self.stack = None;
             self.stack_pulse = None;
             self.stack_paint = Default::default();
@@ -1154,6 +1157,9 @@ impl ChartState {
         if self.show_edge {
             self.set_trend_stack(Some(true), w);
             self.refresh_edge(chrono::Utc::now().timestamp());
+        } else {
+            self.edge_pending = None;
+            self.edge_work = None;
         }
     }
     fn refresh_edge(&mut self, now: i64) {
@@ -1162,12 +1168,17 @@ impl ChartState {
         }
         // Recheck provenance before reusing a report, even when its time key matches.
         let gate = tr_data::stats::require_research_bars(&self.bars, "TSTACK Edge").and_then(|()| {
-            if self.bars.iter().any(|b| b.provenance != self.bars[0].provenance) {
+            if self.bars.iter().any(|b| b.provenance != self.bars[0].provenance) && self.stitch.is_none() {
                 Err("TSTACK Edge refused: mixed real/cache history".into())
             } else {
                 Ok(())
             }
         });
+        if gate.is_err() || self.stack.is_none() {
+            // A refused or stack-less state supersedes any queued/outstanding study.
+            self.edge_pending = None;
+            self.edge_work = None;
+        }
         let mut paint_key = None;
         self.edge = if let Err(e) = gate {
             Some(Err(e))
@@ -1179,6 +1190,7 @@ impl ChartState {
                 if self.archive { Some(now) } else { self.last_refresh },
             );
             let key = EdgeKey {
+                digest: tr_data::stable_hash::bars_digest(&self.bars[..n]),
                 n,
                 first_ts: self.bars[0].ts,
                 last_ts: self.bars[..n].last().map(|b| b.ts).unwrap_or(0),
@@ -1187,12 +1199,13 @@ impl ChartState {
                 generation: self.generation,
                 tf: self.tf,
             };
-            if let Some((cached_key, report)) = &self.edge_cache {
-                if cached_key == &key && self.edge_paint.key.as_ref() == Some(&key) {
-                    self.edge = Some(Ok(report.clone()));
-                    self.edge_paint.forming_excluded = n < self.bars.len();
-                    return;
-                }
+            if let Some((cached_key, report)) = &self.edge_cache
+                && cached_key == &key
+                && self.edge_paint.key.as_ref() == Some(&key)
+            {
+                self.edge = Some(Ok(report.clone()));
+                self.edge_paint.forming_excluded = n < self.bars.len();
+                return;
             }
             let state: Vec<_> =
                 stack.medium.iter().zip(&stack.confidence).take(n).map(|(&s, c)| c.is_finite().then_some(s)).collect();
@@ -1200,17 +1213,22 @@ impl ChartState {
                 (cached_key == &key).then(|| Ok(report.clone()))
             } else {
                 None
-            }
-            .unwrap_or_else(|| {
-                tr_data::edge::regime_edge(
-                    &self.bars[..n],
-                    &state,
-                    &stack.entry_long[..n],
-                    &stack.entry_short[..n],
-                    &key.horizons,
-                )
-                .map(Arc::new)
-            });
+            };
+            let Some(result) = result else {
+                if self.edge_pending.as_ref() != Some(&key) {
+                    self.edge_pending = Some(key.clone());
+                    self.edge_work = Some(Request::StackEdge {
+                        pane: self.id,
+                        key,
+                        bars: self.bars.clone(),
+                        state,
+                        entry_long: stack.entry_long[..n].to_vec(),
+                        entry_short: stack.entry_short[..n].to_vec(),
+                        stitch: self.stitch.clone(),
+                    });
+                }
+                return;
+            };
             if let Ok(report) = &result {
                 self.edge_cache = Some((key.clone(), report.clone()));
                 paint_key = Some(key);
@@ -1315,6 +1333,48 @@ impl ChartState {
         }
     }
 
+    pub fn on_vault_stitch(&mut self, generation: u64, info: Arc<tr_data::vault::StitchInfo>) {
+        if generation == self.generation {
+            self.stitch = Some(info);
+        }
+    }
+    pub fn on_stack_edge(&mut self, key: EdgeKey, result: Result<Arc<tr_data::edge::EdgeReport>, String>) {
+        // Only the outstanding request may answer. Its slot is released even when
+        // the answer is then rejected, so an identical later key is re-requested
+        // instead of waiting forever on a response that was already discarded.
+        if self.edge_pending.as_ref() != Some(&key) {
+            return;
+        }
+        self.edge_pending = None;
+        if !self.show_edge
+            || key.generation != self.generation
+            || key.tf != self.tf
+            || key.params != (AdaptiveTrendParams { session_reset: self.stack_session, ..self.stack_params() })
+            || key.n
+                != tr_data::closed::closed_len(
+                    self.tf,
+                    &self.bars,
+                    self.sec.class,
+                    if self.archive { Some(chrono::Utc::now().timestamp()) } else { self.last_refresh },
+                )
+            || self.bars.iter().any(|b| !b.provenance.is_verified())
+            || key.n > self.bars.len()
+            || tr_data::stable_hash::bars_digest(&self.bars[..key.n]) != key.digest
+        {
+            return;
+        }
+        match result {
+            Ok(report) => {
+                self.edge_cache = Some((key, report));
+                self.refresh_edge(chrono::Utc::now().timestamp());
+            }
+            Err(error) => {
+                self.edge = Some(Err(error));
+                self.edge_paint = Default::default();
+            }
+        }
+    }
+
     pub fn on_trend_stack(&mut self, generation: u64, base_len: usize, result: Result<TrendStack, String>) {
         if !self.show_stack || generation != self.generation || base_len != self.bars.len() {
             return;
@@ -1413,7 +1473,11 @@ impl ChartState {
 
     fn stack_motion_allowed(&self, now: i64) -> bool {
         !self.archive
-            && self.provenance == Provenance::Real
+            && (self.provenance == Provenance::Real
+                || self
+                    .stitch
+                    .as_ref()
+                    .is_some_and(|s| s.live_ok && !s.note.as_ref().is_some_and(|n| n.contains("QUARANTINED"))))
             && self.last_refresh.is_some()
             && self.stack_freshness(now) == Some(Freshness::Current)
     }
@@ -1625,7 +1689,11 @@ impl ChartState {
         }
         self.error = None;
         if !from_cache && !live && prepended == 0 && self.provenance.is_verified() {
-            self.last_refresh = Some(chrono::Utc::now().timestamp());
+            self.last_refresh = self
+                .stitch
+                .as_ref()
+                .map(|s| if s.live_ok { s.fetched_at } else { None })
+                .unwrap_or_else(|| Some(chrono::Utc::now().timestamp()));
         }
         match self.viewport.as_mut() {
             None => {
@@ -1817,6 +1885,9 @@ impl ChartState {
     }
 
     pub fn show(&mut self, ui: &mut Ui, rect: Rect, focused: bool, w: &Worker) -> bool {
+        if let Some(work) = self.edge_work.take() {
+            w.send(work);
+        }
         let painter = ui.painter_at(rect);
         // Sits under a tab strip inside a card: square top, rounded bottom.
         let r = theme::CARD_RADIUS.saturating_sub(1);
@@ -2443,6 +2514,7 @@ impl ChartState {
             Some(cockpit::LinkGeom { plot_id: plot_resp.id, plot: plot_all, price_rect, viewport: v, scale, len });
         self.paint_legend(ui, price_rect, hovered_bar.or(ghost).unwrap_or(len.saturating_sub(1)), &sub_rects);
         self.paint_cockpit_chip(ui, price_rect);
+        self.paint_vault_footer(ui, price_rect, &v);
         if self.show_edge {
             self.paint_flip_outcomes(ui, price_rect, &v, &scale);
             self.paint_edge_card(ui, price_rect);
@@ -2763,7 +2835,13 @@ impl ChartState {
             );
             return;
         };
-        crate::widgets::data_card(&p, rect, "TSTACK EDGE", muted(), false);
+        crate::widgets::data_card(
+            &p,
+            rect,
+            if self.edge_pending.is_some() { "TSTACK EDGE · UPDATING" } else { "TSTACK EDGE" },
+            muted(),
+            false,
+        );
         if report.flip_outcomes.iter().any(|f| f.value.is_none()) {
             let mut child = ui.new_child(
                 UiBuilder::new()
@@ -4534,6 +4612,96 @@ mod tests {
     }
 
     #[test]
+    fn edge_request_is_not_resent_and_obsolete_response_is_dropped() {
+        let (worker, _) = Worker::test_channel();
+        let mut c = stack_chart(&worker, Provenance::Real);
+        c.show_edge = true;
+        let now = chrono::Utc::now().timestamp();
+        c.refresh_edge(now);
+        let Some(Request::StackEdge { key, bars, state, entry_long, entry_short, .. }) = c.edge_work.take() else {
+            panic!("missing worker request")
+        };
+        c.refresh_edge(now);
+        assert!(c.edge_work.is_none());
+        let result =
+            tr_data::edge::regime_edge(&bars[..key.n], &state, &entry_long, &entry_short, &key.horizons).map(Arc::new);
+        let mut changed = (*c.bars).clone();
+        changed[0].close += 0.1;
+        c.bars = Arc::new(changed);
+        c.on_stack_edge(key, result);
+        assert!(c.edge.is_none());
+    }
+    #[test]
+    fn edge_response_dropped_while_off_does_not_wedge_the_next_request() {
+        let (worker, _rx) = Worker::test_channel();
+        let mut c = stack_chart(&worker, Provenance::Real);
+        c.show_edge = true;
+        let now = chrono::Utc::now().timestamp();
+        c.refresh_edge(now);
+        let Some(Request::StackEdge { key, bars, state, entry_long, entry_short, .. }) = c.edge_work.take() else {
+            panic!("missing worker request")
+        };
+        let result =
+            tr_data::edge::regime_edge(&bars[..key.n], &state, &entry_long, &entry_short, &key.horizons).map(Arc::new);
+        // EDGE off while the worker computes: the late answer must not paint.
+        c.set_stack_edge(Some(false), &worker);
+        c.on_stack_edge(key.clone(), result.clone());
+        assert!(c.edge.is_none());
+        // Same inputs again: a fresh request goes out instead of waiting forever.
+        c.set_stack_edge(Some(true), &worker);
+        let Some(Request::StackEdge { key: again, .. }) = c.edge_work.take() else { panic!("request not resent") };
+        assert!(again == key);
+        // A response for a superseded key never displaces the outstanding one.
+        let mut old = key.clone();
+        old.generation += 1;
+        c.on_stack_edge(old, result.clone());
+        assert!(c.edge_pending.is_some() && c.edge.is_none());
+        c.on_stack_edge(again, result);
+        assert!(matches!(c.edge, Some(Ok(_))));
+        assert!(c.edge_pending.is_none());
+    }
+    #[test]
+    fn edge_work_is_dropped_when_symbol_or_timeframe_reloads() {
+        let (worker, _rx) = Worker::test_channel();
+        let mut c = stack_chart(&worker, Provenance::Real);
+        c.show_edge = true;
+        c.refresh_edge(chrono::Utc::now().timestamp());
+        let Some(Request::StackEdge { key, bars, state, entry_long, entry_short, .. }) = c.edge_work.take() else {
+            panic!("missing worker request")
+        };
+        let result =
+            tr_data::edge::regime_edge(&bars[..key.n], &state, &entry_long, &entry_short, &key.horizons).map(Arc::new);
+        assert!(c.edge_pending.is_some());
+        c.load(&worker);
+        assert!(c.edge_work.is_none() && c.edge_pending.is_none());
+        // Same bars are back in the new generation: the old answer is still refused.
+        c.bars = bars.clone();
+        c.on_stack_edge(key, result);
+        assert!(c.edge.is_none());
+    }
+    #[test]
+    fn stitched_series_passes_edge_gate_with_identical_prices() {
+        let (worker, _) = Worker::test_channel();
+        let mut c = stack_chart(&worker, Provenance::Real);
+        c.show_edge = true;
+        let mut b = (*c.bars).clone();
+        b[0].provenance = Provenance::Cached;
+        c.bars = Arc::new(b);
+        c.stitch =
+            Some(Arc::new(tr_data::vault::StitchInfo { source: "yahoo".into(), epoch: 1, ..Default::default() }));
+        complete_edge(&mut c, chrono::Utc::now().timestamp());
+        assert!(matches!(c.edge, Some(Ok(_))));
+    }
+    fn complete_edge(c: &mut ChartState, now: i64) {
+        c.refresh_edge(now);
+        if let Some(Request::StackEdge { key, bars, state, entry_long, entry_short, stitch, .. }) = c.edge_work.take() {
+            let input = tr_data::vault::research_bars(&bars, stitch.as_deref()).unwrap();
+            let result = tr_data::edge::regime_edge(&input[..key.n], &state, &entry_long, &entry_short, &key.horizons)
+                .map(Arc::new);
+            c.on_stack_edge(key, result);
+        }
+    }
+    #[test]
     fn link_bus_routes_same_symbol_cursor_and_next_finer_window() {
         use crate::layouts::Link;
         let mut bus = LinkBus::default();
@@ -4956,11 +5124,11 @@ mod tests {
             // Populate a real cached report first: refusal must hide all old digits.
             let mut c = stack_chart(&worker, Provenance::Real);
             c.show_edge = true;
-            c.refresh_edge(chrono::Utc::now().timestamp());
+            complete_edge(&mut c, chrono::Utc::now().timestamp());
             let mut bars = (*c.bars).clone();
             bars[0].provenance = provenance;
             c.bars = Arc::new(bars);
-            c.refresh_edge(chrono::Utc::now().timestamp());
+            complete_edge(&mut c, chrono::Utc::now().timestamp());
             assert!(matches!(c.edge, Some(Err(_))));
             let mut output = ctx.run_ui(
                 egui::RawInput {
@@ -4981,7 +5149,7 @@ mod tests {
         c.show_edge = true;
         let last_ts = c.bars.last().unwrap().ts;
         c.last_refresh = Some(last_ts + 1);
-        c.refresh_edge(last_ts + 1);
+        complete_edge(&mut c, last_ts + 1);
         let before = c.edge.as_ref().unwrap().as_ref().unwrap().clone();
         let tooltip = c.edge_paint.cells[0].2.clone();
         let mut bars = (*c.bars).clone();
@@ -4991,27 +5159,36 @@ mod tests {
         c.bars = Arc::new(bars);
         c.stack = Some(tr_core::indicators::trend_stack(&c.bars, c.tf, vec![], Default::default()).unwrap());
         c.edge = None; // The history/live update path clears its visible report.
-        c.refresh_edge(last_ts + 2);
+        complete_edge(&mut c, last_ts + 2);
         assert!(Arc::ptr_eq(&before, c.edge.as_ref().unwrap().as_ref().unwrap()));
         assert_eq!(tooltip, c.edge_paint.cells[0].2);
         c.last_refresh = Some(last_ts + c.tf.seconds());
-        c.refresh_edge(last_ts + c.tf.seconds());
+        {
+            let now = last_ts + c.tf.seconds();
+            complete_edge(&mut c, now);
+        }
         let closed = c.edge.as_ref().unwrap().as_ref().unwrap().clone();
         assert!(!Arc::ptr_eq(&before, &closed));
         assert_eq!(closed.bars, c.bars.len());
 
         let mut bars = (*c.bars).clone();
-        let mut earlier = bars[0].clone();
+        let mut earlier = bars[0];
         earlier.ts -= c.tf.seconds();
         bars.insert(0, earlier);
         c.bars = Arc::new(bars);
         c.stack = Some(tr_core::indicators::trend_stack(&c.bars, c.tf, vec![], Default::default()).unwrap());
-        c.refresh_edge(last_ts + c.tf.seconds());
+        {
+            let now = last_ts + c.tf.seconds();
+            complete_edge(&mut c, now);
+        }
         let paged = c.edge.as_ref().unwrap().as_ref().unwrap().clone();
         assert!(!Arc::ptr_eq(&closed, &paged));
         assert_eq!(paged.bars, closed.bars + 1);
         c.stack_session = true;
-        c.refresh_edge(last_ts + c.tf.seconds());
+        {
+            let now = last_ts + c.tf.seconds();
+            complete_edge(&mut c, now);
+        }
         assert!(!Arc::ptr_eq(&paged, c.edge.as_ref().unwrap().as_ref().unwrap()));
     }
     #[test]
@@ -5019,7 +5196,7 @@ mod tests {
         let (worker, _) = Worker::test_channel();
         let mut c = stack_chart(&worker, Provenance::Real);
         c.show_edge = true;
-        c.refresh_edge(chrono::Utc::now().timestamp());
+        complete_edge(&mut c, chrono::Utc::now().timestamp());
         let report = Arc::make_mut(c.edge.as_mut().unwrap().as_mut().unwrap());
         for cell in &mut report.cells {
             cell.q = Some(1.0);
@@ -5071,12 +5248,12 @@ mod tests {
         let (worker, _) = Worker::test_channel();
         let mut c = stack_chart(&worker, Provenance::Real);
         c.show_edge = true;
-        c.refresh_edge(chrono::Utc::now().timestamp());
+        complete_edge(&mut c, chrono::Utc::now().timestamp());
         assert!(matches!(c.edge, Some(Ok(_))));
         let mut bars = (*c.bars).clone();
         bars[0].provenance = Provenance::Cached;
         c.bars = Arc::new(bars);
-        c.refresh_edge(chrono::Utc::now().timestamp());
+        complete_edge(&mut c, chrono::Utc::now().timestamp());
         assert!(matches!(c.edge, Some(Err(_))));
         let mut c = stack_chart(&worker, Provenance::Real);
         c.show_edge = true;
@@ -5090,7 +5267,7 @@ mod tests {
         }
         c.bars = Arc::new(bars);
         c.last_refresh = Some(now);
-        c.refresh_edge(now + tf.seconds() * 10);
+        complete_edge(&mut c, now + tf.seconds() * 10);
         let r = c.edge.as_ref().unwrap().as_ref().unwrap();
         assert_eq!(r.bars, c.bars.len() - 1);
         assert!(r.completed.iter().all(|o| o.index + o.horizon < r.bars));
@@ -5121,17 +5298,20 @@ mod tests {
         c.bars = Arc::new(bars);
         c.last_refresh = Some(now);
         c.stack = Some(tr_core::indicators::trend_stack(&c.bars, c.tf, vec![], Default::default()).unwrap());
-        c.refresh_edge(now);
+        complete_edge(&mut c, now);
         let report = c.edge.as_ref().unwrap().as_ref().unwrap();
         assert_eq!(report.bars, c.bars.len() - 1);
         assert!(c.edge_paint.forming_excluded);
         assert!(report.completed.iter().all(|o| o.index + o.horizon < report.bars));
 
         // Wall time alone cannot close a bar from a stale observation.
-        c.refresh_edge(stamp("2026-11-11T15:31:00Z"));
+        complete_edge(&mut c, stamp("2026-11-11T15:31:00Z"));
         assert_eq!(c.edge.as_ref().unwrap().as_ref().unwrap().bars, c.bars.len() - 1);
         c.last_refresh = Some(stamp("2026-11-11T15:30:00Z"));
-        c.refresh_edge(c.last_refresh.unwrap());
+        {
+            let now = c.last_refresh.unwrap();
+            complete_edge(&mut c, now);
+        }
         assert_eq!(c.edge.as_ref().unwrap().as_ref().unwrap().bars, c.bars.len());
         assert!(!c.edge_paint.forming_excluded);
     }
@@ -5151,7 +5331,7 @@ mod tests {
         c.show_edge = true;
         c.bars = Arc::new(bars.clone());
         c.stack = Some(tr_core::indicators::trend_stack(&bars, c.tf, vec![], Default::default()).unwrap());
-        c.refresh_edge(now);
+        complete_edge(&mut c, now);
         let before = c.edge.clone().unwrap().unwrap();
         assert_eq!(before.bars, bars.len() - 1);
         let stack = c.stack.as_ref().unwrap();
@@ -5163,7 +5343,7 @@ mod tests {
         bars.last_mut().unwrap().high *= 3.0;
         c.bars = Arc::new(bars.clone());
         c.stack = Some(tr_core::indicators::trend_stack(&bars, c.tf, vec![], Default::default()).unwrap());
-        c.refresh_edge(now);
+        complete_edge(&mut c, now);
         assert_eq!(before, c.edge.unwrap().unwrap());
     }
     #[test]

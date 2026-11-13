@@ -8,7 +8,7 @@ use rusqlite::{Connection, params};
 use tr_core::{Bar, Provenance, Timeframe};
 
 pub struct BarCache {
-    conn: Connection,
+    pub(crate) conn: Connection,
 }
 
 impl BarCache {
@@ -23,7 +23,12 @@ impl BarCache {
         Self::init(Connection::open_in_memory()?)
     }
 
-    fn init(conn: Connection) -> Result<Self> {
+    pub(crate) fn init(conn: Connection) -> Result<Self> {
+        Self::init_tables(&conn)?;
+        Ok(Self { conn })
+    }
+
+    pub(crate) fn init_tables(conn: &Connection) -> Result<()> {
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS bars (
                 symbol TEXT NOT NULL, tf TEXT NOT NULL, ts INTEGER NOT NULL,
@@ -52,7 +57,7 @@ impl BarCache {
                 symbol TEXT PRIMARY KEY NOT NULL, zone TEXT NOT NULL
             ) WITHOUT ROWID;",
         )?;
-        Ok(Self { conn })
+        Ok(())
     }
 
     /// Record when a provider refresh for this series completed.

@@ -45,22 +45,34 @@ impl MarketData for Markets {
     }
 
     async fn history(&self, symbol: &str, tf: Timeframe, end: Option<i64>, limit: usize) -> Result<Vec<Bar>> {
+        Ok(self.history_sourced(symbol, tf, end, limit).await?.0)
+    }
+
+    /// The single history routing path; `history` discards the source tag.
+    async fn history_sourced(
+        &self,
+        symbol: &str,
+        tf: Timeframe,
+        end: Option<i64>,
+        limit: usize,
+    ) -> Result<(Vec<Bar>, String)> {
         let sec = security(symbol);
+        let yahoo = |bars: Vec<Bar>| (bars, "yahoo".to_owned());
         match sec.class {
-            AssetClass::Crypto => self.crypto.history(&sec, tf, end, limit).await,
+            AssetClass::Crypto => Ok((self.crypto.history(&sec, tf, end, limit).await?, "crypto".into())),
             AssetClass::Govt if tf.is_intraday() => match catalog::by_security(&sec).and_then(|l| l.yahoo) {
-                Some(y) => self.yahoo.history(y, tf, end, limit).await,
+                Some(y) => self.yahoo.history(y, tf, end, limit).await.map(yahoo),
                 None => bail!("intraday yields are not available for {}; use D, W or M", sec.ticker),
             },
-            AssetClass::Govt => self.treasury.history(&sec, tf, end, limit).await,
+            AssetClass::Govt => Ok((self.treasury.history(&sec, tf, end, limit).await?, "treasury".into())),
             AssetClass::Equity | AssetClass::Etf if self.alpaca.is_some() => {
                 let a = self.alpaca.as_ref().expect("checked");
                 match a.history(&sec.ticker, tf, end, limit).await {
-                    Ok(b) if !b.is_empty() => Ok(b),
-                    _ => self.yahoo.history(&yahoo_symbol(&sec), tf, end, limit).await,
+                    Ok(b) if !b.is_empty() => Ok((b, format!("alpaca:{}", a.feed()))),
+                    _ => self.yahoo.history(&yahoo_symbol(&sec), tf, end, limit).await.map(yahoo),
                 }
             }
-            _ => self.yahoo.history(&yahoo_symbol(&sec), tf, end, limit).await,
+            _ => self.yahoo.history(&yahoo_symbol(&sec), tf, end, limit).await.map(yahoo),
         }
     }
 
@@ -194,5 +206,16 @@ mod tests {
         assert!(!markets.has_live_feed("EURUSD Curncy", Timeframe::M5));
         assert!(!markets.has_live_feed("CL1 Comdty", Timeframe::H1));
         assert!(markets.has_live_feed("BTCUSD Curncy", Timeframe::M1));
+    }
+
+    /// `history` is `history_sourced` minus the tag: one routing table. US2Y has
+    /// no Yahoo intraday listing, so both paths refuse identically without network.
+    #[tokio::test]
+    async fn history_and_history_sourced_share_one_route() {
+        let markets = Markets::new(None).unwrap();
+        let plain = markets.history("US2Y Govt", Timeframe::M5, None, 10).await.unwrap_err();
+        let sourced = markets.history_sourced("US2Y Govt", Timeframe::M5, None, 10).await.unwrap_err();
+        assert_eq!(format!("{plain:#}"), format!("{sourced:#}"));
+        assert!(format!("{plain:#}").contains("intraday yields are not available for US2Y"));
     }
 }

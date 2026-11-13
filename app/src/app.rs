@@ -40,6 +40,7 @@ mod stats;
 mod theming;
 mod trading;
 mod trend_wall;
+pub(crate) mod vault_view;
 mod volume_pace;
 mod watchlists;
 mod workspace;
@@ -73,6 +74,7 @@ use chrome::{SIDEBAR_W, STATUS_H, SidebarCmd};
 use settings_view::SettingsTab;
 
 pub enum PaneKind {
+    Vault(Box<vault_view::VaultPane>),
     Chart(Box<ChartState>),
     Feed {
         filter: FeedFilter,
@@ -307,6 +309,7 @@ impl PaneKind {
             PaneKind::Watchlist => "Watchlist".into(),
             PaneKind::Help => "Help".into(),
             PaneKind::Health => "Feed Health".into(),
+            PaneKind::Vault(_) => "Bar Vault".into(),
             PaneKind::Wei => "World Markets".into(),
             PaneKind::Curve => "Yield Curve".into(),
             PaneKind::Search { query } if query.is_empty() => "Search".into(),
@@ -454,6 +457,7 @@ impl PaneKind {
             PaneKind::Watchlist => "WL",
             PaneKind::Help => "HELP",
             PaneKind::Health => "HEALTH",
+            PaneKind::Vault(_) => "VAULT",
             PaneKind::Wei => "WEI",
             PaneKind::Curve => "GC",
             PaneKind::Search { .. } => "SECF",
@@ -577,6 +581,7 @@ impl PaneKind {
             PaneKind::Watchlist => PaneSettings::Watchlist,
             PaneKind::Help => PaneSettings::Help,
             PaneKind::Health => PaneSettings::Health,
+            PaneKind::Vault(p) => PaneSettings::Vault { symbol: p.symbol.clone() },
             PaneKind::Wei => PaneSettings::Wei,
             PaneKind::Curve => PaneSettings::Curve,
             PaneKind::Search { query } => PaneSettings::Search(query.clone()),
@@ -739,6 +744,7 @@ impl PaneKind {
             PaneSettings::Watchlist | PaneSettings::IntradayScan => PaneKind::Watchlist,
             PaneSettings::Help => PaneKind::Help,
             PaneSettings::Health => PaneKind::Health,
+            PaneSettings::Vault { symbol } => PaneKind::Vault(Box::new(vault_view::VaultPane::new(symbol))),
             PaneSettings::Wei => PaneKind::Wei,
             PaneSettings::Curve => PaneKind::Curve,
             PaneSettings::Search(q) => PaneKind::Search { query: q },
@@ -1439,6 +1445,7 @@ impl TerminalApp {
             Command::SymbolFunction(s, Function::Cockpit { spec }) => self.open_cockpit(Some(&s), &spec),
             Command::SymbolFunction(s, Function::GapFill { spec }) => self.open_gap_fill(Some(&s), &spec),
             Command::SymbolFunction(s, Function::SessionExtreme { spec }) => self.open_session_extreme(Some(&s), &spec),
+            Command::SymbolFunction(s, Function::Vault(cmd)) => self.vault_command(cmd, Some(s)),
             Command::SymbolFunction(s, Function::SessionClock { spec }) => self.open_session_clock(Some(&s), &spec),
             Command::SymbolFunction(s, Function::RelativePath { spec }) => self.open_relative_path(Some(&s), &spec),
             Command::SymbolFunction(s, Function::SessionBrief) => self.open_session_brief(Some(&s)),
@@ -1635,6 +1642,7 @@ impl TerminalApp {
                 }
             }
             Function::Help => self.open_panel(PaneKind::Help),
+            Function::Vault(cmd) => self.vault_command(cmd, symbol.or_else(|| self.focused_symbol())),
             Function::Health => {
                 self.worker.send(Request::Health);
                 self.open_panel(PaneKind::Health);
@@ -1752,6 +1760,23 @@ impl TerminalApp {
                     }
                 }
                 Response::Health(snapshot) => self.health = snapshot,
+                Response::StackEdge { pane, key, result } => {
+                    if let Some(c) = self.chart_mut(pane) {
+                        c.on_stack_edge(key, result);
+                    }
+                }
+                Response::VaultStitch { pane, generation, info } => {
+                    if let Some(c) = self.chart_mut(pane) {
+                        c.on_vault_stitch(generation, info);
+                    }
+                }
+                Response::VaultSnapshot { pane, generation, result } => {
+                    if let Some(PaneKind::Vault(p)) = self.panes.iter_mut().find(|p| p.id == pane).map(|p| &mut p.kind)
+                    {
+                        p.accept(generation, result);
+                    }
+                }
+
                 Response::Feed { feed, pane, symbol, generation, state } => {
                     self.on_feed(feed, pane, symbol, generation, state)
                 }
@@ -2501,6 +2526,7 @@ impl TerminalApp {
         use prefs::Action as A;
         match a {
             A::Help => self.apply(Function::Help),
+            A::Vault => self.vault_command(command::VaultCmd::Open, self.focused_symbol()),
             A::Congress => self.apply(Function::Congress),
             A::Politicians => self.apply(Function::Politician(String::new())),
             A::Alerts => self.apply(Function::Alerts),
@@ -2577,6 +2603,14 @@ impl TerminalApp {
 
     fn periodic(&mut self) {
         let visible = self.visible_panes();
+        for &i in &visible {
+            let id = self.panes[i].id;
+            if let PaneKind::Vault(p) = &mut self.panes[i].kind
+                && p.fetched.is_none_or(|t| t.elapsed() >= Duration::from_secs(60))
+            {
+                p.request(id, &self.worker);
+            }
+        }
         if visible.iter().any(|&i| matches!(self.panes[i].kind, PaneKind::Health))
             && self.last_health.is_none_or(|t| t.elapsed() >= Duration::from_secs(1))
         {
@@ -3085,6 +3119,7 @@ mod tests {
             PaneSettings::Research(None),
             PaneSettings::Research(Some("DARVAS_BREAKOUT".into())),
             PaneSettings::Desk { group: "Growth".into(), selected: Some("AAPL US Equity".into()) },
+            PaneSettings::Vault { symbol: Some("AAPL US Equity".into()) },
             PaneSettings::SessionBrief { symbol: "AAPL US Equity".into() },
             PaneSettings::SessionClock { symbol: "AAPL US Equity".into(), spec: "1h".into(), tf: "30m".into() },
             PaneSettings::Backtest {

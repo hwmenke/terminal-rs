@@ -136,6 +136,9 @@ impl TerminalApp {
 }
 
 fn render_brief(ui: &mut Ui, brief: &SessionBrief) {
+    if !brief.source.is_empty() {
+        ui.label(RichText::new(&brief.source).font(mono(10.)).color(muted()));
+    }
     let when = brief.date.map(|d| d.to_string()).unwrap_or_else(|| "no session".into());
     let stale = !brief.fresh;
     ui.label(
@@ -228,6 +231,7 @@ mod tests {
     #[test]
     fn session_brief_pane_rejects_sample_reads() {
         let mut brief = tr_data::session_brief::SessionBrief {
+            source: String::new(),
             symbol: "AAPL US Equity".into(),
             ticker: "AAPL".into(),
             timeframe: tr_core::Timeframe::M5,

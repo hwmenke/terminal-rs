@@ -223,6 +223,7 @@ pub struct TradingPrefs {
 /// Every rebindable action.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub enum Action {
+    Vault,
     Help,
     Congress,
     Politicians,
@@ -283,7 +284,8 @@ pub enum Action {
 }
 
 impl Action {
-    pub const ALL: [Action; 57] = [
+    pub const ALL: [Action; 58] = [
+        Action::Vault,
         Action::Help,
         Action::Congress,
         Action::Politicians,
@@ -388,6 +390,7 @@ impl Action {
             Action::DrawHorizontal => "Draw horizontal line".into(),
             Action::DrawVertical => "Draw vertical line".into(),
             Action::DrawFib => "Draw Fibonacci retracement".into(),
+            Action::Vault => "Open Bar Vault".into(),
             Action::ToggleTrendCone => "Toggle Trend Cone".into(),
             Action::DrawAnchoredVwap => "Anchor VWAP on a clicked bar".into(),
             Action::ResetView => "Reset chart view".into(),
@@ -625,6 +628,7 @@ impl Default for Keymap {
         bind(Action::DrawFib, "Alt+F");
         bind(Action::DrawAnchoredVwap, "Alt+A");
         bind(Action::ToggleTrendCone, "Alt+C");
+        bind(Action::Vault, "Alt+B");
         bind(Action::ResetView, "Alt+R");
         bind(Action::JumpLatest, "End");
         bind(Action::LogScale, "Alt+L");
@@ -791,6 +795,12 @@ impl Prefs {
 mod tests {
     use super::*;
 
+    #[test]
+    fn alt_b_opens_vault_and_action_all_has_58_entries() {
+        let keys = Keymap::default();
+        assert_eq!(Action::ALL.len(), 58);
+        assert_eq!(keys.0.get(&Action::Vault), Some(&"Alt+B".to_string()));
+    }
     #[test]
     fn chords_parse_and_round_trip() {
         let c = Chord::parse("Alt+T").unwrap();

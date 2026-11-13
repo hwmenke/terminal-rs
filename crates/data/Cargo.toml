@@ -27,3 +27,7 @@ criterion.workspace = true
 [[bench]]
 name = "anchored_vwap"
 harness = false
+
+[[bench]]
+name = "barvault"
+harness = false

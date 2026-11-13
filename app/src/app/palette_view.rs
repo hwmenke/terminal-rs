@@ -32,6 +32,7 @@ const COMMANDS: &[(&str, &str, &str, Option<Action>)] = &[
     ("CONE OFF", "Hide Trend Cone", "cone disable", None),
     ("TSTACK EDGE", "Regime-conditional forward returns and confidence intervals", "quant edge hit rate flips", None),
     ("ZBAND", "Rolling sample-sigma bands and z readout", "statistics sigma bands", None),
+    ("VAULT", "Closed intraday bar vault", "vlt cache history coverage verify prune", None),
     ("HEALTH", "Real data feed health", "src source offline stale retry", None),
     ("PORT", "", "portfolio prtu brokerage holdings value", Some(Action::Portfolio)),
     ("ACCT", "", "accounts balances brokerage", None),

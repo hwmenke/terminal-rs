@@ -194,6 +194,7 @@ impl ChartState {
             }
         }
         w.send(Request::TrendCone {
+            stitch: self.stitch.clone(),
             pane: self.id,
             key: key.clone(),
             class: self.sec.class,

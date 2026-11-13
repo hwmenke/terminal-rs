@@ -63,6 +63,10 @@ impl Link {
 /// A pane's kind plus its persisted, panel-specific settings.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum PaneSettings {
+    Vault {
+        #[serde(default)]
+        symbol: Option<String>,
+    },
     Chart {
         #[serde(default)]
         archive: bool,

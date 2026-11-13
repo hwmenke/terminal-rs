@@ -254,7 +254,38 @@ pub fn cockpit_ladder(spec: &str) -> Result<[Timeframe; 3], String> {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+pub enum VaultCmd {
+    Open,
+    Verify,
+    Prune,
+    Drop { symbol: String, tf: Option<Timeframe> },
+}
+const VAULT_VERBS: [&str; 3] = ["DROP", "VERIFY", "PRUNE"];
+fn parse_vault(rest: &[&str]) -> Option<VaultCmd> {
+    if rest.first().is_some_and(|s| s.eq_ignore_ascii_case("DROP")) {
+        let (sec, used) = Security::resolve_tokens(&rest[1..])?;
+        let tail = &rest[used + 1..];
+        let tf = match tail {
+            [] => None,
+            [tf] => Some(tf.parse::<Timeframe>().ok()?),
+            _ => return None,
+        };
+        if tf.is_some_and(|tf| !tr_data::cash_session::cash_bar_size(tf)) {
+            return None;
+        }
+        return Some(VaultCmd::Drop { symbol: sec.key(), tf });
+    }
+    match rest {
+        [] => Some(VaultCmd::Open),
+        [v] if v.eq_ignore_ascii_case("VERIFY") => Some(VaultCmd::Verify),
+        [v] if v.eq_ignore_ascii_case("PRUNE") => Some(VaultCmd::Prune),
+        _ => None,
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub enum Function {
+    Vault(VaultCmd),
     Timeframe(Timeframe),
     TrendStack(Option<bool>),
     StackLadder(Option<Vec<Timeframe>>),
@@ -703,6 +734,7 @@ fn parse_function(head: &str, rest: &[&str]) -> Option<Function> {
         "EARN" | "EARNINGS" | "ECAL" => Function::Earnings,
         "ISCAN" | "INTRADAY" => Function::Intraday,
         "IDESK" | "IDASH" => Function::IntradayDesk,
+        "VAULT" | "VLT" => Function::Vault(parse_vault(rest)?),
         "COCKPIT" | "CKPT" => Function::Cockpit { spec: joined() },
         "CONE" | "TRENDCONE" => parse_cone(rest)?,
         "AVWAP" => Function::AnchoredVwap(match words().as_slice() {
@@ -872,6 +904,14 @@ pub fn parse(input: &str) -> Option<Command> {
         if ["TSTACK", "STACK", "MTF", "REGIME", "RAIL", "AVWAP"].iter().any(|word| head.eq_ignore_ascii_case(word)) {
             return None;
         }
+        // VAULT and VLT are also listed tickers. Only a vault verb is guarded;
+        // anything else (`VLT 5m`, `VAULT GP`) loads the ticker, as does
+        // `VAULT US Equity` / `VLT Equity` for the bare security.
+        if ["VAULT", "VLT"].iter().any(|word| head.eq_ignore_ascii_case(word))
+            && rest.first().is_some_and(|verb| VAULT_VERBS.iter().any(|v| verb.eq_ignore_ascii_case(v)))
+        {
+            return None;
+        }
     }
     let (sec, used) = Security::resolve_tokens(&tokens)?;
     match tokens[used..].split_first() {
@@ -973,6 +1013,11 @@ fn describe(f: &Function) -> String {
         Function::IntradayDesk => {
             "Intraday desk: 5-minute chart, ISCAN, breadth, and volume pace, saved as the Intraday layout".into()
         }
+        Function::Vault(VaultCmd::Open) => {
+            "Bar Vault · verified closed intraday provider bars · for the tickers type VAULT US Equity / VLT US Equity"
+                .into()
+        }
+        Function::Vault(cmd) => format!("Bar Vault · {cmd:?} · verified closed intraday provider bars"),
         Function::Cockpit { spec } => match cockpit_ladder(spec) {
             Ok(frames) => format!(
                 "Intraday Cockpit: linked native {} charts with Time Link, Lens and anchored VWAP",
@@ -1191,6 +1236,73 @@ fn describe(f: &Function) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn vault_commands_alias_symbol_and_guard() {
+        for cmd in ["VAULT", "VLT"] {
+            assert_eq!(parse(cmd), Some(Command::Function(Function::Vault(VaultCmd::Open))));
+        }
+        assert_eq!(
+            parse("AAPL VAULT"),
+            Some(Command::SymbolFunction("AAPL US Equity".into(), Function::Vault(VaultCmd::Open)))
+        );
+        assert_eq!(parse("VAULT VERIFY"), Some(Command::Function(Function::Vault(VaultCmd::Verify))));
+        assert_eq!(parse("VAULT PRUNE"), Some(Command::Function(Function::Vault(VaultCmd::Prune))));
+        for (text, tf) in [
+            ("VAULT DROP AAPL", None),
+            ("VLT DROP AAPL 1m", Some(Timeframe::M1)),
+            ("VAULT DROP AAPL US Equity 5m", Some(Timeframe::M5)),
+        ] {
+            assert_eq!(
+                parse(text),
+                Some(Command::Function(Function::Vault(VaultCmd::Drop { symbol: "AAPL US Equity".into(), tf })))
+            );
+        }
+        for text in [
+            "VAULT FOO",
+            "VLT FOO",
+            "VAULT DROP",
+            "VAULT DROP AAPL 1d",
+            "VAULT DROP AAPL 1m extra",
+            "VLT VERIFY NOW",
+            "vault prune all",
+        ] {
+            assert!(parse(text).is_none(), "{text}");
+        }
+        assert_eq!(parse("VAULT US Equity"), Some(Command::Symbol("VAULT US Equity".into())));
+    }
+    #[test]
+    fn vault_and_vlt_tickers_still_load() {
+        for t in ["VAULT", "VLT"] {
+            let key = format!("{t} US Equity");
+            for text in
+                [format!("{t} US Equity"), format!("{t} Equity"), format!("{} us equity <GO>", t.to_lowercase())]
+            {
+                assert_eq!(parse(&text), Some(Command::Symbol(key.clone())), "{text}");
+            }
+            assert_eq!(
+                parse(&format!("{t} 5m")),
+                Some(Command::SymbolFunction(key.clone(), Function::Timeframe(Timeframe::M5)))
+            );
+            assert_eq!(
+                parse(&format!("{t} US Equity 1h")),
+                Some(Command::SymbolFunction(key.clone(), Function::Timeframe(Timeframe::H1)))
+            );
+            // The ticker's own vault pane, and dropping the ticker's vault rows.
+            assert_eq!(
+                parse(&format!("{t} US Equity VAULT")),
+                Some(Command::SymbolFunction(key.clone(), Function::Vault(VaultCmd::Open)))
+            );
+            assert_eq!(
+                parse(&format!("VAULT DROP {t} US Equity 1m")),
+                Some(Command::Function(Function::Vault(VaultCmd::Drop {
+                    symbol: key.clone(),
+                    tf: Some(Timeframe::M1)
+                })))
+            );
+        }
+        assert!(hint("VLT").contains("VLT US Equity"));
+        assert_eq!(parse("ZZZT"), Some(Command::Symbol("ZZZT US Equity".into())));
+    }
     #[test]
     fn tstack_edge_command() {
         for (text, on) in [("TSTACK EDGE", None), ("TSTACK EDGE ON", Some(true)), ("TSTACK EDGE OFF", Some(false))] {
