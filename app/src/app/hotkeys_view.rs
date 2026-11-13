@@ -314,6 +314,10 @@ impl TerminalApp {
                         "Relationship Studio: OLS, rolling beta/correlation, ratio z-score and verified peer matrix",
                     ),
                     (
+                        &["SEASON", "SSN", "AAPL SEASON 30M"],
+                        "Seasonality Studio: month heatmap, calendar profiles and New York clock buckets",
+                    ),
+                    (
                         &["STATS", "AAPL STATS", "AAPL COND RSI(14) < 30"],
                         "Historical risk/returns; what followed low RSI or price above a moving average",
                     ),

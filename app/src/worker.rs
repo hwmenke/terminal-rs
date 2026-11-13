@@ -135,6 +135,7 @@ pub enum Request {
         window: tr_data::studio_dist::Window,
     },
     StudioCorr { pane: PaneId, generation: u64, symbol: String, spec: String },
+    StudioSeason { pane: PaneId, generation: u64, symbol: String, tf: Timeframe },
     /// Historical statistics and conditional forward returns for one archive symbol.
     Stats {
         pane: PaneId,
@@ -611,6 +612,11 @@ pub enum Response {
         error: Option<String>,
     },
     StudioCorr { pane: PaneId, generation: u64, result: Result<tr_data::studio_corr::CorrReport, String> },
+    StudioSeason {
+        pane: PaneId,
+        generation: u64,
+        result: Result<tr_data::studio_season::SeasonReport, String>,
+    },
     Stats {
         pane: PaneId,
         generation: u64,
@@ -3308,6 +3314,35 @@ async fn handle_inner(s: &Arc<Shared>, req: Request, force: bool) {
             }).await.map_err(|e| format!("{e:#}"));
             send(Response::StudioCorr { pane, generation, result });
         }
+        Request::StudioSeason { pane, generation, symbol, tf } => {
+            let result = async {
+                if s.sample_mode() { anyhow::bail!("SEASON: no real data in sample / offline display mode"); }
+                if !tr_data::cash_session::is_cash(&tr_data::security(&symbol)) {
+                    anyhow::bail!("SEASON currently requires a US cash-session equity, ETF or index");
+                }
+                let (bars, source, observed) = if tf == Timeframe::D1 {
+                    let ticker = tr_data::whats_news::archive_ticker(&symbol);
+                    let bars = s.history.db(move |db| db.daily(&ticker)).await?;
+                    let (bars, source) = if bars.is_empty() {
+                        if !config.enabled { anyhow::bail!("Seasonality refused: no daily history in the research archive; sample/display prices are never used"); }
+                        let snapshot = config.bridge().bars(&symbol).await?;
+                        snapshot.provenance.require_verified("Seasonality archive").map_err(anyhow::Error::msg)?;
+                        (snapshot.data, snapshot.source)
+                    } else { (bars, "Local Yahoo daily research archive".into()) };
+                    (bars, source, chrono::Utc::now().timestamp())
+                } else {
+                    let (bars, info) = analysis_bars(s, &symbol, tf, tr_data::cash_session::research_fetch_limit(tf), "Seasonality").await?;
+                    // A stale vault must not use wall time to close an observed pending bar.
+                    let observed = info.fetched_at.unwrap_or_else(|| bars.last().map(|b| b.ts).unwrap_or(0));
+                    (bars, info.source, observed)
+                };
+                let now = chrono::Utc::now().timestamp();
+                tokio::task::spawn_blocking(move || {
+                    tr_data::studio_season::compute_at(&symbol, tf, &bars, &source, observed.min(now), now)
+                }).await?.map_err(anyhow::Error::msg)
+            }.await.map_err(|e| format!("{e:#}"));
+            send(Response::StudioSeason { pane, generation, result });
+        }
         Request::Stats { pane, generation, symbol, condition, horizons } => {
             let bridge = config.bridge();
             send(Response::Stats {
@@ -5976,6 +6011,47 @@ mod tests {
                 assert_eq!(*held_spy, spy);
             }
         }
+    }
+
+    #[tokio::test]
+    async fn studio_season_uses_sourced_intraday_and_refuses_sample_without_fetching() {
+        for sample in [false, true] {
+            let mut provider = vault_provider(vault_day("2026-11-09"));
+            Arc::get_mut(&mut provider).unwrap().sample = sample;
+            let (s, rx) = shared(provider.clone(), Some(BarCache::open_in_memory().unwrap()));
+            handle(&s, Request::StudioSeason { pane: 19, generation: 7, symbol: "AAPL US Equity".into(), tf: Timeframe::M5 }).await;
+            let Response::WhatsNews { response, .. } = rx.try_recv().unwrap() else { panic!("expected envelope") };
+            let Response::StudioSeason { pane, generation, result } = *response else { panic!("expected seasonality") };
+            assert_eq!((pane, generation), (19, 7));
+            if sample {
+                assert!(result.unwrap_err().contains("no real data"));
+                assert_eq!(provider.calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+            } else {
+                let report = result.unwrap();
+                assert!(report.provenance.is_verified());
+                assert_eq!(report.bars, 78);
+                assert_eq!(report.source, "yahoo");
+                assert_eq!(provider.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn studio_season_daily_reads_archive_without_market_fetches() {
+        let provider = vault_provider(vec![]);
+        let (mut s, rx) = shared(provider.clone(), None);
+        Arc::get_mut(&mut s).unwrap().history = Arc::new(tr_data::history::Service::new(
+            tr_data::history::Archive::memory().unwrap(), Arc::new(ArchivePrices),
+            tr_data::history::Policy { spacing: Duration::ZERO, ..Default::default() },
+        ));
+        s.whats_news.send_replace((0, tr_data::whats_news::Config { enabled: false, ..Default::default() }));
+        s.history.run("ADD", tr_data::history::universe::resolve("AAPL").unwrap(), |_| {}).await.unwrap();
+        s.history.run("REFRESH", vec![], |_| {}).await.unwrap();
+        handle(&s, Request::StudioSeason { pane: 19, generation: 8, symbol: "AAPL US Equity".into(), tf: Timeframe::D1 }).await;
+        let Response::WhatsNews { response, .. } = rx.try_recv().unwrap() else { panic!("expected envelope") };
+        let Response::StudioSeason { result, .. } = *response else { panic!("expected seasonality") };
+        assert!(result.unwrap().source.contains("Local Yahoo"));
+        assert_eq!(provider.calls.load(std::sync::atomic::Ordering::SeqCst), 0);
     }
 
     #[tokio::test]

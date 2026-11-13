@@ -39,6 +39,7 @@ mod settings_writer;
 mod stats;
 pub(crate) mod studio_dist;
 pub(crate) mod studio_corr;
+mod studio_season;
 mod theming;
 mod trading;
 mod trend_wall;
@@ -115,6 +116,7 @@ pub enum PaneKind {
     Stats(Box<stats::StatsPane>),
     StudioDist(Box<studio_dist::DistPane>),
     StudioCorr(Box<studio_corr::CorrPane>),
+    StudioSeason(Box<studio_season::SeasonPane>),
     /// Strategy vs buy-and-hold paper backtest (`BACKTEST` / `BT`).
     Backtest(Box<backtest::BacktestPane>),
     /// Historical lookalikes / nearest neighbors (`LOOKALIKE` / `KNN`).
@@ -345,6 +347,7 @@ impl PaneKind {
             }
             PaneKind::StudioDist(s) => format!("{} Distribution", tr_data::security(&s.symbol).ticker),
             PaneKind::StudioCorr(s) => format!("{} CORR", tr_data::security(&s.symbol).ticker),
+            PaneKind::StudioSeason(s) => if s.symbol.trim().is_empty() { "Seasonality".into() } else { format!("{} Seasonality", tr_data::security(&s.symbol).ticker) },
             PaneKind::Stats(s) => {
                 if s.symbol.trim().is_empty() {
                     "Stats".into()
@@ -476,6 +479,7 @@ impl PaneKind {
             PaneKind::Stats(_) => "STATS",
             PaneKind::StudioDist(_) => "DIST",
             PaneKind::StudioCorr(_) => "CORR",
+            PaneKind::StudioSeason(_) => "SEASON",
             PaneKind::Backtest(b) if b.intraday => "IBT",
             PaneKind::Backtest(_) => "BT",
             PaneKind::Lookalike(_) => "KNN",
@@ -613,6 +617,7 @@ impl PaneKind {
             PaneKind::Journal(j) => PaneSettings::Journal { filter: j.filter.clone() },
             PaneKind::StudioDist(s) => PaneSettings::StudioDist { symbol: s.symbol.clone(), timeframe: s.timeframe, window: s.window },
             PaneKind::StudioCorr(s) => PaneSettings::StudioCorr { symbol: s.symbol.clone(), spec: s.spec.clone() },
+            PaneKind::StudioSeason(s) => PaneSettings::StudioSeason { symbol: s.symbol.clone(), spec: s.spec.clone() },
             PaneKind::Stats(s) => PaneSettings::Stats {
                 symbol: s.symbol.clone(),
                 condition: s.condition.clone(),
@@ -787,6 +792,7 @@ impl PaneKind {
                 PaneKind::StudioDist(Box::new(studio_dist::DistPane::new(symbol, timeframe, window)))
             }
             PaneSettings::StudioCorr { symbol, spec } => PaneKind::StudioCorr(Box::new(studio_corr::CorrPane::new(symbol, spec))),
+            PaneSettings::StudioSeason { symbol, spec } => PaneKind::StudioSeason(Box::new(studio_season::SeasonPane::new(symbol, spec))),
             PaneSettings::Stats { symbol, condition, conditional } => {
                 PaneKind::Stats(Box::new(stats::StatsPane::new(symbol, condition, conditional)))
             }
@@ -1440,6 +1446,7 @@ impl TerminalApp {
             Command::SymbolFunction(s, Function::Journal(extra)) => self.open_journal(Some(&s), &extra),
             Command::SymbolFunction(s, Function::StudioDist { timeframe }) => self.open_studio_dist(Some(&s), timeframe),
             Command::SymbolFunction(s, Function::StudioCorr { spec }) => self.open_studio_corr(Some(&s), &spec),
+            Command::SymbolFunction(s, Function::StudioSeason { spec }) => self.open_studio_season(Some(&s), &spec),
             Command::SymbolFunction(s, Function::Stats { condition, conditional }) => {
                 self.open_stats(Some(&s), &condition, conditional)
             }
@@ -1692,6 +1699,7 @@ impl TerminalApp {
             Function::Desk => self.open_desk(symbol.as_deref()),
             Function::Journal(extra) => self.open_journal(symbol.as_deref(), &extra),
             Function::StudioCorr { spec } => self.open_studio_corr(symbol.as_deref(), &spec),
+            Function::StudioSeason { spec } => self.open_studio_season(symbol.as_deref(), &spec),
             Function::Stats { condition, conditional } => self.open_stats(symbol.as_deref(), &condition, conditional),
             Function::StudioDist { timeframe } => self.open_studio_dist(symbol.as_deref(), timeframe),
             Function::Backtest { spec } => self.open_backtest(symbol.as_deref(), &spec),
@@ -1826,6 +1834,7 @@ impl TerminalApp {
                             PaneKind::Stats(s) => s.request(pane.id, &self.worker),
                             PaneKind::StudioDist(s) => s.request(pane.id, &self.worker),
                             PaneKind::StudioCorr(s) => s.request(pane.id, &self.worker),
+                            PaneKind::StudioSeason(s) => s.request(pane.id, &self.worker),
                             PaneKind::Backtest(b) => b.request(pane.id, &self.worker),
                             PaneKind::Lookalike(l) => l.request(pane.id, &self.worker),
                             _ => {}
@@ -1895,6 +1904,11 @@ impl TerminalApp {
                 }
                 Response::StudioCorr { pane, generation, result } => {
                     if let Some(PaneKind::StudioCorr(s)) = self.panes.iter_mut().find(|p| p.id == pane).map(|p| &mut p.kind) {
+                        s.accept(generation, result);
+                    }
+                }
+                Response::StudioSeason { pane, generation, result } => {
+                    if let Some(PaneKind::StudioSeason(s)) = self.panes.iter_mut().find(|p| p.id == pane).map(|p| &mut p.kind) {
                         s.accept(generation, result);
                     }
                 }

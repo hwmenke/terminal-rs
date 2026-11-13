@@ -113,6 +113,8 @@ const COMMANDS: &[(&str, &str, &str, Option<Action>)] = &[
     ("RESTORE", "Restore a workspace, journal or history export", "backup import recovery", None),
     ("CORR", "Relationship Studio: beta, correlation, ratios and matrix", "rbeta benchmark regression", None),
     ("AAPL CORR QQQ", "Compare AAPL with QQQ", "relationship studio scatter beta", None),
+    ("SEASON", "Seasonality Studio: calendar and New York clock patterns", "SSN seasonal month weekday heatmap", None),
+    ("AAPL SEASON 30M", "AAPL intraday seasonality from verified history", "time of day volume smile", None),
     ("STATS", "Historical risk, returns and what followed a condition", "conditional returns sma baseline", None),
     ("DIST", "Distribution Studio: log returns, tails, QQ, drawdowns and regimes", "rdist histogram normal student jarque bera var cvar", None),
     ("AAPL DIST 1H", "AAPL intraday return distribution from verified closed bars", "studio vault distribution", None),
@@ -396,6 +398,10 @@ pub(super) fn static_items() -> Vec<Item> {
     v.push(
         Item::new(Kind::Panel, "New Relationship Studio pane", "NEW CORR", Target::Run("NEW CORR".into()))
             .keywords("panel pane relationship beta correlation"),
+    );
+    v.push(
+        Item::new(Kind::Panel, "New Seasonality Studio", "NEW SEASON", Target::Run("NEW SEASON".into()))
+            .keywords("panel pane seasonal calendar SSN month weekday intraday"),
     );
     v.push(
         Item::new(Kind::Panel, "New Statistics pane", "NEW STATS", Target::Run("NEW STATS".into()))

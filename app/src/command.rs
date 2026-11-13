@@ -416,6 +416,8 @@ pub enum Function {
         condition: String,
         conditional: bool,
     },
+    /// Calendar seasonality on verified daily or intraday history.
+    StudioSeason { spec: String },
     /// Paper strategy backtest vs buy-and-hold (`BACKTEST`, `AAPL BT ADTREND`).
     Backtest {
         spec: String,
@@ -827,6 +829,7 @@ fn parse_function(head: &str, rest: &[&str]) -> Option<Function> {
         "DESK" | "PMDESK" | "RISK" => Function::Desk,
         "JOURNAL" | "JRNL" | "CHECKLIST" | "TRADELOG" => Function::Journal(joined()),
         "CORR" | "RBETA" => Function::StudioCorr { spec: joined() },
+        "SEASON" | "SSN" => Function::StudioSeason { spec: joined() },
         "STATS" | "STAT" | "STATISTICS" => Function::Stats { condition: joined(), conditional: !rest.is_empty() },
         "COND" | "CDIST" | "CONDRET" => Function::Stats { condition: joined(), conditional: true },
         "DIST" | "RDIST" => Function::StudioDist {
@@ -1118,6 +1121,7 @@ fn describe(f: &Function) -> String {
         }
         Function::Journal(q) => format!("Trade journal: {q}"),
         Function::StudioCorr { spec } => format!("Relationship Studio · {}", if spec.is_empty() { "SPY" } else { spec }),
+        Function::StudioSeason { spec } => format!("Seasonality Studio {spec}"),
         Function::Stats { condition, conditional } if condition.is_empty() => {
             if *conditional {
                 "Conditional returns: what followed a filter vs the unconditional baseline".into()
@@ -1677,6 +1681,12 @@ mod tests {
             parse("COND RSI(14) < 30"),
             Some(Command::Function(Function::Stats { condition: "RSI(14) < 30".into(), conditional: true }))
         );
+        assert_eq!(parse("SEASON"), Some(Command::Function(Function::StudioSeason { spec: String::new() })));
+        assert_eq!(parse("SSN"), Some(Command::Function(Function::StudioSeason { spec: String::new() })));
+        assert_eq!(parse("SEASON 1H"), Some(Command::Function(Function::StudioSeason { spec: "1H".into() })));
+        assert_eq!(parse("AAPL SEASON"), Some(Command::SymbolFunction("AAPL US Equity".into(), Function::StudioSeason { spec: String::new() })));
+        assert_eq!(parse("AAPL SEASON 30M"), Some(Command::SymbolFunction("AAPL US Equity".into(), Function::StudioSeason { spec: "30M".into() })));
+        assert_eq!(parse("AAPL SSN 30M"), Some(Command::SymbolFunction("AAPL US Equity".into(), Function::StudioSeason { spec: "30M".into() })));
         assert_eq!(parse("EXPORT STATS"), Some(Command::Function(Function::Export(ExportKind::Stats, String::new()))));
         assert_eq!(parse("BACKTEST"), Some(Command::Function(Function::Backtest { spec: String::new() })));
         assert_eq!(

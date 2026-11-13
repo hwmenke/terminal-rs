@@ -179,6 +179,7 @@ impl TerminalApp {
             | PaneKind::StudioCorr(_)
             | PaneKind::Stats(_)
             | PaneKind::StudioDist(_)
+            | PaneKind::StudioSeason(_)
             | PaneKind::Backtest(_)
             | PaneKind::Lookalike(_)
             | PaneKind::IntradayCompare(_)
@@ -206,6 +207,9 @@ impl TerminalApp {
         }
         if matches!(self.panes[i].kind, PaneKind::StudioCorr(_)) {
             actions.extend(self.studio_corr_pane(ui, id));
+        }
+        if matches!(self.panes[i].kind, PaneKind::StudioSeason(_)) {
+            actions.extend(self.studio_season_pane(ui, id));
         }
         if matches!(self.panes[i].kind, PaneKind::Stats(_)) {
             actions.extend(self.stats_pane(ui, id));
