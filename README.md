@@ -645,3 +645,5 @@ cargo bench -p tr-core && cargo bench -p tr-chart
 
 `VAULT` / `AAPL VAULT` (`Alt+B`) opens the local closed-bar vault and session coverage.
 See [Bar Vault](docs/BARVAULT.md) for admission, merge, retention and current limits.
+
+- **Relationship Studio** (`AAPL CORR QQQ`, alias `RBETA`): verified-data OLS, rolling beta/correlation, return scatter, ratio z-scores and peer matrix. See [STUDIO_CORR.md](docs/STUDIO_CORR.md).

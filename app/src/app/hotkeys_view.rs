@@ -310,6 +310,10 @@ impl TerminalApp {
                         "Trade journal: setup + checklist + planned $ risk; record $ and R; notes on chart dates",
                     ),
                     (
+                        &["CORR", "RBETA", "AAPL CORR QQQ", "AAPL CORR QQQ 1H"],
+                        "Relationship Studio: OLS, rolling beta/correlation, ratio z-score and verified peer matrix",
+                    ),
+                    (
                         &["STATS", "AAPL STATS", "AAPL COND RSI(14) < 30"],
                         "Historical risk/returns; what followed low RSI or price above a moving average",
                     ),

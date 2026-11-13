@@ -169,6 +169,13 @@ pub enum PaneSettings {
         #[serde(default)]
         filter: String,
     },
+    /// Relationship Studio asset, benchmark and timeframe.
+    StudioCorr {
+        #[serde(default)]
+        symbol: String,
+        #[serde(default)]
+        spec: String,
+    },
     /// Statistics / conditional returns for one research symbol.
     Stats {
         #[serde(default)]

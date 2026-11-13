@@ -111,6 +111,8 @@ const COMMANDS: &[(&str, &str, &str, Option<Action>)] = &[
     ("EXPORT HIST", "Export archived daily prices with source and dates", "yahoo archive backup", None),
     ("BACKUP", "Back up personal workspace (credentials excluded)", "restore export layouts journal", None),
     ("RESTORE", "Restore a workspace, journal or history export", "backup import recovery", None),
+    ("CORR", "Relationship Studio: beta, correlation, ratios and matrix", "rbeta benchmark regression", None),
+    ("AAPL CORR QQQ", "Compare AAPL with QQQ", "relationship studio scatter beta", None),
     ("STATS", "Historical risk, returns and what followed a condition", "conditional returns sma baseline", None),
     ("AAPL STATS", "AAPL historical risk and returns", "statistics research archive", None),
     ("COND", "Conditional forward returns vs baseline", "sma distribution overlap", None),
@@ -388,6 +390,10 @@ pub(super) fn static_items() -> Vec<Item> {
     v.push(
         Item::new(Kind::Panel, "New Journal pane", "NEW JOURNAL", Target::Run("NEW JOURNAL".into()))
             .keywords("panel pane journal checklist notes"),
+    );
+    v.push(
+        Item::new(Kind::Panel, "New Relationship Studio pane", "NEW CORR", Target::Run("NEW CORR".into()))
+            .keywords("panel pane relationship beta correlation"),
     );
     v.push(
         Item::new(Kind::Panel, "New Statistics pane", "NEW STATS", Target::Run("NEW STATS".into()))
