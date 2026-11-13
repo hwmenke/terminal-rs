@@ -176,7 +176,10 @@ impl TerminalApp {
             | PaneKind::Chart(_)
             | PaneKind::Desk(_)
             | PaneKind::Journal(_)
+            | PaneKind::StudioCorr(_)
             | PaneKind::Stats(_)
+            | PaneKind::StudioDist(_)
+            | PaneKind::StudioSeason(_)
             | PaneKind::Backtest(_)
             | PaneKind::Lookalike(_)
             | PaneKind::IntradayCompare(_)
@@ -198,6 +201,15 @@ impl TerminalApp {
         }
         if matches!(self.panes[i].kind, PaneKind::Journal(_)) {
             actions.extend(self.journal_pane(ui, id));
+        }
+        if matches!(self.panes[i].kind, PaneKind::StudioDist(_)) {
+            actions.extend(self.studio_dist_pane(ui, id));
+        }
+        if matches!(self.panes[i].kind, PaneKind::StudioCorr(_)) {
+            actions.extend(self.studio_corr_pane(ui, id));
+        }
+        if matches!(self.panes[i].kind, PaneKind::StudioSeason(_)) {
+            actions.extend(self.studio_season_pane(ui, id));
         }
         if matches!(self.panes[i].kind, PaneKind::Stats(_)) {
             actions.extend(self.stats_pane(ui, id));

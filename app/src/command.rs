@@ -406,11 +406,19 @@ pub enum Function {
     Desk,
     /// Trade journal / checklist (`JOURNAL`, `AAPL JOURNAL`, `AAPL JOURNAL 2026-10-24`).
     Journal(String),
+    /// Distribution Studio for verified daily or intraday log returns.
+    StudioDist {
+        timeframe: Timeframe,
+    },
+    /// Relationship Studio: benchmark OLS and correlation.
+    StudioCorr { spec: String },
     /// Historical risk/return and conditional forward returns (`STATS`, `AAPL COND RSI < 30`).
     Stats {
         condition: String,
         conditional: bool,
     },
+    /// Calendar seasonality on verified daily or intraday history.
+    StudioSeason { spec: String },
     /// Paper strategy backtest vs buy-and-hold (`BACKTEST`, `AAPL BT ADTREND`).
     Backtest {
         spec: String,
@@ -821,8 +829,27 @@ fn parse_function(head: &str, rest: &[&str]) -> Option<Function> {
         "REVIEW" | "REV" => Function::Review,
         "DESK" | "PMDESK" | "RISK" => Function::Desk,
         "JOURNAL" | "JRNL" | "CHECKLIST" | "TRADELOG" => Function::Journal(joined()),
+        // Studio words are also listed tickers: only valid Studio arguments make
+        // the command; anything else falls through to the ticker (see parse()).
+        "CORR" | "RBETA" => {
+            let spec = joined();
+            crate::app::studio_corr::parse_spec(&spec).ok()?;
+            Function::StudioCorr { spec }
+        }
+        "SEASON" | "SSN" => {
+            let spec = joined();
+            tr_data::studio_season::parse_timeframe(&spec).ok()?;
+            Function::StudioSeason { spec }
+        }
         "STATS" | "STAT" | "STATISTICS" => Function::Stats { condition: joined(), conditional: !rest.is_empty() },
         "COND" | "CDIST" | "CONDRET" => Function::Stats { condition: joined(), conditional: true },
+        "DIST" | "RDIST" => Function::StudioDist {
+            timeframe: match rest {
+                [] => Timeframe::D1,
+                [tf] => tr_data::studio_dist::parse_timeframe(tf).ok()?,
+                _ => return None,
+            },
+        },
         "BACKTEST" | "BT" | "BTEST" => Function::Backtest { spec: joined() },
         "IBT" | "IBACKTEST" | "SETUPBT" => Function::IntradayBacktest { spec: joined() },
         "LOOKALIKE" | "LOOKALIKES" | "KNN" | "ANALOG" | "ANALOGUE" | "NN" => Function::Lookalike { spec: joined() },
@@ -907,6 +934,11 @@ pub fn parse(input: &str) -> Option<Command> {
         // VAULT and VLT are also listed tickers. Only a vault verb is guarded;
         // anything else (`VLT 5m`, `VAULT GP`) loads the ticker, as does
         // `VAULT US Equity` / `VLT Equity` for the bare security.
+        // The Studio words (DIST/RDIST, SEASON/SSN, CORR/RBETA) follow the same
+        // rule with no guard at all: the bare word or the word plus valid Studio
+        // arguments was already taken by parse_function above; anything else
+        // (`DIST 1W`, `SEASON 4H`) and the yellow-key form (`DIST US Equity`)
+        // load the ticker.
         if ["VAULT", "VLT"].iter().any(|word| head.eq_ignore_ascii_case(word))
             && rest.first().is_some_and(|verb| VAULT_VERBS.iter().any(|v| verb.eq_ignore_ascii_case(v)))
         {
@@ -1113,6 +1145,13 @@ fn describe(f: &Function) -> String {
             "Trade journal: setups, checklist, planned risk, outcomes in $ and R".into()
         }
         Function::Journal(q) => format!("Trade journal: {q}"),
+        Function::StudioCorr { spec } => format!(
+            "Relationship Studio · {} · for the tickers type CORR US Equity / RBETA US Equity",
+            if spec.is_empty() { "SPY" } else { spec }
+        ),
+        Function::StudioSeason { spec } => {
+            format!("Seasonality Studio {spec} · for the tickers type SEASON US Equity / SSN US Equity")
+        }
         Function::Stats { condition, conditional } if condition.is_empty() => {
             if *conditional {
                 "Conditional returns: what followed a filter vs the unconditional baseline".into()
@@ -1121,6 +1160,10 @@ fn describe(f: &Function) -> String {
             }
         }
         Function::Stats { condition, .. } => format!("Conditional returns after {condition}"),
+        Function::StudioDist { timeframe } => format!(
+            "Distribution Studio: {} log returns, tails, QQ, drawdowns and regimes · for the tickers type DIST US Equity / RDIST US Equity",
+            timeframe.label()
+        ),
         Function::Backtest { spec } if spec.is_empty() => {
             "Paper backtest: declared strategies vs buy-and-hold on a chronological holdout".into()
         }
@@ -1237,6 +1280,16 @@ fn describe(f: &Function) -> String {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn relationship_studio_commands() {
+        for alias in ["CORR", "RBETA"] {
+            assert_eq!(parse(alias), Some(Command::Function(Function::StudioCorr { spec: String::new() })));
+        }
+        assert_eq!(parse("AAPL CORR"), Some(Command::SymbolFunction("AAPL US Equity".into(), Function::StudioCorr { spec: String::new() })));
+        assert_eq!(parse("AAPL CORR QQQ"), Some(Command::SymbolFunction("AAPL US Equity".into(), Function::StudioCorr { spec: "QQQ".into() })));
+        assert_eq!(parse("AAPL RBETA QQQ 1H"), Some(Command::SymbolFunction("AAPL US Equity".into(), Function::StudioCorr { spec: "QQQ 1H".into() })));
+    }
+
+    #[test]
     fn vault_commands_alias_symbol_and_guard() {
         for cmd in ["VAULT", "VLT"] {
             assert_eq!(parse(cmd), Some(Command::Function(Function::Vault(VaultCmd::Open))));
@@ -1269,6 +1322,49 @@ mod tests {
             assert!(parse(text).is_none(), "{text}");
         }
         assert_eq!(parse("VAULT US Equity"), Some(Command::Symbol("VAULT US Equity".into())));
+    }
+    #[test]
+    fn studio_words_do_not_shadow_their_tickers() {
+        for word in ["DIST", "RDIST", "SEASON", "SSN", "CORR", "RBETA"] {
+            let key = format!("{word} US Equity");
+            // Bare word: the Studio command.
+            let Some(Command::Function(f)) = parse(word) else { panic!("{word} bare must be a Studio command") };
+            assert!(
+                matches!(f, Function::StudioDist { .. } | Function::StudioSeason { .. } | Function::StudioCorr { .. }),
+                "{word}"
+            );
+            // Word plus valid Studio arguments: still the command.
+            let with_args = format!("{word} 30m");
+            let Some(Command::Function(f)) = parse(&with_args) else { panic!("{with_args} must be a Studio command") };
+            assert!(
+                matches!(f, Function::StudioDist { .. } | Function::StudioSeason { .. } | Function::StudioCorr { .. }),
+                "{with_args}"
+            );
+            // Market-suffix forms load the ticker.
+            for text in [format!("{word} US Equity"), format!("{word} Equity"), format!("{} us equity <GO>", word.to_lowercase())] {
+                assert_eq!(parse(&text), Some(Command::Symbol(key.clone())), "{text}");
+            }
+            assert_eq!(
+                parse(&format!("{word} US Equity 1h")),
+                Some(Command::SymbolFunction(key.clone(), Function::Timeframe(Timeframe::H1))),
+                "{word} US Equity 1h"
+            );
+            // The ticker's own Studio pane.
+            assert!(matches!(parse(&format!("{word} US Equity DIST")), Some(Command::SymbolFunction(k, Function::StudioDist { .. })) if k == key));
+            // Arguments that are not Studio arguments load the ticker with an interval.
+            assert_eq!(
+                parse(&format!("{word} 1W")),
+                Some(Command::SymbolFunction(key.clone(), Function::Timeframe(Timeframe::W1))),
+                "{word} 1W"
+            );
+        }
+        assert_eq!(parse("CORR QQQ 1H"), Some(Command::Function(Function::StudioCorr { spec: "QQQ 1H".into() })));
+        assert_eq!(parse("SSN 1h"), Some(Command::Function(Function::StudioSeason { spec: "1h".into() })));
+        assert_eq!(parse("SEASON 4H"), Some(Command::SymbolFunction("SEASON US Equity".into(), Function::Timeframe(Timeframe::H4))));
+        assert_eq!(parse("RDIST 1D"), Some(Command::Function(Function::StudioDist { timeframe: Timeframe::D1 })));
+        for word in ["DIST", "RDIST", "SEASON", "SSN", "CORR", "RBETA"] {
+            assert!(hint(word).contains(&format!("{word} US Equity")), "{word}");
+        }
     }
     #[test]
     fn vault_and_vlt_tickers_still_load() {
@@ -1622,6 +1718,21 @@ mod tests {
     }
 
     #[test]
+    fn distribution_studio_commands() {
+        for alias in ["DIST", "RDIST", "dist"] {
+            assert_eq!(parse(alias), Some(Command::Function(Function::StudioDist { timeframe: Timeframe::D1 })));
+        }
+        assert_eq!(parse("AAPL DIST"), Some(Command::SymbolFunction("AAPL US Equity".into(), Function::StudioDist { timeframe: Timeframe::D1 })));
+        assert_eq!(parse("DIST 1H"), Some(Command::Function(Function::StudioDist { timeframe: Timeframe::H1 })));
+        assert_eq!(parse("AAPL RDIST 30m"), Some(Command::SymbolFunction("AAPL US Equity".into(), Function::StudioDist { timeframe: Timeframe::M30 })));
+        assert_eq!(parse("AAPL US Equity DIST 1m"), Some(Command::SymbolFunction("AAPL US Equity".into(), Function::StudioDist { timeframe: Timeframe::M1 })));
+        for invalid in ["AAPL DIST 1W", "AAPL DIST nonsense", "AAPL DIST 1H junk"] {
+            assert_eq!(parse(invalid), None);
+        }
+        assert!(hint("DIST 1H").contains("Distribution Studio"));
+    }
+
+    #[test]
     fn research_commands() {
         assert_eq!(parse("hist"), Some(Command::Function(Function::History(String::new()))));
         assert_eq!(parse("HIST ADD aapl,msft"), Some(Command::Function(Function::History("ADD AAPL,MSFT".into()))));
@@ -1688,6 +1799,12 @@ mod tests {
             parse("COND RSI(14) < 30"),
             Some(Command::Function(Function::Stats { condition: "RSI(14) < 30".into(), conditional: true }))
         );
+        assert_eq!(parse("SEASON"), Some(Command::Function(Function::StudioSeason { spec: String::new() })));
+        assert_eq!(parse("SSN"), Some(Command::Function(Function::StudioSeason { spec: String::new() })));
+        assert_eq!(parse("SEASON 1H"), Some(Command::Function(Function::StudioSeason { spec: "1H".into() })));
+        assert_eq!(parse("AAPL SEASON"), Some(Command::SymbolFunction("AAPL US Equity".into(), Function::StudioSeason { spec: String::new() })));
+        assert_eq!(parse("AAPL SEASON 30M"), Some(Command::SymbolFunction("AAPL US Equity".into(), Function::StudioSeason { spec: "30M".into() })));
+        assert_eq!(parse("AAPL SSN 30M"), Some(Command::SymbolFunction("AAPL US Equity".into(), Function::StudioSeason { spec: "30M".into() })));
         assert_eq!(parse("EXPORT STATS"), Some(Command::Function(Function::Export(ExportKind::Stats, String::new()))));
         assert_eq!(parse("BACKTEST"), Some(Command::Function(Function::Backtest { spec: String::new() })));
         assert_eq!(

@@ -169,6 +169,21 @@ pub enum PaneSettings {
         #[serde(default)]
         filter: String,
     },
+    StudioDist {
+        #[serde(default)]
+        symbol: String,
+        #[serde(default)]
+        timeframe: Timeframe,
+        #[serde(default)]
+        window: tr_data::studio_dist::Window,
+    },
+    /// Relationship Studio asset, benchmark and timeframe.
+    StudioCorr {
+        #[serde(default)]
+        symbol: String,
+        #[serde(default)]
+        spec: String,
+    },
     /// Statistics / conditional returns for one research symbol.
     Stats {
         #[serde(default)]
@@ -177,6 +192,13 @@ pub enum PaneSettings {
         condition: String,
         #[serde(default)]
         conditional: bool,
+    },
+    /// Calendar seasonality for verified history.
+    StudioSeason {
+        #[serde(default)]
+        symbol: String,
+        #[serde(default)]
+        spec: String,
     },
     /// Paper strategy backtest vs buy-and-hold for one research symbol.
     Backtest {

@@ -221,6 +221,7 @@ gets the native title bar with traffic lights, window vibrancy behind the sideba
   attaches a note to a historical date; cyan **J** pins mark those dates on the chart.
   Rows persist in `trade_journal.json`. Sample bars never invent P&L. See
   [Trade journal](docs/TRADE_JOURNAL.md).
+- **Seasonality Studio** — `SEASON` / `SSN`, `AAPL SEASON 30M`: verified month heatmaps, calendar and New York clock profiles, and conditional forward returns. [Guide](docs/STUDIO_SEASON.md).
 - **Statistics and conditional returns** — `STATS` (or `AAPL STATS`) shows historical
   risk and returns from the research archive: annualised volatility, Sharpe, max
   drawdown, win rate, daily-return distribution, RSI/vol/KAMA deciles and
@@ -228,6 +229,7 @@ gets the native title bar with traffic lights, window vibrancy behind the sideba
   filter to the unconditional baseline. Only completed outcomes count; overlapping
   windows report effective N = N / H. Sample bars are refused. See
   [Statistics](docs/STATS.md).
+- **Distribution Studio** — `AAPL DIST` / `DIST 1H` (`RDIST`): verified log-return tails, fitted distributions, QQ, drawdowns and volatility regimes. [Guide](docs/STUDIO_DIST.md).
 - **Adaptive Trend overlays** — `ADTREND` (or `ATREND`) draws Whats-News Adaptive
   Trend on the chart: SB/MB/LB baselines, destination bands, medium-regime flips
   and MRT/LRT trailing-stop guides. Sample / unverified bars are refused. See
@@ -645,3 +647,5 @@ cargo bench -p tr-core && cargo bench -p tr-chart
 
 `VAULT` / `AAPL VAULT` (`Alt+B`) opens the local closed-bar vault and session coverage.
 See [Bar Vault](docs/BARVAULT.md) for admission, merge, retention and current limits.
+
+- **Relationship Studio** (`AAPL CORR QQQ`, alias `RBETA`): verified-data OLS, rolling beta/correlation, return scatter, ratio z-scores and peer matrix. See [STUDIO_CORR.md](docs/STUDIO_CORR.md).
