@@ -1143,6 +1143,8 @@ impl ChartState {
         } else {
             self.show_edge = false;
             self.edge = None;
+            self.edge_pending = None;
+            self.edge_work = None;
             self.stack = None;
             self.stack_pulse = None;
             self.stack_paint = Default::default();
@@ -1155,6 +1157,9 @@ impl ChartState {
         if self.show_edge {
             self.set_trend_stack(Some(true), w);
             self.refresh_edge(chrono::Utc::now().timestamp());
+        } else {
+            self.edge_pending = None;
+            self.edge_work = None;
         }
     }
     fn refresh_edge(&mut self, now: i64) {
@@ -1169,6 +1174,11 @@ impl ChartState {
                 Ok(())
             }
         });
+        if gate.is_err() || self.stack.is_none() {
+            // A refused or stack-less state supersedes any queued/outstanding study.
+            self.edge_pending = None;
+            self.edge_work = None;
+        }
         let mut paint_key = None;
         self.edge = if let Err(e) = gate {
             Some(Err(e))
@@ -1329,8 +1339,14 @@ impl ChartState {
         }
     }
     pub fn on_stack_edge(&mut self, key: EdgeKey, result: Result<Arc<tr_data::edge::EdgeReport>, String>) {
+        // Only the outstanding request may answer. Its slot is released even when
+        // the answer is then rejected, so an identical later key is re-requested
+        // instead of waiting forever on a response that was already discarded.
+        if self.edge_pending.as_ref() != Some(&key) {
+            return;
+        }
+        self.edge_pending = None;
         if !self.show_edge
-            || self.edge_pending.as_ref() != Some(&key)
             || key.generation != self.generation
             || key.tf != self.tf
             || key.params != (AdaptiveTrendParams { session_reset: self.stack_session, ..self.stack_params() })
@@ -1347,7 +1363,6 @@ impl ChartState {
         {
             return;
         }
-        self.edge_pending = None;
         match result {
             Ok(report) => {
                 self.edge_cache = Some((key, report));
@@ -4613,6 +4628,54 @@ mod tests {
         let mut changed = (*c.bars).clone();
         changed[0].close += 0.1;
         c.bars = Arc::new(changed);
+        c.on_stack_edge(key, result);
+        assert!(c.edge.is_none());
+    }
+    #[test]
+    fn edge_response_dropped_while_off_does_not_wedge_the_next_request() {
+        let (worker, _rx) = Worker::test_channel();
+        let mut c = stack_chart(&worker, Provenance::Real);
+        c.show_edge = true;
+        let now = chrono::Utc::now().timestamp();
+        c.refresh_edge(now);
+        let Some(Request::StackEdge { key, bars, state, entry_long, entry_short, .. }) = c.edge_work.take() else {
+            panic!("missing worker request")
+        };
+        let result =
+            tr_data::edge::regime_edge(&bars[..key.n], &state, &entry_long, &entry_short, &key.horizons).map(Arc::new);
+        // EDGE off while the worker computes: the late answer must not paint.
+        c.set_stack_edge(Some(false), &worker);
+        c.on_stack_edge(key.clone(), result.clone());
+        assert!(c.edge.is_none());
+        // Same inputs again: a fresh request goes out instead of waiting forever.
+        c.set_stack_edge(Some(true), &worker);
+        let Some(Request::StackEdge { key: again, .. }) = c.edge_work.take() else { panic!("request not resent") };
+        assert!(again == key);
+        // A response for a superseded key never displaces the outstanding one.
+        let mut old = key.clone();
+        old.generation += 1;
+        c.on_stack_edge(old, result.clone());
+        assert!(c.edge_pending.is_some() && c.edge.is_none());
+        c.on_stack_edge(again, result);
+        assert!(matches!(c.edge, Some(Ok(_))));
+        assert!(c.edge_pending.is_none());
+    }
+    #[test]
+    fn edge_work_is_dropped_when_symbol_or_timeframe_reloads() {
+        let (worker, _rx) = Worker::test_channel();
+        let mut c = stack_chart(&worker, Provenance::Real);
+        c.show_edge = true;
+        c.refresh_edge(chrono::Utc::now().timestamp());
+        let Some(Request::StackEdge { key, bars, state, entry_long, entry_short, .. }) = c.edge_work.take() else {
+            panic!("missing worker request")
+        };
+        let result =
+            tr_data::edge::regime_edge(&bars[..key.n], &state, &entry_long, &entry_short, &key.horizons).map(Arc::new);
+        assert!(c.edge_pending.is_some());
+        c.load(&worker);
+        assert!(c.edge_work.is_none() && c.edge_pending.is_none());
+        // Same bars are back in the new generation: the old answer is still refused.
+        c.bars = bars.clone();
         c.on_stack_edge(key, result);
         assert!(c.edge.is_none());
     }

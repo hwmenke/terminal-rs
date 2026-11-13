@@ -3743,9 +3743,9 @@ async fn handle_inner(s: &Arc<Shared>, req: Request, force: bool) {
                             return;
                         }
                         let (bars, info) = stitch_native(s, &symbol, tf, bars, source, limit, observation).await;
-                        if info.note.as_ref().is_some_and(|s| {
-                            s.contains("UNVERIFIED JOIN") || s.contains("QUARANTINED") || s.contains("REBASED")
-                        }) {
+                        // A session gap is shown with its marker (never filled); only a
+                        // disputed or re-scaled series refuses to page.
+                        if info.note.as_ref().is_some_and(|s| s.contains("QUARANTINED") || s.contains("REBASED")) {
                             s.send(Response::HistoryError { pane, generation, error: info.note.unwrap() });
                             return;
                         }

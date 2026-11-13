@@ -41,9 +41,9 @@ The log records rejections, corrections, rebases, quarantines, failures, migrati
 
 Alpaca requests `adjustment=split`; Yahoo intraday prices are treated as split-adjusted rather than dividend-adjusted, consistent with the existing provider path. The vault adds no dividend adjustments. Uniform overlap rebases handle splits and reverse splits.
 
-A batch with **no overlap** cannot prove adjustment continuity. It is withheld from the existing stored series and marked `UNVERIFIED JOIN`; the fresh-only result is served, excluding the older vault prefix. The proposed daily-archive join check is deferred: the daily archive uses adjusted prices, so a tolerance alone does not prove the intraday adjustment basis. This conservative restriction also applies to non-overlapping older provider pages.
+A batch with **no overlap** has nothing to contradict, so its real bars are admitted (a `gap` event is logged), but it cannot prove adjustment continuity across the absence. The stitch therefore serves the older vault history *and* the fresh bars, never invents bars between them, and reports every join that skips at least one whole cash session in `StitchInfo::gaps` plus a note `UNVERIFIED JOIN · GAP <date> → <date>`. The chart draws an amber vertical marker at each such join (hover explains it), and the skipped sessions show as Missing cells. A later fetch that fills the absence removes the gap. Paging is not refused for a gap. The proposed daily-archive join check is still deferred: the daily archive uses adjusted prices, so a tolerance alone does not prove the intraday adjustment basis.
 
-The existing series remains on disk. To start accumulating anew after an unresolvable long absence, explicitly drop that symbol/timeframe, confirm, and refresh. Ticker reuse and renames need the same human judgment; a new ticker is a new identity.
+To discard history whose basis you distrust (e.g. a split during the absence), explicitly drop that symbol/timeframe, confirm, and refresh. Ticker reuse and renames need the same human judgment; a new ticker is a new identity.
 
 ## Coverage
 
@@ -63,7 +63,7 @@ The application does not infer unscheduled exchange closures. Such dates can rem
 
 ## Reading and provenance
 
-A normal stitch returns stored bars strictly older than the first fresh timestamp, then the fresh response, trimmed to the caller's limit. Stored tags are Cached; fresh tags are preserved. A quarantined fetch returns stored bars only. An unverified join returns fresh bars only.
+A normal stitch returns stored bars strictly older than the first fresh timestamp, then the fresh response, trimmed to the caller's limit. Stored tags are Cached; fresh tags are preserved. A quarantined fetch returns stored bars only. A join across whole missing sessions returns both sides with a gap marker (see above).
 
 The provenance line names the actual source, vault-only bar count, fresh count, session count, oldest date, interior holes, wholly missing sessions and any warning. Counts describe the returned input; the footer's coverage describes stored sessions.
 
@@ -71,7 +71,7 @@ CLOCK, SPATH, VPACE, RVAR, ACOR, GFILL, XTRM, RPATH, IBT, ICMP, chart Compare, B
 
 A failed fetch can serve vault-only history when exactly one stored source is available. Ambiguous source selection returns the provider error. Refused/unverified input never becomes a fallback success. Vault-only CLOCK receives no observation clock: wall time cannot newly close its last print. Source lines say `VAULT ONLY · feed down`.
 
-Chart initial loads respect the existing chart limit (`TR_HISTORY_LIMIT`). Refreshes ingest the fetched response before display merging. Vault-backed refreshes replace history from a consistent stitch, so a rebase cannot leave an older paged section at the previous scale. Chart paging currently asks the provider, not the vault; it still ingests eligible responses and refuses uncertain joins. There is no new archive or extended-hours stitch.
+Chart initial loads respect the existing chart limit (`TR_HISTORY_LIMIT`). Refreshes ingest the fetched response before display merging. Vault-backed refreshes replace history from a consistent stitch, so a rebase cannot leave an older paged section at the previous scale. Chart paging currently asks the provider, not the vault; it still ingests eligible responses and refuses to page a quarantined or just-rebased series. There is no new archive or extended-hours stitch.
 
 ## Report cache
 
@@ -89,7 +89,7 @@ Disk report caching and report caches for daily STATS, BT and LOOKALIKE are defe
 
 ## UI and commands
 
-`VAULT`, `VLT`, `AAPL VAULT`, `NEW VAULT`, `SPLIT VAULT` and `Alt+B` open the pane. It shows series, counts, database allocation, per-session strips, source/epoch, notes and recent events. It refreshes on opening, an explicit Refresh click and every 60 seconds while visible. Snapshot responses are generation-checked. Repainting alone sends no snapshot request.
+`VAULT`, `VLT`, `AAPL VAULT`, `NEW VAULT`, `SPLIT VAULT` and `Alt+B` open the pane. VAULT and VLT are also real tickers: only a bare `VAULT`/`VLT` or one followed by a vault verb (`VERIFY`, `PRUNE`, `DROP`) is the command. `VAULT US Equity`, `VLT Equity`, `VLT 5m` or `VAULT GP` load the ticker. It shows series, counts, database allocation, per-session strips, source/epoch, notes and recent events. It refreshes on opening, an explicit Refresh click and every 60 seconds while visible. Snapshot responses are generation-checked. Repainting alone sends no snapshot request.
 
 - `VAULT VERIFY`: worker `quick_check` and counter rebuild.
 - `VAULT PRUNE`: opens a confirmation in the pane. Its Prune action applies per-series retention.
@@ -121,10 +121,10 @@ Pruning runs after a 30-second startup delay, every 24 hours and on request. No 
 
 ## Limits and known gaps
 
-No no-overlap adjustment inference, legacy adoption, file-size enforcement, automatic corrupt-file replacement, rate-limit-event suppression or persistent reports. After a long gap, an unverified join needs manual reset or future archive-confirmation support. A second instance can receive SQLITE_BUSY after two seconds; the failed transaction is skipped and the current fetch stays live-only. Provider revisions inside tolerance retain stored prices by design. Rebase notes clear on the next successful non-rebase ingest rather than at a session boundary.
+No no-overlap adjustment inference, legacy adoption, file-size enforcement, automatic corrupt-file replacement, rate-limit-event suppression or persistent reports. A join across a gap stays flagged as unverified until the absence is filled; archive confirmation is future work. A second instance can receive SQLITE_BUSY after two seconds; the failed transaction is skipped and the current fetch stays live-only. Provider revisions inside tolerance retain stored prices by design. Rebase notes clear on the next successful non-rebase ingest rather than at a session boundary.
 
 No live provider was queried to establish Alpaca H1 anchoring or IEX sparsity. The conservative exclusion and informational hole labels avoid claiming verification that the repository's fixtures cannot provide. Runtime contention under a real TWALL burst and GUI rendering have not been exercised; no GUI or server was launched for this slice.
 
 ## Measured timings
 
-Run the offline storage microbenchmark with `cargo bench -p tr-data --bench barvault --profile dev`. It seeds 100,000 cash-grid fixture bars into in-memory SQLite, then measures five agreeing ingests of 2,730 overlapping bars and five 20,000-bar reads. On this workspace (dev profile, in-memory SQLite), the final five-iteration run measured **192.0 ms per ingest** and **7.6 ms per read**. They measure local storage work, not providers, UI latency or physical disk durability.
+Run the offline storage microbenchmark with `cargo bench -p tr-data --bench barvault --profile dev`. It seeds 100,000 cash-grid fixture bars into in-memory SQLite, then measures five agreeing ingests of 2,730 overlapping bars and five 20,000-bar reads. On this workspace (dev profile, in-memory SQLite), the original build measured **192.0 ms per ingest** (it re-read the whole series); with range-bounded ingest (overlap read, per-day session rebuild, incremental counters) it measures **~20 ms per ingest** and **~8 ms per read**. Coverage and the pane snapshot read only `vault_sessions` counters, and pruning finds its cut with an indexed `OFFSET`; only explicit `VAULT VERIFY` re-reads full series. They measure local storage work, not providers, UI latency or physical disk durability.

@@ -31,6 +31,9 @@ pub struct StitchInfo {
     pub fetched_at: Option<i64>,
     pub note: Option<String>,
     pub digest: u64,
+    /// `(last bar before, first bar after)` for every join that skips at least
+    /// one whole cash session. Nothing is drawn or interpolated inside a gap.
+    pub gaps: Vec<(i64, i64)>,
 }
 impl StitchInfo {
     pub fn label(&self) -> String {
@@ -238,15 +241,22 @@ impl BarVault {
         };
         out.rejected = bars.len().saturating_sub(fresh.len());
         note_fetch(&tx, sid, id.tf, at, true)?;
-        let stored = read_rows(&tx, sid, None, usize::MAX)?;
-        let overlap = fresh.iter().any(|b| stored.binary_search_by_key(&b.ts, |x| x.ts).is_ok());
+        let (Some(first), Some(last)) = (fresh.first().map(|b| b.ts), fresh.last().map(|b| b.ts)) else {
+            tx.commit()?;
+            return Ok(out);
+        };
+        // Only rows the fresh batch can touch are read: reconciliation needs the
+        // overlap, never the whole (up to 250k-row) series.
+        let stored = read_between(&tx, sid, first, last)?;
+        let held: i64 = tx.query_row("SELECT bars FROM vault_series WHERE id=?", [sid], |r| r.get(0))?;
         let verdict = merge::reconcile(&stored, &fresh);
-        if verdict == merge::Verdict::Quarantine || (!stored.is_empty() && !fresh.is_empty() && !overlap) {
-            let note = if verdict == merge::Verdict::Quarantine {
-                "QUARANTINED fetch · VAULT VERIFY"
-            } else {
-                "UNVERIFIED JOIN · no overlap"
-            };
+        if held > 0 && stored.is_empty() {
+            // Nothing to compare: store the real bars, never bridge the gap. The
+            // stitch reports the join as an unverified gap from the stored rows.
+            event(&tx, at, Some(sid), "gap", None, "no overlap with stored bars; join unverified")?;
+        }
+        if verdict == merge::Verdict::Quarantine {
+            let note = "QUARANTINED fetch · VAULT VERIFY";
             out.quarantined = true;
             out.note = Some(note.into());
             tx.execute("UPDATE vault_series SET note=? WHERE id=?", params![note, sid])?;
@@ -263,7 +273,7 @@ impl BarVault {
                 params![format!("REBASED ratio {r:.6}"), sid],
             )?;
             tx.execute("DELETE FROM vault_reports WHERE symbol=? AND tf=?", params![id.symbol, id.tf.label()])?;
-            event(&tx, at, Some(sid), "rebase", None, &format!("ratio {r:.8}; {} existing bars", stored.len()))?;
+            event(&tx, at, Some(sid), "rebase", None, &format!("ratio {r:.8}; {held} existing bars"))?;
             out.rebased = Some(r);
         } else {
             tx.execute("UPDATE vault_series SET note=NULL WHERE id=?", [sid])?;
@@ -298,11 +308,10 @@ impl BarVault {
             }
             tx.execute("INSERT INTO vault_bars(series_id,ts,o,h,l,c,v,first_seen,last_seen) VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(series_id,ts) DO UPDATE SET o=excluded.o,h=excluded.h,l=excluded.l,c=excluded.c,v=excluded.v,last_seen=excluded.last_seen,confirms=1",params![sid,b.ts,b.open,b.high,b.low,b.close,b.volume_value().unwrap_or(-1.),at,at])?;
         }
-        rebuild(&tx, sid, id.tf, at)?;
-        tx.execute("UPDATE vault_series SET last_ingest=? WHERE id=?", params![at, sid])?;
+        rebuild_days(&tx, sid, id.tf, first, last, at)?;
         tx.execute(
-            "DELETE FROM vault_events WHERE id NOT IN (SELECT id FROM vault_events ORDER BY id DESC LIMIT 5000)",
-            [],
+            "UPDATE vault_series SET bars=bars+?2,first_ts=(SELECT MIN(ts) FROM vault_bars WHERE series_id=?1),last_ts=(SELECT MAX(ts) FROM vault_bars WHERE series_id=?1),last_ingest=?3 WHERE id=?1",
+            params![sid, out.inserted as i64, at],
         )?;
         tx.commit()?;
         Ok(out)
@@ -333,20 +342,37 @@ impl BarVault {
             None => (0, None),
         };
         let quarantine = note.as_ref().is_some_and(|n| n.starts_with("QUARANTINED"));
-        let cut = note.as_ref().is_some_and(|n| n.starts_with("UNVERIFIED JOIN"));
-        let mut bars = if cut && !fresh.is_empty() {
-            vec![]
-        } else {
-            self.read(id, if quarantine { None } else { fresh.first().map(|b| b.ts) }, limit)?
-        };
+        let mut bars = self.read(id, if quarantine { None } else { fresh.first().map(|b| b.ts) }, limit)?;
         let mut live = if quarantine { vec![] } else { fresh.to_vec() };
         bars.append(&mut live);
         if bars.len() > limit {
             bars.drain(..bars.len() - limit);
         }
+        // Missing whole sessions stay missing: no bars are invented across them,
+        // and the join on either side is reported as unverified.
+        let gaps = session_gaps(&bars);
+        let note = match (note, gaps.last()) {
+            (note, None) => note,
+            (note, Some(&(a, b))) => Some(
+                [
+                    note,
+                    Some(format!(
+                        "UNVERIFIED JOIN · GAP {} → {}{}",
+                        tr_core::ny::civil(a).date(),
+                        tr_core::ny::civil(b).date(),
+                        if gaps.len() > 1 { format!(" (+{} more)", gaps.len() - 1) } else { String::new() }
+                    )),
+                ]
+                .into_iter()
+                .flatten()
+                .collect::<Vec<_>>()
+                .join(" · "),
+            ),
+        };
         let cells = coverage_for(id.tf, &bars, &BTreeMap::new(), at.unwrap_or_else(|| chrono::Utc::now().timestamp()));
         let n = crate::closed::closed_len(id.tf, &bars, crate::security(&id.symbol).class, at);
         let info = StitchInfo {
+            gaps,
             cells: self.coverage(id, at.unwrap_or_else(|| chrono::Utc::now().timestamp()))?,
             source: id.source.clone(),
             vault_bars: bars.iter().filter(|b| b.provenance == Provenance::Cached).count(),
@@ -387,20 +413,43 @@ impl BarVault {
     }
     pub fn coverage(&self, id: &SeriesId, at: i64) -> Result<Vec<SessionCell>> {
         let Some(sid) = self.series_id(id)? else { return Ok(vec![]) };
-        let mut st = self
-            .cache
-            .conn
-            .prepare("SELECT date,fetch_ok,fetch_fail,corrected,last_seen FROM vault_sessions WHERE series_id=?")?;
-        let stats = st
+        // Counters maintained by ingest/prune/verify: no bar rows are read here.
+        let mut st = self.cache.conn.prepare_cached(
+            "SELECT date,present,holes,fetch_ok,fetch_fail,corrected,last_seen FROM vault_sessions WHERE series_id=? ORDER BY date",
+        )?;
+        let rows = st
             .query_map([sid], |r| {
                 Ok((
                     r.get::<_, String>(0)?,
-                    (r.get::<_, u16>(1)?, r.get::<_, u16>(2)?, r.get::<_, u16>(3)?, r.get::<_, Option<i64>>(4)?),
+                    (
+                        r.get::<_, u16>(1)?,
+                        r.get::<_, u16>(2)?,
+                        r.get::<_, u16>(3)?,
+                        r.get::<_, u16>(4)?,
+                        r.get::<_, u16>(5)?,
+                        r.get::<_, Option<i64>>(6)?,
+                    ),
                 ))
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
-        let stats = stats.into_iter().filter_map(|(d, s)| d.parse().ok().map(|d| (d, s))).collect();
-        Ok(coverage_for(id.tf, &read_rows(&self.cache.conn, sid, None, usize::MAX)?, &stats, at))
+        let rows: BTreeMap<NaiveDate, _> =
+            rows.into_iter().filter_map(|(d, s)| d.parse().ok().map(|d| (d, s))).collect();
+        let (Some(mut date), Some(&last)) = (rows.keys().next().copied(), rows.keys().next_back()) else {
+            return Ok(vec![]);
+        };
+        let mut cells = vec![];
+        while date <= last {
+            if crate::history::calendar::is_session(date) {
+                let (present, holes, ok, fail, corrected, seen) = rows.get(&date).copied().unwrap_or_default();
+                let mut cell = merge::classify_counts(date, id.tf, present, holes, ok, fail, at);
+                cell.corrected = corrected;
+                cell.last_seen = seen;
+                cells.push(cell);
+            }
+            let Some(next) = date.succ_opt() else { break };
+            date = next;
+        }
+        Ok(cells)
     }
     pub fn snapshot(&self, symbol: Option<&str>, at: i64) -> Result<VaultSnapshot> {
         if !self.enabled {
@@ -498,24 +547,35 @@ impl BarVault {
         let mut removed = 0;
         let rows = series_list(&self.cache.conn)?;
         for (sid, tf) in rows {
-            removed += self.prune_series(sid, tf, retention_cap(tf), at)?;
+            removed += self.prune_series(sid, retention_cap(tf))?;
         }
         let tx = self.cache.conn.transaction()?;
         event(&tx, at, None, "prune", None, &format!("{removed} bars removed; free pages reused (no VACUUM)"))?;
         tx.commit()?;
         Ok(removed)
     }
-    fn prune_series(&mut self, sid: i64, tf: Timeframe, cap: usize, at: i64) -> Result<usize> {
-        let bars = read_rows(&self.cache.conn, sid, None, usize::MAX)?;
-        if bars.len() <= cap {
-            return Ok(0);
-        }
-        let cut_date = tr_core::ny::civil(bars[bars.len() - cap - 1].ts).date();
-        let end = tr_core::ny::to_utc(cut_date.succ_opt().unwrap().and_hms_opt(0, 0, 0).unwrap());
+    fn prune_series(&mut self, sid: i64, cap: usize) -> Result<usize> {
+        // The newest bar beyond the cap, found on the primary key (no full read).
+        let beyond: Option<i64> = self
+            .cache
+            .conn
+            .query_row(
+                "SELECT ts FROM vault_bars WHERE series_id=? ORDER BY ts DESC LIMIT 1 OFFSET ?",
+                params![sid, i64::try_from(cap).unwrap_or(i64::MAX)],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let Some(beyond) = beyond else { return Ok(0) };
+        let cut_date = tr_core::ny::civil(beyond).date();
+        let end = day_start(cut_date.succ_opt().unwrap());
         let tx = self.cache.conn.transaction()?;
         let n = tx.execute("DELETE FROM vault_bars WHERE series_id=? AND ts<?", params![sid, end])?;
         tx.execute("DELETE FROM vault_sessions WHERE series_id=? AND date<=?", params![sid, cut_date.to_string()])?;
-        rebuild(&tx, sid, tf, at)?;
+        // Whole sessions were removed, so the remaining session counters stand.
+        tx.execute(
+            "UPDATE vault_series SET bars=MAX(0,bars-?2),first_ts=(SELECT MIN(ts) FROM vault_bars WHERE series_id=?1),last_ts=(SELECT MAX(ts) FROM vault_bars WHERE series_id=?1) WHERE id=?1",
+            params![sid, n as i64],
+        )?;
         tx.commit()?;
         Ok(n)
     }
@@ -536,10 +596,8 @@ fn event(c: &Connection, at: i64, sid: Option<i64>, kind: &str, ts: Option<i64>,
         "INSERT INTO vault_events(at,series_id,kind,ts,detail) VALUES(?,?,?,?,?)",
         params![at, sid, kind, ts, detail],
     )?;
-    c.execute(
-        "DELETE FROM vault_events WHERE id NOT IN (SELECT id FROM vault_events ORDER BY id DESC LIMIT 5000)",
-        [],
-    )?;
+    // Ids are monotonic: an indexed range delete keeps the newest 5000 events.
+    c.execute("DELETE FROM vault_events WHERE id <= last_insert_rowid() - 5000", [])?;
     Ok(())
 }
 fn read_rows(c: &Connection, sid: i64, before: Option<i64>, limit: usize) -> Result<Vec<Bar>> {
@@ -552,8 +610,58 @@ fn read_rows(c: &Connection, sid: i64, before: Option<i64>, limit: usize) -> Res
                 .with_provenance(Provenance::Cached))
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
+    count_read(bars.len());
     bars.reverse();
     Ok(bars)
+}
+#[cfg(test)]
+thread_local! {
+    /// Rows materialised from `vault_bars`; tests use it to prove range-bounded reads.
+    static ROWS_READ: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+fn count_read(_n: usize) {
+    #[cfg(test)]
+    ROWS_READ.with(|c| c.set(c.get() + _n));
+}
+/// Stored rows with `from <= ts <= to`, oldest first.
+fn read_between(c: &Connection, sid: i64, from: i64, to: i64) -> Result<Vec<Bar>> {
+    let mut st =
+        c.prepare_cached("SELECT ts,o,h,l,c,v FROM vault_bars WHERE series_id=?1 AND ts>=?2 AND ts<=?3 ORDER BY ts")?;
+    let bars = st
+        .query_map(params![sid, from, to], |r| {
+            let v: f64 = r.get(5)?;
+            Ok(Bar::new(r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, if v < 0. { f64::NAN } else { v })
+                .with_provenance(Provenance::Cached))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    count_read(bars.len());
+    Ok(bars)
+}
+fn day_start(date: NaiveDate) -> i64 {
+    tr_core::ny::to_utc(date.and_hms_opt(0, 0, 0).expect("midnight"))
+}
+/// Recompute present/holes for the New York dates spanned by `[from, to]` only.
+fn rebuild_days(c: &Connection, sid: i64, tf: Timeframe, from: i64, to: i64, at: i64) -> Result<()> {
+    let (first, last) = (tr_core::ny::civil(from).date(), tr_core::ny::civil(to).date());
+    let Some(after) = last.succ_opt() else { return Ok(()) };
+    let bars = read_between(c, sid, day_start(first), day_start(after) - 1)?;
+    c.execute(
+        "UPDATE vault_sessions SET present=0,holes=0 WHERE series_id=? AND date>=? AND date<=?",
+        params![sid, first.to_string(), last.to_string()],
+    )?;
+    for cell in coverage_for(tf, &bars, &BTreeMap::new(), at) {
+        c.execute("INSERT INTO vault_sessions(series_id,date,expected,present,holes) VALUES(?,?,?,?,?) ON CONFLICT(series_id,date) DO UPDATE SET expected=excluded.expected,present=excluded.present,holes=excluded.holes",params![sid,cell.date.to_string(),cell.expected,cell.present,cell.holes])?;
+    }
+    Ok(())
+}
+/// Joins that skip at least one whole cash session. Intraday holes are not gaps.
+fn session_gaps(bars: &[Bar]) -> Vec<(i64, i64)> {
+    bars.windows(2)
+        .filter_map(|w| {
+            let (a, b) = (tr_core::ny::civil(w[0].ts).date(), tr_core::ny::civil(w[1].ts).date());
+            (b > a && crate::history::calendar::next_session(a) < b).then_some((w[0].ts, w[1].ts))
+        })
+        .collect()
 }
 type FetchStats = BTreeMap<NaiveDate, (u16, u16, u16, Option<i64>)>;
 fn coverage_for(tf: Timeframe, bars: &[Bar], stats: &FetchStats, at: i64) -> Vec<SessionCell> {
@@ -746,15 +854,94 @@ mod tests {
         assert!(info.note.unwrap().contains("QUARANTINED"));
     }
     #[test]
-    fn no_overlap_without_archive_confirmation_withholds_older_bars() {
+    fn no_overlap_keeps_older_history_with_a_gap_marker_and_no_bars_inside() {
         let mut v = BarVault::open_in_memory().unwrap();
-        put(&mut v, &id(), &bars("2026-11-10"));
+        let old = bars("2026-11-09");
+        put(&mut v, &id(), &old);
         let b = bars("2026-11-12");
-        assert!(put(&mut v, &id(), &b).quarantined);
+        let out = put(&mut v, &id(), &b);
+        assert!(!out.quarantined);
+        assert_eq!(out.inserted, 78);
         let (read, info) = v.stitch(&id(), &b, 500, Some(at(&b))).unwrap();
-        assert_eq!(read.len(), b.len());
-        assert_eq!(info.vault_bars, 0);
-        assert!(info.note.unwrap().contains("UNVERIFIED JOIN"));
+        // Older vault history is shown, fresh bars follow, nothing is invented between.
+        assert_eq!(read.len(), old.len() + b.len());
+        assert_eq!(info.vault_bars, 78);
+        assert_eq!(info.live_bars, 78);
+        assert_eq!(bars_digest(&read[..78]), bars_digest(&old));
+        assert_eq!(info.gaps, vec![(old.last().unwrap().ts, b[0].ts)]);
+        let note = info.note.clone().unwrap();
+        assert!(note.contains("UNVERIFIED JOIN · GAP 2026-11-09 → 2026-11-12"), "{note}");
+        assert_eq!(info.missing_sessions, 2);
+        assert!(info.live_ok);
+        assert!(research_bars(&read, Some(&info)).is_ok());
+        // Contiguous sessions are not gaps; an overnight join is not a gap.
+        let (_, contiguous) = v.stitch(&id(), &[], 500, None).unwrap();
+        assert_eq!(contiguous.gaps.len(), 1);
+        put(&mut v, &id(), &bars("2026-11-10"));
+        put(&mut v, &id(), &bars("2026-11-11"));
+        let (read, info) = v.stitch(&id(), &b, 500, Some(at(&b))).unwrap();
+        assert_eq!(read.len(), 4 * 78);
+        assert!(info.gaps.is_empty());
+        assert!(info.note.is_none());
+    }
+    #[test]
+    fn ingest_and_coverage_read_only_the_touched_range() {
+        let mut v = BarVault::open_in_memory().unwrap();
+        let mut history = vec![];
+        let mut date: NaiveDate = "2026-06-01".parse().unwrap();
+        while date < "2026-11-10".parse().unwrap() {
+            if crate::history::calendar::is_session(date) {
+                history.extend(bars(&date.to_string()));
+            }
+            date = date.succ_opt().unwrap();
+        }
+        put(&mut v, &id(), &history);
+        let tail = bars("2026-11-10");
+        let mut batch = history[history.len() - 78..].to_vec();
+        batch.extend(tail.iter().copied());
+        ROWS_READ.with(|c| c.set(0));
+        let out = put(&mut v, &id(), &batch);
+        assert_eq!((out.inserted, out.confirmed), (78, 78));
+        let read = ROWS_READ.with(|c| c.get());
+        assert!(read <= 4 * 78, "ingest read {read} rows of {}", history.len());
+        ROWS_READ.with(|c| c.set(0));
+        let cells = v.coverage(&id(), at(&tail)).unwrap();
+        v.snapshot(None, at(&tail)).unwrap();
+        assert_eq!(ROWS_READ.with(|c| c.get()), 0);
+        assert_eq!(cells.last().unwrap().state, CellState::Complete);
+        assert_eq!(v.snapshot(None, at(&tail)).unwrap().series[0].bars, history.len() + 78);
+    }
+    #[test]
+    fn incremental_counters_match_a_full_verify_rebuild() {
+        let mut v = BarVault::open_in_memory().unwrap();
+        let mut a = bars("2026-11-09");
+        a.remove(10);
+        a.remove(0);
+        put(&mut v, &id(), &a);
+        let mut b = bars("2026-11-10");
+        b.truncate(50);
+        put(&mut v, &id(), &b);
+        put(&mut v, &id(), &bars("2026-11-12"));
+        v.fetch_failed(&id(), at(&bars("2026-11-12")), "offline").unwrap();
+        let now = at(&bars("2026-11-12"));
+        let state = |v: &BarVault| {
+            let s = v.snapshot(None, now).unwrap();
+            let cells: Vec<_> = s.series[0].cells.iter().map(|c| (c.date, c.state, c.present, c.holes)).collect();
+            (s.series[0].bars, cells)
+        };
+        let incremental = state(&v);
+        let full = read_rows(&v.cache.conn, v.series_id(&id()).unwrap().unwrap(), None, usize::MAX).unwrap();
+        let expected: Vec<_> = coverage_for(id().tf, &full, &BTreeMap::new(), now)
+            .into_iter()
+            .map(|c| (c.date, c.state, c.present, c.holes))
+            .collect();
+        assert_eq!(incremental.1, expected);
+        assert_eq!(incremental.0, full.len());
+        assert_eq!(incremental.1[0].1, CellState::Partial);
+        assert_eq!(incremental.1[1].1, CellState::Partial);
+        assert_eq!(incremental.1[2].1, CellState::Missing);
+        v.verify(now).unwrap();
+        assert_eq!(state(&v), incremental);
     }
     #[test]
     fn stitch_preserves_provenance_and_counts_holes_and_missing_sessions() {
@@ -840,8 +1027,12 @@ mod tests {
         b.extend(bars("2026-11-11"));
         put(&mut v, &id(), &b);
         let sid = v.series_id(&id()).unwrap().unwrap();
-        assert_eq!(v.prune_series(sid, id().tf, 100, at(&b)).unwrap(), 156);
+        assert_eq!(v.prune_series(sid, 100).unwrap(), 156);
         assert_eq!(v.read(&id(), None, 500).unwrap().len(), 78);
+        let snap = v.snapshot(None, at(&b)).unwrap();
+        assert_eq!(snap.series[0].bars, 78);
+        assert_eq!(snap.series[0].cells.len(), 1);
+        assert_eq!(v.prune_series(sid, 100).unwrap(), 0);
         v.cache.conn.execute("UPDATE vault_series SET bars=999", []).unwrap();
         v.cache.conn.execute("UPDATE vault_sessions SET present=999", []).unwrap();
         assert!(v.verify(at(&b)).unwrap().contains("quick_check ok"));

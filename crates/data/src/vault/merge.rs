@@ -90,17 +90,32 @@ pub fn classify_session(date: NaiveDate, tf: Timeframe, bars: &[Bar], ok: u16, f
         (Some(a), Some(b)) => opens.iter().filter(|t| a <= *t && *t <= b && !present.contains(*t)).count(),
         _ => 0,
     };
+    classify_counts(date, tf, present.len() as u16, holes as u16, ok, fail, at)
+}
+/// Same classification from stored counters. Every missing open is either an
+/// interior hole or an edge miss, so `expected - present > holes` means a
+/// missing first/last bar (Partial) without reading the bars.
+pub fn classify_counts(
+    date: NaiveDate,
+    tf: Timeframe,
+    present: u16,
+    holes: u16,
+    ok: u16,
+    fail: u16,
+    at: i64,
+) -> SessionCell {
+    let expected = intraday::regular_opens(date, tf).len() as u16;
     let close = intraday::close_minute(date);
     let end = tr_core::ny::to_utc(date.and_hms_opt(close / 60, close % 60, 0).unwrap());
     let state = if !crate::history::calendar::is_session(date) {
         CellState::Closed
     } else if tr_core::ny::civil(at).date() == date && at < end {
         CellState::Pending
-    } else if present.len() == opens.len() {
+    } else if present >= expected {
         CellState::Complete
-    } else if present.is_empty() {
+    } else if present == 0 {
         if fail > 0 && ok == 0 { CellState::Failed } else { CellState::Missing }
-    } else if present.first() != opens.first() || present.last() != opens.last() {
+    } else if expected - present > holes {
         if fail > 0 && ok == 0 { CellState::Failed } else { CellState::Partial }
     } else {
         CellState::Holes
@@ -108,9 +123,9 @@ pub fn classify_session(date: NaiveDate, tf: Timeframe, bars: &[Bar], ok: u16, f
     SessionCell {
         date,
         state,
-        expected: opens.len() as u16,
-        present: present.len() as u16,
-        holes: holes as u16,
+        expected,
+        present,
+        holes,
         fetch_ok: ok,
         fetch_fail: fail,
         corrected: 0,
