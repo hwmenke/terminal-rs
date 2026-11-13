@@ -409,6 +409,8 @@ pub enum Function {
     StudioDist {
         timeframe: Timeframe,
     },
+    /// Relationship Studio: benchmark OLS and correlation.
+    StudioCorr { spec: String },
     /// Historical risk/return and conditional forward returns (`STATS`, `AAPL COND RSI < 30`).
     Stats {
         condition: String,
@@ -824,6 +826,7 @@ fn parse_function(head: &str, rest: &[&str]) -> Option<Function> {
         "REVIEW" | "REV" => Function::Review,
         "DESK" | "PMDESK" | "RISK" => Function::Desk,
         "JOURNAL" | "JRNL" | "CHECKLIST" | "TRADELOG" => Function::Journal(joined()),
+        "CORR" | "RBETA" => Function::StudioCorr { spec: joined() },
         "STATS" | "STAT" | "STATISTICS" => Function::Stats { condition: joined(), conditional: !rest.is_empty() },
         "COND" | "CDIST" | "CONDRET" => Function::Stats { condition: joined(), conditional: true },
         "DIST" | "RDIST" => Function::StudioDist {
@@ -1114,6 +1117,7 @@ fn describe(f: &Function) -> String {
             "Trade journal: setups, checklist, planned risk, outcomes in $ and R".into()
         }
         Function::Journal(q) => format!("Trade journal: {q}"),
+        Function::StudioCorr { spec } => format!("Relationship Studio · {}", if spec.is_empty() { "SPY" } else { spec }),
         Function::Stats { condition, conditional } if condition.is_empty() => {
             if *conditional {
                 "Conditional returns: what followed a filter vs the unconditional baseline".into()
@@ -1238,6 +1242,16 @@ fn describe(f: &Function) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn relationship_studio_commands() {
+        for alias in ["CORR", "RBETA"] {
+            assert_eq!(parse(alias), Some(Command::Function(Function::StudioCorr { spec: String::new() })));
+        }
+        assert_eq!(parse("AAPL CORR"), Some(Command::SymbolFunction("AAPL US Equity".into(), Function::StudioCorr { spec: String::new() })));
+        assert_eq!(parse("AAPL CORR QQQ"), Some(Command::SymbolFunction("AAPL US Equity".into(), Function::StudioCorr { spec: "QQQ".into() })));
+        assert_eq!(parse("AAPL RBETA QQQ 1H"), Some(Command::SymbolFunction("AAPL US Equity".into(), Function::StudioCorr { spec: "QQQ 1H".into() })));
+    }
+
     #[test]
     fn vault_commands_alias_symbol_and_guard() {
         for cmd in ["VAULT", "VLT"] {

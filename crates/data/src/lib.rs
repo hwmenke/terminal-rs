@@ -53,6 +53,7 @@ pub mod stable_hash;
 pub mod stack_wall;
 pub mod stats;
 pub mod studio_dist;
+pub mod studio_corr;
 pub mod time_link;
 pub mod trade_plans;
 pub mod treasury;

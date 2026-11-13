@@ -432,6 +432,11 @@ impl TerminalApp {
                 s.request(id, &self.worker);
                 PaneKind::StudioDist(s)
             }
+            PaneKind::StudioCorr(mut s) => {
+                if s.symbol.trim().is_empty() && let Some(sym) = self.focused_symbol() { s.symbol = sym; }
+                s.request(id, &self.worker);
+                PaneKind::StudioCorr(s)
+            }
             PaneKind::Stats(mut s) => {
                 if s.symbol.trim().is_empty() {
                     if let Some(sym) = self.focused_symbol() {
@@ -1041,6 +1046,11 @@ impl TerminalApp {
                 let symbol = symbol.map(|s| tr_data::security(s).key()).or_else(|| self.focused_symbol()).unwrap_or_default();
                 let timeframe = tr_data::studio_dist::parse_timeframe(&words.get(1..).unwrap_or(&[]).join(" ")).ok()?;
                 PaneKind::StudioDist(Box::new(super::studio_dist::DistPane::new(symbol, timeframe, tr_data::studio_dist::Window::All)))
+            }
+            "CORR" | "RBETA" => {
+                let symbol = symbol.map(|s| tr_data::security(s).key()).or_else(|| self.focused_symbol()).unwrap_or_default();
+                let spec = words.get(1..).unwrap_or(&[]).join(" ");
+                PaneKind::StudioCorr(Box::new(super::studio_corr::CorrPane::new(symbol, spec)))
             }
             "STATS" | "STAT" | "STATISTICS" | "COND" | "CDIST" | "CONDRET" => {
                 let symbol = given.or(current).unwrap_or_default();

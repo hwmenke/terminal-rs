@@ -134,6 +134,7 @@ pub enum Request {
         timeframe: Timeframe,
         window: tr_data::studio_dist::Window,
     },
+    StudioCorr { pane: PaneId, generation: u64, symbol: String, spec: String },
     /// Historical statistics and conditional forward returns for one archive symbol.
     Stats {
         pane: PaneId,
@@ -609,6 +610,7 @@ pub enum Response {
         spy: Option<Vec<Bar>>,
         error: Option<String>,
     },
+    StudioCorr { pane: PaneId, generation: u64, result: Result<tr_data::studio_corr::CorrReport, String> },
     Stats {
         pane: PaneId,
         generation: u64,
@@ -3298,6 +3300,13 @@ async fn handle_inner(s: &Arc<Shared>, req: Request, force: bool) {
                     .await.map_err(anyhow::Error::msg)
             }.await;
             send(Response::StudioDist { pane, generation, result: result.map_err(|e| format!("{e:#}")) });
+        }
+        Request::StudioCorr { pane, generation, symbol, spec } => {
+            let bridge = config.bridge();
+            let result = crate::app::studio_corr::research(&s.history, &bridge, s.sample_mode(), &symbol, &spec, |key, tf| async move {
+                analysis_bars(s, &key, tf, default_limit(tf), "Relationship Studio").await
+            }).await.map_err(|e| format!("{e:#}"));
+            send(Response::StudioCorr { pane, generation, result });
         }
         Request::Stats { pane, generation, symbol, condition, horizons } => {
             let bridge = config.bridge();
