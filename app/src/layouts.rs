@@ -169,6 +169,12 @@ pub enum PaneSettings {
         #[serde(default)]
         filter: String,
     },
+    TstackTune {
+        symbol: String,
+        tf: Timeframe,
+        #[serde(default)]
+        params: tr_core::indicators::AdaptiveTrendParams,
+    },
     StudioDist {
         #[serde(default)]
         symbol: String,

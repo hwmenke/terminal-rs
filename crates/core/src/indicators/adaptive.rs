@@ -13,7 +13,7 @@ use super::{NAN, Ohlcv};
 use crate::{Bar, Provenance};
 
 /// Kaufman (squared) or ADMA (linear) efficiency-ratio smoothing.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum AdaptiveMethod {
     Kama,
     Adma,
@@ -33,7 +33,7 @@ impl AdaptiveMethod {
 }
 
 /// Whats-News Adaptive Trend defaults (SB 10/2/30, MB 20/2/60, LB 40/2/120).
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct AdaptiveTrendParams {
     pub method: AdaptiveMethod,
     pub sb_er: usize,

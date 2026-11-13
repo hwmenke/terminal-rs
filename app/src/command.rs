@@ -288,6 +288,7 @@ pub enum Function {
     Vault(VaultCmd),
     Timeframe(Timeframe),
     TrendStack(Option<bool>),
+    TstackTune(Option<Timeframe>),
     StackLadder(Option<Vec<Timeframe>>),
     StackTint(Option<bool>),
     StackSession(Option<bool>),
@@ -767,6 +768,14 @@ fn parse_function(head: &str, rest: &[&str]) -> Option<Function> {
             [arg] if arg.eq_ignore_ascii_case("ON") => Function::TrendStack(Some(true)),
             [arg] if arg.eq_ignore_ascii_case("OFF") => Function::TrendStack(Some(false)),
             [arg] if arg.eq_ignore_ascii_case("AUTO") => Function::StackLadder(None),
+            [arg, tail @ ..] if arg.eq_ignore_ascii_case("TUNE") => {
+                let tf = match tail {
+                    [] => None,
+                    [token] => Some(token.parse::<Timeframe>().ok()?),
+                    _ => return None,
+                };
+                Function::TstackTune(tf)
+            }
             [arg, tail @ ..] if arg.eq_ignore_ascii_case("CONE") => parse_cone(tail)?,
             [arg, tail @ ..] if arg.eq_ignore_ascii_case("EDGE") => Function::StackEdge(parse_switch(tail)?),
             [arg, tail @ ..] if arg.eq_ignore_ascii_case("TINT") => Function::StackTint(parse_switch(tail)?),
@@ -989,6 +998,7 @@ fn describe(f: &Function) -> String {
         Function::TrendCone { .. } => "Trend Cone · regime path quantiles + walk-forward coverage".into(),
         Function::StackEdge(_) => "Trend Stack regime Edge study".into(),
         Function::TruthRail(_) => "Truth Rail".into(),
+        Function::TstackTune(tf) => format!("TSTACK Plateau: 49 FDR-gated Edge tests{}", tf.map(|t| format!(" · {t}")).unwrap_or_default()),
         Function::TrendStack(on) => format!("Trend Stack{}", match on { None => " toggle", Some(true) => " on", Some(false) => " off" }),
         Function::Timeframe(tf) => format!(
             "Interval {}",
@@ -1526,6 +1536,29 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn tune_parses_without_stealing_ticker_or_stack_commands() {
+        assert_eq!(parse("TSTACK TUNE"), Some(Command::Function(Function::TstackTune(None))));
+        assert_eq!(parse("TSTACK TUNE 5m"), Some(Command::Function(Function::TstackTune(Some(Timeframe::M5)))));
+        assert_eq!(
+            parse("AAPL TSTACK TUNE 1H"),
+            Some(Command::SymbolFunction("AAPL US Equity".into(), Function::TstackTune(Some(Timeframe::H1))))
+        );
+        assert_eq!(
+            parse("aapl stack tune"),
+            Some(Command::SymbolFunction("AAPL US Equity".into(), Function::TstackTune(None)))
+        );
+        for bad in ["TSTACK TUNE nonsense", "TSTACK TUNE 5m 1H", "AAPL TSTACK TUNE OFF"] {
+            assert!(parse(bad).is_none(), "{bad}");
+        }
+        assert_eq!(parse("TUNE"), Some(Command::Symbol("TUNE US Equity".into())));
+        assert_eq!(
+            parse("TUNE 5m"),
+            Some(Command::SymbolFunction("TUNE US Equity".into(), Function::Timeframe(Timeframe::M5)))
+        );
+        assert_eq!(parse("TUNE US Equity"), Some(Command::Symbol("TUNE US Equity".into())));
+    }
 
     #[test]
     fn tstack_and_aliases_parse() {

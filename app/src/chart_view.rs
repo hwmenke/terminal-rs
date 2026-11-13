@@ -1045,12 +1045,15 @@ impl ChartState {
                 bars: self.bars.clone(),
                 tf: self.tf,
                 specs: self.indicators.clone(),
+                class: self.sec.class,
+                observed: if self.archive { Some(chrono::Utc::now().timestamp()) } else { self.last_refresh },
+                stitch: self.stitch.clone(),
                 palette: theme::palette(),
             });
         }
     }
 
-    fn stack_params(&self) -> AdaptiveTrendParams {
+    pub(crate) fn stack_params(&self) -> AdaptiveTrendParams {
         self.indicators
             .iter()
             .find(|s| s.code == "ADTREND")
@@ -3151,8 +3154,8 @@ impl ChartState {
             let c = bi.overlays.get(bi.overlays.len() / 2).map_or(text(), |o| opaque(&o.1));
             let title = if bi.spec.code == "ZBAND" {
                 match bi.z_readout.as_ref().and_then(|z| z.get(i)).filter(|z| z.is_finite()) {
-                    Some(z) => format!("{} · z {z:+.1}", bi.spec.label()),
-                    None => format!("{} · z —", bi.spec.label()),
+                    Some(z) => format!("{} · price sample σ(n−1) · z {z:+.1}", bi.spec.label()),
+                    None => format!("{} · price sample σ(n−1) · z —", bi.spec.label()),
                 }
             } else if bi.spec.code == "VWAP" {
                 bi.overlays.first().map(|(n, _)| n.clone()).unwrap_or_else(|| bi.spec.label())
@@ -3167,6 +3170,25 @@ impl ChartState {
                 c,
             );
             ly += 14.0;
+            if let Some(z) = &bi.honest_z {
+                let top = ly;
+                let color = if z.muted() { muted() } else { amber() };
+                p.text(pos2(price_rect.left() + 6.0, ly), Align2::LEFT_TOP, &z.label_text, mono(10.0), color);
+                ly += 14.0;
+                p.text(pos2(price_rect.left() + 6.0, ly), Align2::LEFT_TOP, &z.tail_text, mono(10.0), color);
+                ly += 14.0;
+                ui.interact(
+                    Rect::from_min_max(pos2(price_rect.left() + 4.0, top), pos2(price_rect.right(), ly)),
+                    ui.id().with(("honest-z", bi.spec.label())),
+                    Sense::hover(),
+                )
+                .on_hover_text(&z.detail_text);
+            } else if bi.spec.code == "ZBAND"
+                && let Some(reason) = &bi.refused
+            {
+                p.text(pos2(price_rect.left() + 6.0, ly), Align2::LEFT_TOP, reason, mono(10.0), theme::down());
+                ly += 14.0;
+            }
         }
         let hidden = self.built.iter().filter(|b| b.spec.is_pane()).count().saturating_sub(sub_rects.len());
         if hidden > 0 {

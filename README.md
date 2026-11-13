@@ -244,6 +244,8 @@ gets the native title bar with traffic lights, window vibrancy behind the sideba
   | --- | --- |
   | `TSTACK ON` / `TSTACK OFF` | Enable / disable; saved with layout |
   | `TSTACK 5m 30m 4H` / `TSTACK AUTO` | Native custom ladder / restore defaults |
+  | `AAPL TSTACK TUNE [5m]` | [Plateau grid](docs/TSTACK_TUNE.md): 49 FDR-gated Edge tests, robustness and smoothing |
+  | `ZBAND [length]` | Honest Z: robust VR/z*, empirical tails and named sample σ; grey when trending |
   | `TSTACK TINT` / `TSTACK SESSION` | Regime Candles / 09:30 base anchor |
   | `RAIL [ON\|OFF]` | Intraday provenance strip, holes and stale tail |
   | `NEW TSTACK NVDA` / `SPLIT DOWN TSTACK NVDA` | Open a 5m stacked chart |
