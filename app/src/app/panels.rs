@@ -70,6 +70,7 @@ impl TerminalApp {
                 }
             }
             PaneKind::Health => self.health_pane(ui),
+            PaneKind::Vault(p) => p.show(ui, id, &self.worker),
             PaneKind::Wei => actions.extend(markets_view::wei(
                 ui,
                 &self.quotes,

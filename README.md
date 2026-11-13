@@ -642,3 +642,6 @@ cargo bench -p tr-core && cargo bench -p tr-chart
 - Yahoo's chart endpoint is unofficial and rate-limited; use Alpaca for a supported free source.
   Senate eFD terms prohibit using the data for commercial purposes or credit decisions; the terminal
   accepts the eFD agreement on your behalf for personal research use.
+
+`VAULT` / `AAPL VAULT` (`Alt+B`) opens the local closed-bar vault and session coverage.
+See [Bar Vault](docs/BARVAULT.md) for admission, merge, retention and current limits.

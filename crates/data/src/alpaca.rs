@@ -21,6 +21,9 @@ pub struct AlpacaProvider {
 }
 
 impl AlpacaProvider {
+    pub fn feed(&self) -> &str {
+        &self.feed
+    }
     pub fn new(key: String, secret: String, feed: String) -> Result<Self> {
         let client = reqwest::Client::builder().timeout(Duration::from_secs(20)).build()?;
         Ok(Self { client, key, secret, feed })

@@ -259,6 +259,7 @@ impl TerminalApp {
                         "Scan archived bars; Enter opens the linked archive chart (REVIEW for daily+weekly)",
                     ),
                     (&["WEI"], "World markets overview"),
+                    (&["VAULT", "VLT"], "Closed intraday bars and session coverage · Alt+B · VERIFY / PRUNE / DROP"),
                     (&["HEALTH", "SRC"], "Feed states, last success, errors and retry; R retries a failed pane or selected feed"),
                     (&["GC"], "US Treasury yield curve"),
                     (&["N", "AAPL CN", "TOP"], "Watchlist / scanner-leader news; AAPL CN for one name; TOP for the market"),

@@ -64,18 +64,11 @@ impl ConeKey {
         trend: AdaptiveTrendParams,
         bars: &[Bar],
     ) -> Self {
-        use std::hash::{Hash, Hasher};
-        let mut hash = std::collections::hash_map::DefaultHasher::new();
-        bars.len().hash(&mut hash);
-        for (i, b) in bars.iter().enumerate() {
-            // A provenance downgrade anywhere, even on a forming bar, invalidates a report.
-            (b.provenance as u8).hash(&mut hash);
-            if i < closed {
-                b.ts.hash(&mut hash);
-                for v in [b.open, b.high, b.low, b.close, b.volume] {
-                    v.to_bits().hash(&mut hash);
-                }
-            }
+        let mut hash = crate::stable_hash::Fnv64::default();
+        hash.write_u64(bars.len() as u64);
+        hash.write_u64(crate::stable_hash::bars_digest(&bars[..closed.min(bars.len())]));
+        for b in bars {
+            hash.write_u64(u64::from(b.provenance.is_verified()));
         }
         Self { generation, tf, closed, params, trend, fingerprint: hash.finish() }
     }
@@ -570,6 +563,12 @@ mod tests {
     }
     fn params() -> Params {
         Params { horizon: 5, mean_block: 5, draws: 200, ..Params::default() }
+    }
+    #[test]
+    fn cone_key_fingerprint_is_stable() {
+        let b = Bar::new(123, 10., 11., 9., 10., 5.).with_provenance(Provenance::Real);
+        let k = ConeKey::new(0, Timeframe::M1, 1, Params::default(), AdaptiveTrendParams::default(), &[b]);
+        assert_eq!(k.fingerprint, 0x75a6d488352e9d9d);
     }
     #[test]
     fn seeded_bootstrap_and_report_are_deterministic() {

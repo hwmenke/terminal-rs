@@ -64,6 +64,27 @@ impl MarketData for Markets {
         }
     }
 
+    async fn history_sourced(
+        &self,
+        symbol: &str,
+        tf: Timeframe,
+        end: Option<i64>,
+        limit: usize,
+    ) -> Result<(Vec<Bar>, String)> {
+        let sec = security(symbol);
+        if matches!(sec.class, AssetClass::Equity | AssetClass::Etf)
+            && let Some(a) = &self.alpaca
+            && let Ok(bars) = a.history(&sec.ticker, tf, end, limit).await
+            && !bars.is_empty()
+        {
+            return Ok((bars, format!("alpaca:{}", a.feed())));
+        }
+        if matches!(sec.class, AssetClass::Equity | AssetClass::Etf | AssetClass::Index) {
+            return Ok((self.yahoo.history(&yahoo_symbol(&sec), tf, end, limit).await?, "yahoo".into()));
+        }
+        Ok((self.history(symbol, tf, end, limit).await?, self.name().into()))
+    }
+
     async fn extended_history(&self, symbol: &str, tf: Timeframe, end: Option<i64>, limit: usize) -> Result<Vec<Bar>> {
         let sec = security(symbol);
         match sec.class {

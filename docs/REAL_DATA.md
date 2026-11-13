@@ -136,3 +136,5 @@ extension. Extra compilation/test dependencies touched are `yahoo.rs` (Guarded r
 - `crates/data/src/stats.rs`
 - `crates/data/src/yahoo.rs`
 - `docs/REAL_DATA.md`
+
+The [Bar Vault](BARVAULT.md) accumulates verified closed native US cash-session bars in separate source-specific tables. Sample mode bypasses it entirely. Legacy display-cache rows are preserved but never promoted into the vault.

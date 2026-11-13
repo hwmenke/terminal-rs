@@ -1,4 +1,16 @@
 //! Causal, descriptive regime outcomes. A return enters only after its horizon completes.
+#[derive(Clone, PartialEq)]
+pub struct EdgeKey {
+    pub digest: u64,
+    pub n: usize,
+    pub first_ts: i64,
+    pub last_ts: i64,
+    pub params: tr_core::indicators::AdaptiveTrendParams,
+    pub horizons: [usize; 3],
+    pub generation: u64,
+    pub tf: tr_core::Timeframe,
+}
+
 use crate::{
     nulls::{benjamini_hochberg, rotation_offsets, rotation_test},
     stats::{describe, forward_returns, require_research_bars},

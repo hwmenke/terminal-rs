@@ -527,6 +527,10 @@ impl TerminalApp {
                 p.request(id, &self.worker);
                 PaneKind::SessionExtreme(p)
             }
+            PaneKind::Vault(mut p) => {
+                p.request(id, &self.worker);
+                PaneKind::Vault(p)
+            }
             PaneKind::SessionClock(mut p) => {
                 if p.symbol.trim().is_empty() {
                     if let Some(sym) = self.focused_symbol() {
@@ -1161,6 +1165,7 @@ impl TerminalApp {
             "PREFS" | "SETTINGS" | "PDF" => PaneKind::Settings,
             "HELP" => PaneKind::Help,
             "HEALTH" | "SRC" => PaneKind::Health,
+            "VAULT" | "VLT" => PaneKind::Vault(Box::new(super::vault_view::VaultPane::new(None))),
             _ => return None,
         })
     }

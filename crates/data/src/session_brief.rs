@@ -39,6 +39,7 @@ impl BriefLine {
 /// Five lines for one cash name. Provenance is the name's bars, not SPY's.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SessionBrief {
+    pub source: String,
     pub symbol: String,
     pub ticker: String,
     pub timeframe: Timeframe,
@@ -91,6 +92,7 @@ pub fn build(
         matches!(intraday::freshness(MarketClock::for_class(sec.class), tf, ts, now), Some(Freshness::Current))
     });
     Ok(SessionBrief {
+        source: String::new(),
         symbol: sec.key(),
         ticker: sec.ticker,
         timeframe: tf,

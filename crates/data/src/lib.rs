@@ -39,6 +39,7 @@ pub mod portable;
 pub mod price_alerts;
 pub mod realized_vol;
 pub mod relative_path;
+pub mod report_cache;
 pub mod rotation;
 pub mod rss;
 pub mod sample;
@@ -48,6 +49,7 @@ pub mod session_brief;
 pub mod session_clock;
 pub mod session_extreme;
 pub mod session_path;
+pub mod stable_hash;
 pub mod stack_wall;
 pub mod stats;
 pub mod time_link;
@@ -55,6 +57,7 @@ pub mod trade_plans;
 pub mod treasury;
 pub mod trend_cone;
 pub mod truth_rail;
+pub mod vault;
 pub mod volume_pace;
 pub mod whats_news;
 pub mod yahoo;
@@ -70,6 +73,7 @@ use tr_core::{AssetClass, Bar, Security, Timeframe, catalog};
 pub use cache::BarCache;
 pub use health::{DataMode, DownKind, Feed, FeedState, HealthBoard, Unavailable};
 pub use tr_core::Provenance;
+pub use vault::BarVault;
 
 /// Quote fields a provider actually sent. Missing fields stay `None` — never a guessed price.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
@@ -444,6 +448,17 @@ pub trait MarketData: Send + Sync {
     /// oldest bar already held.
     async fn history(&self, symbol: &str, tf: Timeframe, end: Option<i64>, limit: usize) -> Result<Vec<Bar>>;
 
+    /// Actual source of a response, including provider fallback routing.
+    async fn history_sourced(
+        &self,
+        symbol: &str,
+        tf: Timeframe,
+        end: Option<i64>,
+        limit: usize,
+    ) -> Result<(Vec<Bar>, String)> {
+        Ok((self.history(symbol, tf, end, limit).await?, self.name().to_owned()))
+    }
+
     /// Pre-market, regular, and after-hours bars for a US cash name.
     /// The default has none, so sample bars are not painted as an extended session.
     async fn extended_history(
@@ -623,6 +638,20 @@ impl<P: MarketData> MarketData for Guarded<P> {
             self.primary.history(symbol, tf, end, limit).await,
             |b| b.iter().all(|b| b.provenance.is_verified()),
             Vec::is_empty,
+        )
+    }
+    async fn history_sourced(
+        &self,
+        symbol: &str,
+        tf: Timeframe,
+        end: Option<i64>,
+        limit: usize,
+    ) -> Result<(Vec<Bar>, String)> {
+        self.finish(
+            Feed::Bars,
+            self.primary.history_sourced(symbol, tf, end, limit).await,
+            |(b, _)| b.iter().all(|b| b.provenance.is_verified()),
+            |(b, _)| b.is_empty(),
         )
     }
     async fn extended_history(&self, symbol: &str, tf: Timeframe, end: Option<i64>, limit: usize) -> Result<Vec<Bar>> {

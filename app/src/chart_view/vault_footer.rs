@@ -1,0 +1,84 @@
+//! Coverage is delivered by the worker; paint only maps session dates to indices.
+use super::*;
+impl ChartState {
+    pub(super) fn paint_vault_footer(&self, ui: &mut Ui, price: Rect, v: &Viewport) {
+        if self.extended || !self.tf.is_intraday() {
+            return;
+        }
+        let Some(info) = &self.stitch else {
+            return;
+        };
+        for c in &info.cells {
+            let lo = self.bars.partition_point(|b| tr_core::ny::civil(b.ts).date() < c.date);
+            let hi = self.bars.partition_point(|b| tr_core::ny::civil(b.ts).date() <= c.date);
+            if lo == hi {
+                continue;
+            }
+            let left = (price.left() + v.x_center(lo) as f32 - v.bar_px as f32 / 2.).max(price.left());
+            let right = (price.left() + v.x_center(hi - 1) as f32 + v.bar_px as f32 / 2.).min(price.right());
+            if left >= right {
+                continue;
+            }
+            let r = Rect::from_min_max(pos2(left, price.bottom() - 6.), pos2(right, price.bottom()));
+            crate::app::vault_view::paint_cell(ui, r, c);
+            ui.interact(r, ui.id().with(("chart-vault", self.id, c.date)), Sense::hover()).on_hover_text(format!(
+                "{} · {:?} {}/{} · {} holes · {} · epoch {}",
+                c.date, c.state, c.present, c.expected, c.holes, info.source, info.epoch
+            ));
+        }
+        if !info.cells.is_empty() {
+            ui.painter().text(
+                pos2(price.left() + 8., price.bottom() - 9.),
+                Align2::LEFT_BOTTOM,
+                info.label(),
+                mono(9.),
+                theme::muted(),
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn footer_paints_one_cell_per_visible_stored_session() {
+        let mut chart = ChartState::new(1, "AAPL", Timeframe::M5);
+        let mut bars = vec![];
+        let mut cells = vec![];
+        for day in ["2026-11-09", "2026-11-10"] {
+            let date = day.parse().unwrap();
+            let session: Vec<_> = tr_data::intraday::regular_opens(date, Timeframe::M5)
+                .into_iter()
+                .map(|ts| Bar::new(ts, 100., 101., 99., 100., 1.).with_provenance(Provenance::Cached))
+                .collect();
+            cells.push(tr_data::vault::merge::classify_session(
+                date,
+                Timeframe::M5,
+                &session,
+                1,
+                0,
+                session.last().unwrap().ts + 7200,
+            ));
+            bars.extend(session);
+        }
+        chart.bars = Arc::new(bars);
+        chart.stitch = Some(Arc::new(tr_data::vault::StitchInfo {
+            cells,
+            source: "yahoo".into(),
+            epoch: 1,
+            ..Default::default()
+        }));
+        let ctx = egui::Context::default();
+        for (count, expected) in [(chart.bars.len(), 2), (78, 1)] {
+            let v = Viewport::fit_last(chart.bars.len(), count, 800.);
+            let mut out = ctx.run_ui(egui::RawInput::default(), |ui| {
+                chart.paint_vault_footer(ui, Rect::from_min_size(Pos2::ZERO, vec2(800., 500.)), &v)
+            });
+            out.textures_delta.clear();
+            let color = crate::app::vault_view::coverage_color(tr_data::vault::CellState::Complete);
+            let n = out.shapes.iter().filter(|s| matches!(&s.shape,egui::Shape::Rect(r) if r.fill==color)).count();
+            assert_eq!(n, expected);
+        }
+    }
+}
