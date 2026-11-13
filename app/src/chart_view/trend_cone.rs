@@ -1,5 +1,6 @@
 //! Worker-backed Trend Cone and cached chart geometry.
 use super::*;
+use egui::Vec2;
 use tr_data::trend_cone::{ConeKey, ConeReport, Coverage, Params};
 
 #[derive(Default)]
@@ -9,6 +10,7 @@ pub(super) struct ConeState {
     input: Option<(Arc<Vec<Bar>>, ConeKey)>,
     pub(super) sent: Option<(ConeKey, Instant)>,
     pub(super) result: Option<Result<Arc<ConeReport>, String>>,
+    result_input: Option<(ConeKey, Arc<Vec<Bar>>)>,
     revision: u64,
     pub(super) paint: ConePaint,
 }
@@ -17,7 +19,28 @@ impl ConeState {
         self.input = None;
         self.sent = None;
         self.result = None;
+        self.result_input = None;
         self.paint = Default::default();
+    }
+    /// Only retain an anchored report across extensions of the same verified
+    /// history. Corrections, paging, settings and identity changes invalidate it.
+    fn retain_previous(&mut self, key: &ConeKey, bars: &Arc<Vec<Bar>>) {
+        let keep = self.result.as_ref().is_some_and(Result::is_ok)
+            && self.result_input.as_ref().is_some_and(|(old, history)| {
+                old.generation == key.generation
+                    && old.tf == key.tf
+                    && old.params == key.params
+                    && old.trend == key.trend
+                    && key.closed >= old.closed
+                    && bars.len() >= history.len()
+                    && bars[..old.closed] == history[..old.closed]
+                    && bars.iter().all(|b| b.provenance.is_verified() && b.provenance == history[0].provenance)
+            });
+        if !keep {
+            self.result = None;
+            self.result_input = None;
+            self.paint = Default::default();
+        }
     }
 }
 #[derive(Default)]
@@ -28,7 +51,8 @@ pub(super) struct ConePaint {
     labels: Vec<ConeLabel>,
     card: egui::text::LayoutJob,
     tooltip: String,
-    card_pos: Pos2,
+    fan_bounds: Option<Rect>,
+    badge: egui::text::LayoutJob,
 }
 struct ConeLabel {
     at: Pos2,
@@ -42,6 +66,34 @@ struct ConeLabel {
 /// Label column to the right of the horizon (price + percent pills).
 const LABEL_ROOM: f64 = 150.0;
 const CARD_W: f32 = 300.0;
+
+/// Try the corners away from the visible fan. Short panes use a one-line
+/// coverage badge. If even that cannot fit, leave the fan unobscured.
+fn card_placement(pane: Rect, fan: Rect, full: Vec2, badge: Vec2) -> Option<(Rect, bool)> {
+    // The chart legend occupies the top-left header rows.
+    let mut available = pane.shrink(8.0);
+    available.min.y = (pane.top() + 48.0).min(available.bottom());
+    for (size, compact) in [(full, false), (badge, true)] {
+        if !compact && pane.height() < 220.0 {
+            continue;
+        }
+        if size.x > available.width() || size.y > available.height() {
+            continue;
+        }
+        for min in [
+            available.min,
+            pos2(available.left(), available.bottom() - size.y),
+            pos2(available.right() - size.x, available.top()),
+            available.max - size,
+        ] {
+            let card = Rect::from_min_size(min, size);
+            if !card.intersects(fan.expand(6.0)) {
+                return Some((card, compact));
+            }
+        }
+    }
+    None
+}
 
 /// Keep the fan and horizon tags in the ordinary indexed viewport. Panning and
 /// zooming still work normally; End / reset restores this reservation.
@@ -133,10 +185,10 @@ impl ChartState {
             if sent == &key {
                 return None;
             }
-            // Never paint a report for older bars, settings or provenance.
-            self.cone.result = None;
-            self.cone.paint = Default::default();
             let elapsed = at.elapsed();
+            // Keep the previous fan at its original closed-bar anchor while the
+            // next bar's report is throttled or computing.
+            self.cone.retain_previous(&key, &self.bars);
             if elapsed < THROTTLE {
                 return Some(THROTTLE - elapsed);
             }
@@ -155,6 +207,7 @@ impl ChartState {
         if self.cone_key(chrono::Utc::now().timestamp()).as_ref() != Some(&key) {
             return;
         }
+        self.cone.result_input = Some((key, self.bars.clone()));
         self.cone.result = Some(result);
         self.cone.revision = self.cone.revision.wrapping_add(1);
         self.cone.paint = Default::default();
@@ -336,10 +389,20 @@ impl ChartState {
             color,
             pill: true,
         });
-        paint.card_pos = pos2(
-            (x(0) + 10.0).clamp(rect.left() + 8.0, (rect.right() - CARD_W - 16.0).max(rect.left() + 8.0)),
-            rect.top() + 48.0,
-        );
+        // Include both fans and the bootstrap whiskers in the protected extent.
+        let mut fan_bounds = Rect::NOTHING;
+        for fan in [&r.conditional, &r.unconditional] {
+            for (step, prices) in fan.prices.iter().enumerate() {
+                for price in prices {
+                    fan_bounds.extend_with(pos2(x(step), y(*price)));
+                }
+            }
+        }
+        for [lo, hi] in r.conditional.horizon_band {
+            fan_bounds.extend_with(pos2(end_x + 6.0, y(lo)));
+            fan_bounds.extend_with(pos2(end_x + 6.0, y(hi)));
+        }
+        paint.fan_bounds = Some(fan_bounds);
         let regime = match r.regime {
             1 => "UP",
             -1 => "DOWN",
@@ -353,6 +416,8 @@ impl ChartState {
         coverage_row(card, 1, &r.coverage, &r.baseline_coverage);
         append(card, &format!("whiskers: block-bootstrap 90% CI · L={}\n", r.params.mean_block), theme::muted());
         append(card, &format!("CLOSED THRU {}", scale::crosshair_label(r.anchor_ts, self.tf)), theme::muted());
+        let pct = |band| r.coverage.empirical(band).map_or("—".into(), |e| format!("{:.0}%", e * 100.0));
+        append(&mut paint.badge, &format!("CONE +{h} · 50%→{}  80%→{} · n={}", pct(0), pct(1), r.coverage.n), color);
         let cdf = if r.coverage.n == 0 {
             "—".into()
         } else {
@@ -438,11 +503,53 @@ impl ChartState {
             let mut job = paint.card.clone();
             job.wrap.max_width = (rect.width() - 24.0).clamp(1.0, CARD_W);
             let galley = p.layout_job(job);
-            let card = Rect::from_min_size(paint.card_pos, galley.size() + vec2(16.0, 12.0));
-            p.rect_filled(card, 5.0, theme::card().gamma_multiply(0.94));
-            p.rect_stroke(card, 5.0, Stroke::new(1.0, theme::border()), StrokeKind::Inside);
-            p.galley(card.min + vec2(8.0, 6.0), galley, theme::text());
-            ui.interact(card, ui.id().with((self.id, "cone-math")), Sense::hover()).on_hover_text(&paint.tooltip);
+            let badge = p.layout_job(paint.badge.clone());
+            if let Some((card, compact)) = card_placement(
+                rect,
+                paint.fan_bounds.unwrap_or(Rect::NOTHING),
+                galley.size() + vec2(16.0, 12.0),
+                badge.size() + vec2(16.0, 12.0),
+            ) {
+                p.rect_filled(card, 5.0, theme::card().gamma_multiply(0.94));
+                p.rect_stroke(card, 5.0, Stroke::new(1.0, theme::border()), StrokeKind::Inside);
+                p.galley(card.min + vec2(8.0, 6.0), if compact { badge } else { galley }, theme::text());
+                ui.interact(card, ui.id().with((self.id, "cone-math")), Sense::hover()).on_hover_text(&paint.tooltip);
+            }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn coverage_card_avoids_fan_and_short_panes_use_a_badge() {
+        let size = vec2(316.0, 110.0);
+        let badge = vec2(280.0, 24.0);
+        for (pane, fan, compact) in [
+            (
+                Rect::from_min_size(Pos2::ZERO, vec2(900.0, 600.0)),
+                Rect::from_min_max(pos2(400.0, 30.0), pos2(880.0, 400.0)),
+                false,
+            ),
+            (
+                Rect::from_min_size(Pos2::ZERO, vec2(900.0, 160.0)),
+                Rect::from_min_max(pos2(400.0, 10.0), pos2(880.0, 150.0)),
+                true,
+            ),
+            (
+                Rect::from_min_size(pos2(40.0, 50.0), vec2(900.0, 600.0)),
+                Rect::from_min_max(pos2(50.0, 60.0), pos2(900.0, 450.0)),
+                false,
+            ),
+        ] {
+            let (card, actual_compact) = card_placement(pane, fan, size, badge).unwrap();
+            assert!(pane.contains_rect(card));
+            assert!(!card.intersects(fan));
+            assert_eq!(actual_compact, compact);
+        }
+        let pane = Rect::from_min_size(Pos2::ZERO, vec2(300.0, 100.0));
+        assert!(card_placement(pane, pane, size, badge).is_none());
     }
 }

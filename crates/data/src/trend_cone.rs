@@ -193,13 +193,10 @@ fn build(bars: &[Bar], states: &[Option<i8>], params: Params) -> Result<ConeRepo
     let regime =
         states.last().copied().flatten().ok_or("Trend Cone: TSTACK is warming up; load more verified history")?;
     let h = params.horizon;
+    let logs: Vec<_> = bars.iter().map(|b| b.close.ln()).collect();
     let paths: Vec<_> = (0..n.saturating_sub(h))
         .filter_map(|i| {
-            Some(Path {
-                origin: i,
-                regime: states[i]?,
-                log: (1..=h).map(|k| bars[i + k].close.ln() - bars[i].close.ln()).collect(),
-            })
+            Some(Path { origin: i, regime: states[i]?, log: (1..=h).map(|k| logs[i + k] - logs[i]).collect() })
         })
         .collect();
     let all: Vec<_> = paths.iter().collect();
@@ -211,8 +208,15 @@ fn build(bars: &[Bar], states: &[Option<i8>], params: Params) -> Result<ConeRepo
         ));
     }
     let anchor = bars.last().unwrap();
-    let conditional = fan(&selected, anchor.close, params, params.seed);
-    let unconditional = fan(&all, anchor.close, params, params.seed ^ 0x4241_5345);
+    let (conditional, unconditional) = if all.len() >= 4096 && compute_threads() > 1 {
+        std::thread::scope(|scope| {
+            let conditional = scope.spawn(|| fan(&selected, anchor.close, params, params.seed));
+            let unconditional = fan(&all, anchor.close, params, params.seed ^ 0x4241_5345);
+            (conditional.join().expect("conditional cone computation"), unconditional)
+        })
+    } else {
+        (fan(&selected, anchor.close, params, params.seed), fan(&all, anchor.close, params, params.seed ^ 0x4241_5345))
+    };
     let bands = conditional.horizon_band.iter().chain(&unconditional.horizon_band).flatten();
     if conditional
         .prices
@@ -231,22 +235,35 @@ fn build(bars: &[Bar], states: &[Option<i8>], params: Params) -> Result<ConeRepo
     // earlier forecast or change its seed. H-spaced scored outcomes do not overlap.
     let origins: Vec<_> =
         (0..n.saturating_sub(h)).step_by(h).filter(|&t| states[t] == Some(regime)).rev().take(MAX_SCORES).collect();
+    // Training libraries are growing prefixes of `paths` (origin order). Insert each
+    // matured path once into rank-indexed Fenwick trees and read the exact horizon
+    // order statistics, instead of re-sorting the prefix at every origin.
+    let ranked = Ranked::new(paths.iter().map(|p| p.log[h - 1]));
+    let mut train = Fenwick::new(paths.len());
+    let mut conditional_train = Fenwick::new(paths.len());
+    let mut matured = 0;
     for t in origins.into_iter().rev() {
         // At close t, only paths with endpoint <= t have matured. No t+1 input.
-        let train: Vec<_> = paths.iter().take_while(|p| p.origin + h <= t).collect();
-        let conditional_train: Vec<_> = train.iter().copied().filter(|p| p.regime == states[t].unwrap()).collect();
-        if conditional_train.len() < MIN_PATHS {
+        while matured < paths.len() && paths[matured].origin + h <= t {
+            train.add(ranked.rank[matured] as usize);
+            // Scored origins all sit in `regime` (filtered above).
+            if paths[matured].regime == regime {
+                conditional_train.add(ranked.rank[matured] as usize);
+            }
+            matured += 1;
+        }
+        if conditional_train.len < MIN_PATHS {
             continue;
         }
-        let conditional = horizon_quantiles(&conditional_train, h);
-        let unconditional = horizon_quantiles(&train, h);
+        let conditional = quantiles_by(conditional_train.len, |k| ranked.sorted[conditional_train.kth(k)]);
+        let unconditional = quantiles_by(train.len, |k| ranked.sorted[train.kth(k)]);
         let realized = bars[t + h].close.ln() - bars[t].close.ln();
         coverage.observe(conditional, realized);
         baseline_coverage.observe(unconditional, realized);
         forecasts.push(Forecast {
             origin: t,
-            training_last_end: train.last().unwrap().origin + h,
-            training_paths: conditional_train.len(),
+            training_last_end: paths[matured - 1].origin + h,
+            training_paths: conditional_train.len,
             conditional,
             unconditional,
             realized,
@@ -268,6 +285,7 @@ fn build(bars: &[Bar], states: &[Option<i8>], params: Params) -> Result<ConeRepo
 
 /// Geometric on {1,2,...}, success probability 1/L. Inverse-CDF draw avoids
 /// per-increment restart loops; initial row uniform, continuation circular.
+#[cfg(test)]
 fn block_length(rng: &mut SplitMix64, mean: usize) -> usize {
     if mean == 1 {
         return 1;
@@ -277,29 +295,239 @@ fn block_length(rng: &mut SplitMix64, mean: usize) -> usize {
 }
 /// One stationary-bootstrap replicate: `len` row indices into a library of `n`
 /// origin-ordered rows, in geometric blocks of adjacent rows with circular wrap.
+fn for_each_bootstrap_block(
+    rng: &mut SplitMix64,
+    n: usize,
+    len: usize,
+    mean_block: usize,
+    mut block: impl FnMut(std::ops::Range<usize>),
+) {
+    let log_continue = (-1.0 / mean_block as f64).ln_1p();
+    let mut drawn = 0;
+    while drawn < len {
+        let mut start = rng.below(n);
+        let length = if mean_block == 1 {
+            1
+        } else {
+            let u = (rng.next() >> 11) as f64 * (1.0 / (1_u64 << 53) as f64);
+            // 1-u is exact on this 53-bit grid. `ln` is much cheaper than
+            // log1p here; refine at integer boundaries to retain the original
+            // geometric length even if the two libm calls round differently.
+            let steps = (1.0 - u).ln() / log_continue;
+            let floor = steps.floor();
+            let fraction = steps - floor;
+            let floor = if fraction.min(1.0 - fraction) < 1e-9 { ((-u).ln_1p() / log_continue).floor() } else { floor };
+            floor as usize + 1
+        }
+        .min(len - drawn);
+        let mut remaining = length;
+        while remaining > 0 {
+            let take = remaining.min(n - start);
+            block(start..start + take);
+            remaining -= take;
+            start = 0;
+        }
+        drawn += length;
+    }
+}
+#[cfg(test)]
 fn bootstrap_indices(rng: &mut SplitMix64, n: usize, len: usize, mean_block: usize) -> Vec<usize> {
     let mut indices = Vec::with_capacity(len);
-    while indices.len() < len {
-        let start = rng.below(n);
-        let length = block_length(rng, mean_block).min(len - indices.len());
-        indices.extend((0..length).map(|k| (start + k) % n));
-    }
+    for_each_bootstrap_block(rng, n, len, mean_block, |range| indices.extend(range));
     indices
 }
-/// Linear interpolation at `(len−1)p` of an ascending slice.
+/// Linear interpolation at `(len−1)p` of an ascending sequence, read through
+/// `get(k)` = the k-th smallest (0-based). `get` is called with ascending `k`.
+fn quantiles_by(len: usize, mut get: impl FnMut(usize) -> f64) -> [f64; 5] {
+    QUANTILES.map(|p| {
+        let at = (len - 1) as f64 * p;
+        let lo = get(at.floor() as usize);
+        let hi = get(at.ceil() as usize);
+        lo * (1.0 - at.fract()) + hi * at.fract()
+    })
+}
 fn quantile_sorted(sorted: &[f64], p: f64) -> f64 {
     let at = (sorted.len() - 1) as f64 * p;
     sorted[at.floor() as usize] * (1.0 - at.fract()) + sorted[at.ceil() as usize] * at.fract()
 }
+/// Exact sorted-order quantiles by successive selection: O(n), same values as a sort.
 fn quantiles(values: &mut [f64]) -> [f64; 5] {
-    values.sort_by(f64::total_cmp);
-    QUANTILES.map(|p| quantile_sorted(values, p))
+    // values[..placed] hold the smallest `placed` values in sorted order at the
+    // positions already requested; everything after is >= values[placed - 1].
+    let mut placed = 0;
+    quantiles_by(values.len(), |k| {
+        if k >= placed {
+            values[placed..].select_nth_unstable_by(k - placed, f64::total_cmp);
+            placed = k + 1;
+        }
+        values[k]
+    })
 }
-/// Empirical horizon quantiles of a training library (log space). Deterministic.
-fn horizon_quantiles(paths: &[&Path], h: usize) -> [f64; 5] {
-    let mut samples: Vec<_> = paths.iter().map(|p| p.log[h - 1]).collect();
-    quantiles(&mut samples)
+/// A library's horizon log returns, sorted, with each row's rank in that order.
+/// Any sub-multiset of rows is then fully described by counts per rank.
+struct Ranked {
+    sorted: Vec<f64>,
+    rank: Vec<u32>,
+    order: Vec<u32>,
 }
+impl Ranked {
+    fn new(values: impl Iterator<Item = f64>) -> Self {
+        let mut order: Vec<(f64, u32)> = values.zip(0..).collect();
+        order.sort_unstable_by(|a, b| a.0.total_cmp(&b.0));
+        let mut rank = vec![0; order.len()];
+        for (r, &(_, row)) in order.iter().enumerate() {
+            rank[row as usize] = r as u32;
+        }
+        Self {
+            sorted: order.iter().map(|(v, _)| *v).collect(),
+            rank,
+            order: order.into_iter().map(|(_, row)| row).collect(),
+        }
+    }
+}
+/// Rank-indexed Fenwick tree: insert ranks, read the k-th smallest in O(log n).
+struct Fenwick {
+    tree: Vec<u32>,
+    len: usize,
+}
+impl Fenwick {
+    fn new(n: usize) -> Self {
+        Self { tree: vec![0; n + 1], len: 0 }
+    }
+    fn add(&mut self, rank: usize) {
+        let mut i = rank + 1;
+        while i < self.tree.len() {
+            self.tree[i] += 1;
+            i += 1_usize << i.trailing_zeros();
+        }
+        self.len += 1;
+    }
+    /// Rank of the k-th smallest inserted element (0-based); requires k < len.
+    fn kth(&self, k: usize) -> usize {
+        let (mut pos, mut remaining) = (0, k as u32 + 1);
+        let mut step = (self.tree.len() - 1).checked_ilog2().map_or(0, |b| 1 << b);
+        while step > 0 {
+            if pos + step < self.tree.len() && self.tree[pos + step] < remaining {
+                pos += step;
+                remaining -= self.tree[pos];
+            }
+            step >>= 1;
+        }
+        pos
+    }
+}
+/// Exact bootstrap order statistics. Five prefix CDFs locate each quantile
+/// near its empirical rank, avoiding a scan of the entire sorted library on
+/// every replicate. Row multiplicities come from circular-block differences.
+struct Bootstrap {
+    ranked: Ranked,
+    pivots: [usize; 5],
+    prefix: Vec<[u32; 5]>,
+}
+impl Bootstrap {
+    fn new(values: impl Iterator<Item = f64>) -> Self {
+        let ranked = Ranked::new(values);
+        let n = ranked.sorted.len();
+        let pivots = QUANTILES.map(|p| ((n - 1) as f64 * p).floor() as usize);
+        let mut prefix = Vec::with_capacity(n + 1);
+        let mut counts = [0; 5];
+        prefix.push(counts);
+        for rank in &ranked.rank {
+            for (q, pivot) in pivots.iter().enumerate() {
+                counts[q] += u32::from((*rank as usize) < *pivot);
+            }
+            prefix.push(counts);
+        }
+        Self { ranked, pivots, prefix }
+    }
+    fn draw(&self, weights: &mut [i32], blocks: Vec<std::ops::Range<usize>>) -> [f64; 5] {
+        let n = self.ranked.sorted.len();
+        weights.fill(0);
+        let mut below = [0; 5];
+        for range in blocks {
+            weights[range.start] += 1;
+            weights[range.end] -= 1;
+            for (q, count) in below.iter_mut().enumerate() {
+                *count += self.prefix[range.end][q] - self.prefix[range.start][q];
+            }
+        }
+        let mut count = 0;
+        for weight in &mut weights[..n] {
+            count += *weight;
+            *weight = count;
+        }
+        std::array::from_fn(|q| {
+            let at = (n - 1) as f64 * QUANTILES[q];
+            let mut rank = self.pivots[q];
+            let mut count = below[q] as usize;
+            let mut get = |k| {
+                // `count` is the mass strictly below `rank`.
+                while count > k {
+                    rank -= 1;
+                    count -= weights[self.ranked.order[rank] as usize] as usize;
+                }
+                loop {
+                    let weight = weights[self.ranked.order[rank] as usize] as usize;
+                    if count + weight > k {
+                        break;
+                    }
+                    count += weight;
+                    rank += 1;
+                }
+                self.ranked.sorted[rank]
+            };
+            let lo = get(at.floor() as usize);
+            let hi = get(at.ceil() as usize);
+            lo * (1.0 - at.fract()) + hi * at.fract()
+        })
+    }
+}
+
+/// At most eight compute threads across the two fans, including their producers.
+/// Smaller machines and libraries use the serial path without thread overhead.
+fn compute_threads() -> usize {
+    std::thread::available_parallelism().map_or(1, usize::from).min(8)
+}
+fn bootstrap_blocks(rng: &mut SplitMix64, n: usize, mean: usize) -> Vec<std::ops::Range<usize>> {
+    let mut blocks = Vec::with_capacity(n / mean + 2);
+    for_each_bootstrap_block(rng, n, n, mean, |range| blocks.push(range));
+    blocks
+}
+fn bootstrap_replicates(bootstrap: &Bootstrap, params: Params, seed: u64) -> Vec<[f64; 5]> {
+    let n = bootstrap.ranked.sorted.len();
+    let workers = if n >= 4096 { compute_threads().saturating_sub(2) / 2 } else { 0 };
+    let mut rng = SplitMix64(seed);
+    if workers < 2 {
+        let mut weights = vec![0; n + 1];
+        return (0..params.draws)
+            .map(|_| bootstrap.draw(&mut weights, bootstrap_blocks(&mut rng, n, params.mean_block)))
+            .collect();
+    }
+    // One deterministic producer retains the original RNG stream. Bounded
+    // queues limit memory to a few block lists; workers share the immutable
+    // ranks/CDFs and each reuse one row-count buffer. Replicate order is immaterial
+    // because each edge's replicate quantiles are sorted before its CI is read.
+    std::thread::scope(|scope| {
+        let mut senders = Vec::new();
+        let mut handles = Vec::new();
+        for _ in 0..workers {
+            let (tx, rx) = std::sync::mpsc::sync_channel(1);
+            senders.push(tx);
+            handles.push(scope.spawn(move || {
+                let mut weights = vec![0; n + 1];
+                rx.into_iter().map(|blocks| bootstrap.draw(&mut weights, blocks)).collect::<Vec<_>>()
+            }));
+        }
+        for draw in 0..params.draws {
+            senders[draw % workers]
+                .send(bootstrap_blocks(&mut rng, n, params.mean_block))
+                .expect("cone bootstrap worker");
+        }
+        drop(senders);
+        handles.into_iter().flat_map(|h| h.join().expect("cone bootstrap computation")).collect()
+    })
+}
+
 /// The fan is the empirical per-step quantile of the completed-path library:
 /// exact, with no Monte Carlo noise. (Resampling rows and re-taking quantiles
 /// would only reproduce these values plus noise.) The stationary bootstrap answers
@@ -314,14 +542,10 @@ fn fan(paths: &[&Path], anchor: f64, params: Params, seed: u64) -> Fan {
         let mut values: Vec<_> = paths.iter().map(|p| p.log[k]).collect();
         prices.push(quantiles(&mut values).map(|r| anchor * r.exp()));
     }
-    let mut rng = SplitMix64(seed);
     let mut replicates: [Vec<f64>; 5] = Default::default();
-    let mut values = Vec::with_capacity(paths.len());
-    for _ in 0..params.draws {
-        values.clear();
-        let rows = bootstrap_indices(&mut rng, paths.len(), paths.len(), params.mean_block);
-        values.extend(rows.iter().map(|&i| paths[i].log[h - 1]));
-        for (out, q) in replicates.iter_mut().zip(quantiles(&mut values)) {
+    let bootstrap = Bootstrap::new(paths.iter().map(|p| p.log[h - 1]));
+    for quantiles in bootstrap_replicates(&bootstrap, params, seed) {
+        for (out, q) in replicates.iter_mut().zip(quantiles) {
             out.push(q);
         }
     }
@@ -549,6 +773,121 @@ mod tests {
         assert_eq!(indices.len(), 512);
         assert!(indices.windows(2).filter(|w| w[1] == (w[0] + 1) % 3).count() > 450);
         assert!(indices.windows(2).any(|w| w == [2, 0]));
+    }
+    #[test]
+    fn optimized_bootstrap_matches_expanded_sorted_draws_exactly() {
+        for n in [1, 2, 17, 100, 513] {
+            let mut values_rng = SplitMix64(17);
+            // Include ties as well as negative returns.
+            let values: Vec<_> = (0..n).map(|_| values_rng.below(41) as f64 / 1000.0 - 0.02).collect();
+            for mean in [1, 2, 20, 100] {
+                let (mut fast_rng, mut reference_rng) = (SplitMix64(123), SplitMix64(123));
+                let bootstrap = Bootstrap::new(values.iter().copied());
+                let mut weights = vec![0; n + 1];
+                for _ in 0..20 {
+                    // Original row expansion and full sort, independent of the
+                    // block-count/rank implementation used in production.
+                    let mut sampled = Vec::with_capacity(n);
+                    while sampled.len() < n {
+                        let start = reference_rng.below(n);
+                        let length = block_length(&mut reference_rng, mean).min(n - sampled.len());
+                        sampled.extend((0..length).map(|k| values[(start + k) % n]));
+                    }
+                    sampled.sort_by(f64::total_cmp);
+                    assert_eq!(
+                        bootstrap.draw(&mut weights, bootstrap_blocks(&mut fast_rng, n, mean)),
+                        QUANTILES.map(|q| quantile_sorted(&sampled, q))
+                    );
+                    assert_eq!(fast_rng.next(), reference_rng.next(), "same random stream after each draw");
+                }
+            }
+        }
+    }
+    #[test]
+    fn parallel_bootstrap_preserves_the_serial_replicate_distribution() {
+        let values: Vec<_> = (0..5000).map(|i| (i as f64 * 0.017).sin() * 0.01).collect();
+        let bootstrap = Bootstrap::new(values.iter().copied());
+        let params = Params { draws: 100, ..Params::default() };
+        let parallel = bootstrap_replicates(&bootstrap, params, params.seed);
+        let mut rng = SplitMix64(params.seed);
+        let mut reference = Vec::new();
+        for _ in 0..params.draws {
+            let mut sample = Vec::with_capacity(values.len());
+            while sample.len() < values.len() {
+                let start = rng.below(values.len());
+                let length = block_length(&mut rng, params.mean_block).min(values.len() - sample.len());
+                sample.extend((0..length).map(|k| values[(start + k) % values.len()]));
+            }
+            sample.sort_by(f64::total_cmp);
+            reference.push(QUANTILES.map(|q| quantile_sorted(&sample, q)));
+        }
+        for q in 0..5 {
+            let mut actual: Vec<_> = parallel.iter().map(|r| r[q]).collect();
+            let mut expected: Vec<_> = reference.iter().map(|r| r[q]).collect();
+            actual.sort_by(f64::total_cmp);
+            expected.sort_by(f64::total_cmp);
+            assert_eq!(actual, expected);
+        }
+    }
+    #[test]
+    fn ranked_walk_forward_matches_expanding_sorted_libraries_exactly() {
+        let b = bars(800);
+        let states: Vec<_> = (0..b.len()).map(|i| if i < 30 { None } else { Some(((i / 57) % 3) as i8 - 1) }).collect();
+        for h in [1, 5, 20, 120] {
+            let r = build(&b, &states, Params { horizon: h, ..params() }).unwrap();
+            for forecast in &r.forecasts {
+                for (conditional, actual) in [(true, forecast.conditional), (false, forecast.unconditional)] {
+                    let mut library: Vec<_> = (0..=forecast.origin - h)
+                        .filter(|&i| states[i].is_some() && (!conditional || states[i] == Some(r.regime)))
+                        .map(|i| b[i + h].close.ln() - b[i].close.ln())
+                        .collect();
+                    if conditional {
+                        assert_eq!(library.len(), forecast.training_paths);
+                    }
+                    library.sort_by(f64::total_cmp);
+                    assert_eq!(actual, QUANTILES.map(|q| quantile_sorted(&library, q)));
+                }
+            }
+        }
+    }
+    /// Synthetic 1m random walk with a slow drift cycle, so TSTACK sees real regimes.
+    fn minute_walk(n: usize) -> Vec<Bar> {
+        let mut rng = SplitMix64(11);
+        let mut log = 0.0_f64;
+        (0..n)
+            .map(|i| {
+                let u = (rng.next() >> 11) as f64 / (1_u64 << 53) as f64 - 0.5;
+                log += 0.002 * u + 0.0002 * (i as f64 / 900.0).sin();
+                let p = 100.0 * log.exp();
+                Bar::new(1_700_000_000 + i as i64 * 60, p, p * 1.0005, p * 0.9995, p, 1.0)
+                    .with_provenance(Provenance::Real)
+            })
+            .collect()
+    }
+    /// `cargo test -p tr-data --release trend_cone_long_history_timing -- --ignored --nocapture`
+    #[test]
+    #[ignore = "timing benchmark; run with --release --ignored --nocapture"]
+    fn trend_cone_long_history_timing() {
+        for n in [20_000, 50_000] {
+            let b = minute_walk(n);
+            let trend = AdaptiveTrendParams::default();
+            let start = std::time::Instant::now();
+            let stack = trend_stack(&b[..n - 1], Timeframe::M1, vec![], trend).unwrap();
+            let tstack = start.elapsed();
+            let start = std::time::Instant::now();
+            let r = report(&b, Timeframe::M1, AssetClass::Crypto, None, Params::default(), trend);
+            let total = start.elapsed();
+            let r = r.unwrap();
+            assert_eq!(stack.medium.len(), n - 1);
+            eprintln!(
+                "trend cone n={n}: total {:.1} ms (TSTACK {:.1} ms) · {} cond / {} uncond paths · coverage n={}",
+                total.as_secs_f64() * 1e3,
+                tstack.as_secs_f64() * 1e3,
+                r.conditional.paths,
+                r.unconditional.paths,
+                r.coverage.n
+            );
+        }
     }
     #[test]
     fn cache_key_catches_older_price_and_provenance_revisions() {

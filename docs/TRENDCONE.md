@@ -29,7 +29,9 @@ standard errors of nominal, `NARROW` (red) under-covered, `WIDE` (amber)
 over-covered, `n<10` (muted) too few outcomes to judge. The grey baseline's hit
 rate on the same origins is printed beside it. Coverage is scored **at the
 horizon only**, on at most the latest 64 non-overlapping origins (see below).
-Hover the card for the formula, seed, bootstrap settings, baseline path count,
+The card uses a corner outside the fan's bounding rectangle; panes shorter than
+220 px use a one-line coverage badge. If neither fits without overlap, the card
+is hidden to keep the fan visible. Hover the card for the formula, seed, bootstrap settings, baseline path count,
 quantile CDF coverage at 10/25/50/75/90%, provenance and limitations.
 
 ## Inputs and refusals
@@ -160,12 +162,29 @@ by bar-Arc identity. The key includes generation, timeframe, closed count,
 all completed OHLCV/timestamps, every bar's provenance, cone settings and
 Adaptive Trend parameters. A forming-only price tick reuses the result; an old
 price correction, provenance downgrade, parameter edit or closed-bar transition
-invalidates it. Changed requests are throttled to 300 ms, with old geometry
-removed immediately; a throttled request schedules a repaint for when the
-window ends, so it is sent even on an idle UI. Stale responses are discarded.
+invalidates the input key. Changed requests are throttled to 300 ms. While a new
+bar's result is pending,
+the previous cone stays at its original closed-bar anchor. Corrections to the
+completed prefix, provenance changes, settings changes, paging, or a symbol/timeframe
+reload clear it; a different symbol/timeframe's cone is never reused. A throttled
+request schedules a repaint for when the window ends, so it is sent even on an idle
+UI. Stale responses are discarded.
 
 Meshes and labels cache by report revision, viewport, scale, rectangle and theme.
 Painting performs no bootstrap, TSTACK calculation, I/O or provider access.
+
+Computation reuses log closes, exact rank-count order statistics for expanding
+walk-forward libraries, and difference buffers for bootstrap block multiplicities.
+Long histories compute the two fans and bootstrap batches on bounded scoped
+threads (at most eight including producers, limited by available parallelism),
+inside the existing blocking worker. The original RNG stream is produced serially;
+only independent replicate evaluations run in parallel. The bootstrap draws, path
+libraries, origin cap and interpolated quantiles are unchanged (no approximation
+tolerance is introduced). Run the synthetic 20k/50k 1m timing test with:
+
+```sh
+cargo test -p tr-data --release --lib trend_cone_long_history_timing -- --ignored --nocapture
+```
 
 ## Verification
 

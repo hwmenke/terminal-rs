@@ -6338,6 +6338,51 @@ mod tests {
         assert!(c.cone.result.is_none());
     }
     #[test]
+    fn cone_keeps_previous_anchor_while_next_bar_is_pending_but_never_across_identity_changes() {
+        let (w, mut rx) = Worker::test_channel();
+        let mut c = stack_chart(&w, Provenance::Real);
+        c.set_trend_cone(Some(true), None, &w);
+        let key = cone_requests(&mut rx).pop().unwrap();
+        c.on_trend_cone(key.clone(), cone_result(&c, &key));
+        let previous = c.cone.result.as_ref().unwrap().as_ref().unwrap().clone();
+        // The formerly forming bar may change as it closes; the old completed
+        // prefix and the old report's anchor must remain unchanged.
+        let bars = Arc::make_mut(&mut c.bars);
+        let mut next = *bars.last().unwrap();
+        bars.last_mut().unwrap().close += 0.1;
+        next.ts += c.tf.seconds();
+        bars.push(next);
+        c.last_refresh = Some(next.ts);
+        assert!(c.request_cone(&w).is_some(), "new key is initially throttled");
+        let retained = c.cone.result.as_ref().unwrap().as_ref().unwrap();
+        assert!(Arc::ptr_eq(retained, &previous));
+        assert_eq!(retained.anchor_ts, previous.anchor_ts);
+        assert_eq!(retained.closed, previous.closed);
+        c.cone.sent.as_mut().unwrap().1 = Instant::now() - Duration::from_secs(1);
+        assert_eq!(c.request_cone(&w), None);
+        let next_key = cone_requests(&mut rx).pop().unwrap();
+        assert!(next_key.closed > key.closed);
+        c.on_trend_cone(key.clone(), Err("stale response".into()));
+        assert!(Arc::ptr_eq(c.cone.result.as_ref().unwrap().as_ref().unwrap(), &previous));
+        c.on_trend_cone(next_key.clone(), cone_result(&c, &next_key));
+        assert_eq!(c.cone.result.as_ref().unwrap().as_ref().unwrap().closed, next_key.closed);
+
+        c.set_timeframe(Timeframe::H1, &w);
+        assert!(c.cone.result.is_none());
+        c.on_trend_cone(next_key.clone(), Ok(previous.clone()));
+        assert!(c.cone.result.is_none());
+        // Seed a result for the new identity, then switch symbol.
+        assert_eq!(c.request_cone(&w), None);
+        let tf_key = cone_requests(&mut rx).pop().unwrap();
+        c.on_trend_cone(tf_key.clone(), Ok(previous.clone()));
+        assert!(c.cone.result.is_some());
+        c.set_symbol("ETHUSD Curncy", &w);
+        assert!(c.cone.result.is_none());
+        c.on_trend_cone(tf_key, Ok(previous));
+        assert!(c.cone.result.is_none());
+    }
+
+    #[test]
     fn cone_sample_and_unverified_refusal_paints_no_numbers_lines_or_fan() {
         fn forbidden(shape: &egui::Shape) -> bool {
             match shape {

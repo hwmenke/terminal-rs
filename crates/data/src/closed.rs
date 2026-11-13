@@ -152,6 +152,23 @@ mod tests {
         }
     }
     #[test]
+    fn issue_103_afternoon_half_hour_bars_stay_forming_until_cash_close() {
+        for class in [AssetClass::Equity, AssetClass::Etf, AssetClass::Index] {
+            for (tf, bar) in [
+                (Timeframe::H1, "2026-11-11T20:30:00Z"), // 15:30 ET
+                (Timeframe::H4, "2026-11-11T18:30:00Z"), // 13:30 ET
+            ] {
+                let b = bars(bar);
+                for now in ["2026-11-11T20:45:00Z", "2026-11-11T20:59:59Z"] {
+                    assert_eq!(closed_len(tf, &b, class, Some(ts(now))), 0, "{class:?} {tf:?} {now}");
+                }
+                for now in ["2026-11-11T21:00:00Z", "2026-11-11T21:01:00Z"] {
+                    assert_eq!(closed_len(tf, &b, class, Some(ts(now))), 1, "{class:?} {tf:?} {now}");
+                }
+            }
+        }
+    }
+    #[test]
     fn yahoo_h4_resampled_hours_wait_for_the_last_constituent_to_close() {
         for (first, hours, expected) in [
             (
