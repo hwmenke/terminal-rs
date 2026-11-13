@@ -260,6 +260,7 @@ pub enum VaultCmd {
     Prune,
     Drop { symbol: String, tf: Option<Timeframe> },
 }
+const VAULT_VERBS: [&str; 3] = ["DROP", "VERIFY", "PRUNE"];
 fn parse_vault(rest: &[&str]) -> Option<VaultCmd> {
     if rest.first().is_some_and(|s| s.eq_ignore_ascii_case("DROP")) {
         let (sec, used) = Security::resolve_tokens(&rest[1..])?;
@@ -900,9 +901,14 @@ pub fn parse(input: &str) -> Option<Command> {
             return Some(Command::Function(f));
         }
         // Invalid stack arguments must not become a ticker followed by an interval.
-        if ["TSTACK", "STACK", "MTF", "REGIME", "RAIL", "AVWAP", "VAULT", "VLT"]
-            .iter()
-            .any(|word| head.eq_ignore_ascii_case(word))
+        if ["TSTACK", "STACK", "MTF", "REGIME", "RAIL", "AVWAP"].iter().any(|word| head.eq_ignore_ascii_case(word)) {
+            return None;
+        }
+        // VAULT and VLT are also listed tickers. Only a vault verb is guarded;
+        // anything else (`VLT 5m`, `VAULT GP`) loads the ticker, as does
+        // `VAULT US Equity` / `VLT Equity` for the bare security.
+        if ["VAULT", "VLT"].iter().any(|word| head.eq_ignore_ascii_case(word))
+            && rest.first().is_some_and(|verb| VAULT_VERBS.iter().any(|v| verb.eq_ignore_ascii_case(v)))
         {
             return None;
         }
@@ -1006,6 +1012,10 @@ fn describe(f: &Function) -> String {
         }
         Function::IntradayDesk => {
             "Intraday desk: 5-minute chart, ISCAN, breadth, and volume pace, saved as the Intraday layout".into()
+        }
+        Function::Vault(VaultCmd::Open) => {
+            "Bar Vault · verified closed intraday provider bars · for the tickers type VAULT US Equity / VLT US Equity"
+                .into()
         }
         Function::Vault(cmd) => format!("Bar Vault · {cmd:?} · verified closed intraday provider bars"),
         Function::Cockpit { spec } => match cockpit_ladder(spec) {
@@ -1247,10 +1257,50 @@ mod tests {
                 Some(Command::Function(Function::Vault(VaultCmd::Drop { symbol: "AAPL US Equity".into(), tf })))
             );
         }
-        for text in ["VAULT FOO", "VLT FOO", "VAULT DROP", "VAULT DROP AAPL 1d", "VAULT DROP AAPL 1m extra"] {
+        for text in [
+            "VAULT FOO",
+            "VLT FOO",
+            "VAULT DROP",
+            "VAULT DROP AAPL 1d",
+            "VAULT DROP AAPL 1m extra",
+            "VLT VERIFY NOW",
+            "vault prune all",
+        ] {
             assert!(parse(text).is_none(), "{text}");
         }
         assert_eq!(parse("VAULT US Equity"), Some(Command::Symbol("VAULT US Equity".into())));
+    }
+    #[test]
+    fn vault_and_vlt_tickers_still_load() {
+        for t in ["VAULT", "VLT"] {
+            let key = format!("{t} US Equity");
+            for text in
+                [format!("{t} US Equity"), format!("{t} Equity"), format!("{} us equity <GO>", t.to_lowercase())]
+            {
+                assert_eq!(parse(&text), Some(Command::Symbol(key.clone())), "{text}");
+            }
+            assert_eq!(
+                parse(&format!("{t} 5m")),
+                Some(Command::SymbolFunction(key.clone(), Function::Timeframe(Timeframe::M5)))
+            );
+            assert_eq!(
+                parse(&format!("{t} US Equity 1h")),
+                Some(Command::SymbolFunction(key.clone(), Function::Timeframe(Timeframe::H1)))
+            );
+            // The ticker's own vault pane, and dropping the ticker's vault rows.
+            assert_eq!(
+                parse(&format!("{t} US Equity VAULT")),
+                Some(Command::SymbolFunction(key.clone(), Function::Vault(VaultCmd::Open)))
+            );
+            assert_eq!(
+                parse(&format!("VAULT DROP {t} US Equity 1m")),
+                Some(Command::Function(Function::Vault(VaultCmd::Drop {
+                    symbol: key.clone(),
+                    tf: Some(Timeframe::M1)
+                })))
+            );
+        }
+        assert!(hint("VLT").contains("VLT US Equity"));
         assert_eq!(parse("ZZZT"), Some(Command::Symbol("ZZZT US Equity".into())));
     }
     #[test]
