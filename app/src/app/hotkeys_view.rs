@@ -314,6 +314,10 @@ impl TerminalApp {
                         "Historical risk/returns; what followed low RSI or price above a moving average",
                     ),
                     (
+                        &["DIST", "RDIST", "AAPL DIST", "DIST 1H"],
+                        "Distribution Studio: log returns, tail risk, QQ, drawdowns and volatility regimes on verified bars",
+                    ),
+                    (
                         &["BACKTEST", "AAPL BACKTEST", "AAPL BT ADTREND"],
                         "Paper backtest vs buy-and-hold: costs, next-open fills, chronological holdout, completed-trade win rate",
                     ),

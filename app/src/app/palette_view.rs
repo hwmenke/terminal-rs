@@ -112,6 +112,8 @@ const COMMANDS: &[(&str, &str, &str, Option<Action>)] = &[
     ("BACKUP", "Back up personal workspace (credentials excluded)", "restore export layouts journal", None),
     ("RESTORE", "Restore a workspace, journal or history export", "backup import recovery", None),
     ("STATS", "Historical risk, returns and what followed a condition", "conditional returns sma baseline", None),
+    ("DIST", "Distribution Studio: log returns, tails, QQ, drawdowns and regimes", "rdist histogram normal student jarque bera var cvar", None),
+    ("AAPL DIST 1H", "AAPL intraday return distribution from verified closed bars", "studio vault distribution", None),
     ("AAPL STATS", "AAPL historical risk and returns", "statistics research archive", None),
     ("COND", "Conditional forward returns vs baseline", "sma distribution overlap", None),
     ("AAPL COND RSI(14) < 30", "What followed oversold RSI on AAPL", "conditional returns", None),

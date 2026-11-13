@@ -228,6 +228,7 @@ gets the native title bar with traffic lights, window vibrancy behind the sideba
   filter to the unconditional baseline. Only completed outcomes count; overlapping
   windows report effective N = N / H. Sample bars are refused. See
   [Statistics](docs/STATS.md).
+- **Distribution Studio** — `AAPL DIST` / `DIST 1H` (`RDIST`): verified log-return tails, fitted distributions, QQ, drawdowns and volatility regimes. [Guide](docs/STUDIO_DIST.md).
 - **Adaptive Trend overlays** — `ADTREND` (or `ATREND`) draws Whats-News Adaptive
   Trend on the chart: SB/MB/LB baselines, destination bands, medium-regime flips
   and MRT/LRT trailing-stop guides. Sample / unverified bars are refused. See
