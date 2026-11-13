@@ -27,6 +27,7 @@ use crate::worker::{BuiltIndicator, PaneId, Request, Worker, archive_page, initi
 use tr_data::anchored_vwap::AvwapKey;
 
 mod cockpit;
+mod trend_cone;
 pub use cockpit::{LinkBus, LinkPublish, resolve_hover};
 
 const AXIS_W: f32 = 66.0;
@@ -302,6 +303,7 @@ pub struct ChartState {
     pub stack_session: bool,
     pub show_rail: bool,
     pub show_edge: bool,
+    cone: trend_cone::ConeState,
     edge: Option<Result<Arc<tr_data::edge::EdgeReport>, String>>,
     edge_cache: Option<(EdgeKey, Arc<tr_data::edge::EdgeReport>)>,
     edge_paint: EdgePaint,
@@ -440,6 +442,7 @@ impl ChartState {
             stack_session: false,
             show_rail: true,
             show_edge: false,
+            cone: Default::default(),
             edge: None,
             edge_paint: Default::default(),
             edge_cache: None,
@@ -583,6 +586,7 @@ impl ChartState {
     /// (Re)load history for the current symbol and timeframe.
     pub fn load(&mut self, w: &Worker) {
         self.generation += 1;
+        self.cone.invalidate();
         self.edge = None;
         self.zband_paint = Default::default();
         self.feed_state = Default::default();
@@ -908,6 +912,9 @@ impl ChartState {
         self.glide(|s| {
             if let Some(v) = s.viewport.as_mut() {
                 *v = Viewport::fit_last(s.bars.len(), DEFAULT_VISIBLE, v.width_px);
+                if s.cone.enabled {
+                    trend_cone::reserve(v, s.bars.len(), s.cone.params.horizon);
+                }
             }
             s.manual_scale = None;
         });
@@ -973,6 +980,9 @@ impl ChartState {
         self.glide(|s| {
             if let Some(v) = s.viewport.as_mut() {
                 v.right = s.bars.len() as f64 + 3.0;
+                if s.cone.enabled {
+                    trend_cone::reserve(v, s.bars.len(), s.cone.params.horizon);
+                }
                 v.clamp(s.bars.len());
             }
         });
@@ -1629,6 +1639,12 @@ impl ChartState {
             }
         }
         self.apply_range();
+        if old_len == 0
+            && self.cone.enabled
+            && let Some(v) = &mut self.viewport
+        {
+            trend_cone::reserve(v, new_len, self.cone.params.horizon);
+        }
         if old_len == 0 && !crate::anim::reduced() {
             if let (Some(mut from), Some(to)) = (self.interval_glide.take(), self.viewport) {
                 from.right = to.right;
@@ -1808,6 +1824,9 @@ impl ChartState {
         let mut clicked = false;
         self.link_out = LinkPublish::default();
         self.request_avwap(w);
+        if let Some(wait) = self.request_cone(w) {
+            ui.ctx().request_repaint_after(wait);
+        }
 
         // Controls live in the tab strip when it has room; otherwise a slim header row.
         let header_h = if self.controls_in_strip { 0.0 } else { HEADER_H };
@@ -2075,8 +2094,9 @@ impl ChartState {
         self.viewport = Some(v);
         let click_owner = self.cockpit_input(ui, &plot_resp, price_rect, &v);
         clicked |= click_owner.is_some();
-        // A Shift+click on a time-linked chart only centres; drawing tools ignore it.
-        let drawing_click = click_owner != Some(cockpit::ClickOwner::TimeLink);
+        // A Shift+click on a time-linked chart only centres and an armed AVWAP click only
+        // anchors; drawing tools ignore both.
+        let drawing_click = cockpit::drawing_gets_click(click_owner);
 
         // Page older history when the left edge approaches loaded data.
         if !self.paging && !self.loading && !self.exhausted && v.left() < v.visible_bars() * 0.3 {
@@ -2182,7 +2202,7 @@ impl ChartState {
                 self.shown_scale = Some((a, b, s.log));
                 s
             }
-            None => self.ease_scale(ui.ctx(), scene::autoscale(&pane)),
+            None => self.ease_scale(ui.ctx(), self.cone_scale(scene::autoscale(&pane), &v)),
         });
         let out = scene::price_pane(&pane);
         let mut scale = out.scale;
@@ -2368,6 +2388,7 @@ impl ChartState {
         let click = plot_resp.interact_pointer_pos().filter(|_| plot_resp.clicked() && drawing_click);
         self.paint_drawings(ui, price_rect, &v, &scale, hover, click);
         self.paint_avwap(ui, price_rect, &v, &scale, hover);
+        self.paint_cone(ui, price_rect, &v, &scale);
 
         // ---- congress markers ----
         self.hover_marker = None;
@@ -4774,6 +4795,51 @@ mod tests {
     }
 
     #[test]
+    fn drawing_tool_only_gets_clicks_left_to_the_chart() {
+        use cockpit::{ClickOwner, click_owner, drawing_gets_click};
+        assert!(drawing_gets_click(None));
+        assert!(drawing_gets_click(Some(ClickOwner::Chart)));
+        assert!(!drawing_gets_click(Some(ClickOwner::TimeLink)));
+        assert!(!drawing_gets_click(Some(ClickOwner::AnchorTool)));
+        // AVWAP armed (with a drawing tool also armed): the anchor click is not a drawing click.
+        assert!(!drawing_gets_click(Some(click_owner(false, false, true))));
+        assert!(!drawing_gets_click(Some(click_owner(true, true, true))));
+    }
+
+    #[test]
+    fn avwap_anchor_click_with_a_drawing_tool_anchors_only() {
+        let ctx = egui::Context::default();
+        let (worker, _) = Worker::test_channel();
+        let mut c = cockpit_chart(&worker, Timeframe::M5, Provenance::Real, &[]);
+        chart_frame(&ctx, &mut c, &worker, vec![]);
+        let v = c.viewport.unwrap();
+        let pos = pos2(10.0 + v.x_center(20) as f32, 400.0);
+        let click = |c: &mut ChartState| {
+            let press = |pressed| egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed,
+                modifiers: egui::Modifiers::NONE,
+            };
+            chart_frame(&ctx, c, &worker, vec![egui::Event::PointerMoved(pos)]);
+            chart_frame(&ctx, c, &worker, vec![press(true)]);
+            chart_frame(&ctx, c, &worker, vec![press(false)]);
+        };
+        let anchors = c.avwap_anchors.len();
+        c.arm_avwap();
+        c.draw.tool = Some(Tool::Horizontal);
+        click(&mut c);
+        assert_eq!(c.avwap_anchors.len(), anchors + 1, "the click anchored");
+        assert!(!c.avwap_is_armed(), "the AVWAP tool disarms");
+        assert!(c.drawings.is_empty(), "no drawing point was placed");
+        assert_eq!(c.draw.tool, Some(Tool::Horizontal), "the drawing tool stays armed");
+        // The next click goes to the drawing tool.
+        click(&mut c);
+        assert_eq!(c.drawings.len(), 1);
+        assert_eq!(c.avwap_anchors.len(), anchors + 1);
+    }
+
+    #[test]
     fn shift_click_with_a_drawing_tool_centres_only() {
         let ctx = egui::Context::default();
         let (worker, _) = Worker::test_channel();
@@ -6220,5 +6286,167 @@ mod tests {
         let text = paint(&mut current);
         assert!(!text.contains("STALE"), "{text}");
         assert!(!text.contains("SESSION CLOSED"), "{text}");
+    }
+
+    fn cone_requests(rx: &mut tokio::sync::mpsc::UnboundedReceiver<Request>) -> Vec<tr_data::trend_cone::ConeKey> {
+        let mut out = Vec::new();
+        while let Ok(r) = rx.try_recv() {
+            if let Request::TrendCone { key, .. } = r {
+                out.push(key);
+            }
+        }
+        out
+    }
+    fn cone_result(
+        c: &ChartState,
+        key: &tr_data::trend_cone::ConeKey,
+    ) -> Result<Arc<tr_data::trend_cone::ConeReport>, String> {
+        tr_data::trend_cone::report(
+            &c.bars,
+            c.tf,
+            c.sec.class,
+            if c.archive { Some(chrono::Utc::now().timestamp()) } else { c.last_refresh },
+            key.params,
+            key.trend,
+        )
+        .map(Arc::new)
+    }
+    #[test]
+    fn cone_unchanged_and_forming_only_ticks_reuse_report_but_old_revisions_invalidate() {
+        let (w, mut rx) = Worker::test_channel();
+        let mut c = stack_chart(&w, Provenance::Real);
+        c.set_trend_cone(Some(true), None, &w);
+        let key = cone_requests(&mut rx).pop().unwrap();
+        c.on_trend_cone(key.clone(), cone_result(&c, &key));
+        assert_eq!(c.request_cone(&w), None);
+        assert!(cone_requests(&mut rx).is_empty());
+        Arc::make_mut(&mut c.bars).last_mut().unwrap().close *= 2.0;
+        assert_eq!(c.request_cone(&w), None);
+        assert!(cone_requests(&mut rx).is_empty());
+        Arc::make_mut(&mut c.bars)[10].close += 1.0;
+        // Throttled: nothing is sent yet, but the caller is told when to repaint so
+        // the deferred request cannot be lost on an otherwise idle UI.
+        let wait = c.request_cone(&w).expect("throttled request must ask for a repaint");
+        assert!(wait > Duration::ZERO && wait <= Duration::from_millis(300));
+        assert!(cone_requests(&mut rx).is_empty());
+        // Throttle immediately removes the old report; it cannot paint stale geometry.
+        assert!(c.cone.result.is_none());
+        c.cone.sent.as_mut().unwrap().1 = Instant::now() - Duration::from_secs(1);
+        assert_eq!(c.request_cone(&w), None);
+        assert_eq!(cone_requests(&mut rx).len(), 1);
+        c.on_trend_cone(key, Err("old failure".into()));
+        assert!(c.cone.result.is_none());
+    }
+    #[test]
+    fn cone_keeps_previous_anchor_while_next_bar_is_pending_but_never_across_identity_changes() {
+        let (w, mut rx) = Worker::test_channel();
+        let mut c = stack_chart(&w, Provenance::Real);
+        c.set_trend_cone(Some(true), None, &w);
+        let key = cone_requests(&mut rx).pop().unwrap();
+        c.on_trend_cone(key.clone(), cone_result(&c, &key));
+        let previous = c.cone.result.as_ref().unwrap().as_ref().unwrap().clone();
+        // The formerly forming bar may change as it closes; the old completed
+        // prefix and the old report's anchor must remain unchanged.
+        let bars = Arc::make_mut(&mut c.bars);
+        let mut next = *bars.last().unwrap();
+        bars.last_mut().unwrap().close += 0.1;
+        next.ts += c.tf.seconds();
+        bars.push(next);
+        c.last_refresh = Some(next.ts);
+        assert!(c.request_cone(&w).is_some(), "new key is initially throttled");
+        let retained = c.cone.result.as_ref().unwrap().as_ref().unwrap();
+        assert!(Arc::ptr_eq(retained, &previous));
+        assert_eq!(retained.anchor_ts, previous.anchor_ts);
+        assert_eq!(retained.closed, previous.closed);
+        c.cone.sent.as_mut().unwrap().1 = Instant::now() - Duration::from_secs(1);
+        assert_eq!(c.request_cone(&w), None);
+        let next_key = cone_requests(&mut rx).pop().unwrap();
+        assert!(next_key.closed > key.closed);
+        c.on_trend_cone(key.clone(), Err("stale response".into()));
+        assert!(Arc::ptr_eq(c.cone.result.as_ref().unwrap().as_ref().unwrap(), &previous));
+        c.on_trend_cone(next_key.clone(), cone_result(&c, &next_key));
+        assert_eq!(c.cone.result.as_ref().unwrap().as_ref().unwrap().closed, next_key.closed);
+
+        c.set_timeframe(Timeframe::H1, &w);
+        assert!(c.cone.result.is_none());
+        c.on_trend_cone(next_key.clone(), Ok(previous.clone()));
+        assert!(c.cone.result.is_none());
+        // Seed a result for the new identity, then switch symbol.
+        assert_eq!(c.request_cone(&w), None);
+        let tf_key = cone_requests(&mut rx).pop().unwrap();
+        c.on_trend_cone(tf_key.clone(), Ok(previous.clone()));
+        assert!(c.cone.result.is_some());
+        c.set_symbol("ETHUSD Curncy", &w);
+        assert!(c.cone.result.is_none());
+        c.on_trend_cone(tf_key, Ok(previous));
+        assert!(c.cone.result.is_none());
+    }
+
+    #[test]
+    fn cone_sample_and_unverified_refusal_paints_no_numbers_lines_or_fan() {
+        fn forbidden(shape: &egui::Shape) -> bool {
+            match shape {
+                egui::Shape::Text(t) => t.galley.job.text.chars().any(|c| c.is_ascii_digit()),
+                egui::Shape::Mesh(_) | egui::Shape::LineSegment { .. } => true,
+                egui::Shape::Vec(v) => v.iter().any(forbidden),
+                _ => false,
+            }
+        }
+        let ctx = egui::Context::default();
+        let (w, mut rx) = Worker::test_channel();
+        for provenance in [Provenance::Sample, Provenance::Missing] {
+            let mut c = stack_chart(&w, provenance);
+            c.set_trend_cone(Some(true), None, &w);
+            let key = cone_requests(&mut rx).pop().unwrap();
+            c.on_trend_cone(key.clone(), cone_result(&c, &key));
+            let mut out = ctx.run_ui(egui::RawInput::default(), |ui| {
+                c.paint_cone(
+                    ui,
+                    Rect::from_min_size(Pos2::ZERO, vec2(900.0, 600.0)),
+                    &Viewport::fit_last(160, 160, 900.0),
+                    &PriceScale::new(90.0, 240.0, false, 600.0),
+                )
+            });
+            out.textures_delta.clear();
+            assert!(stack_has_text(&out.shapes, "Trend Cone refused"));
+            assert!(!out.shapes.iter().any(|s| forbidden(&s.shape)));
+        }
+    }
+    #[test]
+    fn cone_paints_two_gradient_fans_prices_and_coverage_and_caches_geometry() {
+        let ctx = egui::Context::default();
+        let (w, mut rx) = Worker::test_channel();
+        let mut c = stack_chart(&w, Provenance::Real);
+        c.set_trend_cone(Some(true), None, &w);
+        let key = cone_requests(&mut rx).pop().unwrap();
+        c.on_trend_cone(key.clone(), cone_result(&c, &key));
+        assert!(matches!(c.cone.result, Some(Ok(_))));
+        let out = chart_frame(&ctx, &mut c, &w, vec![]);
+        assert!(stack_has_text(&out.shapes, "P90"));
+        assert!(stack_has_text(&out.shapes, "P10"));
+        assert!(stack_has_text(&out.shapes, "WALK-FORWARD"));
+        assert!(stack_has_text(&out.shapes, "CLOSED THRU"));
+        assert!(stack_has_text(&out.shapes, "50% band"));
+        assert!(stack_has_text(&out.shapes, "80% band"));
+        assert!(stack_has_text(&out.shapes, "whiskers"));
+        assert!(stack_has_text(&out.shapes, "BASE"));
+        let meshes: Vec<_> = c
+            .cone
+            .paint
+            .shapes
+            .iter()
+            .filter_map(|s| if let egui::Shape::Mesh(m) = s { Some(m) } else { None })
+            .collect();
+        assert_eq!(meshes.len(), 2);
+        assert!(meshes.iter().all(|m| m.vertices.iter().any(|v| v.color != m.vertices[0].color)));
+        let cached = meshes[0].clone();
+        chart_frame(&ctx, &mut c, &w, vec![]);
+        let mesh =
+            c.cone.paint.shapes.iter().find_map(|s| if let egui::Shape::Mesh(m) = s { Some(m) } else { None }).unwrap();
+        assert!(Arc::ptr_eq(&cached, mesh));
+        assert!(cone_requests(&mut rx).is_empty());
+        c.set_trend_cone(Some(false), None, &w);
+        let out = chart_frame(&ctx, &mut c, &w, vec![]);
+        assert!(!stack_has_text(&out.shapes, "WALK-FORWARD"));
     }
 }

@@ -266,6 +266,7 @@ pub enum Action {
     DrawVertical,
     DrawFib,
     DrawAnchoredVwap,
+    ToggleTrendCone,
     ResetView,
     JumpLatest,
     LogScale,
@@ -282,7 +283,7 @@ pub enum Action {
 }
 
 impl Action {
-    pub const ALL: [Action; 56] = [
+    pub const ALL: [Action; 57] = [
         Action::Help,
         Action::Congress,
         Action::Politicians,
@@ -326,6 +327,7 @@ impl Action {
         Action::DrawVertical,
         Action::DrawFib,
         Action::DrawAnchoredVwap,
+        Action::ToggleTrendCone,
         Action::ResetView,
         Action::JumpLatest,
         Action::LogScale,
@@ -386,6 +388,7 @@ impl Action {
             Action::DrawHorizontal => "Draw horizontal line".into(),
             Action::DrawVertical => "Draw vertical line".into(),
             Action::DrawFib => "Draw Fibonacci retracement".into(),
+            Action::ToggleTrendCone => "Toggle Trend Cone".into(),
             Action::DrawAnchoredVwap => "Anchor VWAP on a clicked bar".into(),
             Action::ResetView => "Reset chart view".into(),
             Action::JumpLatest => "Jump to the latest candle".into(),
@@ -417,6 +420,7 @@ impl Action {
             | A::DrawHorizontal
             | A::DrawVertical
             | A::DrawFib
+            | A::ToggleTrendCone
             | A::DrawAnchoredVwap
             | A::ResetView
             | A::JumpLatest
@@ -620,6 +624,7 @@ impl Default for Keymap {
         bind(Action::DrawVertical, "Alt+V");
         bind(Action::DrawFib, "Alt+F");
         bind(Action::DrawAnchoredVwap, "Alt+A");
+        bind(Action::ToggleTrendCone, "Alt+C");
         bind(Action::ResetView, "Alt+R");
         bind(Action::JumpLatest, "End");
         bind(Action::LogScale, "Alt+L");
@@ -938,5 +943,14 @@ mod tests {
         let old: Prefs = serde_json::from_str("{}").unwrap();
         assert_eq!(old.whats_news, tr_data::whats_news::Config::default());
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn cone_hotkey_is_unique_and_chart_scoped() {
+        let keys = Keymap::default();
+        let cone = keys.0.get(&Action::ToggleTrendCone).unwrap();
+        assert_eq!(Chord::parse(cone), Chord::parse("Alt+C"));
+        assert_eq!(keys.0.values().filter(|key| *key == cone).count(), 1);
+        assert_eq!(Action::ToggleTrendCone.category(), "Chart");
     }
 }

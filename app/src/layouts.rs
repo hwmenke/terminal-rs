@@ -107,6 +107,9 @@ pub enum PaneSettings {
         show_rail: bool,
         #[serde(default)]
         show_edge: bool,
+        /// Enabled Trend Cone: (horizon bars, mean stationary-bootstrap block).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cone: Option<(usize, usize)>,
         /// Anchored VWAP anchors (UTC bar opens) per security, keyed like drawings.
         #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
         avwap: BTreeMap<String, Vec<i64>>,
@@ -542,6 +545,7 @@ pub fn chart_settings(symbol: &str, d: &crate::prefs::PanelDefaults) -> PaneSett
         stack_session: false,
         show_rail: true,
         show_edge: false,
+        cone: None,
         avwap: BTreeMap::new(),
         cockpit_chip: None,
     }
@@ -714,7 +718,7 @@ mod tests {
         value["Chart"].as_object_mut().unwrap().remove("show_edge");
         assert!(matches!(
             serde_json::from_value::<PaneSettings>(value).unwrap(),
-            PaneSettings::Chart { show_edge: false, .. }
+            PaneSettings::Chart { show_edge: false, cone: None, .. }
         ));
     }
     #[test]
@@ -773,6 +777,7 @@ mod tests {
                 stack_session: false,
                 show_rail: true,
                 show_edge: false,
+                cone: None,
                 ..
             }
         ));
@@ -997,6 +1002,7 @@ mod tests {
                 stack_session: false,
                 show_rail: true,
                 show_edge: false,
+                cone: None,
                 avwap: BTreeMap::new(),
                 cockpit_chip: None,
             }],
@@ -1033,5 +1039,20 @@ mod tests {
         assert_eq!(Store::file_stem("  "), "Untitled");
         assert_eq!(Store::file_stem("My Layout 2"), "My Layout 2");
         assert_eq!(Store::file_stem(".hidden"), "hidden");
+    }
+
+    #[test]
+    fn cone_settings_round_trip_and_older_layout_defaults_hidden() {
+        let mut settings = chart_settings("AAPL", &Default::default());
+        if let PaneSettings::Chart { cone, .. } = &mut settings {
+            *cone = Some((30, 7));
+        }
+        let mut value = serde_json::to_value(&settings).unwrap();
+        assert_eq!(serde_json::from_value::<PaneSettings>(value.clone()).unwrap(), settings);
+        value["Chart"].as_object_mut().unwrap().remove("cone");
+        assert!(matches!(
+            serde_json::from_value::<PaneSettings>(value).unwrap(),
+            PaneSettings::Chart { cone: None, .. }
+        ));
     }
 }

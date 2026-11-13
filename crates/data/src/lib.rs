@@ -53,6 +53,7 @@ pub mod stats;
 pub mod time_link;
 pub mod trade_plans;
 pub mod treasury;
+pub mod trend_cone;
 pub mod truth_rail;
 pub mod volume_pace;
 pub mod whats_news;

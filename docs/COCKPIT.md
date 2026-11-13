@@ -58,7 +58,8 @@ the request and applies it when its bars arrive.
 
 Click precedence: on a time-linked chart, `Shift+click` only centres the linked charts; an
 active drawing tool or the armed AVWAP tool ignores that click. On an unlinked chart Shift
-does nothing special.
+does nothing special. Otherwise an armed AVWAP tool takes the click (anchor only, no drawing
+point; an armed drawing tool stays armed for the next click); only then do drawing tools get it.
 
 ## Anchored VWAP (`AVWAP`)
 

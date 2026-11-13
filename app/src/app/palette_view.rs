@@ -21,6 +21,15 @@ const VISIBLE_ROWS: usize = 10;
 /// Function codes offered by the palette: code, description (empty uses the command
 /// line's own hint), extra search words, and the action whose shortcut is shown.
 const COMMANDS: &[(&str, &str, &str, Option<Action>)] = &[
+    (
+        "CONE",
+        "Trend Cone: regime path quantiles + walk-forward coverage",
+        "quant bootstrap fan forecast trend cone",
+        Some(Action::ToggleTrendCone),
+    ),
+    ("CONE 30", "Trend Cone: horizon 30 bars (bootstrap block = horizon)", "quant cone horizon", None),
+    ("CONE 20 10", "Trend Cone: horizon 20 bars, mean bootstrap block 10", "quant cone horizon block", None),
+    ("CONE OFF", "Hide Trend Cone", "cone disable", None),
     ("TSTACK EDGE", "Regime-conditional forward returns and confidence intervals", "quant edge hit rate flips", None),
     ("ZBAND", "Rolling sample-sigma bands and z readout", "statistics sigma bands", None),
     ("HEALTH", "Real data feed health", "src source offline stale retry", None),

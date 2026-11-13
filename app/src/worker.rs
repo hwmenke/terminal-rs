@@ -78,6 +78,15 @@ pub enum Request {
         archive: bool,
         base: Arc<Vec<Bar>>,
     },
+    /// Closed-bar path bootstrap and walk-forward calibration on this pane's own
+    /// verified bars. All statistics run in spawn_blocking; no provider access.
+    TrendCone {
+        pane: PaneId,
+        key: tr_data::trend_cone::ConeKey,
+        class: tr_core::AssetClass,
+        bars: Arc<Vec<Bar>>,
+        as_of: Option<i64>,
+    },
     /// Anchored VWAP on the chart's own loaded bars. `key` carries the generation,
     /// interval and anchors; `as_of` is the chart's last refresh (now for archive charts)
     /// and decides the forming bar through `closed_len`. Never fetches prices.
@@ -531,6 +540,12 @@ pub enum Response {
         generation: u64,
         base_len: usize,
         result: Result<LineRef, String>,
+    },
+    /// Predictive quantiles and causal coverage for exactly the keyed input.
+    TrendCone {
+        pane: PaneId,
+        key: tr_data::trend_cone::ConeKey,
+        result: Result<Arc<tr_data::trend_cone::ConeReport>, String>,
     },
     /// Anchored VWAP for the chart state described by `key` (generation, anchors, bars).
     AnchoredVwap {
@@ -2705,6 +2720,15 @@ async fn handle_inner(s: &Arc<Shared>, req: Request, force: bool) {
                 base_len: base.len(),
                 result: result.map_err(|e: anyhow::Error| format!("{e:#}")),
             });
+        }
+        Request::TrendCone { pane, key, class, bars, as_of } => {
+            let config = key.clone();
+            let result = tokio::task::spawn_blocking(move || {
+                tr_data::trend_cone::report(&bars, config.tf, class, as_of, config.params, config.trend).map(Arc::new)
+            })
+            .await
+            .unwrap_or_else(|e| Err(format!("Trend Cone task failed: {e}")));
+            s.send(Response::TrendCone { pane, key, result });
         }
         Request::AnchoredVwap { pane, key, class, bars, as_of } => {
             s.send(Response::AnchoredVwap { pane, result: anchored_vwap(class, bars, &key, as_of).await, key });
@@ -6231,6 +6255,39 @@ mod tests {
             i * 2
         })));
         assert_eq!(out, (0..20).map(|i| i * 2).collect::<Vec<_>>());
+    }
+    #[tokio::test]
+    async fn trend_cone_worker_refuses_sample_unverified_and_mixed_history() {
+        use tr_data::trend_cone::{ConeKey, Params};
+        let (s, rx) = shared(Arc::new(tr_data::sample::SampleProvider::at(0, 10)), None);
+        for provenance in [tr_core::Provenance::Sample, tr_core::Provenance::Missing, tr_core::Provenance::Cached] {
+            let mut bars = stack_fixture(180, Timeframe::M5, tr_core::Provenance::Real);
+            bars[179].provenance = provenance;
+            let key = ConeKey::new(42, Timeframe::M5, 179, Params::default(), Default::default(), &bars);
+            handle(
+                &s,
+                Request::TrendCone {
+                    pane: 7,
+                    key: key.clone(),
+                    class: tr_core::AssetClass::Crypto,
+                    bars: Arc::new(bars),
+                    as_of: None,
+                },
+            )
+            .await;
+            let result = rx
+                .try_iter()
+                .find_map(|r| {
+                    if let Response::TrendCone { pane: 7, key: k, result } = r {
+                        assert_eq!(k, key);
+                        Some(result)
+                    } else {
+                        None
+                    }
+                })
+                .unwrap();
+            assert!(result.unwrap_err().contains("refused"));
+        }
     }
 }
 

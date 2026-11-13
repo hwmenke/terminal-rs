@@ -547,6 +547,7 @@ impl PaneKind {
                 stack_session: c.stack_session,
                 show_rail: c.show_rail,
                 show_edge: c.show_edge,
+                cone: c.cone_settings(),
                 avwap: {
                     let mut store = c.avwap_store.clone();
                     let key = tr_chart::drawings::store_key(&c.symbol);
@@ -682,6 +683,7 @@ impl PaneKind {
                 stack_session,
                 show_rail,
                 show_edge,
+                cone,
                 avwap,
                 cockpit_chip,
             } => {
@@ -723,6 +725,7 @@ impl PaneKind {
                 c.stack_session = stack_session;
                 c.show_rail = show_rail;
                 c.show_edge = show_edge;
+                c.restore_cone(cone);
                 c.show_stack |= show_edge;
                 PaneKind::Chart(Box::new(c))
             }
@@ -1470,6 +1473,7 @@ impl TerminalApp {
             Function::StackLadder(frames) => self.with_chart(|c, w| c.set_stack_ladder(frames, w)),
             Function::StackTint(on) => self.with_chart(|c, w| c.set_stack_tint(on, w)),
             Function::StackSession(on) => self.with_chart(|c, w| c.set_stack_session(on, w)),
+            Function::TrendCone { on, spec } => self.with_chart(|c, w| c.set_trend_cone(on, spec, w)),
             Function::StackEdge(on) => self.with_chart(|c, w| c.set_stack_edge(on, w)),
             Function::TruthRail(on) => self.with_chart(|c, _| c.show_rail = on.unwrap_or(!c.show_rail)),
             Function::TrendStack(on) => self.with_chart(|c, w| c.set_trend_stack(on, w)),
@@ -2004,6 +2008,11 @@ impl TerminalApp {
                         }
                     }
                 }
+                Response::TrendCone { pane, key, result } => {
+                    if let Some(c) = self.chart_mut(pane) {
+                        c.on_trend_cone(key, result);
+                    }
+                }
                 Response::AnchoredVwap { pane, key, result } => {
                     if let Some(c) = self.chart_mut(pane) {
                         c.on_anchored_vwap(key, result);
@@ -2478,6 +2487,7 @@ impl TerminalApp {
             | A::DrawHorizontal
             | A::DrawVertical
             | A::DrawFib
+            | A::ToggleTrendCone
             | A::DrawAnchoredVwap
             | A::ResetView
             | A::JumpLatest
@@ -2529,6 +2539,7 @@ impl TerminalApp {
             A::DrawHorizontal => self.with_chart(|c, _| c.start_tool(Tool::Horizontal)),
             A::DrawVertical => self.with_chart(|c, _| c.start_tool(Tool::Vertical)),
             A::DrawFib => self.with_chart(|c, _| c.start_tool(Tool::Fib)),
+            A::ToggleTrendCone => self.with_chart(|c, w| c.set_trend_cone(None, None, w)),
             A::DrawAnchoredVwap => self.anchored_vwap_command(command::AnchorCmd::Arm),
             A::ResetView => self.with_chart(|c, _| c.reset_view()),
             A::JumpLatest => self.with_chart(|c, _| c.jump_latest()),
