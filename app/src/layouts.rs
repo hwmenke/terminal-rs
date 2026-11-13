@@ -178,6 +178,13 @@ pub enum PaneSettings {
         #[serde(default)]
         conditional: bool,
     },
+    /// Calendar seasonality for verified history.
+    StudioSeason {
+        #[serde(default)]
+        symbol: String,
+        #[serde(default)]
+        spec: String,
+    },
     /// Paper strategy backtest vs buy-and-hold for one research symbol.
     Backtest {
         #[serde(default)]

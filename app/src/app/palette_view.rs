@@ -111,6 +111,8 @@ const COMMANDS: &[(&str, &str, &str, Option<Action>)] = &[
     ("EXPORT HIST", "Export archived daily prices with source and dates", "yahoo archive backup", None),
     ("BACKUP", "Back up personal workspace (credentials excluded)", "restore export layouts journal", None),
     ("RESTORE", "Restore a workspace, journal or history export", "backup import recovery", None),
+    ("SEASON", "Seasonality Studio: calendar and New York clock patterns", "SSN seasonal month weekday heatmap", None),
+    ("AAPL SEASON 30M", "AAPL intraday seasonality from verified history", "time of day volume smile", None),
     ("STATS", "Historical risk, returns and what followed a condition", "conditional returns sma baseline", None),
     ("AAPL STATS", "AAPL historical risk and returns", "statistics research archive", None),
     ("COND", "Conditional forward returns vs baseline", "sma distribution overlap", None),
@@ -388,6 +390,10 @@ pub(super) fn static_items() -> Vec<Item> {
     v.push(
         Item::new(Kind::Panel, "New Journal pane", "NEW JOURNAL", Target::Run("NEW JOURNAL".into()))
             .keywords("panel pane journal checklist notes"),
+    );
+    v.push(
+        Item::new(Kind::Panel, "New Seasonality Studio", "NEW SEASON", Target::Run("NEW SEASON".into()))
+            .keywords("panel pane seasonal calendar SSN month weekday intraday"),
     );
     v.push(
         Item::new(Kind::Panel, "New Statistics pane", "NEW STATS", Target::Run("NEW STATS".into()))

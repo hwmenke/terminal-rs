@@ -310,6 +310,10 @@ impl TerminalApp {
                         "Trade journal: setup + checklist + planned $ risk; record $ and R; notes on chart dates",
                     ),
                     (
+                        &["SEASON", "SSN", "AAPL SEASON 30M"],
+                        "Seasonality Studio: month heatmap, calendar profiles and New York clock buckets",
+                    ),
+                    (
                         &["STATS", "AAPL STATS", "AAPL COND RSI(14) < 30"],
                         "Historical risk/returns; what followed low RSI or price above a moving average",
                     ),

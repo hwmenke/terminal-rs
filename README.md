@@ -221,6 +221,7 @@ gets the native title bar with traffic lights, window vibrancy behind the sideba
   attaches a note to a historical date; cyan **J** pins mark those dates on the chart.
   Rows persist in `trade_journal.json`. Sample bars never invent P&L. See
   [Trade journal](docs/TRADE_JOURNAL.md).
+- **Seasonality Studio** — `SEASON` / `SSN`, `AAPL SEASON 30M`: verified month heatmaps, calendar and New York clock profiles, and conditional forward returns. [Guide](docs/STUDIO_SEASON.md).
 - **Statistics and conditional returns** — `STATS` (or `AAPL STATS`) shows historical
   risk and returns from the research archive: annualised volatility, Sharpe, max
   drawdown, win rate, daily-return distribution, RSI/vol/KAMA deciles and

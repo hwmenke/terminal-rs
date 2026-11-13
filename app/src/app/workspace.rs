@@ -427,6 +427,13 @@ impl TerminalApp {
                 d.request(id, &self.worker, symbols);
                 PaneKind::Desk(d)
             }
+            PaneKind::StudioSeason(mut s) => {
+                if s.symbol.trim().is_empty() && let Some(sym) = self.focused_symbol() {
+                    s.symbol = sym;
+                }
+                s.request(id, &self.worker);
+                PaneKind::StudioSeason(s)
+            }
             PaneKind::Stats(mut s) => {
                 if s.symbol.trim().is_empty() {
                     if let Some(sym) = self.focused_symbol() {
@@ -1031,6 +1038,11 @@ impl TerminalApp {
             "JOURNAL" | "JRNL" | "CHECKLIST" | "TRADELOG" => {
                 let filter = given.clone().or(current.clone()).unwrap_or_default();
                 PaneKind::Journal(Box::new(super::journal::JournalPane::new(filter)))
+            }
+            "SEASON" | "SSN" => {
+                let symbol = symbol.map(|s| tr_data::security(s).key()).or_else(|| self.focused_symbol()).unwrap_or_default();
+                let spec = words.get(1..).unwrap_or(&[]).join(" ");
+                PaneKind::StudioSeason(Box::new(super::studio_season::SeasonPane::new(symbol, spec)))
             }
             "STATS" | "STAT" | "STATISTICS" | "COND" | "CDIST" | "CONDRET" => {
                 let symbol = given.or(current).unwrap_or_default();
