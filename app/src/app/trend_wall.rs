@@ -10,13 +10,14 @@ use tr_core::indicators::LaneStatus;
 use tr_core::{Security, Timeframe};
 use tr_data::stack_wall::{self, Row, Sort, Vote};
 
-#[derive(PartialEq)]
+#[derive(PartialEq, Clone)]
 struct MeshKey {
     revision: u64,
     rect: Rect,
     colors: [Color32; 4],
     sort: Sort,
 }
+#[derive(Clone)]
 pub struct TrendWallPane {
     pub spec: String,
     pub daily: bool,
@@ -319,6 +320,7 @@ impl TerminalApp {
     }
     pub(super) fn trend_wall_pane(&mut self, ui: &mut Ui, id: PaneId) -> Vec<Action> {
         let Some(i) = self.idx(id) else { return vec![] };
+        let arrival = self.handoff_arrival_style(ui, id);
         let group = self.watch_ui.selected_group.clone();
         let mut reload = false;
         let mut open = None;
@@ -386,12 +388,14 @@ impl TerminalApp {
                 }
             });
             if !p.rows.is_empty() {
-                open = paint_wall(ui, p);
+                open = paint_wall(ui, p, arrival.as_ref());
             }
             ui.label(
-                RichText::new("↑/↓ j/k select · Enter chart · S sort · D daily · R reload · / command")
-                    .font(mono(10.0))
-                    .color(muted()),
+                RichText::new(
+                    "↑/↓ j/k select · Enter chart · N next · ⇧N more · S sort · D daily · R reload · / command",
+                )
+                .font(mono(10.0))
+                .color(muted()),
             );
         }
         if reload {
@@ -436,7 +440,11 @@ fn number(value: f64, suffix: &str) -> String {
 const ROW: f32 = 22.0;
 const LEFT: f32 = 150.0;
 const RIGHT: f32 = 345.0;
-fn paint_wall(ui: &mut Ui, p: &mut TrendWallPane) -> Option<(String, Timeframe, bool)> {
+fn paint_wall(
+    ui: &mut Ui,
+    p: &mut TrendWallPane,
+    arrival: Option<&(String, Color32)>,
+) -> Option<(String, Timeframe, bool)> {
     let mut open = None;
     egui::ScrollArea::both().id_salt("trend-wall").show(ui, |ui| {
         let size = vec2(ui.available_width().max(980.0), 24.0 + p.rows.len() as f32 * ROW);
@@ -540,6 +548,16 @@ fn paint_wall(ui: &mut Ui, p: &mut TrendWallPane) -> Option<(String, Timeframe, 
         for (visible, &index) in indices.iter().enumerate() {
             let row = &p.rows[index];
             let y = plot.top() + visible as f32 * ROW;
+            if let Some((symbol, color)) = arrival
+                && tr_data::security(&row.symbol).key() == *symbol
+            {
+                painter.rect_stroke(
+                    Rect::from_min_size(pos2(rect.left(), y), vec2(rect.width(), ROW)),
+                    2.0,
+                    Stroke::new(2.0, *color),
+                    egui::StrokeKind::Inside,
+                );
+            }
             if p.selected == Some(index) {
                 painter.rect_stroke(
                     Rect::from_min_size(pos2(rect.left(), y), vec2(rect.width(), ROW)),
@@ -771,7 +789,7 @@ mod tests {
         let mut app = test_app();
         app.execute("NEW TWALL MSFT");
         app.cmd = "hello".into();
-        for k in [Key::J, Key::D, Key::S, Key::R, Key::Enter] {
+        for k in [Key::J, Key::D, Key::S, Key::R, Key::Enter, Key::N] {
             assert!(!key(&mut app, k));
         }
         let PaneKind::TrendWall(p) = &app.panes[app.idx(app.focus).unwrap()].kind else { panic!() };
@@ -821,7 +839,7 @@ mod tests {
                     ..Default::default()
                 },
                 |ui| {
-                    open = paint_wall(ui, p);
+                    open = paint_wall(ui, p, None);
                 },
             )
             .textures_delta

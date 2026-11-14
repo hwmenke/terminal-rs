@@ -1050,17 +1050,24 @@ impl TerminalApp {
                 PaneKind::Journal(Box::new(super::journal::JournalPane::new(filter)))
             }
             "DIST" | "RDIST" => {
-                let symbol = symbol.map(|s| tr_data::security(s).key()).or_else(|| self.focused_symbol()).unwrap_or_default();
+                let symbol =
+                    symbol.map(|s| tr_data::security(s).key()).or_else(|| self.focused_symbol()).unwrap_or_default();
                 let timeframe = tr_data::studio_dist::parse_timeframe(&words.get(1..).unwrap_or(&[]).join(" ")).ok()?;
-                PaneKind::StudioDist(Box::new(super::studio_dist::DistPane::new(symbol, timeframe, tr_data::studio_dist::Window::All)))
+                PaneKind::StudioDist(Box::new(super::studio_dist::DistPane::new(
+                    symbol,
+                    timeframe,
+                    tr_data::studio_dist::Window::All,
+                )))
             }
             "CORR" | "RBETA" => {
-                let symbol = symbol.map(|s| tr_data::security(s).key()).or_else(|| self.focused_symbol()).unwrap_or_default();
+                let symbol =
+                    symbol.map(|s| tr_data::security(s).key()).or_else(|| self.focused_symbol()).unwrap_or_default();
                 let spec = words.get(1..).unwrap_or(&[]).join(" ");
                 PaneKind::StudioCorr(Box::new(super::studio_corr::CorrPane::new(symbol, spec)))
             }
             "SEASON" | "SSN" => {
-                let symbol = symbol.map(|s| tr_data::security(s).key()).or_else(|| self.focused_symbol()).unwrap_or_default();
+                let symbol =
+                    symbol.map(|s| tr_data::security(s).key()).or_else(|| self.focused_symbol()).unwrap_or_default();
                 let spec = words.get(1..).unwrap_or(&[]).join(" ");
                 PaneKind::StudioSeason(Box::new(super::studio_season::SeasonPane::new(symbol, spec)))
             }
@@ -1289,6 +1296,15 @@ impl TerminalApp {
     /// name in the Blue link group (middle interval large, slow top-right, fast
     /// bottom-right), TSTACK and RAIL on. The previous layout is kept under its own name.
     pub(super) fn open_cockpit(&mut self, symbol: Option<&str>, spec: &str) {
+        self.build_cockpit(symbol, spec, true);
+    }
+
+    /// Hand-off workspaces are temporary: no synchronous layout/settings writes.
+    pub(super) fn handoff_cockpit(&mut self, symbol: &str) {
+        self.build_cockpit(Some(symbol), "", false);
+    }
+
+    fn build_cockpit(&mut self, symbol: Option<&str>, spec: &str, persist: bool) {
         let frames = match crate::command::cockpit_ladder(spec) {
             Ok(frames) => frames,
             Err(e) => {
@@ -1301,7 +1317,7 @@ impl TerminalApp {
             .filter(|s| !s.is_empty())
             .or_else(|| self.focused_symbol())
             .unwrap_or_else(|| tr_data::security("AAPL").key());
-        if !self.layout_name.eq_ignore_ascii_case(COCKPIT) {
+        if persist && !self.layout_name.eq_ignore_ascii_case(COCKPIT) {
             self.save_layout();
         }
         for p in std::mem::take(&mut self.panes) {
@@ -1334,8 +1350,10 @@ impl TerminalApp {
         self.preset = Some(Layout::MainRight2);
         self.focus = ids[0];
         self.layout_name = COCKPIT.into();
-        self.save_layout();
-        self.save_settings();
+        if persist {
+            self.save_layout();
+            self.save_settings();
+        }
         let ticker = tr_data::security(&key).ticker;
         self.status = format!("{ticker}: {chip} — native linked charts, Time Link, Lens, Alt+A anchors VWAP");
     }
@@ -1507,7 +1525,14 @@ impl TerminalApp {
 
     /// Replace the workspace with `doc`. Pane ids are reassigned so responses for the old
     /// panes can never reach the new ones.
-    pub(super) fn apply_doc(&mut self, mut doc: LayoutDoc) {
+    pub(super) fn apply_doc(&mut self, doc: LayoutDoc) {
+        self.apply_doc_with_origin(doc, None);
+    }
+
+    /// Restore a cached hand-off source at its snapshot ordinal, including transient
+    /// selection/filter/replay state. New ids isolate it from all departure responses.
+    pub(super) fn apply_doc_with_origin(&mut self, mut doc: LayoutDoc, mut origin: Option<(usize, PaneKind)>) {
+        let transient = origin.is_some();
         doc.repair();
         for p in std::mem::take(&mut self.panes) {
             self.worker.send(Request::Forget(p.id));
@@ -1517,8 +1542,16 @@ impl TerminalApp {
             self.watch_ui.selected_group = self.watchlists.last_used.clone();
         }
         let mut map = HashMap::new();
-        for sp in doc.panes {
-            let id = self.new_pane(PaneKind::from_settings(sp.settings));
+        for (ordinal, sp) in doc.panes.into_iter().enumerate() {
+            let id = if origin.as_ref().is_some_and(|(at, _)| *at == ordinal) {
+                let (_, kind) = origin.take().expect("source ordinal");
+                let id = self.next_id;
+                self.next_id += 1;
+                self.panes.push(Pane { id, kind, link: None, title: None, window: None });
+                id
+            } else {
+                self.new_pane(PaneKind::from_settings(sp.settings))
+            };
             map.insert(sp.id, id);
             if let Some(p) = self.pane_mut(id) {
                 p.link = sp.link;
@@ -1532,13 +1565,19 @@ impl TerminalApp {
             && !name.eq_ignore_ascii_case(&self.prefs.appearance.theme)
             && (name.eq_ignore_ascii_case(crate::themes::SYSTEM) || crate::themes::find(&self.themes, name).is_some())
         {
-            self.select_theme(name);
+            if transient {
+                self.prefs.appearance.theme = name.to_owned();
+            } else {
+                self.select_theme(name);
+            }
         }
         if let Some(side) = doc.sidebar_side
             && side != self.prefs.appearance.sidebar_side
         {
             self.prefs.appearance.sidebar_side = side;
-            self.save_prefs();
+            if !transient {
+                self.save_prefs();
+            }
         }
         self.dock = doc.dock;
         self.focus = doc.focus.and_then(|f| map.get(&f).copied()).unwrap_or(0);

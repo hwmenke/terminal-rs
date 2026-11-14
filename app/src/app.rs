@@ -15,6 +15,7 @@ mod compare;
 mod demo;
 mod desk;
 mod gap_fill;
+mod handoff;
 mod health_view;
 mod hotkeys_view;
 mod journal;
@@ -1044,6 +1045,7 @@ pub struct TerminalApp {
     dock: Node,
     focus: PaneId,
     next_id: PaneId,
+    handoff: handoff::Handoff,
     last_opened: Option<PaneId>,
     /// Preset last applied, for the toolbar picker (cleared by manual rearranging).
     preset: Option<Layout>,
@@ -1247,6 +1249,7 @@ impl TerminalApp {
             dock: Node::default(),
             focus: 0,
             next_id: 1,
+            handoff: Default::default(),
             last_opened: None,
             preset: None,
             drag: None,
@@ -2407,6 +2410,7 @@ impl TerminalApp {
     /// Global and chart hotkeys. Runs before the command line so it can claim keys; when
     /// the command line holds text, keys belong to it.
     fn hotkeys(&mut self, ctx: &egui::Context) {
+        self.clear_handoff_arrival_on_input(ctx);
         let presses: Vec<(Key, Modifiers)> = ctx.input(|i| {
             i.events
                 .iter()
@@ -2494,6 +2498,9 @@ impl TerminalApp {
         if other_text_focused {
             return;
         }
+        if !cmd_focused && !self.focus_cmd && self.cmd.is_empty() && self.handoff_keys(ctx) {
+            return;
+        }
         if !cmd_focused && !self.focus_cmd && self.cmd.is_empty() && self.clock_keys(ctx) {
             return;
         }
@@ -2579,7 +2586,9 @@ impl TerminalApp {
                 c.cancel();
             });
         }
-        if pressed(Modifiers::NONE, Key::Delete) || pressed(Modifiers::NONE, Key::Backspace) {
+        let delete = pressed(Modifiers::NONE, Key::Delete);
+        let backspace = !self.handoff_live() && pressed(Modifiers::NONE, Key::Backspace);
+        if delete || backspace {
             self.with_chart(|c, _| {
                 c.delete_selected();
             });
@@ -2814,6 +2823,9 @@ impl TerminalApp {
 
     /// Save the active layout (only when it changed) and app settings.
     fn autosave(&mut self) {
+        if self.handoff_live() {
+            return;
+        }
         self.save_dirty_themes(true);
         let json = self.current_doc().to_json();
         if json != self.last_saved {
@@ -3070,6 +3082,7 @@ mod tests {
             dock: Node::default(),
             focus: 0,
             next_id: 1,
+            handoff: Default::default(),
             last_opened: None,
             preset: None,
             drag: None,
