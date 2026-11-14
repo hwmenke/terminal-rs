@@ -3048,23 +3048,30 @@ impl ChartState {
         }
         let mut cloud = Vec::new();
         let (lo, hi) = v.visible_range(self.bars.len());
-        for band in self.built.iter().filter(|b| b.spec.code == "ZBAND" && b.overlays.len() == 5) {
+        for band in self.built.iter().filter(|b| b.spec.code == "ZBAND" && b.overlays.len() >= 5) {
             let mut mesh = egui::Mesh::default();
             let mut previous: Option<(u32, f32)> = None;
-            let rgba = band.overlays[2].1.color;
-            let color = Color32::from_rgb((rgba[0] * 255.0) as u8, (rgba[1] * 255.0) as u8, (rgba[2] * 255.0) as u8);
+            let rgb = |rgba: [f32; 4]| {
+                Color32::from_rgb((rgba[0] * 255.0) as u8, (rgba[1] * 255.0) as u8, (rgba[2] * 255.0) as u8)
+            };
+            let trusted = rgb(band.overlays[2].1.color);
+            let grey = band.overlays.get(7).map_or(trusted, |o| rgb(o.1.color));
+            let values_at = |i: usize| zband_values(band, i);
+            // Closed bars only: the forming slot is NaN, so the cloud must still
+            // reach the last finite bar even when it is not the last visible one.
+            let last = (lo..hi).rev().find(|&i| values_at(i).iter().all(|v| v.is_finite()));
             for i in lo..hi {
-                let values: [f64; 5] = std::array::from_fn(|k| {
-                    band.overlays[k].1.line.pyramid.data.get(i).map_or(f64::NAN, |p| p[1] as f64)
-                });
+                let values = values_at(i);
                 if values.iter().any(|v| !v.is_finite()) {
                     previous = None;
                     continue;
                 }
                 let x = rect.left() + v.x_center(i) as f32;
-                if previous.is_some_and(|(_, px)| x - px < 2.0) && i + 1 < hi {
+                if previous.is_some_and(|(_, px)| x - px < 2.0) && Some(i) != last {
                     continue;
                 }
+                let muted_here = band.honest_z.as_ref().and_then(|z| z.muted_at.get(i).copied()).unwrap_or(false);
+                let color = if muted_here { grey } else { trusted };
                 let base = mesh.vertices.len() as u32;
                 // Duplicate shared boundaries so the inner fill can have its own opacity.
                 for (upper, lower, alpha) in [(0, 1, 0.045), (1, 3, 0.13), (3, 4, 0.045)] {
@@ -3146,16 +3153,35 @@ impl ChartState {
         }
         let value_at = |l: &LineRef| l.pyramid.data.get(i).map(|p| p[1] as f64).filter(|v| v.is_finite());
         for bi in self.built.iter().filter(|b| !b.spec.is_pane()) {
-            let vals: Vec<String> = bi
-                .overlays
-                .iter()
-                .filter_map(|(_, o)| value_at(&o.line).map(|v| format!("{v:.prec$}", prec = dec.min(4))))
-                .collect();
-            let c = bi.overlays.get(bi.overlays.len() / 2).map_or(text(), |o| opaque(&o.1));
+            let honest = (bi.spec.code == "ZBAND").then_some(bi.honest_z.as_ref()).flatten();
+            // ZBAND statistics use closed bars only. On the forming bar show the
+            // last closed values, labelled, instead of a blank readout.
+            let zi = match honest {
+                Some(z) if i >= z.closed => z.closed.saturating_sub(1),
+                _ => i,
+            };
+            let vals: Vec<String> = if honest.is_some() {
+                zband_values(bi, zi)
+                    .iter()
+                    .filter(|v| v.is_finite())
+                    .map(|v| format!("{v:.prec$}", prec = dec.min(4)))
+                    .collect()
+            } else {
+                bi.overlays
+                    .iter()
+                    .filter_map(|(_, o)| value_at(&o.line).map(|v| format!("{v:.prec$}", prec = dec.min(4))))
+                    .collect()
+            };
+            let c = match honest {
+                Some(z) if z.muted_at.get(zi).copied().unwrap_or(true) => muted(),
+                Some(_) => opaque(&bi.overlays[2].1),
+                None => bi.overlays.get(bi.overlays.len() / 2).map_or(text(), |o| opaque(&o.1)),
+            };
             let title = if bi.spec.code == "ZBAND" {
-                match bi.z_readout.as_ref().and_then(|z| z.get(i)).filter(|z| z.is_finite()) {
-                    Some(z) => format!("{} · price sample σ(n−1) · z {z:+.1}", bi.spec.label()),
-                    None => format!("{} · price sample σ(n−1) · z —", bi.spec.label()),
+                let edge = if zi != i { " · last closed (forming bar excluded)" } else { "" };
+                match bi.z_readout.as_ref().and_then(|z| z.get(zi)).filter(|z| z.is_finite()) {
+                    Some(z) => format!("{} · price sample σ(n−1) · z {z:+.1}{edge}", bi.spec.label()),
+                    None => format!("{} · price sample σ(n−1) · z —{edge}", bi.spec.label()),
                 }
             } else if bi.spec.code == "VWAP" {
                 bi.overlays.first().map(|(n, _)| n.clone()).unwrap_or_else(|| bi.spec.label())
@@ -4360,6 +4386,16 @@ impl ChartState {
             ui.painter().galley(pos + vec2(4.0, 3.0), galley, text());
         }
     }
+}
+
+/// The five ZBAND lines at bar `i` (+2σ, +1σ, basis, −1σ, −2σ). Honest Z splits each
+/// line into a coloured half (overlays 0..5) and a grey half (5..10); take whichever
+/// half is finite. Missing bars are NaN.
+fn zband_values(band: &BuiltIndicator, i: usize) -> [f64; 5] {
+    let at = |k: usize| {
+        band.overlays.get(k).and_then(|o| o.1.line.pyramid.data.get(i)).map_or(f64::NAN, |p| p[1] as f64)
+    };
+    std::array::from_fn(|k| Some(at(k)).filter(|v| v.is_finite()).unwrap_or_else(|| at(k + 5)))
 }
 
 fn opaque(o: &Overlay) -> Color32 {

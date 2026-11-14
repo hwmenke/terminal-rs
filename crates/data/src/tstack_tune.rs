@@ -2,10 +2,12 @@
 use crate::{edge::EdgeCell, nulls::benjamini_hochberg};
 use tr_core::{
     AssetClass, Bar, Provenance, Timeframe,
-    indicators::{AdaptiveMethod, AdaptiveTrendParams, trend_stack},
+    indicators::{AdaptiveMethod, AdaptiveTrendParams, trend_grid},
 };
 
 pub const FDR: f64 = 0.10;
+/// Upper bound on worker threads one report may occupy.
+pub const MAX_THREADS: usize = 8;
 pub const HORIZON: usize = 5;
 pub const MAX_BARS: usize = 5_000;
 pub const ER_LENGTHS: [usize; 7] = [8, 12, 16, 20, 24, 32, 40];
@@ -128,13 +130,27 @@ pub fn compute(
     source: &str,
     gaps: &[(i64, i64)],
 ) -> Result<TuneReport, String> {
+    compute_capped(bars, tf, class, as_of, p, source, gaps, MAX_BARS)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn compute_capped(
+    bars: &[Bar],
+    tf: Timeframe,
+    class: AssetClass,
+    as_of: Option<i64>,
+    p: AdaptiveTrendParams,
+    source: &str,
+    gaps: &[(i64, i64)],
+    max_bars: usize,
+) -> Result<TuneReport, String> {
     let start = std::time::Instant::now();
     crate::stats::require_research_bars(bars, "TSTACK Tune")?;
     if p.mb_er == 0 || p.sb_er == 0 || p.lb_er == 0 || p.atr_n == 0 || !p.confirm_mult.is_finite() {
         return Err("TSTACK Tune refused: invalid trend parameters".into());
     }
     let n = crate::closed::closed_len(tf, bars, class, as_of);
-    let bars = &bars[n.saturating_sub(MAX_BARS)..n];
+    let bars = &bars[n.saturating_sub(max_bars)..n];
     if bars.len() < 256 {
         return Err("TSTACK Tune needs at least 256 verified closed bars; no sample fallback.".into());
     }
@@ -157,36 +173,30 @@ pub fn compute(
         .iter()
         .flat_map(|&min_hold| ers.iter().map(move |&mb_er| AdaptiveTrendParams { mb_er, min_hold, ..p }))
         .collect();
-    // No rayon dependency exists; bound parallel CPU work to four threads per report.
-    let stacks = std::thread::scope(|scope| {
-        let jobs: Vec<_> = params
-            .chunks(13)
-            .map(|chunk| {
-                scope.spawn(move || {
-                    chunk.iter().map(|&p| trend_stack(bars, tf, vec![], p)).collect::<Result<Vec<_>, _>>()
-                })
-            })
-            .collect();
-        let mut out = Vec::new();
-        for job in jobs {
-            out.extend(job.join().map_err(|_| "TSTACK Tune calculation panicked")??);
-        }
-        Ok::<_, String>(out)
-    })?;
+    // Shared baselines/ATR once, the medium baseline once per ER column, then only
+    // the sticky state machine per cell (bit-identical to 49 `trend_stack` calls).
+    let stacks = trend_grid(bars, tf, p, &ers, &holds)?;
     // Identical causal eligibility in every cell, including session-reset warmups.
     let eligible: Vec<_> = (0..bars.len()).map(|i| stacks.iter().all(|s| s.confidence[i].is_finite())).collect();
     let eligible_n = eligible.iter().filter(|&&v| v).count();
     if eligible_n < 200 {
         return Err("TSTACK Tune needs at least 200 common warmed closed bars across all settings.".into());
     }
-    let current = params.iter().position(|v| v.mb_er == p.mb_er && v.min_hold == p.min_hold).unwrap();
+    let current = params
+        .iter()
+        .position(|v| v.mb_er == p.mb_er && v.min_hold == p.min_hold)
+        .ok_or("TSTACK Tune internal error: current setting missing from grid")?;
     if !eligible[bars.len() - 1] {
         return Err("TSTACK Tune refused: current closed bar is still warming.".into());
     }
-    let regime = stacks[current].medium[bars.len() - 1];
+    let regime = stacks[current].medium_state[bars.len() - 1];
+    // The rotation null dominates; spread the 49 cells over the available cores
+    // with scoped std threads (no rayon dependency in this crate).
+    let threads = std::thread::available_parallelism().map_or(4, |n| n.get()).clamp(1, MAX_THREADS);
+    let per = stacks.len().div_ceil(threads);
     let edges = std::thread::scope(|scope| {
         let jobs: Vec<_> = stacks
-            .chunks(13)
+            .chunks(per)
             .map(|chunk| {
                 let eligible = &eligible;
                 scope.spawn(move || {
@@ -194,9 +204,12 @@ pub fn compute(
                         .iter()
                         .map(|s| {
                             let states: Vec<_> =
-                                s.medium.iter().zip(eligible).map(|(&s, &ok)| ok.then_some(s)).collect();
+                                s.medium_state.iter().zip(eligible).map(|(&s, &ok)| ok.then_some(s)).collect();
                             let r = crate::edge::regime_edge(bars, &states, &s.entry_long, &s.entry_short, &[HORIZON])?;
-                            Ok(r.cells.into_iter().find(|c| c.regime == regime).unwrap())
+                            r.cells
+                                .into_iter()
+                                .find(|c| c.regime == regime)
+                                .ok_or_else(|| "TSTACK Tune internal error: regime cell missing".to_string())
                         })
                         .collect::<Result<Vec<_>, String>>()
                 })
@@ -385,5 +398,23 @@ mod tests {
         assert_eq!(r.bars, 5000);
         eprintln!("TSTACK Tune 7×7 / 5,000 synthetic TEST bars: {:.1} ms ({} warmed)", r.elapsed_ms, r.eligible);
         // Timing is reported, not asserted: CI hardware and debug profiles vary.
+    }
+    /// `cargo test -p tr-data --release tstack_tune::tests::cold_grid_bench -- --ignored --nocapture`
+    #[test]
+    #[ignore = "timing benchmark"]
+    fn cold_grid_bench() {
+        for n in [5_000, 20_000] {
+            let b = bars(n);
+            let at = Some(b.last().unwrap().ts + 86400);
+            let mut best = f64::INFINITY;
+            for _ in 0..3 {
+                let t = std::time::Instant::now();
+                let r = compute_capped(&b, Timeframe::D1, AssetClass::Crypto, at, Default::default(), "bench", &[], n)
+                    .unwrap();
+                assert_eq!(r.bars, n);
+                best = best.min(t.elapsed().as_secs_f64() * 1000.0);
+            }
+            eprintln!("BENCH cold 7x7 grid on {n} synthetic bars: {best:.1} ms (best of 3)");
+        }
     }
 }

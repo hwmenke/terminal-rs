@@ -1337,6 +1337,13 @@ fn build_indicators_impl(
         .collect()
 }
 
+/// Keep the values whose drawn segment belongs to the `grey` half: bar t is kept
+/// when its own flag or the next bar's flag matches, so adjacent halves join.
+fn zband_split(values: &[f64], muted: &[bool], grey: bool) -> Vec<f64> {
+    let at = |t: usize| muted.get(t).copied().unwrap_or(true) == grey;
+    values.iter().enumerate().map(|(t, v)| if at(t) || at(t + 1) { *v } else { f64::NAN }).collect()
+}
+
 /// Chart-only closed-clock enrichment. Existing indicator calculations stay on
 /// the worker; ZBAND is rebuilt exclusively from admitted closed inputs.
 #[allow(clippy::too_many_arguments)]
@@ -1371,17 +1378,25 @@ pub(crate) fn build_chart_indicators(
             }
             Ok((band, report)) => {
                 indicator.refused = None;
-                let main = if report.muted() { palette.muted } else { palette.series[i % palette.series.len()] };
-                indicator.overlays = [
+                let main = palette.series[i % palette.series.len()];
+                let lines = [
                     ("+2σ", band.upper_two),
                     ("+1σ", band.upper_one),
                     ("Basis", band.mean),
                     ("−1σ", band.lower_one),
                     ("−2σ", band.lower_two),
-                ]
-                .into_iter()
-                .map(|(name, values)| (name.into(), overlay(&values, main, LineKind::Line)))
-                .collect();
+                ];
+                // Point-in-time styling: overlays 0..5 are the trusted (coloured)
+                // segments, 5..10 the grey ones. The segment ending at bar t takes
+                // bar t's flag, so each half keeps the joining bar t−1 as well.
+                let mut overlays = Vec::with_capacity(10);
+                for (grey, color) in [(false, main), (true, palette.muted)] {
+                    for (name, values) in &lines {
+                        let split = zband_split(values, &report.muted_at, grey);
+                        overlays.push(((*name).into(), overlay(&split, color, LineKind::Line)));
+                    }
+                }
+                indicator.overlays = overlays;
                 indicator.z_readout = Some(Arc::new(band.z));
                 indicator.honest_z = Some(Arc::new(report));
             }
@@ -6969,7 +6984,17 @@ mod tests {
         let a = build(&bars);
         let r = a[0].honest_z.as_ref().unwrap();
         assert!(r.trending);
-        assert!(a[0].overlays.iter().all(|(_, o)| o.color == theme::rgba(palette.muted)));
+        assert_eq!(a[0].overlays.len(), 10);
+        assert!(a[0].overlays[5..].iter().all(|(_, o)| o.color == theme::rgba(palette.muted)));
+        assert!(a[0].overlays[..5].iter().all(|(_, o)| o.color != theme::rgba(palette.muted)));
+        // Each bar is drawn by the half matching its own point-in-time flag.
+        let value = |k: usize, t: usize| a[0].overlays[k].1.line.pyramid.data.get(t).map_or(f64::NAN, |p| p[1] as f64);
+        for t in 20..599 {
+            let half = if r.muted_at[t] { 5 } else { 0 };
+            assert!(value(half + 2, t).is_finite(), "bar {t} missing from its half");
+        }
+        // The last closed bars are trending: grey only, no coloured basis there.
+        assert!(r.muted_at[598] && value(2, 597).is_nan() && value(7, 598).is_finite());
         assert!(a[0].z_readout.as_ref().unwrap()[599].is_nan());
         bars[599].close *= 2.0;
         bars[599].high = bars[599].close;
@@ -6978,6 +7003,16 @@ mod tests {
         bars[599].provenance = tr_core::Provenance::Sample;
         let b = build(&bars);
         assert!(b[0].refused.is_some() && b[0].overlays.is_empty() && b[0].honest_z.is_none());
+    }
+
+    #[test]
+    fn zband_split_joins_halves_at_transitions() {
+        let v = [1.0, 2.0, 3.0, 4.0, 5.0];
+        let muted = [true, true, false, false, true];
+        let keep = |grey| zband_split(&v, &muted, grey).iter().map(|x| x.is_finite()).collect::<Vec<_>>();
+        // Coloured: bars 2,3 plus joining bar 1; grey: 0,1, the joining bar 3, and 4.
+        assert_eq!(keep(false), [false, true, true, true, false]);
+        assert_eq!(keep(true), [true, true, false, true, true]);
     }
 
     #[test]
