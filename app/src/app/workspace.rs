@@ -1702,6 +1702,17 @@ impl TerminalApp {
             return;
         }
         let op = match first.as_str() {
+            // Bare SAVE / Ctrl+S mid-hop saves only the origin under its own name:
+            // the visible view may carry a temporary name (e.g. "Cockpit") that is
+            // also a user layout, so keeping it takes an explicit LAYOUT SAVE <name>.
+            "SAVE" if words.len() == 1 && self.handoff_live() => {
+                if self.save_layout() {
+                    let origin = self.handoff_origin_name().unwrap_or_default().to_owned();
+                    self.status =
+                        format!("Saved layout {origin:?}; this hand-off view is temporary (LAYOUT SAVE <name> keeps it)");
+                }
+                return;
+            }
             "SAVE" if words.len() == 1 => {
                 if !self.save_layout_view_as(&self.layout_name.clone()) {
                     return;
@@ -1759,7 +1770,10 @@ impl TerminalApp {
                 if name.is_empty() {
                     anyhow::bail!("LAYOUT SAVEAS needs a name");
                 }
-                if self.store.exists(&name) && !name.eq_ignore_ascii_case(&self.layout_name) {
+                // Mid-hop the user's real layout is the origin; the hop's temporary
+                // name (which may match a saved layout) never licenses an overwrite.
+                let current = self.handoff_origin_name().unwrap_or(&self.layout_name);
+                if self.store.exists(&name) && !name.eq_ignore_ascii_case(current) {
                     anyhow::bail!("a layout named {name:?} already exists (LAYOUT DEL it first)");
                 }
                 // With hops live this persists the origin; the view then stops being

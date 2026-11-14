@@ -3,8 +3,9 @@
 //! Persistence while hops are live: hop layouts are never written under a layout name.
 //! Autosave / quit persist the stack's *origin* layout instead, folded down through
 //! every hop with the edits the user made to panes no hop replaced or retargeted
-//! (see [`carry_edits`]). Explicit `LAYOUT SAVE` / `SAVEAS` adopt the current view;
-//! other layout operations first unwind to the origin.
+//! (see [`carry_edits`]). Bare `LAYOUT SAVE` / Ctrl+S also saves only the origin;
+//! `LAYOUT SAVE <name>` / `SAVEAS <name>` adopt the current view under that explicit
+//! name; other layout operations first unwind to the origin.
 use super::{PaneKind, TerminalApp};
 use crate::{
     anim,
@@ -1358,6 +1359,54 @@ mod tests {
     }
 
     #[test]
+    fn save_hotkey_and_bare_save_mid_hop_never_overwrite_a_named_layout() {
+        let mut app = app();
+        app.layout_name = "Cockpit".into();
+        app.open_panel(PaneKind::Help);
+        app.save_layout();
+        let users_cockpit = app.store.load("Cockpit").unwrap();
+        app.apply_doc(LayoutDoc::default_workspace("Scratch", &app.prefs.panels));
+        wall(&mut app, false);
+        let before = normalized(&app);
+        next(&mut app);
+        assert_eq!(app.layout_name, "Cockpit");
+        // Ctrl+S, then the typed command: both save only the origin.
+        app.run_hotkey(crate::prefs::Action::SaveLayout);
+        app.layout_command("SAVE");
+        assert_eq!(app.store.load("Cockpit").unwrap(), users_cockpit);
+        assert!(app.handoff_live(), "the way back survives");
+        assert!(app.status.contains("\"Scratch\"") && app.status.contains("LAYOUT SAVE"), "{}", app.status);
+        assert_eq!(saved_settings(&app.store.load("Scratch").unwrap()), saved_settings(&before));
+        // The explicit temporary name is refused like any other existing layout.
+        app.layout_command("SAVE Cockpit");
+        assert!(app.status.contains("already exists"), "{}", app.status);
+        assert_eq!(app.store.load("Cockpit").unwrap(), users_cockpit);
+        assert!(app.handoff_live());
+        app.autosave();
+        eframe::App::on_exit(&mut app);
+        assert_eq!(app.store.load("Cockpit").unwrap(), users_cockpit);
+        back(&mut app);
+        assert!(!app.handoff_live());
+        assert_eq!(app.layout_name, "Scratch");
+        assert_eq!(normalized(&app), before);
+
+        // Light hop (layout keeps its name): bare SAVE leaves CLOCK out of the save.
+        let mut app = self::app();
+        app.layout_name = "Scratch".into();
+        wall(&mut app, true);
+        next(&mut app);
+        app.layout_command("SAVE");
+        assert!(app.handoff_live());
+        let saved = app.store.load("Scratch").unwrap();
+        assert!(!saved.panes.iter().any(|p| matches!(p.settings, crate::layouts::PaneSettings::SessionClock { .. })));
+        // Explicitly naming the origin replaces it with the view, as SAVE <current> does.
+        app.layout_command("SAVE Scratch");
+        assert!(!app.handoff_live());
+        let saved = app.store.load("Scratch").unwrap();
+        assert!(saved.panes.iter().any(|p| matches!(p.settings, crate::layouts::PaneSettings::SessionClock { .. })));
+    }
+
+    #[test]
     fn nested_hops_preserve_safe_edits_before_and_after_pane_ids_change() {
         let mut app = app();
         app.layout_name = "Scratch".into();
@@ -1428,11 +1477,13 @@ mod tests {
         app.layout_command("SAVEAS Review");
         assert!(app.handoff_live());
         assert!(app.status.contains("already exists"));
+        // Bare SAVE mid-hop never writes the view under its temporary name.
         std::fs::create_dir_all(app.store.path("Cockpit")).unwrap();
         app.layout_command("SAVE");
         assert!(app.handoff_live());
         assert_eq!(app.layout_name, "Cockpit");
-        assert!(app.status.contains("Could not save layout"));
+        assert!(app.status.contains("temporary"), "{}", app.status);
+        assert!(app.store.path("Cockpit").is_dir());
         assert_eq!(saved_settings(&app.store.load("Scratch").unwrap()), saved_settings(&origin));
         back(&mut app);
         assert_eq!(normalized(&app), origin);
@@ -1540,7 +1591,7 @@ mod tests {
         assert!(app.store.exists("Ideas") && !app.store.exists("Scratch") && !app.store.exists("Cockpit"));
         assert!(matches!(app.panes[app.idx(app.focus).unwrap()].kind, PaneKind::TrendWall(_)));
 
-        // SAVE adopts what is on screen, after the origin is safely written.
+        // SAVE <name> adopts what is on screen, after the origin is safely written.
         let mut app = super::super::tests::test_app();
         let (worker, _) = Worker::test_live_channel();
         app.worker = worker;
@@ -1548,8 +1599,10 @@ mod tests {
         app.layout_name = "Scratch".into();
         wall(&mut app, false);
         next(&mut app);
-        app.layout_command("SAVE");
+        app.layout_command("SAVE Desk");
         assert!(!app.handoff_live());
+        assert_eq!(app.layout_name, "Desk");
+        assert!(!app.store.exists("Cockpit"));
         assert!(
             app.store
                 .load("Scratch")
@@ -1558,7 +1611,7 @@ mod tests {
                 .iter()
                 .any(|p| matches!(p.settings, crate::layouts::PaneSettings::TrendWall { .. }))
         );
-        assert_eq!(app.store.load("Cockpit").unwrap().panes.len(), 3);
+        assert_eq!(app.store.load("Desk").unwrap().panes.len(), 3);
 
         // COCKPIT command mid-hop: back to the real layout, then the normal command.
         let mut app = super::super::tests::test_app();
