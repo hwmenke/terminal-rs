@@ -2695,7 +2695,7 @@ impl TerminalApp {
             }
             A::ClosePane => self.close_pane(self.focus),
             A::PopOut => self.pop_out(self.focus),
-            // Same as LAYOUT SAVE (adopts a live hand-off view after saving its origin).
+            // Same as LAYOUT SAVE (mid-hop: saves the origin only, never the temporary view).
             A::SaveLayout => self.layout_command("SAVE"),
             A::Settings => self.apply(Function::Settings),
             A::CommandPalette => self.palette.toggle(),

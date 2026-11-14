@@ -70,10 +70,16 @@ on return. The source, dock arrangement and pop-out geometry return as snapshott
 new panes and changes to panes a hop created, replaced or retargeted are temporary.
 A source closed after departure still returns from its snapshot.
 
-**LAYOUT SAVE** (also the Save Layout hotkey) adopts the visible workspace under
-its displayed name; **LAYOUT SAVEAS name** adopts it under the requested name.
-Both first save the origin, and clear the stack only after the visible view is
-saved successfully. Use these to keep work on temporary destinations. Switching,
+Bare **LAYOUT SAVE** (also the Save Layout hotkey, Ctrl/Cmd+S) mid-hop saves only
+the origin (with the folded-back edits) under the origin's own name and leaves the
+stack live, so Backspace still returns; a toast says the visible view is temporary.
+It never writes the view under its displayed name, which may be a user layout
+(e.g. your own "Cockpit"). To keep a destination, use **LAYOUT SAVE name** /
+**SAVEAS name**: it first saves the origin, then saves the visible workspace under
+`name` and clears the stack only after that write succeeds. As outside a hop, an
+existing layout is refused unless `name` is the current layout, which mid-hop
+means the origin (explicitly replacing it with the view); the hop's temporary
+name never counts, so `LAYOUT SAVE Cockpit` won't overwrite a saved Cockpit. Switching,
 renaming, duplicating, deleting or exporting layouts, changing their theme policy,
 or running the COCKPIT/Intraday desk command first returns to the origin.
 
