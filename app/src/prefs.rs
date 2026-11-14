@@ -268,6 +268,7 @@ pub enum Action {
     DrawFib,
     DrawAnchoredVwap,
     ToggleTrendCone,
+    ToggleAuctionMap,
     ResetView,
     JumpLatest,
     LogScale,
@@ -284,7 +285,7 @@ pub enum Action {
 }
 
 impl Action {
-    pub const ALL: [Action; 58] = [
+    pub const ALL: [Action; 59] = [
         Action::Vault,
         Action::Help,
         Action::Congress,
@@ -330,6 +331,7 @@ impl Action {
         Action::DrawFib,
         Action::DrawAnchoredVwap,
         Action::ToggleTrendCone,
+        Action::ToggleAuctionMap,
         Action::ResetView,
         Action::JumpLatest,
         Action::LogScale,
@@ -391,6 +393,7 @@ impl Action {
             Action::DrawVertical => "Draw vertical line".into(),
             Action::DrawFib => "Draw Fibonacci retracement".into(),
             Action::Vault => "Open Bar Vault".into(),
+            Action::ToggleAuctionMap => "Toggle Auction Map".into(),
             Action::ToggleTrendCone => "Toggle Trend Cone".into(),
             Action::DrawAnchoredVwap => "Anchor VWAP on a clicked bar".into(),
             Action::ResetView => "Reset chart view".into(),
@@ -423,6 +426,7 @@ impl Action {
             | A::DrawHorizontal
             | A::DrawVertical
             | A::DrawFib
+            | A::ToggleAuctionMap
             | A::ToggleTrendCone
             | A::DrawAnchoredVwap
             | A::ResetView
@@ -628,6 +632,7 @@ impl Default for Keymap {
         bind(Action::DrawFib, "Alt+F");
         bind(Action::DrawAnchoredVwap, "Alt+A");
         bind(Action::ToggleTrendCone, "Alt+C");
+        bind(Action::ToggleAuctionMap, "Alt+P");
         bind(Action::Vault, "Alt+B");
         bind(Action::ResetView, "Alt+R");
         bind(Action::JumpLatest, "End");
@@ -796,9 +801,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn alt_b_opens_vault_and_action_all_has_58_entries() {
+    fn alt_b_opens_vault_and_action_all_has_59_entries() {
         let keys = Keymap::default();
-        assert_eq!(Action::ALL.len(), 58);
+        assert_eq!(Action::ALL.len(), 59);
         assert_eq!(keys.0.get(&Action::Vault), Some(&"Alt+B".to_string()));
     }
     #[test]
@@ -962,5 +967,18 @@ mod tests {
         assert_eq!(Chord::parse(cone), Chord::parse("Alt+C"));
         assert_eq!(keys.0.values().filter(|key| *key == cone).count(), 1);
         assert_eq!(Action::ToggleTrendCone.category(), "Chart");
+    }
+}
+
+#[cfg(test)]
+mod auction_tests {
+    use super::*;
+    #[test]
+    fn alt_p_is_unique_and_chart_scoped() {
+        let keys = Keymap::default();
+        let key = keys.0.get(&Action::ToggleAuctionMap).unwrap();
+        assert_eq!(Chord::parse(key), Chord::parse("Alt+P"));
+        assert_eq!(keys.0.values().filter(|k| *k == key).count(), 1);
+        assert_eq!(Action::ToggleAuctionMap.category(), "Chart");
     }
 }

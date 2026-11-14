@@ -272,6 +272,7 @@ gets the native title bar with traffic lights, window vibrancy behind the sideba
   | `AVWAP CLEAR` / click flag + `Del` | Remove all / one anchor (max 4 per name) |
   | `⇧ Click` / menu "Center linked charts here" | Scroll linked charts to that time |
 
+- **Auction Map** — `AUCTION` / `AMAP` / **Alt+P** toggles verified closed RTH session profiles, a composite dock and naked POC/VAH/VAL. `AUCTION VIS` follows visible whole sessions; click a level tag to centre its origin, Alt+click to anchor VWAP. See [Auction Map](docs/AUCTION_MAP.md).
 - **Trend Cone (Edge v2)** — `CONE` / **Alt+C** toggles a forward
   P10/25/50/75/90 fan from the last closed bar, coloured by the current TSTACK
   medium regime, with a grey unconditional fan underneath. Gradient fills,

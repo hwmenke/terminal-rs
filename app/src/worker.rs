@@ -102,8 +102,17 @@ pub enum Request {
         archive: bool,
         base: Arc<Vec<Bar>>,
     },
-    /// Closed-bar path bootstrap and walk-forward calibration on this pane's own
-    /// verified bars. All statistics run in spawn_blocking; no provider access.
+    /// Verified closed-session profiles with an optional shared fine-bar read.
+    AuctionMap {
+        pane: PaneId,
+        key: tr_data::auction::AuctionKey,
+        symbol: String,
+        class: tr_core::AssetClass,
+        bars: Arc<Vec<Bar>>,
+        as_of: Option<i64>,
+        stitch: Option<Arc<tr_data::vault::StitchInfo>>,
+    },
+    /// Closed-bar path bootstrap and walk-forward calibration on verified bars.
     TrendCone {
         pane: PaneId,
         key: tr_data::trend_cone::ConeKey,
@@ -615,7 +624,12 @@ pub enum Response {
         base_len: usize,
         result: Result<LineRef, String>,
     },
-    /// Predictive quantiles and causal coverage for exactly the keyed input.
+    /// Timestamp-anchored profiles for exactly the keyed chart input.
+    AuctionMap {
+        pane: PaneId,
+        key: tr_data::auction::AuctionKey,
+        result: Result<Arc<tr_data::auction::AuctionReport>, String>,
+    },
     TrendCone {
         pane: PaneId,
         key: tr_data::trend_cone::ConeKey,
@@ -848,6 +862,12 @@ struct LaneSlot {
     completed: std::sync::atomic::AtomicI64,
 }
 
+type FineBars = (Vec<Bar>, tr_data::vault::StitchInfo);
+#[derive(Default)]
+struct FineSlot {
+    value: tokio::sync::OnceCell<Option<Arc<FineBars>>>,
+    completed: std::sync::atomic::AtomicI64,
+}
 type NativeKey = (String, Timeframe, Option<i64>, usize);
 #[derive(Clone, Copy)]
 struct VaultObservation {
@@ -883,6 +903,7 @@ struct Shared {
     archive_daily: std::sync::Mutex<SeriesMap>,
     wall_generations: std::sync::Mutex<HashMap<PaneId, u64>>,
     stack_lanes: std::sync::Mutex<HashMap<LaneKey, Arc<LaneSlot>>>,
+    auction_fine: std::sync::Mutex<HashMap<String, Arc<FineSlot>>>,
     wall_fetches: tokio::sync::Semaphore,
     cache: Arc<std::sync::Mutex<Option<BarVault>>>,
     reports: Arc<tr_data::report_cache::ReportCache>,
@@ -1066,6 +1087,7 @@ impl Worker {
             followers: Default::default(),
             archive_daily: Default::default(),
             stack_lanes: Default::default(),
+            auction_fine: Default::default(),
             wall_fetches: tokio::sync::Semaphore::new(4),
             wall_generations: Default::default(),
             cache: Default::default(),
@@ -1502,6 +1524,17 @@ async fn native_fetch(
     end: Option<i64>,
     limit: usize,
 ) -> anyhow::Result<(Vec<Bar>, String, VaultObservation)> {
+    native_fetch_with_clock(s, symbol, tf, end, limit, || chrono::Utc::now().timestamp()).await
+}
+
+async fn native_fetch_with_clock(
+    s: &Shared,
+    symbol: &str,
+    tf: Timeframe,
+    end: Option<i64>,
+    limit: usize,
+    clock: impl FnOnce() -> i64,
+) -> anyhow::Result<(Vec<Bar>, String, VaultObservation)> {
     let key = (tr_data::security(symbol).key(), tf, end, limit);
     let slot = {
         let mut pending = s.native.lock().expect("native fetches");
@@ -1510,7 +1543,7 @@ async fn native_fetch(
     let result = slot
         .get_or_init(|| async {
             let response = s.provider.history_sourced(symbol, tf, end, limit).await;
-            let at = chrono::Utc::now().timestamp();
+            let at = clock();
             let (bars, source) = match response {
                 Ok(response) => response,
                 Err(error) => {
@@ -1654,6 +1687,122 @@ async fn cached_study<T: Clone + Send + Sync + 'static>(
     tokio::task::spawn_blocking(move || reports.get_or_compute(key, compute).map(|v| (*v).clone()))
         .await?
         .map_err(anyhow::Error::msg)
+}
+
+const AUCTION_FINE_LIMIT: usize = 9_000;
+/// Pane-free fine fetch: does not change chart sources, observation clocks or feeds.
+async fn auction_fine_bars(s: &Shared, symbol: &str) -> Option<Arc<FineBars>> {
+    use std::sync::atomic::Ordering;
+    let symbol = tr_data::security(symbol).key();
+    let now = chrono::Utc::now().timestamp();
+    let slot = {
+        let mut slots = s.auction_fine.lock().unwrap();
+        slots.retain(|_, v| v.value.get().is_none() || now.saturating_sub(v.completed.load(Ordering::Acquire)) < 45);
+        if slots.len() >= 160 && !slots.contains_key(&symbol) {
+            let oldest = slots
+                .iter()
+                .filter(|(_, v)| v.value.get().is_some())
+                .min_by_key(|(_, v)| v.completed.load(Ordering::Acquire))
+                .map(|(k, _)| k.clone());
+            if let Some(k) = oldest {
+                slots.remove(&k);
+            }
+        }
+        slots.entry(symbol.clone()).or_default().clone()
+    };
+    slot.value
+        .get_or_init(|| async {
+            let fetched = match native_fetch(s, &symbol, Timeframe::M1, None, default_limit(Timeframe::M1)).await {
+                Ok((bars, source, observation)) => {
+                    Some(stitch_native(s, &symbol, Timeframe::M1, bars, source, AUCTION_FINE_LIMIT, observation).await)
+                }
+                Err(_) => {
+                    let symbol = symbol.clone();
+                    cache_op(s, move |v| {
+                        let Some(id) = v.sole_series(&symbol, Timeframe::M1)? else { return Ok(None) };
+                        Ok(Some(v.stitch(&id, &[], AUCTION_FINE_LIMIT, None)?))
+                    })
+                    .await
+                    .flatten()
+                }
+            };
+            let result = fetched.filter(|(bars, info)| {
+                !bars.is_empty()
+                    && Bar::require_verified(bars, "Auction Map").is_ok()
+                    && !info.note.as_ref().is_some_and(|n| n.contains("QUARANTINED"))
+            });
+            slot.completed.store(chrono::Utc::now().timestamp(), Ordering::Release);
+            result.map(Arc::new)
+        })
+        .await
+        .clone()
+}
+#[allow(clippy::too_many_arguments)]
+async fn auction_map(
+    s: &Shared,
+    symbol: &str,
+    class: tr_core::AssetClass,
+    bars: Arc<Vec<Bar>>,
+    key: &tr_data::auction::AuctionKey,
+    as_of: Option<i64>,
+    stitch: Option<Arc<tr_data::vault::StitchInfo>>,
+) -> Result<Arc<tr_data::auction::AuctionReport>, String> {
+    if s.sample_mode() {
+        return Err("Auction Map refused: sample / offline display mode".into());
+    }
+    if !key.tf.is_intraday() || key.tf.seconds() > 3600 {
+        return Err("Auction Map needs a live intraday chart (1m–1h)".into());
+    }
+    // Refuse before fetching any fine data. Admission itself runs off the UI thread.
+    Bar::require_verified(&bars, "Auction Map")?;
+    if !tr_data::time_link::cash_class(class) || tr_data::cash_session::require_us_session(symbol, None).is_err() {
+        return Err("Auction Map needs a US cash session".into());
+    }
+    let fine = if key.tf == Timeframe::M1 { None } else { auction_fine_bars(s, symbol).await };
+    let reports = s.reports.clone();
+    let key = key.clone();
+    let symbol = symbol.to_owned();
+    tokio::task::spawn_blocking(move || {
+        let chart = tr_data::vault::research_bars(&bars, stitch.as_deref())?;
+        let n = tr_data::closed::closed_len(key.tf, &chart, class, as_of).min(key.closed);
+        let chart = &chart[..n];
+        let cut = chart
+            .last()
+            .map(|b| tr_data::time_link::bar_end(key.tf, b.ts, true))
+            .ok_or("Auction Map needs closed verified bars")?;
+        let mut gaps = stitch.as_ref().map_or_else(Vec::new, |s| s.gaps.clone());
+        if let Some(f) = &fine {
+            gaps.extend_from_slice(&f.1.gaps);
+        }
+        gaps.sort_unstable();
+        gaps.dedup();
+        let fine_bars = fine.as_ref().map(|f| f.0.as_slice());
+        let fine_closed = fine_bars.map(|b| &b[..b.partition_point(|b| b.ts + 60 <= cut)]);
+        let price = chart.last().unwrap().close;
+        let tick = if price >= 1. { 0.01 } else { 0.0001 };
+        let source = stitch.as_ref().map_or("verified chart bars".into(), |s| s.label());
+        let fine_id = fine.as_ref().map(|f| (&f.1.source, f.1.epoch, &f.1.note));
+        let mut cache_key = tr_data::report_cache::ReportKey::new(
+            "auction",
+            &symbol,
+            key.tf,
+            &source,
+            chart,
+            &format!(
+                "{:?} {class:?} cut={cut} gaps={gaps:?} tick={tick} fine={fine_id:?} digest={}",
+                key.params,
+                tr_data::stable_hash::bars_digest(fine_closed.unwrap_or(&[]))
+            ),
+        );
+        cache_key.epoch = stitch.as_ref().map_or(0, |s| s.epoch);
+        reports.get_or_compute(cache_key, || {
+            let mut r = tr_data::auction::build(chart, key.tf, fine_closed, class, cut, &gaps, key.params, tick)?;
+            r.source = fine.as_ref().map_or(source.clone(), |f| format!("{source} · fine {}", f.1.label()));
+            Ok(r)
+        })
+    })
+    .await
+    .unwrap_or_else(|e| Err(format!("Auction Map task failed: {e}")))
 }
 
 /// Coalesce only the same native key. Never hold the map lock across an await.
@@ -3352,6 +3501,10 @@ async fn handle_inner(s: &Arc<Shared>, req: Request, force: bool) {
                 base_len: base.len(),
                 result: result.map_err(|e: anyhow::Error| format!("{e:#}")),
             });
+        }
+        Request::AuctionMap { pane, key, symbol, class, bars, as_of, stitch } => {
+            let result = auction_map(s, &symbol, class, bars, &key, as_of, stitch).await;
+            s.send(Response::AuctionMap { pane, key, result });
         }
         Request::TrendCone { pane, key, class, bars, as_of, stitch } => {
             let config = key.clone();
@@ -5266,11 +5419,11 @@ mod tests {
         record_chart_source(&s, 1, 2, "yahoo");
         assert!(s.chart_sources.lock().unwrap().is_empty());
     }
-    struct VaultProvider {
-        bars: std::sync::Mutex<Vec<Bar>>,
-        calls: std::sync::atomic::AtomicUsize,
-        fail: std::sync::atomic::AtomicBool,
-        sample: bool,
+    pub(super) struct VaultProvider {
+        pub(super) bars: std::sync::Mutex<Vec<Bar>>,
+        pub(super) calls: std::sync::atomic::AtomicUsize,
+        pub(super) fail: std::sync::atomic::AtomicBool,
+        pub(super) sample: bool,
     }
     #[async_trait::async_trait]
     impl tr_data::MarketData for VaultProvider {
@@ -5298,13 +5451,13 @@ mod tests {
             Ok((self.bars.lock().unwrap().clone(), "yahoo".into()))
         }
     }
-    fn vault_day(s: &str) -> Vec<Bar> {
+    pub(super) fn vault_day(s: &str) -> Vec<Bar> {
         tr_data::intraday::regular_opens(s.parse().unwrap(), Timeframe::M5)
             .into_iter()
             .map(|ts| Bar::new(ts, 100., 101., 99., 100., 1000.).with_provenance(tr_core::Provenance::Real))
             .collect()
     }
-    fn vault_provider(bars: Vec<Bar>) -> Arc<VaultProvider> {
+    pub(super) fn vault_provider(bars: Vec<Bar>) -> Arc<VaultProvider> {
         Arc::new(VaultProvider {
             bars: std::sync::Mutex::new(bars),
             calls: Default::default(),
@@ -5459,24 +5612,27 @@ mod tests {
     }
     #[tokio::test]
     async fn two_identical_native_requests_share_fetch_and_ingest() {
-        let provider = vault_provider(vault_day("2026-11-10"));
+        let bars = vault_day("2026-11-10");
+        // Vault admission waits twenty seconds past close before admitting a bar.
+        let at = bars.last().unwrap().ts + Timeframe::M5.seconds() + 30;
+        let provider = vault_provider(bars.clone());
         let (s, _) = shared(provider.clone(), Some(BarCache::open_in_memory().unwrap()));
         let (a, b) = tokio::join!(
-            analysis_bars(&s, "AAPL", Timeframe::M5, 100, "test"),
-            analysis_bars(&s, "AAPL", Timeframe::M5, 100, "test")
+            native_fetch_with_clock(&s, "AAPL", Timeframe::M5, None, 100, || at),
+            native_fetch_with_clock(&s, "AAPL", Timeframe::M5, None, 100, || at)
         );
-        assert!(a.is_ok() && b.is_ok());
-        assert_eq!(provider.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
-        let now = chrono::Utc::now().timestamp();
-        let snap = s.cache.lock().unwrap().as_ref().unwrap().snapshot(None, now).unwrap();
-        // The fetch is booked under today's New York date; coverage lists session
-        // days only, so on weekends/holidays the counter is not visible there.
-        let total = snap.series[0].cells.iter().map(|c| u32::from(c.fetch_ok)).sum::<u32>();
-        if tr_data::history::calendar::is_session(tr_core::ny::civil(now).date()) {
-            assert_eq!(total, 1);
-        } else {
-            assert_eq!(total, 0);
+        for result in [a, b] {
+            let (fetched, source, observation) = result.unwrap();
+            assert_eq!(fetched, bars);
+            assert_eq!(source, "yahoo");
+            assert_eq!(observation.at, at);
+            assert!(observation.admitted);
         }
+        assert_eq!(provider.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        let snap = s.cache.lock().unwrap().as_ref().unwrap().snapshot(None, at).unwrap();
+        assert_eq!(snap.series.len(), 1);
+        assert_eq!(snap.series[0].cells.iter().map(|c| u32::from(c.fetch_ok)).sum::<u32>(), 1);
+        assert_eq!(snap.series[0].bars, bars.len());
     }
     #[tokio::test]
     async fn every_intraday_study_uses_sourced_analysis() {
@@ -6076,7 +6232,7 @@ mod tests {
         }
     }
 
-    fn shared(provider: Provider, cache: Option<BarCache>) -> (Arc<Shared>, mpsc::Receiver<Response>) {
+    pub(super) fn shared(provider: Provider, cache: Option<BarCache>) -> (Arc<Shared>, mpsc::Receiver<Response>) {
         let (out, rx) = mpsc::channel();
         (
             Arc::new(Shared {
@@ -6092,6 +6248,7 @@ mod tests {
                 followers: Default::default(),
                 archive_daily: Default::default(),
                 stack_lanes: Default::default(),
+                auction_fine: Default::default(),
                 wall_fetches: tokio::sync::Semaphore::new(4),
                 wall_generations: Default::default(),
                 cache: Arc::new(std::sync::Mutex::new(
@@ -7108,6 +7265,7 @@ mod tests {
             followers: Default::default(),
             archive_daily: Default::default(),
             stack_lanes: Default::default(),
+            auction_fine: Default::default(),
             wall_fetches: tokio::sync::Semaphore::new(4),
             wall_generations: Default::default(),
             cache: Default::default(),
@@ -7565,5 +7723,197 @@ mod enriched_scan_tests {
         assert_eq!(filtered.scanned, 3);
         assert_eq!(filtered.results.len(), 1);
         assert_eq!(filtered.results[0].symbol, "WIN");
+    }
+}
+
+#[cfg(test)]
+mod auction_tests {
+    use super::{tests::*, *};
+    use std::sync::atomic::Ordering;
+    use tr_data::auction::{AuctionKey, AuctionParams};
+    fn fine_day() -> Vec<Bar> {
+        tr_data::intraday::regular_opens("2026-11-10".parse().unwrap(), Timeframe::M1)
+            .into_iter()
+            .map(|ts| Bar::new(ts, 100., 101., 99., 100., 100.).with_provenance(tr_core::Provenance::Real))
+            .collect()
+    }
+    async fn run(
+        s: &Shared,
+        bars: Vec<Bar>,
+        tf: Timeframe,
+        params: AuctionParams,
+        epoch: u32,
+    ) -> Result<Arc<tr_data::auction::AuctionReport>, String> {
+        let n = bars.len();
+        let as_of = bars.last().unwrap().ts + tf.seconds();
+        let key = AuctionKey::new(1, tf, n, params, &bars, epoch);
+        auction_map(
+            s,
+            "AAPL US Equity",
+            tr_core::AssetClass::Equity,
+            Arc::new(bars),
+            &key,
+            Some(as_of),
+            Some(Arc::new(tr_data::vault::StitchInfo { epoch, source: "yahoo".into(), ..Default::default() })),
+        )
+        .await
+    }
+    #[tokio::test]
+    async fn auction_refuses_sample_mode_and_unverified_bars_without_network() {
+        let sample = Arc::new(VaultProvider {
+            bars: Default::default(),
+            calls: Default::default(),
+            fail: Default::default(),
+            sample: true,
+        });
+        let (s, _) = shared(sample.clone(), None);
+        assert!(
+            run(&s, fine_day(), Timeframe::M1, Default::default(), 0).await.unwrap_err().contains("sample / offline")
+        );
+        assert_eq!(sample.calls.load(Ordering::SeqCst), 0);
+        let provider = vault_provider(vec![]);
+        let (s, _) = shared(provider.clone(), None);
+        for p in [tr_core::Provenance::Sample, tr_core::Provenance::Missing] {
+            let mut b = vault_day("2026-11-10");
+            b[0].provenance = p;
+            assert!(run(&s, b, Timeframe::M5, Default::default(), 0).await.is_err());
+        }
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 0);
+    }
+    #[tokio::test]
+    async fn auction_uses_vault_one_minute_bars_under_a_five_minute_chart_and_outage() {
+        let provider = vault_provider(fine_day());
+        let (s, _) = shared(provider.clone(), Some(BarCache::open_in_memory().unwrap()));
+        let r = run(&s, vault_day("2026-11-10"), Timeframe::M5, Default::default(), 1).await.unwrap();
+        assert_eq!(r.sessions[0].source_tf, Timeframe::M1);
+        assert!(r.fine_note.is_none());
+        provider.fail.store(true, Ordering::SeqCst);
+        s.auction_fine.lock().unwrap().clear();
+        let f = auction_fine_bars(&s, "AAPL").await.unwrap();
+        assert_eq!(f.0.len(), 390);
+        assert!(f.0.iter().all(|b| b.provenance.is_verified()));
+        assert!(s.chart_sources.lock().unwrap().is_empty());
+        assert!(s.feed_requests.lock().unwrap().is_empty());
+    }
+    #[tokio::test]
+    async fn auction_falls_back_to_chart_bars_with_a_note_when_one_minute_is_unavailable() {
+        let p = vault_provider(vec![]);
+        p.fail.store(true, Ordering::SeqCst);
+        let (s, _) = shared(p, None);
+        let r = run(&s, vault_day("2026-11-10"), Timeframe::M5, Default::default(), 0).await.unwrap();
+        assert_eq!(r.sessions[0].source_tf, Timeframe::M5);
+        assert!(r.fine_note.as_ref().unwrap().contains("fallback"));
+    }
+    #[tokio::test]
+    async fn auction_report_cache_hits_and_misses_on_closed_inputs_params_epoch_and_gaps() {
+        let (s, _) = shared(vault_provider(vec![]), None);
+        let bars = fine_day();
+        let a = run(&s, bars.clone(), Timeframe::M1, Default::default(), 0).await.unwrap();
+        let b = run(&s, bars.clone(), Timeframe::M1, Default::default(), 0).await.unwrap();
+        assert!(Arc::ptr_eq(&a, &b));
+        let mut shorter = bars.clone();
+        shorter.pop();
+        let b = run(&s, shorter, Timeframe::M1, Default::default(), 0).await.unwrap();
+        assert!(!Arc::ptr_eq(&a, &b));
+        let b = run(&s, bars.clone(), Timeframe::M1, AuctionParams { value_area_pct: 68, ..Default::default() }, 0)
+            .await
+            .unwrap();
+        assert!(!Arc::ptr_eq(&a, &b));
+        let b = run(&s, bars.clone(), Timeframe::M1, Default::default(), 2).await.unwrap();
+        assert!(!Arc::ptr_eq(&a, &b));
+        let mut corrected = bars.clone();
+        corrected[0].volume *= 2.;
+        let b = run(&s, corrected, Timeframe::M1, Default::default(), 0).await.unwrap();
+        assert!(!Arc::ptr_eq(&a, &b));
+        let info = tr_data::vault::StitchInfo {
+            source: "yahoo".into(),
+            gaps: vec![(bars[10].ts, bars[30].ts)],
+            ..Default::default()
+        };
+        let key = AuctionKey::new(1, Timeframe::M1, bars.len(), Default::default(), &bars, 0);
+        let b = auction_map(
+            &s,
+            "AAPL US Equity",
+            tr_core::AssetClass::Equity,
+            Arc::new(bars.clone()),
+            &key,
+            Some(bars.last().unwrap().ts + 60),
+            Some(Arc::new(info)),
+        )
+        .await
+        .unwrap();
+        assert!(!Arc::ptr_eq(&a, &b));
+    }
+    #[tokio::test]
+    async fn auction_fine_slot_is_shared_within_ttl() {
+        let provider = vault_provider(fine_day());
+        let (s, _) = shared(provider.clone(), None);
+        let (a, b) = tokio::join!(auction_fine_bars(&s, "AAPL"), auction_fine_bars(&s, "AAPL US Equity"));
+        assert!(Arc::ptr_eq(&a.unwrap(), &b.unwrap()));
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+    }
+    #[tokio::test]
+    async fn auction_errors_are_not_cached() {
+        let (s, _) = shared(vault_provider(vec![]), None);
+        let mut b = fine_day();
+        for b in &mut b {
+            b.volume = 0.;
+        }
+        assert!(run(&s, b.clone(), Timeframe::M1, Default::default(), 0).await.is_err());
+        assert!(run(&s, b, Timeframe::M1, Default::default(), 0).await.is_err());
+        assert!(run(&s, fine_day(), Timeframe::M1, Default::default(), 0).await.is_ok());
+    }
+    #[tokio::test]
+    async fn auction_discards_unverified_fine_bars_and_refuses_non_us_symbols_before_fetch() {
+        let fine = fine_day().into_iter().map(|b| b.with_provenance(tr_core::Provenance::Sample)).collect();
+        let provider = vault_provider(fine);
+        let (s, _) = shared(provider.clone(), None);
+        let bars = vault_day("2026-11-10");
+        let key = AuctionKey::new(1, Timeframe::M5, bars.len(), Default::default(), &bars, 0);
+        let bad = auction_map(
+            &s,
+            "VOD.L",
+            tr_core::AssetClass::Equity,
+            Arc::new(bars.clone()),
+            &key,
+            Some(bars.last().unwrap().ts + 300),
+            None,
+        )
+        .await;
+        assert_eq!(bad.unwrap_err(), "Auction Map needs a US cash session");
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 0);
+        let r = run(&s, bars, Timeframe::M5, Default::default(), 0).await.unwrap();
+        assert_eq!(r.sessions[0].source_tf, Timeframe::M5);
+        assert!(r.fine_note.is_some());
+    }
+    #[tokio::test]
+    async fn auction_vault_stitch_performance() {
+        let (s, _) = shared(vault_provider(vec![]), Some(BarCache::open_in_memory().unwrap()));
+        let mut date = "2026-09-01".parse().unwrap();
+        let mut bars = vec![];
+        for _ in 0..20 {
+            bars.extend(
+                tr_data::intraday::regular_opens(date, Timeframe::M1)
+                    .into_iter()
+                    .map(|ts| Bar::new(ts, 100., 101., 99., 100., 100.).with_provenance(tr_core::Provenance::Real)),
+            );
+            date = tr_data::history::calendar::next_session(date);
+        }
+        let id =
+            tr_data::vault::SeriesId { symbol: "AAPL US Equity".into(), tf: Timeframe::M1, source: "yahoo".into() };
+        let write_id = id.clone();
+        cache_op(&s, move |v| v.ingest(&write_id, &bars, DataMode::Live, chrono::Utc::now().timestamp()))
+            .await
+            .unwrap();
+        let start = std::time::Instant::now();
+        for _ in 0..10 {
+            let id = id.clone();
+            let (bars, _) = cache_op(&s, move |v| v.stitch(&id, &[], AUCTION_FINE_LIMIT, None)).await.unwrap();
+            assert_eq!(bars.len(), 7800);
+        }
+        eprintln!(
+            "Auction in-memory vault read + stitch, 7800 rows, worker scheduling included: {:?}",
+            start.elapsed() / 10
+        );
     }
 }

@@ -26,6 +26,7 @@ use crate::widgets;
 use crate::worker::{BuiltIndicator, PaneId, Request, Worker, archive_page, initial_limit};
 use tr_data::anchored_vwap::AvwapKey;
 
+mod auction;
 mod cockpit;
 mod trend_cone;
 mod vault_footer;
@@ -296,6 +297,7 @@ pub struct ChartState {
     pub show_rail: bool,
     pub show_edge: bool,
     cone: trend_cone::ConeState,
+    auction: auction::AuctionState,
     edge: Option<Result<Arc<tr_data::edge::EdgeReport>, String>>,
     edge_work: Option<Request>,
     edge_pending: Option<EdgeKey>,
@@ -441,6 +443,7 @@ impl ChartState {
             show_rail: true,
             show_edge: false,
             cone: Default::default(),
+            auction: Default::default(),
             edge: None,
             edge_paint: Default::default(),
             edge_work: None,
@@ -592,6 +595,7 @@ impl ChartState {
         self.edge_pending = None;
         self.edge_work = None;
         self.cone.invalidate();
+        self.auction.invalidate();
         self.edge = None;
         self.zband_paint = Default::default();
         self.feed_state = Default::default();
@@ -1943,6 +1947,9 @@ impl ChartState {
         let mut clicked = false;
         self.link_out = LinkPublish::default();
         self.request_avwap(w);
+        if let Some(wait) = self.request_auction(w) {
+            ui.ctx().request_repaint_after(wait);
+        }
         if let Some(wait) = self.request_cone(w) {
             ui.ctx().request_repaint_after(wait);
         }
@@ -2159,6 +2166,7 @@ impl ChartState {
         let hover = plot_resp.hover_pos().filter(|p| self.hover_enabled && plot_all.contains(*p));
         if self.draw.tool.is_none() {
             let specs = self.indicators.clone();
+            self.auction_context(&plot_resp);
             plot_resp.context_menu(|ui| self.context_menu(ui, w));
             // The menu can remove built oscillator panes. Their indices and layout
             // above belong to the old state; rebuild them on the next frame.
@@ -2215,7 +2223,7 @@ impl ChartState {
         clicked |= click_owner.is_some();
         // A Shift+click on a time-linked chart only centres and an armed AVWAP click only
         // anchors; drawing tools ignore both.
-        let drawing_click = cockpit::drawing_gets_click(click_owner);
+        let mut drawing_click = cockpit::drawing_gets_click(click_owner);
 
         // Page older history when the left edge approaches loaded data.
         if !self.paging && !self.loading && !self.exhausted && v.left() < v.visible_bars() * 0.3 {
@@ -2498,8 +2506,15 @@ impl ChartState {
         }
 
         // ---- drawings ----
-        self.paint_volume_profile(ui, price_rect, &scale);
-        self.paint_value_area(ui, price_rect, &scale);
+        if self.auction.enabled {
+            self.paint_auction(ui, price_rect, &v, &scale);
+            if click_owner.is_none() && self.auction_click(ui, &plot_resp) {
+                drawing_click = false;
+            }
+        } else {
+            self.paint_volume_profile(ui, price_rect, &scale);
+            self.paint_value_area(ui, price_rect, &scale);
+        }
         self.paint_review_levels(ui, price_rect, &scale);
         self.paint_alert_levels(ui, price_rect, &scale);
         self.paint_opening_range(ui, price_rect, &scale);
@@ -2699,6 +2714,7 @@ impl ChartState {
             }
         });
         self.cockpit_menu(ui);
+        self.auction_menu(ui);
         ui.checkbox(&mut self.log, "Log Scale");
         ui.checkbox(&mut self.magnet, "Magnet");
         ui.checkbox(&mut self.show_volume, "Volume");
@@ -3166,12 +3182,21 @@ impl ChartState {
             p.text(pos2(price_rect.left() + 6.0, ly), Align2::LEFT_TOP, line, mono(11.0), amber());
             ly += 14.0;
         }
-        if let Some(line) = profile_line(self.tf, &self.sec, &self.bars) {
+        if !self.auction.enabled
+            && let Some(line) = profile_line(self.tf, &self.sec, &self.bars)
+        {
             p.text(pos2(price_rect.left() + 6.0, ly), Align2::LEFT_TOP, line, mono(11.0), theme::series(2));
             ly += 14.0;
         }
-        if let Some(line) = value_line(self.tf, &self.sec, &self.bars) {
+        if !self.auction.enabled
+            && let Some(line) = value_line(self.tf, &self.sec, &self.bars)
+        {
             p.text(pos2(price_rect.left() + 6.0, ly), Align2::LEFT_TOP, line, mono(11.0), theme::accent());
+            ly += 14.0;
+        }
+        // With the Auction Map on, one line from its report replaces VP / VAH.
+        if let Some(line) = self.auction_legend_line() {
+            p.text(pos2(price_rect.left() + 6.0, ly), Align2::LEFT_TOP, line, mono(11.0), theme::series(2));
             ly += 14.0;
         }
         if self.extended && self.offers_extended() {
@@ -4436,9 +4461,8 @@ pub struct TrendConfig {
 /// line into a coloured half (overlays 0..5) and a grey half (5..10); take whichever
 /// half is finite. Missing bars are NaN.
 fn zband_values(band: &BuiltIndicator, i: usize) -> [f64; 5] {
-    let at = |k: usize| {
-        band.overlays.get(k).and_then(|o| o.1.line.pyramid.data.get(i)).map_or(f64::NAN, |p| p[1] as f64)
-    };
+    let at =
+        |k: usize| band.overlays.get(k).and_then(|o| o.1.line.pyramid.data.get(i)).map_or(f64::NAN, |p| p[1] as f64);
     std::array::from_fn(|k| Some(at(k)).filter(|v| v.is_finite()).unwrap_or_else(|| at(k + 5)))
 }
 
@@ -6739,5 +6763,33 @@ mod tests {
         c.set_trend_cone(Some(false), None, &w);
         let out = chart_frame(&ctx, &mut c, &w, vec![]);
         assert!(!stack_has_text(&out.shapes, "WALK-FORWARD"));
+    }
+    #[test]
+    fn auction_on_suppresses_the_legacy_profile_and_value_area_paints() {
+        let ctx = egui::Context::default();
+        let (w, _) = Worker::test_channel();
+        let mut c = cockpit_chart(&w, Timeframe::M5, Provenance::Real, &[]);
+        let off = shape_text(&chart_frame(&ctx, &mut c, &w, vec![]).shapes);
+        assert!(off.contains("VP "), "{off}");
+        assert!(off.contains("VAH "), "{off}");
+        c.restore_auction(Some(Default::default()));
+        let closed = tr_data::closed::closed_len(c.tf, &c.bars, c.sec.class, c.last_refresh);
+        let key = tr_data::auction::AuctionKey::new(c.generation, c.tf, closed, Default::default(), &c.bars, 0);
+        let report = tr_data::auction::build(
+            &c.bars[..closed],
+            c.tf,
+            None,
+            c.sec.class,
+            c.bars[closed - 1].ts + 300,
+            &[],
+            Default::default(),
+            0.01,
+        )
+        .unwrap();
+        c.on_auction_map(key, Ok(Arc::new(report)));
+        let on = shape_text(&chart_frame(&ctx, &mut c, &w, vec![]).shapes);
+        assert!(!on.contains("VP "), "{on}");
+        assert!(!on.contains("VAH "), "{on}");
+        assert!(on.contains("AUCTION · bin"), "{on}");
     }
 }

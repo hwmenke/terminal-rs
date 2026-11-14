@@ -811,7 +811,8 @@ impl ChartState {
             chips.extend(self.avwap_paint.chips.iter().cloned());
         }
         let p = ui.painter_at(rect);
-        let mut y = rect.bottom() - 6.0;
+        // Stack above the Auction Map footer when it is showing.
+        let mut y = rect.bottom() - 6.0 - self.auction_footer_room();
         for (text, color) in chips.iter().rev() {
             let g = p.layout_no_wrap(text.clone(), mono(10.5), *color);
             let r = Rect::from_min_size(pos2(rect.left() + 6.0, y - g.size().y - 2.0), g.size() + vec2(8.0, 2.0));
@@ -819,6 +820,23 @@ impl ChartState {
             p.galley(r.min + vec2(4.0, 1.0), g, *color);
             y = r.top() - 3.0;
         }
+    }
+
+    /// Approximate screen rects of the right-edge AVWAP price tags from the last
+    /// prepared paint (mono 10.5 ≈ 6.3 px per glyph). Other right-edge labels use
+    /// these to step aside; empty when no anchor is set.
+    pub(super) fn avwap_tag_rects(&self) -> Vec<Rect> {
+        if self.avwap_anchors.is_empty() {
+            return Vec::new();
+        }
+        self.avwap_paint
+            .tags
+            .iter()
+            .map(|t| {
+                let w = t.text.chars().count() as f32 * 6.3 + 8.0;
+                Rect::from_min_max(pos2(t.pos.x - w, t.pos.y - 9.0), pos2(t.pos.x, t.pos.y + 9.0))
+            })
+            .collect()
     }
 
     /// `COCKPIT 1m · 5m · 15m` chip on the Cockpit's main chart.

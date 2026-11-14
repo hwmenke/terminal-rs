@@ -442,6 +442,7 @@ impl TerminalApp {
                     (&["TWALL", "TWALL D", "TWALL WL Growth", "NEW TWALL"], "Trend Wall: j/k select; Enter linked stacked chart; S sort; D daily; R reload; / command"),
                     (&["TSTACK", "STACK", "MTF", "REGIME"], "Trend Stack: completed timeframe lanes, confidence cloud, verified bars only"),
                     (&["TSTACK ON", "TSTACK OFF", "NEW TSTACK NVDA", "SPLIT DOWN TSTACK"], "Enable, disable, or open a stacked chart; saved with the layout"),
+                    (&["AUCTION", "AMAP", "AUCTION 10", "AUCTION VIS", "AUCTION NAKED", "AUCTION VA 70"], "Auction Map (Alt+P): closed verified RTH profiles, composite, naked levels; click level to centre; Alt+click anchors VWAP"),
                     (&["CONE", "CONE ON|OFF", "CONE 30", "CONE 20 10"], "Trend Cone (Alt+C): closed-bar regime quantile fan, grey baseline, bootstrap edge whiskers, walk-forward coverage at the horizon; verified bars only"),
                     (&["TSTACK EDGE ON", "TSTACK EDGE OFF"], "Regime forward returns, confidence intervals and completed flip outcomes; verified bars only"),
                     (&["ZBAND 20"], "One/two sample-sigma bands with a causal z readout"),
