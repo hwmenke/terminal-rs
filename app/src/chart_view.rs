@@ -1057,6 +1057,42 @@ impl ChartState {
         }
     }
 
+    /// The Adaptive Trend configuration TSTACK, Edge and the ADTREND overlay use.
+    pub(crate) fn trend_params(&self) -> AdaptiveTrendParams {
+        AdaptiveTrendParams { session_reset: self.stack_session, ..self.stack_params() }
+    }
+
+    pub(crate) fn trend_config(&self) -> TrendConfig {
+        TrendConfig {
+            adtrend: self.indicators.iter().find(|s| s.code == "ADTREND").cloned(),
+            session: self.stack_session,
+        }
+    }
+
+    /// Replace the chart's Adaptive Trend configuration (ADTREND spec and 09:30
+    /// anchor) and recompute everything that depends on it. Used by TSTACK TUNE
+    /// Apply/Revert; restoring a captured [`TrendConfig`] is an exact undo.
+    pub(crate) fn set_trend_config(&mut self, cfg: TrendConfig, w: &Worker) {
+        self.stack_config_revision = self.stack_config_revision.wrapping_add(1);
+        self.stack = None;
+        self.edge = None;
+        self.tint_ref = None;
+        self.stack_session = cfg.session;
+        match (self.indicators.iter().position(|s| s.code == "ADTREND"), cfg.adtrend) {
+            (Some(i), Some(spec)) => self.indicators[i] = spec,
+            (None, Some(spec)) => self.indicators.push(spec),
+            (Some(_), None) => {
+                self.indicators.retain(|s| s.code != "ADTREND");
+                self.built.retain(|b| b.spec.code != "ADTREND");
+            }
+            (None, None) => {}
+        }
+        self.request_indicators(w);
+        if self.show_stack {
+            self.request_trend_stack(w);
+        }
+    }
+
     pub(crate) fn stack_params(&self) -> AdaptiveTrendParams {
         self.indicators
             .iter()
@@ -3158,6 +3194,11 @@ impl ChartState {
             p.text(pos2(price_rect.left() + 6.0, ly), Align2::LEFT_TOP, line, mono(11.0), theme::accent());
             ly += 14.0;
         }
+        // With the Auction Map on, one line from its report replaces VP / VAH.
+        if let Some(line) = self.auction_legend_line() {
+            p.text(pos2(price_rect.left() + 6.0, ly), Align2::LEFT_TOP, line, mono(11.0), theme::series(2));
+            ly += 14.0;
+        }
         if self.extended && self.offers_extended() {
             let line = tr_data::intraday::extended_summary(&self.bars);
             p.text(pos2(price_rect.left() + 6.0, ly), Align2::LEFT_TOP, line, mono(11.0), amber());
@@ -4406,6 +4447,14 @@ impl ChartState {
             ui.painter().galley(pos + vec2(4.0, 3.0), galley, text());
         }
     }
+}
+
+/// A chart's complete Adaptive Trend configuration: the ADTREND spec (absent when
+/// the overlay is off, in which case TSTACK uses defaults) and the 09:30 anchor.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TrendConfig {
+    pub adtrend: Option<IndicatorSpec>,
+    pub session: bool,
 }
 
 /// The five ZBAND lines at bar `i` (+2σ, +1σ, basis, −1σ, −2σ). Honest Z splits each

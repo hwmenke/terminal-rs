@@ -7154,8 +7154,8 @@ mod tests {
         assert!(a[0].overlays[..5].iter().all(|(_, o)| o.color != theme::rgba(palette.muted)));
         // Each bar is drawn by the half matching its own point-in-time flag.
         let value = |k: usize, t: usize| a[0].overlays[k].1.line.pyramid.data.get(t).map_or(f64::NAN, |p| p[1] as f64);
-        for t in 20..599 {
-            let half = if r.muted_at[t] { 5 } else { 0 };
+        for (t, &muted) in r.muted_at.iter().enumerate().take(599).skip(20) {
+            let half = if muted { 5 } else { 0 };
             assert!(value(half + 2, t).is_finite(), "bar {t} missing from its half");
         }
         // The last closed bars are trending: grey only, no coloured basis there.

@@ -176,24 +176,27 @@ fn poc(v: &[f64], midpoint: f64) -> usize {
 fn value_area(v: &[f64], p: usize, pct: u8) -> (usize, usize, f64) {
     let total: f64 = v.iter().sum();
     let (mut lo, mut hi, mut sum) = (p, p, v[p]);
-    let mut below: f64 = v[..p].iter().sum();
-    let mut above: f64 = v[p + 1..].iter().sum();
     while sum < total * pct as f64 / 100. && (lo > 0 || hi + 1 < v.len()) {
         let down = if lo == 0 {
             false
         } else if hi + 1 == v.len() {
             true
+        } else if v[lo - 1] != v[hi + 1] {
+            v[lo - 1] > v[hi + 1]
         } else {
-            v[lo - 1] > v[hi + 1] || (v[lo - 1] == v[hi + 1] && below >= above)
+            // Ties are rare: sum each remaining side outward from the value area so
+            // mirror-image profiles compare bit-for-bit (a running `below -= v`
+            // accumulates rounding and can flip an exact tie to the upper side).
+            let below: f64 = v[..lo].iter().rev().sum();
+            let above: f64 = v[hi + 1..].iter().sum();
+            below >= above
         };
         if down {
             lo -= 1;
             sum += v[lo];
-            below -= v[lo];
         } else {
             hi += 1;
             sum += v[hi];
-            above -= v[hi];
         }
     }
     (lo, hi, if total > 0. { sum / total } else { 0. })
@@ -312,21 +315,27 @@ pub fn build(
     let dates: Vec<_> =
         dates.into_iter().rev().take(params.lookback.max(params.max_age).min(MAX_SESSIONS) + 1).collect();
     let mut chosen = vec![];
+    let complete = |b: &[Bar], opens: &[i64]| holes(b, opens) == 0 && b.iter().all(|b| b.volume_value().is_some());
     for date in dates.into_iter().rev() {
-        let f = fine_days.get(&date);
+        let f = fine_days.get(&date).map(Vec::as_slice);
+        let c = chart_days.get(&date).map(Vec::as_slice);
         let opens = if f.is_some() { expected(date, Timeframe::M1, cut) } else { vec![] };
         let fine_ok = f.is_some_and(|b| {
             !opens.is_empty()
                 && b.first().is_some_and(|b| b.ts < opens[0] + tf.seconds())
-                && b.last().is_some_and(|b| b.ts + 60 >= opens[opens.len() - 1] + 60)
+                && b.last().is_some_and(|b| b.ts >= opens[opens.len() - 1])
                 && holes(b, &opens) as f64 <= opens.len() as f64 * FINE_HOLE_TOLERANCE
         });
-        let (bars, source_tf) = if fine_ok {
-            (f.unwrap(), Timeframe::M1)
-        } else if let Some(b) = chart_days.get(&date) {
-            (b, tf)
-        } else {
-            continue;
+        // Never pick an incomplete source when a complete one exists: a 1m series
+        // with tolerated holes yields to a complete chart session.
+        let fine_complete = fine_ok && f.is_some_and(|b| complete(b, &opens));
+        let chart_complete = c.is_some_and(|b| complete(b, &expected(date, tf, cut)));
+        let (bars, source_tf) = match (f, c) {
+            (Some(f), _) if fine_complete => (f, Timeframe::M1),
+            (_, Some(c)) if chart_complete => (c, tf),
+            (Some(f), _) if fine_ok => (f, Timeframe::M1),
+            (_, Some(c)) => (c, tf),
+            _ => continue,
         };
         let scheduled = session_opens(date, source_tf);
         let open_ts = scheduled[0];
@@ -460,6 +469,10 @@ pub fn build(
     if !sessions.iter().any(|s| s.total > 0.) {
         return Err("Auction Map needs verified volume".into());
     }
+    // Level prices are lattice multiples (k × bin) computed in floating point, e.g.
+    // 2001 × 0.05 = 100.05000000000001. A bar printing exactly 100.05 traded there,
+    // so containment and distance use a sub-tick tolerance.
+    let eps = tick * 1e-3;
     let mut levels = vec![];
     for (i, s) in sessions.iter().enumerate().filter(|(_, s)| s.status == SessionStatus::Complete && s.total > 0.) {
         let age = sessions.len() - 1 - i;
@@ -496,19 +509,19 @@ pub fn build(
                         level.end = LevelEnd::CutByGap { ts: a };
                         break 'later;
                     }
-                    if b.low <= price && price <= b.high {
+                    if trades_at(b, price, eps) {
                         level.end = LevelEnd::Touched { ts: b.ts };
                         break 'later;
                     }
                     if let Some(a) = prev
                         && ((a.close < price && b.open > price) || (a.close > price && b.open < price))
-                        && !(a.low <= price && price <= a.high)
+                        && !trades_at(&a, price, eps)
                     {
                         level.gapped_over = true;
                     }
                     prev = Some(*b);
                 }
-                if (price - later.high).max(later.low - price).max(0.) <= bin {
+                if (price - later.high).max(later.low - price).max(0.) <= bin + eps {
                     level.tests += 1;
                 }
                 if later.status == SessionStatus::Partial {
@@ -537,6 +550,10 @@ pub fn build(
         eth_ignored: chart.iter().filter(|b| !intraday::in_regular_session(b.ts)).count(),
         params,
     })
+}
+/// The bar's range contains `price`, within a sub-tick float tolerance.
+fn trades_at(b: &Bar, price: f64, eps: f64) -> bool {
+    b.low - eps <= price && price <= b.high + eps
 }
 fn holes_in_hour(b: &[Bar], opens: &[i64]) -> bool {
     !opens.is_empty()
@@ -693,15 +710,69 @@ mod tests {
         assert!(r.fine_note.is_some());
     }
     #[test]
-    fn tolerated_fine_holes_still_mark_partial_and_missing_edges_fall_back() {
-        let b = day("2026-11-10", Timeframe::M5);
+    fn tolerated_fine_holes_yield_to_a_complete_chart_session_and_otherwise_mark_partial() {
+        let mut b = day("2026-11-10", Timeframe::M5);
         let mut f = day("2026-11-10", Timeframe::M1);
         f.remove(10);
+        // A complete 5m session beats a 1m session with a tolerated hole.
         let r = run(&b, Timeframe::M5, Some(&f), &[]);
+        assert_eq!(r.sessions[0].source_tf, Timeframe::M5);
+        assert_eq!(r.sessions[0].status, SessionStatus::Complete);
+        // Both incomplete: the finer source is used and the session is Partial.
+        b.remove(40);
+        let r = run(&b, Timeframe::M5, Some(&f), &[]);
+        assert_eq!(r.sessions[0].source_tf, Timeframe::M1);
         assert_eq!(r.sessions[0].holes, 1);
         assert_eq!(r.sessions[0].status, SessionStatus::Partial);
+        // Missing last minute: 1m does not reach the close, so the chart bars are used.
         f.pop();
         assert_eq!(run(&b, Timeframe::M5, Some(&f), &[]).sessions[0].source_tf, Timeframe::M5);
+    }
+    #[test]
+    fn value_area_tie_on_mirror_image_fractional_sides_takes_the_lower_row() {
+        // One step reaches 65%, so only the tie rule decides the side.
+        for v in [[0.1, 0.2, 0.7, 0.2, 0.1], [0.0, 0.3, 0.7, 0.3, 0.0]] {
+            assert_eq!(value_area(&v, 2, 65).0, 1, "{v:?}");
+        }
+        // Equal neighbours, uneven remaining sides: more volume above wins.
+        let (lo, hi, _) = value_area(&[0.05, 0.3, 0.7, 0.3, 0.4], 2, 55);
+        assert_eq!((lo, hi), (2, 3));
+    }
+    #[test]
+    fn a_bar_printing_exactly_at_a_lattice_level_touches_it() {
+        // 2001 × 0.05 is 100.05000000000001 in f64; a bar topping at 100.05 traded there.
+        let level = 2001. * 0.05;
+        assert!(level > 100.05);
+        let below = Bar::new(0, 99.9, 100.05, 99.8, 100., 1.);
+        let above = Bar::new(0, 100.1, 100.2, 100.05, 100.1, 1.);
+        assert!(trades_at(&below, level, 0.01 * 1e-3) && trades_at(&above, level, 0.01 * 1e-3));
+        assert!(!trades_at(&below, level + 0.01, 0.01 * 1e-3));
+        // Prior session 100.00–100.10 flat-ish, VAH lands on a lattice multiple.
+        let mut b = flat_day("2026-11-09", 100.);
+        for (i, x) in b.iter_mut().enumerate() {
+            x.high = 100. + (i % 11) as f64 * 0.01;
+        }
+        let r = run(&b, Timeframe::M1, None, &[]);
+        for kind in [LevelKind::Vah, LevelKind::Val] {
+            let price = r.levels.iter().find(|l| l.kind == kind).unwrap().price;
+            let printed: f64 = format!("{price:.2}").parse().unwrap();
+            // Approach from above (low prints the level) and from below (high prints it).
+            for above in [true, false] {
+                let mut all = b.clone();
+                // Developing next session: the lattice still comes from the complete day.
+                let mut next: Vec<_> =
+                    flat_day("2026-11-10", if above { 101. } else { 99. }).into_iter().take(30).collect();
+                if above {
+                    next[20].low = printed;
+                } else {
+                    next[20].high = printed;
+                }
+                all.extend(next);
+                let r = run(&all, Timeframe::M1, None, &[]);
+                let l = r.levels.iter().find(|l| l.kind == kind).unwrap();
+                assert_eq!(l.end, LevelEnd::Touched { ts: all[390 + 20].ts }, "{kind:?} above={above}");
+            }
+        }
     }
     #[test]
     fn fine_bars_after_the_chart_cut_are_excluded() {

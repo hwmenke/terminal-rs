@@ -19,6 +19,8 @@ pub struct TuneCell {
     pub hold: usize,
     pub edge: EdgeCell,
     pub robustness: f64,
+    /// Medium-regime flips (long + short entries, i.e. trades) on common warmed bars.
+    pub flips: usize,
 }
 impl TuneCell {
     pub fn delta(&self) -> Option<f64> {
@@ -224,7 +226,11 @@ fn compute_capped(
     let mut cells: Vec<_> = params
         .iter()
         .zip(edges)
-        .map(|(p, edge)| TuneCell { er: p.mb_er, hold: p.min_hold, edge, robustness: 0.0 })
+        .zip(&stacks)
+        .map(|((p, edge), s)| {
+            let flips = (0..bars.len()).filter(|&i| eligible[i] && (s.entry_long[i] || s.entry_short[i])).count();
+            TuneCell { er: p.mb_er, hold: p.min_hold, edge, robustness: 0.0, flips }
+        })
         .collect();
     adjust(&mut cells);
     let plateau = plateau(&mut cells);
@@ -277,6 +283,7 @@ mod tests {
             er: 20,
             hold: 10,
             robustness: 0.0,
+            flips: 12,
             edge: EdgeCell {
                 regime: 1,
                 horizon: 5,
@@ -291,6 +298,33 @@ mod tests {
                 folds: std::array::from_fn(|_| EdgeFold { n: 100, delta: Some(delta), span: None }),
             },
         }
+    }
+    #[test]
+    fn fdr_is_step_up_across_the_49_cell_family() {
+        // m = 49. Sorted p = .0025, .004, .006 (rest p = 1 / missing).
+        // Thresholds k·0.10/49: .00204, .00408, .00612. p(1) fails its own
+        // threshold but k = 3 passes, so step-up rejects all three.
+        // q(3) = .006·49/3 = .098; q(2) = min(.098, .004·49/2 = .098);
+        // q(1) = min(.098, .0025·49 = .1225) = .098 (monotone).
+        let mut cells = vec![cell(0.001, true); 49];
+        for (k, c) in cells.iter_mut().enumerate() {
+            c.edge.p = if k < 40 { Some(1.0) } else { None };
+        }
+        for (k, p) in [(7, 0.0025), (8, 0.004), (9, 0.006)] {
+            cells[k].edge.p = Some(p);
+        }
+        adjust(&mut cells);
+        for k in [7, 8, 9] {
+            assert!((cells[k].edge.q.unwrap() - 0.098).abs() < 1e-12, "cell {k}: {:?}", cells[k].edge.q);
+            assert!(cells[k].passes());
+        }
+        assert!(cells.iter().enumerate().filter(|(k, _)| ![7, 8, 9].contains(k)).all(|(_, c)| !c.passes()));
+        // p = .0025, .0045, .0065: q(3) = .10617, q(2) = min(q(3), .11025),
+        // q(1) = min(q(2), .1225) → all .10617 > .10, nothing passes.
+        cells[8].edge.p = Some(0.0045);
+        cells[9].edge.p = Some(0.0065);
+        adjust(&mut cells);
+        assert!(cells.iter().all(|c| !c.passes()));
     }
     #[test]
     fn fdr_known_values_counts_all_49_including_missing_tests() {

@@ -65,10 +65,7 @@ impl VrCore {
         self.ss = self.residuals.iter().map(|r| r * r).sum();
         // Relative guard: constant returns leave only rounding residue in ss.
         let scale: f64 = returns.iter().map(|r| r * r).sum::<f64>().max(f64::MIN_POSITIVE);
-        if self.ss <= n as f64 * (64.0 * f64::EPSILON).powi(2) || self.ss <= 1e-20 * scale {
-            return false;
-        }
-        true
+        self.ss > n as f64 * (64.0 * f64::EPSILON).powi(2) && self.ss > 1e-20 * scale
     }
     fn product(&mut self, j: usize) -> f64 {
         while self.products.len() < j {

@@ -505,8 +505,11 @@ impl ChartState {
             job.wrap.max_width = (rect.width() - 24.0).clamp(1.0, CARD_W);
             let galley = p.layout_job(job);
             let badge = p.layout_job(paint.badge.clone());
+            // The Auction Map footer owns the bottom-left rows when it is on.
+            let mut pane = rect;
+            pane.max.y = (pane.max.y - self.auction_footer_room()).max(pane.min.y);
             if let Some((card, compact)) = card_placement(
-                rect,
+                pane,
                 paint.fan_bounds.unwrap_or(Rect::NOTHING),
                 galley.size() + vec2(16.0, 12.0),
                 badge.size() + vec2(16.0, 12.0),

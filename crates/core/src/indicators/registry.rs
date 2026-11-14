@@ -1065,6 +1065,10 @@ fn catalog() -> Vec<Def> {
         .n("ATR Length", 20.0)
         .real("Confirm", 0.25, 0.0, 2.0)
         .int("Method", 0.0, 0.0, 1.0)
+        // Appended so older 3-parameter labels ("ADTREND 20 0.25 0") normalize to
+        // the historical defaults MB ER 20 / min hold 10.
+        .int("MB ER", 20.0, 2.0, 200.0)
+        .int("Min Hold", 10.0, 1.0, 200.0)
         .research(),
         // Volatility.
         pane("ATR", "Average True Range", vol, |i, p| one("ATR", atr(&i.d, n(p, 0)))).n("Length", 14.0),
@@ -1474,8 +1478,24 @@ mod tests {
         assert_eq!(vwap.compute(&Input::new(&[], Timeframe::M5))[0].name, "Session VWAP");
         assert_eq!(vwap.compute(&Input::new(&[], Timeframe::W1))[0].name, "Yearly VWAP");
         assert_eq!(Spec::parse("psar", &[]).unwrap().label(), "PSAR 0.02 0.02 0.2");
-        assert_eq!(Spec::parse("ADTREND", &[]).unwrap().label(), "ADTREND 20 0.25 0");
+        assert_eq!(Spec::parse("ADTREND", &[]).unwrap().label(), "ADTREND 20 0.25 0 20 10");
         assert!(Spec::parse("ADTREND", &[]).unwrap().def().is_some_and(|d| d.research));
+    }
+
+    #[test]
+    fn old_three_parameter_adtrend_label_loads_with_historical_er_and_hold() {
+        // Layouts saved before MB ER / Min Hold existed store the 3-parameter label.
+        let old: Spec = serde_json::from_str("\"ADTREND 14 0.3 1\"").unwrap();
+        assert_eq!(old.params, vec![14.0, 0.3, 1.0, 20.0, 10.0]);
+        let p = AdaptiveTrendParams::from_registry(&old.params);
+        assert_eq!((p.atr_n, p.mb_er, p.min_hold), (14, 20, 10));
+        assert_eq!(p.method, super::super::AdaptiveMethod::Adma);
+        // Round trip of the new label keeps the tuned settings.
+        let tuned = Spec::new("ADTREND", &AdaptiveTrendParams { mb_er: 32, min_hold: 4, ..p }.to_registry()).unwrap();
+        let back: Spec = serde_json::from_str(&serde_json::to_string(&tuned).unwrap()).unwrap();
+        assert_eq!(back, tuned);
+        let q = AdaptiveTrendParams::from_registry(&back.params);
+        assert_eq!((q.atr_n, q.confirm_mult, q.mb_er, q.min_hold), (14, 0.3, 32, 4));
     }
 
     #[test]

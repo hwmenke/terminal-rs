@@ -35,6 +35,7 @@ struct AuctionPaint {
     labels: Vec<(Pos2, String, Color32)>,
     hits: Vec<Hit>,
     footer: String,
+    note: String,
     detail: String,
     footer_rect: Option<Rect>,
 }
@@ -227,10 +228,57 @@ impl ChartState {
         self.auction.revision = self.auction.revision.wrapping_add(1);
         self.auction.paint = Default::default();
     }
+    /// Room above the price pane's bottom edge taken by the Bar Vault footer label
+    /// and cells; the Auction footer sits on top of it.
+    fn auction_footer_lift(&self) -> f32 {
+        let vault_label =
+            !self.extended && self.tf.is_intraday() && self.stitch.as_ref().is_some_and(|s| !s.cells.is_empty());
+        if vault_label { 22. } else { 6. }
+    }
+    /// Height reserved at the bottom-left for the Auction footer (two rows) plus
+    /// whatever sits under it. Zero when the map is off or has no report.
+    pub(super) fn auction_footer_room(&self) -> f32 {
+        if self.auction.enabled && matches!(self.auction.result, Some(Ok(_))) {
+            self.auction_footer_lift() + 32.
+        } else {
+            0.
+        }
+    }
+    /// Left edge of the Trend Cone's fan when it is on screen; the cone owns the
+    /// right side then, so the composite dock hides and level tags stop before it.
+    fn cone_origin_x(&self, rect: Rect, v: &Viewport) -> Option<f32> {
+        let Some(Ok(r)) = self.cone.result.as_ref().filter(|_| self.cone.enabled) else { return None };
+        Some(rect.left() + v.x_of(r.closed as f64 - 0.5) as f32).filter(|x| *x < rect.right())
+    }
+    /// One legend line for the latest session: POC, value area and open location.
+    pub(super) fn auction_legend_line(&self) -> Option<String> {
+        let Some(Ok(r)) = self.auction.result.as_ref().filter(|_| self.auction.enabled) else { return None };
+        let s = r.sessions.iter().rev().find(|s| s.total > 0.)?;
+        let fmt = |p: f64| scale::format_price(p, self.sec.decimals(p));
+        let open = match s.open_location {
+            Some(math::OpenLocation::AboveValue) => " · OPEN ABOVE VALUE",
+            Some(math::OpenLocation::InValue) => " · OPEN IN VALUE",
+            Some(math::OpenLocation::BelowValue) => " · OPEN BELOW VALUE",
+            Some(math::OpenLocation::OutsideRange) => " · OPEN OUTSIDE RANGE",
+            None => "",
+        };
+        Some(format!(
+            "AMAP {}{} POC {} · VA {}–{} {:.0}%{open}",
+            s.date.format("%m-%d"),
+            if s.status == SessionStatus::Developing { " DEV" } else { "" },
+            fmt((s.poc_bin as f64 + 0.5) * r.bin),
+            fmt(s.va_bins.0 as f64 * r.bin),
+            fmt((s.va_bins.1 + 1) as f64 * r.bin),
+            s.va_share * 100.,
+        ))
+    }
     fn prepare_auction(&mut self, rect: Rect, v: &Viewport, scale: &PriceScale) {
+        let cone_x = self.cone_origin_x(rect, v);
+        let avwap_tags = self.avwap_tag_rects();
+        let lift = self.auction_footer_lift();
         let a = &self.auction;
         let view = &a.view;
-        let key = vec![
+        let mut key = vec![
             a.revision,
             self.bars.len() as u64,
             self.bars.first().map_or(0, |b| b.ts as u64),
@@ -249,7 +297,10 @@ impl ChartState {
             view.naked as u64,
             view.filled as u64,
             view.ib as u64,
+            cone_x.map_or(u64::MAX, |x| x.to_bits() as u64),
+            lift.to_bits() as u64,
         ];
+        key.extend(avwap_tags.iter().flat_map(|r| [r.left().to_bits() as u64, r.top().to_bits() as u64]));
         if a.paint.key == key && a.paint.palette == Some(theme::palette()) {
             return;
         }
@@ -374,11 +425,26 @@ impl ChartState {
                     SessionStatus::Partial => format!("PARTIAL {}/{}", s.bars_used, s.expected),
                 };
                 if !status.is_empty() {
-                    paint.labels.push((
-                        pos2(left.max(rect.left()) + 3., y(s.high).max(rect.top() + 38.)),
-                        status,
-                        theme::amber(),
-                    ));
+                    // Tag under the session's low, away from the top-left legend. Narrow
+                    // sessions get a one-letter tag; the hover card has the full status.
+                    let fits = width >= status.chars().count() as f32 * 5.6 + 6.;
+                    let tag = if fits {
+                        Some(status)
+                    } else if width >= 10. {
+                        status.chars().next().map(String::from)
+                    } else {
+                        None
+                    };
+                    if let Some(tag) = tag {
+                        paint.labels.push((
+                            pos2(
+                                left.max(rect.left()) + 2.,
+                                (y(s.low) + 3.).min(rect.bottom() - lift - 46.).max(rect.top() + 2.),
+                            ),
+                            tag,
+                            theme::amber(),
+                        ));
+                    }
                     let top = y(s.high);
                     let bottom = y(s.low);
                     for yy in [top, bottom] {
@@ -420,8 +486,15 @@ impl ChartState {
         } else {
             r.sessions.iter().rev().take(view.composite as usize).collect()
         };
-        let dock =
-            if rect.width() >= 420. && rect.height() >= 200. { (rect.width() * 0.18).clamp(60., 160.) } else { 0. };
+        let dock = if cone_x.is_none() && rect.width() >= 420. && rect.height() >= 200. {
+            (rect.width() * 0.18).clamp(60., 160.)
+        } else {
+            0.
+        };
+        // Only a gap inside the composite's own time span is worth flagging.
+        let first_open = selected.iter().map(|s| s.open_ts).min().unwrap_or(i64::MAX);
+        let last_close = selected.iter().map(|s| s.close_ts).max().unwrap_or(i64::MIN);
+        let comp_gap = r.gaps.iter().any(|(a, b)| *b > first_open && *a < last_close);
         if dock > 0.
             && let Some(c) = math::composite(&selected, view.value_area)
         {
@@ -452,29 +525,37 @@ impl ChartState {
                     1.,
                 );
             }
-            paint.labels.push((
-                pos2(rect.right() - dock, py - 13.),
-                format!(
-                    "POC {}",
-                    scale::format_price(
-                        (c.poc_bin as f64 + 0.5) * r.bin,
-                        self.sec.decimals((c.poc_bin as f64 + 0.5) * r.bin)
-                    )
+            let poc_price = (c.poc_bin as f64 + 0.5) * r.bin;
+            let header = format!(
+                "{} {}s{}{}",
+                if view.composite == 0 { "VIS" } else { "COMP" },
+                selected.len(),
+                if c.partial > 0 { format!(" · {} partial", c.partial) } else { String::new() },
+                if comp_gap { " · gap" } else { "" }
+            );
+            // Pills: the POC price on its line, the header below the corner badge
+            // (REAL / STALE … sits at the top-right, ~35–48 px down).
+            for (text, at, color) in [
+                (
+                    format!("POC {}", scale::format_price(poc_price, self.sec.decimals(poc_price))),
+                    py - 17.,
+                    theme::amber(),
                 ),
-                theme::amber(),
-            ));
-            paint.labels.push((
-                pos2(rect.right() - dock, rect.top() + 40.),
-                format!(
-                    "{} {}s{}{}",
-                    if view.composite == 0 { "VIS" } else { "COMP" },
-                    selected.len(),
-                    if c.partial > 0 { format!(" · {} partial", c.partial) } else { String::new() },
-                    if r.gaps.is_empty() { "" } else { " · gap" }
-                ),
-                theme::text(),
-            ));
+                (header, rect.top() + 54., theme::text()),
+            ] {
+                let width = (text.chars().count() as f32 * 5.6 + 8.).min(dock);
+                let pill = Rect::from_min_size(pos2(rect.right() - dock, at), vec2(width, 14.));
+                paint.shapes.push(egui::Shape::rect_filled(pill, 3., theme::card().gamma_multiply(0.92)));
+                paint.shapes.push(egui::Shape::rect_stroke(
+                    pill,
+                    3.,
+                    Stroke::new(1., color.gamma_multiply(0.45)),
+                    egui::StrokeKind::Inside,
+                ));
+                paint.labels.push((pill.min + vec2(4., 1.5), text, color));
+            }
         }
+        let tag_right = cone_x.map_or(rect.right() - dock - 8., |x| (x - 8.).max(rect.left() + 160.));
         if view.naked {
             let mut levels: Vec<_> = r
                 .levels
@@ -486,15 +567,16 @@ impl ChartState {
                 .collect();
             let last = r.sessions.last().map_or(0., |s| s.close);
             levels.sort_by(|a, b| (a.price - last).abs().total_cmp(&(b.price - last).abs()));
-            levels.truncate((((rect.height() - 130.) / 17.).floor().max(1.) as usize).min(12));
+            let bottom = rect.bottom() - lift - 40.;
+            levels.truncate((((bottom - rect.top() - 57.) / 17.).floor().max(1.) as usize).min(12));
             levels.sort_by(|a, b| b.price.total_cmp(&a.price));
             let count = levels.len();
             let mut tag_y = rect.top() + 57.;
             for (row, l) in levels.into_iter().enumerate() {
                 let yy = y(l.price);
                 let end = match l.end {
-                    LevelEnd::Naked => rect.right() - dock - 8.,
-                    LevelEnd::Touched { ts } | LevelEnd::CutByGap { ts } => x(ts).min(rect.right() - dock - 8.),
+                    LevelEnd::Naked => tag_right,
+                    LevelEnd::Touched { ts } | LevelEnd::CutByGap { ts } => x(ts).min(tag_right),
                 };
                 // A gap immediately after the origin ends at its last bar,
                 // before the scheduled close. Still show the GAP cap there.
@@ -520,7 +602,7 @@ impl ChartState {
                     }
                     LevelEnd::Naked => {}
                 }
-                let ty = yy.max(tag_y).min(rect.bottom() - 70. - (count - row - 1) as f32 * 17.);
+                let ty = yy.max(tag_y).min(bottom - (count - row - 1) as f32 * 17.);
                 tag_y = ty + 17.;
                 let label = format!(
                     "{}{} {} · {}s · {} tests{}{}{}",
@@ -537,11 +619,26 @@ impl ChartState {
                     if l.gapped_over { " ⇅" } else { "" },
                     if matches!(l.end, LevelEnd::CutByGap { .. }) { " GAP" } else { "" }
                 );
-                let width = (label.chars().count() as f32 * 6. + 8.).min(rect.width());
-                let tag = Rect::from_min_size(pos2((end - width).max(rect.left()), ty - 7.), vec2(width, 15.));
-                line(&mut paint.shapes, pos2(end, yy), tag.right_center(), color, 0.6);
-                paint.shapes.push(egui::Shape::rect_filled(tag, 3., theme::card()));
-                paint.labels.push((tag.min + vec2(4., 1.), label, color));
+                let width = (label.chars().count() as f32 * 5.6 + 8.).min(rect.width());
+                let mut right = end;
+                // Step left of any AVWAP price tag on the same row (those are drawn later, on top).
+                for _ in 0..4 {
+                    let probe = Rect::from_min_max(pos2(right - width, ty - 8.), pos2(right, ty + 8.));
+                    match avwap_tags.iter().find(|r| r.intersects(probe)) {
+                        Some(r) => right = r.left() - 4.,
+                        None => break,
+                    }
+                }
+                let tag = Rect::from_min_size(pos2((right - width).max(rect.left()), ty - 7.), vec2(width, 15.));
+                line(&mut paint.shapes, pos2(end, yy), pos2(end.min(tag.right()), ty), color, 0.8);
+                paint.shapes.push(egui::Shape::rect_filled(tag, 3., theme::card().gamma_multiply(0.94)));
+                paint.shapes.push(egui::Shape::rect_stroke(
+                    tag,
+                    3.,
+                    Stroke::new(1., color.gamma_multiply(0.5)),
+                    egui::StrokeKind::Inside,
+                ));
+                paint.labels.push((tag.min + vec2(4., 1.5), label, color));
                 paint.hits.push(Hit { rect:tag,detail:format!("{:?} {:.4}\nOrigin {} · {} sessions · {} tests\nDistance {:+.4} ({:+.2}%)\n{:?}\nUntouched in closed regular-session bars until the recorded end.\nClick: centre origin · Alt+click: anchor VWAP at open",l.kind,l.price,l.origin,l.age,l.tests,l.price-last,(l.price/last-1.)*100.,l.end).into(),level:Some(l.clone()),row:None });
             }
         }
@@ -559,7 +656,13 @@ impl ChartState {
             sources.into_iter().collect::<Vec<_>>().join(" / "),
             r.fine_note.as_deref().unwrap_or("")
         );
-        paint.footer_rect = Some(Rect::from_min_max(pos2(rect.left() + 8., rect.bottom() - 34.), rect.max));
+        paint.note = format!("uniform H–L · {}", r.fine_note.as_deref().unwrap_or("1m"));
+        let width =
+            ((paint.footer.chars().count() + 2) as f32 * 5.5).max(214. + paint.note.chars().count() as f32 * 5.5);
+        paint.footer_rect = Some(Rect::from_min_max(
+            pos2(rect.left() + 8., rect.bottom() - lift - 28.),
+            pos2((rect.left() + 12. + width).min(rect.right()), rect.bottom() - lift),
+        ));
         self.auction.paint = paint;
     }
     pub(super) fn paint_auction(&mut self, ui: &mut Ui, rect: Rect, v: &Viewport, scale: &PriceScale) {
@@ -596,8 +699,13 @@ impl ChartState {
             .sent
             .as_ref()
             .is_some_and(|(k, _)| self.auction.previous.as_ref().is_none_or(|(old, _)| old != k));
+        let base = rect.bottom() - self.auction_footer_lift();
+        // A card under the two footer rows keeps them legible over candles.
+        if let Some(r) = paint.footer_rect {
+            p.rect_filled(r.expand2(vec2(4., 1.)), 3., theme::card().gamma_multiply(0.85));
+        }
         p.text(
-            pos2(rect.left() + 8., rect.bottom() - 33.),
+            pos2(rect.left() + 8., base - 27.),
             Align2::LEFT_TOP,
             format!("{}{}", paint.footer, if updating { " …" } else { "" }),
             mono(9.),
@@ -605,17 +713,17 @@ impl ChartState {
         );
         widgets::seq_key(
             &p,
-            pos2(rect.left() + 8., rect.bottom() - 17.),
+            pos2(rect.left() + 8., base - 13.),
             theme::series(2),
             &["20", "40", "60", "80", "100% of POC"],
         );
-        let source = self.auction.result.as_ref().and_then(|r| r.as_ref().ok()).unwrap();
+        let fallback = matches!(&self.auction.result, Some(Ok(r)) if r.fine_note.is_some());
         p.text(
-            pos2(rect.left() + 285., rect.bottom() - 17.),
+            pos2(rect.left() + 222., base - 13.),
             Align2::LEFT_TOP,
-            format!("uniform H–L · {}", source.fine_note.as_deref().unwrap_or("1m")),
+            &paint.note,
             mono(9.),
-            if source.fine_note.is_some() { theme::amber() } else { theme::muted() },
+            if fallback { theme::amber() } else { theme::muted() },
         );
         if self.hover_enabled
             && let Some(at) = ui.input(|i| i.pointer.hover_pos())
@@ -1151,6 +1259,71 @@ mod tests {
         c.set_auction(AuctionCmd::Toggle(Some(true)), &w);
         assert!(c.auction.result.as_ref().is_some_and(Result::is_ok));
         assert!(requests(&mut rx).is_empty());
+    }
+    #[test]
+    fn naked_tags_step_left_of_an_avwap_price_tag_on_the_same_row() {
+        let ctx = egui::Context::default();
+        let mut c = fixture();
+        ready(&mut c);
+        // Anchored at the first open, the AVWAP sits at ~103, on Monday's nPOC.
+        c.avwap_anchors = vec![c.bars[0].ts];
+        let key = c.avwap_key(chrono::Utc::now().timestamp()).unwrap();
+        let report = tr_data::anchored_vwap::build(&c.bars, &key.anchors, key.closed_len);
+        c.on_anchored_vwap(key, Ok(Arc::new(report)));
+        ctx.run_ui(Default::default(), |ui| {
+            let rect = Rect::from_min_size(Pos2::ZERO, vec2(780., 500.));
+            let scale = PriceScale::padded(98., 108., 0.01, false, 500.);
+            c.paint_avwap(ui, rect, &c.viewport.unwrap(), &scale, None);
+        })
+        .textures_delta
+        .clear();
+        let avwap = c.avwap_tag_rects();
+        assert_eq!(avwap.len(), 1);
+        geometry(&mut c);
+        let tags: Vec<_> = c.auction.paint.hits.iter().filter(|h| h.level.is_some()).map(|h| h.rect).collect();
+        assert!(!tags.is_empty());
+        assert!(tags.iter().all(|t| !t.intersects(avwap[0])), "{tags:?} vs {avwap:?}");
+    }
+    #[test]
+    fn footer_rides_above_the_vault_label_and_narrow_strips_use_one_letter_tags() {
+        let mut c = fixture();
+        Arc::make_mut(&mut c.bars).remove(3);
+        ready(&mut c);
+        assert_eq!(c.auction_footer_room(), 38.);
+        c.stitch = Some(Arc::new(tr_data::vault::StitchInfo {
+            cells: vec![tr_data::vault::SessionCell {
+                date: "2026-11-10".parse().unwrap(),
+                state: tr_data::vault::CellState::Complete,
+                expected: 78,
+                present: 78,
+                holes: 0,
+                fetch_ok: 1,
+                fetch_fail: 0,
+                corrected: 0,
+                last_seen: None,
+                half_day: false,
+            }],
+            ..Default::default()
+        }));
+        assert_eq!(c.auction_footer_room(), 54.);
+        geometry(&mut c);
+        let footer = c.auction.paint.footer_rect.unwrap();
+        assert!(footer.bottom() <= 500. - 22.);
+        assert!(c.auction.paint.labels.iter().any(|(_, s, _)| s == "PARTIAL 77/78"));
+        // ~20 px per session: the partial strip is tagged "P", never the long tag.
+        c.viewport = Some(Viewport { right: c.bars.len() as f64 + 8., bar_px: 0.26, width_px: 780. });
+        geometry(&mut c);
+        assert!(c.auction.paint.labels.iter().any(|(_, s, _)| s == "P"));
+        assert!(!c.auction.paint.labels.iter().any(|(_, s, _)| s.starts_with("PARTIAL")));
+    }
+    #[test]
+    fn legend_line_names_the_latest_session_value_and_open_location() {
+        let mut c = fixture();
+        assert!(c.auction_legend_line().is_none());
+        ready(&mut c);
+        let line = c.auction_legend_line().unwrap();
+        assert!(line.starts_with("AMAP 11-10 POC "), "{line}");
+        assert!(line.contains("OPEN OUTSIDE RANGE"), "{line}");
     }
     #[test]
     fn non_us_cash_charts_refuse_locally_without_a_fine_fetch() {
