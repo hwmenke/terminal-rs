@@ -556,3 +556,16 @@ mod feed_tests {
         assert!(texts.iter().all(|t| !t.contains("0.00")));
     }
 }
+
+/// Five ordered volume intensities; never implies positive/negative returns.
+pub fn seq_ramp(step: usize, base: Color32) -> Color32 {
+    base.gamma_multiply([0.18, 0.32, 0.50, 0.72, 1.0][step.clamp(1, 5) - 1])
+}
+pub fn seq_key(p: &egui::Painter, at: Pos2, base: Color32, labels: &[&str]) {
+    let mut x = at.x;
+    for (i, label) in labels.iter().take(5).enumerate() {
+        p.rect_filled(Rect::from_min_size(pos2(x, at.y + 2.), vec2(9., 8.)), 0., seq_ramp(i + 1, base));
+        p.text(pos2(x + 12., at.y), Align2::LEFT_TOP, *label, theme::mono(9.), theme::muted());
+        x += 12. + label.len() as f32 * 5.5 + 8.;
+    }
+}

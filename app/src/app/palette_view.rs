@@ -22,6 +22,14 @@ const VISIBLE_ROWS: usize = 10;
 /// line's own hint), extra search words, and the action whose shortcut is shown.
 const COMMANDS: &[(&str, &str, &str, Option<Action>)] = &[
     (
+        "AUCTION",
+        "Auction Map: session profiles, composite and naked levels",
+        "amap volume value area poc",
+        Some(Action::ToggleAuctionMap),
+    ),
+    ("AUCTION VIS", "Visible whole-session composite", "auction profile visible", None),
+    ("AUCTION NAKED", "Toggle naked POC / VAH / VAL", "auction levels", None),
+    (
         "CONE",
         "Trend Cone: regime path quantiles + walk-forward coverage",
         "quant bootstrap fan forecast trend cone",

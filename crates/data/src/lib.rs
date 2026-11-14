@@ -14,6 +14,7 @@
 
 pub mod alpaca;
 pub mod anchored_vwap;
+pub mod auction;
 pub mod autocorr;
 pub mod backtest;
 pub mod cache;

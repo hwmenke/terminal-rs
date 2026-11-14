@@ -294,6 +294,7 @@ pub enum Function {
     StackSession(Option<bool>),
     TruthRail(Option<bool>),
     StackEdge(Option<bool>),
+    AuctionMap(AuctionCmd),
     TrendCone {
         on: Option<bool>,
         spec: Option<(usize, usize)>,
@@ -522,6 +523,35 @@ pub enum ReviewOverlay {
     Volume,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AuctionCmd {
+    Toggle(Option<bool>),
+    Composite(u8),
+    ValueArea(u8),
+    Naked(Option<bool>),
+    MaxAge(u8),
+    Filled(Option<bool>),
+    Strips(Option<bool>),
+    Ib(Option<bool>),
+}
+fn parse_auction(rest: &[&str]) -> Option<AuctionCmd> {
+    use AuctionCmd::*;
+    let words: Vec<_> = rest.iter().map(|s| s.to_ascii_uppercase()).collect();
+    let r: Vec<_> = words.iter().map(String::as_str).collect();
+    let number = |s: &str, lo, hi| s.parse::<u8>().ok().filter(|n| (lo..=hi).contains(n));
+    Some(match r.as_slice() {
+        ["VIS"] => Composite(0),
+        ["VA", n] => ValueArea(number(n, 50, 95)?),
+        ["NAKED", n] if number(n, 1, 20).is_some() => MaxAge(number(n, 1, 20)?),
+        ["NAKED", tail @ ..] => Naked(parse_switch(tail)?),
+        ["FILLED", tail @ ..] => Filled(parse_switch(tail)?),
+        ["STRIPS", tail @ ..] => Strips(parse_switch(tail)?),
+        ["IB", tail @ ..] => Ib(parse_switch(tail)?),
+        [n] if number(n, 1, 20).is_some() => Composite(number(n, 1, 20)?),
+        _ => Toggle(parse_switch(&r)?),
+    })
+}
+
 fn parse_cone(rest: &[&str]) -> Option<Function> {
     if let [h] = rest
         && let Ok(h) = h.parse::<usize>()
@@ -745,6 +775,7 @@ fn parse_function(head: &str, rest: &[&str]) -> Option<Function> {
         "IDESK" | "IDASH" => Function::IntradayDesk,
         "VAULT" | "VLT" => Function::Vault(parse_vault(rest)?),
         "COCKPIT" | "CKPT" => Function::Cockpit { spec: joined() },
+        "AUCTION" | "AMAP" => Function::AuctionMap(parse_auction(rest)?),
         "CONE" | "TRENDCONE" => parse_cone(rest)?,
         "AVWAP" => Function::AnchoredVwap(match words().as_slice() {
             [] => AnchorCmd::Arm,
@@ -937,7 +968,10 @@ pub fn parse(input: &str) -> Option<Command> {
             return Some(Command::Function(f));
         }
         // Invalid stack arguments must not become a ticker followed by an interval.
-        if ["TSTACK", "STACK", "MTF", "REGIME", "RAIL", "AVWAP"].iter().any(|word| head.eq_ignore_ascii_case(word)) {
+        if ["TSTACK", "STACK", "MTF", "REGIME", "RAIL", "AVWAP", "AUCTION", "AMAP"]
+            .iter()
+            .any(|word| head.eq_ignore_ascii_case(word))
+        {
             return None;
         }
         // VAULT and VLT are also listed tickers. Only a vault verb is guarded;
@@ -995,6 +1029,7 @@ fn describe(f: &Function) -> String {
         Function::StackLadder(frames) => format!("Trend Stack ladder {}", frames.as_ref().map(|f| f.iter().map(|t| t.label()).collect::<Vec<_>>().join("·")).unwrap_or_else(|| "AUTO".into())),
         Function::StackTint(_) => "Regime Candle tint".into(),
         Function::StackSession(_) => "Trend Stack session anchor".into(),
+        Function::AuctionMap(_) => "Auction Map · session profiles, composite, naked POC/VAH/VAL · ticker: AUCTION US Equity".into(),
         Function::TrendCone { .. } => "Trend Cone · regime path quantiles + walk-forward coverage".into(),
         Function::StackEdge(_) => "Trend Stack regime Edge study".into(),
         Function::TruthRail(_) => "Truth Rail".into(),
@@ -2226,5 +2261,66 @@ mod combo_tests {
             assert!(parse(input).is_none(), "{input}");
         }
         assert!(matches!(parse("ZZUNKNOWN"), Some(Command::Symbol(_))));
+    }
+}
+#[cfg(test)]
+mod auction_tests {
+    use super::*;
+    #[test]
+    fn auction_and_alias_parse_with_all_subcommands() {
+        use AuctionCmd::*;
+        for (text, cmd) in [
+            ("AUCTION", Toggle(None)),
+            ("amap", Toggle(None)),
+            ("AUCTION ON", Toggle(Some(true))),
+            ("AUCTION OFF", Toggle(Some(false))),
+            ("AUCTION 10", Composite(10)),
+            ("AUCTION VIS", Composite(0)),
+            ("AUCTION VA 68", ValueArea(68)),
+            ("AUCTION NAKED", Naked(None)),
+            ("AUCTION NAKED OFF", Naked(Some(false))),
+            ("AUCTION NAKED ON", Naked(Some(true))),
+            ("AUCTION NAKED 15", MaxAge(15)),
+            ("AUCTION FILLED", Filled(None)),
+            ("AUCTION FILLED ON", Filled(Some(true))),
+            ("AUCTION STRIPS OFF", Strips(Some(false))),
+            ("AUCTION IB ON", Ib(Some(true))),
+        ] {
+            assert_eq!(parse(text), Some(Command::Function(Function::AuctionMap(cmd))), "{text}");
+        }
+        assert_eq!(
+            parse("AAPL AUCTION 5"),
+            Some(Command::SymbolFunction("AAPL US Equity".into(), Function::AuctionMap(Composite(5))))
+        );
+    }
+    #[test]
+    fn auction_rejects_out_of_range_and_unknown_arguments() {
+        for text in [
+            "AUCTION 0",
+            "AUCTION 21",
+            "AUCTION VA 30",
+            "AUCTION VA 96",
+            "AUCTION 5m",
+            "AUCTION FOO",
+            "AMAP FOO",
+            "AUCTION NAKED 21",
+            "AUCTION IB MAYBE",
+            "AUCTION FILLED ON OFF",
+        ] {
+            assert_eq!(parse(text), None, "{text}");
+        }
+    }
+    #[test]
+    fn auction_words_with_a_yellow_key_load_the_ticker() {
+        for text in ["AUCTION US Equity", "AMAP Equity", "amap us equity <GO>"] {
+            assert!(matches!(parse(text), Some(Command::Symbol(_))), "{text}");
+        }
+        assert!(matches!(
+            parse("AUCTION US Equity 1h"),
+            Some(Command::SymbolFunction(_, Function::Timeframe(Timeframe::H1)))
+        ));
+        assert!(matches!(parse("ZZZQ"), Some(Command::Symbol(_))));
+        assert!(tr_core::catalog::lookup("AUCTION", None).is_none());
+        assert!(tr_core::catalog::lookup("AMAP", None).is_none());
     }
 }

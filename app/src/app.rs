@@ -576,6 +576,7 @@ impl PaneKind {
                 show_rail: c.show_rail,
                 show_edge: c.show_edge,
                 cone: c.cone_settings(),
+                auction: c.auction_settings(),
                 avwap: {
                     let mut store = c.avwap_store.clone();
                     let key = tr_chart::drawings::store_key(&c.symbol);
@@ -721,6 +722,7 @@ impl PaneKind {
                 show_rail,
                 show_edge,
                 cone,
+                auction,
                 avwap,
                 cockpit_chip,
             } => {
@@ -763,6 +765,7 @@ impl PaneKind {
                 c.show_rail = show_rail;
                 c.show_edge = show_edge;
                 c.restore_cone(cone);
+                c.restore_auction(auction);
                 c.show_stack |= show_edge;
                 PaneKind::Chart(Box::new(c))
             }
@@ -1460,6 +1463,10 @@ impl TerminalApp {
             Command::SymbolFunction(s, f @ (Function::NewPanel(_) | Function::Split { .. })) => {
                 self.apply_with_symbol(f, Some(s));
             }
+            Command::SymbolFunction(s, Function::AuctionMap(cmd)) => {
+                self.open_security(&s);
+                self.apply_with_symbol(Function::AuctionMap(cmd), Some(s));
+            }
             Command::SymbolFunction(s, Function::TrendStack(on)) => {
                 self.open_security(&s);
                 self.with_chart(|c, w| c.set_trend_stack(Some(on.unwrap_or(true)), w));
@@ -1530,6 +1537,14 @@ impl TerminalApp {
             Function::StackLadder(frames) => self.with_chart(|c, w| c.set_stack_ladder(frames, w)),
             Function::StackTint(on) => self.with_chart(|c, w| c.set_stack_tint(on, w)),
             Function::StackSession(on) => self.with_chart(|c, w| c.set_stack_session(on, w)),
+            Function::AuctionMap(cmd) => {
+                let cmd = if symbol.is_some() && cmd == command::AuctionCmd::Toggle(None) {
+                    command::AuctionCmd::Toggle(Some(true))
+                } else {
+                    cmd
+                };
+                self.with_chart(|c, w| c.set_auction(cmd, w));
+            }
             Function::TrendCone { on, spec } => self.with_chart(|c, w| c.set_trend_cone(on, spec, w)),
             Function::StackEdge(on) => self.with_chart(|c, w| c.set_stack_edge(on, w)),
             Function::TruthRail(on) => self.with_chart(|c, _| c.show_rail = on.unwrap_or(!c.show_rail)),
@@ -2115,6 +2130,11 @@ impl TerminalApp {
                         }
                     }
                 }
+                Response::AuctionMap { pane, key, result } => {
+                    if let Some(c) = self.chart_mut(pane) {
+                        c.on_auction_map(key, result);
+                    }
+                }
                 Response::TrendCone { pane, key, result } => {
                     if let Some(c) = self.chart_mut(pane) {
                         c.on_trend_cone(key, result);
@@ -2594,6 +2614,7 @@ impl TerminalApp {
             | A::DrawHorizontal
             | A::DrawVertical
             | A::DrawFib
+            | A::ToggleAuctionMap
             | A::ToggleTrendCone
             | A::DrawAnchoredVwap
             | A::ResetView
@@ -2647,6 +2668,7 @@ impl TerminalApp {
             A::DrawHorizontal => self.with_chart(|c, _| c.start_tool(Tool::Horizontal)),
             A::DrawVertical => self.with_chart(|c, _| c.start_tool(Tool::Vertical)),
             A::DrawFib => self.with_chart(|c, _| c.start_tool(Tool::Fib)),
+            A::ToggleAuctionMap => self.with_chart(|c, w| c.set_auction(command::AuctionCmd::Toggle(None), w)),
             A::ToggleTrendCone => self.with_chart(|c, w| c.set_trend_cone(None, None, w)),
             A::DrawAnchoredVwap => self.anchored_vwap_command(command::AnchorCmd::Arm),
             A::ResetView => self.with_chart(|c, _| c.reset_view()),
@@ -3499,3 +3521,32 @@ mod tests {
 
 #[cfg(test)]
 mod ticker_switch_tests;
+
+#[cfg(test)]
+mod auction_tests {
+    use super::*;
+    #[test]
+    fn alt_p_toggles_the_auction_map_only_on_a_focused_chart_and_settings_round_trip() {
+        let mut app = tests::test_app();
+        let chart = app.new_pane(PaneKind::Chart(Box::new(ChartState::new(0, "AAPL", tr_core::Timeframe::M5))));
+        let help = app.new_pane(PaneKind::Help);
+        app.focus = help;
+        assert!(!app.hotkey_applies(prefs::Action::ToggleAuctionMap));
+        app.focus = chart;
+        assert!(app.hotkey_applies(prefs::Action::ToggleAuctionMap));
+        app.run_hotkey(prefs::Action::ToggleAuctionMap);
+        let c = app.chart_mut(chart).unwrap();
+        assert!(c.auction_settings().is_some());
+        let settings = app.panes.iter().find(|p| p.id == chart).unwrap().kind.settings();
+        let round_trip =
+            PaneKind::from_settings(serde_json::from_str(&serde_json::to_string(&settings).unwrap()).unwrap());
+        assert_eq!(round_trip.settings(), settings);
+        app.run_hotkey(prefs::Action::ToggleAuctionMap);
+        assert!(app.chart_mut(chart).unwrap().auction_settings().is_none());
+        app.execute("MSFT AUCTION");
+        assert!(app.chart_mut(chart).unwrap().auction_settings().is_some());
+        app.execute("MSFT AUCTION");
+        assert!(app.chart_mut(chart).unwrap().auction_settings().is_some());
+        assert_eq!(app.chart_mut(chart).unwrap().symbol, "MSFT US Equity");
+    }
+}

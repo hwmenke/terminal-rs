@@ -60,6 +60,24 @@ impl Link {
     }
 }
 
+/// Optional Auction Map view and calculation settings. Missing fields use defaults.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct AuctionSettings {
+    pub strips: bool,
+    pub composite: u8,
+    pub value_area: u8,
+    pub naked: bool,
+    pub max_age: u8,
+    pub filled: bool,
+    pub ib: bool,
+}
+impl Default for AuctionSettings {
+    fn default() -> Self {
+        Self { strips: true, composite: 10, value_area: 70, naked: true, max_age: 10, filled: false, ib: true }
+    }
+}
+
 /// A pane's kind plus its persisted, panel-specific settings.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum PaneSettings {
@@ -114,6 +132,8 @@ pub enum PaneSettings {
         /// Enabled Trend Cone: (horizon bars, mean stationary-bootstrap block).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         cone: Option<(usize, usize)>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        auction: Option<AuctionSettings>,
         /// Anchored VWAP anchors (UTC bar opens) per security, keyed like drawings.
         #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
         avwap: BTreeMap<String, Vec<i64>>,
@@ -578,6 +598,7 @@ pub fn chart_settings(symbol: &str, d: &crate::prefs::PanelDefaults) -> PaneSett
         show_rail: true,
         show_edge: false,
         cone: None,
+        auction: None,
         avwap: BTreeMap::new(),
         cockpit_chip: None,
     }
@@ -810,6 +831,7 @@ mod tests {
                 show_rail: true,
                 show_edge: false,
                 cone: None,
+                auction: None,
                 ..
             }
         ));
@@ -1035,6 +1057,7 @@ mod tests {
                 show_rail: true,
                 show_edge: false,
                 cone: None,
+                auction: None,
                 avwap: BTreeMap::new(),
                 cockpit_chip: None,
             }],
@@ -1086,5 +1109,30 @@ mod tests {
             serde_json::from_value::<PaneSettings>(value).unwrap(),
             PaneSettings::Chart { cone: None, .. }
         ));
+    }
+}
+
+#[cfg(test)]
+mod auction_tests {
+    use super::*;
+    #[test]
+    fn older_layout_without_auction_field_loads_with_the_map_off() {
+        let mut value = serde_json::to_value(chart_settings("AAPL", &Default::default())).unwrap();
+        value["Chart"].as_object_mut().unwrap().remove("auction");
+        assert!(matches!(
+            serde_json::from_value::<PaneSettings>(value).unwrap(),
+            PaneSettings::Chart { auction: None, .. }
+        ));
+    }
+    #[test]
+    fn partial_auction_settings_take_defaults_and_round_trip() {
+        let v: AuctionSettings = serde_json::from_str(r#"{"value_area":68}"#).unwrap();
+        assert_eq!(v, AuctionSettings { value_area: 68, ..Default::default() });
+        let mut pane = chart_settings("AAPL", &Default::default());
+        if let PaneSettings::Chart { auction, .. } = &mut pane {
+            *auction = Some(v);
+        }
+        let json = serde_json::to_string(&pane).unwrap();
+        assert_eq!(serde_json::from_str::<PaneSettings>(&json).unwrap(), pane);
     }
 }

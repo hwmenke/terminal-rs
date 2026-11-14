@@ -31,3 +31,7 @@ harness = false
 [[bench]]
 name = "barvault"
 harness = false
+
+[[bench]]
+name = "auction"
+harness = false
