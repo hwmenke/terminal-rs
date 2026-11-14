@@ -148,6 +148,20 @@ mod tests {
     }
 
     #[test]
+    fn bh_is_step_up_not_step_down() {
+        // m = 3, thresholds k·0.10/3 = .0333, .0667, .1. p(1) = .04 fails its own
+        // threshold, but p(3) = .09 ≤ .1 so step-up rejects all three.
+        // q(3) = .09; q(2) = min(.09, .05·3/2 = .075) = .075; q(1) = min(.075, .12) = .075.
+        let q = benjamini_hochberg(&[0.09, 0.04, 0.05]);
+        for (q, e) in q.iter().zip([0.09, 0.075, 0.075]) {
+            assert!((q - e).abs() < 1e-12, "{q} vs {e}");
+        }
+        assert!(q.iter().all(|q| *q <= 0.10));
+        // Adjusted values never exceed 1.
+        assert_eq!(benjamini_hochberg(&[0.9, 0.95]), [0.95, 0.95]);
+    }
+
+    #[test]
     fn sign_test_hand_values_symmetry_and_long_balanced_sample() {
         assert_eq!(sign_test(0, 0), None);
         for (a, b, expected) in [(1, 0, 1.0), (5, 0, 0.0625), (4, 1, 0.375), (3, 3, 1.0), (9, 1, 0.021484375)] {

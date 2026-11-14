@@ -135,8 +135,26 @@ pub enum Request {
         window: tr_data::studio_dist::Window,
     },
     /// `fresh` bypasses the per-(symbol, interval) bar cache (explicit Reload).
-    StudioCorr { pane: PaneId, generation: u64, symbol: String, spec: String, fresh: bool },
-    StudioSeason { pane: PaneId, generation: u64, symbol: String, tf: Timeframe },
+    TstackTune {
+        pane: PaneId,
+        generation: u64,
+        symbol: String,
+        tf: Timeframe,
+        params: AdaptiveTrendParams,
+    },
+    StudioCorr {
+        pane: PaneId,
+        generation: u64,
+        symbol: String,
+        spec: String,
+        fresh: bool,
+    },
+    StudioSeason {
+        pane: PaneId,
+        generation: u64,
+        symbol: String,
+        tf: Timeframe,
+    },
     /// Historical statistics and conditional forward returns for one archive symbol.
     Stats {
         pane: PaneId,
@@ -347,6 +365,9 @@ pub enum Request {
         bars: Arc<Vec<Bar>>,
         tf: Timeframe,
         specs: Vec<IndicatorSpec>,
+        class: tr_core::AssetClass,
+        observed: Option<i64>,
+        stitch: Option<Arc<tr_data::vault::StitchInfo>>,
         /// Colours are baked into overlays, so the UI passes its current palette.
         palette: theme::Palette,
     },
@@ -506,6 +527,7 @@ pub struct BuiltIndicator {
     pub note: Option<String>,
     /// Preserve double precision for z readouts; price geometry uses f32.
     pub z_readout: Option<Arc<Vec<f64>>>,
+    pub honest_z: Option<Arc<tr_data::honest_z::Report>>,
 }
 
 pub struct Profile {
@@ -612,7 +634,16 @@ pub enum Response {
         spy: Option<Vec<Bar>>,
         error: Option<String>,
     },
-    StudioCorr { pane: PaneId, generation: u64, result: Result<tr_data::studio_corr::CorrReport, String> },
+    TstackTune {
+        pane: PaneId,
+        generation: u64,
+        result: Result<Arc<tr_data::tstack_tune::TuneReport>, String>,
+    },
+    StudioCorr {
+        pane: PaneId,
+        generation: u64,
+        result: Result<tr_data::studio_corr::CorrReport, String>,
+    },
     StudioSeason {
         pane: PaneId,
         generation: u64,
@@ -1225,11 +1256,21 @@ fn overlay(values: &[f64], color: egui::Color32, kind: LineKind) -> Overlay {
 
 /// Compute every indicator on `bars`. The `i`-th indicator takes the `i`-th series colour;
 /// its signal lines, outer bands and up/down lines take theme roles.
+#[cfg(test)]
 pub fn build_indicators(
     bars: &[Bar],
     tf: Timeframe,
     specs: &[IndicatorSpec],
     palette: &theme::Palette,
+) -> Vec<BuiltIndicator> {
+    build_indicators_impl(bars, tf, specs, palette, false)
+}
+fn build_indicators_impl(
+    bars: &[Bar],
+    tf: Timeframe,
+    specs: &[IndicatorSpec],
+    palette: &theme::Palette,
+    skip_zband: bool,
 ) -> Vec<BuiltIndicator> {
     let input = Input::new(bars, tf);
     let colors = palette.series.len();
@@ -1237,16 +1278,22 @@ pub fn build_indicators(
         .iter()
         .enumerate()
         .map(|(i, spec)| {
-            if spec.def().is_some_and(|d| d.research) {
-                if let Err(error) = tr_core::indicators::require_adaptive_bars(bars, spec.name()) {
-                    return BuiltIndicator {
-                        spec: spec.clone(),
-                        overlays: Vec::new(),
-                        refused: Some(error),
-                        note: None,
-                        z_readout: None,
-                    };
-                }
+            if skip_zband && spec.code == "ZBAND" {
+                return BuiltIndicator {
+                    spec: spec.clone(),
+                    overlays: Vec::new(),
+                    refused: None,
+                    note: None,
+                    z_readout: None,
+                    honest_z: None,
+                };
+            }
+            if spec.def().is_some_and(|d| d.research)
+                && let Err(error) = tr_core::indicators::require_adaptive_bars(bars, spec.name()) {
+                return BuiltIndicator {
+                    spec: spec.clone(), overlays: Vec::new(), refused: Some(error),
+                    note: None, z_readout: None, honest_z: None,
+                };
             }
             let main = palette.series[i % colors];
             let mut outputs = spec.compute(&input);
@@ -1285,9 +1332,77 @@ pub fn build_indicators(
             });
             let z_readout = (spec.code == "ZBAND")
                 .then(|| Arc::new(tr_core::indicators::registry::zband(&input.d.close, spec.params[0] as usize).z));
-            BuiltIndicator { spec: spec.clone(), overlays, refused: None, note, z_readout }
+            BuiltIndicator { spec: spec.clone(), overlays, refused: None, note, z_readout, honest_z: None }
         })
         .collect()
+}
+
+/// Keep the values whose drawn segment belongs to the `grey` half: bar t is kept
+/// when its own flag or the next bar's flag matches, so adjacent halves join.
+fn zband_split(values: &[f64], muted: &[bool], grey: bool) -> Vec<f64> {
+    let at = |t: usize| muted.get(t).copied().unwrap_or(true) == grey;
+    values.iter().enumerate().map(|(t, v)| if at(t) || at(t + 1) { *v } else { f64::NAN }).collect()
+}
+
+/// Chart-only closed-clock enrichment. Existing indicator calculations stay on
+/// the worker; ZBAND is rebuilt exclusively from admitted closed inputs.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn build_chart_indicators(
+    bars: &[Bar],
+    tf: Timeframe,
+    specs: &[IndicatorSpec],
+    palette: &theme::Palette,
+    class: tr_core::AssetClass,
+    observed: Option<i64>,
+    stitch: Option<&tr_data::vault::StitchInfo>,
+) -> Vec<BuiltIndicator> {
+    let mut built = build_indicators_impl(bars, tf, specs, palette, true);
+    for (i, indicator) in built.iter_mut().enumerate().filter(|(_, b)| b.spec.code == "ZBAND") {
+        let result = tr_data::vault::research_bars(bars, stitch).and_then(|bars| {
+            tr_data::honest_z::compute(
+                &bars,
+                tf,
+                class,
+                observed,
+                indicator.spec.params[0] as usize,
+                stitch.map_or(&[][..], |s| s.gaps.as_slice()),
+            )
+        });
+        // Never retain raw forming/unverified geometry from the generic builder.
+        indicator.overlays.clear();
+        indicator.z_readout = None;
+        indicator.note = None;
+        match result {
+            Err(e) => {
+                indicator.refused = Some(e);
+            }
+            Ok((band, report)) => {
+                indicator.refused = None;
+                let main = palette.series[i % palette.series.len()];
+                let lines = [
+                    ("+2σ", band.upper_two),
+                    ("+1σ", band.upper_one),
+                    ("Basis", band.mean),
+                    ("−1σ", band.lower_one),
+                    ("−2σ", band.lower_two),
+                ];
+                // Point-in-time styling: overlays 0..5 are the trusted (coloured)
+                // segments, 5..10 the grey ones. The segment ending at bar t takes
+                // bar t's flag, so each half keeps the joining bar t−1 as well.
+                let mut overlays = Vec::with_capacity(10);
+                for (grey, color) in [(false, main), (true, palette.muted)] {
+                    for (name, values) in &lines {
+                        let split = zband_split(values, &report.muted_at, grey);
+                        overlays.push(((*name).into(), overlay(&split, color, LineKind::Line)));
+                    }
+                }
+                indicator.overlays = overlays;
+                indicator.z_readout = Some(Arc::new(band.z));
+                indicator.honest_z = Some(Arc::new(report));
+            }
+        }
+    }
+    built
 }
 
 /// Align `other`'s closes to `base` timestamps (last close at or before each bar). The
@@ -1497,6 +1612,36 @@ async fn stitch_native(
     let fresh = bars.clone();
     cache_op(s, move |v| v.stitch(&id, &fresh, limit, Some(at))).await.unwrap_or((bars, fallback))
 }
+/// Admission and cache lookup both run in spawn_blocking, including input hashing.
+#[allow(clippy::too_many_arguments)]
+fn tune_cached(
+    reports: &tr_data::report_cache::ReportCache,
+    symbol: &str,
+    tf: Timeframe,
+    params: AdaptiveTrendParams,
+    bars: &[Bar],
+    source: &str,
+    observed: Option<i64>,
+    stitch: Option<&tr_data::vault::StitchInfo>,
+) -> Result<Arc<tr_data::tstack_tune::TuneReport>, String> {
+    tr_data::stats::require_research_bars(bars, "TSTACK Tune")?;
+    let bars = tr_data::vault::research_bars(bars, stitch)?;
+    let class = tr_data::security(symbol).class;
+    let n = tr_data::closed::closed_len(tf, &bars, class, observed);
+    let input = &bars[n.saturating_sub(tr_data::tstack_tune::MAX_BARS)..n];
+    let gaps = stitch.map_or(&[][..], |s| s.gaps.as_slice());
+    let mut key = tr_data::report_cache::ReportKey::new(
+        "tstack_tune",
+        symbol,
+        tf,
+        source,
+        input,
+        &format!("{params:?} {class:?} {gaps:?}"),
+    );
+    key.epoch = stitch.map_or(0, |s| s.epoch);
+    reports.get_or_compute(key, || tr_data::tstack_tune::compute(&bars, tf, class, observed, params, source, gaps))
+}
+
 async fn cached_study<T: Clone + Send + Sync + 'static>(
     s: &Shared,
     key: tr_data::report_cache::ReportKey,
@@ -3308,6 +3453,30 @@ async fn handle_inner(s: &Arc<Shared>, req: Request, force: bool) {
             }.await;
             send(Response::StudioDist { pane, generation, result: result.map_err(|e| format!("{e:#}")) });
         }
+        Request::TstackTune { pane, generation, symbol, tf, params } => {
+            let result = async {
+                if s.sample_mode() {
+                    anyhow::bail!("TSTACK Tune refused: sample / offline display mode");
+                }
+                let (bars, source, observed, stitch) = if tf.is_intraday() {
+                    let (bars, info) = analysis_bars(s, &symbol, tf, 5_000, "TSTACK Tune").await?;
+                    let observed = info.live_ok.then_some(info.fetched_at).flatten();
+                    (bars, info.label(), observed, Some(info))
+                } else {
+                    let (bars, source) =
+                        crate::app::studio_dist::daily_bars(&s.history, &config.bridge(), &symbol).await?;
+                    (tf.resample(&bars), source, Some(chrono::Utc::now().timestamp()), None)
+                };
+                let reports = s.reports.clone();
+                tokio::task::spawn_blocking(move || {
+                    tune_cached(&reports, &symbol, tf, params, &bars, &source, observed, stitch.as_ref())
+                })
+                .await?
+                .map_err(anyhow::Error::msg)
+            }
+            .await;
+            send(Response::TstackTune { pane, generation, result: result.map_err(|e| format!("{e:#}")) });
+        }
         Request::StudioCorr { pane, generation, symbol, spec, fresh } => {
             let bridge = config.bridge();
             let result = crate::app::studio_corr::research(
@@ -3801,10 +3970,12 @@ async fn handle_inner(s: &Arc<Shared>, req: Request, force: bool) {
                 Err(e) => s.send(Response::HistoryError { pane, generation, error: format!("{e:#}") }),
             }
         }
-        Request::Indicators { pane, generation, bars, tf, specs, palette } => {
-            let built = tokio::task::spawn_blocking(move || build_indicators(&bars, tf, &specs, &palette))
-                .await
-                .unwrap_or_default();
+        Request::Indicators { pane, generation, bars, tf, specs, palette, class, observed, stitch } => {
+            let built = tokio::task::spawn_blocking(move || {
+                build_chart_indicators(&bars, tf, &specs, &palette, class, observed, stitch.as_deref())
+            })
+            .await
+            .unwrap_or_default();
             s.send(Response::Indicators { pane, generation, built });
         }
         Request::Compare { pane, generation, symbol, tf, base } => {
@@ -5141,6 +5312,82 @@ mod tests {
             sample: false,
         })
     }
+    #[test]
+    fn tune_cache_hits_closed_inputs_and_invalidates_corrections_params_source_and_epoch() {
+        let mut bars: Vec<_> = (0..320)
+            .map(|i| {
+                let c = 100.0 + (i as f64 * 0.1).sin();
+                Bar::new(i * 86400, c, c + 1.0, c - 1.0, c, 1000.0).with_provenance(tr_core::Provenance::Real)
+            })
+            .collect();
+        let cache = tr_data::report_cache::ReportCache::default();
+        let p = AdaptiveTrendParams::default();
+        let a = tune_cached(&cache, "BTCUSD", Timeframe::D1, p, &bars, "fixture", None, None).unwrap();
+        bars[319].close += 0.1;
+        let b = tune_cached(&cache, "BTCUSD", Timeframe::D1, p, &bars, "fixture", None, None).unwrap();
+        assert!(Arc::ptr_eq(&a, &b), "forming changes do not invalidate a closed report");
+        bars[100].close += 0.1;
+        let corrected = tune_cached(&cache, "BTCUSD", Timeframe::D1, p, &bars, "fixture", None, None).unwrap();
+        assert!(!Arc::ptr_eq(&a, &corrected));
+        let changed = tune_cached(
+            &cache,
+            "BTCUSD",
+            Timeframe::D1,
+            AdaptiveTrendParams { confirm_mult: 0.5, ..p },
+            &bars,
+            "fixture",
+            None,
+            None,
+        )
+        .unwrap();
+        assert!(!Arc::ptr_eq(&corrected, &changed));
+        let source = tune_cached(&cache, "BTCUSD", Timeframe::D1, p, &bars, "other", None, None).unwrap();
+        assert!(!Arc::ptr_eq(&corrected, &source));
+        let info = tr_data::vault::StitchInfo { epoch: 2, source: "fixture".into(), ..Default::default() };
+        let epoch = tune_cached(&cache, "BTCUSD", Timeframe::D1, p, &bars, "fixture", None, Some(&info)).unwrap();
+        assert!(!Arc::ptr_eq(&corrected, &epoch));
+        let closed =
+            tune_cached(&cache, "BTCUSD", Timeframe::D1, p, &bars, "fixture", Some(320 * 86400), None).unwrap();
+        assert!(!Arc::ptr_eq(&corrected, &closed));
+        bars[319].provenance = tr_core::Provenance::Sample;
+        assert!(tune_cached(&cache, "BTCUSD", Timeframe::D1, p, &bars, "fixture", None, None).is_err());
+    }
+    #[tokio::test]
+    async fn tune_worker_uses_vault_and_refuses_unverified_and_sample_without_network() {
+        let bars: Vec<_> =
+            ["2026-11-02", "2026-11-03", "2026-11-04", "2026-11-05"].into_iter().flat_map(vault_day).collect();
+        let provider = vault_provider(bars);
+        let (s, rx) = shared(provider.clone(), Some(BarCache::open_in_memory().unwrap()));
+        let request = || Request::TstackTune {
+            pane: 55,
+            generation: 7,
+            symbol: "AAPL US Equity".into(),
+            tf: Timeframe::M5,
+            params: Default::default(),
+        };
+        handle(&s, request()).await;
+        let Response::WhatsNews { response, .. } = rx.try_recv().unwrap() else { panic!("envelope") };
+        let Response::TstackTune { pane, generation, result } = *response else { panic!("tune") };
+        let r = result.unwrap();
+        assert_eq!((pane, generation), (55, 7));
+        assert!(r.source.contains("VAULT") && r.provenance.is_verified());
+        provider.bars.lock().unwrap().last_mut().unwrap().provenance = tr_core::Provenance::Sample;
+        handle(&s, request()).await;
+        let Response::WhatsNews { response, .. } = rx.try_recv().unwrap() else { panic!("envelope") };
+        assert!(matches!(*response, Response::TstackTune { result: Err(_), .. }));
+        let sample = Arc::new(VaultProvider {
+            bars: Default::default(),
+            calls: Default::default(),
+            fail: Default::default(),
+            sample: true,
+        });
+        let (s, rx) = shared(sample.clone(), None);
+        handle(&s, request()).await;
+        let Response::WhatsNews { response, .. } = rx.try_recv().unwrap() else { panic!("envelope") };
+        assert!(matches!(*response, Response::TstackTune { result: Err(_), .. }));
+        assert_eq!(sample.calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
     #[tokio::test]
     async fn studio_dist_uses_sourced_vault_history_and_refuses_sample_mode() {
         let bars = vault_day("2026-11-09");
@@ -5220,8 +5467,16 @@ mod tests {
         );
         assert!(a.is_ok() && b.is_ok());
         assert_eq!(provider.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
-        let snap = s.cache.lock().unwrap().as_ref().unwrap().snapshot(None, chrono::Utc::now().timestamp()).unwrap();
-        assert_eq!(snap.series[0].cells.iter().map(|c| u32::from(c.fetch_ok)).sum::<u32>(), 1);
+        let now = chrono::Utc::now().timestamp();
+        let snap = s.cache.lock().unwrap().as_ref().unwrap().snapshot(None, now).unwrap();
+        // The fetch is booked under today's New York date; coverage lists session
+        // days only, so on weekends/holidays the counter is not visible there.
+        let total = snap.series[0].cells.iter().map(|c| u32::from(c.fetch_ok)).sum::<u32>();
+        if tr_data::history::calendar::is_session(tr_core::ny::civil(now).date()) {
+            assert_eq!(total, 1);
+        } else {
+            assert_eq!(total, 0);
+        }
     }
     #[tokio::test]
     async fn every_intraday_study_uses_sourced_analysis() {
@@ -6713,6 +6968,59 @@ mod tests {
         let a = align_compare(&base, &other);
         assert!(a[0].is_nan());
         assert_eq!(&a[1..], &[50.0, 50.0, 55.0, 55.0]);
+    }
+
+    #[test]
+    fn honest_z_worker_greys_trending_bands_and_excludes_forming_bar() {
+        let mut price = 100.0;
+        let mut previous = 0.0;
+        let mut seed = 19_u64;
+        let mut bars: Vec<_> = (0..600)
+            .map(|i| {
+                seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+                let noise = ((seed >> 11) as f64 / (1_u64 << 53) as f64 - 0.5) * 0.01;
+                previous = 0.85 * previous + noise;
+                price *= previous.exp();
+                Bar::new(i * 86400, price, price, price, price, 1.0).with_provenance(tr_core::Provenance::Real)
+            })
+            .collect();
+        let spec = [IndicatorSpec::new("ZBAND", &[20.0]).unwrap()];
+        let palette = theme::palette();
+        let build = |b: &[Bar]| {
+            build_chart_indicators(b, Timeframe::D1, &spec, &palette, tr_core::AssetClass::Crypto, None, None)
+        };
+        let a = build(&bars);
+        let r = a[0].honest_z.as_ref().unwrap();
+        assert!(r.trending);
+        assert_eq!(a[0].overlays.len(), 10);
+        assert!(a[0].overlays[5..].iter().all(|(_, o)| o.color == theme::rgba(palette.muted)));
+        assert!(a[0].overlays[..5].iter().all(|(_, o)| o.color != theme::rgba(palette.muted)));
+        // Each bar is drawn by the half matching its own point-in-time flag.
+        let value = |k: usize, t: usize| a[0].overlays[k].1.line.pyramid.data.get(t).map_or(f64::NAN, |p| p[1] as f64);
+        for (t, &muted) in r.muted_at.iter().enumerate().take(599).skip(20) {
+            let half = if muted { 5 } else { 0 };
+            assert!(value(half + 2, t).is_finite(), "bar {t} missing from its half");
+        }
+        // The last closed bars are trending: grey only, no coloured basis there.
+        assert!(r.muted_at[598] && value(2, 597).is_nan() && value(7, 598).is_finite());
+        assert!(a[0].z_readout.as_ref().unwrap()[599].is_nan());
+        bars[599].close *= 2.0;
+        bars[599].high = bars[599].close;
+        let b = build(&bars);
+        assert_eq!(r.as_ref(), b[0].honest_z.as_ref().unwrap().as_ref());
+        bars[599].provenance = tr_core::Provenance::Sample;
+        let b = build(&bars);
+        assert!(b[0].refused.is_some() && b[0].overlays.is_empty() && b[0].honest_z.is_none());
+    }
+
+    #[test]
+    fn zband_split_joins_halves_at_transitions() {
+        let v = [1.0, 2.0, 3.0, 4.0, 5.0];
+        let muted = [true, true, false, false, true];
+        let keep = |grey| zband_split(&v, &muted, grey).iter().map(|x| x.is_finite()).collect::<Vec<_>>();
+        // Coloured: bars 2,3 plus joining bar 1; grey: 0,1, the joining bar 3, and 4.
+        assert_eq!(keep(false), [false, true, true, true, false]);
+        assert_eq!(keep(true), [true, true, false, true, true]);
     }
 
     #[test]

@@ -37,12 +37,13 @@ mod session_path;
 mod settings_view;
 mod settings_writer;
 mod stats;
-pub(crate) mod studio_dist;
 pub(crate) mod studio_corr;
+pub(crate) mod studio_dist;
 mod studio_season;
 mod theming;
 mod trading;
 mod trend_wall;
+pub(crate) mod tstack_tune;
 pub(crate) mod vault_view;
 mod volume_pace;
 mod watchlists;
@@ -116,6 +117,7 @@ pub enum PaneKind {
     Stats(Box<stats::StatsPane>),
     StudioDist(Box<studio_dist::DistPane>),
     StudioCorr(Box<studio_corr::CorrPane>),
+    TstackTune(Box<tstack_tune::TunePane>),
     StudioSeason(Box<studio_season::SeasonPane>),
     /// Strategy vs buy-and-hold paper backtest (`BACKTEST` / `BT`).
     Backtest(Box<backtest::BacktestPane>),
@@ -346,8 +348,15 @@ impl PaneKind {
                 }
             }
             PaneKind::StudioDist(s) => format!("{} Distribution", tr_data::security(&s.symbol).ticker),
+            PaneKind::TstackTune(s) => format!("{} TSTACK Tune", tr_data::security(&s.symbol).ticker),
             PaneKind::StudioCorr(s) => format!("{} CORR", tr_data::security(&s.symbol).ticker),
-            PaneKind::StudioSeason(s) => if s.symbol.trim().is_empty() { "Seasonality".into() } else { format!("{} Seasonality", tr_data::security(&s.symbol).ticker) },
+            PaneKind::StudioSeason(s) => {
+                if s.symbol.trim().is_empty() {
+                    "Seasonality".into()
+                } else {
+                    format!("{} Seasonality", tr_data::security(&s.symbol).ticker)
+                }
+            }
             PaneKind::Stats(s) => {
                 if s.symbol.trim().is_empty() {
                     "Stats".into()
@@ -479,6 +488,7 @@ impl PaneKind {
             PaneKind::Stats(_) => "STATS",
             PaneKind::StudioDist(_) => "DIST",
             PaneKind::StudioCorr(_) => "CORR",
+            PaneKind::TstackTune(_) => "TUNE",
             PaneKind::StudioSeason(_) => "SEASON",
             PaneKind::Backtest(b) if b.intraday => "IBT",
             PaneKind::Backtest(_) => "BT",
@@ -515,6 +525,7 @@ impl PaneKind {
             PaneKind::SessionBrief(p) => Some(&p.symbol),
             PaneKind::SessionClock(p) => Some(&p.symbol),
             PaneKind::StudioDist(p) => Some(&p.symbol),
+            PaneKind::TstackTune(p) => Some(&p.symbol),
             _ => None,
         }
     }
@@ -615,7 +626,12 @@ impl PaneKind {
             },
             PaneKind::Desk(d) => PaneSettings::Desk { group: d.group.clone(), selected: d.selected.clone() },
             PaneKind::Journal(j) => PaneSettings::Journal { filter: j.filter.clone() },
-            PaneKind::StudioDist(s) => PaneSettings::StudioDist { symbol: s.symbol.clone(), timeframe: s.timeframe, window: s.window },
+            PaneKind::StudioDist(s) => {
+                PaneSettings::StudioDist { symbol: s.symbol.clone(), timeframe: s.timeframe, window: s.window }
+            }
+            PaneKind::TstackTune(s) => {
+                PaneSettings::TstackTune { symbol: s.symbol.clone(), tf: s.tf, params: s.params }
+            }
             PaneKind::StudioCorr(s) => PaneSettings::StudioCorr { symbol: s.symbol.clone(), spec: s.spec.clone() },
             PaneKind::StudioSeason(s) => PaneSettings::StudioSeason { symbol: s.symbol.clone(), spec: s.spec.clone() },
             PaneKind::Stats(s) => PaneSettings::Stats {
@@ -791,8 +807,15 @@ impl PaneKind {
             PaneSettings::StudioDist { symbol, timeframe, window } => {
                 PaneKind::StudioDist(Box::new(studio_dist::DistPane::new(symbol, timeframe, window)))
             }
-            PaneSettings::StudioCorr { symbol, spec } => PaneKind::StudioCorr(Box::new(studio_corr::CorrPane::new(symbol, spec))),
-            PaneSettings::StudioSeason { symbol, spec } => PaneKind::StudioSeason(Box::new(studio_season::SeasonPane::new(symbol, spec))),
+            PaneSettings::TstackTune { symbol, tf, params } => {
+                PaneKind::TstackTune(Box::new(tstack_tune::TunePane::new(symbol, tf, params)))
+            }
+            PaneSettings::StudioCorr { symbol, spec } => {
+                PaneKind::StudioCorr(Box::new(studio_corr::CorrPane::new(symbol, spec)))
+            }
+            PaneSettings::StudioSeason { symbol, spec } => {
+                PaneKind::StudioSeason(Box::new(studio_season::SeasonPane::new(symbol, spec)))
+            }
             PaneSettings::Stats { symbol, condition, conditional } => {
                 PaneKind::Stats(Box::new(stats::StatsPane::new(symbol, condition, conditional)))
             }
@@ -1444,7 +1467,10 @@ impl TerminalApp {
             Command::SymbolFunction(s, Function::Review) => self.open_review(Some(&s)),
             Command::SymbolFunction(s, Function::Desk) => self.open_desk(Some(&s)),
             Command::SymbolFunction(s, Function::Journal(extra)) => self.open_journal(Some(&s), &extra),
-            Command::SymbolFunction(s, Function::StudioDist { timeframe }) => self.open_studio_dist(Some(&s), timeframe),
+            Command::SymbolFunction(s, Function::StudioDist { timeframe }) => {
+                self.open_studio_dist(Some(&s), timeframe)
+            }
+            Command::SymbolFunction(s, Function::TstackTune(tf)) => self.open_tstack_tune(Some(&s), tf),
             Command::SymbolFunction(s, Function::StudioCorr { spec }) => self.open_studio_corr(Some(&s), &spec),
             Command::SymbolFunction(s, Function::StudioSeason { spec }) => self.open_studio_season(Some(&s), &spec),
             Command::SymbolFunction(s, Function::Stats { condition, conditional }) => {
@@ -1698,6 +1724,7 @@ impl TerminalApp {
             Function::Review => self.open_review(symbol.as_deref()),
             Function::Desk => self.open_desk(symbol.as_deref()),
             Function::Journal(extra) => self.open_journal(symbol.as_deref(), &extra),
+            Function::TstackTune(tf) => self.open_tstack_tune(symbol.as_deref(), tf),
             Function::StudioCorr { spec } => self.open_studio_corr(symbol.as_deref(), &spec),
             Function::StudioSeason { spec } => self.open_studio_season(symbol.as_deref(), &spec),
             Function::Stats { condition, conditional } => self.open_stats(symbol.as_deref(), &condition, conditional),
@@ -1833,6 +1860,7 @@ impl TerminalApp {
                             PaneKind::Chart(c) if c.archive => c.load(&self.worker),
                             PaneKind::Stats(s) => s.request(pane.id, &self.worker),
                             PaneKind::StudioDist(s) => s.request(pane.id, &self.worker),
+                            PaneKind::TstackTune(s) => s.request(pane.id, &self.worker),
                             PaneKind::StudioCorr(s) => s.request(pane.id, &self.worker),
                             PaneKind::StudioSeason(s) => s.request(pane.id, &self.worker),
                             PaneKind::Backtest(b) => b.request(pane.id, &self.worker),
@@ -1898,7 +1926,16 @@ impl TerminalApp {
                     }
                 }
                 Response::StudioDist { pane, generation, result } => {
-                    if let Some(PaneKind::StudioDist(s)) = self.panes.iter_mut().find(|p| p.id == pane).map(|p| &mut p.kind) {
+                    if let Some(PaneKind::StudioDist(s)) =
+                        self.panes.iter_mut().find(|p| p.id == pane).map(|p| &mut p.kind)
+                    {
+                        s.accept(generation, result);
+                    }
+                }
+                Response::TstackTune { pane, generation, result } => {
+                    if let Some(PaneKind::TstackTune(s)) =
+                        self.panes.iter_mut().find(|p| p.id == pane).map(|p| &mut p.kind)
+                    {
                         s.accept(generation, result);
                     }
                 }

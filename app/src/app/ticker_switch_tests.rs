@@ -90,11 +90,11 @@ fn respond(app: &mut TerminalApp, requests: &mut Requests, out: &mpsc::Sender<Re
                     })
                     .unwrap();
                 }
-                Request::Indicators { pane, generation, bars, tf, specs, palette } => {
+                Request::Indicators { pane, generation, bars, tf, specs, palette, class, observed, stitch } => {
                     out.send(Response::Indicators {
                         pane,
                         generation,
-                        built: crate::worker::build_indicators(&bars, tf, &specs, &palette),
+                        built: crate::worker::build_chart_indicators(&bars, tf, &specs, &palette, class, observed, stitch.as_deref()),
                     })
                     .unwrap();
                 }

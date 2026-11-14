@@ -1,5 +1,8 @@
 //! Completed native-bar regime lanes. No clock, fetching, price filling or resampling.
-use super::{AdaptiveTrendParams, Ohlcv, adaptive_trend_with, require_adaptive_bars, session_starts};
+use super::{
+    AdaptiveTrendParams, GridTrend, Ohlcv, adaptive_trend_grid, adaptive_trend_with, require_adaptive_bars,
+    session_starts,
+};
 use crate::{Bar, Provenance, Timeframe};
 
 #[derive(Debug, Clone, PartialEq)]
@@ -113,6 +116,47 @@ fn empty_lane(tf: Timeframe, len: usize) -> Lane {
     }
 }
 
+/// Effective parameters and session starts for one lane, exactly as the chart uses them.
+fn lane_params(
+    bars: &[Bar],
+    tf: Timeframe,
+    base_tf: Timeframe,
+    p: AdaptiveTrendParams,
+) -> (AdaptiveTrendParams, Option<Vec<bool>>) {
+    let mut params = p;
+    params.session_atr = tf.is_intraday();
+    params.session_reset = p.session_reset && tf == base_tf && tf.is_intraday();
+    let starts = tf.is_intraday().then(|| {
+        let ts: Vec<_> = bars.iter().map(|b| b.ts).collect();
+        let mut starts = session_starts(&ts);
+        if params.session_reset {
+            for i in 1..ts.len() {
+                let wall = crate::ny::civil(ts[i]);
+                // 09:30 always exists in New York civil time; skip rather than panic if not.
+                let Some(open) = wall.date().and_hms_opt(9, 30, 0).map(crate::ny::to_utc) else { continue };
+                starts[i] |= ts[i - 1] < open && ts[i] >= open;
+            }
+        }
+        starts
+    });
+    (params, starts)
+}
+
+/// Base-lane medium regimes over a medium-ER × min-hold grid (`holds` outer, `ers`
+/// inner). Each cell is identical to `trend_stack(base, base_tf, vec![], p')` with
+/// `p'.mb_er`/`p'.min_hold` replaced, but shared baselines are computed once.
+pub fn trend_grid(
+    base: &[Bar],
+    base_tf: Timeframe,
+    p: AdaptiveTrendParams,
+    ers: &[usize],
+    holds: &[usize],
+) -> Result<Vec<GridTrend>, String> {
+    require_adaptive_bars(base, "Trend Stack")?;
+    let (params, starts) = lane_params(base, base_tf, base_tf, p);
+    Ok(adaptive_trend_grid(&Ohlcv::new(base), params, starts.as_deref(), ers, holds))
+}
+
 pub fn trend_stack(
     base: &[Bar],
     base_tf: Timeframe,
@@ -122,21 +166,7 @@ pub fn trend_stack(
     require_adaptive_bars(base, "Trend Stack")?;
     let base_ts: Vec<_> = base.iter().map(|b| b.ts).collect();
     let calculate = |bars: &[Bar], tf: Timeframe| {
-        let mut params = p;
-        params.session_atr = tf.is_intraday();
-        params.session_reset = p.session_reset && tf == base_tf && tf.is_intraday();
-        let starts = tf.is_intraday().then(|| {
-            let ts: Vec<_> = bars.iter().map(|b| b.ts).collect();
-            let mut starts = session_starts(&ts);
-            if params.session_reset {
-                for i in 1..ts.len() {
-                    let wall = crate::ny::civil(ts[i]);
-                    let open = crate::ny::to_utc(wall.date().and_hms_opt(9, 30, 0).unwrap());
-                    starts[i] |= ts[i - 1] < open && ts[i] >= open;
-                }
-            }
-            starts
-        });
+        let (params, starts) = lane_params(bars, tf, base_tf, p);
         adaptive_trend_with(&Ohlcv::new(bars), params, starts.as_deref())
     };
     let base_trend = calculate(base, base_tf);
@@ -436,6 +466,37 @@ mod tests {
         let t = stack(&bars(100, 300, Provenance::Real), vec![]);
         assert_eq!(t.score.unwrap().scored, 1);
     }
+    #[test]
+    fn trend_grid_is_bit_identical_to_per_cell_trend_stack() {
+        // 2026-11-02 09:30 New York = 14:30 UTC; continuous 5m bars cross session starts.
+        let t0 = 1_793_629_800;
+        let wavy: Vec<_> = (0..1500)
+            .map(|i| {
+                let c = 100.0 + (i as f64 * 0.05).sin() * 3.0 + (i as f64 * 0.31).sin() * 0.7 + i as f64 * 0.002;
+                Bar::new(t0 + i as i64 * 300, c, c + 0.3, c - 0.25, c, 1.0).with_provenance(Provenance::Real)
+            })
+            .collect();
+        let ers = [8, 20, 40];
+        let holds = [2, 10, 30];
+        for (tf, reset) in [(Timeframe::M5, false), (Timeframe::M5, true), (Timeframe::D1, false)] {
+            let p = AdaptiveTrendParams { session_reset: reset, ..Default::default() };
+            let grid = trend_grid(&wavy, tf, p, &ers, &holds).unwrap();
+            assert_eq!(grid.len(), 9);
+            let mut flips = 0;
+            for (k, cell) in grid.iter().enumerate() {
+                let q = AdaptiveTrendParams { mb_er: ers[k % 3], min_hold: holds[k / 3], ..p };
+                let s = trend_stack(&wavy, tf, vec![], q).unwrap();
+                assert_eq!(cell.medium_state, s.medium, "{tf} reset={reset} cell {k}");
+                assert_eq!(cell.entry_long, s.entry_long);
+                assert_eq!(cell.entry_short, s.entry_short);
+                assert!(cell.confidence.iter().zip(&s.confidence).all(|(a, b)| a.to_bits() == b.to_bits()));
+                flips += cell.entry_long.iter().filter(|v| **v).count();
+            }
+            assert!(flips > 0, "fixture must exercise regime flips");
+        }
+        assert!(trend_grid(&bars(100, 300, Provenance::Sample), Timeframe::M5, Default::default(), &ers, &holds).is_err());
+    }
+
     #[test]
     fn trend_stack_never_emits_a_price_outside_input_bars() {
         let base = bars(1000, 300, Provenance::Real);

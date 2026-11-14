@@ -13,7 +13,7 @@ use super::{NAN, Ohlcv};
 use crate::{Bar, Provenance};
 
 /// Kaufman (squared) or ADMA (linear) efficiency-ratio smoothing.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum AdaptiveMethod {
     Kama,
     Adma,
@@ -33,7 +33,8 @@ impl AdaptiveMethod {
 }
 
 /// Whats-News Adaptive Trend defaults (SB 10/2/30, MB 20/2/60, LB 40/2/120).
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct AdaptiveTrendParams {
     pub method: AdaptiveMethod,
     pub sb_er: usize,
@@ -75,19 +76,33 @@ impl Default for AdaptiveTrendParams {
 }
 
 impl AdaptiveTrendParams {
-    /// Registry parameters: ATR length, confirm multiple, method (0 = KAMA, 1 = ADMA).
+    /// Registry parameters: ATR length, confirm multiple, method (0 = KAMA, 1 = ADMA),
+    /// medium-baseline ER length, minimum regime hold. Missing trailing values keep
+    /// the defaults, so older 3-parameter specs behave exactly as before.
     pub fn from_registry(p: &[f64]) -> Self {
         let mut s = Self::default();
-        if let Some(&n) = p.first() {
+        let finite = |k: usize| p.get(k).copied().filter(|v| v.is_finite());
+        if let Some(n) = finite(0) {
             s.atr_n = (n as usize).max(1);
         }
-        if let Some(&c) = p.get(1) {
+        if let Some(c) = finite(1) {
             s.confirm_mult = c;
         }
-        if let Some(&m) = p.get(2) {
+        if let Some(m) = finite(2) {
             s.method = AdaptiveMethod::from_param(m);
         }
+        if let Some(er) = finite(3) {
+            s.mb_er = (er as usize).max(1);
+        }
+        if let Some(hold) = finite(4) {
+            s.min_hold = hold as usize;
+        }
         s
+    }
+
+    /// Inverse of [`Self::from_registry`] for the five registry-backed fields.
+    pub fn to_registry(&self) -> Vec<f64> {
+        vec![self.atr_n as f64, self.confirm_mult, self.method.as_param(), self.mb_er as f64, self.min_hold as f64]
     }
 }
 
@@ -250,42 +265,12 @@ pub fn adaptive_trend_with(o: &Ohlcv, p: AdaptiveTrendParams, starts: Option<&[b
         }
         return out;
     }
-    let hlc3 = o.hlc3();
-    let sb = adaptive_ma(&hlc3, p.sb_er, p.sb_fast, p.sb_slow, p.method);
-    let mb = adaptive_ma(&hlc3, p.mb_er, p.mb_fast, p.mb_slow, p.method);
-    let lb = adaptive_ma(&hlc3, p.lb_er, p.lb_fast, p.lb_slow, p.method);
-    let a = match starts.filter(|_| p.session_atr) {
-        Some(starts) => atr_session(o, p.atr_n, starts),
-        None => atr(o, p.atr_n),
-    };
-
-    let sb_slope = diff(&sb);
-    let mb_slope = diff(&mb);
-    let lb_slope = diff(&lb);
-
-    let mut sh_long = vec![false; len];
-    let mut sh_short = vec![false; len];
-    let mut med_long = vec![false; len];
-    let mut med_short = vec![false; len];
-    let mut lng_long = vec![false; len];
-    let mut lng_short = vec![false; len];
-    for i in 0..len {
-        let confirm = p.confirm_mult * a[i];
-        if !confirm.is_finite() {
-            continue;
-        }
-        let c = o.close[i];
-        sh_long[i] = c > sb[i] + 0.5 * confirm && sb_slope[i] > 0.0;
-        sh_short[i] = c < sb[i] - 0.5 * confirm && sb_slope[i] < 0.0;
-        med_long[i] = sb[i] > mb[i] + confirm && mb_slope[i] > 0.0 && c > mb[i];
-        med_short[i] = sb[i] < mb[i] - confirm && mb_slope[i] < 0.0 && c < mb[i];
-        lng_long[i] = mb[i] > lb[i] + confirm && lb_slope[i] > 0.0;
-        lng_short[i] = mb[i] < lb[i] - confirm && lb_slope[i] < 0.0;
-    }
-
-    let short_state = sticky_state(&sh_long, &sh_short, p.min_hold);
-    let medium_state = sticky_state(&med_long, &med_short, p.min_hold);
-    let long_state = sticky_state(&lng_long, &lng_short, p.min_hold);
+    let shared = Shared::new(o, p, starts);
+    let leg = MediumLeg::new(&shared.hlc3, p);
+    let Regimes { short_state, medium_state, long_state, entry_long, entry_short, confidence } =
+        regimes(o, p, &shared, &leg, p.min_hold);
+    let Shared { sb, lb, a, .. } = shared;
+    let MediumLeg { mb, .. } = leg;
 
     let sdb = ratchet_band(&sb, &medium_state, &a, 2.0, BandKind::Tp);
     let mrt = ratchet_band(&mb, &medium_state, &a, 2.25, BandKind::Stop);
@@ -293,32 +278,6 @@ pub fn adaptive_trend_with(o: &Ohlcv, p: AdaptiveTrendParams, starts: Option<&[b
     let lrt = ratchet_band(&lb, &long_state, &a, 2.25, BandKind::Stop);
     let ldb = ratchet_band(&lb, &long_state, &a, 4.5, BandKind::Tp);
 
-    let mut entry_long = vec![false; len];
-    let mut entry_short = vec![false; len];
-    for i in 1..len {
-        if medium_state[i] == 1 && medium_state[i - 1] != 1 {
-            entry_long[i] = true;
-        }
-        if medium_state[i] == -1 && medium_state[i - 1] != -1 {
-            entry_short[i] = true;
-        }
-    }
-
-    let er = efficiency_ratio(&hlc3, p.mb_er);
-    let confidence = (0..len)
-        .map(|i| {
-            if !mb[i].is_finite() || !a[i].is_finite() || !er[i].is_finite() {
-                return NAN;
-            }
-            let state = medium_state[i];
-            if state == 0 {
-                return 0.0;
-            }
-            let separation = if a[i] > 0.0 { ((sb[i] - mb[i]).abs() / (2.0 * a[i])).clamp(0.0, 1.0) } else { 0.0 };
-            let agree = (u8::from(short_state[i] == state) + u8::from(long_state[i] == state)) as f64 / 2.0;
-            (0.40 * er[i] + 0.35 * separation + 0.25 * agree).clamp(0.0, 1.0)
-        })
-        .collect();
     let residual: Vec<_> = o.close.iter().zip(&mb).map(|(c, m)| (c - m).powi(2)).collect();
     let sigma = rma(&residual, p.atr_n.saturating_mul(2)).into_iter().map(f64::sqrt).collect();
     AdaptiveTrend {
@@ -339,6 +298,197 @@ pub fn adaptive_trend_with(o: &Ohlcv, p: AdaptiveTrendParams, starts: Option<&[b
         entry_short,
         atr: a,
     }
+}
+
+/// State that does not depend on the medium ER length or the minimum hold.
+struct Shared {
+    hlc3: Vec<f64>,
+    sb: Vec<f64>,
+    lb: Vec<f64>,
+    a: Vec<f64>,
+    sb_slope: Vec<f64>,
+    lb_slope: Vec<f64>,
+}
+impl Shared {
+    fn new(o: &Ohlcv, p: AdaptiveTrendParams, starts: Option<&[bool]>) -> Self {
+        let hlc3 = o.hlc3();
+        let sb = adaptive_ma(&hlc3, p.sb_er, p.sb_fast, p.sb_slow, p.method);
+        let lb = adaptive_ma(&hlc3, p.lb_er, p.lb_fast, p.lb_slow, p.method);
+        let a = match starts.filter(|_| p.session_atr) {
+            Some(starts) => atr_session(o, p.atr_n, starts),
+            None => atr(o, p.atr_n),
+        };
+        let sb_slope = diff(&sb);
+        let lb_slope = diff(&lb);
+        Self { hlc3, sb, lb, a, sb_slope, lb_slope }
+    }
+}
+
+/// Medium baseline for one ER length (independent of the minimum hold).
+struct MediumLeg {
+    mb: Vec<f64>,
+    mb_slope: Vec<f64>,
+    er: Vec<f64>,
+}
+impl MediumLeg {
+    fn new(hlc3: &[f64], p: AdaptiveTrendParams) -> Self {
+        let mb = adaptive_ma(hlc3, p.mb_er, p.mb_fast, p.mb_slow, p.method);
+        let mb_slope = diff(&mb);
+        let er = efficiency_ratio(hlc3, p.mb_er);
+        Self { mb, mb_slope, er }
+    }
+}
+
+struct Regimes {
+    short_state: Vec<i8>,
+    medium_state: Vec<i8>,
+    long_state: Vec<i8>,
+    entry_long: Vec<bool>,
+    entry_short: Vec<bool>,
+    confidence: Vec<f64>,
+}
+
+fn regimes(o: &Ohlcv, p: AdaptiveTrendParams, s: &Shared, m: &MediumLeg, min_hold: usize) -> Regimes {
+    let len = o.len();
+    let (sb, lb, a, mb) = (&s.sb, &s.lb, &s.a, &m.mb);
+    let mut sh_long = vec![false; len];
+    let mut sh_short = vec![false; len];
+    let mut med_long = vec![false; len];
+    let mut med_short = vec![false; len];
+    let mut lng_long = vec![false; len];
+    let mut lng_short = vec![false; len];
+    for i in 0..len {
+        let confirm = p.confirm_mult * a[i];
+        if !confirm.is_finite() {
+            continue;
+        }
+        let c = o.close[i];
+        sh_long[i] = c > sb[i] + 0.5 * confirm && s.sb_slope[i] > 0.0;
+        sh_short[i] = c < sb[i] - 0.5 * confirm && s.sb_slope[i] < 0.0;
+        med_long[i] = sb[i] > mb[i] + confirm && m.mb_slope[i] > 0.0 && c > mb[i];
+        med_short[i] = sb[i] < mb[i] - confirm && m.mb_slope[i] < 0.0 && c < mb[i];
+        lng_long[i] = mb[i] > lb[i] + confirm && s.lb_slope[i] > 0.0;
+        lng_short[i] = mb[i] < lb[i] - confirm && s.lb_slope[i] < 0.0;
+    }
+
+    let short_state = sticky_state(&sh_long, &sh_short, min_hold);
+    let medium_state = sticky_state(&med_long, &med_short, min_hold);
+    let long_state = sticky_state(&lng_long, &lng_short, min_hold);
+
+    let mut entry_long = vec![false; len];
+    let mut entry_short = vec![false; len];
+    for i in 1..len {
+        if medium_state[i] == 1 && medium_state[i - 1] != 1 {
+            entry_long[i] = true;
+        }
+        if medium_state[i] == -1 && medium_state[i - 1] != -1 {
+            entry_short[i] = true;
+        }
+    }
+
+    let er = &m.er;
+    let confidence = (0..len)
+        .map(|i| {
+            if !mb[i].is_finite() || !a[i].is_finite() || !er[i].is_finite() {
+                return NAN;
+            }
+            let state = medium_state[i];
+            if state == 0 {
+                return 0.0;
+            }
+            let separation = if a[i] > 0.0 { ((sb[i] - mb[i]).abs() / (2.0 * a[i])).clamp(0.0, 1.0) } else { 0.0 };
+            let agree = (u8::from(short_state[i] == state) + u8::from(long_state[i] == state)) as f64 / 2.0;
+            (0.40 * er[i] + 0.35 * separation + 0.25 * agree).clamp(0.0, 1.0)
+        })
+        .collect();
+    Regimes { short_state, medium_state, long_state, entry_long, entry_short, confidence }
+}
+
+/// The medium-regime outputs a parameter grid needs from one Adaptive Trend run.
+#[derive(Debug, Clone, PartialEq)]
+pub struct GridTrend {
+    pub confidence: Vec<f64>,
+    pub medium_state: Vec<i8>,
+    pub entry_long: Vec<bool>,
+    pub entry_short: Vec<bool>,
+}
+
+/// Adaptive Trend over a medium-ER × min-hold grid, bit-identical to calling
+/// [`adaptive_trend_with`] once per cell with `mb_er`/`min_hold` replaced.
+/// Short/long baselines and ATR are computed once; the medium baseline once per
+/// ER length; only the sticky state machine and confidence run per cell.
+/// Output order is `holds` outer, `ers` inner.
+pub fn adaptive_trend_grid(
+    o: &Ohlcv,
+    p: AdaptiveTrendParams,
+    starts: Option<&[bool]>,
+    ers: &[usize],
+    holds: &[usize],
+) -> Vec<GridTrend> {
+    let len = o.len();
+    if p.session_reset
+        && let Some(starts) = starts
+        && len > 0
+    {
+        let mut out: Vec<_> = (0..ers.len() * holds.len())
+            .map(|_| GridTrend {
+                confidence: vec![NAN; len],
+                medium_state: vec![0; len],
+                entry_long: vec![false; len],
+                entry_short: vec![false; len],
+            })
+            .collect();
+        let cuts: Vec<_> = std::iter::once(0)
+            .chain((1..len).filter(|i| starts.get(*i) == Some(&true)))
+            .chain(std::iter::once(len))
+            .collect();
+        for w in cuts.windows(2) {
+            let (a, b) = (w[0], w[1]);
+            let slice = Ohlcv {
+                ts: o.ts[a..b].to_vec(),
+                open: o.open[a..b].to_vec(),
+                high: o.high[a..b].to_vec(),
+                low: o.low[a..b].to_vec(),
+                close: o.close[a..b].to_vec(),
+                volume: o.volume[a..b].to_vec(),
+            };
+            let parts = adaptive_trend_grid(
+                &slice,
+                AdaptiveTrendParams { session_reset: false, ..p },
+                Some(&vec![false; b - a]),
+                ers,
+                holds,
+            );
+            for (cell, part) in out.iter_mut().zip(parts) {
+                cell.confidence[a..b].copy_from_slice(&part.confidence);
+                cell.medium_state[a..b].copy_from_slice(&part.medium_state);
+                cell.entry_long[a..b].copy_from_slice(&part.entry_long);
+                cell.entry_short[a..b].copy_from_slice(&part.entry_short);
+            }
+        }
+        return out;
+    }
+    if len == 0 {
+        return (0..ers.len() * holds.len())
+            .map(|_| GridTrend { confidence: vec![], medium_state: vec![], entry_long: vec![], entry_short: vec![] })
+            .collect();
+    }
+    let shared = Shared::new(o, p, starts);
+    let legs: Vec<_> =
+        ers.iter().map(|&mb_er| MediumLeg::new(&shared.hlc3, AdaptiveTrendParams { mb_er, ..p })).collect();
+    let mut out = Vec::with_capacity(ers.len() * holds.len());
+    for &min_hold in holds {
+        for (&mb_er, leg) in ers.iter().zip(&legs) {
+            let r = regimes(o, AdaptiveTrendParams { mb_er, min_hold, ..p }, &shared, leg, min_hold);
+            out.push(GridTrend {
+                confidence: r.confidence,
+                medium_state: r.medium_state,
+                entry_long: r.entry_long,
+                entry_short: r.entry_short,
+            });
+        }
+    }
+    out
 }
 
 /// New York calendar session boundaries, including the first observed bar.

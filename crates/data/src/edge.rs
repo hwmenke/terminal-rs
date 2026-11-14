@@ -288,17 +288,26 @@ pub fn regime_edge(
             let mut counts = [0; 3];
             let mut flip_sum = 0.0;
             let mut flip_n = 0;
-            for &(i, _, r) in &horizon.known {
-                // A single source index rotates state AND both entry flags. The
-                // final h signals remain in the block even without an outcome.
-                let source = warm_start + (i - warm_start + offset) % warm_len;
-                if let Some(state) = state[source] {
-                    let row = (1 - state) as usize;
-                    sums[row] += r;
-                    counts[row] += 1;
-                    if horizon.h == 5 && (entry_long[source] || entry_short[source]) {
-                        flip_sum += r * if entry_long[source] { 1.0 } else { -1.0 };
-                        flip_n += 1;
+            // A single source index rotates state AND both entry flags. The final h
+            // signals remain in the block even without an outcome. Source index is
+            // `warm_start + (i − warm_start + offset) % warm_len`; since offset <
+            // warm_len and `known` is sorted by i, that is `i + offset` before the
+            // wrap point and `i + offset − warm_len` after it. Splitting there keeps
+            // the summation order (and so every p value) while dropping a division.
+            let wrap = horizon.known.partition_point(|&(i, _, _)| i - warm_start + offset < warm_len);
+            let (head, tail) = horizon.known.split_at(wrap);
+            let flips_here = horizon.h == 5;
+            for (part, shifted) in [(head, false), (tail, true)] {
+                for &(i, _, r) in part {
+                    let source = if shifted { i + offset - warm_len } else { i + offset };
+                    if let Some(state) = state[source] {
+                        let row = (1 - state) as usize;
+                        sums[row] += r;
+                        counts[row] += 1;
+                        if flips_here && (entry_long[source] || entry_short[source]) {
+                            flip_sum += r * if entry_long[source] { 1.0 } else { -1.0 };
+                            flip_n += 1;
+                        }
                     }
                 }
             }

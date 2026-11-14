@@ -14,12 +14,17 @@ The study is a native Rust port of the Whats-News Adaptive Trend rules
 | `ADTREND` | Toggle the overlay on the focused chart |
 | `ATREND` / `ADAPTIVE` | Same study |
 | `ADTREND 14 0.3 1` | ATR 14, confirm 0.3, ADMA smoothing (1). Defaults: ATR 20, confirm 0.25, KAMA (0) |
+| `ADTREND 20 0.25 0 32 4` | Also medium-baseline ER length 32 and min hold 4 bars. Defaults: MB ER 20, Min Hold 10 |
+| `TSTACK TUNE` → Apply | Sets MB ER / Min Hold from a [plateau grid](TSTACK_TUNE.md) cell; Revert undoes |
 | `IND` / `IND TREND` | Picker; search “adaptive” |
 | Chart menu → Indicators → Trend → Adaptive Trend | Same toggle |
 | Chart menu → Review overlays → Adaptive Trend | Same instance; saved with the layout |
 
 Repeating the command removes it. The spec is stored with the chart like any
-other study (`"ADTREND 20 0.25 0"`), so it survives layout save/restore.
+other study (`"ADTREND 20 0.25 0 20 10"`), so it survives layout save/restore.
+Older three-parameter specs (`"ADTREND 20 0.25 0"`) load with MB ER 20 and Min
+Hold 10, which are exactly the previous fixed values. TSTACK and TSTACK EDGE read
+the same five parameters.
 
 `REVIEW` does **not** turn Adaptive Trend on by itself.
 

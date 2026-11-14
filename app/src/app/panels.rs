@@ -176,6 +176,7 @@ impl TerminalApp {
             | PaneKind::Chart(_)
             | PaneKind::Desk(_)
             | PaneKind::Journal(_)
+            | PaneKind::TstackTune(_)
             | PaneKind::StudioCorr(_)
             | PaneKind::Stats(_)
             | PaneKind::StudioDist(_)
@@ -204,6 +205,9 @@ impl TerminalApp {
         }
         if matches!(self.panes[i].kind, PaneKind::StudioDist(_)) {
             actions.extend(self.studio_dist_pane(ui, id));
+        }
+        if matches!(self.panes[i].kind, PaneKind::TstackTune(_)) {
+            self.tstack_tune_pane(ui, id);
         }
         if matches!(self.panes[i].kind, PaneKind::StudioCorr(_)) {
             actions.extend(self.studio_corr_pane(ui, id));
