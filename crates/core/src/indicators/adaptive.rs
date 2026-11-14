@@ -34,6 +34,7 @@ impl AdaptiveMethod {
 
 /// Whats-News Adaptive Trend defaults (SB 10/2/30, MB 20/2/60, LB 40/2/120).
 #[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct AdaptiveTrendParams {
     pub method: AdaptiveMethod,
     pub sb_er: usize,
@@ -75,19 +76,33 @@ impl Default for AdaptiveTrendParams {
 }
 
 impl AdaptiveTrendParams {
-    /// Registry parameters: ATR length, confirm multiple, method (0 = KAMA, 1 = ADMA).
+    /// Registry parameters: ATR length, confirm multiple, method (0 = KAMA, 1 = ADMA),
+    /// medium-baseline ER length, minimum regime hold. Missing trailing values keep
+    /// the defaults, so older 3-parameter specs behave exactly as before.
     pub fn from_registry(p: &[f64]) -> Self {
         let mut s = Self::default();
-        if let Some(&n) = p.first() {
+        let finite = |k: usize| p.get(k).copied().filter(|v| v.is_finite());
+        if let Some(n) = finite(0) {
             s.atr_n = (n as usize).max(1);
         }
-        if let Some(&c) = p.get(1) {
+        if let Some(c) = finite(1) {
             s.confirm_mult = c;
         }
-        if let Some(&m) = p.get(2) {
+        if let Some(m) = finite(2) {
             s.method = AdaptiveMethod::from_param(m);
         }
+        if let Some(er) = finite(3) {
+            s.mb_er = (er as usize).max(1);
+        }
+        if let Some(hold) = finite(4) {
+            s.min_hold = hold as usize;
+        }
         s
+    }
+
+    /// Inverse of [`Self::from_registry`] for the five registry-backed fields.
+    pub fn to_registry(&self) -> Vec<f64> {
+        vec![self.atr_n as f64, self.confirm_mult, self.method.as_param(), self.mb_er as f64, self.min_hold as f64]
     }
 }
 

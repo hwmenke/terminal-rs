@@ -5467,8 +5467,16 @@ mod tests {
         );
         assert!(a.is_ok() && b.is_ok());
         assert_eq!(provider.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
-        let snap = s.cache.lock().unwrap().as_ref().unwrap().snapshot(None, chrono::Utc::now().timestamp()).unwrap();
-        assert_eq!(snap.series[0].cells.iter().map(|c| u32::from(c.fetch_ok)).sum::<u32>(), 1);
+        let now = chrono::Utc::now().timestamp();
+        let snap = s.cache.lock().unwrap().as_ref().unwrap().snapshot(None, now).unwrap();
+        // The fetch is booked under today's New York date; coverage lists session
+        // days only, so on weekends/holidays the counter is not visible there.
+        let total = snap.series[0].cells.iter().map(|c| u32::from(c.fetch_ok)).sum::<u32>();
+        if tr_data::history::calendar::is_session(tr_core::ny::civil(now).date()) {
+            assert_eq!(total, 1);
+        } else {
+            assert_eq!(total, 0);
+        }
     }
     #[tokio::test]
     async fn every_intraday_study_uses_sourced_analysis() {
@@ -6989,8 +6997,8 @@ mod tests {
         assert!(a[0].overlays[..5].iter().all(|(_, o)| o.color != theme::rgba(palette.muted)));
         // Each bar is drawn by the half matching its own point-in-time flag.
         let value = |k: usize, t: usize| a[0].overlays[k].1.line.pyramid.data.get(t).map_or(f64::NAN, |p| p[1] as f64);
-        for t in 20..599 {
-            let half = if r.muted_at[t] { 5 } else { 0 };
+        for (t, &muted) in r.muted_at.iter().enumerate().take(599).skip(20) {
+            let half = if muted { 5 } else { 0 };
             assert!(value(half + 2, t).is_finite(), "bar {t} missing from its half");
         }
         // The last closed bars are trending: grey only, no coloured basis there.

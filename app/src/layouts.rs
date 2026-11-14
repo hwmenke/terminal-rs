@@ -169,8 +169,12 @@ pub enum PaneSettings {
         #[serde(default)]
         filter: String,
     },
+    /// TSTACK Plateau grid. Every field defaults so partial/older entries load;
+    /// missing parameter fields take the Adaptive Trend defaults individually.
     TstackTune {
+        #[serde(default)]
         symbol: String,
+        #[serde(default)]
         tf: Timeframe,
         #[serde(default)]
         params: tr_core::indicators::AdaptiveTrendParams,
@@ -771,6 +775,39 @@ mod tests {
         assert!(matches!(
             serde_json::from_value::<PaneSettings>(json).unwrap(),
             PaneSettings::Chart { stack_ladder: None, stack_tint: false, stack_session: false, show_rail: true, .. }
+        ));
+    }
+
+    #[test]
+    fn pre_tune_layout_json_loads_with_trend_defaults() {
+        // A chart pane as saved before TSTACK TUNE / Honest Z / ADTREND ER+hold:
+        // 3-parameter ADTREND label, ZBAND, and no stack / edge / rail / cone keys.
+        let old = r#"{"Chart":{"symbol":"AAPL US Equity","tf":"M5","chart_type":"Candles","log":false,
+            "indicators":["ADTREND 14 0.3 1","ZBAND 20"],"drawings":[],"compare":null}}"#;
+        let PaneSettings::Chart { indicators, show_stack, stack_session, stack_ladder, show_edge, show_rail, .. } =
+            serde_json::from_str::<PaneSettings>(old).unwrap()
+        else {
+            panic!("chart")
+        };
+        assert!(!show_stack && !stack_session && stack_ladder.is_none() && !show_edge && show_rail);
+        assert_eq!(indicators[0].label(), "ADTREND 14 0.3 1 20 10");
+        let p = tr_core::indicators::AdaptiveTrendParams::from_registry(&indicators[0].params);
+        assert_eq!((p.atr_n, p.mb_er, p.min_hold), (14, 20, 10));
+        assert_eq!(indicators[1].label(), "ZBAND 20");
+        // TSTACK TUNE entries with missing or partial fields still load.
+        let defaults = tr_core::indicators::AdaptiveTrendParams::default();
+        assert_eq!(
+            serde_json::from_str::<PaneSettings>(r#"{"TstackTune":{"symbol":"AAPL US Equity","tf":"M5"}}"#).unwrap(),
+            PaneSettings::TstackTune { symbol: "AAPL US Equity".into(), tf: Timeframe::M5, params: defaults }
+        );
+        let partial = r#"{"TstackTune":{"symbol":"AAPL US Equity","tf":"D1","params":{"atr_n":14,"min_hold":4}}}"#;
+        let PaneSettings::TstackTune { params, .. } = serde_json::from_str::<PaneSettings>(partial).unwrap() else {
+            panic!("tune")
+        };
+        assert_eq!(params, tr_core::indicators::AdaptiveTrendParams { atr_n: 14, min_hold: 4, ..defaults });
+        assert!(matches!(
+            serde_json::from_str::<PaneSettings>(r#"{"TstackTune":{}}"#).unwrap(),
+            PaneSettings::TstackTune { tf: Timeframe::D1, .. }
         ));
     }
 

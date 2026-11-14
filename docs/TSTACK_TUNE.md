@@ -12,15 +12,48 @@ session reset, or the Adaptive Trend defaults. The captured current setting is
 always in the grid; a nonstandard value replaces the middle axis value. Captured
 settings, symbol and interval persist with the layout.
 
-Amber outlines identify the current setting; cyan outlines identify the strongest
-supported 3×3 neighbourhood; white identifies the inspected cell. Signed Edge Δ
-uses the shared diverging heat ramp and an explicit bp key. Grey hatching means
-FDR, effective sample size, or fold support failed, or no test was available.
-Numbers remain inspectable even when unsupported; missing statistics show a dash.
-Click a cell or use arrow keys while the pane is focused to inspect it. Hover
-shows parameters, delta, Welch t, raw rotation p, grid q, regime observation count,
-effective count, purged-fold agreement, outcome dates and robustness. There is no
-parameter application: the existing chart does not expose ER/hold adjustment.
+Amber outlines identify the captured reference setting; a small amber **CHART**
+tag marks the cell equal to the linked chart's live Adaptive Trend setting; cyan
+outlines identify the strongest supported 3×3 neighbourhood; white identifies the
+inspected cell. Signed Edge Δ uses the shared diverging heat ramp and an explicit
+bp key. Grey hatching means FDR, effective sample size, or fold support failed, or
+no test was available. Numbers remain inspectable even when unsupported; missing
+statistics show a dash.
+
+### Inspect, Apply, Revert
+
+Click a cell or use arrow keys while the pane is focused to inspect it. The
+inspector (and hover) shows ER/hold, regime mean 5-bar return and Edge Δ (bp),
+Welch t, rotation p, BH q with an explicit **FDR PASS / FAIL / n/a**, regime
+observation count and effective n, the number of trades (medium-regime flips on
+common warmed bars), purged-fold agreement, outcome dates, robustness and the
+overall SUPPORTED / UNSUPPORTED verdict.
+
+Both grid axes are real chart settings. `ADTREND` now has two trailing registry
+parameters, **MB ER** (medium-baseline efficiency-ratio length, default 20) and
+**Min Hold** (minimum bars between regime flips, default 10):
+`ADTREND <ATR> <confirm> <method> <MB ER> <Min Hold>`. TSTACK, TSTACK EDGE and
+the ADTREND overlay all read them through `ChartState::stack_params`. Older
+three-parameter labels (`ADTREND 20 0.25 0`) normalize to 20/10, so saved
+layouts behave exactly as before.
+
+**Apply** (the amber `APPLY ER x / HOLD y TO CHART` button, **Enter** on the
+selected cell, or a **double-click**) sets the linked chart's ADTREND to the
+grid's captured ATR/confirm/method and 09:30 anchor plus the cell's MB ER and
+Min Hold, then recomputes the overlay, TSTACK and Edge on the worker. If the
+chart had no ADTREND overlay it is added, because the overlay spec carries these
+settings (the button tooltip says so). The linked chart is the chart the grid was
+opened from while it still shows the same symbol **and interval**, otherwise the
+first chart with that symbol and interval; a chart on another interval is never
+changed. Without such a chart Apply is disabled and the pane says which chart to
+open. Unsupported cells can be applied but are labelled **UNSUPPORTED CELL**.
+
+**Revert** restores the chart's exact configuration from before the first Apply
+of this pane (ADTREND spec or its absence, and the 09:30 anchor). Repeated
+Applies keep that original snapshot. If the chart's non-grid settings differ
+from the captured ones, no cell carries the CHART tag and the pane says so.
+Applying the best-looking cell is in-sample selection; the pane states this.
+
 Reload rereads data. The previous verified grid stays visible, explicitly labelled
 as a previous snapshot, while recomputing or after a failed refresh. Sample mode
 clears it and invalidates pending responses.
@@ -40,17 +73,24 @@ New files:
 Modified files:
 
 - `crates/data/src/lib.rs`: export the pure calculation module.
-- `crates/core/src/indicators/adaptive.rs`: serialize existing parameter types so
-  layout restores the exact captured configuration.
+- `crates/core/src/indicators/adaptive.rs`: serialize parameter types (struct-level
+  `#[serde(default)]`); `from_registry`/`to_registry` for MB ER and Min Hold; shared
+  baseline helpers and `adaptive_trend_grid`.
+- `crates/core/src/indicators/registry.rs`: ADTREND `MB ER` and `Min Hold` params.
+- `crates/core/src/indicators/trend_stack.rs`: `trend_grid` (bit-identical to per-cell
+  `trend_stack`).
+- `crates/data/src/edge.rs`: division-free rotation inner loop (same p values).
 - `app/src/worker.rs`: Request/Response, loading, admission and report-cache key;
-  closed-clock ZBAND building; offline integration and cache tests.
-- `app/src/chart_view.rs`: expose the existing parameter getter within the app;
-  send indicator observation metadata; paint Honest Z labels/hover and grey bands.
+  closed-clock ZBAND building with point-in-time coloured/grey halves; tests.
+- `app/src/chart_view.rs`: `trend_params`/`trend_config`/`set_trend_config` for
+  Apply/Revert; send indicator observation metadata; paint Honest Z labels/hover,
+  per-bar grey cloud and the closed-bar right edge.
 - `app/src/command.rs`: `TstackTune` command, description and collision tests.
 - `app/src/app.rs`: pane registration, dispatch, persistence, refresh, response routing.
 - `app/src/app/panels.rs`: pane rendering dispatch.
 - `app/src/app/palette_view.rs`: discoverability.
-- `app/src/layouts.rs`: persisted symbol, interval and captured configuration.
+- `app/src/layouts.rs`: persisted symbol, interval and captured configuration, all
+  `#[serde(default)]`; old-format layout test.
 - `README.md`: command table and guide link.
 - `app/src/app/ticker_switch_tests.rs`: route the headless harness through the same
   closed-clock indicator builder as production.
@@ -84,9 +124,18 @@ stability checks, not out-of-sample parameter selection.
 
 No disk/network I/O, statistics, digesting, or grid computation occurs in paint.
 The pane sends ordinary worker messages; generation checks drop obsolete results.
-The grid calculations use scoped standard-library threads in chunks of 13 (at
-most four), since this workspace has no direct rayon dependency. Parallelism is
-bounded per report, not globally across panes.
+Apply/Revert only swap the chart's indicator spec and anchor flag on the UI thread;
+the recomputation is the chart's ordinary worker request.
+
+Grid computation shares work: `trend_grid` computes HLC3, the short and long
+baselines, ATR and their slopes once; the medium baseline, its slope and ER once
+per ER column (7); only the sticky state machines, entries and confidence run per
+cell (49). A test asserts bit-identical output to 49 `trend_stack` calls (daily,
+intraday, session reset). The 49 Edge rotation nulls then run on scoped std threads
+(`available_parallelism`, capped at 8 per report; no rayon dependency in this
+crate). The rotation inner loop splits at the wrap point instead of using `%`,
+keeping summation order and therefore every p value identical (covered by the
+existing direct-reference rotation test).
 
 ## Math
 
@@ -104,9 +153,19 @@ existing Edge Proof overlap rules.
 
 Recompute BH across the **49 grid tests**, replacing unavailable p with 1 in the
 family size: sort p ascending, then `q_(i)=min(1,min_(j≥i)(49 p_(j)/j))`.
-Unavailable cells retain no q. Support requires q≤0.10, effective n≥30, nonzero
-delta and at least three of four same-sign purged fold deltas. BH is valid under
-independence or positive dependence; arbitrary grid dependence is not guaranteed.
+Unavailable cells retain no q. This is the BH **step-up** procedure: with sorted
+p and threshold `k·0.10/49`, the largest passing k rejects all smaller p, even
+ones above their own threshold; adjusted q are monotone in p and capped at 1.
+Tests cover hand-computed step-up vectors (m=3 and the 49-cell family).
+Support requires q≤0.10, effective n≥30, nonzero
+delta and at least three of four same-sign purged fold deltas.
+
+**Dependence.** BH is kept (not Benjamini–Yekutieli). Neighbouring cells share the
+same returns and nearly the same regimes, so test statistics are positively
+correlated, which is the usual PRDS (positive regression dependence) case under
+which BH controls FDR. PRDS is assumed, not proven, for this grid; BY would hold
+under arbitrary dependence but is ≈4.5× stricter for 49 tests
+(Σ1/k ≈ 4.48). The pane states this.
 Searching symbols, intervals or configurations creates additional families this
 single-grid correction does not account for.
 
@@ -155,8 +214,8 @@ through that request lets diagnostics and grey styling fit without another
 loader, service or UI-thread calculation. Its details and limits are below.
 
 Other deliberate limits: one predefined h=5 horizon; one captured current regime;
-fixed seven-value axes; click inspection only because ER/hold are fixed in chart
-TSTACK. No global worker CPU queue, parameter optimizer, new dependencies, journal,
+fixed seven-value axes; Apply is explicit and per cell (no automatic "best cell").
+No global worker CPU queue, parameter optimizer, new dependencies, journal,
 trade-plan, alert, secrets, service or deployment changes. Preserve verified gates,
 closed-clock handling, FDR and worker execution before adding any of those options.
 
@@ -192,6 +251,13 @@ estimator. This is not return volatility, an independent Gaussian observation,
 or an out-of-sample band breach. All new production ZBAND geometry/readouts use
 verified **closed** bars only; the forming slot is NaN, not a solid provisional
 band. Missing/unverified inputs and loaded vault joins refuse with no geometry.
+
+**Right edge.** Lines and the shaded cloud stop at the last closed bar, one slot
+left of the forming candle. Nothing jumps: the forming bar never contributes, so
+its updates cannot move earlier band values. The cloud explicitly includes the
+last closed bar even when zoomed-out decimation would otherwise skip it. Hovering
+the forming bar shows the last closed values and z, labelled
+`last closed (forming bar excluded)`, instead of a blank readout.
 At least `length` closed bars are needed for bands. A short or zero-variance
 variance-ratio sample prints `VR unavailable` and greys the bands.
 
@@ -221,7 +287,13 @@ estimator and heteroskedastic robust test from [Lo and MacKinlay (1988), equatio
 12 and 19–20](https://finance.martinsewell.com/stylized-facts/dependence/LoMacKinlay1988.pdf).
 Heteroskedastic consistency does not remove dependence assumptions or make the
 normal approximation exact in small samples. We require ≥20q returns at each of
-q=2,5,10. All three VR/z* pairs are printed. The two-sided Bonferroni family level
+q=2,5,10. All three VR/z* pairs are printed; the hover also lists N, the two-sided
+normal p of z* (`erfc(|z*|/√2)`) and, for comparison only, the homoskedastic
+`z(q) = √N (VR−1) / √(2(2q−1)(q−1)/(3q))` (Lo–MacKinlay eq. 14). Verdicts use z*.
+Tests check a hand-computed period-4 vector (VR = 20/19, z* = 40/(19√39)), a
+brute-force reference at q = 2, 5, 10, 17, normal-quantile p values, and random
+walk vs AR(1) population VRs. Constant returns are detected with a relative
+variance guard and reported unavailable. The two-sided Bonferroni family level
 is 5% (three fixed tests; rounded critical |z*|=2.394). Any positive rejection
 (`VR>1`, `z*>2.394`) marks **TREND PERSISTENCE** and greys both cloud and lines.
 Significant negative z* is labelled anti-persistence, without claiming price-level
@@ -237,48 +309,64 @@ are overlapping and self-normalized; the Gaussian values are references, not
 claimed expected coverage or significance tests. The preceding rolling window
 may start before the diagnostic window when loaded history permits it.
 
-Grey styling reflects the **latest closed snapshot across the visible history**;
-it is retrospective styling, not a causal historical signal. The z series and
+Grey styling is **point-in-time**. For each closed bar t, the VR family is
+recomputed on the trailing ≤512 closes ending at t (closes after t are never
+read), and bar t is grey when that family shows trend persistence or is
+unavailable (fewer than 200 returns, i.e. warm-up). The worker splits each band
+line into a coloured half and a grey half (overlays 0–4 and 5–9). The segment
+ending at bar t takes bar t's flag, and the joining bar is kept in both halves so
+lines stay continuous at transitions. The cloud is coloured per bar. The text
+label and hover describe the latest closed snapshot, which always equals the
+last closed bar's flag. Tests use 700 random-walk returns followed by 700 AR(1)
+returns: the latest snapshot is trending, yet the random-walk era stays mostly
+coloured, and truncating the future never changes an earlier flag. Cost is about
+90 ms for 20,000 bars in a release build, on the worker only. The z series and
 band values themselves remain causal in-window quantities. Small-sample and
 zero-variance diagnostics remain absent rather than receiving fabricated values.
 ZBAND does not claim to test cointegration, market efficiency, or execution edge.
 
-Offline coverage includes an exact alternating-return VR/z* vector; seeded random
-walk versus AR(1) with population VR checks; strict empirical tail counts; short
-and constant-return unavailability; forming-mutation invariance; unverified/join
-refusals; and worker checks that trending colours are grey, readouts exclude the
-forming slot and sample input paints no bands.
+Offline coverage includes exact alternating and period-4 VR/z* vectors, a
+brute-force Lo–MacKinlay reference, two-sided p values, seeded random walk versus
+AR(1) with population VR checks, strict empirical tail counts, short and
+constant-return unavailability, point-in-time greying with prefix causality,
+forming-mutation invariance and unverified/join refusals. Worker tests check
+that each bar is drawn by the half matching its own flag, that the halves join at
+transitions, that readouts exclude the forming slot, and that sample input paints
+no bands.
+
+## Saved-layout compatibility
+
+`PaneSettings::TstackTune` fields are all `#[serde(default)]`, and
+`AdaptiveTrendParams` has a struct-level `#[serde(default)]`, so a partial
+`params` object fills each missing field from the Adaptive Trend defaults.
+Existing chart fields (`show_stack`, `stack_ladder`, `stack_tint`,
+`stack_session`, `show_edge`, `show_rail`, `cone`) were already defaulted.
+Indicators persist as labels, so a 3-parameter `ADTREND` label gains MB ER 20 and
+Min Hold 10, and `ZBAND n` is unchanged. A test loads a literal pre-TUNE chart
+layout JSON and partial/empty TSTACK TUNE entries.
 
 ### Validation results
 
-All cargo commands exported `CARGO_TARGET_DIR=/workspace/tr-plateau-target`.
-Build/test/clippy commands used `CARGO_NET_OFFLINE=true`. The initial read-only
-target issue was resolved by adding that directory to the writable roots; no
-alternate target was used.
+Review pass (Opus), `CARGO_TARGET_DIR=/workspace/tr-plateau-review-target`:
 
-- `cargo test --workspace`: **1,241 passed, 0 failed, 6 ignored**, aggregated
-  across 28 test/doc-test suites. The six existing ignored tests are five live
-  network checks and the Trend Cone timing benchmark. All 20 new tests run in
-  the ordinary suite. New tests use only fabricated in-memory fixtures; the
-  existing full suite also contains local loopback HTTP fixtures, with no live
-  market or brokerage requests.
-- `cargo clippy --workspace --all-targets`: exit 0. Existing workspace warnings
-  remain; no warning locations fall on added lines or in either new math module
-  or the new Tune pane. The new range-loop warning was fixed, and the modified
-  indicator admission branch was simplified as clippy requested.
-- Timing: the offline data test binary's
-  `tstack_tune::tests::grid_timing_7_by_7_on_5000_bars` reported **984.1 ms** for
-  one cold **7×7 grid on 5,000 synthetic test bars** (4,960 common warmed bars),
-  in the ordinary debug/test build. This includes grid calculations, nulls, FDR,
-  robustness and smoothing, and excludes data loading and UI paint. The report
-  cache was bypassed for that measurement. This is a measured fixture result,
-  not a guarantee for all hardware, symbols, intervals or concurrently open panes.
-- Both new math modules and the Tune pane were rustfmt-checked;
-  `git diff --check` passes. No application GUI or application server was run.
+- `cargo test --workspace`: **1,256 passed, 0 failed, 8 ignored**. The ignored
+  tests are five live network checks, the Trend Cone timing benchmark and two
+  timing benchmarks added here (`tstack_tune::tests::cold_grid_bench`,
+  `honest_z::tests::muted_series_bench`). All fixtures are synthetic and in
+  memory, test-only.
+- `cargo clippy --workspace --all-targets`: no warnings on added or changed lines;
+  pre-existing workspace warnings remain.
+- Cold grid timing, release build on 8 cores, best of 3, cache bypassed,
+  synthetic test bars (`cargo test -p tr-data --release --lib
+  tstack_tune::tests::cold_grid_bench -- --ignored --nocapture`):
 
-The first compilation found an egui keyboard API rename, and the first headless
-paint tests needed explicit texture-delta clearing; both are fixed. Honest Z's
-new clock metadata also required updating the existing ticker-switch test
-harness. The final complete suite and clippy checks above include those fixes.
-No git add, commit, push, secrets, deployment, or new network service was used.
+  | Bars | Before | After |
+  | --- | --- | --- |
+  | 5,000 | 200.6 ms | 89.8 ms |
+  | 20,000 (uncapped, bench only) | 319.1 ms | 128.0 ms |
+
+  Production trims to the latest 5,000 closed bars. The rotation budget shrinks
+  as n grows (`15M / n / 3`), which is why 20k costs less than 4× 5k. All work
+  runs in `spawn_blocking` and the report cache serves repeats.
+- No application GUI or server was run.
 
