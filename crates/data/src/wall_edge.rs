@@ -121,7 +121,13 @@ pub fn prepare(
     }
     Ok(Prepared { bars: input.to_vec(), trimmed_gap })
 }
+/// One name's test: Edge Proof's `regime_edge` at `HORIZON` on the base-lane regime.
+/// Callers pass `prepare`d bars: verified, closed, session-cut and gap-trimmed.
 pub fn compute(bars: &[Bar], tf: Timeframe, params: AdaptiveTrendParams) -> Result<WallEdge, String> {
+    let (Some(first), Some(last)) = (bars.first(), bars.last()) else {
+        return Err("Wall Edge: no closed bars".into());
+    };
+    let (first_ts, closed_thru_ts) = (first.ts, last.ts);
     let stack = trend_stack(bars, tf, vec![], params)?;
     let state: Vec<_> = stack.medium.iter().zip(&stack.confidence).map(|(&s, c)| c.is_finite().then_some(s)).collect();
     let report = regime_edge(bars, &state, &stack.entry_long, &stack.entry_short, &[HORIZON])?;
@@ -130,8 +136,8 @@ pub fn compute(bars: &[Bar], tf: Timeframe, params: AdaptiveTrendParams) -> Resu
         as_of_regime: state.last().copied().flatten(),
         baseline_mean: report.baseline[0].stats.as_ref().map(|s| s.mean),
         bars: bars.len(),
-        first_ts: bars[0].ts,
-        closed_thru_ts: bars.last().unwrap().ts,
+        first_ts,
+        closed_thru_ts,
         tf,
         provenance: Bar::provenance(bars),
         source: String::new(),
@@ -221,6 +227,17 @@ impl DisplayEdge {
             }
             Ok(r) => {
                 out.cell = r.cell(live).cloned();
+                // A computed but non-finite Δ or p is a defect, not evidence: it is not a test,
+                // never enters m and is never painted as a number.
+                let invalid = out.cell.as_ref().is_some_and(|c| {
+                    c.stats.as_ref().and_then(|s| s.delta).is_some_and(|d| !d.is_finite())
+                        || c.p.is_some_and(|p| !probability(p))
+                });
+                if invalid {
+                    out.trial = Trial::NoTest;
+                    out.miss = Some(Miss::new("INVALID", "Non-finite Δ or p in the displayed regime", false));
+                    return out;
+                }
                 let valid = out.cell.as_ref().filter(|c| delta(c).is_some() && c.p.is_some_and(probability));
                 out.trial = Trial::P(valid.and_then(|c| c.p));
                 if valid.is_none() {
@@ -286,6 +303,13 @@ pub fn order(rows: &[Row], edges: &[DisplayEdge], sort: Sort) -> Vec<usize> {
         _ => rows[b].scored().cmp(&rows[a].scored()).then(a.cmp(&b)),
     });
     ids
+}
+/// Work order for an Edge pass: the rows on screen (positions `visible` in the displayed
+/// order `sorted`) widened by `margin` rows each side, then everything else in display order.
+pub fn prefetch_order(sorted: &[usize], visible: std::ops::Range<usize>, margin: usize) -> Vec<usize> {
+    let start = visible.start.saturating_sub(margin).min(sorted.len());
+    let end = visible.end.saturating_add(margin).clamp(start, sorted.len());
+    sorted[start..end].iter().chain(&sorted[end..]).chain(&sorted[..start]).copied().collect()
 }
 #[derive(Debug, Clone, Default)]
 pub struct Summary {
@@ -583,6 +607,109 @@ mod tests {
         assert_eq!(s.lone_p, Some(0.025));
         assert_eq!(summary(&[]).scale_bp, 1.0);
         assert_eq!(summary(&[]).lone_p, None);
+    }
+    #[test]
+    fn wall_bh_hand_computed_with_ties_monotone_step_up_and_clip() {
+        // m = 6 (the NoTest name is excluded). Sorted p with rank k: 0.01(1) 0.03(2) 0.04(3)
+        // 0.04(4) 0.20(5) 0.90(6). Raw p·m/k: 0.06 0.09 0.08 0.06 0.24 0.90. Step-up from the
+        // top takes running minima: 0.90 0.24 0.06 0.06 0.06 0.06, so the tied 0.04s share
+        // q = 0.06 and q never decreases when p increases.
+        let trials = [
+            Trial::P(Some(0.04)),
+            Trial::NoTest,
+            Trial::P(Some(0.01)),
+            Trial::P(Some(0.9)),
+            Trial::P(Some(0.03)),
+            Trial::P(Some(0.04)),
+            Trial::P(Some(0.2)),
+        ];
+        let q = adjust(&trials);
+        let want = [Some(0.06), None, Some(0.06), Some(0.9), Some(0.06), Some(0.06), Some(0.24)];
+        for (got, want) in q.iter().zip(want) {
+            assert_eq!(got.is_some(), want.is_some());
+            if let (Some(g), Some(w)) = (got, want) {
+                assert!((g - w).abs() < 1e-12, "{g} vs {w}");
+            }
+        }
+        // p = 1 everywhere: q is clipped at 1, not m/k.
+        assert!(adjust(&[Trial::P(Some(1.0)), Trial::Pending, Trial::P(None)]).iter().flatten().all(|q| *q == 1.0));
+        // Out-of-range or non-finite p never reaches BH as a number.
+        assert_eq!(adjust(&[Trial::P(Some(f64::NAN)), Trial::P(Some(0.01))])[0], None);
+    }
+    #[test]
+    fn non_finite_statistics_are_no_test_and_never_numbers() {
+        let nan_p = (*report_with(Some(f64::NAN), Some(0.001))).clone();
+        for r in [nan_p, (*report_with(Some(0.01), Some(f64::INFINITY))).clone()] {
+            let e = DisplayEdge::select(Ok(&r), Some(1));
+            assert_eq!(e.trial, Trial::NoTest);
+            assert_eq!(e.miss.as_ref().unwrap().code, "INVALID");
+            assert_eq!(e.delta_bp(), None);
+        }
+        // A verified name whose displayed regime has too few outcomes stays in the family at p = 1.
+        let mut low = (*report_with(Some(0.01), Some(0.001))).clone();
+        low.cells[0].stats = None;
+        let e = DisplayEdge::select(Ok(&low), Some(1));
+        assert_eq!((e.trial, e.miss.as_ref().unwrap().code), (Trial::P(None), "LOW N"));
+        let mut edges = vec![e, display(0.001, 0.01)];
+        assert_eq!(resolve(&mut edges).m, 2);
+        assert_eq!(edges[1].q, Some(0.02));
+    }
+    fn report_with(p: Option<f64>, delta: Option<f64>) -> std::sync::Arc<WallEdge> {
+        let mut c = cell(delta.unwrap_or(0.0), p.unwrap_or(1.0));
+        c.p = p;
+        c.stats.as_mut().unwrap().delta = delta;
+        std::sync::Arc::new(WallEdge {
+            cells: [c.clone(), EdgeCell { regime: 0, ..c.clone() }, EdgeCell { regime: -1, ..c }],
+            as_of_regime: Some(1),
+            baseline_mean: Some(0.0),
+            bars: 1000,
+            first_ts: 0,
+            closed_thru_ts: 1,
+            tf: Timeframe::M5,
+            provenance: Provenance::Real,
+            source: String::new(),
+            vault_bars: 0,
+            live_bars: 1000,
+            trimmed_gap: false,
+            vault_only: false,
+        })
+    }
+    #[test]
+    fn folds_are_contiguous_time_ordered_and_purged_by_the_horizon() {
+        // Folds come from Edge Proof unchanged. Check the walk-forward contract on a real
+        // regime_edge call: fold spans are time-ordered and never overlap, and no fold's
+        // last outcome window reaches into the next fold's first entry bar.
+        let bars = fixture(1200);
+        let stack = trend_stack(&bars, Timeframe::D1, vec![], AdaptiveTrendParams::default()).unwrap();
+        let state: Vec<_> =
+            stack.medium.iter().zip(&stack.confidence).map(|(&s, c)| c.is_finite().then_some(s)).collect();
+        let wall = compute(&bars, Timeframe::D1, AdaptiveTrendParams::default()).unwrap();
+        let first_known = state.iter().position(Option::is_some).unwrap();
+        let usable = bars.len() - HORIZON - first_known;
+        for c in &wall.cells {
+            let spans: Vec<_> = c.folds.iter().filter_map(|f| f.span).collect();
+            for w in spans.windows(2) {
+                assert!(w[0].1 < w[1].0, "fold windows overlap: {w:?}");
+            }
+            for f in &c.folds {
+                // Fewer than eight effective outcomes leaves the fold unknown, never 0.
+                assert_eq!(f.delta.is_some(), f.n as f64 / HORIZON as f64 >= 8.0);
+            }
+            assert!(c.folds.iter().map(|f| f.n).sum::<usize>() <= c.n);
+            assert!(c.n <= usable);
+        }
+        // Short history: a name with too few outcomes per fold shows hollow folds, not zeros.
+        let short = compute(&fixture(300), Timeframe::D1, AdaptiveTrendParams::default()).unwrap();
+        assert!(short.cells.iter().flat_map(|c| &c.folds).any(|f| f.delta.is_none()));
+    }
+    #[test]
+    fn prefetch_order_puts_visible_rows_and_margin_first() {
+        let sorted = [4, 2, 0, 1, 3, 5, 6];
+        // Visible ± margin first, then the rows below the fold, then those above it.
+        assert_eq!(prefetch_order(&sorted, 2..4, 1), vec![2, 0, 1, 3, 5, 6, 4]);
+        assert_eq!(prefetch_order(&sorted, 0..2, 0), vec![4, 2, 0, 1, 3, 5, 6]);
+        assert_eq!(prefetch_order(&sorted, 6..99, 2), vec![3, 5, 6, 4, 2, 0, 1]);
+        assert_eq!(prefetch_order(&[], 0..3, 4), Vec::<usize>::new());
     }
     #[test]
     fn completed_session_before_and_after_close_weekend_and_holiday() {

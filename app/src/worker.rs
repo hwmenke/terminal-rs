@@ -79,15 +79,24 @@ pub enum Request {
         generation: u64,
         symbols: Vec<String>,
     },
+    /// One Edge pass over the wall's rows. `priority` lists row indices to start first
+    /// (the rows on screen plus a margin); unlisted rows follow in row order.
     WallEdge {
         pane: PaneId,
         generation: u64,
         symbols: Vec<String>,
         daily: bool,
+        priority: Vec<usize>,
     },
     CancelWallEdge {
         pane: PaneId,
         generation: u64,
+    },
+    /// Re-rank the not-yet-started rows of a running pass (scroll or re-sort). No fetch.
+    WallEdgeFocus {
+        pane: PaneId,
+        generation: u64,
+        priority: Vec<usize>,
     },
     TrendWall {
         pane: PaneId,
@@ -925,6 +934,8 @@ struct Shared {
     archive_daily: std::sync::Mutex<SeriesMap>,
     wall_generations: std::sync::Mutex<HashMap<PaneId, u64>>,
     wall_edge_generations: std::sync::Mutex<HashMap<PaneId, u64>>,
+    /// Latest on-screen priority per pane, tagged with the Edge generation it ranks.
+    wall_edge_focus: std::sync::Mutex<HashMap<PaneId, (u64, Vec<usize>)>>,
     wall_edge: std::sync::Mutex<HashMap<(String, bool), Arc<EdgeSlot>>>,
     wall_edge_compute: Arc<tokio::sync::Semaphore>,
     stack_lanes: std::sync::Mutex<HashMap<LaneKey, Arc<LaneSlot>>>,
@@ -1116,6 +1127,7 @@ impl Worker {
             wall_fetches: tokio::sync::Semaphore::new(4),
             wall_generations: Default::default(),
             wall_edge_generations: Default::default(),
+            wall_edge_focus: Default::default(),
             wall_edge: Default::default(),
             wall_edge_compute: Arc::new(tokio::sync::Semaphore::new(4)),
             cache: Default::default(),
@@ -1974,6 +1986,16 @@ async fn stack_chart_lane_bars(
 }
 
 type WallEdgeResult = Result<Arc<tr_data::wall_edge::WallEdge>, tr_data::wall_edge::Miss>;
+/// Rows of one Edge pass in flight at once: the four wall fetch permits plus two
+/// computing, so fetch and compute overlap without queueing all fifty names at once.
+const WALL_EDGE_IN_FLIGHT: usize = 6;
+/// Next row to start: latest on-screen focus, then the request's priority, then row order.
+fn wall_edge_next(focus: &[usize], priority: &[usize], started: &mut [bool]) -> Option<usize> {
+    let i =
+        focus.iter().chain(priority).copied().chain(0..started.len()).find(|&i| started.get(i).is_some_and(|s| !s))?;
+    started[i] = true;
+    Some(i)
+}
 struct EdgeSlot {
     value: tokio::sync::OnceCell<Arc<tr_data::wall_edge::WallEdge>>,
     day: chrono::NaiveDate,
@@ -2013,19 +2035,24 @@ fn wall_edge_cached(
         &format!("{params:?} h=5 {class:?} v1"),
     );
     key.epoch = stitch.map_or(0, |s| s.epoch);
-    key.day = input.bars.last().map(|b| {
+    key.day = input.bars.last().and_then(|b| {
         if tf.is_intraday() {
-            tr_core::ny::civil(b.ts).date()
+            Some(tr_core::ny::civil(b.ts).date())
         } else {
-            chrono::DateTime::from_timestamp(b.ts, 0).unwrap().date_naive()
+            chrono::DateTime::from_timestamp(b.ts, 0).map(|t| t.date_naive())
         }
     });
+    // Vault/live split of the input window itself (research_bars re-tags a mixed stitch).
+    let (lo, hi) = (input.bars.first().map_or(0, |b| b.ts), input.bars.last().map_or(0, |b| b.ts));
+    let window = bars.iter().filter(|b| (lo..=hi).contains(&b.ts));
+    let vault_bars = window.clone().filter(|b| b.provenance == tr_core::Provenance::Cached).count();
+    let live_bars = window.filter(|b| b.provenance == tr_core::Provenance::Real).count();
     reports.get_or_compute(key, || {
         let mut report = wall_edge::compute(&input.bars, tf, params).map_err(Miss::unverified)?;
         report.source = source.into();
         report.trimmed_gap = input.trimmed_gap;
-        report.vault_bars = stitch.map_or(0, |s| s.vault_bars);
-        report.live_bars = stitch.map_or(input.bars.len(), |s| s.live_bars);
+        report.vault_bars = if stitch.is_some() { vault_bars } else { 0 };
+        report.live_bars = if stitch.is_some() { live_bars } else { input.bars.len() };
         report.vault_only = tf.is_intraday() && observed.is_none();
         Ok(report)
     })
@@ -2074,11 +2101,22 @@ async fn wall_edge_one(s: &Arc<Shared>, symbol: &str, daily: bool, pane: PaneId,
                 return Err(Miss::new("NOT US CASH", "Requires a verified US cash-session symbol", false));
             }
             let tf = if daily { Timeframe::D1 } else { Timeframe::M5 };
-            let permit = s.wall_fetches.acquire().await.map_err(|e| Miss::new("NO DATA", e.to_string(), false))?;
+            // The wall's own ribbon refresh has usually just admitted today's 5m bars. When
+            // the vault alone already holds a full contiguous window, a deep provider fetch
+            // could only re-confirm bars the window contains: skip it.
+            let reused = if daily { None } else { wall_edge_vault_window(s, &symbol, day).await };
+            let permit = if reused.is_some() {
+                None
+            } else {
+                Some(s.wall_fetches.acquire().await.map_err(|e| Miss::new("NO DATA", e.to_string(), false))?)
+            };
             if !wall_edge_current(s, pane, generation) {
                 return Err(Miss::new("NO DATA", "Cancelled", false));
             }
-            let (bars, stitch, observed, source) = if daily {
+            let (bars, stitch, observed, source) = if let Some((bars, info, at)) = reused {
+                let source = info.source.clone();
+                (bars, Some(info), Some(at), source)
+            } else if daily {
                 let ticker = tr_data::whats_news::archive_ticker(&symbol);
                 let bars = s
                     .history
@@ -2141,6 +2179,35 @@ async fn wall_edge_one(s: &Arc<Shared>, symbol: &str, daily: bool, pane: PaneId,
         }
     }
     result
+}
+/// Vault rows read for the reuse check: the Edge window plus room for the session cut.
+const WALL_EDGE_VAULT_READ: usize = tr_data::wall_edge::MAX_BARS + 400;
+/// A vault-only 5m window for Wall Edge, or `None` when a provider fetch is still needed.
+/// Reuse requires (a) exactly one vault source, (b) an admitted fetch at or after the
+/// close of the last completed session, so that session is complete in the vault, and
+/// (c) a full `MAX_BARS` contiguous closed window after the session cut and gap trim.
+/// The input is the last `MAX_BARS` contiguous closed bars either way; a deep fetch could
+/// only re-confirm (or, rarely, correct) bars older than the ribbon's own fetch.
+async fn wall_edge_vault_window(
+    s: &Shared,
+    symbol: &str,
+    day: chrono::NaiveDate,
+) -> Option<(Vec<Bar>, tr_data::vault::StitchInfo, i64)> {
+    use tr_data::wall_edge;
+    let close = tr_data::intraday::close_minute(day);
+    let close = tr_core::ny::to_utc(day.and_hms_opt(close / 60, close % 60, 0)?);
+    let symbol = tr_data::security(symbol).key();
+    cache_op(s, move |v| {
+        let Some(id) = v.sole_series(&symbol, Timeframe::M5)? else { return Ok(None) };
+        let Some(at) = v.last_ingest(&id)?.filter(|at| *at >= close) else { return Ok(None) };
+        let (bars, info) = v.stitch(&id, &[], WALL_EDGE_VAULT_READ, Some(at))?;
+        let class = tr_data::security(&symbol).class;
+        let full = wall_edge::prepare(&bars, Timeframe::M5, class, Some(at), Some(&info))
+            .is_ok_and(|p| p.bars.len() == wall_edge::MAX_BARS);
+        Ok(full.then_some((bars, info, at)))
+    })
+    .await
+    .flatten()
 }
 
 fn claim_wall(s: &Shared, pane: PaneId, generation: u64) -> bool {
@@ -3499,7 +3566,7 @@ async fn handle_inner(s: &Arc<Shared>, req: Request, force: bool) {
                 });
             }
         }
-        Request::WallEdge { pane, generation, symbols, daily } => {
+        Request::WallEdge { pane, generation, symbols, daily, priority } => {
             if !wall_edge_current(s, pane, generation) {
                 return;
             }
@@ -3511,37 +3578,67 @@ async fn handle_inner(s: &Arc<Shared>, req: Request, force: bool) {
                 });
                 return;
             }
+            let symbols: Vec<_> = symbols.into_iter().take(tr_data::stack_wall::MAX_SYMBOLS).collect();
+            let mut started = vec![false; symbols.len()];
+            // Pull rows one at a time in on-screen order, re-reading the pane's latest
+            // focus so a scroll during the pass re-ranks the rows not yet started.
+            let mut next = || {
+                let focus = s
+                    .wall_edge_focus
+                    .lock()
+                    .unwrap()
+                    .get(&pane)
+                    .filter(|(g, _)| *g == generation)
+                    .map(|(_, p)| p.clone())
+                    .unwrap_or_default();
+                let i = wall_edge_next(&focus, &priority, &mut started)?;
+                Some((i, symbols[i].clone()))
+            };
             let mut tasks = tokio::task::JoinSet::new();
-            for (index, symbol) in symbols.into_iter().take(tr_data::stack_wall::MAX_SYMBOLS).enumerate() {
-                let shared = s.clone();
-                tasks.spawn(async move {
-                    let result = wall_edge_one(&shared, &symbol, daily, pane, generation).await;
-                    (index, symbol, result)
-                });
-            }
             let mut tick = tokio::time::interval(Duration::from_millis(20));
-            while !tasks.is_empty() {
+            loop {
+                while tasks.len() < WALL_EDGE_IN_FLIGHT {
+                    let Some((index, symbol)) = next() else { break };
+                    let shared = s.clone();
+                    tasks.spawn(async move {
+                        let result = wall_edge_one(&shared, &symbol, daily, pane, generation).await;
+                        (index, symbol, result)
+                    });
+                }
+                if tasks.is_empty() {
+                    break;
+                }
                 if !wall_edge_current(s, pane, generation) {
                     tasks.abort_all();
                     return;
                 }
                 tokio::select! {
-                    _ = tick.tick() => {},
+                    _ = tick.tick() => {}
                     result = tasks.join_next() => {
-                        if !wall_edge_current(s,pane,generation) { tasks.abort_all(); return; }
+                        if !wall_edge_current(s, pane, generation) {
+                            tasks.abort_all();
+                            return;
+                        }
                         match result {
-                            Some(Ok((index,symbol,result))) => send(Response::WallEdgeRow { pane,generation,index,symbol,result }),
-                            Some(Err(e)) => { tasks.abort_all(); send(Response::WallEdgeDone { pane,generation,error: Some(e.to_string()) }); return; }
+                            Some(Ok((index, symbol, result))) => {
+                                send(Response::WallEdgeRow { pane, generation, index, symbol, result })
+                            }
+                            Some(Err(e)) => {
+                                tasks.abort_all();
+                                send(Response::WallEdgeDone { pane, generation, error: Some(e.to_string()) });
+                                return;
+                            }
                             None => break,
                         }
                     }
                 }
             }
             if wall_edge_current(s, pane, generation) {
+                s.wall_edge_focus.lock().unwrap().remove(&pane);
                 send(Response::WallEdgeDone { pane, generation, error: None });
             }
         }
-        Request::CancelWallEdge { .. } => {}
+        Request::CancelWallEdge { .. } | Request::WallEdgeFocus { .. } => {}
         Request::TrendWall { pane, generation, symbols, daily } => {
             if !wall_current(s, pane, generation) {
                 return;
@@ -4696,14 +4793,22 @@ fn begin_request(s: &Shared, req: &Request) -> bool {
         | Request::ArchiveHistory { pane, generation, .. } => claim_series(s, *pane, *generation),
         Request::TrendWall { pane, generation, .. } => claim_wall(s, *pane, *generation),
         Request::WallEdge { pane, generation, .. } => claim_wall_edge(s, *pane, *generation),
+        Request::WallEdgeFocus { pane, generation, priority } => {
+            if wall_edge_current(s, *pane, *generation) {
+                s.wall_edge_focus.lock().unwrap().insert(*pane, (*generation, priority.clone()));
+            }
+            false
+        }
         Request::CancelWallEdge { pane, generation } => {
             claim_wall_edge(s, *pane, *generation);
+            s.wall_edge_focus.lock().unwrap().remove(pane);
             false
         }
         Request::Forget(pane) => {
             s.feed_requests.lock().expect("feed requests").retain(|(_, id), _| *id != Some(*pane));
             s.wall_generations.lock().expect("wall generations").remove(pane);
             s.wall_edge_generations.lock().unwrap().remove(pane);
+            s.wall_edge_focus.lock().unwrap().remove(pane);
             s.series.lock().expect("series lock").remove(pane);
             s.archive_daily.lock().expect("archive daily lock").remove(pane);
             s.chart_sources.lock().expect("chart sources").remove(pane);
@@ -6274,7 +6379,7 @@ mod tests {
             .unwrap()
     }
     fn edge_request(generation: u64, daily: bool) -> Request {
-        Request::WallEdge { pane: 31, generation, symbols: vec!["AAPL US Equity".into()], daily }
+        Request::WallEdge { pane: 31, generation, symbols: vec!["AAPL US Equity".into()], daily, priority: vec![] }
     }
     fn edge_fixture() -> Vec<Bar> {
         let mut date = tr_data::wall_edge::completed_session(chrono::Utc::now().timestamp());
@@ -6415,13 +6520,22 @@ mod tests {
     struct EdgeBlocked {
         calls: std::sync::atomic::AtomicUsize,
         release: tokio::sync::Semaphore,
+        seen: std::sync::Mutex<Vec<String>>,
+    }
+    fn edge_blocked() -> Arc<EdgeBlocked> {
+        Arc::new(EdgeBlocked {
+            calls: Default::default(),
+            release: tokio::sync::Semaphore::new(0),
+            seen: Default::default(),
+        })
     }
     #[async_trait::async_trait]
     impl tr_data::MarketData for EdgeBlocked {
         fn name(&self) -> &str {
             "edge blocked"
         }
-        async fn history(&self, _: &str, _: Timeframe, _: Option<i64>, _: usize) -> anyhow::Result<Vec<Bar>> {
+        async fn history(&self, symbol: &str, _: Timeframe, _: Option<i64>, _: usize) -> anyhow::Result<Vec<Bar>> {
+            self.seen.lock().unwrap().push(symbol.to_string());
             self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             self.release.acquire().await.unwrap().forget();
             Ok(edge_fixture())
@@ -6438,7 +6552,7 @@ mod tests {
     }
     #[tokio::test]
     async fn wall_edge_cancels_when_generation_advances() {
-        let provider = Arc::new(EdgeBlocked { calls: Default::default(), release: tokio::sync::Semaphore::new(0) });
+        let provider = edge_blocked();
         let (s, rx) = shared(provider.clone(), None);
         let r = edge_request(1, false);
         begin_request(&s, &r);
@@ -6466,16 +6580,16 @@ mod tests {
     }
     #[tokio::test]
     async fn wall_edge_fetches_are_bounded_by_the_wall_semaphore() {
-        let provider = Arc::new(EdgeBlocked { calls: Default::default(), release: tokio::sync::Semaphore::new(0) });
+        let provider = edge_blocked();
         let (s, rx) = shared(provider.clone(), None);
+        let names = ["AAPL", "MSFT", "NVDA", "META", "GOOG", "AMZN", "TSLA", "SPY", "QQQ", "IWM", "DIA", "XLF"];
         let r = Request::WallEdge {
             pane: 31,
             generation: 1,
             daily: false,
-            symbols: ["AAPL", "MSFT", "NVDA", "META", "GOOG", "AMZN", "TSLA", "SPY"]
-                .iter()
-                .map(|s| tr_data::security(s).key())
-                .collect(),
+            symbols: names.iter().map(|s| tr_data::security(s).key()).collect(),
+            // The three bottom rows are on screen.
+            priority: vec![9, 10, 11],
         };
         begin_request(&s, &r);
         let one = s.clone();
@@ -6484,21 +6598,99 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(20)).await;
         assert_eq!(provider.calls.load(std::sync::atomic::Ordering::SeqCst), 4);
         assert_eq!(s.wall_fetches.available_permits(), 0);
-        provider.release.add_permits(8);
+        // Only the first WALL_EDGE_IN_FLIGHT rows in on-screen order were started.
+        let first = provider.seen.lock().unwrap().clone();
+        let allowed: Vec<_> = [9, 10, 11, 0, 1, 2].iter().map(|&i| tr_data::security(names[i]).key()).collect();
+        assert!(first.iter().all(|s| allowed.contains(s)), "{first:?}");
+        provider.release.add_permits(names.len());
         tokio::time::timeout(Duration::from_secs(5), task).await.unwrap().unwrap();
-        assert_eq!(wall_responses(&rx).iter().filter(|r| matches!(r, Response::WallEdgeRow { .. })).count(), 8);
+        assert_eq!(
+            wall_responses(&rx).iter().filter(|r| matches!(r, Response::WallEdgeRow { .. })).count(),
+            names.len()
+        );
+    }
+    #[test]
+    fn wall_edge_next_follows_focus_then_priority_then_row_order() {
+        let mut started = vec![false; 6];
+        assert_eq!(wall_edge_next(&[], &[4, 5], &mut started), Some(4));
+        assert_eq!(wall_edge_next(&[2, 4], &[4, 5], &mut started), Some(2));
+        assert_eq!(wall_edge_next(&[2, 4, 99], &[4, 5], &mut started), Some(5));
+        assert_eq!(wall_edge_next(&[], &[], &mut started), Some(0));
+        assert_eq!(wall_edge_next(&[], &[], &mut started), Some(1));
+        assert_eq!(wall_edge_next(&[], &[], &mut started), Some(3));
+        assert_eq!(wall_edge_next(&[], &[], &mut started), None);
+    }
+    #[tokio::test]
+    async fn wall_edge_focus_is_kept_only_for_the_current_generation() {
+        let (s, _rx) = shared(edge_blocked(), None);
+        begin_request(&s, &edge_request(3, false));
+        assert!(!begin_request(&s, &Request::WallEdgeFocus { pane: 31, generation: 2, priority: vec![1] }));
+        assert!(s.wall_edge_focus.lock().unwrap().is_empty());
+        begin_request(&s, &Request::WallEdgeFocus { pane: 31, generation: 3, priority: vec![1] });
+        assert_eq!(s.wall_edge_focus.lock().unwrap().get(&31), Some(&(3, vec![1])));
+        begin_request(&s, &Request::Forget(31));
+        assert!(s.wall_edge_focus.lock().unwrap().is_empty());
+    }
+    /// A vault that already holds a full contiguous Edge window, admitted after the last
+    /// completed close, serves Edge with zero provider requests.
+    #[tokio::test]
+    async fn wall_edge_reuses_a_full_vault_window_without_a_provider_call() {
+        let mut date = tr_data::wall_edge::completed_session(chrono::Utc::now().timestamp());
+        let mut days = vec![date];
+        while days.len() * 78 < tr_data::wall_edge::MAX_BARS + 200 {
+            date = tr_data::history::calendar::previous_session(date);
+            days.push(date);
+        }
+        days.reverse();
+        let bars: Vec<Bar> = days
+            .iter()
+            .flat_map(|d| vault_day(&d.to_string()))
+            .enumerate()
+            .map(|(i, mut b)| {
+                let c = 100.0 + (i as f64 / 23.0).sin() * 2.0;
+                (b.open, b.high, b.low, b.close) = (c, c + 0.1, c - 0.1, c);
+                b
+            })
+            .collect();
+        let provider = vault_provider(vec![]);
+        let (s, rx) = shared(provider.clone(), Some(BarCache::open_in_memory().unwrap()));
+        let now = chrono::Utc::now().timestamp();
+        let id =
+            tr_data::vault::SeriesId { symbol: "AAPL US Equity".into(), tf: Timeframe::M5, source: "yahoo".into() };
+        let stored = cache_op(&s, move |v| v.ingest(&id, &bars, DataMode::Live, now)).await.unwrap();
+        assert!(stored.inserted > tr_data::wall_edge::MAX_BARS);
+        let r = edge_request(1, false);
+        begin_request(&s, &r);
+        handle(&s, r).await;
+        let report = wall_responses(&rx)
+            .into_iter()
+            .find_map(|r| if let Response::WallEdgeRow { result, .. } = r { Some(result) } else { None })
+            .unwrap()
+            .unwrap();
+        assert_eq!(provider.calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert_eq!(report.bars, tr_data::wall_edge::MAX_BARS);
+        assert_eq!(report.source, "yahoo");
+        assert!(!report.vault_only);
+        // A vault that has not observed the last completed close still goes to the provider.
+        let (s, _rx) = shared(provider.clone(), Some(BarCache::open_in_memory().unwrap()));
+        assert!(wall_edge_vault_window(&s, "AAPL US Equity", days[days.len() - 1]).await.is_none());
     }
     #[tokio::test]
     async fn wall_edge_cancelled_initializer_does_not_poison_another_pane() {
-        let provider = Arc::new(EdgeBlocked { calls: Default::default(), release: tokio::sync::Semaphore::new(0) });
+        let provider = edge_blocked();
         let (s, rx) = shared(provider.clone(), None);
         let first = edge_request(1, false);
         begin_request(&s, &first);
         let one = s.clone();
         let first = tokio::spawn(async move { handle(&one, first).await });
         wait_edge_calls(&provider, 1).await;
-        let second =
-            Request::WallEdge { pane: 32, generation: 1, symbols: vec!["AAPL US Equity".into()], daily: false };
+        let second = Request::WallEdge {
+            pane: 32,
+            generation: 1,
+            symbols: vec!["AAPL US Equity".into()],
+            daily: false,
+            priority: vec![],
+        };
         begin_request(&s, &second);
         let two = s.clone();
         let second = tokio::spawn(async move { handle(&two, second).await });
@@ -6785,6 +6977,7 @@ mod tests {
                 wall_fetches: tokio::sync::Semaphore::new(4),
                 wall_generations: Default::default(),
                 wall_edge_generations: Default::default(),
+                wall_edge_focus: Default::default(),
                 wall_edge: Default::default(),
                 wall_edge_compute: Arc::new(tokio::sync::Semaphore::new(4)),
                 cache: Arc::new(std::sync::Mutex::new(
@@ -7814,6 +8007,7 @@ mod tests {
             wall_fetches: tokio::sync::Semaphore::new(4),
             wall_generations: Default::default(),
             wall_edge_generations: Default::default(),
+            wall_edge_focus: Default::default(),
             wall_edge: Default::default(),
             wall_edge_compute: Arc::new(tokio::sync::Semaphore::new(4)),
             cache: Default::default(),

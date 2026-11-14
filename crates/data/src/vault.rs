@@ -316,6 +316,22 @@ impl BarVault {
         tx.commit()?;
         Ok(out)
     }
+    /// Clock of the last fetch whose bars were admitted (not quarantined, not rejected).
+    pub fn last_ingest(&self, id: &SeriesId) -> Result<Option<i64>> {
+        if !self.enabled {
+            return Ok(None);
+        }
+        Ok(self
+            .cache
+            .conn
+            .query_row(
+                "SELECT last_ingest FROM vault_series WHERE symbol=? AND tf=? AND source=?",
+                params![id.symbol, id.tf.label(), id.source],
+                |r| r.get::<_, Option<i64>>(0),
+            )
+            .optional()?
+            .flatten())
+    }
     pub fn read(&self, id: &SeriesId, before: Option<i64>, limit: usize) -> Result<Vec<Bar>> {
         if !self.enabled {
             return Ok(vec![]);

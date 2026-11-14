@@ -44,6 +44,12 @@ pub struct TrendWallPane {
     edge_revision: u64,
     edge_mesh: Option<(edge::MeshKey, Arc<Mesh>)>,
     edge_error: Option<String>,
+    /// Oldest CLOSED THRU bar end over the loaded reports, cached in `changed()`.
+    edge_thru: Option<i64>,
+    /// Display positions on screen at the last paint; drives Edge fetch priority.
+    visible: std::ops::Range<usize>,
+    /// The priority last sent to the worker for the in-flight pass.
+    edge_focus_sent: Vec<usize>,
     scroll_selected: bool,
     pub generation: u64,
     pub rows: Vec<Row>,
@@ -83,6 +89,9 @@ impl TrendWallPane {
             edge_revision: 0,
             edge_mesh: None,
             edge_error: None,
+            edge_thru: None,
+            visible: 0..EDGE_FIRST_SCREEN,
+            edge_focus_sent: Vec::new(),
             scroll_selected: false,
             generation: 0,
             rows: Vec::new(),
@@ -195,13 +204,39 @@ impl TrendWallPane {
         self.edge_error = None;
         self.edge_received.clear();
         self.edge_inflight = Some(want.clone());
+        let priority = self.edge_priority();
+        self.edge_focus_sent = priority.clone();
         worker.send(Request::WallEdge {
             pane,
             generation: self.edge_generation,
             symbols: want.symbols,
             daily: want.daily,
+            priority,
         });
         self.changed();
+    }
+    /// Rows on screen (plus a margin) first, in display order, then the rest.
+    fn edge_priority(&self) -> Vec<usize> {
+        let order = wall_edge::order(&self.rows, &self.edges, self.sort);
+        wall_edge::prefetch_order(&order, self.visible.clone(), EDGE_PREFETCH_MARGIN)
+    }
+    /// While a pass runs, re-rank its unstarted rows after a scroll or re-sort. Only the
+    /// on-screen head is compared, so steady frames send nothing.
+    pub(super) fn refocus_edge(&mut self, pane: PaneId, worker: &Worker) {
+        if self.edge_inflight.is_none() {
+            return;
+        }
+        let priority = self.edge_priority();
+        let head = (self.visible.len() + 2 * EDGE_PREFETCH_MARGIN).min(priority.len());
+        if priority[..head] == self.edge_focus_sent[..head.min(self.edge_focus_sent.len())] {
+            return;
+        }
+        self.edge_focus_sent = priority.clone();
+        worker.send(Request::WallEdgeFocus { pane, generation: self.edge_generation, priority });
+    }
+    /// Rows still waiting for an Edge result (no report yet, or a pass in flight for them).
+    pub(super) fn edge_pending(&self) -> usize {
+        self.edge_summary.pending
     }
     pub fn accept_edge(&mut self, generation: u64, index: usize, symbol: String, result: Result<Arc<WallEdge>, Miss>) {
         if generation != self.edge_generation
@@ -260,6 +295,13 @@ impl TrendWallPane {
             })
             .collect();
         self.edge_summary = wall_edge::resolve(&mut self.edges);
+        // Bar END of the last closed bar (a 15:55 5m bar closes at 16:00).
+        self.edge_thru = self
+            .rows
+            .iter()
+            .filter_map(|r| self.edge_reports.get(&(r.symbol.clone(), self.daily))?.as_ref().ok())
+            .map(|r| if r.tf.is_intraday() { r.closed_thru_ts + r.tf.seconds() } else { r.closed_thru_ts })
+            .min();
         self.edge_revision = self.edge_revision.wrapping_add(1);
     }
     fn refresh_due(&self, now: i64) -> bool {
@@ -533,8 +575,22 @@ impl TerminalApp {
                     p.daily = !p.daily;
                     reload = true;
                 }
-                if ui.small_button(format!("Sort: {:?}", p.sort)).clicked() {
+                if ui.small_button(format!("Sort: {}", sort_label(p.sort))).clicked() {
                     p.sort = p.sort.next();
+                }
+                // An Edge sort over a partly computed wall must say so: pending rows sit last
+                // and will move as their results land.
+                let pending = p.edge_pending();
+                if p.edge && is_edge_sort(p.sort) && pending > 0 {
+                    ui.label(
+                        RichText::new(format!(
+                            "EDGE SORT PARTIAL · {}/{} computed · pending last",
+                            p.rows.len() - pending,
+                            p.rows.len()
+                        ))
+                        .font(mono(10.0))
+                        .color(amber()),
+                    );
                 }
             });
             if let Some(e) = &p.error {
@@ -572,6 +628,7 @@ impl TerminalApp {
             }
             if !p.rows.is_empty() {
                 open = paint_wall(ui, p, arrival.as_ref());
+                p.refocus_edge(id, &self.worker);
             }
             ui.label(
                 RichText::new(
@@ -621,6 +678,24 @@ fn number(value: f64, suffix: &str) -> String {
     if value.is_finite() { format!("{value:+.1}{suffix}") } else { "—".into() }
 }
 const ROW: f32 = 22.0;
+/// Rows assumed on screen before the first paint reports the real range.
+const EDGE_FIRST_SCREEN: usize = 16;
+/// Off-screen rows computed with the visible ones, each side, so a short scroll is ready.
+const EDGE_PREFETCH_MARGIN: usize = 6;
+fn sort_label(sort: Sort) -> &'static str {
+    match sort {
+        Sort::Stack => "Stack",
+        Sort::Flip => "Flip",
+        Sort::Cushion => "Cushion",
+        Sort::List => "List",
+        Sort::EdgeScore => "Edge score",
+        Sort::EdgeDelta => "Edge Δ",
+        Sort::EdgeQ => "Edge q",
+    }
+}
+fn is_edge_sort(sort: Sort) -> bool {
+    matches!(sort, Sort::EdgeScore | Sort::EdgeDelta | Sort::EdgeQ)
+}
 const LEFT: f32 = 150.0;
 const RIGHT: f32 = 345.0;
 fn paint_wall(
@@ -634,6 +709,10 @@ fn paint_wall(
         let size = vec2(ui.available_width().max(980.0 + edge_width), 24.0 + p.rows.len() as f32 * ROW);
         let (rect, response) = ui.allocate_exact_size(size, Sense::click());
         let plot = Rect::from_min_max(rect.min + vec2(LEFT, 24.0), rect.max - vec2(RIGHT + edge_width, 0.0));
+        let clip = ui.clip_rect();
+        let first = (((clip.top() - plot.top()) / ROW).floor().max(0.0) as usize).min(p.rows.len());
+        let last = ((clip.bottom() - plot.top()) / ROW).ceil().max(0.0) as usize;
+        p.visible = first..last.clamp(first, p.rows.len());
         let painter = ui.painter().with_clip_rect(rect);
         painter.text(rect.min, Align2::LEFT_TOP, "SYM       STACK", mono(10.0), muted());
         painter.text(
@@ -1076,6 +1155,35 @@ mod tests {
         p.done(p.generation, None);
         p.ensure_edge(1, &w, now);
         assert!(matches!(rx.try_recv().unwrap(), Request::WallEdge { daily: true, .. }));
+    }
+    #[test]
+    fn edge_pass_starts_with_visible_rows_and_refocuses_on_scroll_only() {
+        let (w, mut rx) = Worker::test_channel();
+        let list: Vec<_> = (0..40).map(|i| format!("S{i}")).collect();
+        let mut p = TrendWallPane::new("");
+        p.request(1, &w, &list);
+        rx.try_recv().unwrap();
+        p.done(p.generation, None);
+        // Scrolled to rows 20..30 before the pass starts.
+        p.visible = 20..30;
+        p.ensure_edge(1, &w, chrono::Utc::now().timestamp());
+        let Request::WallEdge { priority, .. } = rx.try_recv().unwrap() else { panic!("edge pass") };
+        let head: Vec<_> = (20 - EDGE_PREFETCH_MARGIN..30 + EDGE_PREFETCH_MARGIN).collect();
+        assert_eq!(priority[..head.len()], head[..]);
+        assert_eq!(priority.len(), 40);
+        // A steady frame sends nothing; a scroll re-ranks the running pass.
+        p.refocus_edge(1, &w);
+        assert!(rx.try_recv().is_err());
+        p.visible = 0..10;
+        p.refocus_edge(1, &w);
+        let Request::WallEdgeFocus { generation, priority, .. } = rx.try_recv().unwrap() else { panic!("focus") };
+        assert_eq!(generation, p.edge_generation);
+        assert_eq!(priority[0], 0);
+        // Once the pass is done, scrolling costs nothing.
+        p.edge_done(p.edge_generation, None);
+        p.visible = 30..40;
+        p.refocus_edge(1, &w);
+        assert!(rx.try_recv().is_err());
     }
     #[test]
     fn edge_row_for_old_generation_or_wrong_symbol_is_dropped() {

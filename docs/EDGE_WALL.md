@@ -5,15 +5,18 @@
 form the statistical family; overflow names are listed and excluded.
 
 ```
-SYM   STACK | native ribbons | ▲ [+3.1bp] q .03 n 412 ▮▮▯▮ | FLIP CUSH VWAP RVOL SRC
+                          EDGE 5b · 37/50 computed
+SYM   STACK | ribbons |   Δ5b       q        S    n       FOLDS | FLIP CUSH VWAP RVOL SRC
+              ...     | ▲ [+3.1bp]  q .03~   +37  n 412   ▮▮▯▮  | ...
 ```
 
 The glyph identifies the conditioning regime: up, flat or down. A hollow glyph
 uses the historical window's last regime when a completed live ribbon is unavailable.
 The tile is conditional excess return, in basis points; it fills only when the
 wall pass rule holds. Non-passing tiles have an outline and dimmed fold ticks.
-The four ticks show the signs of the purged walk-forward fold effects; unknown
-folds are hollow. `LOW N` warns of fewer than 30 effective outcomes.
+`S` is the edge score (below). The four ticks show the signs of the contiguous,
+purged stability-fold effects; unknown folds are hollow. `LOW N` warns of fewer
+than 30 effective outcomes.
 
 ## Inputs and timing
 
@@ -28,8 +31,9 @@ folds are hollow. `LOW N` warns of fewer than 30 effective outcomes.
 A name needs at least 256 closed bars after admission and gap trimming. Warm-up
 bars do not enter outcomes. Each report holds all three regimes, so a completed
 live regime flip switches the displayed cell and reruns wall BH without a fetch.
-The summary's `CLOSED THRU` is the oldest displayed report end; hover gives each
-name's exact first and last input timestamps. Timestamps identify bar opens.
+The summary's `CLOSED THRU` is the oldest displayed report end, shown as the end
+of the last closed bar (a 15:55 5m bar shows as 16:00); hover gives each name's
+first input bar open and its `CLOSED THRU`.
 During the session, today's intraday bars never enter Edge's historical window.
 The session identity rolls at cash close, using the existing US calendar and
 half-day/DST rules. Existing daily closed-bar rules retain the provider's post-close
@@ -44,9 +48,19 @@ For a warmed bar t whose outcome has completed:
 - `Δ_r = mean(r_t | regime_t = r) − mean(r_t | all warmed t)`.
 - Raw p is a two-sided circular-rotation test of the regime block against fixed
   outcomes, using up to 999 deterministic offsets. Below 99 null samples p is absent.
-- Four contiguous folds use equal counts of completed outcomes and purge outcomes
-  crossing each fold boundary. Fold Δ subtracts that fold's baseline. A fold is
-  unknown below eight effective outcomes. `n_eff = n/5` describes overlap.
+- Four contiguous, time-ordered folds use equal counts of completed outcomes.
+  They are stability folds, not train/test splits: nothing is fitted, the regime
+  uses fixed default parameters, and states are causal. An outcome whose 5-bar
+  window reaches the next fold's first entry bar is purged, so no fold's labels use
+  another fold's bars. The last fold also drops its final 5 outcomes (inherited,
+  conservative). Fold Δ subtracts that fold's baseline. A fold is unknown (hollow)
+  below eight effective outcomes, so short histories show hollow ticks rather than
+  zeros. `n_eff = n/5` describes overlap.
+
+Δ, n, hit rate and folds equal the chart's TSTACK Edge 5b cell on the same window.
+Raw p can differ slightly: the rotation offsets depend on the set of horizons
+tested together, and the wall tests only horizon 5 (as TSTACK Tune does), while
+the chart tests 1, 5 and 20 at once.
 
 The wall is the FDR family because the user scans names and chooses among them.
 Each loaded name contributes one test, chosen by its causally known displayed
@@ -54,7 +68,9 @@ regime. The report's per-name q is shown in hover as **not used**. Wall q uses t
 shared Benjamini–Hochberg step-up procedure across the loaded names.
 
 Pending names and admitted short-history/low-outcome names enter at p = 1.
-Unverified, unavailable, non-US-cash and quarantined names are excluded.
+Unverified, unavailable, non-US-cash and quarantined names are excluded, as are
+names whose computed Δ or p is non-finite (`INVALID`): a defect is not evidence.
+Equal p get equal q, q never decreases as p increases, and q is capped at 1.
 For example, `[.01, .01, .03, .04]` with two pending names gives m = 6 and
 q = `[.03, .03, .06, .06]`; those four alone give `[.02, .02, .04, .04]`.
 Pending q values are conservative upper bounds for a fixed family and inputs:
@@ -84,7 +100,7 @@ basis points are not comparable across names with different volatility.
 | E | Show Edge and sort by score, then cycle score → Δ → q |
 | Shift+E / Edge button | Show/hide Edge; hiding cancels unfinished work |
 | X / Scatter button | Toggle Δ versus −log10 q scatter |
-| EDGE / Δ5b / q header | Select that Edge sort |
+| Δ5b / q / S header | Select that Edge sort (Δ, q, score) |
 | S | Four existing stack sorts; from an Edge sort returns to Stack |
 | Cell/dot click | Select the underlying row; scatter selection scrolls to it |
 | N / Shift+N / Backspace | Existing hand-off and return, retaining Edge results |
@@ -97,6 +113,9 @@ Score sort uses |S| descending, q ascending, |Δ| descending, then list order.
 Δ sort uses signed Δ descending; q sort uses q ascending and |Δ| descending.
 Missing/non-finite values sort last, with scored rows first within the missing
 set, then list order. Historical Edge may remain valid on a stale ribbon row.
+While rows are still pending, an Edge sort is partial: the header turns amber
+(`EDGE 5b · k/50 computed`) and the toolbar shows
+`EDGE SORT PARTIAL · k/50 computed · pending last`.
 
 The summary shows tests m, passing names split by sign, median/IQR Δ, a symmetric
 Δ strip plot, a heat key, dates and fill progress. Below ten trials it shows
@@ -115,7 +134,8 @@ q, fold dates/counts, score arithmetic, provenance and source details.
 | NOT US CASH | Intraday symbol/session unsupported | No |
 | QUARANTINED | Vault withheld fresh data | No |
 | SHORT HISTORY | Fewer than 256 closed bars after session cut/gap trim | Yes, p = 1 |
-| LOW N | No finite Δ or insufficient null samples for the displayed regime | Yes, p = 1 |
+| LOW N | Too few outcomes or null samples for the displayed regime | Yes, p = 1 |
+| INVALID | Non-finite Δ or p (a defect, never painted as a number) | No |
 | ··· | Work pending | Yes, p = 1 |
 
 Blank cells show an em-dash and reason, with no statistical digits. Hover explains
@@ -133,8 +153,11 @@ gap inside it; gaps are never bridged. Quarantined stitches are refused. Archive
 Edge reads local daily history only, with no market provider or bridge fallback.
 The sample provider triggers a refusal banner and zero Edge fetches.
 
-Ribbons load first, then Edge streams rows as they finish. Four wall permits bound
-acquisition; four shared compute permits bound `spawn_blocking` across panes.
+Ribbons load first, then Edge streams rows as they finish. Rows on screen, plus six
+rows each side, start first; the rest follow in display order. Scrolling or
+re-sorting during a pass re-ranks the rows not yet started (`WallEdgeFocus`, no
+fetch). At most six rows are in flight per pass; four wall permits bound
+acquisition, and four shared compute permits bound `spawn_blocking` across panes.
 No network/disk work or indicator/null computation runs on the UI thread. A separate
 Edge generation cancels abandoned passes; late generations and mismatched symbols
 are ignored. Ribbon refreshes keep Edge results and send no extra Edge request.
@@ -149,10 +172,22 @@ changes invalidate the report when newly acquired; same-day acquisition memo hit
 do not poll the provider or archive for corrections. The lane cache holds 256 keys,
 enough for 50 names × four intraday lanes.
 
-Cold 50-name Edge has up to 50 deep provider requests (intraday) or 50 SQLite reads
-(archive). Warm same-day opens need no acquisitions. Provider pacing and available
-history determine latency; fills are progressive. No live latency claim has been
-measured here. `cargo bench -p tr-data --bench wall_edge` can measure real inputs
+**Vault reuse (intraday).** Before a deep fetch, Edge reads the Bar Vault's 5m
+series for the name. If it has exactly one source, its last admitted fetch is at or
+after the close of the last completed session (the wall's own ribbon refresh
+usually is), and it already holds a full contiguous 5,000-bar closed window, that
+window is used with no provider request. The input is the same window a deep fetch
+would produce; the fetch could only re-confirm or, rarely, correct older bars.
+Otherwise Edge makes one deep request for the name.
+
+Cost for a cold 50-name intraday wall: the ribbon pass makes about 200 requests
+(4 lanes × 50). Edge then adds up to 50 deep 5m requests, each clipped by Yahoo to
+about 59 days (≈3,100 bars), and all paced at ≥200 ms apart, so ≥10 s for Edge
+alone. A vault already holding 64+ contiguous sessions per name needs 0 Edge
+requests. Archive Edge makes 50 SQLite reads. Warm same-day opens need no
+acquisitions. Measured compute (release build, unit-level): ≈8 ms per name at
+3,100 bars and ≈13 ms at 5,000, so about 0.4–0.7 s CPU for 50 names, spread over
+four blocking threads. Provider latency is not measured here. `cargo bench -p tr-data --bench wall_edge` can measure real inputs
 provided via `EDGE_WALL_BARS_JSON` (a verified regular-session 5m Bar JSON export);
 it performs no fetch and does not fabricate bars.
 
@@ -161,4 +196,7 @@ it performs no fetch and does not fabricate bars.
 Intraday five-bar outcomes can span the overnight close: this is inherited from
 Edge Proof. Small/short histories limit p resolution and FDR power. Live regime
 selection is causal, but repeated viewing across dates/regimes is not an additional
-across-time FDR correction. Edge is descriptive historical evidence, not a forecast.
+across-time FDR correction. Names on a wall are correlated (shared market moves),
+and two-sided tests are not guaranteed to meet BH's positive-dependence (PRDS)
+condition, so the 10% FDR is nominal rather than guaranteed. Edge is descriptive
+historical evidence, not a forecast.
