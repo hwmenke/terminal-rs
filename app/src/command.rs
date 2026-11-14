@@ -441,6 +441,9 @@ pub enum Function {
     TrendWall {
         spec: String,
     },
+    EdgeWall {
+        spec: String,
+    },
     /// Relative rotation from the verified daily research archive.
     Rotation {
         spec: String,
@@ -896,6 +899,7 @@ fn parse_function(head: &str, rest: &[&str]) -> Option<Function> {
         "ICMP" | "ICOMPARE" | "ICOMP" => Function::IntradayCompare { spec: joined() },
         "SPATH" | "SESSIONPATH" | "TPATH" => Function::SessionPath { spec: joined() },
         "TWALL" | "TGRID" | "STACKS" | "MTFGRID" => Function::TrendWall { spec: joined() },
+        "EWALL" => Function::EdgeWall { spec: joined() },
         "RRG" | "ROT" | "ROTATION" | "ROTATE" => Function::Rotation { spec: joined() },
         "BRD" | "BREADTH" | "SBREADTH" => Function::Breadth { spec: joined() },
         "VPACE" | "VOLPACE" | "CUMVOL" => Function::VolumePace { spec: joined() },
@@ -1226,6 +1230,7 @@ fn describe(f: &Function) -> String {
         }
         Function::SessionPath { spec } => format!("Session path versus prior 09:30 opens ({spec})"),
         Function::TrendWall { spec } => format!("Trend Wall from verified native bars ({spec})"),
+        Function::EdgeWall { spec } => format!("Edge Wall: wall-wide FDR evidence ({spec})"),
         Function::Rotation { spec } => format!("Relative rotation graph from the verified research archive ({spec})"),
         Function::Breadth { spec } if spec.is_empty() => {
             "Session breadth: share of the watchlist at or above the 09:30 open and session VWAP".into()
@@ -1558,13 +1563,26 @@ mod tests {
     }
 
     #[test]
+    fn ewall_parses_with_and_without_spec() {
+        for (input, spec) in [("EWALL", ""), ("EWALL D WL Growth", "D WL Growth")] {
+            assert_eq!(parse(input), Some(Command::Function(Function::EdgeWall { spec: spec.into() })));
+        }
+    }
+    #[test]
+    fn ewall_us_equity_is_a_symbol() {
+        assert_eq!(parse("EWALL US Equity"), Some(Command::Symbol("EWALL US Equity".into())));
+    }
+    #[test]
     fn twall_and_aliases_parse() {
         for alias in ["TWALL", "TGRID", "STACKS", "MTFGRID"] {
             assert_eq!(parse(alias), Some(Command::Function(Function::TrendWall { spec: String::new() })));
         }
-        for (input, spec) in
-            [("TWALL D", "D"), ("TWALL WL Growth", "WL Growth"), ("TWALL AAPL MSFT NVDA", "AAPL MSFT NVDA")]
-        {
+        for (input, spec) in [
+            ("TWALL D", "D"),
+            ("TWALL WL Growth", "WL Growth"),
+            ("TWALL AAPL MSFT NVDA", "AAPL MSFT NVDA"),
+            ("TWALL EDGE", "EDGE"),
+        ] {
             assert_eq!(parse(input), Some(Command::Function(Function::TrendWall { spec: spec.into() })));
         }
         assert_eq!(parse("TGRID US Equity"), Some(Command::Symbol("TGRID US Equity".into())));

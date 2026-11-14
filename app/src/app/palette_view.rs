@@ -45,7 +45,12 @@ const COMMANDS: &[(&str, &str, &str, Option<Action>)] = &[
         None,
     ),
     ("TSTACK EDGE", "Regime-conditional forward returns and confidence intervals", "quant edge hit rate flips", None),
-    ("ZBAND", "Closed sample-sigma bands, robust VR and empirical tails", "statistics sigma bands honest variance ratio", None),
+    (
+        "ZBAND",
+        "Closed sample-sigma bands, robust VR and empirical tails",
+        "statistics sigma bands honest variance ratio",
+        None,
+    ),
     ("VAULT", "Closed intraday bar vault", "vlt cache history coverage verify prune", None),
     ("HEALTH", "Real data feed health", "src source offline stale retry", None),
     ("PORT", "", "portfolio prtu brokerage holdings value", Some(Action::Portfolio)),
@@ -130,7 +135,12 @@ const COMMANDS: &[(&str, &str, &str, Option<Action>)] = &[
     ("SEASON", "Seasonality Studio: calendar and New York clock patterns", "SSN seasonal month weekday heatmap", None),
     ("AAPL SEASON 30M", "AAPL intraday seasonality from verified history", "time of day volume smile", None),
     ("STATS", "Historical risk, returns and what followed a condition", "conditional returns sma baseline", None),
-    ("DIST", "Distribution Studio: log returns, tails, QQ, drawdowns and regimes", "rdist histogram normal student jarque bera var cvar", None),
+    (
+        "DIST",
+        "Distribution Studio: log returns, tails, QQ, drawdowns and regimes",
+        "rdist histogram normal student jarque bera var cvar",
+        None,
+    ),
     ("AAPL DIST 1H", "AAPL intraday return distribution from verified closed bars", "studio vault distribution", None),
     ("AAPL STATS", "AAPL historical risk and returns", "statistics research archive", None),
     ("COND", "Conditional forward returns vs baseline", "sma distribution overlap", None),
@@ -437,10 +447,10 @@ pub(super) fn static_items() -> Vec<Item> {
         Item::new(Kind::Panel, "New session path", "NEW SPATH", Target::Run("NEW SPATH".into()))
             .keywords("panel pane spath typical session path mean band"),
     );
-    for command in ["TWALL", "TWALL D", "NEW TWALL", "SPLIT DOWN TWALL"] {
+    for command in ["TWALL", "TWALL D", "NEW TWALL", "SPLIT DOWN TWALL", "EWALL", "EWALL D"] {
         v.push(
             Item::new(Kind::Panel, "Trend Wall", command, Target::Run(command.into()))
-                .keywords("stack tgrid stacks mtfgrid watchlist breadth native session"),
+                .keywords("stack tgrid stacks mtfgrid watchlist breadth native session edge evidence fdr scatter 50"),
         );
     }
     for command in ["RRG", "RRG WL", "RRG WEEKLY", "NEW RRG"] {

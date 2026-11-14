@@ -277,6 +277,10 @@ pub enum PaneSettings {
         daily: bool,
         #[serde(default)]
         sort: tr_data::stack_wall::Sort,
+        #[serde(default = "yes")]
+        edge: bool,
+        #[serde(default)]
+        scatter: bool,
     },
     /// Relative rotation graph and its saved view preferences.
     Rotation {
@@ -833,13 +837,27 @@ mod tests {
     }
 
     #[test]
-    fn trend_wall_settings_round_trip() {
-        let settings =
-            PaneSettings::TrendWall { spec: "WL Growth".into(), daily: true, sort: tr_data::stack_wall::Sort::Cushion };
+    fn trend_wall_settings_round_trip_keeps_edge_scatter_and_edge_sort() {
+        let settings = PaneSettings::TrendWall {
+            spec: "WL Growth".into(),
+            daily: true,
+            sort: tr_data::stack_wall::Sort::EdgeQ,
+            edge: true,
+            scatter: true,
+        };
         assert_eq!(serde_json::from_str::<PaneSettings>(&serde_json::to_string(&settings).unwrap()).unwrap(), settings);
+    }
+    #[test]
+    fn older_trend_wall_layout_without_edge_fields_loads() {
         assert_eq!(
             serde_json::from_str::<PaneSettings>(r#"{"TrendWall":{}}"#).unwrap(),
-            PaneSettings::TrendWall { spec: String::new(), daily: false, sort: Default::default() }
+            PaneSettings::TrendWall {
+                spec: String::new(),
+                daily: false,
+                sort: Default::default(),
+                edge: true,
+                scatter: false
+            }
         );
     }
 

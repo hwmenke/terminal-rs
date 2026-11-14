@@ -307,9 +307,13 @@ gets the native title bar with traffic lights, window vibrancy behind the sideba
   forecast. Sample bars are refused. See [Session path](docs/SESSION_PATH.md).
 - **Trend Wall** — `TWALL` shows the active watchlist's completed native TSTACK
   lanes on a shared session clock, with stack alignment, flip age, cushion, VWAP,
-  RVOL and verified breadth. `TWALL D` reads only the daily research archive.
+  RVOL and verified breadth for up to 50 names. Edge adds conditional forward-return
+  evidence with wall-wide FDR, fold stability and a scatter; E cycles evidence sorts,
+  Shift+E hides the column, X toggles scatter. `EWALL` opens sorted by Edge score.
+  `TWALL D` reads only the daily research archive.
   Use `TWALL WL Growth`, explicit symbols, `NEW TWALL` or `SPLIT DOWN TWALL`.
-  Stale/refused rows never score. See [Trend Wall](docs/TREND_WALL.md).
+  Stale/refused rows never contribute stack scores. See [Trend Wall](docs/TREND_WALL.md)
+  and [Edge on the Wall](docs/EDGE_WALL.md).
 
 - **Rotation graph** — `RRG` animates sector, watchlist or typed-name relative
   strength and momentum against a benchmark, using only verified local daily

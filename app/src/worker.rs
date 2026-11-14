@@ -79,6 +79,25 @@ pub enum Request {
         generation: u64,
         symbols: Vec<String>,
     },
+    /// One Edge pass over the wall's rows. `priority` lists row indices to start first
+    /// (the rows on screen plus a margin); unlisted rows follow in row order.
+    WallEdge {
+        pane: PaneId,
+        generation: u64,
+        symbols: Vec<String>,
+        daily: bool,
+        priority: Vec<usize>,
+    },
+    CancelWallEdge {
+        pane: PaneId,
+        generation: u64,
+    },
+    /// Re-rank the not-yet-started rows of a running pass (scroll or re-sort). No fetch.
+    WallEdgeFocus {
+        pane: PaneId,
+        generation: u64,
+        priority: Vec<usize>,
+    },
     TrendWall {
         pane: PaneId,
         generation: u64,
@@ -600,6 +619,18 @@ pub enum Response {
         generation: u64,
         result: Result<tr_data::whats_news::Snapshot<Vec<tr_data::whats_news::MemberRow>>, String>,
     },
+    WallEdgeRow {
+        pane: PaneId,
+        generation: u64,
+        index: usize,
+        symbol: String,
+        result: WallEdgeResult,
+    },
+    WallEdgeDone {
+        pane: PaneId,
+        generation: u64,
+        error: Option<String>,
+    },
     TrendWallRow {
         pane: PaneId,
         generation: u64,
@@ -902,6 +933,11 @@ struct Shared {
     /// combined window instead of stitching broken week boundaries.
     archive_daily: std::sync::Mutex<SeriesMap>,
     wall_generations: std::sync::Mutex<HashMap<PaneId, u64>>,
+    wall_edge_generations: std::sync::Mutex<HashMap<PaneId, u64>>,
+    /// Latest on-screen priority per pane, tagged with the Edge generation it ranks.
+    wall_edge_focus: std::sync::Mutex<HashMap<PaneId, (u64, Vec<usize>)>>,
+    wall_edge: std::sync::Mutex<HashMap<(String, bool), Arc<EdgeSlot>>>,
+    wall_edge_compute: Arc<tokio::sync::Semaphore>,
     stack_lanes: std::sync::Mutex<HashMap<LaneKey, Arc<LaneSlot>>>,
     auction_fine: std::sync::Mutex<HashMap<String, Arc<FineSlot>>>,
     wall_fetches: tokio::sync::Semaphore,
@@ -1090,6 +1126,10 @@ impl Worker {
             auction_fine: Default::default(),
             wall_fetches: tokio::sync::Semaphore::new(4),
             wall_generations: Default::default(),
+            wall_edge_generations: Default::default(),
+            wall_edge_focus: Default::default(),
+            wall_edge: Default::default(),
+            wall_edge_compute: Arc::new(tokio::sync::Semaphore::new(4)),
             cache: Default::default(),
             reports: Default::default(),
             native: Default::default(),
@@ -1825,7 +1865,7 @@ async fn stack_lane_bars(
                 cache.remove(&key);
             }
         }
-        while cache.len() >= 160 && !cache.contains_key(&key) {
+        while cache.len() >= 256 && !cache.contains_key(&key) {
             let oldest = cache
                 .iter()
                 .filter(|(_, slot)| slot.value.get().is_some())
@@ -1853,8 +1893,8 @@ async fn stack_lane_bars(
     if result.is_err() && cache.get(&key).is_some_and(|current| Arc::ptr_eq(current, &slot)) {
         cache.remove(&key);
     }
-    // A burst may temporarily contain more than 160 in-flight slots. Prune only completed ones.
-    while cache.len() > 160 {
+    // A burst may temporarily contain more than 256 in-flight slots. Prune only completed ones.
+    while cache.len() > 256 {
         let oldest = cache
             .iter()
             .filter(|(_, slot)| slot.value.get().is_some())
@@ -1943,6 +1983,231 @@ async fn stack_chart_lane_bars(
     } else {
         result
     }
+}
+
+type WallEdgeResult = Result<Arc<tr_data::wall_edge::WallEdge>, tr_data::wall_edge::Miss>;
+/// Rows of one Edge pass in flight at once: the four wall fetch permits plus two
+/// computing, so fetch and compute overlap without queueing all fifty names at once.
+const WALL_EDGE_IN_FLIGHT: usize = 6;
+/// Next row to start: latest on-screen focus, then the request's priority, then row order.
+fn wall_edge_next(focus: &[usize], priority: &[usize], started: &mut [bool]) -> Option<usize> {
+    let i =
+        focus.iter().chain(priority).copied().chain(0..started.len()).find(|&i| started.get(i).is_some_and(|s| !s))?;
+    started[i] = true;
+    Some(i)
+}
+struct EdgeSlot {
+    value: tokio::sync::OnceCell<Arc<tr_data::wall_edge::WallEdge>>,
+    day: chrono::NaiveDate,
+    completed: std::sync::atomic::AtomicI64,
+}
+fn claim_wall_edge(s: &Shared, pane: PaneId, generation: u64) -> bool {
+    let mut generations = s.wall_edge_generations.lock().unwrap();
+    if generations.get(&pane).is_some_and(|g| *g > generation) {
+        return false;
+    }
+    generations.insert(pane, generation);
+    true
+}
+fn wall_edge_current(s: &Shared, pane: PaneId, generation: u64) -> bool {
+    s.wall_edge_generations.lock().unwrap().get(&pane) == Some(&generation)
+}
+#[allow(clippy::too_many_arguments)]
+fn wall_edge_cached(
+    reports: &tr_data::report_cache::ReportCache,
+    symbol: &str,
+    tf: Timeframe,
+    params: AdaptiveTrendParams,
+    bars: &[Bar],
+    source: &str,
+    observed: Option<i64>,
+    stitch: Option<&tr_data::vault::StitchInfo>,
+) -> WallEdgeResult {
+    use tr_data::wall_edge::{self, Miss};
+    let class = tr_data::security(symbol).class;
+    let input = wall_edge::prepare(bars, tf, class, observed, stitch)?;
+    let mut key = tr_data::report_cache::ReportKey::new(
+        "wall_edge",
+        symbol,
+        tf,
+        source,
+        &input.bars,
+        &format!("{params:?} h=5 {class:?} v1"),
+    );
+    key.epoch = stitch.map_or(0, |s| s.epoch);
+    key.day = input.bars.last().and_then(|b| {
+        if tf.is_intraday() {
+            Some(tr_core::ny::civil(b.ts).date())
+        } else {
+            chrono::DateTime::from_timestamp(b.ts, 0).map(|t| t.date_naive())
+        }
+    });
+    // Vault/live split of the input window itself (research_bars re-tags a mixed stitch).
+    let (lo, hi) = (input.bars.first().map_or(0, |b| b.ts), input.bars.last().map_or(0, |b| b.ts));
+    let window = bars.iter().filter(|b| (lo..=hi).contains(&b.ts));
+    let vault_bars = window.clone().filter(|b| b.provenance == tr_core::Provenance::Cached).count();
+    let live_bars = window.filter(|b| b.provenance == tr_core::Provenance::Real).count();
+    reports.get_or_compute(key, || {
+        let mut report = wall_edge::compute(&input.bars, tf, params).map_err(Miss::unverified)?;
+        report.source = source.into();
+        report.trimmed_gap = input.trimmed_gap;
+        report.vault_bars = if stitch.is_some() { vault_bars } else { 0 };
+        report.live_bars = if stitch.is_some() { live_bars } else { input.bars.len() };
+        report.vault_only = tf.is_intraday() && observed.is_none();
+        Ok(report)
+    })
+}
+async fn wall_edge_one(s: &Arc<Shared>, symbol: &str, daily: bool, pane: PaneId, generation: u64) -> WallEdgeResult {
+    use std::sync::atomic::Ordering;
+    use tr_data::wall_edge::{self, Miss};
+    let now = chrono::Utc::now().timestamp();
+    let day = wall_edge::completed_session(now);
+    let symbol = tr_data::security(symbol).key();
+    let key = (symbol.clone(), daily);
+    let slot = {
+        let mut cache = s.wall_edge.lock().unwrap();
+        cache.retain(|_, v| v.day == day);
+        while cache.len() >= 128 && !cache.contains_key(&key) {
+            let oldest = cache
+                .iter()
+                .filter(|(_, v)| v.value.get().is_some())
+                .min_by_key(|(_, v)| v.completed.load(Ordering::Acquire))
+                .map(|(k, _)| k.clone());
+            if let Some(k) = oldest {
+                cache.remove(&k);
+            } else {
+                break;
+            }
+        }
+        cache
+            .entry(key.clone())
+            .or_insert_with(|| Arc::new(EdgeSlot { value: Default::default(), day, completed: Default::default() }))
+            .clone()
+    };
+    let result = slot
+        .value
+        .get_or_try_init(|| async {
+            if s.sample_mode() {
+                return Err(Miss::unverified("SAMPLE DATA · offline display mode"));
+            }
+            if !daily
+                && (!tr_data::cash_session::is_cash(&tr_data::security(&symbol))
+                    || tr_data::cash_session::require_us_session(
+                        &symbol,
+                        tr_data::cash_session::exchange_zone(&symbol).as_deref(),
+                    )
+                    .is_err())
+            {
+                return Err(Miss::new("NOT US CASH", "Requires a verified US cash-session symbol", false));
+            }
+            let tf = if daily { Timeframe::D1 } else { Timeframe::M5 };
+            // The wall's own ribbon refresh has usually just admitted today's 5m bars. When
+            // the vault alone already holds a full contiguous window, a deep provider fetch
+            // could only re-confirm bars the window contains: skip it.
+            let reused = if daily { None } else { wall_edge_vault_window(s, &symbol, day).await };
+            let permit = if reused.is_some() {
+                None
+            } else {
+                Some(s.wall_fetches.acquire().await.map_err(|e| Miss::new("NO DATA", e.to_string(), false))?)
+            };
+            if !wall_edge_current(s, pane, generation) {
+                return Err(Miss::new("NO DATA", "Cancelled", false));
+            }
+            let (bars, stitch, observed, source) = if let Some((bars, info, at)) = reused {
+                let source = info.source.clone();
+                (bars, Some(info), Some(at), source)
+            } else if daily {
+                let ticker = tr_data::whats_news::archive_ticker(&symbol);
+                let bars = s
+                    .history
+                    .db(move |db| db.daily(&ticker))
+                    .await
+                    .map_err(|e| Miss::new("NO DATA", format!("{e:#}"), false))?;
+                (bars, None, Some(now), "research archive".to_string())
+            } else {
+                let (bars, info) =
+                    analysis_bars(s, &symbol, tf, wall_edge::MAX_BARS, "Wall Edge").await.map_err(|e| {
+                        let detail = format!("{e:#}");
+                        let upper = detail.to_uppercase();
+                        if upper.contains("UNVERIFIED") || upper.contains("SAMPLE") || upper.contains("MIXED") {
+                            Miss::unverified(detail)
+                        } else {
+                            Miss::new("NO DATA", detail, false)
+                        }
+                    })?;
+                let observed = info.live_ok.then_some(info.fetched_at).flatten();
+                let source = info.source.clone();
+                (bars, Some(info), observed, source)
+            };
+            drop(permit);
+            let compute = s
+                .wall_edge_compute
+                .clone()
+                .acquire_owned()
+                .await
+                .map_err(|e| Miss::new("NO DATA", e.to_string(), false))?;
+            if !wall_edge_current(s, pane, generation) {
+                return Err(Miss::new("NO DATA", "Cancelled", false));
+            }
+            let reports = s.reports.clone();
+            let symbol = symbol.clone();
+            let result = tokio::task::spawn_blocking(move || {
+                let _permit = compute;
+                wall_edge_cached(&reports, &symbol, tf, Default::default(), &bars, &source, observed, stitch.as_ref())
+            })
+            .await
+            .map_err(|e| Miss::new("NO DATA", e.to_string(), false))?;
+            slot.completed.store(chrono::Utc::now().timestamp(), Ordering::Release);
+            result
+        })
+        .await
+        .cloned();
+    let mut cache = s.wall_edge.lock().unwrap();
+    if result.is_err() && slot.value.get().is_none() && cache.get(&key).is_some_and(|v| Arc::ptr_eq(v, &slot)) {
+        cache.remove(&key);
+    }
+    while cache.len() > 128 {
+        let oldest = cache
+            .iter()
+            .filter(|(_, v)| v.value.get().is_some())
+            .min_by_key(|(_, v)| v.completed.load(Ordering::Acquire))
+            .map(|(k, _)| k.clone());
+        if let Some(k) = oldest {
+            cache.remove(&k);
+        } else {
+            break;
+        }
+    }
+    result
+}
+/// Vault rows read for the reuse check: the Edge window plus room for the session cut.
+const WALL_EDGE_VAULT_READ: usize = tr_data::wall_edge::MAX_BARS + 400;
+/// A vault-only 5m window for Wall Edge, or `None` when a provider fetch is still needed.
+/// Reuse requires (a) exactly one vault source, (b) an admitted fetch at or after the
+/// close of the last completed session, so that session is complete in the vault, and
+/// (c) a full `MAX_BARS` contiguous closed window after the session cut and gap trim.
+/// The input is the last `MAX_BARS` contiguous closed bars either way; a deep fetch could
+/// only re-confirm (or, rarely, correct) bars older than the ribbon's own fetch.
+async fn wall_edge_vault_window(
+    s: &Shared,
+    symbol: &str,
+    day: chrono::NaiveDate,
+) -> Option<(Vec<Bar>, tr_data::vault::StitchInfo, i64)> {
+    use tr_data::wall_edge;
+    let close = tr_data::intraday::close_minute(day);
+    let close = tr_core::ny::to_utc(day.and_hms_opt(close / 60, close % 60, 0)?);
+    let symbol = tr_data::security(symbol).key();
+    cache_op(s, move |v| {
+        let Some(id) = v.sole_series(&symbol, Timeframe::M5)? else { return Ok(None) };
+        let Some(at) = v.last_ingest(&id)?.filter(|at| *at >= close) else { return Ok(None) };
+        let (bars, info) = v.stitch(&id, &[], WALL_EDGE_VAULT_READ, Some(at))?;
+        let class = tr_data::security(&symbol).class;
+        let full = wall_edge::prepare(&bars, Timeframe::M5, class, Some(at), Some(&info))
+            .is_ok_and(|p| p.bars.len() == wall_edge::MAX_BARS);
+        Ok(full.then_some((bars, info, at)))
+    })
+    .await
+    .flatten()
 }
 
 fn claim_wall(s: &Shared, pane: PaneId, generation: u64) -> bool {
@@ -3301,6 +3566,79 @@ async fn handle_inner(s: &Arc<Shared>, req: Request, force: bool) {
                 });
             }
         }
+        Request::WallEdge { pane, generation, symbols, daily, priority } => {
+            if !wall_edge_current(s, pane, generation) {
+                return;
+            }
+            if s.sample_mode() {
+                send(Response::WallEdgeDone {
+                    pane,
+                    generation,
+                    error: Some("EDGE REFUSED · WARNING: SAMPLE DATA".into()),
+                });
+                return;
+            }
+            let symbols: Vec<_> = symbols.into_iter().take(tr_data::stack_wall::MAX_SYMBOLS).collect();
+            let mut started = vec![false; symbols.len()];
+            // Pull rows one at a time in on-screen order, re-reading the pane's latest
+            // focus so a scroll during the pass re-ranks the rows not yet started.
+            let mut next = || {
+                let focus = s
+                    .wall_edge_focus
+                    .lock()
+                    .unwrap()
+                    .get(&pane)
+                    .filter(|(g, _)| *g == generation)
+                    .map(|(_, p)| p.clone())
+                    .unwrap_or_default();
+                let i = wall_edge_next(&focus, &priority, &mut started)?;
+                Some((i, symbols[i].clone()))
+            };
+            let mut tasks = tokio::task::JoinSet::new();
+            let mut tick = tokio::time::interval(Duration::from_millis(20));
+            loop {
+                while tasks.len() < WALL_EDGE_IN_FLIGHT {
+                    let Some((index, symbol)) = next() else { break };
+                    let shared = s.clone();
+                    tasks.spawn(async move {
+                        let result = wall_edge_one(&shared, &symbol, daily, pane, generation).await;
+                        (index, symbol, result)
+                    });
+                }
+                if tasks.is_empty() {
+                    break;
+                }
+                if !wall_edge_current(s, pane, generation) {
+                    tasks.abort_all();
+                    return;
+                }
+                tokio::select! {
+                    _ = tick.tick() => {}
+                    result = tasks.join_next() => {
+                        if !wall_edge_current(s, pane, generation) {
+                            tasks.abort_all();
+                            return;
+                        }
+                        match result {
+                            Some(Ok((index, symbol, result))) => {
+                                send(Response::WallEdgeRow { pane, generation, index, symbol, result })
+                            }
+                            Some(Err(e)) => {
+                                tasks.abort_all();
+                                send(Response::WallEdgeDone { pane, generation, error: Some(e.to_string()) });
+                                return;
+                            }
+                            None => break,
+                        }
+                    }
+                }
+            }
+            if wall_edge_current(s, pane, generation) {
+                s.wall_edge_focus.lock().unwrap().remove(&pane);
+                send(Response::WallEdgeDone { pane, generation, error: None });
+            }
+        }
+        Request::CancelWallEdge { .. } | Request::WallEdgeFocus { .. } => {}
         Request::TrendWall { pane, generation, symbols, daily } => {
             if !wall_current(s, pane, generation) {
                 return;
@@ -4336,6 +4674,7 @@ async fn handle_inner(s: &Arc<Shared>, req: Request, force: bool) {
         Request::Forget(pane) => {
             s.feed_requests.lock().expect("feed requests").retain(|(_, id), _| *id != Some(pane));
             s.wall_generations.lock().expect("wall generations").remove(&pane);
+            s.wall_edge_generations.lock().unwrap().remove(&pane);
             s.series.lock().expect("series lock").remove(&pane);
             s.archive_daily.lock().expect("archive daily lock").remove(&pane);
             s.chart_sources.lock().expect("chart sources").remove(&pane);
@@ -4453,9 +4792,23 @@ fn begin_request(s: &Shared, req: &Request) -> bool {
         | Request::ExtendedHistory { pane, generation, .. }
         | Request::ArchiveHistory { pane, generation, .. } => claim_series(s, *pane, *generation),
         Request::TrendWall { pane, generation, .. } => claim_wall(s, *pane, *generation),
+        Request::WallEdge { pane, generation, .. } => claim_wall_edge(s, *pane, *generation),
+        Request::WallEdgeFocus { pane, generation, priority } => {
+            if wall_edge_current(s, *pane, *generation) {
+                s.wall_edge_focus.lock().unwrap().insert(*pane, (*generation, priority.clone()));
+            }
+            false
+        }
+        Request::CancelWallEdge { pane, generation } => {
+            claim_wall_edge(s, *pane, *generation);
+            s.wall_edge_focus.lock().unwrap().remove(pane);
+            false
+        }
         Request::Forget(pane) => {
             s.feed_requests.lock().expect("feed requests").retain(|(_, id), _| *id != Some(*pane));
             s.wall_generations.lock().expect("wall generations").remove(pane);
+            s.wall_edge_generations.lock().unwrap().remove(pane);
+            s.wall_edge_focus.lock().unwrap().remove(pane);
             s.series.lock().expect("series lock").remove(pane);
             s.archive_daily.lock().expect("archive daily lock").remove(pane);
             s.chart_sources.lock().expect("chart sources").remove(pane);
@@ -5546,7 +5899,13 @@ mod tests {
         let bars = vault_day("2026-11-09");
         let provider = vault_provider(bars.clone());
         let (s, rx) = shared(provider.clone(), Some(BarCache::open_in_memory().unwrap()));
-        let request = || Request::StudioDist { pane: 55, generation: 7, symbol: "AAPL US Equity".into(), timeframe: Timeframe::M5, window: tr_data::studio_dist::Window::All };
+        let request = || Request::StudioDist {
+            pane: 55,
+            generation: 7,
+            symbol: "AAPL US Equity".into(),
+            timeframe: Timeframe::M5,
+            window: tr_data::studio_dist::Window::All,
+        };
         handle(&s, request()).await;
         let Response::WhatsNews { response, .. } = rx.try_recv().unwrap() else { panic!("archive envelope") };
         let Response::StudioDist { pane, generation, result } = *response else { panic!("distribution report") };
@@ -5563,10 +5922,25 @@ mod tests {
         let report = result.unwrap();
         assert_eq!(report.bars, bars.len() - 1);
         assert!(report.observed_at.is_none());
-        let sample = Arc::new(VaultProvider { bars: std::sync::Mutex::new(bars), calls: Default::default(), fail: Default::default(), sample: true });
+        let sample = Arc::new(VaultProvider {
+            bars: std::sync::Mutex::new(bars),
+            calls: Default::default(),
+            fail: Default::default(),
+            sample: true,
+        });
         let (s, rx) = shared(sample.clone(), None);
         for timeframe in [Timeframe::D1, Timeframe::M5] {
-            handle(&s, Request::StudioDist { pane: 55, generation: 8, symbol: "AAPL".into(), timeframe, window: tr_data::studio_dist::Window::All }).await;
+            handle(
+                &s,
+                Request::StudioDist {
+                    pane: 55,
+                    generation: 8,
+                    symbol: "AAPL".into(),
+                    timeframe,
+                    window: tr_data::studio_dist::Window::All,
+                },
+            )
+            .await;
             let Response::WhatsNews { response, .. } = rx.try_recv().unwrap() else { panic!("archive envelope") };
             let Response::StudioDist { result, .. } = *response else { panic!("sample refusal") };
             assert!(result.unwrap_err().contains("sample"));
@@ -5875,7 +6249,7 @@ mod tests {
         {
             let mut cache = s.stack_lanes.lock().unwrap();
             cache.insert(key.clone(), pending.clone());
-            for i in 0..160 {
+            for i in 0..256 {
                 let slot = LaneSlot {
                     value: tokio::sync::OnceCell::new_with(Some(Ok(Arc::new(Vec::new())))),
                     completed: std::sync::atomic::AtomicI64::new(i),
@@ -5885,7 +6259,7 @@ mod tests {
         }
         stack_lane_bars(&s, "FAST", Timeframe::M30, false, chrono::Utc::now().timestamp()).await.unwrap();
         let cache = s.stack_lanes.lock().unwrap();
-        assert_eq!(cache.len(), 160);
+        assert_eq!(cache.len(), 256);
         assert!(Arc::ptr_eq(cache.get(&key).unwrap(), &pending));
     }
 
@@ -6003,6 +6377,357 @@ mod tests {
             })
             .last()
             .unwrap()
+    }
+    fn edge_request(generation: u64, daily: bool) -> Request {
+        Request::WallEdge { pane: 31, generation, symbols: vec!["AAPL US Equity".into()], daily, priority: vec![] }
+    }
+    fn edge_fixture() -> Vec<Bar> {
+        let mut date = tr_data::wall_edge::completed_session(chrono::Utc::now().timestamp());
+        let mut days = Vec::new();
+        for _ in 0..8 {
+            date = tr_data::history::calendar::previous_session(date);
+            days.push(date);
+        }
+        days.reverse();
+        days.iter().flat_map(|d| vault_day(&d.to_string())).collect()
+    }
+    #[tokio::test]
+    async fn wall_edge_refuses_sample_provider_without_fetching() {
+        let provider =
+            Arc::new(StackPrices { calls: Default::default(), name: "sample", provenance: tr_core::Provenance::Real });
+        let (s, rx) = shared(provider.clone(), None);
+        let r = edge_request(1, false);
+        assert!(begin_request(&s, &r));
+        handle(&s, r).await;
+        assert!(matches!(&wall_responses(&rx)[0],Response::WallEdgeDone {error:Some(e),..} if e.contains("SAMPLE")));
+        assert_eq!(provider.calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+    #[tokio::test]
+    async fn wall_edge_unverified_symbol_returns_miss_not_numbers() {
+        let provider = Arc::new(StackPrices {
+            calls: Default::default(),
+            name: "fixture",
+            provenance: tr_core::Provenance::Missing,
+        });
+        let (s, rx) = shared(provider, None);
+        let r = edge_request(1, false);
+        begin_request(&s, &r);
+        handle(&s, r).await;
+        assert!(
+            wall_responses(&rx)
+                .iter()
+                .any(|r| matches!(r,Response::WallEdgeRow {result:Err(m),..} if m.code=="UNVERIFIED" && !m.is_test))
+        );
+        assert!(s.wall_edge.lock().unwrap().is_empty());
+    }
+    #[tokio::test]
+    async fn wall_edge_daily_never_calls_the_market_provider() {
+        let provider = vault_provider(edge_fixture());
+        let (mut s, rx) = shared(provider.clone(), None);
+        Arc::get_mut(&mut s).unwrap().history = Arc::new(tr_data::history::Service::new(
+            tr_data::history::Archive::memory().unwrap(),
+            Arc::new(ArchivePrices),
+            tr_data::history::Policy { spacing: Duration::ZERO, ..Default::default() },
+        ));
+        let r = edge_request(1, true);
+        begin_request(&s, &r);
+        handle(&s, r).await;
+        assert!(
+            wall_responses(&rx)
+                .iter()
+                .any(|r| matches!(r,Response::WallEdgeRow {result:Err(m),..} if m.code=="NO DATA"))
+        );
+        s.history.run("ADD", tr_data::history::universe::resolve("AAPL").unwrap(), |_| {}).await.unwrap();
+        s.history.run("REFRESH", vec![], |_| {}).await.unwrap();
+        let r = edge_request(2, true);
+        begin_request(&s, &r);
+        handle(&s, r).await;
+        assert!(
+            wall_responses(&rx)
+                .iter()
+                .any(|r| matches!(r,Response::WallEdgeRow {result:Err(m),..} if m.code=="SHORT HISTORY" && m.is_test))
+        );
+        assert_eq!(provider.calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+    #[tokio::test]
+    async fn wall_edge_second_request_hits_memo_and_report_cache() {
+        let provider = vault_provider(edge_fixture());
+        let (s, rx) = shared(provider.clone(), None);
+        let r = edge_request(1, false);
+        begin_request(&s, &r);
+        handle(&s, r).await;
+        let a = wall_responses(&rx)
+            .into_iter()
+            .find_map(|r| if let Response::WallEdgeRow { result: Ok(r), .. } = r { Some(r) } else { None })
+            .unwrap();
+        let count = provider.calls.load(std::sync::atomic::Ordering::SeqCst);
+        let r = edge_request(2, false);
+        begin_request(&s, &r);
+        handle(&s, r).await;
+        let b = wall_responses(&rx)
+            .into_iter()
+            .find_map(|r| if let Response::WallEdgeRow { result: Ok(r), .. } = r { Some(r) } else { None })
+            .unwrap();
+        assert!(Arc::ptr_eq(&a, &b));
+        assert_eq!(provider.calls.load(std::sync::atomic::Ordering::SeqCst), count);
+        // Bypass only the acquisition memo; identical admitted inputs still reuse ReportCache.
+        s.wall_edge.lock().unwrap().clear();
+        let c = wall_edge_one(&s, "AAPL US Equity", false, 31, 2).await.unwrap();
+        assert!(Arc::ptr_eq(&a, &c));
+        // A different pane shares the memo too.
+        claim_wall_edge(&s, 32, 1);
+        let d = wall_edge_one(&s, "AAPL US Equity", false, 32, 1).await.unwrap();
+        assert!(Arc::ptr_eq(&c, &d));
+    }
+    #[test]
+    fn wall_edge_report_cache_misses_on_new_session_epoch_and_params() {
+        let mut bars = edge_fixture();
+        let cache = tr_data::report_cache::ReportCache::default();
+        let p = AdaptiveTrendParams::default();
+        let now = chrono::Utc::now().timestamp();
+        let a = wall_edge_cached(&cache, "AAPL", Timeframe::M5, p, &bars, "yahoo", Some(now), None).unwrap();
+        let b = wall_edge_cached(&cache, "AAPL", Timeframe::M5, p, &bars, "yahoo", Some(now), None).unwrap();
+        assert!(Arc::ptr_eq(&a, &b));
+        let mut info = tr_data::vault::StitchInfo { source: "yahoo".into(), epoch: 2, ..Default::default() };
+        let b = wall_edge_cached(&cache, "AAPL", Timeframe::M5, p, &bars, "yahoo", Some(now), Some(&info)).unwrap();
+        assert!(!Arc::ptr_eq(&a, &b));
+        info.epoch += 1;
+        let c = wall_edge_cached(&cache, "AAPL", Timeframe::M5, p, &bars, "yahoo", Some(now), Some(&info)).unwrap();
+        assert!(!Arc::ptr_eq(&b, &c));
+        let d = wall_edge_cached(
+            &cache,
+            "AAPL",
+            Timeframe::M5,
+            AdaptiveTrendParams { confirm_mult: 0.5, ..p },
+            &bars,
+            "yahoo",
+            Some(now),
+            None,
+        )
+        .unwrap();
+        assert!(!Arc::ptr_eq(&a, &d));
+        let date = tr_core::ny::civil(bars.last().unwrap().ts).date();
+        let next = tr_data::history::calendar::next_session(date);
+        bars.extend(vault_day(&next.to_string()));
+        let e = wall_edge_cached(&cache, "AAPL", Timeframe::M5, p, &bars, "yahoo", Some(now), None).unwrap();
+        assert!(!Arc::ptr_eq(&a, &e));
+        bars[10].close += 0.1;
+        let f = wall_edge_cached(&cache, "AAPL", Timeframe::M5, p, &bars, "yahoo", Some(now), None).unwrap();
+        assert!(!Arc::ptr_eq(&e, &f));
+        let g = wall_edge_cached(&cache, "AAPL", Timeframe::M5, p, &bars, "other", Some(now), None).unwrap();
+        assert!(!Arc::ptr_eq(&f, &g));
+    }
+    struct EdgeBlocked {
+        calls: std::sync::atomic::AtomicUsize,
+        release: tokio::sync::Semaphore,
+        seen: std::sync::Mutex<Vec<String>>,
+    }
+    fn edge_blocked() -> Arc<EdgeBlocked> {
+        Arc::new(EdgeBlocked {
+            calls: Default::default(),
+            release: tokio::sync::Semaphore::new(0),
+            seen: Default::default(),
+        })
+    }
+    #[async_trait::async_trait]
+    impl tr_data::MarketData for EdgeBlocked {
+        fn name(&self) -> &str {
+            "edge blocked"
+        }
+        async fn history(&self, symbol: &str, _: Timeframe, _: Option<i64>, _: usize) -> anyhow::Result<Vec<Bar>> {
+            self.seen.lock().unwrap().push(symbol.to_string());
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.release.acquire().await.unwrap().forget();
+            Ok(edge_fixture())
+        }
+    }
+    async fn wait_edge_calls(p: &EdgeBlocked, n: usize) {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while p.calls.load(std::sync::atomic::Ordering::SeqCst) < n {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .unwrap();
+    }
+    #[tokio::test]
+    async fn wall_edge_cancels_when_generation_advances() {
+        let provider = edge_blocked();
+        let (s, rx) = shared(provider.clone(), None);
+        let r = edge_request(1, false);
+        begin_request(&s, &r);
+        let one = s.clone();
+        let task = tokio::spawn(async move { handle(&one, r).await });
+        wait_edge_calls(&provider, 1).await;
+        let next = edge_request(2, false);
+        begin_request(&s, &next);
+        tokio::time::timeout(Duration::from_secs(1), task).await.unwrap().unwrap();
+        assert!(wall_responses(&rx).is_empty());
+        assert_eq!(s.wall_fetches.available_permits(), 4);
+        assert!(!begin_request(&s, &edge_request(1, false)));
+    }
+    #[tokio::test]
+    async fn wall_edge_forget_removes_generation() {
+        let provider = vault_provider(edge_fixture());
+        let (s, rx) = shared(provider.clone(), None);
+        let r = edge_request(1, false);
+        begin_request(&s, &r);
+        assert!(!begin_request(&s, &Request::Forget(31)));
+        assert!(!wall_edge_current(&s, 31, 1));
+        handle(&s, r).await;
+        assert!(wall_responses(&rx).is_empty());
+        assert_eq!(provider.calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+    #[tokio::test]
+    async fn wall_edge_fetches_are_bounded_by_the_wall_semaphore() {
+        let provider = edge_blocked();
+        let (s, rx) = shared(provider.clone(), None);
+        let names = ["AAPL", "MSFT", "NVDA", "META", "GOOG", "AMZN", "TSLA", "SPY", "QQQ", "IWM", "DIA", "XLF"];
+        let r = Request::WallEdge {
+            pane: 31,
+            generation: 1,
+            daily: false,
+            symbols: names.iter().map(|s| tr_data::security(s).key()).collect(),
+            // The three bottom rows are on screen.
+            priority: vec![9, 10, 11],
+        };
+        begin_request(&s, &r);
+        let one = s.clone();
+        let task = tokio::spawn(async move { handle(&one, r).await });
+        wait_edge_calls(&provider, 4).await;
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert_eq!(provider.calls.load(std::sync::atomic::Ordering::SeqCst), 4);
+        assert_eq!(s.wall_fetches.available_permits(), 0);
+        // Only the first WALL_EDGE_IN_FLIGHT rows in on-screen order were started.
+        let first = provider.seen.lock().unwrap().clone();
+        let allowed: Vec<_> = [9, 10, 11, 0, 1, 2].iter().map(|&i| tr_data::security(names[i]).key()).collect();
+        assert!(first.iter().all(|s| allowed.contains(s)), "{first:?}");
+        provider.release.add_permits(names.len());
+        tokio::time::timeout(Duration::from_secs(5), task).await.unwrap().unwrap();
+        assert_eq!(
+            wall_responses(&rx).iter().filter(|r| matches!(r, Response::WallEdgeRow { .. })).count(),
+            names.len()
+        );
+    }
+    #[test]
+    fn wall_edge_next_follows_focus_then_priority_then_row_order() {
+        let mut started = vec![false; 6];
+        assert_eq!(wall_edge_next(&[], &[4, 5], &mut started), Some(4));
+        assert_eq!(wall_edge_next(&[2, 4], &[4, 5], &mut started), Some(2));
+        assert_eq!(wall_edge_next(&[2, 4, 99], &[4, 5], &mut started), Some(5));
+        assert_eq!(wall_edge_next(&[], &[], &mut started), Some(0));
+        assert_eq!(wall_edge_next(&[], &[], &mut started), Some(1));
+        assert_eq!(wall_edge_next(&[], &[], &mut started), Some(3));
+        assert_eq!(wall_edge_next(&[], &[], &mut started), None);
+    }
+    #[tokio::test]
+    async fn wall_edge_focus_is_kept_only_for_the_current_generation() {
+        let (s, _rx) = shared(edge_blocked(), None);
+        begin_request(&s, &edge_request(3, false));
+        assert!(!begin_request(&s, &Request::WallEdgeFocus { pane: 31, generation: 2, priority: vec![1] }));
+        assert!(s.wall_edge_focus.lock().unwrap().is_empty());
+        begin_request(&s, &Request::WallEdgeFocus { pane: 31, generation: 3, priority: vec![1] });
+        assert_eq!(s.wall_edge_focus.lock().unwrap().get(&31), Some(&(3, vec![1])));
+        begin_request(&s, &Request::Forget(31));
+        assert!(s.wall_edge_focus.lock().unwrap().is_empty());
+    }
+    /// A vault that already holds a full contiguous Edge window, admitted after the last
+    /// completed close, serves Edge with zero provider requests.
+    #[tokio::test]
+    async fn wall_edge_reuses_a_full_vault_window_without_a_provider_call() {
+        let mut date = tr_data::wall_edge::completed_session(chrono::Utc::now().timestamp());
+        let mut days = vec![date];
+        while days.len() * 78 < tr_data::wall_edge::MAX_BARS + 200 {
+            date = tr_data::history::calendar::previous_session(date);
+            days.push(date);
+        }
+        days.reverse();
+        let bars: Vec<Bar> = days
+            .iter()
+            .flat_map(|d| vault_day(&d.to_string()))
+            .enumerate()
+            .map(|(i, mut b)| {
+                let c = 100.0 + (i as f64 / 23.0).sin() * 2.0;
+                (b.open, b.high, b.low, b.close) = (c, c + 0.1, c - 0.1, c);
+                b
+            })
+            .collect();
+        let provider = vault_provider(vec![]);
+        let (s, rx) = shared(provider.clone(), Some(BarCache::open_in_memory().unwrap()));
+        let now = chrono::Utc::now().timestamp();
+        let id =
+            tr_data::vault::SeriesId { symbol: "AAPL US Equity".into(), tf: Timeframe::M5, source: "yahoo".into() };
+        let stored = cache_op(&s, move |v| v.ingest(&id, &bars, DataMode::Live, now)).await.unwrap();
+        assert!(stored.inserted > tr_data::wall_edge::MAX_BARS);
+        let r = edge_request(1, false);
+        begin_request(&s, &r);
+        handle(&s, r).await;
+        let report = wall_responses(&rx)
+            .into_iter()
+            .find_map(|r| if let Response::WallEdgeRow { result, .. } = r { Some(result) } else { None })
+            .unwrap()
+            .unwrap();
+        assert_eq!(provider.calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert_eq!(report.bars, tr_data::wall_edge::MAX_BARS);
+        assert_eq!(report.source, "yahoo");
+        assert!(!report.vault_only);
+        // A vault that has not observed the last completed close still goes to the provider.
+        let (s, _rx) = shared(provider.clone(), Some(BarCache::open_in_memory().unwrap()));
+        assert!(wall_edge_vault_window(&s, "AAPL US Equity", days[days.len() - 1]).await.is_none());
+    }
+    #[tokio::test]
+    async fn wall_edge_cancelled_initializer_does_not_poison_another_pane() {
+        let provider = edge_blocked();
+        let (s, rx) = shared(provider.clone(), None);
+        let first = edge_request(1, false);
+        begin_request(&s, &first);
+        let one = s.clone();
+        let first = tokio::spawn(async move { handle(&one, first).await });
+        wait_edge_calls(&provider, 1).await;
+        let second = Request::WallEdge {
+            pane: 32,
+            generation: 1,
+            symbols: vec!["AAPL US Equity".into()],
+            daily: false,
+            priority: vec![],
+        };
+        begin_request(&s, &second);
+        let two = s.clone();
+        let second = tokio::spawn(async move { handle(&two, second).await });
+        tokio::task::yield_now().await;
+        begin_request(&s, &Request::CancelWallEdge { pane: 31, generation: 2 });
+        tokio::time::timeout(Duration::from_secs(1), first).await.unwrap().unwrap();
+        wait_edge_calls(&provider, 2).await;
+        provider.release.add_permits(1);
+        tokio::time::timeout(Duration::from_secs(2), second).await.unwrap().unwrap();
+        let responses = wall_responses(&rx);
+        assert!(responses.iter().any(|r| matches!(r, Response::WallEdgeRow { pane: 32, result: Ok(_), .. })));
+        assert!(
+            !responses
+                .iter()
+                .any(|r| matches!(r, Response::WallEdgeRow { pane: 31, .. } | Response::WallEdgeDone { pane: 31, .. }))
+        );
+    }
+    #[tokio::test]
+    async fn lane_cache_holds_fifty_names_times_four_lanes() {
+        let (s, _) = shared(lane_provider(), None);
+        let now = chrono::Utc::now().timestamp();
+        {
+            let mut cache = s.stack_lanes.lock().unwrap();
+            for i in 0..50 {
+                for tf in [Timeframe::M5, Timeframe::M15, Timeframe::H1, Timeframe::D1] {
+                    cache.insert(
+                        (format!("S{i}"), tf, false),
+                        Arc::new(LaneSlot {
+                            value: tokio::sync::OnceCell::new_with(Some(Ok(Arc::new(Vec::new())))),
+                            completed: std::sync::atomic::AtomicI64::new(now),
+                        }),
+                    );
+                }
+            }
+        }
+        stack_lane_bars(&s, "FAST", Timeframe::M30, false, now).await.unwrap();
+        assert_eq!(s.stack_lanes.lock().unwrap().len(), 201);
     }
     fn wall_request(generation: u64, daily: bool) -> Request {
         Request::TrendWall { pane: 31, generation, symbols: vec!["AAPL US Equity".into()], daily }
@@ -6251,6 +6976,10 @@ mod tests {
                 auction_fine: Default::default(),
                 wall_fetches: tokio::sync::Semaphore::new(4),
                 wall_generations: Default::default(),
+                wall_edge_generations: Default::default(),
+                wall_edge_focus: Default::default(),
+                wall_edge: Default::default(),
+                wall_edge_compute: Arc::new(tokio::sync::Semaphore::new(4)),
                 cache: Arc::new(std::sync::Mutex::new(
                     cache.map(|c| BarVault::from_cache(c).expect("vault migration")),
                 )),
@@ -6441,7 +7170,11 @@ mod tests {
             let mut provider = vault_provider(vault_day("2026-11-09"));
             Arc::get_mut(&mut provider).unwrap().sample = sample;
             let (s, rx) = shared(provider.clone(), Some(BarCache::open_in_memory().unwrap()));
-            handle(&s, Request::StudioSeason { pane: 19, generation: 7, symbol: "AAPL US Equity".into(), tf: Timeframe::M5 }).await;
+            handle(
+                &s,
+                Request::StudioSeason { pane: 19, generation: 7, symbol: "AAPL US Equity".into(), tf: Timeframe::M5 },
+            )
+            .await;
             let Response::WhatsNews { response, .. } = rx.try_recv().unwrap() else { panic!("expected envelope") };
             let Response::StudioSeason { pane, generation, result } = *response else { panic!("expected seasonality") };
             assert_eq!((pane, generation), (19, 7));
@@ -6463,13 +7196,18 @@ mod tests {
         let provider = vault_provider(vec![]);
         let (mut s, rx) = shared(provider.clone(), None);
         Arc::get_mut(&mut s).unwrap().history = Arc::new(tr_data::history::Service::new(
-            tr_data::history::Archive::memory().unwrap(), Arc::new(ArchivePrices),
+            tr_data::history::Archive::memory().unwrap(),
+            Arc::new(ArchivePrices),
             tr_data::history::Policy { spacing: Duration::ZERO, ..Default::default() },
         ));
         s.whats_news.send_replace((0, tr_data::whats_news::Config { enabled: false, ..Default::default() }));
         s.history.run("ADD", tr_data::history::universe::resolve("AAPL").unwrap(), |_| {}).await.unwrap();
         s.history.run("REFRESH", vec![], |_| {}).await.unwrap();
-        handle(&s, Request::StudioSeason { pane: 19, generation: 8, symbol: "AAPL US Equity".into(), tf: Timeframe::D1 }).await;
+        handle(
+            &s,
+            Request::StudioSeason { pane: 19, generation: 8, symbol: "AAPL US Equity".into(), tf: Timeframe::D1 },
+        )
+        .await;
         let Response::WhatsNews { response, .. } = rx.try_recv().unwrap() else { panic!("expected envelope") };
         let Response::StudioSeason { result, .. } = *response else { panic!("expected seasonality") };
         assert!(result.unwrap().source.contains("Local Yahoo"));
@@ -7268,6 +8006,10 @@ mod tests {
             auction_fine: Default::default(),
             wall_fetches: tokio::sync::Semaphore::new(4),
             wall_generations: Default::default(),
+            wall_edge_generations: Default::default(),
+            wall_edge_focus: Default::default(),
+            wall_edge: Default::default(),
+            wall_edge_compute: Arc::new(tokio::sync::Semaphore::new(4)),
             cache: Default::default(),
             reports: Default::default(),
             native: Default::default(),

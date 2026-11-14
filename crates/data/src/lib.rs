@@ -65,6 +65,7 @@ pub mod truth_rail;
 pub mod tstack_tune;
 pub mod vault;
 pub mod volume_pace;
+pub mod wall_edge;
 pub mod whats_news;
 pub mod yahoo;
 
