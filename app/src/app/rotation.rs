@@ -1016,7 +1016,7 @@ mod tests {
     }
 
     #[test]
-    fn next_keeps_a_capped_out_rotation_selection_in_the_wall() {
+    fn next_keeps_a_rotation_selection_in_the_wall() {
         let mut app = test_app();
         let (worker, _) = Worker::test_live_channel();
         app.worker = worker;
@@ -1057,9 +1057,9 @@ mod tests {
             .clear();
         let i = app.idx(app.focus).unwrap();
         let PaneKind::TrendWall(w) = &app.panes[i].kind else { panic!("wall") };
-        assert_eq!(w.rows.len(), 24);
+        assert_eq!(w.rows.len(), names.len().min(tr_data::stack_wall::MAX_SYMBOLS));
         assert_eq!(w.rows[w.selected.unwrap()].symbol, tr_data::security(&names[29]).key());
-        assert_eq!(w.not_loaded.len(), 6);
+        assert_eq!(w.not_loaded.len(), names.len().saturating_sub(tr_data::stack_wall::MAX_SYMBOLS));
     }
 
     #[test]

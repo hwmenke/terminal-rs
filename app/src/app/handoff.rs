@@ -188,7 +188,7 @@ impl TerminalApp {
                     return None;
                 }
                 let visible = r.visible_symbols();
-                let names = if (2..=24).contains(&visible.len()) {
+                let names = if (2..=tr_data::stack_wall::MAX_SYMBOLS).contains(&visible.len()) {
                     visible.iter().map(|s| tr_data::security(s).key()).collect()
                 } else {
                     vec![member.symbol.clone()]
@@ -259,7 +259,7 @@ impl TerminalApp {
             Destination::Wall => {
                 let mut names =
                     if source.names.is_empty() { vec![source.symbol.clone()] } else { source.names.clone() };
-                // RRG admits 40 names, TWALL displays 24. Preserve the list but
+                // RRG admits 40 names, TWALL displays 50. Preserve the list but
                 // bring an otherwise capped-out hand-off row into view.
                 if names
                     .iter()
@@ -423,6 +423,9 @@ impl TerminalApp {
                 PaneKind::TrendWall(p) => self.wall_watchlist(&p.spec),
                 _ => vec![],
             };
+            if let PaneKind::TrendWall(p) = &mut self.panes[i].kind {
+                p.resume_edge();
+            }
             match &mut self.panes[i].kind {
                 PaneKind::TrendWall(p) if p.loading => p.request(id, &self.worker, &wall_names),
                 PaneKind::Research(p) if p.loading => p.request(id, &self.worker),
@@ -791,7 +794,15 @@ mod tests {
         ))));
         let i = app.idx(app.focus).unwrap();
         let PaneKind::Research(r) = &mut app.panes[i].kind else { panic!() };
-        let names: Vec<_> = (0..count).map(|i| format!("X{}", (b'A' + i as u8) as char)).collect();
+        let names: Vec<_> = (0..count)
+            .map(|i| {
+                if i < 26 {
+                    format!("X{}", (b'A' + i as u8) as char)
+                } else {
+                    format!("X{}{}", (b'A' + (i / 26 - 1) as u8) as char, (b'A' + (i % 26) as u8) as char)
+                }
+            })
+            .collect();
         if scan {
             r.filter.include_stale = true;
             r.accept_scan(Ok(Snapshot {
@@ -873,14 +884,14 @@ mod tests {
     #[test]
     fn scan_and_universe_prefill_archive_wall_and_bound_the_visible_list() {
         for scan in [false, true] {
-            for count in [1, 2, 24, 25] {
+            for count in [1, 2, 50, 51] {
                 let mut app = app();
                 research(&mut app, scan, count);
                 let source = app.handoff_source().unwrap();
                 next(&mut app);
                 let w = selected_wall(&app);
                 assert!(w.daily);
-                assert_eq!(w.rows.len(), if count == 25 { 1 } else { count });
+                assert_eq!(w.rows.len(), if count > tr_data::stack_wall::MAX_SYMBOLS { 1 } else { count });
                 assert_eq!(w.rows[w.selected.unwrap()].symbol, source.symbol);
                 assert!(app.cmd.is_empty() && !app.focus_cmd);
                 back(&mut app);

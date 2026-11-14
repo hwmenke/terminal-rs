@@ -9,7 +9,7 @@ timestamp, confidence and provenance; the crosshair spans the wall.
 
 | Command | Result |
 | --- | --- |
-| `TWALL` | Active watchlist, up to 24 unique symbols |
+| `TWALL` | Active watchlist, up to 50 unique symbols |
 | `TWALL WL Growth` | Named watchlist |
 | `TWALL AAPL MSFT NVDA` | Explicit symbols |
 | `TWALL D` / `TWALL D WL Growth` | D/W/M research archive view, last 120 daily bars |
@@ -29,13 +29,16 @@ With the pane focused and an empty command line (Shift only where shown):
 | Shift+N | Alternate destinations |
 | Backspace | Return through a live hand-off stack |
 | S | Cycle stack alignment, flip age, cushion, original list order |
+| E | Show Edge and cycle score, Δ, q sorts |
+| Shift+E | Toggle Edge column |
+| X | Toggle Edge scatter |
 | D | Toggle intraday/archive |
 | R | Reload |
 | / | Focus command line |
 
 Click a lane to open its interval. Linked charts follow the selected symbol, interval
 and mode, while focus stays on the wall. Comma, period and backslash remain chart keys.
-Settings (list, mode and sort) persist with layouts; older layouts remain compatible.
+Settings (list, mode, sort, Edge visibility and scatter) persist with layouts; older layouts remain compatible.
 
 `STACK` counts lanes aligned with the completed base regime; a flat base has no arrow.
 `FLIP` is native base bars since the completed medium-regime flip. `CUSH` is
@@ -47,10 +50,11 @@ Intraday metrics stay blank in archive mode.
 Breadth shows the share of Ready verified rows whose completed lane is long. Each
 bar prints its numerator and denominator, and stays hidden below five votes.
 Refused, warming, unavailable and stale rows have blank STACK tiles, no metric
-scores, no breadth vote, and sort after scored rows in every sort mode.
+scores, no breadth vote, and sort after scored rows in the four stack sort modes. Edge sorts can use historical
+evidence on stale rows; missing Edge values sort last.
 
 The sample provider produces one refusal banner and zero history fetches. Live
-lanes use verified native history and share TSTACK's 160-entry cache and interval
+lanes use verified native history and share TSTACK's 256-entry cache and interval
 TTLs. The chart's verified base history also seeds the persistent native cache.
 No intraday prices are resampled, interpolated or carried forward. Refresh uses the
 existing UI periodic tick and 5m TTL during the regular session. Freshness is checked
@@ -70,8 +74,12 @@ and holidays do not demand nonexistent daily prints.
 
 The ribbon cells and forming outlines are built into one cached mesh per pane.
 Its key includes content revision, rectangle, sort and theme colours; moving the
-hover crosshair does not rebuild the mesh. The 24-symbol cap bounds painting and
+hover crosshair does not rebuild the mesh. The 50-symbol cap bounds painting and
 worker acquisition. Worker rows stream after each symbol's native fetches, with
 computation on `spawn_blocking`; pane generations discard superseded responses.
 
 See [Next ▸ hand-off](NEXT_HANDOFF.md) for the crumb, command-bar isolation and temporary layout snapshots.
+
+See [Edge on the Wall](EDGE_WALL.md) for the default Edge column, wall-wide FDR,
+summary, scatter, real-data admission and session-frozen evidence. `EWALL [spec]`
+opens the wall sorted by Edge score.

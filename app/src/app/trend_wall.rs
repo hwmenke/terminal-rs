@@ -1,4 +1,8 @@
 //! Watchlist-wide completed native Trend Stack observations.
+mod edge;
+use std::collections::{HashMap, HashSet};
+use tr_data::wall_edge::{self, DisplayEdge, Miss, Summary, WallEdge};
+
 use super::{PaneKind, TerminalApp};
 use crate::congress_view::Action;
 use crate::dock::PaneId;
@@ -17,11 +21,30 @@ struct MeshKey {
     colors: [Color32; 4],
     sort: Sort,
 }
+#[derive(Clone, PartialEq)]
+struct EdgeWant {
+    symbols: Vec<String>,
+    daily: bool,
+    day: chrono::NaiveDate,
+}
 #[derive(Clone)]
 pub struct TrendWallPane {
     pub spec: String,
     pub daily: bool,
     pub sort: Sort,
+    pub edge: bool,
+    pub scatter: bool,
+    edge_generation: u64,
+    edge_held: Option<EdgeWant>,
+    edge_inflight: Option<EdgeWant>,
+    edge_received: HashSet<String>,
+    edge_reports: HashMap<(String, bool), Result<Arc<WallEdge>, Miss>>,
+    edges: Vec<DisplayEdge>,
+    edge_summary: Summary,
+    edge_revision: u64,
+    edge_mesh: Option<(edge::MeshKey, Arc<Mesh>)>,
+    edge_error: Option<String>,
+    scroll_selected: bool,
     pub generation: u64,
     pub rows: Vec<Row>,
     pub loading: bool,
@@ -48,6 +71,19 @@ impl TrendWallPane {
             spec,
             daily,
             sort: Sort::Stack,
+            edge: true,
+            scatter: false,
+            edge_generation: 0,
+            edge_held: None,
+            edge_inflight: None,
+            edge_received: HashSet::new(),
+            edge_reports: HashMap::new(),
+            edges: Vec::new(),
+            edge_summary: Summary::default(),
+            edge_revision: 0,
+            edge_mesh: None,
+            edge_error: None,
+            scroll_selected: false,
             generation: 0,
             rows: Vec::new(),
             loading: false,
@@ -68,6 +104,9 @@ impl TrendWallPane {
         let symbols = match symbols(&self.spec, watchlist) {
             Ok(s) => s,
             Err(e) => {
+                self.cancel_edge(pane, worker);
+                self.edge_held = None;
+                self.edge_reports.clear();
                 self.rows.clear();
                 self.votes.clear();
                 self.error = Some(e);
@@ -75,6 +114,14 @@ impl TrendWallPane {
                 return;
             }
         };
+        let incoming: Vec<_> = symbols.iter().take(stack_wall::MAX_SYMBOLS).cloned().collect();
+        if self.rows.iter().map(|r| &r.symbol).ne(incoming.iter()) || self.rows.iter().any(|r| r.daily != self.daily) {
+            if !self.rows.is_empty() || self.edge_inflight.is_some() {
+                self.cancel_edge(pane, worker);
+            }
+            self.edge_held = None;
+        }
+        self.edge_reports.retain(|(symbol, daily), _| *daily == self.daily && incoming.contains(symbol));
         self.not_loaded = symbols.iter().skip(stack_wall::MAX_SYMBOLS).cloned().collect();
         let symbols: Vec<_> = symbols.into_iter().take(stack_wall::MAX_SYMBOLS).collect();
         let old = std::mem::take(&mut self.rows);
@@ -124,9 +171,96 @@ impl TrendWallPane {
         }
         self.changed();
     }
+    pub(super) fn resume_edge(&mut self) {
+        self.edge_inflight = None;
+    }
+    fn cancel_edge(&mut self, pane: PaneId, worker: &Worker) {
+        self.edge_generation += 1;
+        self.edge_inflight = None;
+        worker.send(Request::CancelWallEdge { pane, generation: self.edge_generation });
+    }
+    pub(super) fn ensure_edge(&mut self, pane: PaneId, worker: &Worker, now: i64) {
+        if !self.edge || self.loading || self.error.is_some() || self.rows.is_empty() {
+            return;
+        }
+        let want = EdgeWant {
+            symbols: self.rows.iter().map(|r| r.symbol.clone()).collect(),
+            daily: self.daily,
+            day: wall_edge::completed_session(now),
+        };
+        if self.edge_held.as_ref() == Some(&want) || self.edge_inflight.as_ref() == Some(&want) {
+            return;
+        }
+        self.edge_generation += 1;
+        self.edge_error = None;
+        self.edge_received.clear();
+        self.edge_inflight = Some(want.clone());
+        worker.send(Request::WallEdge {
+            pane,
+            generation: self.edge_generation,
+            symbols: want.symbols,
+            daily: want.daily,
+        });
+        self.changed();
+    }
+    pub fn accept_edge(&mut self, generation: u64, index: usize, symbol: String, result: Result<Arc<WallEdge>, Miss>) {
+        if generation != self.edge_generation
+            || self.edge_inflight.is_none()
+            || self.rows.get(index).is_none_or(|r| r.symbol != symbol)
+        {
+            return;
+        }
+        self.edge_received.insert(symbol.clone());
+        self.edge_reports.insert((symbol, self.daily), result);
+        self.changed();
+    }
+    pub fn edge_done(&mut self, generation: u64, error: Option<String>) {
+        if generation != self.edge_generation || self.edge_inflight.is_none() {
+            return;
+        }
+        self.edge_error = error;
+        if self.edge_error.is_none() {
+            self.edge_held = self.edge_inflight.take();
+        } else {
+            let detail = self.edge_error.clone().unwrap();
+            for r in &self.rows {
+                if !self.edge_received.contains(&r.symbol) {
+                    self.edge_reports
+                        .insert((r.symbol.clone(), self.daily), Err(Miss::new("NO DATA", detail.clone(), false)));
+                }
+            }
+            // Hold the failed pass until an explicit reload, instead of retrying every frame.
+            self.edge_held = self.edge_inflight.take();
+        }
+        self.changed();
+    }
+    fn edge_sort(&mut self) {
+        self.sort = if !self.edge {
+            Sort::EdgeScore
+        } else {
+            match self.sort {
+                Sort::EdgeScore => Sort::EdgeDelta,
+                Sort::EdgeDelta => Sort::EdgeQ,
+                _ => Sort::EdgeScore,
+            }
+        };
+        self.edge = true;
+    }
+
     fn changed(&mut self) {
         self.revision = self.revision.wrapping_add(1);
         self.votes = stack_wall::breadth(&self.rows);
+        self.edges = self
+            .rows
+            .iter()
+            .map(|r| {
+                self.edge_reports
+                    .get(&(r.symbol.clone(), self.daily))
+                    .map_or_else(DisplayEdge::pending, |result| DisplayEdge::select(result.as_deref(), r.base_regime()))
+            })
+            .collect();
+        self.edge_summary = wall_edge::resolve(&mut self.edges);
+        self.edge_revision = self.edge_revision.wrapping_add(1);
     }
     fn refresh_due(&self, now: i64) -> bool {
         !self.daily
@@ -136,7 +270,7 @@ impl TrendWallPane {
             && now.saturating_sub(self.requested_at) >= tr_data::intraday::refresh_ttl_secs(Timeframe::M5).unwrap()
     }
     fn move_selection(&mut self, down: bool) {
-        let indices = stack_wall::sorted_indices(&self.rows, self.sort);
+        let indices = wall_edge::order(&self.rows, &self.edges, self.sort);
         if indices.is_empty() {
             return;
         }
@@ -187,6 +321,12 @@ impl TerminalApp {
         });
         self.watchlists.group(group).map(|g| g.members.iter().map(|m| m.symbol.clone()).collect()).unwrap_or_default()
     }
+    pub(super) fn open_edge_wall(&mut self, symbol: Option<&str>, spec: &str) {
+        let mut p = TrendWallPane::new(spec);
+        p.spec = super::rotation::prepend_symbol(symbol, &p.spec);
+        p.sort = Sort::EdgeScore;
+        self.open_panel(PaneKind::TrendWall(Box::new(p)));
+    }
     pub(super) fn open_trend_wall(&mut self, symbol: Option<&str>, spec: &str) {
         // D is a mode selector, before any optional security prefix.
         let mut p = TrendWallPane::new(spec);
@@ -196,6 +336,7 @@ impl TerminalApp {
     pub(super) fn trend_wall_periodic(&mut self, visible: &[usize]) {
         let now = chrono::Utc::now().timestamp();
         for &i in visible {
+            let pane_id = self.panes[i].id;
             let PaneKind::TrendWall(p) = &mut self.panes[i].kind else { continue };
             let mut changed = false;
             for row in &mut p.rows {
@@ -203,6 +344,9 @@ impl TerminalApp {
             }
             if changed {
                 p.changed();
+            }
+            if self.provider != "sample" {
+                p.ensure_edge(pane_id, &self.worker, now);
             }
         }
         let due: Vec<_> = visible
@@ -282,19 +426,40 @@ impl TerminalApp {
         let mut reload = false;
         let mut open = None;
         for (key, m) in keys {
+            let pane_id = self.panes[i].id;
+            let PaneKind::TrendWall(p) = &mut self.panes[i].kind else { break };
+            if key == Key::E && m.shift_only() {
+                p.edge = !p.edge;
+                if !p.edge {
+                    p.cancel_edge(pane_id, &self.worker);
+                }
+                handled = true;
+                ctx.input_mut(|i| {
+                    i.consume_key(m, key);
+                    i.events.retain(|e| !matches!(e,egui::Event::Text(t) if t == "E"));
+                });
+                continue;
+            }
             if m.any() {
                 continue;
             }
-            let PaneKind::TrendWall(p) = &mut self.panes[i].kind else { break };
             match key {
                 Key::ArrowDown | Key::J => p.move_selection(true),
                 Key::ArrowUp | Key::K => p.move_selection(false),
                 Key::S => p.sort = p.sort.next(),
+                Key::E => p.edge_sort(),
+                Key::X => {
+                    p.scatter = !p.scatter;
+                }
                 Key::D => {
                     p.daily = !p.daily;
                     reload = true;
                 }
-                Key::R => reload = true,
+                Key::R => {
+                    p.cancel_edge(pane_id, &self.worker);
+                    p.edge_held = None;
+                    reload = true;
+                }
                 Key::Slash => self.focus_cmd = true,
                 Key::Enter => {
                     open = p
@@ -307,7 +472,8 @@ impl TerminalApp {
             handled = true;
             ctx.input_mut(|i| {
                 i.consume_key(m, key);
-                i.events.retain(|e| !matches!(e, egui::Event::Text(t) if t.chars().all(|c| "jJkKsSdDrR/".contains(c))));
+                i.events
+                    .retain(|e| !matches!(e, egui::Event::Text(t) if t.chars().all(|c| "jJkKsSdDrReExX/".contains(c))));
             });
         }
         if reload {
@@ -350,7 +516,18 @@ impl TerminalApp {
                     .color(text()),
                 );
                 if ui.small_button("Reload").clicked() {
+                    p.cancel_edge(id, &self.worker);
+                    p.edge_held = None;
                     reload = true;
+                }
+                if ui.small_button(if p.edge { "Edge ●" } else { "Edge" }).clicked() {
+                    p.edge = !p.edge;
+                    if !p.edge {
+                        p.cancel_edge(id, &self.worker);
+                    }
+                }
+                if p.edge && ui.small_button(if p.scatter { "Scatter ●" } else { "Scatter" }).clicked() {
+                    p.scatter = !p.scatter;
                 }
                 if ui.small_button(if p.daily { "RESEARCH ARCHIVE" } else { "Daily" }).clicked() {
                     p.daily = !p.daily;
@@ -365,7 +542,7 @@ impl TerminalApp {
             }
             if !p.not_loaded.is_empty() {
                 ui.label(
-                    RichText::new(format!("Not loaded (24-symbol cap): {}", p.not_loaded.join(", "))).color(amber()),
+                    RichText::new(format!("Not loaded (50-symbol cap): {}", p.not_loaded.join(", "))).color(amber()),
                 );
             }
             ui.horizontal_wrapped(|ui| {
@@ -387,12 +564,18 @@ impl TerminalApp {
                     );
                 }
             });
+            if p.edge {
+                edge::summary_strip(ui, p);
+                if p.scatter {
+                    edge::scatter(ui, p);
+                }
+            }
             if !p.rows.is_empty() {
                 open = paint_wall(ui, p, arrival.as_ref());
             }
             ui.label(
                 RichText::new(
-                    "↑/↓ j/k select · Enter chart · N next · ⇧N more · S sort · D daily · R reload · / command",
+                    "↑/↓ j/k select · Enter chart · N next · ⇧N more · S sort · E edge · ⇧E hide · X scatter · D daily · R reload · / command",
                 )
                 .font(mono(10.0))
                 .color(muted()),
@@ -447,9 +630,10 @@ fn paint_wall(
 ) -> Option<(String, Timeframe, bool)> {
     let mut open = None;
     egui::ScrollArea::both().id_salt("trend-wall").show(ui, |ui| {
-        let size = vec2(ui.available_width().max(980.0), 24.0 + p.rows.len() as f32 * ROW);
+        let edge_width = if p.edge { edge::WIDTH } else { 0.0 };
+        let size = vec2(ui.available_width().max(980.0 + edge_width), 24.0 + p.rows.len() as f32 * ROW);
         let (rect, response) = ui.allocate_exact_size(size, Sense::click());
-        let plot = Rect::from_min_max(rect.min + vec2(LEFT, 24.0), rect.max - vec2(RIGHT, 0.0));
+        let plot = Rect::from_min_max(rect.min + vec2(LEFT, 24.0), rect.max - vec2(RIGHT + edge_width, 0.0));
         let painter = ui.painter().with_clip_rect(rect);
         painter.text(rect.min, Align2::LEFT_TOP, "SYM       STACK", mono(10.0), muted());
         painter.text(
@@ -467,13 +651,24 @@ fn paint_wall(
             muted(),
         );
         painter.text(
-            pos2(plot.right() + 8.0, rect.top()),
+            pos2(plot.right() + edge_width + 8.0, rect.top()),
             Align2::LEFT_TOP,
             "FLIP    CUSH   VWAP   RVOL  SRC",
             mono(10.0),
             muted(),
         );
-        let indices = stack_wall::sorted_indices(&p.rows, p.sort);
+        if p.edge {
+            edge::header(ui, p, pos2(plot.right(), rect.top()));
+        }
+        let indices = wall_edge::order(&p.rows, &p.edges, p.sort);
+        if p.edge {
+            edge::column(
+                ui,
+                p,
+                &indices,
+                Rect::from_min_size(pos2(plot.right(), plot.top()), vec2(edge_width, plot.height())),
+            );
+        }
         let key = MeshKey {
             revision: p.revision,
             rect: plot,
@@ -559,6 +754,13 @@ fn paint_wall(
                 );
             }
             if p.selected == Some(index) {
+                if p.scroll_selected {
+                    ui.scroll_to_rect(
+                        Rect::from_min_size(pos2(rect.left(), y), vec2(rect.width(), ROW)),
+                        Some(egui::Align::Center),
+                    );
+                    p.scroll_selected = false;
+                }
                 painter.rect_stroke(
                     Rect::from_min_size(pos2(rect.left(), y), vec2(rect.width(), ROW)),
                     0.0,
@@ -630,7 +832,7 @@ fn paint_wall(
                     status_text(&row.status)
                 },
             ];
-            let mut x = plot.right() + 8.0;
+            let mut x = plot.right() + edge_width + 8.0;
             for (col, value) in values.iter().enumerate() {
                 painter.text(
                     pos2(x, y + 10.0),
@@ -675,7 +877,7 @@ fn paint_wall(
                 }
             }
         } else if response.clicked()
-            && let Some(mouse) = response.interact_pointer_pos()
+            && let Some(mouse) = response.interact_pointer_pos().filter(|mouse| mouse.y >= plot.top())
         {
             let visible = ((mouse.y - plot.top()) / ROW) as usize;
             p.selected = indices.get(visible).copied();
@@ -739,18 +941,15 @@ mod tests {
     use super::*;
     use crate::app::tests::test_app;
     fn key(app: &mut TerminalApp, key: Key) -> bool {
+        key_modified(app, key, egui::Modifiers::NONE)
+    }
+    fn key_modified(app: &mut TerminalApp, key: Key, modifiers: egui::Modifiers) -> bool {
         app.focus_cmd = false;
         let ctx = egui::Context::default();
         let mut handled = false;
         ctx.run_ui(
             egui::RawInput {
-                events: vec![egui::Event::Key {
-                    key,
-                    physical_key: None,
-                    pressed: true,
-                    repeat: false,
-                    modifiers: egui::Modifiers::NONE,
-                }],
+                events: vec![egui::Event::Key { key, physical_key: None, pressed: true, repeat: false, modifiers }],
                 ..Default::default()
             },
             |ui| {
@@ -760,6 +959,276 @@ mod tests {
         .textures_delta
         .clear();
         handled
+    }
+    pub(super) fn report() -> Arc<WallEdge> {
+        use tr_data::edge::{EdgeCell, EdgeFold, EdgeStats};
+        Arc::new(WallEdge {
+            cells: std::array::from_fn(|i| {
+                let d = if i == 2 { -0.001 } else { 0.001 };
+                EdgeCell {
+                    regime: [1, 0, -1][i],
+                    horizon: 5,
+                    n: 400,
+                    n_eff: 80.0,
+                    low_n: false,
+                    stats: Some(EdgeStats {
+                        mean: d,
+                        median: d,
+                        std: 0.01,
+                        hit_rate: 0.54,
+                        t: None,
+                        ci95: (0.0, 0.0),
+                        hit_ci95: (0.49, 0.59),
+                        delta: Some(d),
+                        welch_t: None,
+                    }),
+                    span: None,
+                    p: Some([0.01, 0.3, 0.02][i]),
+                    q: Some(0.03),
+                    null_band: Some((-0.0002, 0.0002)),
+                    folds: std::array::from_fn(|_| EdgeFold { n: 100, delta: Some(d), span: None }),
+                }
+            }),
+            as_of_regime: Some(1),
+            baseline_mean: Some(0.0),
+            bars: 1200,
+            first_ts: 1_700_000_000,
+            closed_thru_ts: 1_700_500_000,
+            tf: Timeframe::M5,
+            provenance: tr_core::Provenance::Real,
+            source: "test verified".into(),
+            vault_bars: 800,
+            live_bars: 400,
+            trimmed_gap: false,
+            vault_only: false,
+        })
+    }
+    fn live_row(symbol: &str, state: i8) -> Row {
+        use tr_core::{Provenance, indicators::StackScore};
+        let mut r = Row::failure(symbol, LaneStatus::Ready, false);
+        r.provenance = Provenance::Real;
+        r.score = Some(StackScore { aligned: 1, scored: 1, dir: state, provenance: Provenance::Real });
+        r.lanes = vec![tr_data::stack_wall::Ribbon {
+            tf: Timeframe::M5,
+            status: LaneStatus::Ready,
+            last_bar_ts: Some(1_700_500_000),
+            forming: None,
+            cells: vec![Some(tr_data::stack_wall::Cell {
+                state,
+                confidence: 1.0,
+                native_ts: 1_700_500_000,
+                provenance: Provenance::Real,
+            })],
+        }];
+        r
+    }
+    fn started() -> (TrendWallPane, Worker, tokio::sync::mpsc::UnboundedReceiver<Request>) {
+        let (w, mut rx) = Worker::test_channel();
+        let mut p = TrendWallPane::new("AAPL MSFT");
+        p.request(1, &w, &[]);
+        assert!(matches!(rx.try_recv().unwrap(), Request::TrendWall { .. }));
+        p.done(p.generation, None);
+        p.ensure_edge(1, &w, chrono::Utc::now().timestamp());
+        assert!(matches!(rx.try_recv().unwrap(), Request::WallEdge { .. }));
+        (p, w, rx)
+    }
+    #[test]
+    fn edge_request_sent_after_done_and_not_resent_on_ribbon_refresh() {
+        let (w, mut rx) = Worker::test_channel();
+        let mut p = TrendWallPane::new("AAPL");
+        p.request(1, &w, &[]);
+        rx.try_recv().unwrap();
+        p.ensure_edge(1, &w, chrono::Utc::now().timestamp());
+        assert!(rx.try_recv().is_err());
+        p.done(p.generation, None);
+        p.ensure_edge(1, &w, chrono::Utc::now().timestamp());
+        assert!(matches!(rx.try_recv().unwrap(), Request::WallEdge { .. }));
+        p.accept_edge(p.edge_generation, 0, p.rows[0].symbol.clone(), Ok(report()));
+        p.edge_done(p.edge_generation, None);
+        let rev = p.edge_generation;
+        p.request(1, &w, &[]);
+        assert!(matches!(rx.try_recv().unwrap(), Request::TrendWall { .. }));
+        p.done(p.generation, None);
+        p.ensure_edge(1, &w, chrono::Utc::now().timestamp());
+        assert!(rx.try_recv().is_err());
+        assert_eq!(p.edge_generation, rev);
+        assert!(p.edges[0].cell.is_some());
+    }
+    #[test]
+    fn edge_request_resent_when_symbols_mode_or_session_day_change() {
+        let (mut p, w, mut rx) = started();
+        let now = chrono::Utc::now().timestamp();
+        p.edge_done(p.edge_generation, None);
+        let future = now + 7 * 86400;
+        p.ensure_edge(1, &w, future);
+        assert!(matches!(rx.try_recv().unwrap(), Request::WallEdge { .. }));
+        p.spec = "NVDA".into();
+        p.request(1, &w, &[]);
+        assert!(matches!(rx.try_recv().unwrap(), Request::CancelWallEdge { .. }));
+        rx.try_recv().unwrap();
+        p.done(p.generation, None);
+        p.ensure_edge(1, &w, now);
+        assert!(matches!(rx.try_recv().unwrap(),Request::WallEdge {symbols,..} if symbols==vec!["NVDA US Equity"]));
+        p.daily = true;
+        p.request(1, &w, &[]);
+        rx.try_recv().unwrap();
+        rx.try_recv().unwrap();
+        p.done(p.generation, None);
+        p.ensure_edge(1, &w, now);
+        assert!(matches!(rx.try_recv().unwrap(), Request::WallEdge { daily: true, .. }));
+    }
+    #[test]
+    fn edge_row_for_old_generation_or_wrong_symbol_is_dropped() {
+        let (mut p, _w, _rx) = started();
+        let g = p.edge_generation;
+        p.accept_edge(g - 1, 0, p.rows[0].symbol.clone(), Ok(report()));
+        p.accept_edge(g, 0, "NVDA US Equity".into(), Ok(report()));
+        assert!(p.edge_reports.is_empty());
+        p.accept_edge(g, 0, p.rows[0].symbol.clone(), Ok(report()));
+        assert_eq!(p.edge_reports.len(), 1);
+    }
+    #[test]
+    fn live_regime_flip_switches_cell_and_reruns_wall_bh_without_a_request() {
+        let (mut p, _w, mut rx) = started();
+        p.rows[0] = live_row("AAPL US Equity", 1);
+        p.rows[1] = live_row("MSFT US Equity", 1);
+        let g = p.edge_generation;
+        for i in 0..2 {
+            p.accept_edge(g, i, p.rows[i].symbol.clone(), Ok(report()));
+        }
+        p.edge_done(g, None);
+        let before = p.edges[0].q;
+        p.rows[0].lanes[0].cells[0].as_mut().unwrap().state = 0;
+        p.changed();
+        assert_eq!(p.edges[0].cell.as_ref().unwrap().regime, 0);
+        assert_ne!(p.edges[0].q, before);
+        assert_eq!(p.edge_generation, g);
+        assert!(rx.try_recv().is_err());
+    }
+    #[test]
+    fn e_cycles_edge_sorts_and_s_returns_to_stack() {
+        let mut app = test_app();
+        app.execute("NEW TWALL AAPL");
+        for sort in [Sort::EdgeScore, Sort::EdgeDelta, Sort::EdgeQ, Sort::EdgeScore] {
+            assert!(key(&mut app, Key::E));
+            let PaneKind::TrendWall(p) = &app.panes[app.idx(app.focus).unwrap()].kind else { panic!() };
+            assert_eq!(p.sort, sort);
+        }
+        assert!(key(&mut app, Key::S));
+        let PaneKind::TrendWall(p) = &app.panes[app.idx(app.focus).unwrap()].kind else { panic!() };
+        assert_eq!(p.sort, Sort::Stack);
+    }
+    #[test]
+    fn shift_e_hides_column_and_x_toggles_scatter() {
+        let mut app = test_app();
+        app.execute("NEW TWALL AAPL");
+        assert!(key_modified(&mut app, Key::E, egui::Modifiers::SHIFT));
+        assert!(key(&mut app, Key::X));
+        let PaneKind::TrendWall(p) = &app.panes[app.idx(app.focus).unwrap()].kind else { panic!() };
+        assert!(!p.edge);
+        assert!(p.scatter);
+        assert!(key(&mut app, Key::E));
+        let PaneKind::TrendWall(p) = &app.panes[app.idx(app.focus).unwrap()].kind else { panic!() };
+        assert!(p.edge);
+        assert_eq!(p.sort, Sort::EdgeScore);
+    }
+    #[test]
+    fn n_from_an_edge_sorted_wall_opens_cockpit_for_the_selected_row() {
+        let mut app = test_app();
+        let (worker, _) = Worker::test_live_channel();
+        app.worker = worker;
+        app.provider = "verified fixture".into();
+        app.execute("NEW EWALL AAPL MSFT");
+        let id = app.focus;
+        let i = app.idx(id).unwrap();
+        let PaneKind::TrendWall(p) = &mut app.panes[i].kind else { panic!() };
+        p.done(p.generation, None);
+        p.ensure_edge(id, &app.worker, chrono::Utc::now().timestamp());
+        let mut weak = report();
+        for c in &mut Arc::make_mut(&mut weak).cells {
+            c.p = Some(0.08);
+        }
+        p.accept_edge(p.edge_generation, 0, p.rows[0].symbol.clone(), Ok(weak));
+        p.accept_edge(p.edge_generation, 1, p.rows[1].symbol.clone(), Ok(report()));
+        p.selected = Some(1);
+        assert_eq!(wall_edge::order(&p.rows, &p.edges, p.sort)[0], 1);
+        app.focus_cmd = false;
+        let ctx = egui::Context::default();
+        ctx.run_ui(
+            egui::RawInput {
+                events: vec![egui::Event::Key {
+                    key: Key::N,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers::NONE,
+                }],
+                ..Default::default()
+            },
+            |ui| {
+                assert!(app.handoff_keys(ui.ctx()));
+            },
+        )
+        .textures_delta
+        .clear();
+        assert_eq!(app.panes.len(), 3);
+        for pane in &app.panes {
+            let PaneKind::Chart(c) = &pane.kind else { panic!("cockpit chart") };
+            assert_eq!(c.symbol, "MSFT US Equity");
+        }
+    }
+    #[test]
+    fn backspace_restores_edge_results_and_requeues_an_unfinished_pass() {
+        let mut app = test_app();
+        let (worker, _) = Worker::test_live_channel();
+        app.worker = worker;
+        app.provider = "verified fixture".into();
+        app.execute("NEW TWALL AAPL MSFT");
+        let i = app.idx(app.focus).unwrap();
+        let PaneKind::TrendWall(p) = &mut app.panes[i].kind else { panic!() };
+        p.done(p.generation, None);
+        p.ensure_edge(app.focus, &app.worker, chrono::Utc::now().timestamp());
+        p.accept_edge(p.edge_generation, 0, p.rows[0].symbol.clone(), Ok(report()));
+        p.selected = Some(0);
+        p.sort = Sort::EdgeScore;
+        p.scatter = true;
+        let held = p.edge_reports.values().next().unwrap().as_ref().unwrap().clone();
+        let old_generation = p.edge_generation;
+        // Use the same N / Backspace path as the existing hand-off tests.
+        let run = |app: &mut TerminalApp, key: Key| {
+            let ctx = egui::Context::default();
+            app.focus_cmd = false;
+            app.cmd.clear();
+            ctx.run_ui(
+                egui::RawInput {
+                    events: vec![egui::Event::Key {
+                        key,
+                        physical_key: None,
+                        pressed: true,
+                        repeat: false,
+                        modifiers: egui::Modifiers::NONE,
+                    }],
+                    ..Default::default()
+                },
+                |ui| {
+                    app.handoff_keys(ui.ctx());
+                },
+            )
+            .textures_delta
+            .clear();
+        };
+        run(&mut app, Key::N);
+        run(&mut app, Key::Backspace);
+        let id = app.focus;
+        let i = app.idx(id).unwrap();
+        let PaneKind::TrendWall(p) = &mut app.panes[i].kind else { panic!() };
+        assert_eq!(p.sort, Sort::EdgeScore);
+        assert!(p.scatter);
+        assert!(p.edge_inflight.is_none());
+        assert!(Arc::ptr_eq(&held, p.edge_reports.values().next().unwrap().as_ref().unwrap()));
+        p.ensure_edge(id, &app.worker, chrono::Utc::now().timestamp());
+        assert!(p.edge_inflight.is_some());
+        assert!(p.edge_generation > old_generation);
     }
     #[test]
     fn enter_opens_linked_5m_chart_with_stack_on() {
@@ -789,7 +1258,7 @@ mod tests {
         let mut app = test_app();
         app.execute("NEW TWALL MSFT");
         app.cmd = "hello".into();
-        for k in [Key::J, Key::D, Key::S, Key::R, Key::Enter, Key::N] {
+        for k in [Key::J, Key::D, Key::S, Key::R, Key::E, Key::X, Key::Enter, Key::N] {
             assert!(!key(&mut app, k));
         }
         let PaneKind::TrendWall(p) = &app.panes[app.idx(app.focus).unwrap()].kind else { panic!() };
@@ -875,14 +1344,14 @@ mod tests {
         assert!(Arc::ptr_eq(&mesh, &p.mesh.as_ref().unwrap().1));
     }
     #[test]
-    fn pane_ignores_old_rows_and_done_and_lists_overflow() {
+    fn pane_lists_overflow_beyond_fifty() {
         let (worker, mut requests) = Worker::test_channel();
         let mut p = TrendWallPane::new("");
-        let list: Vec<_> = (0..27).map(|i| format!("S{i}")).collect();
+        let list: Vec<_> = (0..53).map(|i| format!("S{i}")).collect();
         p.request(1, &worker, &list);
         assert_eq!(p.not_loaded.len(), 3);
-        assert_eq!(p.rows.len(), 24);
-        assert!(matches!(requests.try_recv().unwrap(), Request::TrendWall { symbols, .. } if symbols.len() == 24));
+        assert_eq!(p.rows.len(), 50);
+        assert!(matches!(requests.try_recv().unwrap(), Request::TrendWall { symbols, .. } if symbols.len() == 50));
         p.accept(0, 0, Row::failure("S0 US Equity", LaneStatus::Refused("bad".into()), false));
         p.done(0, Some("bad".into()));
         assert!(p.loading);

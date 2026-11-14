@@ -5,7 +5,7 @@ use tr_core::{Bar, Provenance, Timeframe};
 
 use crate::intraday;
 
-pub const MAX_SYMBOLS: usize = 24;
+pub const MAX_SYMBOLS: usize = 50;
 pub const SESSION_SLOTS: usize = 78;
 pub const MIN_VOTES: usize = 5;
 
@@ -57,6 +57,11 @@ impl Row {
             daily,
             note: None,
         }
+    }
+    pub fn base_regime(&self) -> Option<i8> {
+        self.scored()
+            .then(|| self.lanes.first()?.cells.iter().rev().find_map(|c| c.as_ref().map(|c| c.state)))
+            .flatten()
     }
     pub fn scored(&self) -> bool {
         self.status == LaneStatus::Ready
@@ -275,6 +280,9 @@ pub enum Sort {
     Flip,
     Cushion,
     List,
+    EdgeScore,
+    EdgeDelta,
+    EdgeQ,
 }
 impl Sort {
     pub fn next(self) -> Self {
@@ -282,7 +290,7 @@ impl Sort {
             Self::Stack => Self::Flip,
             Self::Flip => Self::Cushion,
             Self::Cushion => Self::List,
-            Self::List => Self::Stack,
+            Self::List | Self::EdgeScore | Self::EdgeDelta | Self::EdgeQ => Self::Stack,
         }
     }
 }
@@ -308,7 +316,7 @@ pub fn sorted_indices(rows: &[Row], mode: Sort) -> Vec<usize> {
                         (true, true) => rb.cushion.total_cmp(&ra.cushion),
                         (a, b) => b.cmp(&a),
                     },
-                    Sort::List => a.cmp(&b),
+                    Sort::List | Sort::EdgeScore | Sort::EdgeDelta | Sort::EdgeQ => a.cmp(&b),
                 }
             })
             .then(a.cmp(&b))
@@ -333,6 +341,25 @@ mod tests {
     }
     fn row(base: &[Bar], now: i64) -> Row {
         build_row("AAPL", &trend_stack(base, Timeframe::M5, vec![], Default::default()).unwrap(), base, now)
+    }
+    #[test]
+    fn sort_next_cycles_four_modes_and_leaves_edge_sorts_to_stack() {
+        let mut s = Sort::Stack;
+        for expected in [Sort::Flip, Sort::Cushion, Sort::List, Sort::Stack] {
+            s = s.next();
+            assert_eq!(s, expected);
+        }
+        for s in [Sort::EdgeScore, Sort::EdgeDelta, Sort::EdgeQ] {
+            assert_eq!(s.next(), Sort::Stack);
+        }
+    }
+    #[test]
+    fn base_regime_is_none_for_unscored_rows() {
+        let (bars, now) = fixture();
+        let mut r = row(&bars, now);
+        assert_eq!(r.base_regime(), r.lanes[0].cells.iter().rev().flatten().next().map(|c| c.state));
+        r.status = LaneStatus::Stale { lag_secs: 900 };
+        assert_eq!(r.base_regime(), None);
     }
     #[test]
     fn failed_refresh_past_freshness_emits_no_ribbon_cells() {

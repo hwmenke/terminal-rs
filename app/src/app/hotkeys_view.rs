@@ -439,7 +439,7 @@ impl TerminalApp {
                     (&["REVIEW", "AAPL REVIEW"], "Linked daily + weekly archive charts for candidate review"),
                     (&["LATEST", "END"], "Jump to the latest candle (keeps zoom)"),
                     (&["BOX", "RS", "VCTX"], "Toggle box levels, 21-bar return, volume context"),
-                    (&["TWALL", "TWALL D", "TWALL WL Growth", "NEW TWALL"], "Trend Wall: j/k select; Enter linked stacked chart; S sort; D daily; R reload; / command"),
+                    (&["TWALL", "TWALL D", "TWALL WL Growth", "NEW TWALL", "EWALL"], "Trend Wall: j/k select; Enter linked stacked chart; S sort; E edge sort; Shift+E edge; X scatter; D daily; R reload; / command"),
                     (&["TSTACK", "STACK", "MTF", "REGIME"], "Trend Stack: completed timeframe lanes, confidence cloud, verified bars only"),
                     (&["TSTACK ON", "TSTACK OFF", "NEW TSTACK NVDA", "SPLIT DOWN TSTACK"], "Enable, disable, or open a stacked chart; saved with the layout"),
                     (&["AUCTION", "AMAP", "AUCTION 10", "AUCTION VIS", "AUCTION NAKED", "AUCTION VA 70"], "Auction Map (Alt+P): closed verified RTH profiles, composite, naked levels; click level to centre; Alt+click anchors VWAP"),

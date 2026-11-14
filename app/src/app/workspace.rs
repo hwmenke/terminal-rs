@@ -1101,8 +1101,11 @@ impl TerminalApp {
                 let spec = words.get(1..).unwrap_or(&[]).join(" ");
                 PaneKind::SessionPath(Box::new(super::session_path::SessionPathPane::new(symbol, spec)))
             }
-            "TWALL" | "TGRID" | "STACKS" | "MTFGRID" => {
+            "EWALL" | "TWALL" | "TGRID" | "STACKS" | "MTFGRID" => {
                 let mut p = super::trend_wall::TrendWallPane::new(words[1..].join(" "));
+                if words[0].eq_ignore_ascii_case("EWALL") {
+                    p.sort = tr_data::stack_wall::Sort::EdgeScore;
+                }
                 p.spec = super::rotation::prepend_symbol(symbol, &p.spec);
                 PaneKind::TrendWall(Box::new(p))
             }
