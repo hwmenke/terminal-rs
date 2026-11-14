@@ -1372,7 +1372,8 @@ impl TerminalApp {
             watchlists: Some(self.watchlists.clone()),
             recent_symbols: self.recent_symbols.clone(),
             sidebar: self.sidebar_open,
-            active_layout: Some(self.layout_name.clone()),
+            // A temporary hand-off layout is never reopened; its origin is.
+            active_layout: Some(self.handoff_origin_name().unwrap_or(&self.layout_name).to_owned()),
             layout: None,
             panes: None,
         };
@@ -2667,10 +2668,8 @@ impl TerminalApp {
             }
             A::ClosePane => self.close_pane(self.focus),
             A::PopOut => self.pop_out(self.focus),
-            A::SaveLayout => {
-                self.save_layout();
-                self.status = format!("Saved layout {:?}", self.layout_name);
-            }
+            // Same as LAYOUT SAVE (adopts a live hand-off view after saving its origin).
+            A::SaveLayout => self.layout_command("SAVE"),
             A::Settings => self.apply(Function::Settings),
             A::CommandPalette => self.palette.toggle(),
             A::DrawTrendline => self.with_chart(|c, _| c.start_tool(Tool::Trendline)),
@@ -2822,13 +2821,11 @@ impl TerminalApp {
     }
 
     /// Save the active layout (only when it changed) and app settings.
+    /// With hand-off hops live this keeps saving: the hop origin under its own name
+    /// (see `save_layout`), preserving pre-hop work through long navigation sessions.
     fn autosave(&mut self) {
-        if self.handoff_live() {
-            return;
-        }
         self.save_dirty_themes(true);
-        let json = self.current_doc().to_json();
-        if json != self.last_saved {
+        if self.layout_dirty() {
             self.save_layout();
         }
         self.save_settings();

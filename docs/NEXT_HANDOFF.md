@@ -42,12 +42,17 @@ In CLOCK, click a historical cell (including a hole or LOW N cell), or use arrow
 to select and move. Arrows stop at grid edges. TODAY is descriptive and is not a
 selectable historical cell. Clicking the **Session Clock** heading selects the
 symbol without a bucket; arrival from another pane also selects the symbol.
-A cell hand-off names its weekday and bucket in status. It does not move a chart
-to an inferred session or manufacture any missing observations.
+A cell hand-off names its weekday and bucket in status. If that cell has a
+historical observation, the chart queues its existing timestamp jump to put the
+most recent contributing closed session near the right edge, keeping the zoom.
+The jump applies when chart bars arrive; it does not fetch a special session or
+manufacture missing observations. Session close respects half days and New York
+DST. A hole or a symbol-only selection opens the chart without a jump.
 
 The lower status bar shows a clickable `← from TWALL · AAPL` crumb. A depth suffix
 appears after the first hop, and `⌫ back` is shown beside it. The stack holds up to
-eight snapshots and drops the oldest when full. It lives only in memory: it is
+eight snapshots. At the cap it collapses the second-oldest step, preserving the
+original layout as the final return point and autosave target. It lives only in memory: it is
 not in layouts or preferences, and restarting clears it. Layout snapshots include
 pane settings, links, titles, focus and pop-out geometry. The departing source's
 cached data and transient state also return: scanner filters/selection, wall
@@ -55,12 +60,22 @@ sort/selection, RRG replay frame/play state, and CLOCK selection. Pane ids are
 renewed so old worker responses cannot reach restored panes.
 
 A COCKPIT hand-off replaces the workspace temporarily. Unlike running the COCKPIT
-command, it does not save either the departing named layout or Cockpit. Automatic
-layout/settings saving pauses while hops are live; explicit save commands remain
-available. Backspace restores the actual pre-hop workspace, including unsaved
-changes and its prior saved/dirty state, without switching through a named save.
-As with other full-layout restores, destination changes made after departure are
-not carried back. A source closed after departure still returns from its snapshot.
+command, opening it does not synchronously save either layout. **Autosave and quit
+keep saving the original layout under its own name**, including its unsaved
+pre-hop work. Settings reopen that origin on restart. Temporary destination
+layouts never overwrite named saves automatically, including an existing Cockpit.
+Edits to original panes that a hop left alone (drawings, studies, links, titles,
+and other pane settings) are folded back through the stack, saved, and retained
+on return. The source, dock arrangement and pop-out geometry return as snapshotted;
+new panes and changes to panes a hop created, replaced or retargeted are temporary.
+A source closed after departure still returns from its snapshot.
+
+**LAYOUT SAVE** (also the Save Layout hotkey) adopts the visible workspace under
+its displayed name; **LAYOUT SAVEAS name** adopts it under the requested name.
+Both first save the origin, and clear the stack only after the visible view is
+saved successfully. Use these to keep work on temporary destinations. Switching,
+renaming, duplicating, deleting or exporting layouts, changing their theme policy,
+or running the COCKPIT/Intraday desk command first returns to the origin.
 
 Arrival outlines the wall's selected symbol row and shows an accent symbol chip
 on destinations for about 0.6 seconds. Reduce Motion keeps the outline/chip static
@@ -68,13 +83,21 @@ until the next click, text input or key. The picker and crumb use the terminal's
 current theme.
 
 Hand-off uses existing worker requests and verified-data caches. It adds no worker
-endpoint, network service, disk read or synchronous save. Sample/offline display
-mode refuses the hop with the existing **NO REAL DATA** card and creates no stack
-entry. Destination panes retain their existing real-data admission/refusal rules.
+endpoint or network service. Navigation itself adds no disk read or synchronous
+save; the existing autosave and explicit layout operations handle persistence.
+In sample/offline display mode the destination opens with a full-pane **NO REAL
+DATA** refusal in the existing card style. The crumb and Backspace remain active,
+and ordinary input does not dismiss the refusal. All three COCKPIT panes refuse;
+no sample prices or synthetic bars are displayed. Destination panes also retain
+their existing real-data admission/refusal rules.
 
-This slice does not add ISCAN hand-off, chart-source hand-off, a CLOCK session lens
-jump, persisted navigation, journals, trade plans or alerts. Keyboard hand-off is
-limited to sources docked in the main window. Other pop-out windows survive return;
+This slice does not add ISCAN hand-off: that board currently opens charts on row
+click and has no persistent row selection for N to use or Backspace to restore.
+It also adds no chart-source hand-off, new session lens, persisted navigation,
+journals, trade plans or alerts. Keyboard hand-off and its alternate picker work
+inside popped-out source panes as well as the main window. Pane replacement is
+deferred until window rendering finishes. Other pop-out windows survive return;
 if an existing destination is popped out, its replacement is docked for the hop
-and the original window is restored on return. Native-window interaction has not
-been exercised by launching the GUI in this change.
+and the original window is restored on return. Geometry, selection and return are
+tested headlessly; native-window interaction has not been exercised by launching
+the GUI in this change.

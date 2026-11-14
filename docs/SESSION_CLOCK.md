@@ -20,8 +20,10 @@ the default grid fits a 600 px pane.
 | Backspace | Return through a live hand-off stack |
 | R / Reload | Retry the existing worker request |
 
-N needs a selected cell or symbol heading. A bucket is named in status without an
-inferred chart jump. TODAY remains descriptive. Command/text inputs retain their
+N needs a selected cell or symbol heading. A bucket is named in status; when it
+has observations, the chart uses its existing timestamp jump to the most recent
+contributing closed session, applying it when bars arrive. Holes and symbol-only
+selections do not jump. TODAY remains descriptive. Command/text inputs retain their
 keys. See [Next ▸ hand-off](NEXT_HANDOFF.md) for the crumb and layout restoration.
 
 ## Observations and admission
