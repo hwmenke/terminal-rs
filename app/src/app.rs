@@ -657,7 +657,13 @@ impl PaneKind {
             PaneKind::SessionPath(p) => {
                 PaneSettings::SessionPath { symbol: p.symbol.clone(), spec: p.spec.clone(), tf: p.tf.clone() }
             }
-            PaneKind::TrendWall(p) => PaneSettings::TrendWall { spec: p.spec.clone(), daily: p.daily, sort: p.sort },
+            PaneKind::TrendWall(p) => PaneSettings::TrendWall {
+                spec: p.spec.clone(),
+                daily: p.daily,
+                sort: p.sort,
+                edge: p.edge,
+                scatter: p.scatter,
+            },
             PaneKind::Rotation(p) => {
                 PaneSettings::Rotation { spec: p.spec.clone(), tail: p.tail as u8, table: p.show_table }
             }
@@ -861,10 +867,12 @@ impl PaneKind {
                 }
                 PaneKind::SessionPath(Box::new(pane))
             }
-            PaneSettings::TrendWall { spec, daily, sort } => {
+            PaneSettings::TrendWall { spec, daily, sort, edge, scatter } => {
                 let mut p = trend_wall::TrendWallPane::new(spec);
                 p.daily = daily;
                 p.sort = sort;
+                p.edge = edge;
+                p.scatter = scatter;
                 PaneKind::TrendWall(Box::new(p))
             }
             PaneSettings::Rotation { spec, tail, table } => {
@@ -1497,6 +1505,7 @@ impl TerminalApp {
             }
             Command::SymbolFunction(s, Function::SessionPath { spec }) => self.open_session_path(Some(&s), &spec),
             Command::SymbolFunction(s, Function::TrendWall { spec }) => self.open_trend_wall(Some(&s), &spec),
+            Command::SymbolFunction(s, Function::EdgeWall { spec }) => self.open_edge_wall(Some(&s), &spec),
             Command::SymbolFunction(s, Function::Rotation { spec }) => self.open_rotation(Some(&s), &spec),
             Command::SymbolFunction(s, Function::Breadth { spec }) => self.open_breadth(Some(&s), &spec),
             Command::SymbolFunction(s, Function::VolumePace { spec }) => self.open_volume_pace(Some(&s), &spec),
@@ -1754,6 +1763,7 @@ impl TerminalApp {
             Function::IntradayCompare { spec } => self.open_intraday_compare(symbol.as_deref(), &spec),
             Function::SessionPath { spec } => self.open_session_path(symbol.as_deref(), &spec),
             Function::TrendWall { spec } => self.open_trend_wall(symbol.as_deref(), &spec),
+            Function::EdgeWall { spec } => self.open_edge_wall(symbol.as_deref(), &spec),
             Function::Rotation { spec } => self.open_rotation(symbol.as_deref(), &spec),
             Function::Breadth { spec } => self.open_breadth(symbol.as_deref(), &spec),
             Function::VolumePace { spec } => self.open_volume_pace(symbol.as_deref(), &spec),
@@ -1995,6 +2005,20 @@ impl TerminalApp {
                         p.accept(generation, result);
                     }
                 }
+                Response::WallEdgeRow { pane, generation, index, symbol, result } => {
+                    if let Some(PaneKind::TrendWall(p)) =
+                        self.panes.iter_mut().find(|p| p.id == pane).map(|p| &mut p.kind)
+                    {
+                        p.accept_edge(generation, index, symbol, result);
+                    }
+                }
+                Response::WallEdgeDone { pane, generation, error } => {
+                    if let Some(PaneKind::TrendWall(p)) =
+                        self.panes.iter_mut().find(|p| p.id == pane).map(|p| &mut p.kind)
+                    {
+                        p.edge_done(generation, error);
+                    }
+                }
                 Response::TrendWallRow { pane, generation, index, row } => {
                     if let Some(PaneKind::TrendWall(p)) =
                         self.panes.iter_mut().find(|p| p.id == pane).map(|p| &mut p.kind)
@@ -2007,6 +2031,9 @@ impl TerminalApp {
                         self.panes.iter_mut().find(|p| p.id == pane).map(|p| &mut p.kind)
                     {
                         p.done(generation, error);
+                        if self.provider != "sample" {
+                            p.ensure_edge(pane, &self.worker, chrono::Utc::now().timestamp());
+                        }
                     }
                 }
                 Response::Rotation { pane, generation, result } => {

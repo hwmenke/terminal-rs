@@ -35,3 +35,7 @@ harness = false
 [[bench]]
 name = "auction"
 harness = false
+
+[[bench]]
+name = "wall_edge"
+harness = false
