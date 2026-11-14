@@ -10,11 +10,12 @@ use crate::{
 use egui::{Align2, Color32, Key, Mesh, Pos2, Rect, RichText, Sense, Stroke, Ui, Vec2, pos2, vec2};
 use tr_data::rotation::{self, Point, Quadrant, RotationReport, TAILS, Track};
 
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub struct LabelsCache {
     key: Option<(usize, Rect, Rect, [bool; 4])>,
     offsets: Vec<Option<Vec2>>,
 }
+#[derive(Clone)]
 pub struct RotationPane {
     pub spec: String,
     pub tail: usize,
@@ -360,6 +361,11 @@ impl TerminalApp {
                     reload = true;
                 }
             });
+            ui.label(
+                RichText::new("↑/↓ j/k select · Enter chart · N next · ⇧N more · / command")
+                    .font(mono(10.0))
+                    .color(muted()),
+            );
             if sample_offline {
                 ui.label(RichText::new("Sample / offline display mode does not feed this pane. Rotation never falls back to sample bars.").font(mono(12.0)).color(theme::down()));
             }
@@ -456,7 +462,7 @@ fn archive_add(p: &RotationPane) -> Option<String> {
         .collect::<Vec<_>>();
     if names.is_empty() { None } else { Some(format!("HIST ADD {}", names.join(" "))) }
 }
-fn selected_symbol(p: &RotationPane) -> Option<String> {
+pub(super) fn selected_symbol(p: &RotationPane) -> Option<String> {
     let r = p.report.as_ref()?;
     let t = r.tracks.get(p.selected?)?;
     let head = current(t, p.cursor)?;
@@ -961,6 +967,101 @@ mod tests {
         )
         .unwrap()
     }
+    #[test]
+    fn next_opens_intraday_wall_of_rotation_list_and_back_restores_replay() {
+        let mut app = test_app();
+        let (worker, _) = Worker::test_live_channel();
+        app.worker = worker;
+        app.focus_cmd = false;
+        app.open_rotation(None, "AAPL MSFT VS QQQ WEEKLY TAIL 20");
+        let i = app.idx(app.focus).unwrap();
+        let PaneKind::Rotation(r) = &mut app.panes[i].kind else { panic!() };
+        r.accept(r.generation, Ok(report()));
+        r.selected = Some(1);
+        r.cursor = 200.0;
+        r.playing = true;
+        let key = |app: &mut TerminalApp, key| {
+            egui::Context::default()
+                .run_ui(
+                    egui::RawInput {
+                        events: vec![egui::Event::Key {
+                            key,
+                            physical_key: None,
+                            pressed: true,
+                            repeat: false,
+                            modifiers: egui::Modifiers::NONE,
+                        }],
+                        ..Default::default()
+                    },
+                    |ui| app.hotkeys(ui.ctx()),
+                )
+                .textures_delta
+                .clear();
+        };
+        key(&mut app, Key::N);
+        let i = app.idx(app.focus).unwrap();
+        let PaneKind::TrendWall(w) = &app.panes[i].kind else { panic!("wall") };
+        assert!(!w.daily);
+        assert_eq!(
+            w.rows.iter().map(|r| r.symbol.as_str()).collect::<Vec<_>>(),
+            vec!["AAPL US Equity", "MSFT US Equity"]
+        );
+        assert_eq!(w.rows[w.selected.unwrap()].symbol, "MSFT US Equity");
+        key(&mut app, Key::Backspace);
+        let i = app.idx(app.focus).unwrap();
+        let PaneKind::Rotation(r) = &app.panes[i].kind else { panic!("rotation") };
+        assert_eq!(selected_symbol(r).as_deref(), Some("MSFT"));
+        assert_eq!(r.cursor, 200.0);
+        assert!(r.playing);
+    }
+
+    #[test]
+    fn next_keeps_a_capped_out_rotation_selection_in_the_wall() {
+        let mut app = test_app();
+        let (worker, _) = Worker::test_live_channel();
+        app.worker = worker;
+        app.focus_cmd = false;
+        let names: Vec<String> = (0..30)
+            .map(|i| format!("X{}{}", (b'A' + (i / 26) as u8) as char, (b'A' + (i % 26) as u8) as char))
+            .collect();
+        app.open_rotation(None, &names.join(" "));
+        let mut report = report();
+        let track = report.tracks[0].clone();
+        report.tracks = names
+            .iter()
+            .map(|name| {
+                let mut t = track.clone();
+                t.symbol = name.clone();
+                t
+            })
+            .collect();
+        let i = app.idx(app.focus).unwrap();
+        let PaneKind::Rotation(r) = &mut app.panes[i].kind else { panic!() };
+        r.accept(r.generation, Ok(report));
+        r.selected = Some(29);
+        egui::Context::default()
+            .run_ui(
+                egui::RawInput {
+                    events: vec![egui::Event::Key {
+                        key: Key::N,
+                        physical_key: None,
+                        pressed: true,
+                        repeat: false,
+                        modifiers: egui::Modifiers::NONE,
+                    }],
+                    ..Default::default()
+                },
+                |ui| app.hotkeys(ui.ctx()),
+            )
+            .textures_delta
+            .clear();
+        let i = app.idx(app.focus).unwrap();
+        let PaneKind::TrendWall(w) = &app.panes[i].kind else { panic!("wall") };
+        assert_eq!(w.rows.len(), 24);
+        assert_eq!(w.rows[w.selected.unwrap()].symbol, tr_data::security(&names[29]).key());
+        assert_eq!(w.not_loaded.len(), 6);
+    }
+
     #[test]
     fn rrg_commands_open_the_pane_and_request_the_list() {
         let mut app = test_app();

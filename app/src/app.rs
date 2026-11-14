@@ -15,6 +15,7 @@ mod compare;
 mod demo;
 mod desk;
 mod gap_fill;
+mod handoff;
 mod health_view;
 mod hotkeys_view;
 mod journal;
@@ -1044,6 +1045,7 @@ pub struct TerminalApp {
     dock: Node,
     focus: PaneId,
     next_id: PaneId,
+    handoff: handoff::Handoff,
     last_opened: Option<PaneId>,
     /// Preset last applied, for the toolbar picker (cleared by manual rearranging).
     preset: Option<Layout>,
@@ -1247,6 +1249,7 @@ impl TerminalApp {
             dock: Node::default(),
             focus: 0,
             next_id: 1,
+            handoff: Default::default(),
             last_opened: None,
             preset: None,
             drag: None,
@@ -1369,7 +1372,8 @@ impl TerminalApp {
             watchlists: Some(self.watchlists.clone()),
             recent_symbols: self.recent_symbols.clone(),
             sidebar: self.sidebar_open,
-            active_layout: Some(self.layout_name.clone()),
+            // A temporary hand-off layout is never reopened; its origin is.
+            active_layout: Some(self.handoff_origin_name().unwrap_or(&self.layout_name).to_owned()),
             layout: None,
             panes: None,
         };
@@ -2407,6 +2411,7 @@ impl TerminalApp {
     /// Global and chart hotkeys. Runs before the command line so it can claim keys; when
     /// the command line holds text, keys belong to it.
     fn hotkeys(&mut self, ctx: &egui::Context) {
+        self.clear_handoff_arrival_on_input(ctx);
         let presses: Vec<(Key, Modifiers)> = ctx.input(|i| {
             i.events
                 .iter()
@@ -2494,6 +2499,9 @@ impl TerminalApp {
         if other_text_focused {
             return;
         }
+        if !cmd_focused && !self.focus_cmd && self.cmd.is_empty() && self.handoff_keys(ctx) {
+            return;
+        }
         if !cmd_focused && !self.focus_cmd && self.cmd.is_empty() && self.clock_keys(ctx) {
             return;
         }
@@ -2579,7 +2587,9 @@ impl TerminalApp {
                 c.cancel();
             });
         }
-        if pressed(Modifiers::NONE, Key::Delete) || pressed(Modifiers::NONE, Key::Backspace) {
+        let delete = pressed(Modifiers::NONE, Key::Delete);
+        let backspace = !self.handoff_live() && pressed(Modifiers::NONE, Key::Backspace);
+        if delete || backspace {
             self.with_chart(|c, _| {
                 c.delete_selected();
             });
@@ -2658,10 +2668,8 @@ impl TerminalApp {
             }
             A::ClosePane => self.close_pane(self.focus),
             A::PopOut => self.pop_out(self.focus),
-            A::SaveLayout => {
-                self.save_layout();
-                self.status = format!("Saved layout {:?}", self.layout_name);
-            }
+            // Same as LAYOUT SAVE (adopts a live hand-off view after saving its origin).
+            A::SaveLayout => self.layout_command("SAVE"),
             A::Settings => self.apply(Function::Settings),
             A::CommandPalette => self.palette.toggle(),
             A::DrawTrendline => self.with_chart(|c, _| c.start_tool(Tool::Trendline)),
@@ -2813,10 +2821,11 @@ impl TerminalApp {
     }
 
     /// Save the active layout (only when it changed) and app settings.
+    /// With hand-off hops live this keeps saving: the hop origin under its own name
+    /// (see `save_layout`), preserving pre-hop work through long navigation sessions.
     fn autosave(&mut self) {
         self.save_dirty_themes(true);
-        let json = self.current_doc().to_json();
-        if json != self.last_saved {
+        if self.layout_dirty() {
             self.save_layout();
         }
         self.save_settings();
@@ -3070,6 +3079,7 @@ mod tests {
             dock: Node::default(),
             focus: 0,
             next_id: 1,
+            handoff: Default::default(),
             last_opened: None,
             preset: None,
             drag: None,

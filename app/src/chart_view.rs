@@ -902,6 +902,11 @@ impl ChartState {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn select_drawing_for_test(&mut self, index: usize) {
+        self.draw.selected = Some(index);
+    }
+
     pub fn delete_selected(&mut self) -> bool {
         if self.delete_selected_anchor() {
             return true;

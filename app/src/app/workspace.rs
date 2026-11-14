@@ -1050,17 +1050,24 @@ impl TerminalApp {
                 PaneKind::Journal(Box::new(super::journal::JournalPane::new(filter)))
             }
             "DIST" | "RDIST" => {
-                let symbol = symbol.map(|s| tr_data::security(s).key()).or_else(|| self.focused_symbol()).unwrap_or_default();
+                let symbol =
+                    symbol.map(|s| tr_data::security(s).key()).or_else(|| self.focused_symbol()).unwrap_or_default();
                 let timeframe = tr_data::studio_dist::parse_timeframe(&words.get(1..).unwrap_or(&[]).join(" ")).ok()?;
-                PaneKind::StudioDist(Box::new(super::studio_dist::DistPane::new(symbol, timeframe, tr_data::studio_dist::Window::All)))
+                PaneKind::StudioDist(Box::new(super::studio_dist::DistPane::new(
+                    symbol,
+                    timeframe,
+                    tr_data::studio_dist::Window::All,
+                )))
             }
             "CORR" | "RBETA" => {
-                let symbol = symbol.map(|s| tr_data::security(s).key()).or_else(|| self.focused_symbol()).unwrap_or_default();
+                let symbol =
+                    symbol.map(|s| tr_data::security(s).key()).or_else(|| self.focused_symbol()).unwrap_or_default();
                 let spec = words.get(1..).unwrap_or(&[]).join(" ");
                 PaneKind::StudioCorr(Box::new(super::studio_corr::CorrPane::new(symbol, spec)))
             }
             "SEASON" | "SSN" => {
-                let symbol = symbol.map(|s| tr_data::security(s).key()).or_else(|| self.focused_symbol()).unwrap_or_default();
+                let symbol =
+                    symbol.map(|s| tr_data::security(s).key()).or_else(|| self.focused_symbol()).unwrap_or_default();
                 let spec = words.get(1..).unwrap_or(&[]).join(" ");
                 PaneKind::StudioSeason(Box::new(super::studio_season::SeasonPane::new(symbol, spec)))
             }
@@ -1245,6 +1252,7 @@ impl TerminalApp {
             .filter(|s| !s.is_empty())
             .or_else(|| self.focused_symbol())
             .unwrap_or_else(|| tr_data::security("AAPL").key());
+        self.handoff_unwind();
         if !self.layout_name.eq_ignore_ascii_case(INTRADAY_DESK) {
             self.save_layout();
         }
@@ -1289,6 +1297,15 @@ impl TerminalApp {
     /// name in the Blue link group (middle interval large, slow top-right, fast
     /// bottom-right), TSTACK and RAIL on. The previous layout is kept under its own name.
     pub(super) fn open_cockpit(&mut self, symbol: Option<&str>, spec: &str) {
+        self.build_cockpit(symbol, spec, true);
+    }
+
+    /// Hand-off workspaces are temporary: no synchronous layout/settings writes.
+    pub(super) fn handoff_cockpit(&mut self, symbol: &str) {
+        self.build_cockpit(Some(symbol), "", false);
+    }
+
+    fn build_cockpit(&mut self, symbol: Option<&str>, spec: &str, persist: bool) {
         let frames = match crate::command::cockpit_ladder(spec) {
             Ok(frames) => frames,
             Err(e) => {
@@ -1301,7 +1318,11 @@ impl TerminalApp {
             .filter(|s| !s.is_empty())
             .or_else(|| self.focused_symbol())
             .unwrap_or_else(|| tr_data::security("AAPL").key());
-        if !self.layout_name.eq_ignore_ascii_case(COCKPIT) {
+        if persist {
+            // The COCKPIT command leaves any hand-off: back to the real layout first.
+            self.handoff_unwind();
+        }
+        if persist && !self.layout_name.eq_ignore_ascii_case(COCKPIT) {
             self.save_layout();
         }
         for p in std::mem::take(&mut self.panes) {
@@ -1334,8 +1355,10 @@ impl TerminalApp {
         self.preset = Some(Layout::MainRight2);
         self.focus = ids[0];
         self.layout_name = COCKPIT.into();
-        self.save_layout();
-        self.save_settings();
+        if persist {
+            self.save_layout();
+            self.save_settings();
+        }
         let ticker = tr_data::security(&key).ticker;
         self.status = format!("{ticker}: {chip} — native linked charts, Time Link, Lens, Alt+A anchors VWAP");
     }
@@ -1507,7 +1530,21 @@ impl TerminalApp {
 
     /// Replace the workspace with `doc`. Pane ids are reassigned so responses for the old
     /// panes can never reach the new ones.
-    pub(super) fn apply_doc(&mut self, mut doc: LayoutDoc) {
+    pub(super) fn apply_doc(&mut self, doc: LayoutDoc) {
+        // A replaced workspace makes any hand-off snapshots stale.
+        self.handoff_forget();
+        self.apply_doc_with_origin(doc, None);
+    }
+
+    /// Restore a cached hand-off source at its snapshot ordinal, including transient
+    /// selection/filter/replay state. New ids isolate it from all departure responses.
+    /// Returns the doc-id → new-id map.
+    pub(super) fn apply_doc_with_origin(
+        &mut self,
+        mut doc: LayoutDoc,
+        mut origin: Option<(usize, PaneKind)>,
+    ) -> HashMap<PaneId, PaneId> {
+        let transient = origin.is_some();
         doc.repair();
         for p in std::mem::take(&mut self.panes) {
             self.worker.send(Request::Forget(p.id));
@@ -1517,8 +1554,16 @@ impl TerminalApp {
             self.watch_ui.selected_group = self.watchlists.last_used.clone();
         }
         let mut map = HashMap::new();
-        for sp in doc.panes {
-            let id = self.new_pane(PaneKind::from_settings(sp.settings));
+        for (ordinal, sp) in doc.panes.into_iter().enumerate() {
+            let id = if origin.as_ref().is_some_and(|(at, _)| *at == ordinal) {
+                let (_, kind) = origin.take().expect("source ordinal");
+                let id = self.next_id;
+                self.next_id += 1;
+                self.panes.push(Pane { id, kind, link: None, title: None, window: None });
+                id
+            } else {
+                self.new_pane(PaneKind::from_settings(sp.settings))
+            };
             map.insert(sp.id, id);
             if let Some(p) = self.pane_mut(id) {
                 p.link = sp.link;
@@ -1532,13 +1577,19 @@ impl TerminalApp {
             && !name.eq_ignore_ascii_case(&self.prefs.appearance.theme)
             && (name.eq_ignore_ascii_case(crate::themes::SYSTEM) || crate::themes::find(&self.themes, name).is_some())
         {
-            self.select_theme(name);
+            if transient {
+                self.prefs.appearance.theme = name.to_owned();
+            } else {
+                self.select_theme(name);
+            }
         }
         if let Some(side) = doc.sidebar_side
             && side != self.prefs.appearance.sidebar_side
         {
             self.prefs.appearance.sidebar_side = side;
-            self.save_prefs();
+            if !transient {
+                self.save_prefs();
+            }
         }
         self.dock = doc.dock;
         self.focus = doc.focus.and_then(|f| map.get(&f).copied()).unwrap_or(0);
@@ -1553,15 +1604,55 @@ impl TerminalApp {
         self.drag = None;
         self.renaming_tab = None;
         self.last_saved = self.current_doc().to_json();
+        map
     }
 
-    pub(super) fn save_layout(&mut self) {
-        let doc = self.current_doc();
+    /// Write the active layout under its name. While hand-off hops are live this
+    /// writes the hop stack's origin layout (with safe edits folded in) under the
+    /// origin's name instead: a temporary hop layout never reaches a named file.
+    pub(super) fn save_layout(&mut self) -> bool {
+        let (doc, hop) = match self.handoff_persist_doc() {
+            Some(doc) => (doc, true),
+            None => (self.current_doc(), false),
+        };
         match self.store.save(&doc) {
+            Ok(_) if hop => self.handoff_mark_saved(doc.to_json()),
             Ok(_) => self.last_saved = doc.to_json(),
-            Err(e) => self.status = format!("Could not save layout: {e:#}"),
+            Err(e) => {
+                self.status = format!("Could not save layout: {e:#}");
+                return false;
+            }
         }
         self.refresh_layout_names();
+        true
+    }
+
+    /// Explicitly adopt the visible workspace, only clearing navigation once both
+    /// the origin and the requested view have reached disk successfully.
+    fn save_layout_view_as(&mut self, name: &str) -> bool {
+        if !self.save_layout() {
+            return false;
+        }
+        let mut doc = self.current_doc();
+        doc.name = name.to_owned();
+        if let Err(e) = self.store.save(&doc) {
+            self.status = format!("Could not save layout: {e:#}");
+            return false;
+        }
+        self.handoff_forget();
+        self.layout_name = doc.name.clone();
+        self.last_saved = doc.to_json();
+        self.refresh_layout_names();
+        self.save_settings();
+        true
+    }
+
+    /// The JSON autosave would write now, and whether it differs from the last write.
+    pub(super) fn layout_dirty(&self) -> bool {
+        match self.handoff_persist_doc() {
+            Some(doc) => self.handoff_saved_json() != Some(doc.to_json().as_slice()),
+            None => self.current_doc().to_json() != self.last_saved,
+        }
     }
 
     pub(super) fn refresh_layout_names(&mut self) {
@@ -1569,11 +1660,14 @@ impl TerminalApp {
     }
 
     pub(super) fn switch_layout(&mut self, name: &str) {
+        self.handoff_unwind();
         if name.eq_ignore_ascii_case(&self.layout_name) {
             self.status = format!("Already on layout {name:?}");
             return;
         }
-        self.save_layout();
+        if !self.save_layout() {
+            return;
+        }
         match self.store.load(name) {
             Ok(doc) => {
                 self.apply_doc(doc);
@@ -1592,6 +1686,15 @@ impl TerminalApp {
             self.apply(crate::command::Function::Layouts);
             return;
         };
+        // Saving adopts the current view (after persisting the hop origin); presets
+        // rearrange it in place. Anything else manages named layouts: unwind first
+        // so ops below name the user's real layout, never a temporary hop one.
+        if matches!(
+            first.as_str(),
+            "RENAME" | "MV" | "DUP" | "DUPLICATE" | "COPY" | "DEL" | "DELETE" | "RM" | "EXPORT" | "THEME"
+        ) {
+            self.handoff_unwind();
+        }
         if words.len() == 1
             && let Some(l) = Layout::parse(&first)
         {
@@ -1600,7 +1703,9 @@ impl TerminalApp {
         }
         let op = match first.as_str() {
             "SAVE" if words.len() == 1 => {
-                self.save_layout();
+                if !self.save_layout_view_as(&self.layout_name.clone()) {
+                    return;
+                }
                 self.status = format!("Saved layout {:?}", self.layout_name);
                 return;
             }
@@ -1633,6 +1738,9 @@ impl TerminalApp {
     }
 
     pub(super) fn layout_op(&mut self, op: LayoutOp) {
+        if !matches!(op, LayoutOp::SaveAs(_) | LayoutOp::OpenFolder | LayoutOp::Import(_)) {
+            self.handoff_unwind();
+        }
         let result: anyhow::Result<String> = (|| match op {
             LayoutOp::Switch(name) => {
                 self.switch_layout(&name);
@@ -1654,10 +1762,11 @@ impl TerminalApp {
                 if self.store.exists(&name) && !name.eq_ignore_ascii_case(&self.layout_name) {
                     anyhow::bail!("a layout named {name:?} already exists (LAYOUT DEL it first)");
                 }
-                self.save_layout();
-                self.layout_name = name.clone();
-                self.save_layout();
-                self.save_settings();
+                // With hops live this persists the origin; the view then stops being
+                // temporary and is saved under the new name only.
+                if !self.save_layout_view_as(&name) {
+                    anyhow::bail!("{}", self.status);
+                }
                 Ok(format!("Saved as {name:?}"))
             }
             LayoutOp::Rename(old, new) => {
@@ -2194,6 +2303,7 @@ impl TerminalApp {
     /// Draw each popped-out pane in its own native window.
     pub(super) fn render_windows(&mut self, ctx: &egui::Context) -> Vec<Action> {
         let mut actions = Vec::new();
+        let mut handoff = None;
         let ids: Vec<PaneId> = self.panes.iter().filter(|p| p.window.is_some()).map(|p| p.id).collect();
         for id in ids {
             let Some(i) = self.idx(id) else { continue };
@@ -2206,7 +2316,13 @@ impl TerminalApp {
                 .with_min_inner_size([320.0, 220.0]);
             let mut dock_back = false;
             let mut new_geom = None;
-            ctx.show_viewport_immediate(ViewportId::from_hash_of(("pane-window", id)), builder, |ui, _class| {
+            ctx.show_viewport_immediate(ViewportId::from_hash_of(("pane-window", id)), builder, |ui, class| {
+                // Native focus can change through the window manager, without a
+                // click in the pane. Embedded viewports share the root input.
+                if class != egui::ViewportClass::EmbeddedWindow && ui.input(|inp| inp.viewport().focused == Some(true))
+                {
+                    self.focus = id;
+                }
                 let rect = ui.max_rect();
                 ui.painter().rect_filled(rect, 0.0, theme::window());
                 let bar = Rect::from_min_size(rect.min, vec2(rect.width(), dp(30.0)));
@@ -2232,8 +2348,21 @@ impl TerminalApp {
                 let content =
                     Rect::from_min_max(pos2(rect.left() + 6.0, bar.bottom() + 6.0), rect.max - vec2(6.0, 6.0));
                 let inner = widgets::card(ui, content, 0.0);
+                // Keys typed in this window never reach the root hotkeys. Read
+                // hand-off keys here, run them after the loop (they replace panes).
+                if self.focus == id {
+                    self.clear_handoff_arrival_on_input(ui.ctx());
+                    if let (_, Some(intent)) = self.handoff_input(ui.ctx()) {
+                        handoff = Some((id, intent));
+                    }
+                }
                 let (acts, clicked) = self.render_content(ui, i, inner, self.focus == id);
                 actions.extend(acts);
+                if self.focus == id
+                    && let Some(intent) = self.handoff_menu_input(ui.ctx(), content.left_bottom())
+                {
+                    handoff = Some((id, intent));
+                }
                 if clicked || ui.input(|inp| inp.pointer.primary_pressed()) {
                     self.focus = id;
                 }
@@ -2258,6 +2387,10 @@ impl TerminalApp {
             {
                 p.window = Some(g);
             }
+        }
+        if let Some((id, intent)) = handoff {
+            self.focus = id;
+            self.run_handoff(intent);
         }
         actions
     }

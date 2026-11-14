@@ -22,6 +22,21 @@ missing metrics and unmet filters. A missing weekly/monthly lookback does not hi
 an otherwise valid daily candidate until that timeframe's condition is requested.
 Text search omissions and non-matching setups are not data failures.
 
+## Keys (SCAN / UNIV)
+
+| Key | Action |
+| --- | --- |
+| ↑/↓ or j/k | Select a row in displayed order |
+| Page Up/Down, Home/End | Move through the list |
+| Enter | Open selected symbol in the archive chart, retaining list focus |
+| N | Open TWALL D of the visible 2–24 names, otherwise only the selected name |
+| Shift+N | CLOCK or chart + TSTACK |
+| Backspace | Return through a live hand-off stack |
+| w / Shift+W | Pick a watchlist group / save to last-used group |
+
+Hand-off is inactive in the archive management/history view. Keys require an empty
+command line and no focused text editor. See [Next ▸ hand-off](NEXT_HANDOFF.md).
+
 ## Shared Rust calculation contract
 
 Implementation: `crates/data/src/whats_news/scanner.rs`. Both archives and HTTP

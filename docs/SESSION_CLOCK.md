@@ -8,6 +8,24 @@ through the application's update lifecycle during cash hours, including the clos
 The amber outline follows the current cash bucket. Narrower buckets scroll horizontally;
 the default grid fits a 600 px pane.
 
+## Keys and selection
+
+| Key / control | Action |
+| --- | --- |
+| Click historical cell | Select a weekday/ALL bucket, including holes and LOW N cells |
+| Arrow keys | Start selection at Mon's first bucket; move within the grid |
+| Click Session Clock heading | Select the symbol without a bucket |
+| N | Open this symbol's 5m chart with Auction Map enabled |
+| Shift+N | SPATH, BRIEF or COCKPIT |
+| Backspace | Return through a live hand-off stack |
+| R / Reload | Retry the existing worker request |
+
+N needs a selected cell or symbol heading. A bucket is named in status; when it
+has observations, the chart uses its existing timestamp jump to the most recent
+contributing closed session, applying it when bars arrive. Holes and symbol-only
+selections do not jump. TODAY remains descriptive. Command/text inputs retain their
+keys. See [Next ▸ hand-off](NEXT_HANDOFF.md) for the crumb and layout restoration.
+
 ## Observations and admission
 
 The worker reads only `history_for_analysis`, with the shared

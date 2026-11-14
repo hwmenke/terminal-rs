@@ -19,12 +19,15 @@ Aliases: `TGRID`, `STACKS`, `MTFGRID`. An explicit yellow key still names a secu
 `TGRID US Equity` opens that symbol. Symbols beyond the cap are listed as “not loaded”.
 Intraday mode uses US cash-session securities; unsupported sessions are flagged.
 
-With the pane focused, an empty command line and no modifiers:
+With the pane focused and an empty command line (Shift only where shown):
 
 | Key | Action |
 | --- | --- |
 | ↑/↓ or J/K | Select row |
 | Enter | Open selected symbol at 5m (daily in archive mode), with TSTACK enabled |
+| N | Intraday: COCKPIT of selected symbol; archive: CLOCK |
+| Shift+N | Alternate destinations |
+| Backspace | Return through a live hand-off stack |
 | S | Cycle stack alignment, flip age, cushion, original list order |
 | D | Toggle intraday/archive |
 | R | Reload |
@@ -70,3 +73,5 @@ Its key includes content revision, rectangle, sort and theme colours; moving the
 hover crosshair does not rebuild the mesh. The 24-symbol cap bounds painting and
 worker acquisition. Worker rows stream after each symbol's native fetches, with
 computation on `spawn_blocking`; pane generations discard superseded responses.
+
+See [Next ▸ hand-off](NEXT_HANDOFF.md) for the crumb, command-bar isolation and temporary layout snapshots.
