@@ -1118,7 +1118,12 @@ impl TerminalApp {
         p.hline(rect.x_range(), rect.top() + 0.5, Stroke::new(1.0, theme::border()));
         let cy = rect.center().y;
         let mut x = rect.left() + 10.0;
-        if self.cmd.trim().is_empty() {
+        let crumb = self.handoff_crumb(ui, rect);
+        self.handoff_menu(ui.ctx(), rect.left_bottom());
+        if let Some(end) = crumb {
+            x = end;
+        }
+        if self.cmd.trim().is_empty() && crumb.is_none() {
             use crate::prefs::Action as A;
             let keys: Vec<(String, &str)> = [
                 (A::Help, "Help"),
@@ -1147,8 +1152,11 @@ impl TerminalApp {
                 p.galley(pos2(x, cy - g.size().y / 2.0), g.clone(), muted());
                 x += g.size().x + 12.0;
             }
-        } else {
-            p.text(pos2(x, cy), Align2::LEFT_CENTER, command::hint(&self.cmd), mono(11.0), text());
+        } else if !self.cmd.trim().is_empty() {
+            // Typing keeps its hint; with a live hop it continues after the crumb.
+            let clip =
+                if crumb.is_some() { Rect::from_min_max(rect.min, pos2(rect.center().x, rect.bottom())) } else { rect };
+            p.with_clip_rect(clip).text(pos2(x, cy), Align2::LEFT_CENTER, command::hint(&self.cmd), mono(11.0), text());
         }
         let mut status = if self.show_perf {
             format!(
@@ -1164,7 +1172,13 @@ impl TerminalApp {
         if let Some(position) = self.watch_position() {
             status = format!("{position} · {status}");
         }
-        p.text(pos2(rect.right() - 10.0, cy), Align2::RIGHT_CENTER, status, ui_font(11.5), muted());
+        p.with_clip_rect(Rect::from_min_max(pos2(rect.center().x, rect.top()), rect.max)).text(
+            pos2(rect.right() - 10.0, cy),
+            Align2::RIGHT_CENTER,
+            status,
+            ui_font(11.5),
+            muted(),
+        );
     }
 
     /// Alerts stacked at the top right: each slides in from the edge with a slight

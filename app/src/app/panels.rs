@@ -15,6 +15,15 @@ use crate::worker::Request;
 impl TerminalApp {
     /// Draw pane `i` into `rect`. Returns its actions and whether it was clicked.
     pub(super) fn render_content(&mut self, ui: &mut Ui, i: usize, rect: Rect, focused: bool) -> (Vec<Action>, bool) {
+        if self.handoff_refusal(ui, self.panes[i].id, rect) {
+            return (vec![], false);
+        }
+        let result = self.render_content_inner(ui, i, rect, focused);
+        self.paint_handoff_arrival(ui, self.panes[i].id, rect);
+        result
+    }
+
+    fn render_content_inner(&mut self, ui: &mut Ui, i: usize, rect: Rect, focused: bool) -> (Vec<Action>, bool) {
         let mut actions = Vec::new();
         let id = self.panes[i].id;
         let dragging = self.drag.is_some_and(|d| d.active);

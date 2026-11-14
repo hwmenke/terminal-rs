@@ -10,6 +10,7 @@ use crate::{
 use egui::{Align2, Color32, Key, Modifiers, Rect, RichText, Sense, Shape, Stroke, StrokeKind, Ui, pos2, vec2};
 use tr_data::session_clock::{self, ClockCell, MIN_SAMPLES, ROWS, SessionClock};
 
+#[derive(Clone)]
 pub struct SessionClockPane {
     pub symbol: String,
     pub spec: String,
@@ -18,6 +19,8 @@ pub struct SessionClockPane {
     pub clock: Option<SessionClock>,
     pub loading: bool,
     pub error: Option<String>,
+    pub selected: Option<(usize, usize)>,
+    pub symbol_selected: bool,
     requested: Option<std::time::Instant>,
 }
 
@@ -33,6 +36,8 @@ impl SessionClockPane {
             clock: None,
             loading: false,
             error: None,
+            selected: None,
+            symbol_selected: false,
             requested: None,
         }
     }
@@ -70,6 +75,10 @@ impl SessionClockPane {
         match result {
             Ok(clock) if clock.provenance.is_verified() => {
                 self.tf = clock.timeframe.label().into();
+                self.selected = self.selected.and_then(|(row, col)| {
+                    (!clock.minutes.is_empty())
+                        .then_some((row.min(ROWS.len() - 1), col.min(clock.minutes.len().saturating_sub(1))))
+                });
                 self.clock = Some(clock);
                 self.error = None;
             }
@@ -112,20 +121,31 @@ impl TerminalApp {
     }
 
     pub(super) fn clock_keys(&mut self, ctx: &egui::Context) -> bool {
-        if !ctx.input(|i| i.key_pressed(Key::R) && !i.modifiers.any()) {
+        let Some(i) = self.idx(self.focus) else { return false };
+        let id = self.panes[i].id;
+        let PaneKind::SessionClock(pane) = &mut self.panes[i].kind else { return false };
+        let key = ctx.input(|i| {
+            if i.modifiers.any() {
+                return None;
+            }
+            [Key::R, Key::ArrowDown, Key::ArrowUp, Key::ArrowLeft, Key::ArrowRight]
+                .into_iter()
+                .find(|k| i.key_pressed(*k))
+        });
+        let Some(key) = key else { return false };
+        if key == Key::R {
+            pane.request(id, &self.worker);
+        } else if let Some(clock) = &pane.clock {
+            pane.selected = move_cell(pane.selected, key, clock.minutes.len());
+            pane.symbol_selected = false;
+        } else {
             return false;
         }
-        let Some(i) = self.idx(self.focus) else {
-            return false;
-        };
-        let id = self.panes[i].id;
-        let PaneKind::SessionClock(pane) = &mut self.panes[i].kind else {
-            return false;
-        };
-        pane.request(id, &self.worker);
         ctx.input_mut(|i| {
-            i.consume_key(Modifiers::NONE, Key::R);
-            i.events.retain(|e| !matches!(e, egui::Event::Text(t) if t.eq_ignore_ascii_case("r")));
+            i.consume_key(Modifiers::NONE, key);
+            if key == Key::R {
+                i.events.retain(|e| !matches!(e, egui::Event::Text(t) if t.eq_ignore_ascii_case("r")));
+            }
         });
         true
     }
@@ -138,7 +158,14 @@ impl TerminalApp {
         };
         let mut reload = false;
         ui.horizontal_wrapped(|ui| {
-            ui.label(RichText::new("Session Clock").strong().color(text()));
+            if ui
+                .selectable_label(pane.symbol_selected, RichText::new("Session Clock").strong().color(text()))
+                .on_hover_text("Select symbol for N next")
+                .clicked()
+            {
+                pane.symbol_selected = true;
+                pane.selected = None;
+            }
             if ui.small_button("Reload · R").clicked() {
                 reload = true;
             }
@@ -177,7 +204,12 @@ impl TerminalApp {
                 ui.label(RichText::new("Reading verified cash-session bars…").color(muted()));
             }
             if let Some(clock) = &pane.clock {
-                render_clock(ui, clock, chrono::Utc::now().timestamp());
+                render_clock_selected(ui, clock, chrono::Utc::now().timestamp(), &mut pane.selected);
+                ui.label(
+                    RichText::new("Click / arrows select · N next · ⇧N more · R reload")
+                        .font(mono(10.0))
+                        .color(muted()),
+                );
             }
         }
         if reload {
@@ -195,7 +227,29 @@ fn refusal_card(ui: &mut Ui, reason: &str) -> bool {
     widgets::unavailable_card(ui, rect, &tr_data::FeedState::Unsupported { reason })
 }
 
+#[cfg(test)]
 fn render_clock(ui: &mut Ui, clock: &SessionClock, now: i64) {
+    render_clock_selected(ui, clock, now, &mut None);
+}
+
+fn move_cell(selected: Option<(usize, usize)>, key: Key, columns: usize) -> Option<(usize, usize)> {
+    if columns == 0 {
+        return None;
+    }
+    let Some((row, col)) = selected else {
+        return Some((0, 0));
+    };
+    let (row, col) = (row.min(ROWS.len() - 1), col.min(columns - 1));
+    Some(match key {
+        Key::ArrowDown => ((row + 1).min(ROWS.len() - 1), col),
+        Key::ArrowUp => (row.saturating_sub(1), col),
+        Key::ArrowRight => (row, (col + 1).min(columns - 1)),
+        Key::ArrowLeft => (row, col.saturating_sub(1)),
+        _ => (row, col),
+    })
+}
+
+fn render_clock_selected(ui: &mut Ui, clock: &SessionClock, now: i64, selected: &mut Option<(usize, usize)>) {
     // Defense in depth for callers outside the pane's response gate.
     if !clock.provenance.is_verified() {
         refusal_card(ui, "Verified real data is required.");
@@ -266,7 +320,16 @@ fn render_clock(ui: &mut Ui, clock: &SessionClock, now: i64) {
                 if row < 6 {
                     let cell = &clock.cells[row][col];
                     paint_cell(painter, r, cell.mean, cell.passes(clock.joint_p), cell.n < MIN_SAMPLES);
-                    ui.interact(r, ui.id().with(("clock", row, col)), Sense::hover()).on_hover_text(hover_cell(cell));
+                    if ui
+                        .interact(r, ui.id().with(("clock", row, col)), Sense::click())
+                        .on_hover_text(hover_cell(cell))
+                        .clicked()
+                    {
+                        *selected = Some((row, col));
+                    }
+                    if *selected == Some((row, col)) {
+                        painter.rect_stroke(r, 2.0, Stroke::new(2.0, theme::accent()), StrokeKind::Inside);
+                    }
                 } else {
                     // TODAY is descriptive only: it has no p/q and never earns a significance fill.
                     paint_cell(
@@ -366,6 +429,100 @@ mod tests {
                 _ => None,
             })
             .collect()
+    }
+
+    #[test]
+    fn clock_selection_arrows_and_next_enable_auction_of_the_selected_symbol() {
+        let mut app = test_app();
+        let (worker, _) = crate::worker::Worker::test_live_channel();
+        app.worker = worker;
+        app.focus_cmd = false;
+        app.open_session_clock(Some("AAPL"), "");
+        let i = app.idx(app.focus).unwrap();
+        let PaneKind::SessionClock(c) = &mut app.panes[i].kind else { panic!() };
+        c.accept(c.generation, Ok(fixture()));
+        let key = |app: &mut TerminalApp, key| {
+            let mut handled = false;
+            egui::Context::default()
+                .run_ui(
+                    egui::RawInput {
+                        events: vec![egui::Event::Key {
+                            key,
+                            physical_key: None,
+                            pressed: true,
+                            repeat: false,
+                            modifiers: Modifiers::NONE,
+                        }],
+                        ..Default::default()
+                    },
+                    |ui| {
+                        handled = app.handoff_keys(ui.ctx()) || app.clock_keys(ui.ctx());
+                    },
+                )
+                .textures_delta
+                .clear();
+            handled
+        };
+        assert!(!key(&mut app, Key::N));
+        assert!(key(&mut app, Key::ArrowDown));
+        assert!(key(&mut app, Key::ArrowRight));
+        let PaneKind::SessionClock(c) = &app.panes[i].kind else { panic!() };
+        assert_eq!(c.selected, Some((0, 1)));
+        assert!(key(&mut app, Key::N));
+        assert!(app.status.contains("Mon 10:00"));
+        let i = app.idx(app.focus).unwrap();
+        let PaneKind::Chart(c) = &app.panes[i].kind else { panic!("chart") };
+        assert_eq!(c.symbol, "AAPL US Equity");
+        assert!(matches!(app.panes[i].kind.settings(), crate::layouts::PaneSettings::Chart { auction: Some(_), .. }));
+        assert_eq!(c.tf, Timeframe::M5);
+        assert!(key(&mut app, Key::Backspace));
+        let i = app.idx(app.focus).unwrap();
+        let PaneKind::SessionClock(c) = &app.panes[i].kind else { panic!("clock") };
+        assert_eq!(c.selected, Some((0, 1)));
+        assert!(c.clock.is_some());
+        assert_eq!(move_cell(Some((0, 0)), Key::ArrowLeft, 13), Some((0, 0)));
+        assert_eq!(move_cell(Some((5, 12)), Key::ArrowDown, 13), Some((5, 12)));
+    }
+
+    #[test]
+    fn clock_click_selects_a_hole_without_creating_observations() {
+        let ctx = egui::Context::default();
+        let clock = fixture();
+        let mut selected = None;
+        let input = |events| egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(egui::Pos2::ZERO, vec2(900.0, 650.0))),
+            events,
+            ..Default::default()
+        };
+        let mut out = ctx.run_ui(input(vec![]), |ui| render_clock_selected(ui, &clock, clock.last_ts, &mut selected));
+        let rect = out
+            .shapes
+            .iter()
+            .find_map(|s| match &s.shape {
+                Shape::Rect(r) if r.rect.height() == 28.0 && r.rect.left() > 100.0 => Some(r.rect),
+                _ => None,
+            })
+            .expect("cell");
+        out.textures_delta.clear();
+        let pos = rect.center();
+        for pressed in [true, false] {
+            ctx.run_ui(
+                input(vec![
+                    egui::Event::PointerMoved(pos),
+                    egui::Event::PointerButton {
+                        pos,
+                        button: egui::PointerButton::Primary,
+                        pressed,
+                        modifiers: Modifiers::NONE,
+                    },
+                ]),
+                |ui| render_clock_selected(ui, &clock, clock.last_ts, &mut selected),
+            )
+            .textures_delta
+            .clear();
+        }
+        assert_eq!(selected, Some((0, 1)));
+        assert_eq!(clock.cells[0][1].mean, None);
     }
 
     #[test]

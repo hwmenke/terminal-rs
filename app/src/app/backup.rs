@@ -263,6 +263,9 @@ impl TerminalApp {
                 return;
             }
         };
+        // Restored layouts replace the store: leave any hand-off (no writes) so a
+        // stale hop origin is never persisted over them.
+        self.handoff_unwind();
         if let Ok(prefs) = serde_json::from_value::<crate::prefs::Prefs>(payload.prefs.clone()) {
             self.prefs = prefs;
             self.save_prefs();

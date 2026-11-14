@@ -76,6 +76,7 @@ impl DisplayRow<'_> {
     }
 }
 
+#[derive(Clone)]
 pub struct ResearchPane {
     pub scan: Option<String>,
     filter_scan: Option<String>,
@@ -197,7 +198,7 @@ impl ResearchPane {
         self.error = None;
         worker.send(Request::Research { pane, generation: self.generation, scan: self.scan.clone() });
     }
-    fn visible_symbols(&self) -> Vec<&str> {
+    pub(super) fn visible_symbols(&self) -> Vec<&str> {
         let query = self.search.trim().to_ascii_uppercase();
         if let Some(s) = &self.results {
             return self
@@ -309,7 +310,7 @@ impl ResearchPane {
             ui.ctx().request_repaint_after(std::time::Duration::from_secs(60));
             self.scan_controls(ui);
         }
-        ui.label("↑/↓ j/k · PgUp/PgDn Home/End · Enter: chart · w/W: save to group");
+        ui.label("↑/↓ j/k · PgUp/PgDn Home/End · Enter: chart · N next · ⇧N more · w/W: save to group");
         if self.loading {
             ui.spinner();
             ui.label("Reading research archive…");

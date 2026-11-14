@@ -78,6 +78,9 @@ reloading RRG never downloads history.
 | A | Add missing archive names through HIST ADD |
 | j/k or Down/Up | Select a visible name |
 | Enter | Open the selected name in the active archive chart; keep RRG focus |
+| N | Intraday TWALL of this list, selecting the same name |
+| Shift+N | COCKPIT, CLOCK, or archive chart + TSTACK |
+| Backspace | Return through a live hand-off stack |
 | Esc | Clear selection |
 | / | Focus command bar |
 
@@ -90,3 +93,5 @@ Reduced motion removes the entrance and steps playback by whole frames.
 
 The pane docks, splits, pops out, and persists its spec, tail and table visibility
 in layouts. It has no default global hotkey and no trading, alert or export hooks.
+
+See [Next ▸ hand-off](NEXT_HANDOFF.md) for the crumb, command-bar isolation and temporary layout snapshots.
