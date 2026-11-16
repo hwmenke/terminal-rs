@@ -22,16 +22,18 @@ editing controls marks them dirty while accepted evidence keeps its own settings
 - **DSR gauge** is a probability, coloured cyan. Marks are .50, .95 and .99,
   without an approval verdict. Fewer than 30 common sessions is labelled
   **LOW N** and hatched. Unavailable confidence has a reason and no gauge fill.
-  DSR estimates the probability that true Sharpe exceeds zero after adjustment
-  for tried variants. It belongs to the selected variant, never an implicit
+  **DSR is the probability the true Sharpe beats SR\***, the best Sharpe you'd
+  expect from `N_eff` lucky zero-skill variants; it is *not* the probability
+  that the true Sharpe exceeds zero. **PSR** is that undeflated probability
+  (true Sharpe > 0). DSR belongs to the selected variant, never an implicit
   benchmark or a winner chosen using OOS results. `N_raw` is the durable count
   of distinct experiments; `N_eff` is the common-date correlation cluster count.
   Missing estimates are grey em dashes with a reason. PSR/DSR hover cards
   substitute the selected trial's actual session Sharpe, benchmark, n, skew,
-  Pearson kurtosis and probability variance into the formula.
-- **Sharpe bar** puts annualised raw SR and the annualised null maximum on one
-  signed axis. Their difference is **Sharpe above null maximum**; DSR itself
-  is not a reduced Sharpe estimate.
+  Pearson kurtosis and probability variance into the formula; the DSR card also
+  shows SR\* with its inputs (`N_eff`, cross-trial Sharpe variance `V[SR_k]`, γ).
+- **Sharpe bar** puts annualised raw SR and annualised SR\* on one signed axis.
+  Their difference is **SR − SR\***; DSR itself is not a reduced Sharpe estimate.
 - **Scatter** uses annualised IS and OOS SR on the same numeric scale with zero
   axes and an equality diagonal. Missing statistics appear in an unavailable
   row, never as a point at zero. Click a point, ribbon row or fold row to select
@@ -113,7 +115,7 @@ results can remain. The UI shows tracking start, revision, declared trials,
 eligible stochastic trials, excluded all-zero series and cluster sizes. Earlier
 experiments and external research are unknown; this is not lifetime search history.
 
-## Effective trials and the null maximum
+## Effective trials and SR* (expected best lucky Sharpe)
 
 Canonical-ID order makes clustering deterministic. Starting with singleton
 clusters, merge the pair with the largest minimum cross-cluster Pearson
@@ -135,14 +137,20 @@ a_2 = 1 / √π
 for N >= 3:
   a_N = (1 - γ) Φ⁻¹(1 - 1/N) + γ Φ⁻¹(1 - 1/(N e))
   γ = 0.5772156649015329
-SR_null,max = s_SR × a_N
-DSR = PSR(SR_null,max)
-Sharpe above null maximum = SR - SR_null,max
+V[SR_k] = s_SR²
+SR* = √V[SR_k] × a_N        # expected best Sharpe of N_eff zero-skill trials
+DSR = PSR(SR*)               # P(true SR > SR*), not P(true SR > 0)
+SR - SR*                     # shown on the Sharpe bar
 ```
+
+SR\* is the Sharpe the luckiest of `N_eff` independent zero-skill variants
+would be expected to show, given the observed cross-trial Sharpe variance. DSR
+asks whether the selected variant's Sharpe clears that bar; PSR (`SR*=0`) is
+the undeflated probability that the true Sharpe exceeds zero.
 
 The N=2 branch is the exact maximum expectation of two independent standard
 normals. Larger families use the cited approximation. With one effective
-opportunity the null maximum is zero and DSR equals PSR. Equal observed Sharpes
+opportunity SR\* is zero and DSR equals PSR. Equal observed Sharpes
 can produce zero empirical dispersion; this is disclosed rather than repaired.
 
 Replay is capped at **64 distinct experiments** and **60,000,000 bar-pass work
@@ -295,5 +303,5 @@ and `bool_comparison` in Adaptive Trend tests, before reaching this slice.
 No GUI, server, external-data test, dependency addition or git commit is part of
 this change.
 
-Final workspace result: **1,446 passed, 0 failed, 8 ignored** (including doc-test
+Final workspace result: **1,447 passed, 0 failed, 8 ignored** (including doc-test
 targets). Ignored tests retain their existing opt-in status.
