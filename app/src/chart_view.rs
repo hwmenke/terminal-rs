@@ -1946,6 +1946,7 @@ impl ChartState {
     }
 
     pub fn show(&mut self, ui: &mut Ui, rect: Rect, focused: bool, w: &Worker) -> bool {
+        let _chart_scope = crate::perf::scope(crate::perf::Layer::ChartTotal);
         if let Some(work) = self.edge_work.take() {
             w.send(work);
         }
@@ -2164,6 +2165,7 @@ impl ChartState {
             self.viewport.get_or_insert_with(|| Viewport::fit_last(len, DEFAULT_VISIBLE, price_rect.width() as f64));
         v.set_width(price_rect.width() as f64);
 
+        let _perf_input = crate::perf::scope(crate::perf::Layer::Input);
         // ---- input ----
         let plot_resp = ui.interact(plot_all, ui.id().with((self.id, "plot")), Sense::click_and_drag());
         let axis_rect =
@@ -2262,6 +2264,8 @@ impl ChartState {
             }
         }
 
+        drop(_perf_input);
+        let _perf_scene = crate::perf::scope(crate::perf::Layer::Scene);
         // ---- price pane GPU frame ----
         let mut overlays: Vec<Overlay> = self
             .built
@@ -2358,6 +2362,8 @@ impl ChartState {
             self.manual_scale = None;
         }
 
+        drop(_perf_scene);
+        let _perf_gridaxes = crate::perf::scope(crate::perf::Layer::GridAxes);
         // Grid first (under the GPU geometry is not possible inside one pass, so draw it
         // faintly; candles are opaque on top visually).
         let price_painter = ui.painter_at(price_rect);
@@ -2368,21 +2374,35 @@ impl ChartState {
             let y = price_rect.top() + scale.y_of(*t) as f32;
             price_painter.hline(price_rect.x_range(), y, Stroke::new(1.0, theme::grid()));
         }
+        drop(_perf_gridaxes);
+        let _perf_zband = crate::perf::scope(crate::perf::Layer::ZBand);
         self.prepare_zband_paint(price_rect, &v, &scale);
         ui.painter_at(price_rect).extend(self.zband_paint.cloud.iter().cloned());
+        drop(_perf_zband);
+        let _perf_link = crate::perf::scope(crate::perf::Layer::Link);
         self.paint_lens(ui, price_rect, &v);
+        drop(_perf_link);
+        let _perf_stack = crate::perf::scope(crate::perf::Layer::Stack);
         if self.show_stack {
             self.prepare_stack_paint(price_rect, stack_rect, &v, &scale);
             self.paint_stack_cloud(ui, price_rect, &v, &scale, &reveal);
         }
-        self.paint_stop_cloud(ui, price_rect, &v, &scale);
+        drop(_perf_stack);
+        {
+            let _s = crate::perf::scope(crate::perf::Layer::Stops);
+            self.paint_stop_cloud(ui, price_rect, &v, &scale);
+        }
         let frame_no = ui.ctx().cumulative_frame_nr();
         let frame = Frame { pane: self.id * 8, frame_no, cmds: out.cmds };
         ui.painter().add(tr_chart::egui_wgpu::Callback::new_paint_callback(price_rect, ChartCallback(Arc::new(frame))));
 
         if self.show_stack {
-            self.paint_stack_pulse(ui, price_rect, &v, &scale);
+            {
+                let _s = crate::perf::scope(crate::perf::Layer::Stack);
+                self.paint_stack_pulse(ui, price_rect, &v, &scale);
+            }
         }
+        let _perf_scene = crate::perf::scope(crate::perf::Layer::Scene);
         // Sub panes.
         let mut sub_rects = Vec::new();
         for (k, &bi) in pane_specs.iter().take(n_sub).enumerate() {
@@ -2407,15 +2427,21 @@ impl ChartState {
             sub_rects.push((r, bi, so.scale));
         }
 
+        drop(_perf_scene);
+        let _perf_stack = crate::perf::scope(crate::perf::Layer::Stack);
         if self.show_stack && stack_h > 0.0 {
             if let Some(tf) = self.paint_stack_lanes(ui, stack_rect, &v, hover, &reveal) {
                 self.set_timeframe(tf, w);
                 return true;
             }
         }
+        drop(_perf_stack);
+        let _perf_rail = crate::perf::scope(crate::perf::Layer::Rail);
         if rail_h > 0.0 {
             self.paint_truth_rail(ui, rail_rect, &v);
         }
+        drop(_perf_rail);
+        let _perf_stack = crate::perf::scope(crate::perf::Layer::Stack);
         if self.show_stack {
             if let Some(frames) = &self.stack_ladder {
                 let label = format!("LADDER {}", frames.iter().map(|tf| tf.label()).collect::<Vec<_>>().join("·"));
@@ -2439,6 +2465,8 @@ impl ChartState {
                 );
             }
         }
+        drop(_perf_stack);
+        let _perf_gridaxes = crate::perf::scope(crate::perf::Layer::GridAxes);
         // ---- axes ----
         let axis_painter = ui.painter_at(Rect::from_min_max(pos2(plot_all.right(), body.top()), body.max));
         axis_painter.vline(plot_all.right(), body.y_range(), Stroke::new(1.0, theme::border()));
@@ -2520,6 +2548,8 @@ impl ChartState {
             }
         }
 
+        drop(_perf_gridaxes);
+        let _perf_auction = crate::perf::scope(crate::perf::Layer::Auction);
         // ---- drawings ----
         if self.auction.enabled {
             self.paint_auction(ui, price_rect, &v, &scale);
@@ -2530,16 +2560,32 @@ impl ChartState {
             self.paint_volume_profile(ui, price_rect, &scale);
             self.paint_value_area(ui, price_rect, &scale);
         }
+        drop(_perf_auction);
+        let _perf_levels = crate::perf::scope(crate::perf::Layer::Levels);
         self.paint_review_levels(ui, price_rect, &scale);
         self.paint_alert_levels(ui, price_rect, &scale);
         self.paint_opening_range(ui, price_rect, &scale);
         self.paint_prior_session(ui, price_rect, &scale);
+        drop(_perf_levels);
         let click = plot_resp.interact_pointer_pos().filter(|_| plot_resp.clicked() && drawing_click);
-        self.paint_drawings(ui, price_rect, &v, &scale, hover, click);
-        self.paint_avwap(ui, price_rect, &v, &scale, hover);
-        self.paint_cone(ui, price_rect, &v, &scale);
-        self.paint_stop_odds(ui, price_rect);
+        {
+            let _s = crate::perf::scope(crate::perf::Layer::Drawings);
+            self.paint_drawings(ui, price_rect, &v, &scale, hover, click);
+        }
+        {
+            let _s = crate::perf::scope(crate::perf::Layer::Avwap);
+            self.paint_avwap(ui, price_rect, &v, &scale, hover);
+        }
+        {
+            let _s = crate::perf::scope(crate::perf::Layer::Cone);
+            self.paint_cone(ui, price_rect, &v, &scale);
+        }
+        {
+            let _s = crate::perf::scope(crate::perf::Layer::Stops);
+            self.paint_stop_odds(ui, price_rect);
+        }
 
+        let _perf_markers = crate::perf::scope(crate::perf::Layer::Markers);
         // ---- congress markers ----
         self.hover_marker = None;
         if self.show_congress {
@@ -2553,6 +2599,8 @@ impl ChartState {
             self.paint_journal(ui, price_rect, &v, hover, &reveal);
         }
 
+        drop(_perf_markers);
+        let _perf_crosshair = crate::perf::scope(crate::perf::Layer::Crosshair);
         // ---- crosshair + legend ----
         let hovered_bar = hover.and_then(|p| v.bar_at((p.x - price_rect.left()) as f64, len));
         self.hover_bar = hovered_bar;
@@ -2585,19 +2633,26 @@ impl ChartState {
                 ui.ctx().set_cursor_icon(CursorIcon::Crosshair);
             }
         }
+        drop(_perf_crosshair);
+        let _perf_link = crate::perf::scope(crate::perf::Layer::Link);
         let ghost = self.paint_link_ghost(ui, price_rect, plot_all, time_rect, &v, &scale);
         let cursor_price =
             hover.filter(|p| price_rect.contains(*p)).map(|p| scale.price_at((p.y - price_rect.top()) as f64));
         self.publish_link(hovered_bar, cursor_price, &v);
         self.link_geom =
             Some(cockpit::LinkGeom { plot_id: plot_resp.id, plot: plot_all, price_rect, viewport: v, scale, len });
+        drop(_perf_link);
+        let _perf_legend = crate::perf::scope(crate::perf::Layer::Legend);
         self.paint_legend(ui, price_rect, hovered_bar.or(ghost).unwrap_or(len.saturating_sub(1)), &sub_rects);
         self.paint_cockpit_chip(ui, price_rect);
         self.paint_vault_footer(ui, price_rect, &v);
+        drop(_perf_legend);
+        let _perf_edge = crate::perf::scope(crate::perf::Layer::Edge);
         if self.show_edge {
             self.paint_flip_outcomes(ui, price_rect, &v, &scale);
             self.paint_edge_card(ui, price_rect);
         }
+        drop(_perf_edge);
         if matches!(self.sec.class, tr_core::AssetClass::Equity | tr_core::AssetClass::Etf) {
             clicked |= self.trade_buttons(ui, plot_all);
         }
@@ -4628,6 +4683,9 @@ fn hover_card(ui: &Ui, at: Pos2, t: &Trade) {
 }
 
 #[cfg(test)]
+mod perf_gate;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -4838,7 +4896,7 @@ mod tests {
         complete_edge(&mut c, chrono::Utc::now().timestamp());
         assert!(matches!(c.edge, Some(Ok(_))));
     }
-    fn complete_edge(c: &mut ChartState, now: i64) {
+    pub(super) fn complete_edge(c: &mut ChartState, now: i64) {
         c.refresh_edge(now);
         if let Some(Request::StackEdge { key, bars, state, entry_long, entry_short, stitch, .. }) = c.edge_work.take() {
             let input = tr_data::vault::research_bars(&bars, stitch.as_deref()).unwrap();
@@ -6642,7 +6700,7 @@ mod tests {
             .filter_map(|r| if let Request::StopCloud { key, .. } = r { Some(key) } else { None })
             .collect()
     }
-    fn stop_result(
+    pub(super) fn stop_result(
         c: &ChartState,
         key: &tr_data::stop_cloud::StopKey,
     ) -> Result<Arc<tr_data::stop_cloud::StopReport>, String> {
@@ -6971,7 +7029,7 @@ mod tests {
         }
         out
     }
-    fn cone_result(
+    pub(super) fn cone_result(
         c: &ChartState,
         key: &tr_data::trend_cone::ConeKey,
     ) -> Result<Arc<tr_data::trend_cone::ConeReport>, String> {

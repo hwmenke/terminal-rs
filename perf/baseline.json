@@ -1,0 +1,649 @@
+{
+  "schema": 1,
+  "recorded": "2026-11-16",
+  "profile": "release",
+  "host": {
+    "cpu": "Intel(R) Xeon(R) Processor",
+    "cores": 8,
+    "os": "linux"
+  },
+  "calib_us": 6000.224999999999,
+  "cases": {
+    "auction.build_20x390": {
+      "median_us": 1708.1889999999999,
+      "p95_us": 1920.4840000000002,
+      "min_us": 1575.288,
+      "n": 187
+    },
+    "auction.composite_20": {
+      "median_us": 1.2761210191082804,
+      "p95_us": 1.3425222929936307,
+      "min_us": 1.1674267515923566,
+      "n": 201
+    },
+    "avwap.report_23k_x4": {
+      "median_us": 474.814,
+      "p95_us": 536.8420000000001,
+      "min_us": 462.562,
+      "n": 201
+    },
+    "avwap.time_link_span": {
+      "median_us": 1.0115486486486487,
+      "p95_us": 1.123008108108108,
+      "min_us": 1.0084702702702704,
+      "n": 201
+    },
+    "bt.dsr_family_64": {
+      "median_us": 17024.245,
+      "p95_us": 17890.813,
+      "min_us": 16614.179,
+      "n": 18
+    },
+    "bt.report_5y": {
+      "median_us": 247.116,
+      "p95_us": 279.512,
+      "min_us": 245.876,
+      "n": 201
+    },
+    "clock.build_60d_30m": {
+      "median_us": 4701.929,
+      "p95_us": 5073.32,
+      "min_us": 4263.663,
+      "n": 62
+    },
+    "cone.report_5k": {
+      "median_us": 6088.98,
+      "p95_us": 7410.44,
+      "min_us": 5578.427000000001,
+      "n": 52
+    },
+    "data.bars_digest_23k": {
+      "median_us": 1245.691,
+      "p95_us": 1338.4370000000001,
+      "min_us": 1146.49,
+      "n": 201
+    },
+    "data.series_gpu_23k": {
+      "median_us": 272.209,
+      "p95_us": 312.855,
+      "min_us": 244.92999999999998,
+      "n": 201
+    },
+    "data.vault_ingest_390": {
+      "median_us": 1486.1,
+      "p95_us": 4309.984,
+      "min_us": 1344.3039999999999,
+      "n": 201
+    },
+    "data.vault_read_5k": {
+      "median_us": 905.001,
+      "p95_us": 1002.8199999999999,
+      "min_us": 847.6179999999999,
+      "n": 201
+    },
+    "data.vault_stitch_7800": {
+      "median_us": 3444.1549999999997,
+      "p95_us": 3708.4629999999997,
+      "min_us": 3340.89,
+      "n": 88
+    },
+    "edge.regime_edge_5k": {
+      "median_us": 30728.43,
+      "p95_us": 33823.309,
+      "min_us": 29527.976000000002,
+      "n": 9
+    },
+    "edge.wall_edge_5k": {
+      "median_us": 11533.099999999999,
+      "p95_us": 12354.764000000001,
+      "min_us": 11071.796999999999,
+      "n": 25
+    },
+    "nulls.bh_10k": {
+      "median_us": 217.82999999999998,
+      "p95_us": 240.676,
+      "min_us": 200.309,
+      "n": 201
+    },
+    "nulls.sign_test": {
+      "median_us": 67.65133333333334,
+      "p95_us": 73.45666666666666,
+      "min_us": 62.592333333333336,
+      "n": 201
+    },
+    "paint.auction.pan.layer.Auction": {
+      "median_us": 57.41649866104126,
+      "p95_us": 65.09099900722504,
+      "min_us": 50.19799992442131,
+      "n": 120
+    },
+    "paint.auction.pan.layer.Avwap": {
+      "median_us": 84.85500141978264,
+      "p95_us": 93.24999898672104,
+      "min_us": 75.14700293540955,
+      "n": 120
+    },
+    "paint.auction.pan.layer.ChartTotal": {
+      "median_us": 15236.271381378174,
+      "p95_us": 15790.431022644045,
+      "min_us": 14647.053718566896,
+      "n": 120
+    },
+    "paint.auction.pan.layer.Cone": {
+      "median_us": 0.11150000136694872,
+      "p95_us": 0.2099999983329326,
+      "min_us": 0.05600000076810829,
+      "n": 120
+    },
+    "paint.auction.pan.layer.Crosshair": {
+      "median_us": 27.96749956905842,
+      "p95_us": 31.780000776052475,
+      "min_us": 23.900000378489494,
+      "n": 120
+    },
+    "paint.auction.pan.layer.Drawings": {
+      "median_us": 0.28700000257231295,
+      "p95_us": 0.5080000264570117,
+      "min_us": 0.10599999950500204,
+      "n": 120
+    },
+    "paint.auction.pan.layer.Edge": {
+      "median_us": 0.03699999797390774,
+      "p95_us": 0.05999999848427251,
+      "min_us": 0.03099999958067201,
+      "n": 120
+    },
+    "paint.auction.pan.layer.GridAxes": {
+      "median_us": 64.94750082492828,
+      "p95_us": 75.55199414491653,
+      "min_us": 55.60999736189842,
+      "n": 120
+    },
+    "paint.auction.pan.layer.Input": {
+      "median_us": 2.3105000145733356,
+      "p95_us": 2.9529999010264874,
+      "min_us": 1.753999968059361,
+      "n": 120
+    },
+    "paint.auction.pan.layer.Legend": {
+      "median_us": 11018.182754516602,
+      "p95_us": 11519.349098205566,
+      "min_us": 10588.329315185549,
+      "n": 120
+    },
+    "paint.auction.pan.layer.Levels": {
+      "median_us": 3850.1731157302856,
+      "p95_us": 4043.464183807373,
+      "min_us": 3666.769981384278,
+      "n": 120
+    },
+    "paint.auction.pan.layer.Link": {
+      "median_us": 1.3075000024400651,
+      "p95_us": 2.2170001175254583,
+      "min_us": 0.8950000046752393,
+      "n": 120
+    },
+    "paint.auction.pan.layer.Markers": {
+      "median_us": 0.2390000008745119,
+      "p95_us": 0.35200000274926424,
+      "min_us": 0.08699999307282269,
+      "n": 120
+    },
+    "paint.auction.pan.layer.Rail": {
+      "median_us": 50.770001485943794,
+      "p95_us": 57.7009990811348,
+      "min_us": 46.60400003194809,
+      "n": 120
+    },
+    "paint.auction.pan.layer.Scene": {
+      "median_us": 4.407000029459596,
+      "p95_us": 5.35999983549118,
+      "min_us": 3.4730001352727413,
+      "n": 120
+    },
+    "paint.auction.pan.layer.Stack": {
+      "median_us": 0.2229999954579398,
+      "p95_us": 0.2589999930933118,
+      "min_us": 0.10900000052060932,
+      "n": 120
+    },
+    "paint.auction.pan.layer.Stops": {
+      "median_us": 0.15249999705702066,
+      "p95_us": 0.49700000090524554,
+      "min_us": 0.07500000356230885,
+      "n": 120
+    },
+    "paint.auction.pan.layer.ZBand": {
+      "median_us": 0.17399998614564538,
+      "p95_us": 0.2690000110305846,
+      "min_us": 0.07399999594781548,
+      "n": 120
+    },
+    "paint.auction.pan.tess": {
+      "median_us": 277.576,
+      "p95_us": 304.52099999999996,
+      "min_us": 259.64,
+      "n": 120
+    },
+    "paint.auction.pan.total": {
+      "median_us": 15558.9805,
+      "p95_us": 16122.132,
+      "min_us": 14948.358,
+      "n": 120
+    },
+    "paint.auction.pan.ui": {
+      "median_us": 15274.9165,
+      "p95_us": 15828.629,
+      "min_us": 14683.899,
+      "n": 120
+    },
+    "paint.auction.steady.layer.Auction": {
+      "median_us": 12.664500158280134,
+      "p95_us": 14.135999605059624,
+      "min_us": 11.191999539732931,
+      "n": 120
+    },
+    "paint.auction.steady.layer.Avwap": {
+      "median_us": 10.716999880969524,
+      "p95_us": 12.485000304877758,
+      "min_us": 9.26200021058321,
+      "n": 120
+    },
+    "paint.auction.steady.layer.ChartTotal": {
+      "median_us": 14964.969158172607,
+      "p95_us": 15891.85905456543,
+      "min_us": 14423.605918884276,
+      "n": 120
+    },
+    "paint.auction.steady.layer.Cone": {
+      "median_us": 0.12250000509084202,
+      "p95_us": 0.18899999849963933,
+      "min_us": 0.0470000013592653,
+      "n": 120
+    },
+    "paint.auction.steady.layer.Crosshair": {
+      "median_us": 27.383998967707157,
+      "p95_us": 32.29399770498276,
+      "min_us": 24.13799986243248,
+      "n": 120
+    },
+    "paint.auction.steady.layer.Drawings": {
+      "median_us": 0.21749999723397195,
+      "p95_us": 0.48499999684281647,
+      "min_us": 0.07999999797903001,
+      "n": 120
+    },
+    "paint.auction.steady.layer.Edge": {
+      "median_us": 0.0424999998358544,
+      "p95_us": 0.05900000178371556,
+      "min_us": 0.025000001187436283,
+      "n": 120
+    },
+    "paint.auction.steady.layer.GridAxes": {
+      "median_us": 47.496497631073,
+      "p95_us": 52.80099809169769,
+      "min_us": 45.53600028157234,
+      "n": 120
+    },
+    "paint.auction.steady.layer.Input": {
+      "median_us": 2.009500050917268,
+      "p95_us": 2.6749998796731234,
+      "min_us": 1.5650000423192978,
+      "n": 120
+    },
+    "paint.auction.steady.layer.Legend": {
+      "median_us": 10965.872287750244,
+      "p95_us": 11676.395416259766,
+      "min_us": 10566.636085510254,
+      "n": 120
+    },
+    "paint.auction.steady.layer.Levels": {
+      "median_us": 3809.5920085906982,
+      "p95_us": 4129.004001617432,
+      "min_us": 3635.846138000488,
+      "n": 120
+    },
+    "paint.auction.steady.layer.Link": {
+      "median_us": 1.231500064022839,
+      "p95_us": 1.6169999726116655,
+      "min_us": 1.0599999222904444,
+      "n": 120
+    },
+    "paint.auction.steady.layer.Markers": {
+      "median_us": 0.14899999951012433,
+      "p95_us": 0.3920000162906945,
+      "min_us": 0.07199999527074397,
+      "n": 120
+    },
+    "paint.auction.steady.layer.Rail": {
+      "median_us": 19.23299953341484,
+      "p95_us": 21.41600102186203,
+      "min_us": 17.61299930512905,
+      "n": 120
+    },
+    "paint.auction.steady.layer.Scene": {
+      "median_us": 3.8399999029934406,
+      "p95_us": 4.860000219196081,
+      "min_us": 3.109999932348728,
+      "n": 120
+    },
+    "paint.auction.steady.layer.Stack": {
+      "median_us": 0.19299999985378236,
+      "p95_us": 0.3619999624788761,
+      "min_us": 0.1069999998435378,
+      "n": 120
+    },
+    "paint.auction.steady.layer.Stops": {
+      "median_us": 0.27800000680144876,
+      "p95_us": 0.48099999548867345,
+      "min_us": 0.12599999899975955,
+      "n": 120
+    },
+    "paint.auction.steady.layer.ZBand": {
+      "median_us": 0.1449999981559813,
+      "p95_us": 0.2010000025620684,
+      "min_us": 0.09299999510403724,
+      "n": 120
+    },
+    "paint.auction.steady.tess": {
+      "median_us": 265.9335,
+      "p95_us": 298.081,
+      "min_us": 254.638,
+      "n": 120
+    },
+    "paint.auction.steady.total": {
+      "median_us": 15269.1105,
+      "p95_us": 16206.541,
+      "min_us": 14709.722000000002,
+      "n": 120
+    },
+    "paint.auction.steady.ui": {
+      "median_us": 14996.185,
+      "p95_us": 15924.574,
+      "min_us": 14454.443,
+      "n": 120
+    },
+    "paint.intraday.pan.layer.Auction": {
+      "median_us": 0.06950000170036219,
+      "p95_us": 0.1250000059371814,
+      "min_us": 0.03199999991920777,
+      "n": 120
+    },
+    "paint.intraday.pan.layer.Avwap": {
+      "median_us": 75.52649825811386,
+      "p95_us": 87.76099979877472,
+      "min_us": 70.30399888753891,
+      "n": 120
+    },
+    "paint.intraday.pan.layer.ChartTotal": {
+      "median_us": 451.7130106687546,
+      "p95_us": 503.57604026794434,
+      "min_us": 413.1929874420166,
+      "n": 120
+    },
+    "paint.intraday.pan.layer.Cone": {
+      "median_us": 30.45900072902441,
+      "p95_us": 35.17699986696243,
+      "min_us": 27.117999270558357,
+      "n": 120
+    },
+    "paint.intraday.pan.layer.Crosshair": {
+      "median_us": 23.630499839782715,
+      "p95_us": 27.758000418543816,
+      "min_us": 19.821999594569206,
+      "n": 120
+    },
+    "paint.intraday.pan.layer.Drawings": {
+      "median_us": 0.27550000231713057,
+      "p95_us": 0.3270000161137432,
+      "min_us": 0.1360000023851171,
+      "n": 120
+    },
+    "paint.intraday.pan.layer.Edge": {
+      "median_us": 15.468500088900328,
+      "p95_us": 17.573000863194466,
+      "min_us": 13.847000896930696,
+      "n": 120
+    },
+    "paint.intraday.pan.layer.GridAxes": {
+      "median_us": 45.47099955379963,
+      "p95_us": 50.83099752664566,
+      "min_us": 43.331000953912735,
+      "n": 120
+    },
+    "paint.intraday.pan.layer.Input": {
+      "median_us": 2.043499960564077,
+      "p95_us": 2.515000058338046,
+      "min_us": 1.5369999455288053,
+      "n": 120
+    },
+    "paint.intraday.pan.layer.Legend": {
+      "median_us": 42.93750040233135,
+      "p95_us": 53.34800109267235,
+      "min_us": 37.88500279188156,
+      "n": 120
+    },
+    "paint.intraday.pan.layer.Levels": {
+      "median_us": 0.10199999815085904,
+      "p95_us": 0.14600000577047467,
+      "min_us": 0.045000000682193786,
+      "n": 120
+    },
+    "paint.intraday.pan.layer.Link": {
+      "median_us": 0.8455000061076134,
+      "p95_us": 1.1779998894780874,
+      "min_us": 0.5319999763742089,
+      "n": 120
+    },
+    "paint.intraday.pan.layer.Markers": {
+      "median_us": 0.19600000814534724,
+      "p95_us": 0.2589999930933118,
+      "min_us": 0.06199999916134402,
+      "n": 120
+    },
+    "paint.intraday.pan.layer.Rail": {
+      "median_us": 26.809499599039555,
+      "p95_us": 30.093999579548836,
+      "min_us": 23.80799874663353,
+      "n": 120
+    },
+    "paint.intraday.pan.layer.Scene": {
+      "median_us": 16.50850009173155,
+      "p95_us": 18.681999295949936,
+      "min_us": 14.205999672412872,
+      "n": 120
+    },
+    "paint.intraday.pan.layer.Stack": {
+      "median_us": 56.01949989795685,
+      "p95_us": 61.11699715256691,
+      "min_us": 51.7129972577095,
+      "n": 120
+    },
+    "paint.intraday.pan.layer.Stops": {
+      "median_us": 69.30350139737129,
+      "p95_us": 77.43100821971893,
+      "min_us": 63.67599964141846,
+      "n": 120
+    },
+    "paint.intraday.pan.layer.ZBand": {
+      "median_us": 14.17599990963936,
+      "p95_us": 15.604998916387558,
+      "min_us": 12.825999408960342,
+      "n": 120
+    },
+    "paint.intraday.pan.tess": {
+      "median_us": 614.611,
+      "p95_us": 687.572,
+      "min_us": 407.874,
+      "n": 120
+    },
+    "paint.intraday.pan.total": {
+      "median_us": 1085.1155,
+      "p95_us": 1209.949,
+      "min_us": 875.611,
+      "n": 120
+    },
+    "paint.intraday.pan.ui": {
+      "median_us": 477.477,
+      "p95_us": 531.567,
+      "min_us": 432.493,
+      "n": 120
+    },
+    "paint.intraday.steady.layer.Auction": {
+      "median_us": 0.0625000011496013,
+      "p95_us": 0.15500000154133886,
+      "min_us": 0.02700000004551839,
+      "n": 120
+    },
+    "paint.intraday.steady.layer.Avwap": {
+      "median_us": 9.915499947965143,
+      "p95_us": 11.087999679148195,
+      "min_us": 8.89500044286251,
+      "n": 120
+    },
+    "paint.intraday.steady.layer.ChartTotal": {
+      "median_us": 190.66249579191208,
+      "p95_us": 223.36100041866305,
+      "min_us": 165.36299884319305,
+      "n": 120
+    },
+    "paint.intraday.steady.layer.Cone": {
+      "median_us": 4.323499975726008,
+      "p95_us": 5.109000019729137,
+      "min_us": 3.800000064074993,
+      "n": 120
+    },
+    "paint.intraday.steady.layer.Crosshair": {
+      "median_us": 20.153499208390713,
+      "p95_us": 26.08499862253666,
+      "min_us": 17.055999487638474,
+      "n": 120
+    },
+    "paint.intraday.steady.layer.Drawings": {
+      "median_us": 0.1940000001923181,
+      "p95_us": 0.27699998463504016,
+      "min_us": 0.058000001445179805,
+      "n": 120
+    },
+    "paint.intraday.steady.layer.Edge": {
+      "median_us": 13.496999628841875,
+      "p95_us": 16.02100022137165,
+      "min_us": 11.944999918341637,
+      "n": 120
+    },
+    "paint.intraday.steady.layer.GridAxes": {
+      "median_us": 45.86699977517128,
+      "p95_us": 51.255002617836,
+      "min_us": 41.23300313949585,
+      "n": 120
+    },
+    "paint.intraday.steady.layer.Input": {
+      "median_us": 1.624500029720366,
+      "p95_us": 2.2219999227672815,
+      "min_us": 0.9589999681338668,
+      "n": 120
+    },
+    "paint.intraday.steady.layer.Legend": {
+      "median_us": 37.38200105726719,
+      "p95_us": 47.07599803805351,
+      "min_us": 32.54999965429306,
+      "n": 120
+    },
+    "paint.intraday.steady.layer.Levels": {
+      "median_us": 0.08450000314041972,
+      "p95_us": 0.13800000306218865,
+      "min_us": 0.025999999706982635,
+      "n": 120
+    },
+    "paint.intraday.steady.layer.Link": {
+      "median_us": 0.6860000139568001,
+      "p95_us": 1.0770000517368317,
+      "min_us": 0.44499998330138624,
+      "n": 120
+    },
+    "paint.intraday.steady.layer.Markers": {
+      "median_us": 0.0870000003487803,
+      "p95_us": 0.17399998614564538,
+      "min_us": 0.025999999706982635,
+      "n": 120
+    },
+    "paint.intraday.steady.layer.Rail": {
+      "median_us": 0.6915000267326832,
+      "p95_us": 0.930999987758696,
+      "min_us": 0.42100000428035855,
+      "n": 120
+    },
+    "paint.intraday.steady.layer.Scene": {
+      "median_us": 14.139500446617603,
+      "p95_us": 16.52499847114086,
+      "min_us": 12.192999944090843,
+      "n": 120
+    },
+    "paint.intraday.steady.layer.Stack": {
+      "median_us": 2.442500088363886,
+      "p95_us": 2.7740001678466797,
+      "min_us": 2.062000101432204,
+      "n": 120
+    },
+    "paint.intraday.steady.layer.Stops": {
+      "median_us": 14.759500045329332,
+      "p95_us": 17.407000064849854,
+      "min_us": 12.428000569343569,
+      "n": 120
+    },
+    "paint.intraday.steady.layer.ZBand": {
+      "median_us": 0.3235000040149316,
+      "p95_us": 0.5210000090301037,
+      "min_us": 0.11499999527586624,
+      "n": 120
+    },
+    "paint.intraday.steady.tess": {
+      "median_us": 392.151,
+      "p95_us": 615.832,
+      "min_us": 320.055,
+      "n": 120
+    },
+    "paint.intraday.steady.total": {
+      "median_us": 603.6065,
+      "p95_us": 850.4449999999999,
+      "min_us": 499.526,
+      "n": 120
+    },
+    "paint.intraday.steady.ui": {
+      "median_us": 208.575,
+      "p95_us": 247.69,
+      "min_us": 178.147,
+      "n": 120
+    },
+    "scene.price_pane_200": {
+      "median_us": 1.2793367346938775,
+      "p95_us": 1.475561224489796,
+      "min_us": 1.2314319727891156,
+      "n": 201
+    },
+    "scene.price_pane_all": {
+      "median_us": 4.483977272727272,
+      "p95_us": 4.949159090909091,
+      "min_us": 4.197840909090909,
+      "n": 201
+    },
+    "stack.trend_stack_5k": {
+      "median_us": 1037.1200000000001,
+      "p95_us": 1286.223,
+      "min_us": 991.572,
+      "n": 201
+    },
+    "stack.tune_7x7_5k": {
+      "median_us": 91994.912,
+      "p95_us": 126257.184,
+      "min_us": 89121.857,
+      "n": 9
+    },
+    "stops.report_5k": {
+      "median_us": 6848.131,
+      "p95_us": 7080.139,
+      "min_us": 6626.159000000001,
+      "n": 43
+    }
+  }
+}

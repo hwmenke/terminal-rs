@@ -4107,6 +4107,7 @@ dependencies = [
  "tr-core",
  "tr-data",
  "tr-macos",
+ "tr-perf",
  "tracing",
  "tracing-subscriber",
 ]
@@ -4497,6 +4498,18 @@ dependencies = [
  "objc2 0.6.5",
  "objc2-app-kit 0.3.2",
  "objc2-foundation 0.3.2",
+]
+
+[[package]]
+name = "tr-perf"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "serde",
+ "serde_json",
+ "tr-chart",
+ "tr-core",
+ "tr-data",
 ]
 
 [[package]]
