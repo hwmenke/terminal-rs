@@ -502,6 +502,53 @@ mod tests {
             assert_eq!(bits(&before.guides[k]), bits(&after.guides[k]));
         }
     }
+    /// End to end through `report` (state/MB masking, guides, origin grid): each
+    /// new bar that appears as the forming bar, then closes, must leave every
+    /// previously reported closed-bar value bit-identical, so the drawn cloud
+    /// never repaints history.
+    #[test]
+    fn appending_or_updating_the_forming_bar_never_revises_earlier_report_values() {
+        let path: Vec<Bar> = (0..900)
+            .map(|i| {
+                let c = 100.0 + 15.0 * (i as f64 * 0.015).sin() + 0.8 * (i as f64 * 0.9).sin();
+                Bar::new(1_700_000_000 + i as i64 * 300, c, c + 0.6, c - 0.6, c, 1.0).with_provenance(Provenance::Real)
+            })
+            .collect();
+        let run = |b: &[Bar]| {
+            report(b, Timeframe::M5, AssetClass::Crypto, None, Params::default(), Default::default()).unwrap()
+        };
+        let mut previous: Option<StopReport> = None;
+        let mut regimes = std::collections::BTreeSet::new();
+        for len in (300..path.len()).step_by(7) {
+            let mut b = path[..len].to_vec();
+            let r = run(&b);
+            regimes.insert(r.regime);
+            // A wild tick on the forming bar changes nothing.
+            let last = b.last_mut().unwrap();
+            last.high += 50.0;
+            last.low -= 50.0;
+            last.close += 40.0;
+            // Debug text compares warm-up NaNs as equal, unlike `PartialEq`.
+            assert_eq!(format!("{r:?}"), format!("{:?}", run(&b)), "forming tick changed the report at len {len}");
+            if let Some(p) = &previous {
+                let c = p.closed;
+                assert!(r.closed > c);
+                assert_eq!(bits(&p.mb), bits(&r.mb[..c]));
+                assert_eq!(bits(&p.atr), bits(&r.atr[..c]));
+                assert_eq!(p.state, r.state[..c]);
+                for k in 0..3 {
+                    assert_eq!(bits(&p.guides[k]), bits(&r.guides[k][..c]), "guide {k} revised at len {len}");
+                }
+                if p.regime == r.regime && r.regime != 0 {
+                    for (old, new) in p.horizons.iter().zip(&r.horizons) {
+                        assert_eq!(old.outcomes[..], new.outcomes[..old.n], "outcomes revised at len {len}");
+                    }
+                }
+            }
+            previous = Some(r);
+        }
+        assert!(regimes.contains(&1) && regimes.contains(&-1), "fixture must exercise both regimes: {regimes:?}");
+    }
     #[test]
     fn small_n_or_few_episodes_yields_low_n_not_a_number() {
         let b = bars(301);

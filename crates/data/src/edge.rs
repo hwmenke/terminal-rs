@@ -89,7 +89,7 @@ pub struct EdgeReport {
 }
 /// Wilson 95% score interval for a proportion and a positive trial count.
 /// Fractional effective counts are supported for existing Edge statistics.
-pub fn wilson(p: f64, n: f64) -> (f64, f64) {
+fn wilson(p: f64, n: f64) -> (f64, f64) {
     let z2 = 1.96_f64.powi(2);
     let denominator = 1.0 + z2 / n;
     let center = (p + z2 / (2.0 * n)) / denominator;

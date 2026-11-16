@@ -6835,6 +6835,37 @@ mod tests {
         }
     }
     #[test]
+    fn stops_forming_bar_ticks_do_not_repaint_the_closed_cloud() {
+        let ctx = egui::Context::default();
+        let (w, mut rx) = Worker::test_channel();
+        let mut c = stack_chart(&w, Provenance::Real);
+        c.set_stop_cloud(crate::command::StopCmd::Toggle(Some(true)), &w);
+        let key = stop_requests(&mut rx).pop().unwrap();
+        c.on_stop_cloud(key.clone(), stop_result(&c, &key));
+        let rect = Rect::from_min_size(Pos2::ZERO, vec2(900.0, 600.0));
+        let v = Viewport::fit_last(160, 160, 900.0);
+        let scale = PriceScale::new(90.0, 240.0, false, 600.0);
+        let paint = |c: &mut ChartState| {
+            let mut out = ctx.run_ui(egui::RawInput::default(), |ui| c.paint_stop_cloud(ui, rect, &v, &scale));
+            out.textures_delta.clear();
+            format!("{:?}", c.stops.paint.shapes)
+        };
+        let before = paint(&mut c);
+        assert!(before.contains("Mesh"));
+        // Wild ticks on the forming bar, on a fresh Arc as live updates deliver them.
+        for _ in 0..3 {
+            let mut bars = (*c.bars).clone();
+            let last = bars.last_mut().unwrap();
+            last.high *= 1.5;
+            last.low *= 0.5;
+            last.close = last.high;
+            c.bars = Arc::new(bars);
+            assert_eq!(c.request_stops(&w), None);
+            assert!(stop_requests(&mut rx).is_empty(), "forming tick must not request a recompute");
+            assert_eq!(paint(&mut c), before, "forming tick repainted closed cloud values");
+        }
+    }
+    #[test]
     fn stops_low_n_cells_paint_em_dash() {
         let ctx = egui::Context::default();
         let (w, mut rx) = Worker::test_channel();

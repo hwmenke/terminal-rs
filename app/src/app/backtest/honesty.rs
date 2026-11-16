@@ -20,28 +20,40 @@ fn probability_formula(m: &Moments, benchmark: f64) -> String {
         m.sharpe, benchmark, m.n, m.probability_variance, m.skew, m.sharpe, m.pearson_kurtosis, m.sharpe
     )
 }
+/// Plain meaning of each probability. DSR is NOT "P(true Sharpe > 0)": it tests
+/// against SR*, the Sharpe the luckiest of N_eff zero-skill variants would show.
+pub(super) const PSR_MEANING: &str = "PSR: probability the true Sharpe > 0 (no deflation)";
+pub(super) const DSR_MEANING: &str =
+    "DSR: probability the true Sharpe beats SR*, the best Sharpe you'd expect from N_eff lucky zero-skill variants";
 fn probability_card(ui: &mut Ui, c: Option<&Comparison>, h: &HonestReport, deflated: bool) {
     card(ui, c.map(|c| &c.moments), h, if deflated { "DSR = PSR(SR*)" } else { "PSR = PSR(0)" });
-    ui.label("PSR(SR*) = Φ((SR − SR*) × √(n − 1) / √V); all Sharpe inputs are per session.");
+    ui.label(if deflated { DSR_MEANING } else { PSR_MEANING });
+    ui.label("PSR(B) = Φ((SR − B) × √(n − 1) / √V); all Sharpe inputs are per session, not annualised.");
     if let Some(c) = c {
         ui.label(probability_formula(&c.moments, if deflated { c.null_maximum } else { 0. }));
         if deflated {
             if let Some(f) = h.family_statistics.value() {
-                ui.label("Zero-mean Gaussian null; trial dispersion uses the common session dates.");
+                ui.label(
+                    "SR* = expected maximum Sharpe of N_eff zero-skill trials; inputs use the common session dates.",
+                );
                 ui.label(if f.stochastic_trials == 1 {
-                    "SR* = 0; one eligible trial has no cross-trial dispersion estimate."
+                    "SR* = 0; one eligible trial has no cross-trial variance estimate."
                 } else {
-                    "SR* = s_SR × a_N; s_SR = √(Σ(SR_k − mean SR)² / (M − 1))"
+                    "SR* = √V[SR_k] × a_N; V[SR_k] = Σ(SR_k − mean SR)² / (M − 1)"
+                });
+                ui.label(match f.effective_trials {
+                    1 => "a₁ = 0 (one effective trial: SR* = 0, DSR = PSR)".into(),
+                    2 => "a₂ = 1 / √π (exact expected maximum of two)".into(),
+                    n => format!("a_N = (1 − γ) × Φ⁻¹(1 − 1/{n}) + γ × Φ⁻¹(1 − 1/({n} × e)); γ = 0.5772156649"),
                 });
                 ui.label(format!(
-                    "SR* = {:.8}; s_SR = {:.8}; M = {}; N_eff = {}",
-                    c.null_maximum, f.sharpe_dispersion, f.stochastic_trials, f.effective_trials
+                    "N_eff = {} · V[SR_k] = {:.10} (√ = {:.8}, M = {}) · γ = 0.5772156649\nSR* = {:.8} per session",
+                    f.effective_trials,
+                    f.sharpe_dispersion.powi(2),
+                    f.sharpe_dispersion,
+                    f.stochastic_trials,
+                    c.null_maximum
                 ));
-                ui.label(match f.effective_trials {
-                    1 => "a₁ = 0".into(),
-                    2 => "a₂ = 1 / √π".into(),
-                    n => format!("a_N = (1 − 0.5772156649) × Φ⁻¹(1 − 1/{n}) + 0.5772156649 × Φ⁻¹(1 − 1/({n} × e))"),
-                });
             }
             ui.label(format!("DSR {}", value(&c.dsr, true)));
         } else {
@@ -145,9 +157,7 @@ pub(super) fn render(ui: &mut Ui, h: &HonestReport, variant: &mut usize, fold: &
 }
 fn render_body(ui: &mut Ui, h: &HonestReport, variant: &mut usize, fold: &mut usize) {
     ui.label(RichText::new("HONEST BACKTEST · historical OOS replay").font(mono(15.)).strong().color(theme::cyan()));
-    ui.label(
-        RichText::new("DSR: estimated probability true Sharpe > 0 after adjusting for tried variants.").color(muted()),
-    );
+    ui.label(RichText::new(format!("{DSR_MEANING}.\n{PSR_MEANING}.")).color(muted()));
     ui.label(
         RichText::new(format!("VERIFIED · CLOSED THROUGH {}", date(h.closed_through))).font(mono(11.)).color(muted()),
     );
@@ -359,8 +369,10 @@ fn equity(ui: &mut Ui, e: &Evaluation, benchmark: Option<&Evaluation>, selected:
 fn ribbon(ui: &mut Ui, e: &Evaluation, selected: &mut usize, h: &HonestReport) {
     let height = 28. + e.folds.len() as f32 * 23.;
     let (r, _) = ui.allocate_exact_size(Vec2::new(ui.available_width().max(80.), height), Sense::hover());
-    let first = e.folds.first().unwrap();
-    let last = e.folds.last().unwrap();
+    // A holdout-shaped or hand-edited evaluation can carry no folds; never panic in paint.
+    let (Some(first), Some(last)) = (e.folds.first(), e.folds.last()) else {
+        return;
+    };
     let plot = r.shrink2(Vec2::new(38., 0.));
     let a = first.train_candidate.start;
     let b = last.test.end;
@@ -462,13 +474,13 @@ fn gauge(ui: &mut Ui, c: Option<&Comparison>, h: &HonestReport) {
         ui,
         Pos2::new(bar.left(), r.bottom() - 7.),
         Align2::LEFT_BOTTOM,
-        format!("SR {raw:+.2} · null max {null:+.2} · above null {:+.2}", c.sharpe_above_null * h::YEAR.sqrt()),
+        format!("SR {raw:+.2} · SR* {null:+.2} · SR − SR* {:+.2} (annual)", c.sharpe_above_null * h::YEAR.sqrt()),
         11.,
         text(),
     );
     response.on_hover_ui(|ui| {
         ui.label(format!(
-            "Session null maximum={:.8} · annual={:.5}\nSharpe above null maximum={:.8} session units",
+            "SR* (expected best of N_eff lucky zero-skill trials) = {:.8} per session · annual={:.5}\nSR − SR* = {:.8} session units",
             c.null_maximum, null, c.sharpe_above_null
         ));
         probability_card(ui, Some(c), h, true);
@@ -620,10 +632,13 @@ mod tests {
                 |ui| render_body(ui, &honest, &mut selected, &mut 0),
             );
             let text = paint_text(&output);
-            for expected in [expected, "N_raw=4", "N_eff=", "n=", "probability true Sharpe > 0", "selected variant"] {
+            for expected in [expected, "N_raw=4", "N_eff=", "n=", DSR_MEANING, PSR_MEANING, "selected variant"] {
                 assert!(text.contains(expected), "missing {expected}");
             }
             assert!(!text.contains(other));
+            // DSR is a test against SR*, never "P(true Sharpe > 0)".
+            assert!(DSR_MEANING.contains("beats SR*") && !DSR_MEANING.contains("> 0"));
+            assert!(!text.contains("DSR: estimated probability true Sharpe > 0"));
             output.textures_delta.clear();
         }
         honest.family_statistics = Estimate::Unavailable(h::Reason::NoComparableTrialWindow);
@@ -673,6 +688,23 @@ mod tests {
             assert!(text.contains(&format!("Φ((1.22474487 − {benchmark}) × √(4 − 1) / √1.37500000)")));
             assert!(text.contains("2.00000000 − 1")); // Pearson, not excess kurtosis.
             assert!(text.contains(result));
+            if deflated {
+                assert!(text.contains(DSR_MEANING));
+                assert!(!text.contains(PSR_MEANING));
+                // SR* is shown with every input: N_eff, cross-trial variance and γ.
+                let f = honest.family_statistics.value().unwrap();
+                for input in [
+                    format!("N_eff = {}", f.effective_trials),
+                    format!("V[SR_k] = {:.10}", f.sharpe_dispersion.powi(2)),
+                    "γ = 0.5772156649".into(),
+                    "SR* = 0.05641896 per session".into(),
+                ] {
+                    assert!(text.contains(&input), "missing {input}");
+                }
+            } else {
+                assert!(text.contains(PSR_MEANING));
+                assert!(!text.contains("SR* = 0.05641896"));
+            }
             output.textures_delta.clear();
         }
         let mut single = honest.clone();
@@ -691,8 +723,26 @@ mod tests {
         );
         let text = paint_text(&output);
         assert!(text.contains("a₁ = 0"));
-        assert!(text.contains("one eligible trial has no cross-trial dispersion estimate"));
+        assert!(text.contains("one eligible trial has no cross-trial variance estimate"));
         assert!(!text.contains("/ (M − 1)"));
+        output.textures_delta.clear();
+    }
+    #[test]
+    fn honest_backtest_paint_survives_a_variant_without_folds() {
+        let report = super::super::tests::honest_report();
+        let mut honest = report.honesty.as_ref().unwrap().clone();
+        if let Estimate::Available(e) = &mut honest.variants[0].evaluation {
+            e.folds.clear();
+        }
+        let ctx = egui::Context::default();
+        let mut output = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(900., 2200.))),
+                ..Default::default()
+            },
+            |ui| render_body(ui, &honest, &mut 0, &mut 0),
+        );
+        assert!(paint_text(&output).contains("FULL STITCHED OOS"));
         output.textures_delta.clear();
     }
     fn click(ctx: &egui::Context, p: Pos2, mut paint: impl FnMut(&mut Ui)) {
