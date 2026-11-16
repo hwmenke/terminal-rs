@@ -250,6 +250,14 @@ pub enum PaneSettings {
         /// Intraday bar size (`5m`). Ignored by the daily archive backtest.
         #[serde(default)]
         tf: String,
+        #[serde(default)]
+        honesty: tr_data::backtest_honesty::HonestySettings,
+        #[serde(default)]
+        holdout_tables: bool,
+        #[serde(default)]
+        selected_variant: usize,
+        #[serde(default)]
+        selected_fold: usize,
     },
     /// Intraday multi-symbol compare, percent from each 09:30 open.
     IntradayCompare {

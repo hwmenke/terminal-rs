@@ -33,7 +33,8 @@ The benchmark is always listed. Typing one setup does not drop it.
 
 - The signal is the bar that just closed.
 - The fill is the **next regular open of the same session**. There is no same-bar fill.
-- An open trade is flattened at that session's **last regular close**. Nothing is carried overnight.
+- An open trade is flattened at the scheduled session close. Nothing is carried overnight.
+- Incomplete sessions are excluded until every expected bucket, including the final bucket, is closed. Partial sessions never flatten at an arbitrary last print.
 - Premarket and after-hours prints are ignored.
 - A session with a missing bucket, two prints in one bucket, or no opening print is skipped. A later complete day does not stand in.
 - A session whose first 30 minutes are incomplete stays flat for the opening-range setup. 1h bars do not divide 30 minutes, so that setup does not run on them.
@@ -60,3 +61,16 @@ At least 10 complete regular sessions are required. Do not pick a winner on the 
 The share of up bars while in a position is listed separately and is not a win rate.
 
 Sample, missing, and unverified bars are refused. `TR_PROVIDER=sample` does not feed this pane.
+
+## Honest session walk-forward
+
+The default **Honest** view adds PSR/DSR, durable experiment history, expanding
+folds, a fold ribbon, stitched OOS equity and an IS/OOS scatter. **Holdout tables**
+keeps the original comparison. All inference uses **one net return per complete
+cash session**, including every intraday fill cost; it does not count 1m/5m bars
+as independent daily returns. Default WF requires 37 sessions (20 initial,
+three tests of at least five sessions, and two one-session embargoes).
+Session-boundary labels normally need no purge at the first boundary; prior
+embargo sessions remain excluded from later IS. Complete half days are allowed;
+partial, holed, ambiguous and bad-price sessions are counted separately.
+See [HONEST_BACKTEST.md](HONEST_BACKTEST.md) for formulas, scope and limitations.

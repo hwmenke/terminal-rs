@@ -149,8 +149,8 @@ const COMMANDS: &[(&str, &str, &str, Option<Action>)] = &[
     ("EXPORT STATS", "Export statistics with source and date", "conditional returns provenance", None),
     (
         "BACKTEST",
-        "Paper backtest vs buy-and-hold with costs and a chronological holdout",
-        "strategy evaluate cagr completed trades",
+        "Honest backtest: DSR, purged walk-forward and holdout tables",
+        "strategy DSR PSR purged walk forward equity",
         None,
     ),
     ("AAPL BACKTEST", "AAPL paper backtest versus buy-and-hold", "holdout costs next open", None),
@@ -158,7 +158,7 @@ const COMMANDS: &[(&str, &str, &str, Option<Action>)] = &[
     ("EXPORT BACKTEST", "Export backtest settings, costs, holdout and metrics", "paper research provenance", None),
     (
         "IBT",
-        "Paper intraday backtest of session VWAP and the opening range",
+        "Honest intraday backtest: DSR and complete-session walk-forward",
         "vwap opening range next open session holdout",
         None,
     ),

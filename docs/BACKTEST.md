@@ -32,8 +32,9 @@ benchmark, even when you type a single name.
 2. Type `AAPL BACKTEST` (or open **Backtest** in the sidebar).
 3. Set **holdout** (default last 20%), **commission** and **slippage** in bps
    per side, and whether shorts are allowed.
-4. Press **RUN**. The evaluate table is the comparison. Train figures sit below
-   it and are labelled in-sample.
+4. Set folds and embargo and press **RUN**. The default **Honest** view shows
+   DSR, purged walk-forward folds and stitched OOS equity. **Holdout tables**
+   retains the original comparison and in-sample train figures.
 
 `TR_PROVIDER=sample` never feeds this pane.
 
@@ -106,3 +107,14 @@ order routing. SnapTrade / credentials. Parameter search on the evaluate window.
 
 Session VWAP and the opening range are not scored on these daily bars. That
 comparison is `IBT`, documented in [INTRADAY_BACKTEST.md](INTRADAY_BACKTEST.md).
+
+## Honest walk-forward
+
+See [HONEST_BACKTEST.md](HONEST_BACKTEST.md) for PSR/DSR formulas, durable trial
+tracking, common-date comparisons, controls, math cards and limitations. Daily
+WF tests start flat, fill from the preceding closed signal and liquidate at the
+scheduled final test close with exit costs. Training positions remain open at
+the cutoff for right-censored holding-label purging; unresolved IS can be
+unavailable while OOS remains valid. Post-test embargo sessions are excluded
+from later IS scoring and stitched OOS. Missing daily sessions refuse the
+request; holidays follow the archive calendar. Pending bars never score.

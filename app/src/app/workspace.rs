@@ -428,17 +428,25 @@ impl TerminalApp {
                 PaneKind::Desk(d)
             }
             PaneKind::StudioDist(mut s) => {
-                if s.symbol.trim().is_empty() { s.symbol = self.focused_symbol().unwrap_or_default(); }
+                if s.symbol.trim().is_empty() {
+                    s.symbol = self.focused_symbol().unwrap_or_default();
+                }
                 s.request(id, &self.worker);
                 PaneKind::StudioDist(s)
             }
             PaneKind::StudioCorr(mut s) => {
-                if s.symbol.trim().is_empty() && let Some(sym) = self.focused_symbol() { s.symbol = sym; }
+                if s.symbol.trim().is_empty()
+                    && let Some(sym) = self.focused_symbol()
+                {
+                    s.symbol = sym;
+                }
                 s.request(id, &self.worker);
                 PaneKind::StudioCorr(s)
             }
             PaneKind::StudioSeason(mut s) => {
-                if s.symbol.trim().is_empty() && let Some(sym) = self.focused_symbol() {
+                if s.symbol.trim().is_empty()
+                    && let Some(sym) = self.focused_symbol()
+                {
                     s.symbol = sym;
                 }
                 s.request(id, &self.worker);
@@ -1711,8 +1719,9 @@ impl TerminalApp {
             "SAVE" if words.len() == 1 && self.handoff_live() => {
                 if self.save_layout() {
                     let origin = self.handoff_origin_name().unwrap_or_default().to_owned();
-                    self.status =
-                        format!("Saved layout {origin:?}; this hand-off view is temporary (LAYOUT SAVE <name> keeps it)");
+                    self.status = format!(
+                        "Saved layout {origin:?}; this hand-off view is temporary (LAYOUT SAVE <name> keeps it)"
+                    );
                 }
                 return;
             }
@@ -2369,8 +2378,12 @@ impl TerminalApp {
                 // hand-off keys here, run them after the loop (they replace panes).
                 if self.focus == id {
                     self.clear_handoff_arrival_on_input(ui.ctx());
-                    if let (_, Some(intent)) = self.handoff_input(ui.ctx()) {
+                    let (consumed, intent) = self.handoff_input(ui.ctx());
+                    if let Some(intent) = intent {
                         handoff = Some((id, intent));
+                    }
+                    if !consumed {
+                        self.backtest_keys(ui.ctx());
                     }
                 }
                 let (acts, clicked) = self.render_content(ui, i, inner, self.focus == id);

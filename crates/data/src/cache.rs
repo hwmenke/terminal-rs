@@ -57,6 +57,7 @@ impl BarCache {
                 symbol TEXT PRIMARY KEY NOT NULL, zone TEXT NOT NULL
             ) WITHOUT ROWID;",
         )?;
+        crate::backtest_trials::init(conn)?;
         Ok(())
     }
 

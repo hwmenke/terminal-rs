@@ -201,6 +201,7 @@ pub enum Request {
         commission_bps: f64,
         slippage_bps: f64,
         allow_short: bool,
+        honesty: tr_data::backtest_honesty::HonestySettings,
     },
     /// Multi-symbol intraday compare, percent from each name's 09:30 open.
     IntradayCompare {
@@ -309,6 +310,7 @@ pub enum Request {
         commission_bps: f64,
         slippage_bps: f64,
         allow_short: bool,
+        honesty: tr_data::backtest_honesty::HonestySettings,
     },
     /// Historical lookalikes / nearest neighbors for one archive symbol.
     Lookalike {
@@ -704,15 +706,19 @@ pub enum Response {
         generation: u64,
         result: Result<tr_data::studio_dist::Report, String>,
     },
+    BacktestTrialRevision {
+        scope: String,
+        revision: u64,
+    },
     Backtest {
         pane: PaneId,
         generation: u64,
-        result: Result<tr_data::backtest::BacktestReport, String>,
+        result: Result<(Arc<tr_data::backtest::BacktestReport>, String), String>,
     },
     IntradayBacktest {
         pane: PaneId,
         generation: u64,
-        result: Result<tr_data::intraday_backtest::IntradayReport, String>,
+        result: Result<(Arc<tr_data::intraday_backtest::IntradayReport>, String), String>,
     },
     IntradayCompare {
         pane: PaneId,
@@ -1351,10 +1357,15 @@ fn build_indicators_impl(
                 };
             }
             if spec.def().is_some_and(|d| d.research)
-                && let Err(error) = tr_core::indicators::require_adaptive_bars(bars, spec.name()) {
+                && let Err(error) = tr_core::indicators::require_adaptive_bars(bars, spec.name())
+            {
                 return BuiltIndicator {
-                    spec: spec.clone(), overlays: Vec::new(), refused: Some(error),
-                    note: None, z_readout: None, honest_z: None,
+                    spec: spec.clone(),
+                    overlays: Vec::new(),
+                    refused: Some(error),
+                    note: None,
+                    z_readout: None,
+                    honest_z: None,
                 };
             }
             let main = palette.series[i % colors];
@@ -2544,7 +2555,142 @@ async fn research_stats(
     Ok(snapshot)
 }
 
+/// Science cache contains immutable admitted inputs, never refresh receipts. All
+/// hashing, DB work and inference happen on the blocking worker.
+#[allow(clippy::too_many_arguments)]
+async fn honest_cached<T: Send + Sync + 'static>(
+    s: &Shared,
+    symbol: String,
+    tf: Timeframe,
+    bars: Vec<Bar>,
+    basis: String,
+    observed: Option<i64>,
+    stitch: Option<tr_data::vault::StitchInfo>,
+    settings: tr_data::backtest_honesty::HonestySettings,
+    current: Vec<tr_data::backtest_trials::Experiment>,
+    compute: impl Fn(&[Bar], tr_data::backtest_honesty::HonestReport) -> Result<T, String> + Send + 'static,
+) -> anyhow::Result<Arc<T>> {
+    if s.sample_mode() {
+        anyhow::bail!("Backtest refused: sample / offline display mode");
+    }
+    let cache = s.cache.clone();
+    let reports = s.reports.clone();
+    let out = s.out.clone();
+    let ctx = s.ctx.clone();
+    tokio::task::spawn_blocking(move || -> Result<Arc<T>, String> {
+        use tr_data::backtest_honesty::{Estimate, Reason};
+        // Gate even before a science-cache hit. A mixed series needs its witness.
+        let normalized = tr_data::vault::research_bars(&bars, stitch.as_ref())?;
+        if normalized.windows(2).any(|w| w[0].ts > w[1].ts) {
+            return Err("Backtest refused: input timestamps are not ascending".into());
+        }
+        let mut closed = tr_data::closed::closed_len(tf, &normalized, tr_data::security(&symbol).class, observed);
+        // Equal timestamps are not successors. Keep the entire pending bucket
+        // out; interior duplicates are counted by the intraday session gate.
+        if closed < normalized.len() {
+            while closed > 0 && normalized[closed - 1].ts >= normalized[closed].ts {
+                closed -= 1;
+            }
+        }
+        let bars = &normalized[..closed];
+        if bars.is_empty() {
+            return Err("Backtest refused: no closed bars".into());
+        }
+        if !tf.is_intraday() {
+            tr_data::backtest::require_backtest_bars(bars, "Honest backtest")?;
+            tr_data::backtest_honesty::validate_daily(bars).map_err(|r| r.to_string())?;
+        }
+        for e in &current {
+            e.validate().map_err(|r| r.to_string())?;
+        }
+        let scope = tr_data::backtest_trials::scope(&symbol, tf.is_intraday(), tf, &basis);
+        for _ in 0..3 {
+            let family = cache.lock().ok().and_then(|mut guard| {
+                let v = guard.as_mut()?;
+                if !v.enabled() {
+                    return None;
+                }
+                v.backtest_register(&scope, &current, bars, chrono::Utc::now().timestamp())
+                    .map_err(|e| tracing::warn!("backtest trial register: {e:#}"))
+                    .ok()
+            });
+            let family = match family {
+                Some((f, changed)) => {
+                    if changed {
+                        let _ =
+                            out.send(Response::BacktestTrialRevision { scope: f.scope.clone(), revision: f.revision });
+                        ctx.request_repaint();
+                    }
+                    Estimate::Available(f)
+                }
+                None => Estimate::Unavailable(Reason::RegisterUnavailable),
+            };
+            let revision = family.value().map(|f| f.revision);
+            let params = serde_json::to_string(&(
+                settings,
+                &current,
+                family.value().map(|f| (&f.scope, f.revision, &f.digest)),
+                stitch.as_ref().map(|s| (&s.gaps, s.holes, s.missing_sessions)),
+            ))
+            .map_err(|e| e.to_string())?;
+            let mut key = tr_data::report_cache::ReportKey::new(
+                if tf.is_intraday() { "backtest_honest_intraday_v1" } else { "backtest_honest_daily_v1" },
+                &symbol,
+                tf,
+                &basis,
+                bars,
+                &params,
+            );
+            key.epoch = stitch.as_ref().map_or(0, |s| s.epoch);
+            let result = reports.get_or_compute(key, || {
+                let honest = tr_data::backtest_trials::compute(
+                    bars,
+                    tf,
+                    settings,
+                    &current,
+                    family.clone(),
+                    format!(
+                        "Verified closed prefix: {} native bars; complete cash sessions only; source {}",
+                        bars.len(),
+                        basis
+                    ),
+                );
+                // Persist failed attempts too, without changing experiment identity.
+                if let Ok(mut guard) = cache.lock()
+                    && let Some(v) = guard.as_mut().filter(|v| v.enabled())
+                {
+                    for (id, status) in &honest.replay_statuses {
+                        let _ = v.backtest_status(&scope, id, status);
+                    }
+                }
+                let result = compute(bars, honest);
+                if let Err(e) = &result
+                    && let Ok(mut guard) = cache.lock()
+                    && let Some(v) = guard.as_mut().filter(|v| v.enabled())
+                {
+                    for experiment in &current {
+                        let _ = v.backtest_status(&scope, &experiment.canonical(), &format!("failed: {e}"));
+                    }
+                }
+                result
+            })?;
+            let latest = cache
+                .lock()
+                .ok()
+                .and_then(|guard| guard.as_ref().filter(|v| v.enabled()).and_then(|v| v.backtest_family(&scope).ok()))
+                .map(|f| f.revision);
+            if latest == revision {
+                return Ok(result);
+            }
+        }
+        Err("Backtest trial family changed during replay; reload to obtain current confidence".into())
+    })
+    .await?
+    .map_err(anyhow::Error::msg)
+}
+
 /// Load one name from the local archive, then Whats-News. Sample/display bars never enter.
+#[allow(clippy::too_many_arguments)] // mirrors the typed pane request
 async fn research_backtest(
     s: &Shared,
     bridge: &tr_data::whats_news::Bridge,
@@ -2554,7 +2700,12 @@ async fn research_backtest(
     commission_bps: f64,
     slippage_bps: f64,
     allow_short: bool,
-) -> anyhow::Result<tr_data::backtest::BacktestReport> {
+    honesty: tr_data::backtest_honesty::HonestySettings,
+) -> anyhow::Result<(Arc<tr_data::backtest::BacktestReport>, String)> {
+    if s.sample_mode() {
+        anyhow::bail!("Backtest refused: sample / offline display mode does not feed this pane");
+    }
+    let observed = chrono::Utc::now().timestamp();
     use tr_data::whats_news::archive_ticker;
     let ticker = archive_ticker(key);
     if ticker.is_empty() {
@@ -2564,7 +2715,7 @@ async fn research_backtest(
     let local = s.history.db(move |db| db.daily(&wanted)).await?;
     let mut source = "Local Yahoo daily research archive".to_string();
     let bars = if !local.is_empty() {
-        tr_data::backtest::require_backtest_bars(&local, "Backtest").map_err(anyhow::Error::msg)?;
+        Bar::require_verified(&local, "Backtest").map_err(anyhow::Error::msg)?;
         local
     } else if bridge.enabled {
         match bridge.histories_for(std::slice::from_ref(&ticker)).await {
@@ -2581,7 +2732,7 @@ async fn research_backtest(
                     .find(|(s, _)| s.eq_ignore_ascii_case(&ticker))
                     .map(|(_, b)| b)
                     .unwrap_or_default();
-                tr_data::backtest::require_backtest_bars(&bars, "Backtest").map_err(anyhow::Error::msg)?;
+                Bar::require_verified(&bars, "Backtest").map_err(anyhow::Error::msg)?;
                 bars
             }
             Err(e) if tr_data::whats_news::is_unverified(&e) => return Err(e),
@@ -2604,17 +2755,37 @@ async fn research_backtest(
         strategies,
     };
     let key = tr_data::security(key).key();
-    let report = tokio::task::spawn_blocking({
-        let source = source.clone();
-        let ticker = ticker.clone();
-        move || tr_data::backtest::compute_report(&key, &ticker, &bars, &settings, &source)
-    })
-    .await?
-    .map_err(anyhow::Error::msg)?;
-    Ok(report)
+    let current = tr_data::backtest_trials::daily_experiments(&settings, honesty);
+    let basis = source.clone();
+    let receipt = format!("{} · verified daily archive · observation {}", source, observed);
+    let report = honest_cached(
+        s,
+        key,
+        Timeframe::D1,
+        bars,
+        basis,
+        Some(observed),
+        None,
+        honesty,
+        current,
+        move |bars, honest| {
+            let mut report = tr_data::backtest::compute_report(
+                &tr_data::security(&ticker).key(),
+                &ticker,
+                bars,
+                &settings,
+                &source,
+            )?;
+            report.honesty = Some(honest);
+            Ok(report)
+        },
+    )
+    .await?;
+    Ok((report, receipt))
 }
 
 /// Verified regular-session bars only. Sample substitution is refused before a setup is scored.
+#[allow(clippy::too_many_arguments)] // mirrors the typed pane request
 async fn research_intraday_backtest(
     s: &Shared,
     key: &str,
@@ -2624,7 +2795,8 @@ async fn research_intraday_backtest(
     commission_bps: f64,
     slippage_bps: f64,
     allow_short: bool,
-) -> anyhow::Result<tr_data::intraday_backtest::IntradayReport> {
+    honesty: tr_data::backtest_honesty::HonestySettings,
+) -> anyhow::Result<(Arc<tr_data::intraday_backtest::IntradayReport>, String)> {
     let sec = tr_data::security(key);
     tr_data::cash_session::require_us_session(&sec.ticker, None).map_err(anyhow::Error::msg)?;
     if !matches!(sec.class, tr_core::AssetClass::Equity | tr_core::AssetClass::Etf | tr_core::AssetClass::Index) {
@@ -2648,7 +2820,6 @@ async fn research_intraday_backtest(
             "Intraday backtest refused: no regular-session bars were returned. Sample prices are never used."
         );
     }
-    Bar::require_verified(&bars, "Intraday backtest").map_err(anyhow::Error::msg)?;
     let settings = tr_data::intraday_backtest::RunSettings {
         holdout_frac: tr_data::backtest::parse_holdout(holdout),
         costs: tr_data::backtest::CostModel { commission_bps, slippage_bps },
@@ -2657,13 +2828,29 @@ async fn research_intraday_backtest(
         timeframe: tf,
         setups,
     };
-    let source = format!("{} {} regular session", stitch.label(), tf.label());
-    let mut cache_key =
-        tr_data::report_cache::ReportKey::new("intraday_bt", &symbol, tf, &source, &bars, &format!("{settings:?}"));
-    cache_key.epoch = stitch.epoch;
-    cache_key.day = Some(tr_core::ny::civil(chrono::Utc::now().timestamp()).date());
-    cached_study(s, cache_key, move || tr_data::intraday_backtest::compute_report(&symbol, &bars, &settings, &source))
-        .await
+    let source = stitch.source.clone();
+    let receipt = stitch.label();
+    let current = tr_data::backtest_trials::intraday_experiments(&settings, honesty);
+    let report = honest_cached(
+        s,
+        symbol.clone(),
+        tf,
+        bars,
+        source.clone(),
+        stitch.fetched_at,
+        Some(stitch),
+        honesty,
+        current,
+        move |bars, honest| {
+            let mut report = tr_data::intraday_backtest::compute_report(&symbol, bars, &settings, &source)?;
+            let mut honest = honest;
+            honest.admission.push_str(&format!(" · {}", report.skip_note));
+            report.honesty = Some(honest);
+            Ok(report)
+        },
+    )
+    .await?;
+    Ok((report, receipt))
 }
 
 /// Verified regular-session bars for several cash names. Sample substitution is refused.
@@ -3926,22 +4113,31 @@ async fn handle_inner(s: &Arc<Shared>, req: Request, force: bool) {
         Request::StudioDist { pane, generation, symbol, timeframe, window } => {
             let result = async {
                 if s.sample_mode() {
-                    anyhow::bail!("Distribution Studio: sample / demo mode has no real data. Verified bars are required.");
+                    anyhow::bail!(
+                        "Distribution Studio: sample / demo mode has no real data. Verified bars are required."
+                    );
                 }
                 let (bars, source, observed_at, gaps) = if timeframe == Timeframe::D1 {
-                    let (bars, source) = crate::app::studio_dist::daily_bars(&s.history, &config.bridge(), &symbol).await?;
+                    let (bars, source) =
+                        crate::app::studio_dist::daily_bars(&s.history, &config.bridge(), &symbol).await?;
                     (bars, source, Some(chrono::Utc::now().timestamp()), Vec::new())
                 } else {
-                    let (bars, stitch) = analysis_bars(s, &symbol, timeframe, default_limit(timeframe), "Distribution Studio").await?;
+                    let (bars, stitch) =
+                        analysis_bars(s, &symbol, timeframe, default_limit(timeframe), "Distribution Studio").await?;
                     let stale = s.provider.health().is_some_and(|h| {
-                        matches!(h.snapshot()[Feed::Bars as usize].state, FeedState::Stale { .. } | FeedState::Unavailable(_))
+                        matches!(
+                            h.snapshot()[Feed::Bars as usize].state,
+                            FeedState::Stale { .. } | FeedState::Unavailable(_)
+                        )
                     });
                     let observed_at = (!stale && stitch.live_ok).then_some(stitch.fetched_at).flatten();
                     (bars, stitch.label(), observed_at, stitch.gaps)
                 };
                 crate::app::studio_dist::build_report(symbol, bars, timeframe, window, source, observed_at, gaps)
-                    .await.map_err(anyhow::Error::msg)
-            }.await;
+                    .await
+                    .map_err(anyhow::Error::msg)
+            }
+            .await;
             send(Response::StudioDist { pane, generation, result: result.map_err(|e| format!("{e:#}")) });
         }
         Request::TstackTune { pane, generation, symbol, tf, params } => {
@@ -4021,7 +4217,17 @@ async fn handle_inner(s: &Arc<Shared>, req: Request, force: bool) {
                 result: research_stats(s, &bridge, &symbol, &condition, &horizons).await.map_err(|e| format!("{e:#}")),
             });
         }
-        Request::Backtest { pane, generation, symbol, spec, holdout, commission_bps, slippage_bps, allow_short } => {
+        Request::Backtest {
+            pane,
+            generation,
+            symbol,
+            spec,
+            holdout,
+            commission_bps,
+            slippage_bps,
+            allow_short,
+            honesty,
+        } => {
             let bridge = config.bridge();
             send(Response::Backtest {
                 pane,
@@ -4035,6 +4241,7 @@ async fn handle_inner(s: &Arc<Shared>, req: Request, force: bool) {
                     commission_bps,
                     slippage_bps,
                     allow_short,
+                    honesty,
                 )
                 .await
                 .map_err(|e| format!("{e:#}")),
@@ -4137,6 +4344,7 @@ async fn handle_inner(s: &Arc<Shared>, req: Request, force: bool) {
             commission_bps,
             slippage_bps,
             allow_short,
+            honesty,
         } => {
             send(Response::IntradayBacktest {
                 pane,
@@ -4150,6 +4358,7 @@ async fn handle_inner(s: &Arc<Shared>, req: Request, force: bool) {
                     commission_bps,
                     slippage_bps,
                     allow_short,
+                    honesty,
                 )
                 .await
                 .map_err(|e| format!("{e:#}")),
@@ -6020,7 +6229,7 @@ mod tests {
         let _ = research_session_extreme(&s, "AAPL", "", "5m").await;
         let _ = research_relative_path(&s, "AAPL", "", "5m").await;
         let _ = research_session_clock(&s, "AAPL", "", "5m").await;
-        let _ = research_intraday_backtest(&s, "AAPL", "OR", "5m", "20%", 0., 0., false).await;
+        let _ = research_intraday_backtest(&s, "AAPL", "OR", "5m", "20%", 0., 0., false, Default::default()).await;
         let _ = research_intraday_compare(&s, "AAPL", "SPY", "5m").await;
         let _ = research_breadth(&s, "AAPL MSFT SPY NVDA META", "5m", &[]).await;
         let _ = research_session_brief(&s, "AAPL").await;
@@ -8657,5 +8866,205 @@ mod auction_tests {
             "Auction in-memory vault read + stitch, 7800 rows, worker scheduling included: {:?}",
             start.elapsed() / 10
         );
+    }
+}
+
+#[cfg(test)]
+mod honest_backtest_tests {
+    use super::tests::{shared, vault_provider};
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tr_data::{
+        backtest_honesty::{Estimate, HonestReport, HonestySettings, Reason},
+        backtest_trials,
+    };
+    fn daily(n: usize) -> Vec<Bar> {
+        let mut date = "2025-01-02".parse().unwrap();
+        let mut out = Vec::new();
+        while out.len() < n {
+            let p = 100. + out.len() as f64 * 0.1 + (out.len() as f64 * 0.7).sin();
+            out.push(
+                Bar::new(
+                    chrono::NaiveDate::and_hms_opt(&date, 0, 0, 0).unwrap().and_utc().timestamp(),
+                    p,
+                    p + 1.,
+                    p - 1.,
+                    p + 0.3,
+                    100.,
+                )
+                .with_provenance(tr_core::Provenance::Real),
+            );
+            date = tr_data::history::calendar::next_session(date);
+        }
+        out
+    }
+    #[allow(clippy::too_many_arguments)]
+    async fn science(
+        s: &Shared,
+        bars: Vec<Bar>,
+        tf: Timeframe,
+        observed: Option<i64>,
+        stitch: Option<tr_data::vault::StitchInfo>,
+        settings: HonestySettings,
+        shorts: bool,
+        counter: Arc<AtomicUsize>,
+    ) -> anyhow::Result<Arc<HonestReport>> {
+        let current = if tf.is_intraday() {
+            backtest_trials::intraday_experiments(
+                &tr_data::intraday_backtest::RunSettings { timeframe: tf, allow_short: shorts, ..Default::default() },
+                settings,
+            )
+        } else {
+            backtest_trials::daily_experiments(
+                &tr_data::backtest::RunSettings {
+                    strategies: vec![tr_data::backtest::StrategySpec::BuyAndHold],
+                    allow_short: shorts,
+                    ..Default::default()
+                },
+                settings,
+            )
+        };
+        honest_cached(
+            s,
+            "AAPL US Equity".into(),
+            tf,
+            bars,
+            "fixture-native".into(),
+            observed,
+            stitch,
+            settings,
+            current,
+            move |_, h| {
+                counter.fetch_add(1, Ordering::SeqCst);
+                Ok(h)
+            },
+        )
+        .await
+    }
+    #[tokio::test]
+    async fn backtest_worker_cache_closed_prefix_durable_revisions_and_concurrency() {
+        let path = std::env::temp_dir().join(format!("tr-honest-worker-{}.sqlite", std::process::id()));
+        let (s, rx) = shared(vault_provider(vec![]), Some(BarCache::open(&path).unwrap()));
+        let count = Arc::new(AtomicUsize::new(0));
+        let bars = daily(160);
+        let wf = HonestySettings::default();
+        let (a, b) = tokio::join!(
+            science(&s, bars.clone(), Timeframe::D1, None, None, wf, false, count.clone()),
+            science(&s, bars.clone(), Timeframe::D1, None, None, wf, false, count.clone())
+        );
+        let a = a.unwrap();
+        let b = b.unwrap();
+        assert!(Arc::ptr_eq(&a, &b));
+        assert_eq!(count.load(Ordering::SeqCst), 1);
+        assert_eq!(a.trial_family.value().unwrap().trials.len(), 2);
+        assert!(a.family_statistics.value().is_some());
+        assert_eq!(rx.try_iter().filter(|r| matches!(r, Response::BacktestTrialRevision { .. })).count(), 1);
+        let mut forming = bars.clone();
+        forming.last_mut().unwrap().close = f64::NAN;
+        let same = science(&s, forming, Timeframe::D1, None, None, wf, false, count.clone()).await.unwrap();
+        assert!(Arc::ptr_eq(&a, &same));
+        let mut correction = bars.clone();
+        correction[50].close += 0.1;
+        let changed = science(&s, correction, Timeframe::D1, None, None, wf, false, count.clone()).await.unwrap();
+        assert!(!Arc::ptr_eq(&a, &changed));
+        assert_eq!(changed.trial_family.value().unwrap().revision, a.trial_family.value().unwrap().revision);
+        let new_history = science(&s, daily(161), Timeframe::D1, None, None, wf, false, count.clone()).await.unwrap();
+        assert!(!Arc::ptr_eq(&a, &new_history));
+        let new_trial = science(&s, bars.clone(), Timeframe::D1, None, None, wf, true, count.clone()).await.unwrap();
+        assert_eq!(new_trial.trial_family.value().unwrap().trials.len(), 4);
+        assert_eq!(new_trial.trial_family.value().unwrap().revision, 4);
+        let reload = science(&s, bars, Timeframe::D1, None, None, wf, true, count.clone()).await.unwrap();
+        assert!(Arc::ptr_eq(&new_trial, &reload));
+        assert_eq!(rx.try_iter().filter(|r| matches!(r, Response::BacktestTrialRevision { .. })).count(), 1);
+        drop(s);
+        std::fs::remove_file(path).unwrap();
+    }
+    #[tokio::test]
+    async fn backtest_worker_verified_gate_precedes_cache_and_missing_register_has_no_dsr() {
+        let (s, _) = shared(vault_provider(vec![]), Some(BarCache::open_in_memory().unwrap()));
+        let bars = daily(160);
+        let count = Arc::new(AtomicUsize::new(0));
+        let wf = HonestySettings::default();
+        let a = science(&s, bars.clone(), Timeframe::D1, None, None, wf, false, count.clone()).await.unwrap();
+        assert_eq!(a.family_statistics, Estimate::Unavailable(Reason::RegisterUnavailable));
+        assert!(a.variants[0].evaluation.value().is_some());
+        for provenance in [tr_core::Provenance::Sample, tr_core::Provenance::Missing] {
+            for tf in [Timeframe::D1, Timeframe::M5] {
+                let mut bad = bars.clone();
+                bad.last_mut().unwrap().provenance = provenance;
+                assert!(science(&s, bad, tf, None, None, wf, false, count.clone()).await.is_err());
+            }
+        }
+        let mut mixed = bars.clone();
+        mixed[0].provenance = tr_core::Provenance::Cached;
+        assert!(
+            science(&s, mixed.clone(), Timeframe::D1, None, None, wf, false, count.clone())
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("stitch")
+        );
+        let witness = tr_data::vault::StitchInfo { source: "fixture-native".into(), epoch: 1, ..Default::default() };
+        assert!(science(&s, mixed, Timeframe::D1, None, Some(witness), wf, false, count.clone()).await.is_ok());
+        let mut gap = bars;
+        gap.remove(20);
+        assert!(
+            science(&s, gap, Timeframe::D1, None, None, wf, false, count)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("hole")
+        );
+    }
+    #[tokio::test]
+    async fn backtest_worker_sample_mode_refuses_both_without_fetching() {
+        let sample = Arc::new(tr_data::sample::SampleProvider::at(0, 10));
+        let (s, _) = shared(sample, None);
+        let count = Arc::new(AtomicUsize::new(0));
+        for tf in [Timeframe::D1, Timeframe::M5] {
+            assert!(
+                science(&s, daily(160), tf, None, None, Default::default(), false, count.clone())
+                    .await
+                    .unwrap_err()
+                    .to_string()
+                    .contains("sample")
+            );
+        }
+        assert_eq!(count.load(Ordering::SeqCst), 0);
+    }
+    #[tokio::test]
+    async fn backtest_worker_intraday_uses_complete_sessions_and_current_outage_receipt() {
+        let mut date = "2025-06-02".parse().unwrap();
+        let mut bars = Vec::new();
+        for i in 0..40 {
+            for (j, ts) in tr_data::intraday::regular_opens(date, Timeframe::M30).into_iter().enumerate() {
+                let p = 100. + i as f64 * 0.1 + j as f64 * 0.02 + (i as f64 * 0.4).sin();
+                bars.push(
+                    Bar::new(ts, p, p + 1., p - 1., p + (i as f64 * 0.3).sin() * 0.2, 100.)
+                        .with_provenance(tr_core::Provenance::Real),
+                );
+            }
+            date = tr_data::history::calendar::next_session(date);
+        }
+        let provider = vault_provider(bars);
+        let (s, _) = shared(provider.clone(), Some(BarCache::open_in_memory().unwrap()));
+        let (a, fresh) = research_intraday_backtest(&s, "AAPL", "ALL", "30m", "20%", 5., 5., false, Default::default())
+            .await
+            .unwrap();
+        assert_eq!(a.sessions, 40);
+        assert!(!fresh.contains("VAULT ONLY"));
+        let e = a.honesty.as_ref().unwrap().variants[0].evaluation.value().unwrap();
+        assert_eq!(e.returns.len(), 18);
+        assert_eq!(e.folds[0].removed_labels, 0);
+        assert_eq!(e.folds[1].removed_labels, 1);
+        provider.fail.store(true, Ordering::SeqCst);
+        let (b, receipt) =
+            research_intraday_backtest(&s, "AAPL", "ALL", "30m", "20%", 5., 5., false, Default::default())
+                .await
+                .unwrap();
+        assert!(receipt.contains("VAULT ONLY"));
+        assert_eq!(b.sessions, 39);
+        assert_eq!(b.partial_sessions, 1);
+        assert_eq!(b.honesty.as_ref().unwrap().variants[0].evaluation.value().unwrap().returns.len(), 17);
     }
 }
