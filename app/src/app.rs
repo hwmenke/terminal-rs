@@ -41,6 +41,8 @@ mod stats;
 pub(crate) mod studio_corr;
 pub(crate) mod studio_dist;
 mod studio_season;
+#[cfg(test)]
+mod studio_perf_gate;
 mod theming;
 mod trading;
 mod trend_wall;

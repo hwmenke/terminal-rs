@@ -1,4 +1,5 @@
 //! Seasonality Studio pane and painter charts.
+pub(super) mod or_lens;
 use super::{PaneKind, TerminalApp};
 use crate::{
     congress_view::Action,
@@ -17,11 +18,22 @@ pub struct SeasonPane {
     pub loading: bool,
     pub error: Option<String>,
     pub report: Option<SeasonReport>,
+    pub or_tab: bool,
+    pub or_selection: or_lens::Selection,
 }
 
 impl SeasonPane {
     pub fn new(symbol: impl Into<String>, spec: impl Into<String>) -> Self {
-        Self { symbol: symbol.into(), spec: spec.into(), generation: 0, loading: false, error: None, report: None }
+        Self {
+            symbol: symbol.into(),
+            spec: spec.into(),
+            generation: 0,
+            loading: false,
+            error: None,
+            report: None,
+            or_tab: false,
+            or_selection: Default::default(),
+        }
     }
     pub fn request(&mut self, id: PaneId, worker: &Worker) {
         self.generation += 1;
@@ -80,7 +92,9 @@ impl TerminalApp {
             // Same empty state as DIST / CORR: never send a request for display prices.
             pane.report = None;
             pane.loading = false;
-            pane.error = Some("No real data in sample / demo display mode. Seasonality never uses display or demo prices.".into());
+            pane.error = Some(
+                "No real data in sample / demo display mode. Seasonality never uses display or demo prices.".into(),
+            );
         } else if pane.generation == 0 {
             pane.request(id, &self.worker);
         }
@@ -108,7 +122,25 @@ impl TerminalApp {
         }
         super::studio_dist::studio_states(ui, pane.loading, pane.error.as_deref(), None);
         if let Some(r) = &pane.report {
-            ui.push_id(id, |ui| report_view(ui, id, r));
+            ui.horizontal(|ui| {
+                ui.selectable_value(&mut pane.or_tab, false, "Calendar");
+                if r.timeframe == tr_core::Timeframe::M30 {
+                    ui.selectable_value(&mut pane.or_tab, true, "OR Lens");
+                } else {
+                    pane.or_tab = false;
+                }
+            });
+            ui.push_id(id, |ui| {
+                if pane.or_tab {
+                    if let Some(lens) = &r.or_lens {
+                        or_lens::view(ui, lens, &mut pane.or_selection);
+                    } else {
+                        ui.label(r.or_unavailable.as_deref().unwrap_or("OR Lens unavailable"));
+                    }
+                } else {
+                    report_view(ui, id, r);
+                }
+            });
         }
         vec![]
     }

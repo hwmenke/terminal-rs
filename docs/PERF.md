@@ -334,3 +334,99 @@ The p95 values are reported observations; the harness continues to gate medians.
 Headless timings cover CPU UI/tessellation, without GPU presentation or a four-pane
 desk. Concentration is bin-dependent descriptive allocated volume with no CI or
 predictive significance. Existing strict Clippy debt remains separate.
+
+## Slice 2: Opening-range conditional lens
+
+`SEASON 30m` now builds an immutable OR report in the existing `spawn_blocking`
+job (`StudioSeason` CPU timer). Admission retains native sourced bars, the complete
+vault stitch witness, gaps and source observation clock. Mixed verified live/cache
+tags are normalized only with that witness. The OR API also refuses unwitnessed
+mixed input before filtering. The pane's existing generation/sample/refusal rules
+apply. No report, tab or selection fields enter saved-layout/prefs schemas.
+
+All 117 cells, same-clock complements, five-session Bartlett HAC estimates,
+pointwise intervals, normal p-values, full-family BY q-values and shared-edge
+histogram counts/masses are built before painting. The effect scale, histogram
+scale and whisker extents are also report fields. Paint only maps this immutable
+report to geometry; changing a horizon or cell never reruns inference or changes
+the family. Receipt text prints actual historical coverage and CLOSED THRU;
+TODAY is excluded. Sparse/degenerate inference remains unavailable.
+
+New complete compute cases (also exercised at smoke scale):
+
+| Case | Admission/work guard | Ceiling |
+| --- | --- | ---: |
+| `studio.or_lens_120d_30m` | 120 native sessions, all 117 cells, three nonempty state/complement pairs with ≥30/group, completed outcomes and real intervals; no final-clock overnight substitution | 40 ms |
+| `nulls.by_117` | All 117 adjusted finite q-values including unavailable p=1 members | 0.5 ms |
+
+The generated OR bars are confined to `tr-perf` test/dev infrastructure, never
+application data. The full OR compute rebuild is timed, including validation,
+calendar admission, session grids, inference, correction and distributions.
+Smoke scale retains 93 sessions so inferential work is still exercised.
+
+`app::studio_perf_gate::perf_gate_paint_studios` is an ignored release test
+selected by the existing `cargo perf-paint` alias. Its 1440×1200 headless pane
+uses the normal `SeasonPane::accept` path with 120 sessions, 20 warmup frames
+per mode, 120 steady frames and 120 moving-pointer hover frames. Hover warmup
+holds the pointer still until egui opens the card, preserving the default tooltip
+delay; measured hover frames include the open MathCard. Guards require all three
+state rows, key, coverage receipt, distributions, effect whisker and actual hovered
+MathCard text. Geometry checks also exercise 320/1440 widths, sparse/constant
+returns and empty complements. A failing metric gets two retries with the best
+median retained, matching the existing chart gate. The chart/studio tests each
+validate their exact budget IDs and merge `paint.json`/optional baseline entries
+so neither overwrites the other's measurements.
+
+| OR paint mode | UI ceiling | Tessellation ceiling | Total ceiling |
+| --- | ---: | ---: | ---: |
+| `paint.studio_or.steady` | 1.2 ms | 0.8 ms | 2.0 ms |
+| `paint.studio_or.hover` | 1.2 ms | 0.8 ms | 2.0 ms |
+
+All previous compute, aggregate paint and layer budgets are unchanged. Medians
+are gated; p95 is reported for review. These remain CPU UI/tessellation checks,
+not GPU/presentation or whole-desk measurements. Decorative polish and optional
+interaction shortcuts were cut; all specified statistical/admission/UI/gate
+requirements remain. No dependencies were added.
+
+Final release measurements (2026-11-16, same Linux host, calibration
+**6.010915 ms**, slack **1.0**):
+
+| Case / metric | Median ms | p95 ms | Ceiling ms |
+| --- | ---: | ---: | ---: |
+| `studio.or_lens_120d_30m` | 0.871805 | 0.932144 | 40 |
+| `nulls.by_117` | 0.001649 | 0.001735 | 0.5 |
+| `paint.studio_or.steady.ui` | 0.102348 | 0.110185 | 1.2 |
+| `paint.studio_or.steady.tess` | 0.069597 | 0.080104 | 0.8 |
+| `paint.studio_or.steady.total` | 0.171866 | 0.193672 | 2 |
+| `paint.studio_or.hover.ui` | 0.120776 | 0.135208 | 1.2 |
+| `paint.studio_or.hover.tess` | 0.081248 | 0.087695 | 0.8 |
+| `paint.studio_or.hover.total` | 0.201384 | 0.221900 | 2 |
+
+The reviewed baseline records **26 compute cases and 111 paint metrics**. All
+24 existing compute cases passed their unchanged absolute and normalized relative
+rules, with no advisory slowdown/speedup warnings in the final run. Both release
+paint tests passed all aggregate and per-layer checks. The gate caught a genuine
+harness defect during development: duplicate synthetic PointerMoved events at an
+unchanged position reset egui's tooltip delay. The final fixture emits only real
+position changes, warms the default tooltip naturally, and asserts the actual
+MathCard is painted under measured pointer motion; no ceiling was changed.
+
+Final validation:
+
+- `cargo test --workspace --offline`: **1,571 passed, 0 failed, 10 ignored**.
+- `cargo build --release --offline`: **passed**.
+- `scripts/perf-gate.sh`: **26 compute/data passed, 0 failed, 0 harness errors**;
+  **2 release paint tests passed, 0 failed, 0 ignored**, checking **111 metrics**.
+- **14 new ordinary tests**: three inference references/degeneracy tests, one BY
+  vector/family test, six OR admission/window/causality/histogram tests, three
+  app geometry/selection/card tests and one worker witnessed mixed-source test.
+  The additional ignored test is the explicitly executed release studio paint
+  gate. Existing sample, generation, layout round-trip and colour guards pass.
+  All 26 compute closures also execute through the existing smoke-work test.
+- No dependencies, saved schemas, prior budgets or unrelated features changed.
+  Cargo still prints the pre-existing unused `workspace.package.rust-version`
+  manifest warning. Strict Clippy was not part of this slice's final checks.
+
+Remaining limits are provider/vault depth and corporate-action evidence,
+asymptotic bandwidth sensitivity, exploration outside the displayed family, and
+the distinction between headless CPU cost and GPU/whole-desk presentation.

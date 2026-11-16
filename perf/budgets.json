@@ -122,6 +122,16 @@
       "budget_us": 200,
       "relative": true,
       "class": "interactive"
+    },
+    "studio.or_lens_120d_30m": {
+      "budget_us": 40000,
+      "relative": true,
+      "class": "interactive"
+    },
+    "nulls.by_117": {
+      "budget_us": 500,
+      "relative": true,
+      "class": "interactive"
     }
   }
 }

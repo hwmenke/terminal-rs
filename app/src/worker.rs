@@ -4414,12 +4414,16 @@ async fn handle_inner(s: &Arc<Shared>, req: Request, force: bool) {
                     (bars, source, chrono::Utc::now().timestamp(), Vec::new())
                 } else {
                     let (bars, info) = analysis_bars(s, &symbol, tf, tr_data::cash_session::research_fetch_limit(tf), "Seasonality").await?;
+                    // Normalise mixed verified cache/live tags only with the original vault witness.
+                    let bars = tr_data::vault::research_bars(&bars, Some(&info)).map_err(anyhow::Error::msg)?.into_owned();
                     // A stale vault must not use wall time to close an observed pending bar.
                     let observed = info.fetched_at.unwrap_or_else(|| bars.last().map(|b| b.ts).unwrap_or(0));
                     (bars, info.source, observed, info.gaps)
                 };
                 let now = chrono::Utc::now().timestamp();
+                let jobs = s.jobs.clone();
                 tokio::task::spawn_blocking(move || {
+                    let _job = crate::perf::JobTimer::new(&jobs, "StudioSeason");
                     tr_data::studio_season::compute_with_gaps(&symbol, tf, &bars, &source, observed.min(now), now, &gaps)
                 }).await?.map_err(anyhow::Error::msg)
             }.await.map_err(|e| format!("{e:#}"));
@@ -7716,6 +7720,31 @@ mod tests {
                 assert_eq!(provider.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
             }
         }
+    }
+
+    #[tokio::test]
+    async fn studio_or_lens_retains_vault_witness_gaps_and_source_clock() {
+        let bars = tr_perf::fixtures::or_lens(3);
+        let provider = vault_provider(bars[..26].to_vec());
+        let (s, rx) = shared(provider.clone(), Some(BarCache::open_in_memory().unwrap()));
+        analysis_bars(&s, "AAPL US Equity", Timeframe::M30, 100, "test").await.unwrap();
+        *provider.bars.lock().unwrap() = bars[13..].to_vec();
+        handle(&s, Request::StudioSeason {
+            pane: 19, generation: 11, symbol: "AAPL US Equity".into(), tf: Timeframe::M30,
+        }).await;
+        let Response::WhatsNews { response, .. } = rx.try_recv().unwrap() else { panic!("envelope") };
+        let Response::StudioSeason { generation, result, .. } = *response else { panic!("season report") };
+        assert_eq!(generation, 11);
+        let report = result.unwrap();
+        let lens = report.or_lens.unwrap();
+        assert_eq!(lens.provenance, tr_core::Provenance::Cached);
+        assert_eq!(lens.sessions, 3);
+        assert_eq!(lens.observed_at, report.observed_at);
+        assert_eq!(lens.closed_thru, bars.last().unwrap().ts + 1800);
+        assert_eq!(lens.gaps, report.gaps);
+        assert_eq!(lens.cell(0,1,0).selected.len(), 1);
+        assert_eq!(lens.cell(0,1,0).complement.len(), 2);
+        assert_eq!(lens.source, "yahoo");
     }
 
     #[tokio::test]
