@@ -22,6 +22,13 @@ editing controls marks them dirty while accepted evidence keeps its own settings
 - **DSR gauge** is a probability, coloured cyan. Marks are .50, .95 and .99,
   without an approval verdict. Fewer than 30 common sessions is labelled
   **LOW N** and hatched. Unavailable confidence has a reason and no gauge fill.
+  DSR estimates the probability that true Sharpe exceeds zero after adjustment
+  for tried variants. It belongs to the selected variant, never an implicit
+  benchmark or a winner chosen using OOS results. `N_raw` is the durable count
+  of distinct experiments; `N_eff` is the common-date correlation cluster count.
+  Missing estimates are grey em dashes with a reason. PSR/DSR hover cards
+  substitute the selected trial's actual session Sharpe, benchmark, n, skew,
+  Pearson kurtosis and probability variance into the formula.
 - **Sharpe bar** puts annualised raw SR and the annualised null maximum on one
   signed axis. Their difference is **Sharpe above null maximum**; DSR itself
   is not a reduced Sharpe estimate.
@@ -169,6 +176,9 @@ no future test exit is inspected. All dependent accounting returns are removed.
 A reversal-day return containing costs from two episodes is removed in full
 when either is excluded. Persistent daily holdings can leave no usable IS;
 valid OOS equity remains, with an explicit unresolved-label reason for IS.
+Purge counts include only labels touching the scored training candidate, not
+unscored warm-up labels. Insufficient IS caused by known overlapping exits is
+reported as too few returns; the unresolved-label reason requires an unknown exit.
 
 IBT labels complete within their sessions. The first session-boundary fold
 normally has zero purge. Later folds still exclude labels in prior embargo
@@ -179,6 +189,10 @@ There are no future training observations in a strictly forward fold. The
 post-test embargo is omitted from stitched OOS and excluded from later training
 scoring, along with any holding label touching it. Those past prices may still
 supply causal indicator warm-up. Earlier tests may become later training history.
+The configured embargo is a post-test gap, not a cap on label duration. IBT
+holdings resolve within a session; daily holdings can have an unbounded horizon.
+Purging uses each full holding interval regardless of the gap setting, and
+removes unresolved intervals conservatively instead of assigning a shorter horizon.
 See the [purged-validation label-overlap principle](https://www.quantresearch.org/Innovations.htm).
 
 ## Boundary execution, stitching and degradation
@@ -267,7 +281,8 @@ and round-trip tests verify that path.
 Checks use `CARGO_TARGET_DIR=/workspace/tr-auction-target`:
 
 ```
-cargo test --workspace --no-fail-fast
+cargo test --workspace --offline
+cargo build --release --offline
 cargo clippy --workspace --all-targets --offline
 ```
 
@@ -280,5 +295,5 @@ and `bool_comparison` in Adaptive Trend tests, before reaching this slice.
 No GUI, server, external-data test, dependency addition or git commit is part of
 this change.
 
-Final workspace result: **1,439 passed, 0 failed, 8 ignored** (including doc-test
+Final workspace result: **1,446 passed, 0 failed, 8 ignored** (including doc-test
 targets). Ignored tests retain their existing opt-in status.

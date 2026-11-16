@@ -441,5 +441,58 @@ mod tests {
         assert_ne!(a, scope("MSFT", false, tr_core::Timeframe::D1, "yahoo archive"));
         assert_ne!(a, scope("AAPL", true, tr_core::Timeframe::M5, "yahoo archive"));
         assert_ne!(a, scope("AAPL", false, tr_core::Timeframe::D1, "other source"));
+        assert_ne!(
+            scope("AAPL", true, tr_core::Timeframe::M5, "yahoo archive"),
+            scope("AAPL", true, tr_core::Timeframe::M15, "yahoo archive")
+        );
+    }
+    #[test]
+    fn backtest_trials_hidden_variants_and_failed_replays_remain_in_the_family() {
+        let mut date = chrono::NaiveDate::from_ymd_opt(2025, 1, 2).unwrap();
+        let mut bars = Vec::new();
+        for i in 0..160 {
+            let price = 100. + i as f64 * 0.1 + (i as f64 * 0.4).sin();
+            bars.push(
+                Bar::new(
+                    date.and_hms_opt(0, 0, 0).unwrap().and_utc().timestamp(),
+                    price,
+                    price + 1.,
+                    price - 1.,
+                    price + 0.2,
+                    100.,
+                )
+                .with_provenance(tr_core::Provenance::Real),
+            );
+            date = crate::history::calendar::next_session(date);
+        }
+        let wf = HonestySettings::default();
+        let current = daily_experiments(
+            &crate::backtest::RunSettings {
+                strategies: vec![crate::backtest::StrategySpec::BuyAndHold],
+                ..Default::default()
+            },
+            wf,
+        );
+        let mut hidden = experiment(12., Protocol::WalkForward(wf));
+        let mut cache = BarCache::open_in_memory().unwrap();
+        cache.backtest_register_inner("scope", std::slice::from_ref(&hidden), &bars, 1).unwrap();
+        let (family, _) = cache.backtest_register_inner("scope", &current, &bars, 2).unwrap();
+        assert_eq!(family.trials.len(), 3);
+        let report = compute(&bars, tr_core::Timeframe::D1, wf, &current, Estimate::Available(family), "test".into());
+        assert_eq!(report.variants.len(), 1);
+        assert_eq!(report.replay_statuses.len(), 3);
+        assert_eq!(report.family_statistics.value().unwrap().comparisons.len(), 3);
+        assert!(report.family_statistics.value().unwrap().comparisons.contains_key(&hidden.canonical()));
+
+        // Valid declaration, but its warm-up cannot be replayed on this history.
+        if let Experiment::Daily { strategy, .. } = &mut hidden {
+            *strategy = crate::backtest::StrategySpec::SmaCross { fast: 10, slow: 1000 };
+        }
+        let (family, _) = cache.backtest_register_inner("scope", &[hidden.clone()], &bars, 3).unwrap();
+        assert_eq!(family.trials.len(), 4);
+        let report = compute(&bars, tr_core::Timeframe::D1, wf, &current, Estimate::Available(family), "test".into());
+        assert!(report.variants[0].evaluation.value().is_some());
+        assert_eq!(report.family_statistics, Estimate::Unavailable(Reason::IncompleteFamily));
+        assert!(report.replay_statuses[&hidden.canonical()].starts_with("failed:"));
     }
 }

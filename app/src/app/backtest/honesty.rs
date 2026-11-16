@@ -4,7 +4,7 @@ use egui::{Align2, Color32, Pos2, Rect, Sense, Stroke, Vec2};
 use tr_data::backtest_honesty::{self as h, Comparison, Estimate, Evaluation, FoldReport, HonestReport, Moments};
 
 fn unavailable<T>(value: &Estimate<T>) -> String {
-    value.reason().map(|r| format!("unavailable — {r}")).unwrap_or_default()
+    value.reason().map(|r| format!("— {r}")).unwrap_or_default()
 }
 fn date(ts: i64) -> String {
     tr_core::ny::civil(ts).format("%Y-%m-%d %H:%M ET").to_string()
@@ -13,6 +13,43 @@ fn value(v: &Estimate<f64>, probability: bool) -> String {
     v.value()
         .map(|x| if probability { format!("{:.1}%", 100. * x) } else { format!("{x:+.2}") })
         .unwrap_or_else(|| unavailable(v))
+}
+fn probability_formula(m: &Moments, benchmark: f64) -> String {
+    format!(
+        "Φ(({:.8} − {:.8}) × √({} − 1) / √{:.8})\nV = 1 − ({:.8}) × ({:.8}) + ({:.8} − 1) × ({:.8})² / 4",
+        m.sharpe, benchmark, m.n, m.probability_variance, m.skew, m.sharpe, m.pearson_kurtosis, m.sharpe
+    )
+}
+fn probability_card(ui: &mut Ui, c: Option<&Comparison>, h: &HonestReport, deflated: bool) {
+    card(ui, c.map(|c| &c.moments), h, if deflated { "DSR = PSR(SR*)" } else { "PSR = PSR(0)" });
+    ui.label("PSR(SR*) = Φ((SR − SR*) × √(n − 1) / √V); all Sharpe inputs are per session.");
+    if let Some(c) = c {
+        ui.label(probability_formula(&c.moments, if deflated { c.null_maximum } else { 0. }));
+        if deflated {
+            if let Some(f) = h.family_statistics.value() {
+                ui.label("Zero-mean Gaussian null; trial dispersion uses the common session dates.");
+                ui.label(if f.stochastic_trials == 1 {
+                    "SR* = 0; one eligible trial has no cross-trial dispersion estimate."
+                } else {
+                    "SR* = s_SR × a_N; s_SR = √(Σ(SR_k − mean SR)² / (M − 1))"
+                });
+                ui.label(format!(
+                    "SR* = {:.8}; s_SR = {:.8}; M = {}; N_eff = {}",
+                    c.null_maximum, f.sharpe_dispersion, f.stochastic_trials, f.effective_trials
+                ));
+                ui.label(match f.effective_trials {
+                    1 => "a₁ = 0".into(),
+                    2 => "a₂ = 1 / √π".into(),
+                    n => format!("a_N = (1 − 0.5772156649) × Φ⁻¹(1 − 1/{n}) + 0.5772156649 × Φ⁻¹(1 − 1/({n} × e))"),
+                });
+            }
+            ui.label(format!("DSR {}", value(&c.dsr, true)));
+        } else {
+            ui.label(format!("PSR {}", value(&c.psr, true)));
+        }
+    } else {
+        ui.label("— see common-family reason in the pane");
+    }
 }
 fn card(ui: &mut Ui, m: Option<&Moments>, h: &HonestReport, formula: &str) {
     ui.set_max_width(490.);
@@ -36,7 +73,7 @@ fn card(ui: &mut Ui, m: Option<&Moments>, h: &HonestReport, formula: &str) {
     }
     if let Some(f) = h.trial_family.value() {
         ui.label(format!(
-            "Scope {}\nTracked since {} · revision {} · declared {}",
+            "Scope {}\nTracked since {} · revision {} · N_raw={}",
             f.scope,
             date(f.tracked_since),
             f.revision,
@@ -115,6 +152,9 @@ pub(super) fn render(ui: &mut Ui, h: &HonestReport, variant: &mut usize, fold: &
 fn render_body(ui: &mut Ui, h: &HonestReport, variant: &mut usize, fold: &mut usize) {
     ui.label(RichText::new("HONEST BACKTEST · historical OOS replay").font(mono(15.)).strong().color(theme::cyan()));
     ui.label(
+        RichText::new("DSR: estimated probability true Sharpe > 0 after adjusting for tried variants.").color(muted()),
+    );
+    ui.label(
         RichText::new(format!("VERIFIED · CLOSED THROUGH {}", date(h.closed_through))).font(mono(11.)).color(muted()),
     );
     ui.label(RichText::new(&h.admission).font(mono(11.)).color(muted()));
@@ -139,41 +179,40 @@ fn render_body(ui: &mut Ui, h: &HonestReport, variant: &mut usize, fold: &mut us
         }
     });
     if let Some(f) = h.trial_family.value() {
-        ui.label(RichText::new(format!("Tracked since {} · {} declared · revision {} · replayed on current history",date(f.tracked_since),f.trials.len(),f.revision)).font(mono(11.)).color(muted())).on_hover_text(format!("Scope: {}\nAutomatic benchmarks and legacy holdouts are included. Earlier/external research is unknown. Reopening cannot reset tracked trials.",f.scope));
+        ui.label(RichText::new(format!("Tracked since {} · N_raw={} · revision {} · replayed on current history",date(f.tracked_since),f.trials.len(),f.revision)).font(mono(11.)).color(muted())).on_hover_text(format!("Scope: {}\nAutomatic benchmarks and legacy holdouts are included. Earlier/external research is unknown. Reopening cannot reset tracked trials.",f.scope));
     } else {
-        ui.label(RichText::new(format!("DSR {}", unavailable(&h.trial_family))).color(amber()));
+        ui.label(RichText::new(format!("N_raw=— · DSR {}", unavailable(&h.trial_family))).color(muted()));
     }
     let v = &h.variants[*variant];
     let Some(e) = v.evaluation.value() else {
-        ui.label(RichText::new(unavailable(&v.evaluation)).color(amber()));
+        ui.label(RichText::new(unavailable(&v.evaluation)).color(muted()));
         return;
     };
     *fold = (*fold).min(e.folds.len().saturating_sub(1));
     let comparison = h.family_statistics.value().and_then(|f| f.comparisons.get(&v.id)).and_then(Estimate::value);
+    ui.label(RichText::new(format!("Statistics for {} · selected variant", v.label)).font(mono(11.)).color(muted()));
     ui.horizontal_wrapped(|ui| {
         let sr = comparison.map(|c| format!("{:+.2}", c.moments.sharpe * h::YEAR.sqrt())).unwrap_or_else(|| "—".into());
-        ui.label(RichText::new(format!("SR {sr}")).font(mono(23.)).color(text())).on_hover_ui(|ui| {
+        ui.label(RichText::new(format!("SR {sr}")).font(mono(23.)).color(if comparison.is_some() {
+            text()
+        } else {
+            muted()
+        }))
+        .on_hover_ui(|ui| {
             card(ui, comparison.map(|c| &c.moments), h, "SR=mean / sample SD; annual SR=√252 × session SR")
         });
         ui.label(
             RichText::new(format!("PSR {}", comparison.map(|c| value(&c.psr, true)).unwrap_or_else(|| "—".into())))
                 .font(mono(19.))
-                .color(theme::cyan()),
+                .color(if comparison.is_some_and(|c| c.psr.value().is_some()) { theme::cyan() } else { muted() }),
         )
-        .on_hover_ui(|ui| card(ui, comparison.map(|c| &c.moments), h, "PSR(S*)=Φ((SR−S*)√(n−1)/√V), S*=0"));
+        .on_hover_ui(|ui| probability_card(ui, comparison, h, false));
         ui.label(
             RichText::new(format!("DSR {}", comparison.map(|c| value(&c.dsr, true)).unwrap_or_else(|| "—".into())))
                 .font(mono(19.))
-                .color(theme::cyan()),
+                .color(if comparison.is_some_and(|c| c.dsr.value().is_some()) { theme::cyan() } else { muted() }),
         )
-        .on_hover_ui(|ui| {
-            card(
-                ui,
-                comparison.map(|c| &c.moments),
-                h,
-                "DSR=PSR(s_SR × a_N); zero-mean Gaussian null, empirical cross-trial dispersion",
-            )
-        });
+        .on_hover_ui(|ui| probability_card(ui, comparison, h, true));
     });
     if let Some(f) = h.family_statistics.value() {
         ui.label(
@@ -190,10 +229,11 @@ fn render_body(ui: &mut Ui, h: &HonestReport, variant: &mut usize, fold: &mut us
             .font(mono(11.)),
         );
         if let Some(reason) = f.comparisons.get(&v.id).and_then(Estimate::reason) {
-            ui.label(RichText::new(format!("DSR unavailable — {reason}")).color(amber()));
+            ui.label(RichText::new(format!("DSR — {reason}")).color(muted()));
         }
     } else {
-        ui.label(RichText::new(format!("DSR {}", unavailable(&h.family_statistics))).color(amber()));
+        ui.label(RichText::new("COMMON COMPARISON · n=— · dates — · N_eff=—").font(mono(11.)).color(muted()));
+        ui.label(RichText::new(format!("DSR {}", unavailable(&h.family_statistics))).color(muted()));
     }
     ui.label(
         RichText::new(format!(
@@ -384,18 +424,11 @@ fn gauge(ui: &mut Ui, c: Option<&Comparison>, h: &HonestReport) {
     let (r, response) = ui.allocate_exact_size(Vec2::new(ui.available_width().max(80.), 135.), Sense::hover());
     ui.painter().rect_filled(r, 4., theme::card());
     let Some(c) = c else {
-        text_at(
-            ui,
-            r.center(),
-            Align2::CENTER_CENTER,
-            "DSR unavailable · see common-family reason above",
-            12.,
-            amber(),
-        );
+        text_at(ui, r.center(), Align2::CENTER_CENTER, "DSR — see common-family reason above", 12., muted());
         return;
     };
     let Some(dsr) = c.dsr.value() else {
-        text_at(ui, r.center(), Align2::CENTER_CENTER, format!("DSR {}", unavailable(&c.dsr)), 12., amber());
+        text_at(ui, r.center(), Align2::CENTER_CENTER, format!("DSR {}", unavailable(&c.dsr)), 12., muted());
         return;
     };
     let bar = Rect::from_min_max(r.left_top() + Vec2::new(18., 32.), Pos2::new(r.right() - 18., r.top() + 50.));
@@ -444,12 +477,7 @@ fn gauge(ui: &mut Ui, c: Option<&Comparison>, h: &HonestReport) {
             "Session null maximum={:.8} · annual={:.5}\nSharpe above null maximum={:.8} session units",
             c.null_maximum, null, c.sharpe_above_null
         ));
-        card(
-            ui,
-            Some(&c.moments),
-            h,
-            "DSR=PSR(SR_null,max); DSR is a probability, not a reduced Sharpe. aₙ=(1−γ)Φ⁻¹(1−1/N)+γΦ⁻¹(1−1/(Ne))",
-        );
+        probability_card(ui, Some(c), h, true);
     });
 }
 fn scatter(ui: &mut Ui, e: &Evaluation, selected: &mut usize, h: &HonestReport) {
@@ -501,7 +529,7 @@ fn scatter(ui: &mut Ui, e: &Evaluation, selected: &mut usize, h: &HonestReport) 
     for (i, f) in e.folds.iter().enumerate().filter(|(_, f)| f.train.value().is_none() || f.oos.value().is_none()) {
         ui.label(
             RichText::new(format!("F{} scatter unavailable · IS {} · OOS {}", i + 1, sharpe(&f.train), sharpe(&f.oos)))
-                .color(amber())
+                .color(muted())
                 .font(mono(11.)),
         );
     }
@@ -564,6 +592,115 @@ impl TerminalApp {
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn paint_text(output: &egui::FullOutput) -> String {
+        output
+            .shapes
+            .iter()
+            .filter_map(|s| match &s.shape {
+                egui::Shape::Text(t) => Some(t.galley.job.text.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+    #[test]
+    fn honest_backtest_selected_trial_counts_definition_and_unavailable_evidence() {
+        let report = super::super::tests::honest_report();
+        let mut honest = report.honesty.as_ref().unwrap().clone();
+        // Force different probabilities to catch accidental reuse of the first
+        // (benchmark) comparison when inspecting another selected experiment.
+        if let Estimate::Available(f) = &mut honest.family_statistics {
+            for (v, probability) in honest.variants.iter().zip([0.123, 0.876]) {
+                if let Some(Estimate::Available(c)) = f.comparisons.get_mut(&v.id) {
+                    c.dsr = Estimate::Available(probability);
+                }
+            }
+        }
+        let ctx = egui::Context::default();
+        for (mut selected, expected, other) in [(0, "DSR 12.3%", "DSR 87.6%"), (1, "DSR 87.6%", "DSR 12.3%")] {
+            let mut output = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(900., 2200.))),
+                    ..Default::default()
+                },
+                |ui| render_body(ui, &honest, &mut selected, &mut 0),
+            );
+            let text = paint_text(&output);
+            for expected in [expected, "N_raw=4", "N_eff=", "n=", "probability true Sharpe > 0", "selected variant"] {
+                assert!(text.contains(expected), "missing {expected}");
+            }
+            assert!(!text.contains(other));
+            output.textures_delta.clear();
+        }
+        honest.family_statistics = Estimate::Unavailable(h::Reason::NoComparableTrialWindow);
+        let mut output = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(900., 2200.))),
+                ..Default::default()
+            },
+            |ui| render_body(ui, &honest, &mut 1, &mut 0),
+        );
+        let text = paint_text(&output);
+        assert!(text.contains("DSR — insufficient common trial dates"));
+        assert!(text.contains("n=— · dates — · N_eff=—"));
+        assert!(!text.contains("DSR 87.6%"));
+        for shape in &output.shapes {
+            if let egui::Shape::Text(t) = &shape.shape
+                && t.galley.job.text.starts_with("DSR —")
+            {
+                assert!(t.galley.job.sections.iter().all(|s| s.format.color == muted()));
+            }
+        }
+        output.textures_delta.clear();
+    }
+    #[test]
+    fn honest_backtest_math_cards_show_selected_inputs_and_deflated_benchmark() {
+        let report = super::super::tests::honest_report();
+        let honest = report.honesty.as_ref().unwrap();
+        let m = h::moments(&[0., 0.01, 0.01, 0.02]).unwrap();
+        let null = h::expected_maximum(2, 0.1).unwrap();
+        let c = Comparison {
+            moments: m,
+            psr: h::psr(&m, 0.).into(),
+            dsr: h::psr(&m, null).into(),
+            null_maximum: null,
+            sharpe_above_null: m.sharpe - null,
+        };
+        let ctx = egui::Context::default();
+        for (deflated, benchmark, result) in [(false, "0.00000000", "PSR 96.5%"), (true, "0.05641896", "DSR 95.8%")] {
+            let mut output = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(900., 2200.))),
+                    ..Default::default()
+                },
+                |ui| probability_card(ui, Some(&c), honest, deflated),
+            );
+            let text = paint_text(&output);
+            assert!(text.contains(&format!("Φ((1.22474487 − {benchmark}) × √(4 − 1) / √1.37500000)")));
+            assert!(text.contains("2.00000000 − 1")); // Pearson, not excess kurtosis.
+            assert!(text.contains(result));
+            output.textures_delta.clear();
+        }
+        let mut single = honest.clone();
+        if let Estimate::Available(f) = &mut single.family_statistics {
+            f.stochastic_trials = 1;
+            f.effective_trials = 1;
+            f.sharpe_dispersion = 0.;
+        }
+        let c = Comparison { null_maximum: 0., dsr: c.psr.clone(), ..c };
+        let mut output = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(900., 2200.))),
+                ..Default::default()
+            },
+            |ui| probability_card(ui, Some(&c), &single, true),
+        );
+        let text = paint_text(&output);
+        assert!(text.contains("a₁ = 0"));
+        assert!(text.contains("one eligible trial has no cross-trial dispersion estimate"));
+        assert!(!text.contains("/ (M − 1)"));
+        output.textures_delta.clear();
+    }
     fn click(ctx: &egui::Context, p: Pos2, mut paint: impl FnMut(&mut Ui)) {
         for pressed in [true, false] {
             let mut out = ctx.run_ui(
