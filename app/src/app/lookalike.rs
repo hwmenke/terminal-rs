@@ -297,7 +297,7 @@ fn render_report(ui: &mut Ui, pane: &mut LookalikePane) -> Option<(String, i64)>
             report.bars
         ))
         .font(mono(11.5))
-        .color(if report.provenance.is_verified() { muted() } else { theme::down() }),
+        .color(theme::provenance(report.provenance)),
     );
     ui.label(
         RichText::new(format!(

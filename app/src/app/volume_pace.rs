@@ -178,7 +178,7 @@ fn render_pace(ui: &mut Ui, pace: &VolumePace) {
             pace.source
         ))
         .font(mono(11.5))
-        .color(if pace.provenance.is_verified() { muted() } else { theme::down() }),
+        .color(theme::provenance(pace.provenance)),
     );
     ui.label(RichText::new(summary_line(pace)).font(mono(12.0)).color(text()));
     for note in &pace.notes {

@@ -49,14 +49,9 @@ impl Link {
         }
     }
 
+    /// Categorical identity colour (light/dark variants live in the theme roles).
     pub fn color(self) -> egui::Color32 {
-        match self {
-            Link::Red => egui::Color32::from_rgb(255, 69, 58),
-            Link::Orange => egui::Color32::from_rgb(255, 159, 10),
-            Link::Green => egui::Color32::from_rgb(48, 209, 88),
-            Link::Blue => egui::Color32::from_rgb(10, 132, 255),
-            Link::Purple => egui::Color32::from_rgb(191, 90, 242),
-        }
+        crate::theme::link(self)
     }
 }
 

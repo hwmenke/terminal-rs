@@ -665,14 +665,9 @@ fn direction(state: i8) -> &'static str {
         ""
     }
 }
+/// Model-state colour (regime role); flat is the grid colour.
 fn color(state: i8) -> Color32 {
-    if state > 0 {
-        theme::up()
-    } else if state < 0 {
-        theme::down()
-    } else {
-        theme::grid()
-    }
+    theme::regime_lane(state.signum())
 }
 fn number(value: f64, suffix: &str) -> String {
     if value.is_finite() { format!("{value:+.1}{suffix}") } else { "—".into() }

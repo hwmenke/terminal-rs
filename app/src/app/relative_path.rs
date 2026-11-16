@@ -180,7 +180,7 @@ fn render_path(ui: &mut Ui, path: &RelativePath) {
             path.source
         ))
         .font(mono(11.5))
-        .color(if path.provenance.is_verified() { muted() } else { theme::down() }),
+        .color(theme::provenance(path.provenance)),
     );
     ui.label(RichText::new(summary_line(path)).font(mono(12.0)).color(text()));
     for note in &path.notes {

@@ -109,9 +109,10 @@ fn coverage_row(job: &mut egui::text::LayoutJob, band: usize, c: &Coverage, base
     let pct = |c: &Coverage| c.empirical(band).map_or("—".to_string(), |e| format!("{:.0}%", e * 100.0));
     append(job, &format!("  {nominal:.0}% band → {:>4}", pct(c)), theme::text());
     let (word, color) = match c.verdict(band) {
-        Some(0) => ("  OK  ", theme::up()),
-        Some(-1) => ("  NARROW", theme::down()),
-        Some(_) => ("  WIDE", theme::amber()),
+        // Significance/status: no sign hue. Pass is full-strength text; misses are caution.
+        Some(0) => ("  OK  ", theme::text()),
+        Some(-1) => ("  NARROW", theme::caution()),
+        Some(_) => ("  WIDE", theme::caution()),
         None => ("  n<10", theme::muted()),
     };
     append(job, word, color);
@@ -270,10 +271,10 @@ impl ChartState {
             self.cone.paint = paint;
             return;
         }
+        // Regime role; flat stays cyan so it never reads as the grey baseline sheet.
         let color = match r.regime {
-            1 => theme::up(),
-            -1 => theme::down(),
-            _ => theme::cyan(),
+            0 => theme::cyan(),
+            s => theme::regime(s),
         };
         let h = r.params.horizon;
         let fade = |step: usize| 0.55 + 0.45 * step as f32 / h as f32;
@@ -468,11 +469,11 @@ impl ChartState {
         let p = ui.painter_at(rect);
         match &self.cone.result {
             Some(Err(e)) => {
-                let galley = p.layout(e.clone(), mono(12.0), theme::down(), (rect.width() - 24.0).max(1.0));
+                let galley = p.layout(e.clone(), mono(12.0), theme::alert(), (rect.width() - 24.0).max(1.0));
                 let card = Rect::from_min_size(rect.min + vec2(8.0, 44.0), galley.size() + vec2(12.0, 10.0));
                 self.cone.paint.card_rect = Some(card);
                 p.rect_filled(card, 4.0, theme::card());
-                p.galley(rect.min + vec2(14.0, 49.0), galley, theme::down());
+                p.galley(rect.min + vec2(14.0, 49.0), galley, theme::alert());
                 return;
             }
             None => {

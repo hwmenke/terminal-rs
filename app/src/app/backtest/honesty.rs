@@ -121,13 +121,7 @@ fn sharpe(m: &Estimate<Moments>) -> String {
     m.value().map(|m| format!("{:+.2}", m.sharpe * h::YEAR.sqrt())).unwrap_or_else(|| unavailable(m))
 }
 fn sign(x: f64) -> Color32 {
-    if x > 0. {
-        theme::up()
-    } else if x < 0. {
-        theme::down()
-    } else {
-        muted()
-    }
+    theme::sign(x)
 }
 fn text_at(ui: &Ui, p: Pos2, anchor: Align2, s: impl ToString, size: f32, color: Color32) {
     ui.painter().text(p, anchor, s.to_string(), mono(size), color);

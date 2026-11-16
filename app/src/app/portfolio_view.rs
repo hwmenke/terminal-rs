@@ -101,13 +101,7 @@ fn pct(x: f64) -> String {
 }
 
 fn pnl_color(x: f64) -> Color32 {
-    if x > 0.0 {
-        theme::up()
-    } else if x < 0.0 {
-        theme::down()
-    } else {
-        muted()
-    }
+    theme::sign(x)
 }
 
 // ---- tables -------------------------------------------------------------------------------

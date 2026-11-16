@@ -18,6 +18,9 @@ struct Uniforms {
     anim: vec4<f32>,
     neutral: vec4<f32>,
     tint: vec4<f32>,
+    // Candle-tint colours for model state (regime); never the sign colours.
+    regime_up: vec4<f32>,
+    regime_down: vec4<f32>,
 };
 
 @group(0) @binding(0) var<uniform> u: Uniforms;
@@ -128,7 +131,7 @@ fn vs_candle(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) -
         let value = regime[index];
         var tint = u.neutral;
         if (value != 0.0) {
-            let hue = select(u.down, u.up, value > 0.0);
+            let hue = select(u.regime_down, u.regime_up, value > 0.0);
             tint = vec4<f32>(mix(u.neutral.rgb, hue.rgb, 0.35 + 0.65 * abs(value)), color.a);
             if ((value > 0.0) != (b.close >= b.open)) { tint = vec4<f32>(tint.rgb * 0.6, tint.a); }
         }

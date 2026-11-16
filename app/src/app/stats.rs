@@ -249,7 +249,7 @@ fn provenance_line(ui: &mut Ui, s: &StatsReport) {
             s.bars
         ))
         .font(mono(11.5))
-        .color(if s.provenance.is_verified() { muted() } else { theme::down() }),
+        .color(theme::provenance(s.provenance)),
     );
 }
 

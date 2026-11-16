@@ -481,11 +481,7 @@ impl ChartState {
     }
 }
 fn regime_color(s: i8) -> Color32 {
-    match s {
-        1 => theme::up(),
-        -1 => theme::down(),
-        _ => theme::muted(),
-    }
+    theme::regime(s)
 }
 fn cell_text(t: &Touch, compact: bool) -> String {
     match t {

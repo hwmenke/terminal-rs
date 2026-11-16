@@ -450,7 +450,7 @@ fn render_report(ui: &mut Ui, report: &BacktestReport) {
             report.bars
         ))
         .font(mono(11.5))
-        .color(if report.provenance.is_verified() { muted() } else { theme::down() }),
+        .color(theme::provenance(report.provenance)),
     );
     ui.label(RichText::new(&report.settings_line).font(mono(11.0)).color(muted()));
     ui.label(
@@ -595,7 +595,7 @@ fn render_intraday(ui: &mut Ui, report: &tr_data::intraday_backtest::IntradayRep
             report.bars
         ))
         .font(mono(11.5))
-        .color(if report.provenance.is_verified() { muted() } else { theme::down() }),
+        .color(theme::provenance(report.provenance)),
     );
     ui.label(RichText::new(&report.settings_line).font(mono(11.0)).color(muted()));
     ui.label(

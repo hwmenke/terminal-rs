@@ -180,7 +180,7 @@ fn render_extreme(ui: &mut Ui, extreme: &SessionExtreme) {
             extreme.source
         ))
         .font(mono(11.5))
-        .color(if extreme.provenance.is_verified() { muted() } else { theme::down() }),
+        .color(theme::provenance(extreme.provenance)),
     );
     ui.label(RichText::new(summary_line(extreme)).font(mono(12.0)).color(text()));
     for note in &extreme.notes {

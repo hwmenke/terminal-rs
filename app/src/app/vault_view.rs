@@ -111,6 +111,9 @@ impl VaultPane {
         if snapshot.series.is_empty() {
             ui.label("No vaulted bars yet. Open a US stock or ETF intraday chart; closed verified bars are kept from then on.");
         }
+        if !snapshot.series.is_empty() {
+            coverage_legend(ui);
+        }
         egui::ScrollArea::vertical().show(ui, |ui| {
             for series in &snapshot.series {
                 ui.separator();
@@ -151,11 +154,13 @@ impl VaultPane {
 }
 pub(crate) fn coverage_color(state: CellState) -> Color32 {
     match state {
-        CellState::Complete => crate::widgets::heat_ramp(1., 1.),
-        CellState::Holes => crate::widgets::heat_ramp(0.5, 1.),
-        CellState::Partial => theme::amber(),
-        CellState::Failed => Color32::from_rgb(225, 74, 83),
-        CellState::Missing => crate::widgets::heat_ramp(-1., 1.),
+        // Categories, not a heat scale: verified coverage has no hue (provenance rule),
+        // exceptions use caution/alert, missing is a grid outline.
+        CellState::Complete => theme::rail(tr_core::Provenance::Real),
+        CellState::Holes => theme::rail(tr_core::Provenance::Real).gamma_multiply(0.7),
+        CellState::Partial => theme::caution(),
+        CellState::Failed => theme::alert(),
+        CellState::Missing => theme::grid(),
         _ => theme::muted(),
     }
 }
@@ -186,6 +191,36 @@ pub(crate) fn paint_cell(ui: &Ui, r: Rect, c: &SessionCell) {
     if c.corrected > 0 {
         p.hline(r.x_range(), r.top(), Stroke::new(2., theme::cyan()));
     }
+}
+/// Categorical legend for the coverage strip: each state's swatch is drawn by the same
+/// [`paint_cell`] as the strip, so shape and colour cannot drift from it.
+pub(crate) fn coverage_legend(ui: &mut Ui) {
+    let date = chrono::NaiveDate::default();
+    ui.horizontal_wrapped(|ui| {
+        for (state, label, holes) in [
+            (CellState::Complete, "Complete", 0),
+            (CellState::Holes, "Holes", 2),
+            (CellState::Partial, "Partial", 0),
+            (CellState::Failed, "Failed", 0),
+            (CellState::Missing, "Missing", 0),
+        ] {
+            let cell = SessionCell {
+                date,
+                state,
+                expected: 0,
+                present: 0,
+                holes,
+                fetch_ok: 0,
+                fetch_fail: 0,
+                corrected: 0,
+                last_seen: None,
+                half_day: false,
+            };
+            let (r, _) = ui.allocate_exact_size(vec2(10., 14.), Sense::hover());
+            paint_cell(ui, r, &cell);
+            ui.label(RichText::new(label).font(theme::mono(9.)).color(theme::muted()));
+        }
+    });
 }
 pub(crate) fn vault_strip(ui: &mut Ui, rect: Rect, cells: &[SessionCell], source: &str, epoch: u32) {
     if cells.is_empty() {

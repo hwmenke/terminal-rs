@@ -4,10 +4,10 @@ use crate::{
     congress_view::Action,
     dock::PaneId,
     theme::{self, mono, muted, text},
-    widgets,
+    widgets::{self, MathCardExt},
     worker::Request,
 };
-use egui::{Align2, Color32, Key, Modifiers, Rect, RichText, Sense, Shape, Stroke, StrokeKind, Ui, pos2, vec2};
+use egui::{Align2, Key, Modifiers, Rect, RichText, Sense, Shape, Stroke, StrokeKind, Ui, pos2, vec2};
 use tr_data::session_clock::{self, ClockCell, MIN_SAMPLES, ROWS, SessionClock};
 
 #[derive(Clone)]
@@ -249,6 +249,30 @@ fn move_cell(selected: Option<(usize, usize)>, key: Key, columns: usize) -> Opti
     })
 }
 
+/// Formula card for the "x of y pass · joint p" header.
+fn header_card(clock: &SessionClock) -> widgets::MathCard {
+    use tr_data::session_clock::{ALPHA, PERMUTATIONS};
+    let card = widgets::MathCard::new(
+        "CLOCK JOINT TEST",
+        "p = (1 + #{Var*(column means) ≥ Var_obs}) / (B + 1)  (within-session permutation)",
+    )
+    .input("tested cells", clock.tested.to_string())
+    .input("passing cells", clock.passing.to_string())
+    .input("B", PERMUTATIONS.to_string())
+    .input("α", format!("{ALPHA:.2}"))
+    .n(clock.sessions, "prior sessions")
+    .closed_thru(clock.date.to_string())
+    .provenance(clock.provenance)
+    .source(clock.source.clone())
+    .note(format!(
+        "A cell passes when n ≥ {MIN_SAMPLES}, its Benjamini–Hochberg q ≤ α and the joint p ≤ α."
+    ));
+    match clock.joint_p {
+        Some(p) => card.value(probability(Some(p))),
+        None => card.unavailable("fewer than two columns with observations"),
+    }
+}
+
 fn render_clock_selected(ui: &mut Ui, clock: &SessionClock, now: i64, selected: &mut Option<(usize, usize)>) {
     // Defense in depth for callers outside the pane's response gate.
     if !clock.provenance.is_verified() {
@@ -265,7 +289,9 @@ fn render_clock_selected(ui: &mut Ui, clock: &SessionClock, now: i64, selected: 
             ))
             .font(mono(12.0))
             .color(text()),
-        );
+        )
+        .interact(Sense::hover())
+        .math_card(|| header_card(clock));
         if clock.stale {
             widgets::chip(ui, widgets::ChipKind::Caution, "STALE")
                 .on_hover_text("Input trails the cash-session grid or has no fresh observation clock. R retries.");
@@ -361,14 +387,17 @@ fn render_clock_selected(ui: &mut Ui, clock: &SessionClock, now: i64, selected: 
 }
 
 fn paint_cell(p: &egui::Painter, rect: Rect, mean: Option<f64>, fill: bool, low_n: bool) {
+    let mut ink = muted();
     if fill && let Some(mean) = mean {
-        p.rect_filled(rect, 2.0, widgets::heat_ramp(mean, 10.0));
+        let heat = widgets::heat_ramp(mean, 10.0);
+        p.rect_filled(rect, 2.0, heat);
+        ink = theme::on_fill(heat);
     }
     p.rect_stroke(rect, 2.0, Stroke::new(1.0, theme::border()), StrokeKind::Inside);
     let label = mean
         .map(|m| if m.abs() < 1000.0 { format!("{m:+.1}") } else { format!("{:+.0}k", m / 1000.0) })
         .unwrap_or_else(|| "—".into());
-    p.text(rect.center(), Align2::CENTER_CENTER, label, mono(10.0), if fill { Color32::WHITE } else { muted() });
+    p.text(rect.center(), Align2::CENTER_CENTER, label, mono(10.0), ink);
     if low_n {
         p.add(Shape::line(
             vec![rect.left_top() + vec2(1.0, 6.0), rect.left_top() + vec2(1.0, 1.0), rect.left_top() + vec2(6.0, 1.0)],

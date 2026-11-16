@@ -1,6 +1,6 @@
 //! Local planning estimates; no worker or trading actions.
 use super::portfolio_stops::Store;
-use egui::{Color32, RichText, Ui};
+use egui::{RichText, Ui};
 use std::collections::HashMap;
 use tr_broker::{InstrumentKind, Portfolio, Position};
 use tr_core::portfolio_risk::{self as engine, Holding, HoldingKind, PortfolioRisk, RiskInput, Status};
@@ -102,7 +102,7 @@ pub(super) fn panel(
         });
         let parsed_budget = budget(draft);
         if let Err(error) = parsed_budget {
-            ui.colored_label(Color32::RED, error);
+            ui.colored_label(crate::theme::alert(), error);
         }
         // Exclude cash, broker cash equivalents, and closed positions explicitly.
         let holdings: Vec<_> = pf
@@ -164,7 +164,7 @@ pub(super) fn panel(
             base_currency: currency,
         }) {
             Err(e) => {
-                ui.colored_label(Color32::RED, format!("Planning estimate unavailable: {e:?}"));
+                ui.colored_label(crate::theme::alert(), format!("Planning estimate unavailable: {e:?}"));
             }
             Ok(risk) => {
                 ui.label(format!("Known planned loss: {:.2} {}", risk.covered_risk, currency));
@@ -186,7 +186,7 @@ pub(super) fn panel(
                                     row.holding.symbol
                                 ))
                                 .strong()
-                                .color(Color32::RED),
+                                .color(crate::theme::alert()),
                             );
                         }
                         Status::Covered => {
@@ -203,7 +203,7 @@ pub(super) fn panel(
             }
         }
         if let Some(error) = &state.error {
-            ui.colored_label(Color32::RED, error);
+            ui.colored_label(crate::theme::alert(), error);
         }
         ui.label("Planning stops place no orders and do not guarantee a loss limit.");
     });

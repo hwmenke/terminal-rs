@@ -505,7 +505,7 @@ impl TerminalApp {
         };
         let r = Rect::from_center_size(rect.center(), vec2(rect.width().min(410.0), rect.height().min(150.0)));
         let p = ui.painter_at(rect);
-        crate::widgets::data_card(&p, r, "NO REAL DATA", egui::Color32::from_rgb(225, 74, 83), false);
+        crate::widgets::data_card(&p, r, "NO REAL DATA", crate::theme::alert(), false);
         let mut job = egui::text::LayoutJob::simple(
             format!(
                 "Sample / offline mode: {} needs verified real data. Hand-off never shows sample or synthetic bars.",

@@ -80,7 +80,7 @@ fn row(
             provenance.label().into()
         },
         mono(10.0),
-        if provenance.is_verified() { muted() } else { theme::down() },
+        theme::provenance(provenance),
     );
     p.text(pos2(x, y), Align2::LEFT_CENTER, l.ticker, mono(12.0), amber());
     let right = rect.right() - 2.0;

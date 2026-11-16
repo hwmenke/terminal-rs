@@ -125,17 +125,9 @@ pub(super) fn column(ui: &mut Ui, p: &mut TrendWallPane, ids: &[usize], rect: Re
             if let Some(c) = &e.cell {
                 for (fold, f) in c.folds.iter().enumerate() {
                     if let Some(d) = f.delta.filter(|d| d.is_finite()) {
-                        let state = if d > 0.0 {
-                            1
-                        } else if d < 0.0 {
-                            -1
-                        } else {
-                            0
-                        };
-                        mesh.add_colored_rect(
-                            fold_rect(r, fold),
-                            color(state).gamma_multiply(if e.pass { 1.0 } else { 0.3 }),
-                        );
+                        // Fold Δ is a signed number (sign role), not a regime.
+                        let ink = if d == 0.0 { theme::grid() } else { theme::sign(d) };
+                        mesh.add_colored_rect(fold_rect(r, fold), ink.gamma_multiply(if e.pass { 1.0 } else { 0.3 }));
                     }
                 }
             }
