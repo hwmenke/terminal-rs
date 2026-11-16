@@ -131,6 +131,15 @@ pub enum Request {
         as_of: Option<i64>,
         stitch: Option<Arc<tr_data::vault::StitchInfo>>,
     },
+    /// Closed-bar ATR guides and empirical non-overlapping stop-touch odds.
+    StopCloud {
+        pane: PaneId,
+        key: tr_data::stop_cloud::StopKey,
+        class: tr_core::AssetClass,
+        bars: Arc<Vec<Bar>>,
+        as_of: Option<i64>,
+        stitch: Option<Arc<tr_data::vault::StitchInfo>>,
+    },
     /// Closed-bar path bootstrap and walk-forward calibration on verified bars.
     TrendCone {
         pane: PaneId,
@@ -662,6 +671,11 @@ pub enum Response {
         pane: PaneId,
         key: tr_data::auction::AuctionKey,
         result: Result<Arc<tr_data::auction::AuctionReport>, String>,
+    },
+    StopCloud {
+        pane: PaneId,
+        key: tr_data::stop_cloud::StopKey,
+        result: Result<Arc<tr_data::stop_cloud::StopReport>, String>,
     },
     TrendCone {
         pane: PaneId,
@@ -4030,6 +4044,31 @@ async fn handle_inner(s: &Arc<Shared>, req: Request, force: bool) {
         Request::AuctionMap { pane, key, symbol, class, bars, as_of, stitch } => {
             let result = auction_map(s, &symbol, class, bars, &key, as_of, stitch).await;
             s.send(Response::AuctionMap { pane, key, result });
+        }
+        Request::StopCloud { pane, key, class, bars, as_of, stitch } => {
+            let config = key.clone();
+            let reports = s.reports.clone();
+            let result = tokio::task::spawn_blocking(move || {
+                let bars = tr_data::vault::research_bars(&bars, stitch.as_deref())?;
+                let mut cache_key = tr_data::report_cache::ReportKey::new(
+                    "stops",
+                    "",
+                    config.tf,
+                    "chart",
+                    &bars[..config.closed.min(bars.len())],
+                    &format!("{:?} {:?} {:?}", config.params, config.trend, class),
+                );
+                if let Some(s) = &stitch {
+                    cache_key.source = s.source.clone();
+                    cache_key.epoch = s.epoch;
+                }
+                reports.get_or_compute(cache_key, || {
+                    tr_data::stop_cloud::report(&bars, config.tf, class, as_of, config.params, config.trend)
+                })
+            })
+            .await
+            .unwrap_or_else(|e| Err(format!("Stop Cloud task failed: {e}")));
+            s.send(Response::StopCloud { pane, key, result });
         }
         Request::TrendCone { pane, key, class, bars, as_of, stitch } => {
             let config = key.clone();
@@ -8595,6 +8634,91 @@ mod tests {
             i * 2
         })));
         assert_eq!(out, (0..20).map(|i| i * 2).collect::<Vec<_>>());
+    }
+    #[tokio::test]
+    async fn stop_cloud_worker_refuses_sample_unverified_and_mixed_history() {
+        use tr_data::stop_cloud::{Params, StopKey};
+        let (s, rx) = shared(Arc::new(tr_data::sample::SampleProvider::at(0, 10)), None);
+        for provenance in [tr_core::Provenance::Sample, tr_core::Provenance::Missing, tr_core::Provenance::Cached] {
+            let mut bars = stack_fixture(180, Timeframe::M5, tr_core::Provenance::Real);
+            bars[179].provenance = provenance;
+            let key = StopKey::new(42, Timeframe::M5, 179, Params::default(), Default::default(), &bars);
+            handle(
+                &s,
+                Request::StopCloud {
+                    stitch: None,
+                    pane: 7,
+                    key: key.clone(),
+                    class: tr_core::AssetClass::Crypto,
+                    bars: Arc::new(bars),
+                    as_of: None,
+                },
+            )
+            .await;
+            let result = rx
+                .try_iter()
+                .find_map(|r| {
+                    if let Response::StopCloud { pane: 7, key: k, result } = r {
+                        assert_eq!(k, key);
+                        Some(result)
+                    } else {
+                        None
+                    }
+                })
+                .unwrap();
+            assert!(result.unwrap_err().contains("refused"));
+        }
+    }
+    #[tokio::test]
+    async fn stop_cloud_second_request_hits_report_cache_and_misses_on_params() {
+        use tr_data::stop_cloud::{Params, StopKey};
+        let (s, rx) = shared(Arc::new(tr_data::sample::SampleProvider::at(0, 10)), None);
+        let bars = Arc::new(stack_fixture(400, Timeframe::M5, tr_core::Provenance::Real));
+        let mut results = vec![];
+        for ks in [vec![1.0, 2.0, 3.0], vec![1.0, 2.0, 3.0], vec![1.5, 2.5, 3.5]] {
+            let key =
+                StopKey::new(42, Timeframe::M5, 399, Params { ks, ..Default::default() }, Default::default(), &bars);
+            handle(
+                &s,
+                Request::StopCloud {
+                    stitch: None,
+                    pane: 7,
+                    key,
+                    class: tr_core::AssetClass::Crypto,
+                    bars: bars.clone(),
+                    as_of: None,
+                },
+            )
+            .await;
+            results.push(
+                rx.try_iter()
+                    .find_map(|r| if let Response::StopCloud { result, .. } = r { Some(result.unwrap()) } else { None })
+                    .unwrap(),
+            );
+        }
+        assert!(Arc::ptr_eq(&results[0], &results[1]));
+        assert!(!Arc::ptr_eq(&results[0], &results[2]));
+        // The verified gate must run before a cached closed-prefix report can hit.
+        let mut tainted = (*bars).clone();
+        tainted.last_mut().unwrap().provenance = tr_core::Provenance::Sample;
+        let key = StopKey::new(42, Timeframe::M5, 399, Params::default(), Default::default(), &tainted);
+        handle(
+            &s,
+            Request::StopCloud {
+                stitch: None,
+                pane: 7,
+                key,
+                class: tr_core::AssetClass::Crypto,
+                bars: Arc::new(tainted),
+                as_of: None,
+            },
+        )
+        .await;
+        let result = rx
+            .try_iter()
+            .find_map(|r| if let Response::StopCloud { result, .. } = r { Some(result) } else { None })
+            .unwrap();
+        assert!(result.unwrap_err().contains("refused"));
     }
     #[tokio::test]
     async fn trend_cone_worker_refuses_sample_unverified_and_mixed_history() {

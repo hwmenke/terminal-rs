@@ -1,7 +1,7 @@
 //! Completed native-bar regime lanes. No clock, fetching, price filling or resampling.
 use super::{
-    AdaptiveTrendParams, GridTrend, Ohlcv, adaptive_trend_grid, adaptive_trend_with, require_adaptive_bars,
-    session_starts,
+    AdaptiveTrend, AdaptiveTrendParams, GridTrend, Ohlcv, adaptive_trend_grid, adaptive_trend_with,
+    require_adaptive_bars, session_starts,
 };
 use crate::{Bar, Provenance, Timeframe};
 
@@ -157,6 +157,15 @@ pub fn trend_grid(
     Ok(adaptive_trend_grid(&Ohlcv::new(base), params, starts.as_deref(), ers, holds))
 }
 
+/// The chart's base-lane Adaptive Trend, with exactly the parameters and session
+/// starts [`trend_stack`] uses for its base lane (session ATR on intraday,
+/// optional 09:30 reset). Exposes ATR and the medium baseline for Stop Cloud.
+pub fn base_trend(base: &[Bar], base_tf: Timeframe, p: AdaptiveTrendParams) -> Result<AdaptiveTrend, String> {
+    require_adaptive_bars(base, "Trend Stack")?;
+    let (params, starts) = lane_params(base, base_tf, base_tf, p);
+    Ok(adaptive_trend_with(&Ohlcv::new(base), params, starts.as_deref()))
+}
+
 pub fn trend_stack(
     base: &[Bar],
     base_tf: Timeframe,
@@ -308,6 +317,29 @@ mod tests {
     }
     fn stack(base: &[Bar], lanes: Vec<(Timeframe, Result<Vec<Bar>, String>)>) -> TrendStack {
         trend_stack(base, Timeframe::M5, lanes, Default::default()).unwrap()
+    }
+    #[test]
+    fn base_trend_matches_trend_stack_base_lane_mb_and_medium() {
+        for (tf, step, reset) in
+            [(Timeframe::D1, 86400, false), (Timeframe::M5, 300, false), (Timeframe::M5, 300, true)]
+        {
+            let base = bars(700, step, Provenance::Real);
+            let p = AdaptiveTrendParams { session_reset: reset, ..Default::default() };
+            let t = base_trend(&base, tf, p).unwrap();
+            let stack = trend_stack(&base, tf, vec![], p).unwrap();
+            assert_eq!(
+                t.mb.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                stack.mb.iter().map(|v| v.to_bits()).collect::<Vec<_>>()
+            );
+            assert_eq!(t.medium_state, stack.medium);
+            let (expected, starts) = lane_params(&base, tf, tf, p);
+            assert_eq!(expected.session_atr, tf.is_intraday());
+            let a = adaptive_trend_with(&Ohlcv::new(&base), expected, starts.as_deref());
+            assert_eq!(
+                t.atr.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                a.atr.iter().map(|v| v.to_bits()).collect::<Vec<_>>()
+            );
+        }
     }
     #[test]
     fn session_anchor_resets_at_0930_and_keeps_higher_lanes_continuous() {
@@ -494,7 +526,9 @@ mod tests {
             }
             assert!(flips > 0, "fixture must exercise regime flips");
         }
-        assert!(trend_grid(&bars(100, 300, Provenance::Sample), Timeframe::M5, Default::default(), &ers, &holds).is_err());
+        assert!(
+            trend_grid(&bars(100, 300, Provenance::Sample), Timeframe::M5, Default::default(), &ers, &holds).is_err()
+        );
     }
 
     #[test]

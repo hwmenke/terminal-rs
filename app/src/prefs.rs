@@ -268,6 +268,7 @@ pub enum Action {
     DrawFib,
     DrawAnchoredVwap,
     ToggleTrendCone,
+    ToggleStopCloud,
     ToggleAuctionMap,
     ResetView,
     JumpLatest,
@@ -285,7 +286,7 @@ pub enum Action {
 }
 
 impl Action {
-    pub const ALL: [Action; 59] = [
+    pub const ALL: [Action; 60] = [
         Action::Vault,
         Action::Help,
         Action::Congress,
@@ -331,6 +332,7 @@ impl Action {
         Action::DrawFib,
         Action::DrawAnchoredVwap,
         Action::ToggleTrendCone,
+        Action::ToggleStopCloud,
         Action::ToggleAuctionMap,
         Action::ResetView,
         Action::JumpLatest,
@@ -394,6 +396,7 @@ impl Action {
             Action::DrawFib => "Draw Fibonacci retracement".into(),
             Action::Vault => "Open Bar Vault".into(),
             Action::ToggleAuctionMap => "Toggle Auction Map".into(),
+            Action::ToggleStopCloud => "Toggle Stop Cloud".into(),
             Action::ToggleTrendCone => "Toggle Trend Cone".into(),
             Action::DrawAnchoredVwap => "Anchor VWAP on a clicked bar".into(),
             Action::ResetView => "Reset chart view".into(),
@@ -427,6 +430,7 @@ impl Action {
             | A::DrawVertical
             | A::DrawFib
             | A::ToggleAuctionMap
+            | A::ToggleStopCloud
             | A::ToggleTrendCone
             | A::DrawAnchoredVwap
             | A::ResetView
@@ -631,6 +635,7 @@ impl Default for Keymap {
         bind(Action::DrawVertical, "Alt+V");
         bind(Action::DrawFib, "Alt+F");
         bind(Action::DrawAnchoredVwap, "Alt+A");
+        bind(Action::ToggleStopCloud, "Alt+S");
         bind(Action::ToggleTrendCone, "Alt+C");
         bind(Action::ToggleAuctionMap, "Alt+P");
         bind(Action::Vault, "Alt+B");
@@ -801,9 +806,20 @@ mod tests {
     use super::*;
 
     #[test]
-    fn alt_b_opens_vault_and_action_all_has_59_entries() {
+    fn alt_s_is_unique() {
         let keys = Keymap::default();
-        assert_eq!(Action::ALL.len(), 59);
+        assert_eq!(keys.0.get(&Action::ToggleStopCloud).unwrap(), "Alt+S");
+        let chord = Chord::parse("Alt+S").unwrap();
+        assert_eq!(Action::ToggleStopCloud.category(), "Chart");
+        assert_eq!(keys.action_for(egui::Key::S, egui::Modifiers::ALT), Some(Action::ToggleStopCloud));
+        assert_eq!(keys.0.values().filter(|k| Chord::parse(k) == Some(chord)).count(), 1);
+        let restored = Keymap(BTreeMap::new()).with_defaults();
+        assert_eq!(restored.0.get(&Action::ToggleStopCloud).unwrap(), "Alt+S");
+    }
+    #[test]
+    fn alt_b_opens_vault_and_action_all_has_60_entries() {
+        let keys = Keymap::default();
+        assert_eq!(Action::ALL.len(), 60);
         assert_eq!(keys.0.get(&Action::Vault), Some(&"Alt+B".to_string()));
     }
     #[test]

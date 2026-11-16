@@ -78,6 +78,20 @@ impl Default for AuctionSettings {
     }
 }
 
+/// Optional ATR Stop Cloud. Missing fields retain safe, compatible defaults.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct StopCloudSettings {
+    pub ks: Vec<f64>,
+    pub horizons: Option<(usize, usize)>,
+    pub odds: bool,
+}
+impl Default for StopCloudSettings {
+    fn default() -> Self {
+        Self { ks: vec![1.0, 2.0, 3.0], horizons: None, odds: true }
+    }
+}
+
 /// A pane's kind plus its persisted, panel-specific settings.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum PaneSettings {
@@ -132,6 +146,8 @@ pub enum PaneSettings {
         /// Enabled Trend Cone: (horizon bars, mean stationary-bootstrap block).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         cone: Option<(usize, usize)>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        stops: Option<StopCloudSettings>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         auction: Option<AuctionSettings>,
         /// Anchored VWAP anchors (UTC bar opens) per security, keyed like drawings.
@@ -614,6 +630,7 @@ pub fn chart_settings(symbol: &str, d: &crate::prefs::PanelDefaults) -> PaneSett
         show_rail: true,
         show_edge: false,
         cone: None,
+        stops: None,
         auction: None,
         avwap: BTreeMap::new(),
         cockpit_chip: None,
@@ -777,6 +794,24 @@ impl Store {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn older_layout_without_stops_field_loads_with_cloud_off() {
+        let p = chart_settings("AAPL", &PanelDefaults::default());
+        let json = serde_json::to_value(p).unwrap();
+        assert!(json["Chart"].get("stops").is_none());
+        let restored: PaneSettings = serde_json::from_value(json).unwrap();
+        assert!(matches!(restored, PaneSettings::Chart { stops: None, .. }));
+    }
+    #[test]
+    fn partial_stops_object_takes_defaults() {
+        let s: StopCloudSettings = serde_json::from_str(r#"{"odds":false}"#).unwrap();
+        assert_eq!(s, StopCloudSettings { odds: false, ..Default::default() });
+        let mut json = serde_json::to_value(chart_settings("AAPL", &PanelDefaults::default())).unwrap();
+        json["Chart"]["stops"] = serde_json::json!({});
+        assert!(
+            matches!(serde_json::from_value::<PaneSettings>(json).unwrap(),PaneSettings::Chart{stops:Some(s),..} if s==StopCloudSettings::default())
+        );
+    }
+    #[test]
     fn edge_layout_round_trip_defaults_off() {
         let mut settings = chart_settings("AAPL", &Default::default());
         if let PaneSettings::Chart { show_edge, .. } = &mut settings {
@@ -894,6 +929,7 @@ mod tests {
                 show_rail: true,
                 show_edge: false,
                 cone: None,
+                stops: None,
                 auction: None,
                 ..
             }
@@ -1120,6 +1156,7 @@ mod tests {
                 show_rail: true,
                 show_edge: false,
                 cone: None,
+                stops: None,
                 auction: None,
                 avwap: BTreeMap::new(),
                 cockpit_chip: None,

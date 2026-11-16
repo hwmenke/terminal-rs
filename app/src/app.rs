@@ -577,6 +577,7 @@ impl PaneKind {
                 show_rail: c.show_rail,
                 show_edge: c.show_edge,
                 cone: c.cone_settings(),
+                stops: c.stop_settings(),
                 auction: c.auction_settings(),
                 avwap: {
                     let mut store = c.avwap_store.clone();
@@ -733,6 +734,7 @@ impl PaneKind {
                 show_rail,
                 show_edge,
                 cone,
+                stops,
                 auction,
                 avwap,
                 cockpit_chip,
@@ -776,6 +778,7 @@ impl PaneKind {
                 c.show_rail = show_rail;
                 c.show_edge = show_edge;
                 c.restore_cone(cone);
+                c.restore_stops(stops);
                 c.restore_auction(auction);
                 c.show_stack |= show_edge;
                 PaneKind::Chart(Box::new(c))
@@ -1496,6 +1499,10 @@ impl TerminalApp {
             Command::SymbolFunction(s, f @ (Function::NewPanel(_) | Function::Split { .. })) => {
                 self.apply_with_symbol(f, Some(s));
             }
+            Command::SymbolFunction(s, Function::StopCloud(cmd)) => {
+                self.open_security(&s);
+                self.apply_with_symbol(Function::StopCloud(cmd), Some(s));
+            }
             Command::SymbolFunction(s, Function::AuctionMap(cmd)) => {
                 self.open_security(&s);
                 self.apply_with_symbol(Function::AuctionMap(cmd), Some(s));
@@ -1571,6 +1578,14 @@ impl TerminalApp {
             Function::StackLadder(frames) => self.with_chart(|c, w| c.set_stack_ladder(frames, w)),
             Function::StackTint(on) => self.with_chart(|c, w| c.set_stack_tint(on, w)),
             Function::StackSession(on) => self.with_chart(|c, w| c.set_stack_session(on, w)),
+            Function::StopCloud(cmd) => {
+                let cmd = if symbol.is_some() && cmd == command::StopCmd::Toggle(None) {
+                    command::StopCmd::Toggle(Some(true))
+                } else {
+                    cmd
+                };
+                self.with_chart(|c, w| c.set_stop_cloud(cmd, w));
+            }
             Function::AuctionMap(cmd) => {
                 let cmd = if symbol.is_some() && cmd == command::AuctionCmd::Toggle(None) {
                     command::AuctionCmd::Toggle(Some(true))
@@ -2200,6 +2215,11 @@ impl TerminalApp {
                         c.on_auction_map(key, result);
                     }
                 }
+                Response::StopCloud { pane, key, result } => {
+                    if let Some(c) = self.chart_mut(pane) {
+                        c.on_stop_cloud(key, result);
+                    }
+                }
                 Response::TrendCone { pane, key, result } => {
                     if let Some(c) = self.chart_mut(pane) {
                         c.on_trend_cone(key, result);
@@ -2689,6 +2709,7 @@ impl TerminalApp {
             | A::DrawVertical
             | A::DrawFib
             | A::ToggleAuctionMap
+            | A::ToggleStopCloud
             | A::ToggleTrendCone
             | A::DrawAnchoredVwap
             | A::ResetView
@@ -2741,6 +2762,7 @@ impl TerminalApp {
             A::DrawVertical => self.with_chart(|c, _| c.start_tool(Tool::Vertical)),
             A::DrawFib => self.with_chart(|c, _| c.start_tool(Tool::Fib)),
             A::ToggleAuctionMap => self.with_chart(|c, w| c.set_auction(command::AuctionCmd::Toggle(None), w)),
+            A::ToggleStopCloud => self.with_chart(|c, w| c.set_stop_cloud(command::StopCmd::Toggle(None), w)),
             A::ToggleTrendCone => self.with_chart(|c, w| c.set_trend_cone(None, None, w)),
             A::DrawAnchoredVwap => self.anchored_vwap_command(command::AnchorCmd::Arm),
             A::ResetView => self.with_chart(|c, _| c.reset_view()),
@@ -3627,5 +3649,52 @@ mod auction_tests {
         app.execute("MSFT AUCTION");
         assert!(app.chart_mut(chart).unwrap().auction_settings().is_some());
         assert_eq!(app.chart_mut(chart).unwrap().symbol, "MSFT US Equity");
+    }
+}
+
+#[cfg(test)]
+mod stops_tests {
+    use super::*;
+    #[test]
+    fn hotkey_and_command_toggle_stop_cloud_on_the_focused_chart() {
+        let mut app = tests::test_app();
+        let chart = app.new_pane(PaneKind::Chart(Box::new(ChartState::new(0, "AAPL", tr_core::Timeframe::M5))));
+        let help = app.new_pane(PaneKind::Help);
+        app.focus = help;
+        assert!(!app.hotkey_applies(prefs::Action::ToggleStopCloud));
+        app.focus = chart;
+        assert!(app.hotkey_applies(prefs::Action::ToggleStopCloud));
+        app.run_hotkey(prefs::Action::ToggleStopCloud);
+        assert!(app.chart_mut(chart).unwrap().stop_settings().is_some());
+        app.execute("STOPS");
+        assert!(app.chart_mut(chart).unwrap().stop_settings().is_none());
+        app.execute("MSFT STOPS");
+        app.execute("MSFT STOPS");
+        let c = app.chart_mut(chart).unwrap();
+        assert_eq!(c.symbol, "MSFT US Equity");
+        assert!(c.stop_settings().is_some());
+        app.execute("STOPS ODDS OFF");
+        assert!(!app.chart_mut(chart).unwrap().stop_settings().unwrap().odds);
+        app.run_hotkey(prefs::Action::ToggleStopCloud);
+        assert!(app.chart_mut(chart).unwrap().stop_settings().is_none());
+    }
+    #[test]
+    fn pane_settings_round_trip_keeps_stop_cloud_settings() {
+        let mut chart = ChartState::new(0, "AAPL", tr_core::Timeframe::M5);
+        chart.restore_stops(Some(crate::layouts::StopCloudSettings {
+            ks: vec![0.5, 1.5, 2.5],
+            horizons: Some((8, 40)),
+            odds: false,
+        }));
+        let s = PaneKind::Chart(Box::new(chart)).settings();
+        let restored = PaneKind::from_settings(serde_json::from_str(&serde_json::to_string(&s).unwrap()).unwrap());
+        assert_eq!(restored.settings(), s);
+        let mut chart = ChartState::new(0, "AAPL", tr_core::Timeframe::D1);
+        chart.restore_stops(Some(crate::layouts::StopCloudSettings {
+            ks: vec![3.0, 1.0],
+            horizons: Some((48, 12)),
+            odds: true,
+        }));
+        assert_eq!(chart.stop_settings(), Some(Default::default()));
     }
 }
