@@ -498,6 +498,102 @@ pub enum Request {
     Trade(TradeRequest),
 }
 
+impl Request {
+    fn kind(&self) -> &'static str {
+        match self {
+            Self::StackEdge { .. } => "StackEdge",
+            Self::VaultSnapshot { .. } => "VaultSnapshot",
+            Self::VaultDrop { .. } => "VaultDrop",
+            Self::VaultVerify => "VaultVerify",
+            Self::VaultPrune => "VaultPrune",
+            Self::Health => "Health",
+            Self::RetryFeed { .. } => "RetryFeed",
+            Self::HistoryStatus => "HistoryStatus",
+            Self::HistoryTask(..) => "HistoryTask",
+            Self::ConfigureWhatsNews { .. } => "ConfigureWhatsNews",
+            Self::AutocompleteUniverse => "AutocompleteUniverse",
+            Self::Research { .. } => "Research",
+            Self::Desk { .. } => "Desk",
+            Self::WallEdge { .. } => "WallEdge",
+            Self::CancelWallEdge { .. } => "CancelWallEdge",
+            Self::WallEdgeFocus { .. } => "WallEdgeFocus",
+            Self::TrendWall { .. } => "TrendWall",
+            Self::TrendStack { .. } => "TrendStack",
+            Self::DailyStrength { .. } => "DailyStrength",
+            Self::AuctionMap { .. } => "AuctionMap",
+            Self::StopCloud { .. } => "StopCloud",
+            Self::TrendCone { .. } => "TrendCone",
+            Self::AnchoredVwap { .. } => "AnchoredVwap",
+            Self::HoldingHistory { .. } => "HoldingHistory",
+            Self::StudioDist { .. } => "StudioDist",
+            Self::TstackTune { .. } => "TstackTune",
+            Self::StudioCorr { .. } => "StudioCorr",
+            Self::StudioSeason { .. } => "StudioSeason",
+            Self::Stats { .. } => "Stats",
+            Self::Backtest { .. } => "Backtest",
+            Self::IntradayCompare { .. } => "IntradayCompare",
+            Self::SessionPath { .. } => "SessionPath",
+            Self::Rotation { .. } => "Rotation",
+            Self::Breadth { .. } => "Breadth",
+            Self::VolumePace { .. } => "VolumePace",
+            Self::RealizedVol { .. } => "RealizedVol",
+            Self::Autocorr { .. } => "Autocorr",
+            Self::GapFill { .. } => "GapFill",
+            Self::SessionExtreme { .. } => "SessionExtreme",
+            Self::SessionClock { .. } => "SessionClock",
+            Self::RelativePath { .. } => "RelativePath",
+            Self::SessionBrief { .. } => "SessionBrief",
+            Self::CashLevels { .. } => "CashLevels",
+            Self::IntradayBacktest { .. } => "IntradayBacktest",
+            Self::Lookalike { .. } => "Lookalike",
+            Self::ArchiveHistory { .. } => "ArchiveHistory",
+            Self::Portfolio(..) => "Portfolio",
+            Self::BrokerRegister { .. } => "BrokerRegister",
+            Self::BrokerPortal { .. } => "BrokerPortal",
+            Self::BrokerDisconnect { .. } => "BrokerDisconnect",
+            Self::Options { .. } => "Options",
+            Self::News { .. } => "News",
+            Self::OrderBook { .. } => "OrderBook",
+            Self::History { .. } => "History",
+            Self::ExtendedHistory { .. } => "ExtendedHistory",
+            Self::MoreHistory { .. } => "MoreHistory",
+            Self::Indicators { .. } => "Indicators",
+            Self::Compare { .. } => "Compare",
+            Self::Markers { .. } => "Markers",
+            Self::Quotes(..) => "Quotes",
+            Self::Latest { .. } => "Latest",
+            Self::TickerTrades { .. } => "TickerTrades",
+            Self::Profile { .. } => "Profile",
+            Self::SearchPoliticians(..) => "SearchPoliticians",
+            Self::Track { .. } => "Track",
+            Self::Alerts => "Alerts",
+            Self::MarkAlertsSeen => "MarkAlertsSeen",
+            Self::TradePlans => "TradePlans",
+            Self::ArmTradePlan(..) => "ArmTradePlan",
+            Self::UpdateTradePlan { .. } => "UpdateTradePlan",
+            Self::CancelTradePlan { .. } => "CancelTradePlan",
+            Self::RemoveTradePlan { .. } => "RemoveTradePlan",
+            Self::CancelTradePlansFor { .. } => "CancelTradePlansFor",
+            Self::MarkTradePlansSeen => "MarkTradePlansSeen",
+            Self::PriceAlerts => "PriceAlerts",
+            Self::AddPriceAlert { .. } => "AddPriceAlert",
+            Self::RemovePriceAlert { .. } => "RemovePriceAlert",
+            Self::SetPriceAlertEnabled { .. } => "SetPriceAlertEnabled",
+            Self::MarkPriceAlertsSeen => "MarkPriceAlertsSeen",
+            Self::EvaluatePriceAlerts => "EvaluatePriceAlerts",
+            Self::IntradayScan { .. } => "IntradayScan",
+            Self::RefreshCongress => "RefreshCongress",
+            Self::ExportHistory { .. } => "ExportHistory",
+            Self::ImportHistory { .. } => "ImportHistory",
+            Self::ReplacePriceAlerts(..) => "ReplacePriceAlerts",
+            Self::Forget(..) => "Forget",
+            Self::YieldCurves => "YieldCurves",
+            Self::Search(..) => "Search",
+            Self::Trade(..) => "Trade",
+        }
+    }
+}
+
 /// A trading call through SnapTrade. Previews never place anything; placing takes a preview
 /// the user confirmed.
 pub enum TradeRequest {
@@ -896,6 +992,7 @@ pub enum Response {
 }
 
 pub struct Worker {
+    jobs: Arc<crate::perf::JobLog>,
     data_mode: DataMode,
     health_board: Option<Arc<tr_data::HealthBoard>>,
     tx: tokio::sync::mpsc::UnboundedSender<Request>,
@@ -941,6 +1038,7 @@ impl std::error::Error for NativeError {
 }
 
 struct Shared {
+    jobs: Arc<crate::perf::JobLog>,
     history: Arc<tr_data::history::Service>,
     whats_news: tokio::sync::watch::Sender<(u64, tr_data::whats_news::Config)>,
     provider: Provider,
@@ -1131,6 +1229,7 @@ impl Worker {
         let (whats_news, _) =
             tokio::sync::watch::channel((0, crate::prefs::Prefs::load(&dir.join("prefs.json")).whats_news));
         let shared = Arc::new(Shared {
+            jobs: Default::default(),
             history: Arc::new(tr_data::history::Service::new(
                 tr_data::history::Archive::open(dir.join("history.sqlite3"))?,
                 Arc::new(tr_data::yahoo::YahooProvider::new()?),
@@ -1276,7 +1375,7 @@ impl Worker {
                 congress_refresh(&s).await;
             }
         });
-        Ok(Self { data_mode, health_board, tx, rx, _rt: rt })
+        Ok(Self { jobs: shared.jobs.clone(), data_mode, health_board, tx, rx, _rt: rt })
     }
 
     #[cfg(test)]
@@ -1291,7 +1390,11 @@ impl Worker {
         let (tx, requests) = tokio::sync::mpsc::unbounded_channel();
         let (out, rx) = mpsc::channel();
         let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
-        (Self { data_mode: DataMode::ExplicitSample, health_board: None, tx, rx, _rt: rt }, requests, out)
+        (
+            Self { jobs: Default::default(), data_mode: DataMode::ExplicitSample, health_board: None, tx, rx, _rt: rt },
+            requests,
+            out,
+        )
     }
 
     #[cfg(test)]
@@ -1299,6 +1402,10 @@ impl Worker {
         let (mut worker, rx) = Self::test_channel();
         worker.data_mode = DataMode::Live;
         (worker, rx)
+    }
+
+    pub fn jobs(&self) -> &crate::perf::JobLog {
+        &self.jobs
     }
 
     pub fn mode(&self) -> DataMode {
@@ -1713,6 +1820,7 @@ async fn stitch_native(
 /// Admission and cache lookup both run in spawn_blocking, including input hashing.
 #[allow(clippy::too_many_arguments)]
 fn tune_cached(
+    jobs: &crate::perf::JobLog,
     reports: &tr_data::report_cache::ReportCache,
     symbol: &str,
     tf: Timeframe,
@@ -1737,7 +1845,9 @@ fn tune_cached(
         &format!("{params:?} {class:?} {gaps:?}"),
     );
     key.epoch = stitch.map_or(0, |s| s.epoch);
-    reports.get_or_compute(key, || tr_data::tstack_tune::compute(&bars, tf, class, observed, params, source, gaps))
+    reports.get_or_compute(key, || {
+        jobs.time("TstackTune", || tr_data::tstack_tune::compute(&bars, tf, class, observed, params, source, gaps))
+    })
 }
 
 async fn cached_study<T: Clone + Send + Sync + 'static>(
@@ -1749,7 +1859,22 @@ async fn cached_study<T: Clone + Send + Sync + 'static>(
         return Ok((*hit).clone());
     }
     let reports = s.reports.clone();
-    tokio::task::spawn_blocking(move || reports.get_or_compute(key, compute).map(|v| (*v).clone()))
+    let jobs = s.jobs.clone();
+    let kind = match key.kind.as_str() {
+        "stack" => "TrendStack",
+        "clock" => "SessionClock",
+        "session_path" => "SessionPath",
+        "intraday_compare" => "IntradayCompare",
+        "volume_pace" => "VolumePace",
+        "realized_vol" => "RealizedVol",
+        "autocorr" => "Autocorr",
+        "gap_fill" => "GapFill",
+        "session_extreme" => "SessionExtreme",
+        "relative_path" => "RelativePath",
+        "breadth" => "Breadth",
+        _ => "cached study",
+    };
+    tokio::task::spawn_blocking(move || reports.get_or_compute(key, || jobs.time(kind, compute)).map(|v| (*v).clone()))
         .await?
         .map_err(anyhow::Error::msg)
 }
@@ -1824,6 +1949,7 @@ async fn auction_map(
         return Err("Auction Map needs a US cash session".into());
     }
     let fine = if key.tf == Timeframe::M1 { None } else { auction_fine_bars(s, symbol).await };
+    let jobs = s.jobs.clone();
     let reports = s.reports.clone();
     let key = key.clone();
     let symbol = symbol.to_owned();
@@ -1861,6 +1987,7 @@ async fn auction_map(
         );
         cache_key.epoch = stitch.as_ref().map_or(0, |s| s.epoch);
         reports.get_or_compute(cache_key, || {
+            let _job = crate::perf::JobTimer::new(&jobs, "AuctionMap");
             let mut r = tr_data::auction::build(chart, key.tf, fine_closed, class, cut, &gaps, key.params, tick)?;
             r.source = fine.as_ref().map_or(source.clone(), |f| format!("{source} · fine {}", f.1.label()));
             Ok(r)
@@ -2588,6 +2715,7 @@ async fn honest_cached<T: Send + Sync + 'static>(
         anyhow::bail!("Backtest refused: sample / offline display mode");
     }
     let cache = s.cache.clone();
+    let jobs = s.jobs.clone();
     let reports = s.reports.clone();
     let out = s.out.clone();
     let ctx = s.ctx.clone();
@@ -2657,6 +2785,7 @@ async fn honest_cached<T: Send + Sync + 'static>(
             );
             key.epoch = stitch.as_ref().map_or(0, |s| s.epoch);
             let result = reports.get_or_compute(key, || {
+                let _job = crate::perf::JobTimer::new(&jobs, "HonestBacktest");
                 let honest = tr_data::backtest_trials::compute(
                     bars,
                     tf,
@@ -3551,6 +3680,7 @@ async fn research_desk(
 /// Verified gate first, then `closed_len` on the feed's clock, then the sums off the async
 /// runtime. Sample or unverified bars return the shared refusal and no numbers.
 async fn anchored_vwap(
+    jobs: Arc<crate::perf::JobLog>,
     class: tr_core::AssetClass,
     bars: Arc<Vec<Bar>>,
     key: &tr_data::anchored_vwap::AvwapKey,
@@ -3559,13 +3689,18 @@ async fn anchored_vwap(
     Bar::require_verified(&bars, "Anchored VWAP")?;
     let closed = tr_data::closed::closed_len(key.tf, &bars, class, as_of);
     let anchors = key.anchors.clone();
-    tokio::task::spawn_blocking(move || tr_data::anchored_vwap::report(&bars, &anchors, closed).map(Arc::new))
-        .await
-        .map_err(|e| format!("Anchored VWAP task failed: {e}"))?
+    tokio::task::spawn_blocking(move || {
+        jobs.time("AnchoredVwap", || tr_data::anchored_vwap::report(&bars, &anchors, closed).map(Arc::new))
+    })
+    .await
+    .map_err(|e| format!("Anchored VWAP task failed: {e}"))?
 }
 
 async fn handle(s: &Arc<Shared>, req: Request) {
+    let kind = req.kind();
+    let started = std::time::Instant::now();
     handle_inner(s, req, false).await;
+    s.jobs.record(kind, crate::perf::Phase::Wall, started.elapsed());
 }
 async fn handle_inner(s: &Arc<Shared>, req: Request, force: bool) {
     if let Request::RetryFeed { feed, pane } = req {
@@ -3588,6 +3723,7 @@ async fn handle_inner(s: &Arc<Shared>, req: Request, force: bool) {
     let send = |response| s.send(Response::WhatsNews { epoch, response: Box::new(response) });
     match req {
         Request::StackEdge { pane, key, bars, state, entry_long, entry_short, stitch } => {
+            let jobs = s.jobs.clone();
             let k = key.clone();
             let reports = s.reports.clone();
             let result = tokio::task::spawn_blocking(move || {
@@ -3615,7 +3751,9 @@ async fn handle_inner(s: &Arc<Shared>, req: Request, force: bool) {
                     cache_key.epoch = s.epoch;
                 }
                 reports.get_or_compute(cache_key, || {
-                    tr_data::edge::regime_edge(&bars[..k.n], &state, &entry_long, &entry_short, &k.horizons)
+                    jobs.time("StackEdge", || {
+                        tr_data::edge::regime_edge(&bars[..k.n], &state, &entry_long, &entry_short, &k.horizons)
+                    })
                 })
             })
             .await
@@ -3963,7 +4101,11 @@ async fn handle_inner(s: &Arc<Shared>, req: Request, force: bool) {
             // Base/cloud first: no network or main-thread maths. Higher lanes fill later.
             let initial = frames.iter().copied().filter(|t| *t != tf).map(|t| (t, Err("Loading…".into()))).collect();
             let b = base.clone();
-            if let Ok(result) = tokio::task::spawn_blocking(move || trend_stack(&b, tf, initial, params)).await {
+            let jobs = s.jobs.clone();
+            if let Ok(result) =
+                tokio::task::spawn_blocking(move || jobs.time("TrendStack", || trend_stack(&b, tf, initial, params)))
+                    .await
+            {
                 send(Response::TrendStack { config_revision, pane, generation, base_len: base.len(), result });
             }
             let now = chrono::Utc::now().timestamp();
@@ -3999,7 +4141,8 @@ async fn handle_inner(s: &Arc<Shared>, req: Request, force: bool) {
                 &format!("{params:?} {lane_identity:?}"),
             );
             let mut result = if lanes.iter().any(|(_, b)| b.is_err()) {
-                tokio::task::spawn_blocking(move || trend_stack(&base, tf, lanes, params))
+                let jobs = s.jobs.clone();
+                tokio::task::spawn_blocking(move || jobs.time("TrendStack", || trend_stack(&base, tf, lanes, params)))
                     .await
                     .unwrap_or_else(|e| Err(e.to_string()))
             } else {
@@ -4046,6 +4189,7 @@ async fn handle_inner(s: &Arc<Shared>, req: Request, force: bool) {
             s.send(Response::AuctionMap { pane, key, result });
         }
         Request::StopCloud { pane, key, class, bars, as_of, stitch } => {
+            let jobs = s.jobs.clone();
             let config = key.clone();
             let reports = s.reports.clone();
             let result = tokio::task::spawn_blocking(move || {
@@ -4063,7 +4207,9 @@ async fn handle_inner(s: &Arc<Shared>, req: Request, force: bool) {
                     cache_key.epoch = s.epoch;
                 }
                 reports.get_or_compute(cache_key, || {
-                    tr_data::stop_cloud::report(&bars, config.tf, class, as_of, config.params, config.trend)
+                    jobs.time("StopCloud", || {
+                        tr_data::stop_cloud::report(&bars, config.tf, class, as_of, config.params, config.trend)
+                    })
                 })
             })
             .await
@@ -4071,6 +4217,7 @@ async fn handle_inner(s: &Arc<Shared>, req: Request, force: bool) {
             s.send(Response::StopCloud { pane, key, result });
         }
         Request::TrendCone { pane, key, class, bars, as_of, stitch } => {
+            let jobs = s.jobs.clone();
             let config = key.clone();
             let reports = s.reports.clone();
             let result = tokio::task::spawn_blocking(move || {
@@ -4088,7 +4235,9 @@ async fn handle_inner(s: &Arc<Shared>, req: Request, force: bool) {
                     cache_key.epoch = s.epoch;
                 }
                 reports.get_or_compute(cache_key, || {
-                    tr_data::trend_cone::report(&bars, config.tf, class, as_of, config.params, config.trend)
+                    jobs.time("TrendCone", || {
+                        tr_data::trend_cone::report(&bars, config.tf, class, as_of, config.params, config.trend)
+                    })
                 })
             })
             .await
@@ -4096,7 +4245,11 @@ async fn handle_inner(s: &Arc<Shared>, req: Request, force: bool) {
             s.send(Response::TrendCone { pane, key, result });
         }
         Request::AnchoredVwap { pane, key, class, bars, as_of } => {
-            s.send(Response::AnchoredVwap { pane, result: anchored_vwap(class, bars, &key, as_of).await, key });
+            s.send(Response::AnchoredVwap {
+                pane,
+                result: anchored_vwap(s.jobs.clone(), class, bars, &key, as_of).await,
+                key,
+            });
         }
         Request::HoldingHistory { pane, generation, symbols } => {
             let bridge = config.bridge();
@@ -4194,8 +4347,9 @@ async fn handle_inner(s: &Arc<Shared>, req: Request, force: bool) {
                     (tf.resample(&bars), source, Some(chrono::Utc::now().timestamp()), None)
                 };
                 let reports = s.reports.clone();
+                let jobs = s.jobs.clone();
                 tokio::task::spawn_blocking(move || {
-                    tune_cached(&reports, &symbol, tf, params, &bars, &source, observed, stitch.as_ref())
+                    tune_cached(&jobs, &reports, &symbol, tf, params, &bars, &source, observed, stitch.as_ref())
                 })
                 .await?
                 .map_err(anyhow::Error::msg)
@@ -4464,7 +4618,7 @@ async fn handle_inner(s: &Arc<Shared>, req: Request, force: bool) {
                     if !store_series(s, pane, generation, bars.clone()) {
                         return;
                     }
-                    let gpu = build_gpu(bars.clone()).await;
+                    let gpu = build_gpu(s.jobs.clone(), bars.clone()).await;
                     send(Response::History {
                         pane,
                         generation,
@@ -4509,7 +4663,7 @@ async fn handle_inner(s: &Arc<Shared>, req: Request, force: bool) {
                 if !store_series(s, pane, generation, bars.clone()) {
                     return;
                 }
-                let gpu = build_gpu(bars.clone()).await;
+                let gpu = build_gpu(s.jobs.clone(), bars.clone()).await;
                 s.send(Response::History {
                     pane,
                     generation,
@@ -4536,7 +4690,7 @@ async fn handle_inner(s: &Arc<Shared>, req: Request, force: bool) {
                 if !store_series(s, pane, generation, bars.clone()) {
                     return;
                 }
-                let gpu = build_gpu(bars.clone()).await;
+                let gpu = build_gpu(s.jobs.clone(), bars.clone()).await;
                 s.send(Response::History {
                     pane,
                     generation,
@@ -4586,7 +4740,7 @@ async fn handle_inner(s: &Arc<Shared>, req: Request, force: bool) {
                     if !store_series(s, pane, generation, bars.clone()) {
                         return; // superseded while loading
                     }
-                    let gpu = build_gpu(bars.clone()).await;
+                    let gpu = build_gpu(s.jobs.clone(), bars.clone()).await;
                     s.send(Response::History {
                         pane,
                         generation,
@@ -4692,7 +4846,7 @@ async fn handle_inner(s: &Arc<Shared>, req: Request, force: bool) {
                         *cur = Arc::new(merged);
                         cur.clone()
                     };
-                    let gpu = build_gpu(bars.clone()).await;
+                    let gpu = build_gpu(s.jobs.clone(), bars.clone()).await;
                     s.send(Response::History {
                         pane,
                         generation,
@@ -4710,8 +4864,11 @@ async fn handle_inner(s: &Arc<Shared>, req: Request, force: bool) {
             }
         }
         Request::Indicators { pane, generation, bars, tf, specs, palette, class, observed, stitch } => {
+            let jobs = s.jobs.clone();
             let built = tokio::task::spawn_blocking(move || {
-                build_chart_indicators(&bars, tf, &specs, &palette, class, observed, stitch.as_deref())
+                jobs.time("Indicators", || {
+                    build_chart_indicators(&bars, tf, &specs, &palette, class, observed, stitch.as_deref())
+                })
             })
             .await
             .unwrap_or_default();
@@ -5204,7 +5361,7 @@ async fn load_extended(s: &Arc<Shared>, pane: PaneId, generation: u64, symbol: S
                 if !store_series(s, pane, generation, bars.clone()) {
                     return;
                 }
-                let gpu = build_gpu(bars.clone()).await;
+                let gpu = build_gpu(s.jobs.clone(), bars.clone()).await;
                 s.send(Response::History {
                     pane,
                     generation,
@@ -5314,7 +5471,7 @@ async fn refresh_intraday(s: &Shared, pane: PaneId, generation: u64, symbol: &st
     if !extended {
         store_verified_history(s, symbol, tf, &merged).await;
     }
-    let gpu = build_gpu(merged.clone()).await;
+    let gpu = build_gpu(s.jobs.clone(), merged.clone()).await;
     if current_series(s, pane, generation).is_none() {
         return;
     }
@@ -5364,7 +5521,7 @@ fn start_live(s: Arc<Shared>, pane: PaneId, generation: u64, symbol: String, tf:
                     }
                     dirty = false;
                     let Some(bars) = current_series(&s, pane, generation) else { break };
-                    let gpu = build_gpu(bars.clone()).await;
+                    let gpu = build_gpu(s.jobs.clone(), bars.clone()).await;
                     s.send(Response::History {
                         pane,
                         generation,
@@ -5388,8 +5545,10 @@ fn start_live(s: Arc<Shared>, pane: PaneId, generation: u64, symbol: String, tf:
     });
 }
 
-async fn build_gpu(bars: Arc<Vec<Bar>>) -> SeriesGpu {
-    tokio::task::spawn_blocking(move || SeriesGpu::build(&bars)).await.expect("pyramid build task")
+async fn build_gpu(jobs: Arc<crate::perf::JobLog>, bars: Arc<Vec<Bar>>) -> SeriesGpu {
+    tokio::task::spawn_blocking(move || jobs.time("SeriesGpu", || SeriesGpu::build(&bars)))
+        .await
+        .expect("pyramid build task")
 }
 
 fn resolve_politician(db: &Db, query: &str) -> Option<Politician> {
@@ -6076,14 +6235,48 @@ mod tests {
             .collect();
         let cache = tr_data::report_cache::ReportCache::default();
         let p = AdaptiveTrendParams::default();
-        let a = tune_cached(&cache, "BTCUSD", Timeframe::D1, p, &bars, "fixture", None, None).unwrap();
+        let a = tune_cached(
+            &crate::perf::JobLog::default(),
+            &cache,
+            "BTCUSD",
+            Timeframe::D1,
+            p,
+            &bars,
+            "fixture",
+            None,
+            None,
+        )
+        .unwrap();
         bars[319].close += 0.1;
-        let b = tune_cached(&cache, "BTCUSD", Timeframe::D1, p, &bars, "fixture", None, None).unwrap();
+        let b = tune_cached(
+            &crate::perf::JobLog::default(),
+            &cache,
+            "BTCUSD",
+            Timeframe::D1,
+            p,
+            &bars,
+            "fixture",
+            None,
+            None,
+        )
+        .unwrap();
         assert!(Arc::ptr_eq(&a, &b), "forming changes do not invalidate a closed report");
         bars[100].close += 0.1;
-        let corrected = tune_cached(&cache, "BTCUSD", Timeframe::D1, p, &bars, "fixture", None, None).unwrap();
+        let corrected = tune_cached(
+            &crate::perf::JobLog::default(),
+            &cache,
+            "BTCUSD",
+            Timeframe::D1,
+            p,
+            &bars,
+            "fixture",
+            None,
+            None,
+        )
+        .unwrap();
         assert!(!Arc::ptr_eq(&a, &corrected));
         let changed = tune_cached(
+            &crate::perf::JobLog::default(),
             &cache,
             "BTCUSD",
             Timeframe::D1,
@@ -6095,16 +6288,61 @@ mod tests {
         )
         .unwrap();
         assert!(!Arc::ptr_eq(&corrected, &changed));
-        let source = tune_cached(&cache, "BTCUSD", Timeframe::D1, p, &bars, "other", None, None).unwrap();
+        let source = tune_cached(
+            &crate::perf::JobLog::default(),
+            &cache,
+            "BTCUSD",
+            Timeframe::D1,
+            p,
+            &bars,
+            "other",
+            None,
+            None,
+        )
+        .unwrap();
         assert!(!Arc::ptr_eq(&corrected, &source));
         let info = tr_data::vault::StitchInfo { epoch: 2, source: "fixture".into(), ..Default::default() };
-        let epoch = tune_cached(&cache, "BTCUSD", Timeframe::D1, p, &bars, "fixture", None, Some(&info)).unwrap();
+        let epoch = tune_cached(
+            &crate::perf::JobLog::default(),
+            &cache,
+            "BTCUSD",
+            Timeframe::D1,
+            p,
+            &bars,
+            "fixture",
+            None,
+            Some(&info),
+        )
+        .unwrap();
         assert!(!Arc::ptr_eq(&corrected, &epoch));
-        let closed =
-            tune_cached(&cache, "BTCUSD", Timeframe::D1, p, &bars, "fixture", Some(320 * 86400), None).unwrap();
+        let closed = tune_cached(
+            &crate::perf::JobLog::default(),
+            &cache,
+            "BTCUSD",
+            Timeframe::D1,
+            p,
+            &bars,
+            "fixture",
+            Some(320 * 86400),
+            None,
+        )
+        .unwrap();
         assert!(!Arc::ptr_eq(&corrected, &closed));
         bars[319].provenance = tr_core::Provenance::Sample;
-        assert!(tune_cached(&cache, "BTCUSD", Timeframe::D1, p, &bars, "fixture", None, None).is_err());
+        assert!(
+            tune_cached(
+                &crate::perf::JobLog::default(),
+                &cache,
+                "BTCUSD",
+                Timeframe::D1,
+                p,
+                &bars,
+                "fixture",
+                None,
+                None
+            )
+            .is_err()
+        );
     }
     #[tokio::test]
     async fn tune_worker_uses_vault_and_refuses_unverified_and_sample_without_network() {
@@ -7209,6 +7447,7 @@ mod tests {
         let (out, rx) = mpsc::channel();
         (
             Arc::new(Shared {
+                jobs: Default::default(),
                 history: Arc::new(tr_data::history::Service::new(
                     tr_data::history::Archive::memory().unwrap(),
                     Arc::new(tr_data::yahoo::YahooProvider::new().unwrap()),
@@ -7245,6 +7484,23 @@ mod tests {
             }),
             rx,
         )
+    }
+
+    #[tokio::test]
+    async fn worker_logs_wall_and_cpu_time_per_kind() {
+        let (s, rx) = shared(Arc::new(tr_data::sample::SampleProvider::at(0, 10)), None);
+        let bars = Arc::new(tr_perf::fixtures::crypto_m5(500, 1_790_000_000));
+        let now = bars.last().unwrap().ts + 300;
+        let key = tr_data::anchored_vwap::AvwapKey::new(1, Timeframe::M5, &[bars[0].ts], &bars, bars.len());
+        handle(&s, Request::AnchoredVwap { pane: 1, key, class: tr_core::AssetClass::Crypto, bars, as_of: Some(now) })
+            .await;
+        assert!(matches!(rx.try_recv().unwrap(), Response::AnchoredVwap { result: Ok(_), .. }));
+        let rows = s.jobs.snapshot();
+        for phase in [crate::perf::Phase::Cpu, crate::perf::Phase::Wall] {
+            let row = rows.iter().find(|r| r.kind == "AnchoredVwap" && r.phase == phase).expect("recorded job");
+            assert_eq!(row.count, 1);
+            assert!(row.last > 0.0);
+        }
     }
 
     #[tokio::test]
@@ -8239,6 +8495,7 @@ mod tests {
     fn series_generations_only_move_forward() {
         let (out, _rx) = mpsc::channel();
         let s = Shared {
+            jobs: Default::default(),
             history: Arc::new(tr_data::history::Service::new(
                 tr_data::history::Archive::memory().unwrap(),
                 Arc::new(tr_data::yahoo::YahooProvider::new().unwrap()),

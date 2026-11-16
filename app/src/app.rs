@@ -1167,6 +1167,7 @@ pub struct TerminalApp {
     show_perf: bool,
     /// Time Link cursors and Lens windows exchanged between linked charts each frame.
     link_bus: crate::chart_view::LinkBus,
+    perf_profile: crate::perf::FrameProfile,
     perf_cpu_ms: f64,
     perf_dt_ms: f64,
     last_frame: Option<Instant>,
@@ -1350,6 +1351,7 @@ impl TerminalApp {
             smoke_done: false,
             show_perf: std::env::var_os("TR_FPS").is_some(),
             link_bus: Default::default(),
+            perf_profile: Default::default(),
             perf_cpu_ms: 0.0,
             perf_dt_ms: 0.0,
             last_frame: None,
@@ -2732,7 +2734,10 @@ impl TerminalApp {
             A::Desk => self.apply(Function::Desk),
             A::Journal => self.apply(Function::Journal(String::new())),
             A::Refresh => self.apply(Function::Refresh),
-            A::FrameTiming => self.show_perf = !self.show_perf,
+            A::FrameTiming => {
+                self.show_perf = !self.show_perf;
+                crate::perf::set_enabled(self.show_perf);
+            }
             A::Portfolio => self.apply(Function::Portfolio(command::PortView::Summary, String::new())),
             A::Positions => self.apply(Function::Portfolio(command::PortView::Positions, String::new())),
             A::Orders => self.apply(Function::Portfolio(command::PortView::Orders, String::new())),
@@ -2958,9 +2963,12 @@ impl eframe::App for TerminalApp {
     }
 
     fn ui(&mut self, ui: &mut Ui, frame: &mut eframe::Frame) {
+        crate::perf::set_enabled(self.show_perf);
         let frame_start = Instant::now();
+        let mut frame_dt_ms = self.perf_dt_ms as f32;
         if let Some(prev) = self.last_frame.replace(frame_start) {
             let dt = prev.elapsed().as_secs_f64() * 1e3;
+            frame_dt_ms = dt as f32;
             self.perf_dt_ms = if self.perf_dt_ms == 0.0 { dt } else { self.perf_dt_ms * 0.9 + dt * 0.1 };
         }
         let ctx = ui.ctx().clone();
@@ -2994,7 +3002,10 @@ impl eframe::App for TerminalApp {
             self.applied_theme = Some(self.themes[ti].clone());
         }
         theme::refresh(&ctx, &self.themes[ti], self.system_accent);
-        self.drain();
+        {
+            let _s = crate::perf::scope(crate::perf::Layer::Drain);
+            self.drain();
+        }
         self.periodic();
         self.sync_holding_risk();
 
@@ -3028,6 +3039,7 @@ impl eframe::App for TerminalApp {
         self.hotkeys(&ctx);
         self.command_palette(&ctx);
         self.watchlist_dialogs(&ctx);
+        let _chrome_scope = crate::perf::scope(crate::perf::Layer::Chrome);
         let mut sidebar_cmds = Vec::new();
         if sb_w >= 1.0 {
             // The sidebar slides in from its edge.
@@ -3047,6 +3059,7 @@ impl eframe::App for TerminalApp {
         let inset = if right_side { self.traffic_inset() } else { (self.traffic_inset() - sb_w).max(0.0) };
         self.toolbar(ui, toolbar, inset);
         self.status_bar(ui, status);
+        drop(_chrome_scope);
 
         let mut actions = Vec::new();
         for c in sidebar_cmds {
@@ -3058,8 +3071,14 @@ impl eframe::App for TerminalApp {
         }
         self.link_bus.begin_frame();
         self.seed_link_hover(&ctx);
-        actions.extend(self.render_dock(ui, area, gap));
-        actions.extend(self.render_windows(&ctx));
+        {
+            let _s = crate::perf::scope(crate::perf::Layer::Dock);
+            actions.extend(self.render_dock(ui, area, gap));
+        }
+        {
+            let _s = crate::perf::scope(crate::perf::Layer::Windows);
+            actions.extend(self.render_windows(&ctx));
+        }
         self.run_actions(actions);
         self.sync_linked_review_levels();
         self.sync_linked_anchors();
@@ -3082,6 +3101,11 @@ impl eframe::App for TerminalApp {
                 self.autosave();
                 ctx.send_viewport_cmd(egui::ViewportCommand::Close);
             }
+        }
+        if self.show_perf {
+            crate::perf::hud(&ctx, status, &self.perf_profile, &self.worker.jobs().snapshot());
+            let sums = crate::perf::end_frame();
+            self.perf_profile.push(sums, frame_start.elapsed().as_secs_f32() * 1000.0, frame_dt_ms);
         }
         let cpu = frame_start.elapsed().as_secs_f64() * 1e3;
         self.perf_cpu_ms = self.perf_cpu_ms * 0.9 + cpu * 0.1;
@@ -3107,6 +3131,46 @@ impl eframe::App for TerminalApp {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn f12_toggles_the_hud_and_layer_recording() {
+        let mut app = test_app();
+        let ctx = egui::Context::default();
+        crate::perf::set_enabled(false);
+        for on in [true, false] {
+            let mut out = ctx.run_ui(
+                egui::RawInput {
+                    events: vec![egui::Event::Key {
+                        key: Key::F12,
+                        physical_key: Some(Key::F12),
+                        pressed: true,
+                        repeat: false,
+                        modifiers: Modifiers::NONE,
+                    }],
+                    ..Default::default()
+                },
+                |ui| app.hotkeys(ui.ctx()),
+            );
+            out.textures_delta.clear();
+            assert_eq!(app.show_perf, on);
+            assert_eq!(crate::perf::enabled(), on);
+            ctx.run_ui(
+                egui::RawInput {
+                    events: vec![egui::Event::Key {
+                        key: Key::F12,
+                        physical_key: Some(Key::F12),
+                        pressed: false,
+                        repeat: false,
+                        modifiers: Modifiers::NONE,
+                    }],
+                    ..Default::default()
+                },
+                |_| {},
+            )
+            .textures_delta
+            .clear();
+        }
+    }
 
     /// Isolated UI fixture: all paths are temporary and the worker only records requests.
     pub(super) fn test_app() -> TerminalApp {
@@ -3235,6 +3299,7 @@ mod tests {
             smoke_done: false,
             show_perf: false,
             link_bus: Default::default(),
+            perf_profile: Default::default(),
             perf_cpu_ms: 0.0,
             perf_dt_ms: 0.0,
             last_frame: None,

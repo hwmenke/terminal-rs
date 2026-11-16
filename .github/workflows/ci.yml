@@ -89,6 +89,12 @@ jobs:
       - run: cargo fmt --all -- --check
       - run: cargo build --release --workspace --all-targets
       - run: cargo test --release --workspace
+      - name: Offline CPU performance gate
+        run: cargo perf-gate --absolute-only
+      - name: Headless paint budget
+        env:
+          TR_PERF_ABSOLUTE: "1"
+        run: cargo perf-paint
       - run: cargo clippy --release --workspace --all-targets -- -D warnings
       - name: Run the app (smoke test)
         env:

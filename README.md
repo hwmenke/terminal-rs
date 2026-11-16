@@ -597,6 +597,9 @@ Measured on Linux with Mesa **llvmpipe (a CPU software rasterizer)** — a real 
 
 ## Tests
 
+Offline CPU/data and headless paint regression gates: [performance budgets and F12 HUD](docs/PERF.md).
+Run both with `scripts/perf-gate.sh`.
+
 ```sh
 cargo test --workspace                       # unit + fixture tests (parsers, indicators, chart, app)
 cargo test -p tr-data -- --ignored           # live tests: every asset class, quotes, curve, search, websocket

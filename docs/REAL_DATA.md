@@ -98,9 +98,10 @@ timestamps, parameters and horizons (scoped to chart generation/timeframe). Live
 reuse that report; history paging or a newly closed bar changes the key. Provenance gates
 still run before reuse. No study calculation or network request runs on paint.
 
-Timing targets (2 ms compute / 0.1 ms paint and the strip budget) have not been
-benchmarked; validation covers correctness and headless painting. Edge reuses the
-existing `describe` implementation, including its sorting for distribution statistics.
+The offline [performance gates and measured budgets](PERF.md) now cover representative
+data loads, statistical reports and headless per-layer painting. The earlier 2 ms compute /
+0.1 ms paint strip targets are design targets, not separately certified by that suite.
+Edge reuses the existing `describe` implementation, including its sorting for distribution statistics.
 
 Phase two has no cuts. The only feature cut from phase one is the optional prior-day MARKS
 extension. Extra compilation/test dependencies touched are `yahoo.rs` (Guarded rename),
