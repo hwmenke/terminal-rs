@@ -323,7 +323,7 @@ pub fn purge(tape: &Tape, candidate: IndexSpan, test: (i64, i64), embargoes: &[(
     }
     let mut removed_labels = 0;
     for label in &tape.labels {
-        if label_is_purged(label, test, embargoes) {
+        if label_touches_candidate(label, candidate) && label_is_purged(label, test, embargoes) {
             removed_labels += 1;
             for v in keep.iter_mut().take(label.last_return + 1).skip(label.first_return) {
                 *v = false;
@@ -336,6 +336,9 @@ pub fn purge(tape: &Tape, candidate: IndexSpan, test: (i64, i64), embargoes: &[(
         }
     }
     (keep, removed_labels)
+}
+fn label_touches_candidate(label: &HoldingLabel, candidate: IndexSpan) -> bool {
+    label.first_return < candidate.end && label.last_return >= candidate.start
 }
 fn label_is_purged(label: &HoldingLabel, test: (i64, i64), embargoes: &[(i64, i64)]) -> bool {
     let overlaps = |a, b| label.decision_ts <= b && label.exit_ts.is_none_or(|exit| exit >= a);
@@ -653,17 +656,20 @@ pub fn evaluate_protocol(
                 let test = span(units, f.test);
                 let embargo_intervals: Vec<_> = embargoes.iter().map(|s| (s.start, s.end)).collect();
                 let (keep, removed_labels) = purge(&train_tape, f.train, (test.start, test.end), &embargo_intervals);
-                let purged_labels = train_tape
+                let purged_labels: Vec<_> = train_tape
                     .labels
                     .iter()
-                    .filter(|l| label_is_purged(l, (test.start, test.end), &embargo_intervals))
+                    .filter(|l| {
+                        label_touches_candidate(l, f.train)
+                            && label_is_purged(l, (test.start, test.end), &embargo_intervals)
+                    })
                     .cloned()
                     .collect();
                 let train_returns: Vec<_> =
                     train_tape.returns.iter().zip(&keep).filter(|(_, k)| **k).map(|(p, _)| p.net_return).collect();
                 let train_n = train_returns.len();
                 let mut train: Estimate<Moments> = moments(&train_returns).into();
-                if train_n < 2 && removed_labels > 0 {
+                if train_n < 2 && purged_labels.iter().any(|l| l.exit_ts.is_none()) {
                     train = Estimate::Unavailable(Reason::UnresolvedHoldingLabel);
                 }
                 let test_tape = simulate(f.test.start, f.test.end, true)?;
@@ -833,6 +839,47 @@ mod tests {
         assert_eq!(compare_family(&oversized), Err(Reason::WorkBudgetExceeded { trials: 65 }));
     }
     #[test]
+    fn backtest_honesty_family_dsr_uses_session_dispersion_and_the_requested_trial() {
+        // Independent Python statistics.NormalDist/sample-stdev calculation.
+        // Deliberately reverse one tape and add non-common, extreme observations:
+        // neither storage order nor data outside the common window may enter DSR.
+        let x = [0., 0.01, 0.02, 0.04, -0.01, 0.03];
+        let y = [0.03, -0.01, 0.01, 0.02, 0., -0.02];
+        let mut a: Vec<_> = x.iter().enumerate().map(|(i, r)| point(i, *r)).collect();
+        a.push(point(100, 0.9));
+        let b = y.iter().enumerate().rev().map(|(i, r)| point(i, *r)).collect();
+        let family = compare_family(&BTreeMap::from([("a".into(), Ok(a)), ("b".into(), Ok(b))])).unwrap();
+        assert_eq!(family.dates.len(), 6);
+        assert_eq!(family.effective_trials, 2);
+        near(family.sharpe_dispersion, 0.37796447300922714);
+        let a = family.comparisons["a"].value().unwrap();
+        let b = family.comparisons["b"].value().unwrap();
+        near(a.null_maximum, 0.21324361862292304);
+        near(b.null_maximum, a.null_maximum);
+        near(a.moments.sharpe, 0.8017837257372731);
+        near(*a.psr.value().unwrap(), 0.9550506667203803);
+        near(*a.dsr.value().unwrap(), 0.8934120137777781);
+        near(*b.dsr.value().unwrap(), 0.5477607660965832);
+        assert!(a.dsr != b.dsr); // A selected ID never inherits another trial's DSR.
+    }
+    #[test]
+    fn backtest_honesty_independent_equal_sharpes_have_zero_null_dispersion() {
+        let a = [-0.01, -0.01, 0.03, 0.03];
+        let b = [-0.01, 0.03, -0.01, 0.03];
+        let tapes = [a, b]
+            .into_iter()
+            .enumerate()
+            .map(|(j, xs)| (j.to_string(), Ok(xs.iter().enumerate().map(|(i, r)| point(i, *r)).collect())))
+            .collect();
+        let family = compare_family(&tapes).unwrap();
+        assert_eq!(family.effective_trials, 2);
+        near(family.sharpe_dispersion, 0.);
+        for c in family.comparisons.values().filter_map(Estimate::value) {
+            near(c.null_maximum, 0.);
+            near(*c.dsr.value().unwrap(), *c.psr.value().unwrap());
+        }
+    }
+    #[test]
     fn backtest_honesty_fold_spans_match_hand_allocation() {
         let f = schedule(125, 1, false, HonestySettings::default()).unwrap();
         assert_eq!(
@@ -869,6 +916,85 @@ mod tests {
         assert!(!keep[1]); // exact exit touch
         let (keep, _) = purge(&tape, IndexSpan { start: 0, end: 8 }, (80, 99), &[(10, 19)]);
         assert!(!keep[1]);
+    }
+    #[test]
+    fn backtest_honesty_injected_future_label_cannot_enter_training_statistics() {
+        let units: Vec<_> = (0..40).map(|i| point(i, (i as f64 % 4. - 1.) / 100.)).collect();
+        let protocol = Protocol::WalkForward(HonestySettings { folds: 2, embargo_sessions: 1 });
+        let e = evaluate_protocol(&units, 0, true, &protocol, |start, end, liquidate| {
+            let returns = units[start..end].to_vec();
+            let labels = if liquidate {
+                Vec::new()
+            } else {
+                assert_eq!(start, 0); // strictly forward training prefix
+                vec![HoldingLabel {
+                    decision_ts: units[4].period_start,
+                    entry_ts: units[4].period_start,
+                    // Deliberate lookahead: this training label resolves in test.
+                    exit_ts: Some(units[end + 1].period_end),
+                    first_return: 4,
+                    last_return: end - 1,
+                }]
+            };
+            Ok(Tape { returns, labels })
+        })
+        .unwrap();
+        for f in &e.folds {
+            assert_eq!(f.train_n, 4);
+            assert_eq!(f.removed_labels, 1);
+            assert_eq!(f.train_used.len(), 1);
+            assert_eq!(f.train_used[0].indices, IndexSpan { start: 0, end: 4 });
+            near(f.train.value().unwrap().mean, 0.005);
+            assert!(f.train_used.iter().all(|s| s.end < f.test.start));
+        }
+    }
+    #[test]
+    fn backtest_honesty_purge_diagnostics_only_count_scored_labels_and_censored_exits() {
+        let tape = Tape {
+            returns: (0..8).map(|i| point(i, 0.)).collect(),
+            labels: vec![HoldingLabel {
+                decision_ts: 0,
+                entry_ts: 10,
+                exit_ts: Some(20),
+                first_return: 1,
+                last_return: 2,
+            }],
+        };
+        let (_, count) = purge(&tape, IndexSpan { start: 4, end: 8 }, (80, 99), &[(10, 19)]);
+        assert_eq!(count, 0); // An unscored warm-up label removed no training evidence.
+
+        let units: Vec<_> = (0..40).map(|i| point(i, (i as f64 % 4. - 1.) / 100.)).collect();
+        let protocol = Protocol::WalkForward(HonestySettings { folds: 2, embargo_sessions: 1 });
+        for censored in [false, true] {
+            let e = evaluate_protocol(&units, 0, true, &protocol, |start, end, liquidate| {
+                Ok(Tape {
+                    returns: units[start..end].to_vec(),
+                    labels: if liquidate {
+                        vec![]
+                    } else {
+                        vec![HoldingLabel {
+                            decision_ts: 0,
+                            entry_ts: 10,
+                            exit_ts: if censored { None } else { Some(units[end].period_end) },
+                            first_return: 0,
+                            last_return: end - 1,
+                        }]
+                    },
+                })
+            })
+            .unwrap();
+            for f in e.folds {
+                assert_eq!(f.train_n, 0);
+                assert_eq!(
+                    f.train,
+                    Estimate::Unavailable(if censored {
+                        Reason::UnresolvedHoldingLabel
+                    } else {
+                        Reason::TooFewReturns
+                    })
+                );
+            }
+        }
     }
     #[test]
     fn backtest_honesty_daily_liquidation_purge_stitch_and_causality() {
