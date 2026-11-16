@@ -273,6 +273,7 @@ gets the native title bar with traffic lights, window vibrancy behind the sideba
   | `⇧ Click` / menu "Center linked charts here" | Scroll linked charts to that time |
 
 - **Auction Map** — `AUCTION` / `AMAP` / **Alt+P** toggles verified closed RTH session profiles, a composite dock and naked POC/VAH/VAL. `AUCTION VIS` follows visible whole sessions; click a level tag to centre its origin, Alt+click to anchor VWAP. See [Auction Map](docs/AUCTION_MAP.md).
+- **ATR Stop Cloud + Stop Odds** — `STOPS` / `SCLOUD` / **Alt+S** toggles closed-bar ATR envelopes, ratcheting guides and empirical stop-touch odds with Wilson intervals and small-sample refusals. Settings save with layouts. See [Stop Cloud](docs/STOP_CLOUD.md).
 - **Trend Cone (Edge v2)** — `CONE` / **Alt+C** toggles a forward
   P10/25/50/75/90 fan from the last closed bar, coloured by the current TSTACK
   medium regime, with a grey unconditional fan underneath. Gradient fills,

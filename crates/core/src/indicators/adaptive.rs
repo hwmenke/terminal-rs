@@ -590,6 +590,14 @@ enum BandKind {
     Stop,
 }
 
+/// Ratcheting trailing-stop guide at `multiple` ATR from `center`: below the
+/// baseline in a long regime (only rises), above it in a short regime (only
+/// falls), reset to the raw level on a regime flip. At 2.25 this is exactly
+/// [`AdaptiveTrend::mrt`] for the medium baseline.
+pub fn stop_guide(center: &[f64], regime: &[i8], atr: &[f64], multiple: f64) -> Vec<f64> {
+    ratchet_band(center, regime, atr, multiple, BandKind::Stop)
+}
+
 /// One-sided ratcheting band. Resets on a regime flip; stays put when the regime is flat.
 fn ratchet_band(center: &[f64], regime: &[i8], atr: &[f64], multiple: f64, kind: BandKind) -> Vec<f64> {
     let n = center.len();
@@ -859,6 +867,35 @@ mod tests {
             last = t.mrt[i];
         }
         assert!(last.is_finite(), "expected a long stretch with a stop");
+    }
+
+    #[test]
+    fn stop_guide_at_2_25_is_bit_identical_to_mrt() {
+        for closes in [rise_then_fall(80, 80), rise_then_fall(90, 10), rise_then_fall(30, 120)] {
+            let o = Ohlcv::new(&series(&closes, Provenance::Real));
+            let t = adaptive_trend(&o, AdaptiveTrendParams::default());
+            let guide = stop_guide(&t.mb, &t.medium_state, &t.atr, 2.25);
+            assert_eq!(
+                guide.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                t.mrt.iter().map(|v| v.to_bits()).collect::<Vec<_>>()
+            );
+        }
+    }
+
+    #[test]
+    fn stop_guide_ratchets_only_in_profit_direction_and_resets_on_flip() {
+        let center = [100.0, 101.0, 99.0, 103.0, 102.0, 100.0, 98.0, 99.0];
+        let regime = [1, 1, 1, 1, -1, -1, -1, -1];
+        let atr = [1.0; 8];
+        let g = stop_guide(&center, &regime, &atr, 2.0);
+        // Long: max(prev, c − 2): 98, 99, max(99, 97)=99, 101.
+        assert_eq!(&g[..4], &[98.0, 99.0, 99.0, 101.0]);
+        // Flip to short resets to c + 2 = 104, then min(prev, c + 2): 102, 100, min(100, 101)=100.
+        assert_eq!(&g[4..], &[104.0, 102.0, 100.0, 100.0]);
+        // A wider multiple sits further from the baseline on the same side.
+        let wide = stop_guide(&center, &regime, &atr, 3.0);
+        assert!(wide[..4].iter().zip(&g[..4]).all(|(w, n)| w < n));
+        assert!(wide[4..].iter().zip(&g[4..]).all(|(w, n)| w > n));
     }
 
     #[test]

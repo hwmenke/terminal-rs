@@ -22,6 +22,15 @@ const VISIBLE_ROWS: usize = 10;
 /// line's own hint), extra search words, and the action whose shortcut is shown.
 const COMMANDS: &[(&str, &str, &str, Option<Action>)] = &[
     (
+        "STOPS",
+        "ATR Stop Cloud and empirical Stop Odds",
+        "scloud trailing atr probability",
+        Some(Action::ToggleStopCloud),
+    ),
+    ("STOPS K 1 2 3", "Set ascending ATR guide multiples", "stops multiples", None),
+    ("STOPS H AUTO", "Per-interval Stop Odds horizons", "stops horizon", None),
+    ("STOPS OFF", "Hide Stop Cloud", "stops disable", None),
+    (
         "AUCTION",
         "Auction Map: session profiles, composite and naked levels",
         "amap volume value area poc",

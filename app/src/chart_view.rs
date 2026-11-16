@@ -28,6 +28,7 @@ use tr_data::anchored_vwap::AvwapKey;
 
 mod auction;
 mod cockpit;
+mod stop_cloud;
 mod trend_cone;
 mod vault_footer;
 pub use cockpit::{LinkBus, LinkPublish, resolve_hover};
@@ -297,6 +298,7 @@ pub struct ChartState {
     pub show_rail: bool,
     pub show_edge: bool,
     cone: trend_cone::ConeState,
+    stops: stop_cloud::StopState,
     auction: auction::AuctionState,
     edge: Option<Result<Arc<tr_data::edge::EdgeReport>, String>>,
     edge_work: Option<Request>,
@@ -443,6 +445,7 @@ impl ChartState {
             show_rail: true,
             show_edge: false,
             cone: Default::default(),
+            stops: Default::default(),
             auction: Default::default(),
             edge: None,
             edge_paint: Default::default(),
@@ -595,6 +598,7 @@ impl ChartState {
         self.edge_pending = None;
         self.edge_work = None;
         self.cone.invalidate();
+        self.stops.invalidate();
         self.auction.invalidate();
         self.edge = None;
         self.zband_paint = Default::default();
@@ -1955,6 +1959,9 @@ impl ChartState {
         if let Some(wait) = self.request_auction(w) {
             ui.ctx().request_repaint_after(wait);
         }
+        if let Some(wait) = self.request_stops(w) {
+            ui.ctx().request_repaint_after(wait);
+        }
         if let Some(wait) = self.request_cone(w) {
             ui.ctx().request_repaint_after(wait);
         }
@@ -2366,6 +2373,7 @@ impl ChartState {
             self.prepare_stack_paint(price_rect, stack_rect, &v, &scale);
             self.paint_stack_cloud(ui, price_rect, &v, &scale, &reveal);
         }
+        self.paint_stop_cloud(ui, price_rect, &v, &scale);
         let frame_no = ui.ctx().cumulative_frame_nr();
         let frame = Frame { pane: self.id * 8, frame_no, cmds: out.cmds };
         ui.painter().add(tr_chart::egui_wgpu::Callback::new_paint_callback(price_rect, ChartCallback(Arc::new(frame))));
@@ -2528,6 +2536,7 @@ impl ChartState {
         self.paint_drawings(ui, price_rect, &v, &scale, hover, click);
         self.paint_avwap(ui, price_rect, &v, &scale, hover);
         self.paint_cone(ui, price_rect, &v, &scale);
+        self.paint_stop_odds(ui, price_rect);
 
         // ---- congress markers ----
         self.hover_marker = None;
@@ -2751,6 +2760,10 @@ impl ChartState {
         }
         ui.checkbox(&mut self.show_volume_ctx, "Volume context")
             .on_hover_text("This bar versus the prior 20, plus 5/20");
+        let mut stops_on = self.stop_settings().is_some();
+        if ui.checkbox(&mut stops_on, "Stop Cloud").changed() {
+            self.set_stop_cloud(crate::command::StopCmd::Toggle(Some(stops_on)), w);
+        }
         let mut stack_on = self.show_stack;
         if ui.checkbox(&mut stack_on, "Trend Stack").changed() {
             self.set_trend_stack(Some(stack_on), w);
@@ -6606,6 +6619,300 @@ mod tests {
         let text = paint(&mut current);
         assert!(!text.contains("STALE"), "{text}");
         assert!(!text.contains("SESSION CLOSED"), "{text}");
+    }
+
+    fn stop_requests(rx: &mut tokio::sync::mpsc::UnboundedReceiver<Request>) -> Vec<tr_data::stop_cloud::StopKey> {
+        std::iter::from_fn(|| rx.try_recv().ok())
+            .filter_map(|r| if let Request::StopCloud { key, .. } = r { Some(key) } else { None })
+            .collect()
+    }
+    fn stop_result(
+        c: &ChartState,
+        key: &tr_data::stop_cloud::StopKey,
+    ) -> Result<Arc<tr_data::stop_cloud::StopReport>, String> {
+        tr_data::stop_cloud::report(
+            &c.bars,
+            c.tf,
+            c.sec.class,
+            if c.archive { Some(chrono::Utc::now().timestamp()) } else { c.last_refresh },
+            key.params.clone(),
+            key.trend,
+        )
+        .map(Arc::new)
+    }
+    #[test]
+    fn stops_unchanged_and_forming_only_ticks_send_no_request() {
+        let (w, mut rx) = Worker::test_channel();
+        let mut c = stack_chart(&w, Provenance::Real);
+        c.set_stop_cloud(crate::command::StopCmd::Toggle(Some(true)), &w);
+        let key = stop_requests(&mut rx).pop().unwrap();
+        c.on_stop_cloud(key.clone(), stop_result(&c, &key));
+        assert_eq!(c.request_stops(&w), None);
+        assert!(stop_requests(&mut rx).is_empty());
+        Arc::make_mut(&mut c.bars).last_mut().unwrap().close *= 2.0;
+        assert_eq!(c.request_stops(&w), None);
+        assert!(stop_requests(&mut rx).is_empty());
+        Arc::make_mut(&mut c.bars)[10].high += 1.0;
+        assert!(c.request_stops(&w).is_some());
+        assert!(c.stops.result.is_none());
+        c.stops.sent.as_mut().unwrap().1 = Instant::now() - Duration::from_secs(1);
+        assert_eq!(c.request_stops(&w), None);
+        assert_eq!(stop_requests(&mut rx).len(), 1);
+    }
+    #[test]
+    fn stops_reverting_a_throttled_edit_reissues_an_invalidated_answer() {
+        let (w, mut rx) = Worker::test_channel();
+        let mut c = stack_chart(&w, Provenance::Real);
+        c.set_stop_cloud(crate::command::StopCmd::Toggle(Some(true)), &w);
+        let key = stop_requests(&mut rx).pop().unwrap();
+        c.on_stop_cloud(key.clone(), stop_result(&c, &key));
+        c.set_stop_cloud(crate::command::StopCmd::Multiples(vec![1.5, 2.5]), &w);
+        assert!(c.stops.result.is_none());
+        c.set_stop_cloud(crate::command::StopCmd::Multiples(vec![1.0, 2.0, 3.0]), &w);
+        assert!(stop_requests(&mut rx).is_empty());
+        assert!(c.request_stops(&w).is_some());
+        c.stops.sent.as_mut().unwrap().1 = Instant::now() - Duration::from_secs(1);
+        assert_eq!(c.request_stops(&w), None);
+        assert_eq!(stop_requests(&mut rx), vec![key.clone()]);
+        c.on_stop_cloud(key.clone(), stop_result(&c, &key));
+        assert!(c.stops.result.as_ref().is_some_and(Result::is_ok));
+        assert_eq!(c.request_stops(&w), None);
+        assert!(stop_requests(&mut rx).is_empty());
+    }
+    #[test]
+    fn stops_response_for_an_old_key_is_dropped() {
+        let (w, mut rx) = Worker::test_channel();
+        let mut c = stack_chart(&w, Provenance::Real);
+        c.set_stop_cloud(crate::command::StopCmd::Toggle(Some(true)), &w);
+        let key = stop_requests(&mut rx).pop().unwrap();
+        let report = stop_result(&c, &key);
+        c.set_stop_cloud(crate::command::StopCmd::Multiples(vec![1.5, 2.5]), &w);
+        c.on_stop_cloud(key.clone(), report.clone());
+        assert!(c.stops.result.is_none());
+        c.set_symbol("ETHUSD Curncy", &w);
+        c.on_stop_cloud(key, report);
+        assert!(c.stops.result.is_none());
+    }
+    #[test]
+    fn stops_retains_previous_only_across_same_history_extensions_and_rearms_after_off() {
+        let (w, mut rx) = Worker::test_channel();
+        let mut c = stack_chart(&w, Provenance::Real);
+        c.set_stop_cloud(crate::command::StopCmd::Toggle(Some(true)), &w);
+        let key = stop_requests(&mut rx).pop().unwrap();
+        c.on_stop_cloud(key.clone(), stop_result(&c, &key));
+        let before = c.stops.result.as_ref().unwrap().as_ref().unwrap().clone();
+        let bars = Arc::make_mut(&mut c.bars);
+        let mut next = *bars.last().unwrap();
+        next.ts += 300;
+        bars.push(next);
+        c.last_refresh = Some(next.ts);
+        assert!(c.request_stops(&w).is_some());
+        assert!(Arc::ptr_eq(c.stops.result.as_ref().unwrap().as_ref().unwrap(), &before));
+        c.set_stop_cloud(crate::command::StopCmd::Toggle(Some(false)), &w);
+        c.set_stop_cloud(crate::command::StopCmd::Toggle(Some(true)), &w);
+        assert_eq!(stop_requests(&mut rx).len(), 1);
+        c.set_timeframe(Timeframe::H1, &w);
+        assert!(c.stops.result.is_none());
+    }
+    #[test]
+    fn stops_refusal_paints_no_digits_lines_or_mesh() {
+        fn forbidden(s: &egui::Shape) -> bool {
+            match s {
+                egui::Shape::Text(t) => t.galley.job.text.chars().any(|c| c.is_ascii_digit()),
+                egui::Shape::Mesh(_) | egui::Shape::LineSegment { .. } | egui::Shape::Path(_) => true,
+                egui::Shape::Vec(v) => v.iter().any(forbidden),
+                _ => false,
+            }
+        }
+        let ctx = egui::Context::default();
+        let (w, mut rx) = Worker::test_channel();
+        for provenance in [Provenance::Sample, Provenance::Missing, Provenance::Cached] {
+            let mut c = stack_chart(&w, Provenance::Real);
+            Arc::make_mut(&mut c.bars)[159].provenance = provenance;
+            c.set_stop_cloud(crate::command::StopCmd::Toggle(Some(true)), &w);
+            let key = stop_requests(&mut rx).pop().unwrap();
+            c.on_stop_cloud(key.clone(), stop_result(&c, &key));
+            let mut out = ctx.run_ui(egui::RawInput::default(), |ui| {
+                let rect = Rect::from_min_size(Pos2::ZERO, vec2(900.0, 600.0));
+                c.paint_stop_cloud(
+                    ui,
+                    rect,
+                    &Viewport::fit_last(160, 160, 900.0),
+                    &PriceScale::new(90.0, 240.0, false, 600.0),
+                );
+                c.paint_stop_odds(ui, rect);
+            });
+            out.textures_delta.clear();
+            assert!(stack_has_text(&out.shapes, "refused"));
+            assert!(!out.shapes.iter().any(|s| forbidden(&s.shape)));
+            assert!(c.stops.paint.shapes.is_empty());
+        }
+    }
+    #[test]
+    fn stops_paints_cloud_mesh_stepped_edges_and_odds_and_caches_geometry() {
+        let ctx = egui::Context::default();
+        let (w, mut rx) = Worker::test_channel();
+        let mut c = stack_chart(&w, Provenance::Real);
+        c.show_stack = false;
+        c.set_stop_cloud(crate::command::StopCmd::Toggle(Some(true)), &w);
+        let key = stop_requests(&mut rx).pop().unwrap();
+        c.on_stop_cloud(key.clone(), stop_result(&c, &key));
+        let out = chart_frame(&ctx, &mut c, &w, vec![]);
+        assert!(stack_has_text(&out.shapes, "STOP ODDS"));
+        assert!(stack_has_text(&out.shapes, "CLOSED THRU"));
+        let mesh = c
+            .stops
+            .paint
+            .shapes
+            .iter()
+            .find_map(|s| if let egui::Shape::Mesh(m) = s { Some(m.clone()) } else { None })
+            .unwrap();
+        assert!(mesh.vertices.iter().any(|v| v.color != mesh.vertices[0].color));
+        assert!(c.stops.paint.shapes.iter().any(|s| if let egui::Shape::Path(p) = s {
+            p.points.windows(2).any(|w| w[0].x == w[1].x && w[0].y != w[1].y)
+                && p.points.windows(2).any(|w| w[0].y == w[1].y)
+        } else {
+            false
+        }));
+        chart_frame(&ctx, &mut c, &w, vec![]);
+        let cached = c
+            .stops
+            .paint
+            .shapes
+            .iter()
+            .find_map(|s| if let egui::Shape::Mesh(m) = s { Some(m) } else { None })
+            .unwrap();
+        assert!(Arc::ptr_eq(&mesh, cached));
+        assert!(stop_requests(&mut rx).is_empty());
+        c.set_stop_cloud(crate::command::StopCmd::Odds(false), &w);
+        let out = chart_frame(&ctx, &mut c, &w, vec![]);
+        assert!(!stack_has_text(&out.shapes, "STOP ODDS"));
+        assert!(!c.stops.paint.shapes.is_empty());
+    }
+    #[test]
+    fn stops_forming_bar_edge_is_dashed_at_last_closed_level() {
+        let ctx = egui::Context::default();
+        let (w, mut rx) = Worker::test_channel();
+        let mut c = stack_chart(&w, Provenance::Real);
+        c.set_stop_cloud(crate::command::StopCmd::Toggle(Some(true)), &w);
+        let key = stop_requests(&mut rx).pop().unwrap();
+        c.on_stop_cloud(key.clone(), stop_result(&c, &key));
+        let rect = Rect::from_min_size(Pos2::ZERO, vec2(900.0, 600.0));
+        let v = Viewport::fit_last(160, 60, 900.0);
+        let scale = PriceScale::new(90.0, 240.0, false, 600.0);
+        let mut out = ctx.run_ui(egui::RawInput::default(), |ui| c.paint_stop_cloud(ui, rect, &v, &scale));
+        out.textures_delta.clear();
+        let r = c.stops.result.as_ref().unwrap().as_ref().unwrap();
+        let dashes: Vec<_> = c
+            .stops
+            .paint
+            .shapes
+            .iter()
+            .filter_map(|s| if let egui::Shape::LineSegment { points, .. } = s { Some(points) } else { None })
+            .collect();
+        assert!(dashes.len() >= 3);
+        for d in dashes {
+            assert!(d[0].x >= v.x_of(r.closed as f64) as f32 - 0.001);
+            assert!((d[1].x - d[0].x) <= 4.001);
+            assert_eq!(d[0].y, d[1].y);
+            assert!(r.levels.iter().any(|p| (scale.y_of(*p) as f32 - d[0].y).abs() < 0.001));
+        }
+    }
+    #[test]
+    fn stops_low_n_cells_paint_em_dash() {
+        let ctx = egui::Context::default();
+        let (w, mut rx) = Worker::test_channel();
+        let mut c = stack_chart(&w, Provenance::Real);
+        c.set_stop_cloud(crate::command::StopCmd::Toggle(Some(true)), &w);
+        let key = stop_requests(&mut rx).pop().unwrap();
+        c.on_stop_cloud(key.clone(), stop_result(&c, &key));
+        let out = chart_frame(&ctx, &mut c, &w, vec![]);
+        assert!(stack_has_text(&out.shapes, "— n="));
+        assert!(c.stops.result.as_ref().unwrap().as_ref().unwrap().horizons[0].n < 20);
+    }
+    #[test]
+    fn stops_numeric_odds_have_intervals_counts_and_microbars_on_verified_history() {
+        let ctx = egui::Context::default();
+        let (w, mut rx) = Worker::test_channel();
+        let mut c = stack_chart(&w, Provenance::Real);
+        let last = c.bars.last().unwrap().ts;
+        let bars = Arc::new(
+            (0..8000)
+                .map(|i| {
+                    let phase = i % 200;
+                    let leg = if phase < 100 { phase } else { 200 - phase };
+                    let p = 100.0 + leg as f64 + if i % 2 == 0 { 0.9 } else { -0.9 };
+                    Bar::new(last - (7999 - i) * 300, p, p + 0.4, p - 0.4, p, 1000.0).with_provenance(Provenance::Real)
+                })
+                .collect::<Vec<_>>(),
+        );
+        c.on_history(c.generation, bars.clone(), SeriesGpu::build(&bars), 0, false, true, false, &w);
+        c.show_stack = false;
+        c.set_stop_cloud(crate::command::StopCmd::Toggle(Some(true)), &w);
+        let key = stop_requests(&mut rx).pop().unwrap();
+        c.on_stop_cloud(key.clone(), stop_result(&c, &key));
+        let r = c.stops.result.as_ref().unwrap().as_ref().unwrap();
+        for h in &r.horizons {
+            assert!(
+                h.n >= 20 && h.episodes >= 5,
+                "regime={} closed={} h={} n={} episodes={}",
+                r.regime,
+                r.closed,
+                h.h,
+                h.n,
+                h.episodes
+            );
+            for k in 0..3 {
+                if let tr_data::stop_cloud::Touch::Ok { hits, n, p, lo, hi } = h.touches[k] {
+                    assert_eq!(hits, h.outcomes.iter().filter(|o| o.mae >= r.distances[k]).count());
+                    assert_eq!(p, hits as f64 / n as f64);
+                    assert!(lo <= p && hi >= p);
+                } else {
+                    panic!("expected numeric Stop Odds");
+                }
+            }
+        }
+        let out = chart_frame(&ctx, &mut c, &w, vec![]);
+        assert!(stack_has_text(&out.shapes, "% ["));
+        assert!(stack_has_text(&out.shapes, "episodes"));
+        assert!(!c.stops.paint.compact);
+    }
+    #[test]
+    fn stops_panel_avoids_cone_card_and_edge_card() {
+        let ctx = egui::Context::default();
+        let (w, mut rx) = Worker::test_channel();
+        let mut c = stack_chart(&w, Provenance::Real);
+        c.set_stop_cloud(crate::command::StopCmd::Toggle(Some(true)), &w);
+        let key = stop_requests(&mut rx).pop().unwrap();
+        c.on_stop_cloud(key.clone(), stop_result(&c, &key));
+        c.cone.enabled = true;
+        c.show_edge = true;
+        let rect = Rect::from_min_size(Pos2::ZERO, vec2(1100.0, 800.0));
+        let cone_card = Rect::from_min_size(pos2(8.0, 56.0), vec2(300.0, 120.0));
+        let fan = Rect::from_min_max(pos2(600.0, 350.0), pos2(1090.0, 780.0));
+        c.cone.paint.card_rect = Some(cone_card);
+        c.cone.paint.fan_bounds = Some(fan);
+        let mut out = ctx.run_ui(egui::RawInput::default(), |ui| {
+            c.paint_stop_cloud(
+                ui,
+                rect,
+                &Viewport::fit_last(160, 160, 1100.0),
+                &PriceScale::new(90.0, 240.0, false, 800.0),
+            );
+            c.paint_stop_odds(ui, rect);
+        });
+        out.textures_delta.clear();
+        let card = c.stops.paint.card_rect.unwrap();
+        let edge = Rect::from_min_size(pos2(rect.right() - 452.0, rect.top() + 28.0), vec2(440.0, 300.0));
+        assert!(!c.stops.paint.compact);
+        assert!(!card.intersects(cone_card));
+        assert!(!card.intersects(fan));
+        assert!(!card.intersects(edge));
+        let small = Rect::from_min_size(Pos2::ZERO, vec2(400.0, 180.0));
+        let mut out = ctx.run_ui(egui::RawInput::default(), |ui| c.paint_stop_odds(ui, small));
+        out.textures_delta.clear();
+        assert!(c.stops.paint.compact);
+        assert!(stack_has_text(&out.shapes, "STOPS ≤12b"));
     }
 
     fn cone_requests(rx: &mut tokio::sync::mpsc::UnboundedReceiver<Request>) -> Vec<tr_data::trend_cone::ConeKey> {

@@ -87,12 +87,18 @@ pub struct EdgeReport {
     pub completed: Vec<CompletedOutcome>,
     pub current_regime: Option<i8>,
 }
-fn wilson(p: f64, n: f64) -> (f64, f64) {
+/// Wilson 95% score interval for a proportion and a positive trial count.
+/// Fractional effective counts are supported for existing Edge statistics.
+pub fn wilson(p: f64, n: f64) -> (f64, f64) {
     let z2 = 1.96_f64.powi(2);
     let denominator = 1.0 + z2 / n;
     let center = (p + z2 / (2.0 * n)) / denominator;
     let half = 1.96 * (p * (1.0 - p) / n + z2 / (4.0 * n * n)).sqrt() / denominator;
     ((center - half).max(0.0), (center + half).min(1.0))
+}
+/// Wilson interval for integer trials. Empty or invalid counts have no estimate.
+pub fn wilson95(hits: usize, n: usize) -> Option<(f64, f64)> {
+    (n > 0 && hits <= n).then(|| wilson(hits as f64 / n as f64, n as f64))
 }
 fn cell(regime: i8, horizon: usize, values: &[f64], span: Option<(i64, i64)>, baseline: Option<&EdgeCell>) -> EdgeCell {
     let d = describe(values, horizon);

@@ -284,6 +284,37 @@ fn parse_vault(rest: &[&str]) -> Option<VaultCmd> {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+pub enum StopCmd {
+    Toggle(Option<bool>),
+    Multiples(Vec<f64>),
+    Horizons(Option<(usize, usize)>),
+    Odds(bool),
+}
+fn parse_stops(rest: &[&str]) -> Option<StopCmd> {
+    let words: Vec<_> = rest.iter().map(|w| w.to_ascii_uppercase()).collect();
+    let r: Vec<_> = words.iter().map(String::as_str).collect();
+    let cmd = match r.as_slice() {
+        [] => StopCmd::Toggle(None),
+        ["ON"] => StopCmd::Toggle(Some(true)),
+        ["OFF"] => StopCmd::Toggle(Some(false)),
+        ["ODDS", "ON"] => StopCmd::Odds(true),
+        ["ODDS", "OFF"] => StopCmd::Odds(false),
+        ["H", "AUTO"] => StopCmd::Horizons(None),
+        ["H", a, b] => StopCmd::Horizons(Some((a.parse().ok()?, b.parse().ok()?))),
+        ["K", ks @ ..] => StopCmd::Multiples(ks.iter().map(|k| k.parse::<f64>()).collect::<Result<Vec<_>, _>>().ok()?),
+        _ => return None,
+    };
+    let mut p = tr_data::stop_cloud::Params::default();
+    match &cmd {
+        StopCmd::Multiples(ks) => p.ks = ks.clone(),
+        StopCmd::Horizons(h) => p.horizons = *h,
+        _ => {}
+    }
+    p.validate().ok()?;
+    Some(cmd)
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub enum Function {
     Vault(VaultCmd),
     Timeframe(Timeframe),
@@ -295,6 +326,7 @@ pub enum Function {
     TruthRail(Option<bool>),
     StackEdge(Option<bool>),
     AuctionMap(AuctionCmd),
+    StopCloud(StopCmd),
     TrendCone {
         on: Option<bool>,
         spec: Option<(usize, usize)>,
@@ -782,6 +814,7 @@ fn parse_function(head: &str, rest: &[&str]) -> Option<Function> {
         "IDESK" | "IDASH" => Function::IntradayDesk,
         "VAULT" | "VLT" => Function::Vault(parse_vault(rest)?),
         "COCKPIT" | "CKPT" => Function::Cockpit { spec: joined() },
+        "STOPS" | "SCLOUD" => Function::StopCloud(parse_stops(rest)?),
         "AUCTION" | "AMAP" => Function::AuctionMap(parse_auction(rest)?),
         "CONE" | "TRENDCONE" => parse_cone(rest)?,
         "AVWAP" => Function::AnchoredVwap(match words().as_slice() {
@@ -814,6 +847,7 @@ fn parse_function(head: &str, rest: &[&str]) -> Option<Function> {
                 };
                 Function::TstackTune(tf)
             }
+            [arg, tail @ ..] if arg.eq_ignore_ascii_case("STOPS") => Function::StopCloud(parse_stops(tail)?),
             [arg, tail @ ..] if arg.eq_ignore_ascii_case("CONE") => parse_cone(tail)?,
             [arg, tail @ ..] if arg.eq_ignore_ascii_case("EDGE") => Function::StackEdge(parse_switch(tail)?),
             [arg, tail @ ..] if arg.eq_ignore_ascii_case("TINT") => Function::StackTint(parse_switch(tail)?),
@@ -982,7 +1016,7 @@ pub fn parse(input: &str) -> Option<Command> {
             return Some(Command::Function(f));
         }
         // Invalid stack arguments must not become a ticker followed by an interval.
-        if ["TSTACK", "STACK", "MTF", "REGIME", "RAIL", "AVWAP", "AUCTION", "AMAP"]
+        if ["TSTACK", "STACK", "MTF", "REGIME", "RAIL", "AVWAP", "AUCTION", "AMAP", "STOPS", "SCLOUD"]
             .iter()
             .any(|word| head.eq_ignore_ascii_case(word))
         {
@@ -1043,6 +1077,7 @@ fn describe(f: &Function) -> String {
         Function::StackLadder(frames) => format!("Trend Stack ladder {}", frames.as_ref().map(|f| f.iter().map(|t| t.label()).collect::<Vec<_>>().join("·")).unwrap_or_else(|| "AUTO".into())),
         Function::StackTint(_) => "Regime Candle tint".into(),
         Function::StackSession(_) => "Trend Stack session anchor".into(),
+        Function::StopCloud(_) => "ATR Stop Cloud · closed-bar guides and empirical Stop Odds".into(),
         Function::AuctionMap(_) => "Auction Map · session profiles, composite, naked POC/VAH/VAL · ticker: AUCTION US Equity".into(),
         Function::TrendCone { .. } => "Trend Cone · regime path quantiles + walk-forward coverage".into(),
         Function::StackEdge(_) => "Trend Stack regime Edge study".into(),
@@ -1339,6 +1374,69 @@ fn describe(f: &Function) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn stops_commands_aliases_and_subcommands_parse() {
+        use StopCmd::*;
+        for (text, cmd) in [
+            ("STOPS", Toggle(None)),
+            ("SCLOUD", Toggle(None)),
+            ("TSTACK STOPS", Toggle(None)),
+            ("STOPS ON", Toggle(Some(true))),
+            ("STOPS OFF", Toggle(Some(false))),
+            ("STOPS K 1 2 3", Multiples(vec![1.0, 2.0, 3.0])),
+            ("STOPS K 0.25 6", Multiples(vec![0.25, 6.0])),
+            ("STOPS H 12 48", Horizons(Some((12, 48)))),
+            ("STOPS H AUTO", Horizons(None)),
+            ("STOPS ODDS ON", Odds(true)),
+            ("STOPS ODDS OFF", Odds(false)),
+        ] {
+            assert_eq!(parse(text), Some(Command::Function(Function::StopCloud(cmd))), "{text}");
+        }
+        assert_eq!(
+            parse("AAPL STOPS"),
+            Some(Command::SymbolFunction("AAPL US Equity".into(), Function::StopCloud(Toggle(None))))
+        );
+    }
+    #[test]
+    fn stops_rejects_bad_arguments() {
+        for text in [
+            "STOPS FOO",
+            "SCLOUD FOO",
+            "TSTACK STOPS FOO",
+            "STOPS K 0",
+            "STOPS K 3 2",
+            "STOPS K",
+            "STOPS K NaN",
+            "STOPS K 1 1",
+            "STOPS K 7",
+            "STOPS H 48 12",
+            "STOPS H 0 5",
+            "STOPS H 1 251",
+            "STOPS H 12",
+            "STOPS ODDS MAYBE",
+        ] {
+            assert_eq!(parse(text), None, "{text}");
+        }
+    }
+    #[test]
+    fn stops_words_with_a_yellow_key_load_the_ticker() {
+        for word in ["STOPS", "SCLOUD"] {
+            assert!(tr_core::catalog::lookup(word, None).is_none());
+        }
+        for text in [
+            "STOPS US Equity",
+            "STOPS Equity",
+            "SCLOUD Equity",
+            "SCLOUD US Equity",
+            "stops us equity <GO>",
+            "ZZZS US Equity",
+        ] {
+            assert!(matches!(parse(text), Some(Command::Symbol(_))), "{text}");
+        }
+        assert!(
+            matches!(parse("STOPS US Equity 1h"),Some(Command::SymbolFunction(s,Function::Timeframe(Timeframe::H1))) if s=="STOPS US Equity")
+        );
+    }
     #[test]
     fn relationship_studio_commands() {
         for alias in ["CORR", "RBETA"] {

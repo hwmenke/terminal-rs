@@ -51,7 +51,8 @@ pub(super) struct ConePaint {
     labels: Vec<ConeLabel>,
     card: egui::text::LayoutJob,
     tooltip: String,
-    fan_bounds: Option<Rect>,
+    pub(super) fan_bounds: Option<Rect>,
+    pub(super) card_rect: Option<Rect>,
     badge: egui::text::LayoutJob,
 }
 struct ConeLabel {
@@ -460,6 +461,7 @@ impl ChartState {
         self.cone.paint = paint;
     }
     pub(super) fn paint_cone(&mut self, ui: &mut Ui, rect: Rect, v: &Viewport, scale: &PriceScale) {
+        self.cone.paint.card_rect = None;
         if !self.cone.enabled {
             return;
         }
@@ -467,22 +469,20 @@ impl ChartState {
         match &self.cone.result {
             Some(Err(e)) => {
                 let galley = p.layout(e.clone(), mono(12.0), theme::down(), (rect.width() - 24.0).max(1.0));
-                p.rect_filled(
-                    Rect::from_min_size(rect.min + vec2(8.0, 44.0), galley.size() + vec2(12.0, 10.0)),
-                    4.0,
-                    theme::card(),
-                );
+                let card = Rect::from_min_size(rect.min + vec2(8.0, 44.0), galley.size() + vec2(12.0, 10.0));
+                self.cone.paint.card_rect = Some(card);
+                p.rect_filled(card, 4.0, theme::card());
                 p.galley(rect.min + vec2(14.0, 49.0), galley, theme::down());
                 return;
             }
             None => {
-                p.text(
+                self.cone.paint.card_rect = Some(p.text(
                     rect.min + vec2(12.0, 48.0),
                     Align2::LEFT_TOP,
                     "TREND CONE · computing verified closed paths…",
                     mono(11.0),
                     theme::muted(),
-                );
+                ));
                 return;
             }
             _ => {}
@@ -518,6 +518,7 @@ impl ChartState {
                 p.rect_stroke(card, 5.0, Stroke::new(1.0, theme::border()), StrokeKind::Inside);
                 p.galley(card.min + vec2(8.0, 6.0), if compact { badge } else { galley }, theme::text());
                 ui.interact(card, ui.id().with((self.id, "cone-math")), Sense::hover()).on_hover_text(&paint.tooltip);
+                self.cone.paint.card_rect = Some(card);
             }
         }
     }
