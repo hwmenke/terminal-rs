@@ -117,3 +117,70 @@ continuous live subscription. Reload takes another verified snapshot. A month
 profile needs several complete years to meet the display threshold. Intraday
 history depth depends on provider and vault coverage. Futures, FX, crypto,
 non-US sessions and extended hours are intentionally unsupported.
+
+## Opening-range conditional lens (native 30m)
+
+Open `AAPL SEASON 30m`, then select **OR Lens**. This local tab reuses the
+SEASON snapshot and worker lifecycle. Tab, horizon and cell selection are ephemeral;
+existing saved ticker/timeframe layouts and preferences load unchanged.
+
+The exact 09:30–10:00 New York bar defines ORH and ORL. At each completed
+origin close, `Above` means C > ORH, `Below` means C < ORL, and `Inside` includes
+equality. Conditions first exist at 10:00. A missing opening print leaves the
+session unclassified. Columns are **origin close times**, 10:00 through 16:00,
+not bar opening times. The 10:00 close is necessarily Inside; its empty complement
+is honest. The last columns also have unavailable outcomes at longer horizons.
+
+Horizon chips select completed **30/60/120 minute** close-to-close outcomes,
+`R = 10,000 × (C[t+h]/C[t] − 1)` in basis points. Every intervening expected
+bucket must exist and be closed under the source observation clock. Endpoints
+stay in the same session; half days never borrow afternoon or overnight bars.
+**TODAY is excluded** from this historical lens, even after the cash close.
+Vault UNVERIFIED JOIN gaps break both forward windows and any OR-to-origin
+condition crossing the join. Missing data is never filled or shortened.
+
+Click a heatmap cell to compare its state against **all other states at that
+same origin clock and horizon**. Both normalized histograms use the same twenty
+bin edges, and each nonempty group's mass sums to one. Raw n and descriptive
+means remain visible for sparse groups. The all-state mean is context containing
+the selected observations, not an independent comparator. No strategy P&L or
+recommendation is calculated.
+
+The heatmap shows the mean contrast Δ in bp with the printed shared key.
+Signed numbers use sign roles; state/distribution colours identify categories.
+An outline marks asymptotic BY q ≤ 0.10, without a significance hue. A corner
+tick marks **LOW N** (fewer than 30 observations in either group). Hover cards
+explain formulas, substitutions, both counts, expected session span, bandwidth,
+source, dates, observation time, CLOSED THRU and unavailable reasons.
+
+Inference uses the explicit expected exchange-session grid between the first
+and last admitted historical sessions. Missing sessions have zero score and
+preserve lag distance. For group g and its complement, the score is
+`u[s] = I[g](R−mean[g])/n[g] − I[¬g](R−mean[¬g])/n[¬g]`.
+Bartlett HAC variance is `Σu² + 2Σ(l=1…L)(1−l/(L+1))Σu[s]u[s−l]`, with
+`L=min(5,T−1)` for T expected sessions. There is no iid/sample-variance
+substitution or small-sample correction. A mean helper uses `I(R−mean)/n`
+on the same grid for later slices.
+
+With **at least 30 observations in each group**, the whisker is the approximate
+pointwise **Δ ± 1.96 SE** interval and the two-sided p-value uses a standard
+normal approximation. Zero/numerically degenerate variance produces unavailable
+inference, never an infinite test statistic or a manufactured p=0. The complete
+fixed **3 states × 13 clocks × 3 horizons = 117** family enters BH followed by
+the Benjamini–Yekutieli harmonic multiplier: `q=min(1,H₁₁₇×q_BH)`.
+Unavailable cells enter at p=1. Changing horizon or selected cell cannot change
+q-values or the family. Intervals are pointwise, not simultaneous.
+
+These are **asymptotic**, bandwidth-sensitive methods. BY adjusts dependence
+between tests only when their marginal p-values are valid. Repeated exploration
+across symbols, dates and settings is outside the displayed family. Provider and
+vault depth may leave most comparisons unavailable; thresholds are never relaxed.
+Corporate-action continuity remains limited by existing source/vault evidence.
+The original Calendar views retain their existing descriptive methods; the
+multiple-comparison limitation described above still applies to those older views.
+
+Acceptance tests cover hand-calculated states/returns/contrasts, direct HAC and
+BY references, missing-session lag spacing, causal classification, missing opening
+and intervening prints, early closes, gaps, pending endpoints, full-input admission,
+shared histogram mass, selection invariance, generation/provenance refusals and
+finite geometry at 320/1440 px. All generated inputs are test/dev fixtures only.

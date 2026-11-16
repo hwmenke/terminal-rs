@@ -136,6 +136,37 @@ pub fn all(scale: Scale) -> Vec<Case> {
     )
     .unwrap())
     .tested);
+    let or = fixtures::or_lens(if full { 120 } else { 93 });
+    let observed = or.last().unwrap().ts + 1800;
+    let now = observed + 86400;
+    add!("studio.or_lens_120d_30m", move || {
+        let r = bb(tr_data::studio_season::opening_range_lens(
+            "AAPL US Equity",
+            Timeframe::M30,
+            bb(&or),
+            "benchmark fixture only",
+            observed,
+            now,
+            &[],
+        )
+        .unwrap());
+        assert_eq!(r.cells.len(), 117);
+        assert_eq!(r.opening_sessions, if full { 120 } else { 93 });
+        let c = r.cell(0, 1, 0);
+        assert!(c.selected.len() >= 30 && c.complement.len() >= 60);
+        assert!(c.inference.p.is_some() && c.inference.interval.is_some());
+        assert!(r.cell(1, 1, 1).inference.p.is_some());
+        assert!(r.cell(2, 1, 2).inference.p.is_some());
+        assert!(r.cell(0, 12, 0).all_mean.is_none());
+        r.cells.iter().map(|c| c.selected.len()).sum()
+    });
+    let by_ps = (0..117).map(|i| if i % 4 == 0 { 1. } else { (i as f64 + 1.) / 1170. }).collect::<Vec<_>>();
+    add!("nulls.by_117", move || {
+        let q = bb(nulls::benjamini_yekutieli(bb(&by_ps)));
+        assert_eq!(q.len(), 117);
+        assert!(q.iter().all(|q| q.is_finite() && (0. ..=1.).contains(q)));
+        q.len()
+    });
     let b = d.clone();
     let now = b.last().unwrap().ts + 86400;
     add!("stack.tune_7x7_5k", move || {

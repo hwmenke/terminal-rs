@@ -14,6 +14,13 @@ pub fn benjamini_hochberg(p: &[f64]) -> Vec<f64> {
     q
 }
 
+/// Dependency-adjusted step-up q values for the caller's entire fixed family.
+/// Unavailable tests must be supplied as p=1, rather than removed.
+pub fn benjamini_yekutieli(p: &[f64]) -> Vec<f64> {
+    let harmonic = (1..=p.len()).map(|j| 1.0 / j as f64).sum::<f64>();
+    benjamini_hochberg(p).into_iter().map(|q| (q * harmonic).min(1.0)).collect()
+}
+
 /// Exact two-sided Binomial(n, 1/2) sign test; callers drop zero returns.
 /// Log probabilities avoid underflow from starting at 2^-n on long histories.
 pub fn sign_test(positive: usize, negative: usize) -> Option<f64> {
@@ -131,6 +138,20 @@ pub(crate) fn rotation_test(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn by_hand_vector_and_fixed_unavailable_family() {
+        let q = benjamini_yekutieli(&[0.01, 0.04, 0.03, 1.0]);
+        for (q, e) in q.iter().zip([1.0 / 12.0, 1.0 / 9.0, 1.0 / 9.0, 1.0]) {
+            assert!((q - e).abs() < 1e-12, "{q} vs {e}");
+        }
+        assert!(benjamini_yekutieli(&[]).is_empty());
+        assert_eq!(benjamini_yekutieli(&[0., 1.]), [0., 1.]);
+        let mut full = vec![1.; 117];
+        full[0] = 0.001;
+        let harmonic: f64 = (1..=117).map(|j| 1. / j as f64).sum();
+        assert!((benjamini_yekutieli(&full)[0] - 0.117 * harmonic).abs() < 1e-12);
+    }
 
     #[test]
     fn bh_hand_vector_ties_original_order_and_monotonicity() {

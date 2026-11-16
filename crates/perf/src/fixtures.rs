@@ -97,3 +97,23 @@ pub fn stitch(bars: &[Bar], tf: Timeframe) -> tr_data::vault::StitchInfo {
         ..Default::default()
     }
 }
+
+/// Dev-only OR admission fixture: all three states recur on native cash buckets.
+/// Deliberately bounded moves keep the opening range distinct from later states.
+pub fn or_lens(sessions: usize) -> Vec<Bar> {
+    let mut date = "2026-01-05".parse().unwrap();
+    let mut out = Vec::new();
+    for s in 0..sessions {
+        let mut prior: f64 = 100.;
+        for (k, ts) in intraday::regular_opens(date, Timeframe::M30).into_iter().enumerate() {
+            let c =
+                if k == 0 { 100. } else { [101., 99., 100.][s % 3] + 0.06 * (s as f64 * 0.7 + k as f64 * 0.6).sin() };
+            let high = if k == 0 { 100.25 } else { prior.max(c) + 0.08 };
+            let low = if k == 0 { 99.75 } else { prior.min(c) - 0.08 };
+            out.push(Bar::new(ts, prior, high, low, c, 1000.).with_provenance(Provenance::Real));
+            prior = c;
+        }
+        date = calendar::next_session(date);
+    }
+    out
+}

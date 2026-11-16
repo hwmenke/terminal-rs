@@ -268,7 +268,11 @@ fn perf_gate_paint() {
     }
     let metric_ids =
         all.keys().filter(|id| !id.contains(".layer.")).cloned().collect::<std::collections::BTreeSet<_>>();
-    assert_eq!(metric_ids, budgets.cases.keys().cloned().collect(), "stale/missing paint budgets");
+    assert_eq!(
+        metric_ids,
+        budgets.cases.keys().filter(|id| !id.starts_with("paint.studio_or.")).cloned().collect(),
+        "stale/missing paint budgets"
+    );
     let mut failures = vec![];
     for (id, s) in &all {
         let budget = paint_budget(id, &budgets);
@@ -286,7 +290,11 @@ fn perf_gate_paint() {
     }
     let mut record = tr_perf::Baseline::new(1.);
     record.cases = all;
-    tr_perf::write_json(&tr_perf::output_dir().join("paint.json"), &record).unwrap();
+    let paint_path = tr_perf::output_dir().join("paint.json");
+    if let Ok(previous) = tr_perf::read_json::<tr_perf::Baseline>(&paint_path) {
+        record.cases.extend(previous.cases.into_iter().filter(|(id, _)| id.starts_with("paint.studio_or.")));
+    }
+    tr_perf::write_json(&paint_path, &record).unwrap();
     assert!(failures.is_empty(), "paint gate failures:\n{}", failures.join("\n"));
     if std::env::var("TR_PERF_SAVE").as_deref() == Ok("1") {
         let path = tr_perf::root().join("perf/baseline.json");

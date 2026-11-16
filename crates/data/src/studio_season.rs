@@ -1,4 +1,6 @@
 //! Verified calendar seasonality. Returns are fractions, never annualised estimates.
+mod or_lens;
+pub use or_lens::*;
 use std::collections::BTreeMap;
 
 use chrono::{DateTime, Datelike, NaiveDate, Timelike, Utc};
@@ -29,11 +31,8 @@ fn nonzero_sd(sd: f64, mean: f64) -> bool {
 
 fn bucket(label: impl Into<String>, values: &[f64]) -> Bucket {
     let stats = describe(values, 1);
-    let t_stat = stats
-        .std
-        .zip(stats.mean)
-        .filter(|&(s, m)| nonzero_sd(s, m))
-        .map(|(s, m)| m / s * (stats.count as f64).sqrt());
+    let t_stat =
+        stats.std.zip(stats.mean).filter(|&(s, m)| nonzero_sd(s, m)).map(|(s, m)| m / s * (stats.count as f64).sqrt());
     Bucket { label: label.into(), stats, t_stat }
 }
 
@@ -103,6 +102,8 @@ pub struct ForwardCompare {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct SeasonReport {
+    pub or_lens: Option<OrLens>,
+    pub or_unavailable: Option<String>,
     pub symbol: String,
     pub timeframe: Timeframe,
     pub provenance: Provenance,
@@ -387,7 +388,19 @@ pub fn compute_with_gaps(
             baseline_values: baseline,
         });
     }
+    let or_result = if tf == Timeframe::M30 {
+        Some(opening_range_lens(symbol, tf, input, source, observed, now, gaps.as_slice()))
+    } else {
+        None
+    };
+    let (or_lens, or_unavailable) = match or_result {
+        Some(Ok(r)) => (Some(r), None),
+        Some(Err(e)) => (None, Some(e)),
+        None => (None, Some("OR Lens requires native 30m US cash bars".into())),
+    };
     Ok(SeasonReport {
+        or_lens,
+        or_unavailable,
         symbol: symbol.into(),
         timeframe: tf,
         provenance,
