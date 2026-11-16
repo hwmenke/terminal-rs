@@ -490,8 +490,12 @@ pub fn evaluation(returns: Vec<ReturnPoint>, folds: Vec<FoldReport>) -> Result<E
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Comparison {
     pub moments: Moments,
+    /// PSR(0): probability the true Sharpe > 0, with no deflation.
     pub psr: Estimate<f64>,
+    /// PSR(SR*): probability the true Sharpe beats SR* (`null_maximum`), the
+    /// expected best Sharpe of N_eff zero-skill trials. Not P(true Sharpe > 0).
     pub dsr: Estimate<f64>,
+    /// SR*, per session: √V[SR_k] × a_N(N_eff).
     pub null_maximum: f64,
     pub sharpe_above_null: f64,
 }
