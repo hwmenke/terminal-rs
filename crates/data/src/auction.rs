@@ -4,6 +4,29 @@ use chrono::NaiveDate;
 use std::collections::{BTreeMap, BTreeSet};
 use tr_core::{AssetClass, Bar, Timeframe};
 
+/// Descriptive Hill order-two concentration of allocated volume, not inference.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Concentration {
+    pub occupied: usize,
+    pub effective_rows: f64,
+    pub normalized: f64,
+}
+pub fn concentration(volume: &[f64]) -> Option<Concentration> {
+    if volume.iter().any(|v| !v.is_finite() || *v < 0.) {
+        return None;
+    }
+    // Scale first so finite volumes with an overflowing raw sum remain well-defined.
+    let max = volume.iter().copied().fold(0., f64::max);
+    if max <= 0. {
+        return None;
+    }
+    let occupied = volume.iter().filter(|v| **v > 0.).count();
+    let total: f64 = volume.iter().map(|v| v / max).sum();
+    let squares: f64 = volume.iter().map(|v| (v / max / total).powi(2)).sum();
+    let effective_rows = (1. / squares).clamp(1., occupied as f64);
+    Some(Concentration { occupied, effective_rows, normalized: (1. - effective_rows / occupied as f64).clamp(0., 1.) })
+}
+
 pub const MAX_SESSIONS: usize = 20;
 pub const TARGET_ROWS: f64 = 40.;
 pub const FINE_HOLE_TOLERANCE: f64 = 0.05;
@@ -968,5 +991,39 @@ mod tests {
         }
         b[0].provenance = Provenance::Sample;
         assert!(build(&b, Timeframe::M1, None, AssetClass::Equity, cut, &[], Default::default(), 0.01).is_err());
+    }
+}
+
+#[cfg(test)]
+mod concentration_tests {
+    use super::*;
+    #[test]
+    fn concentration_uniform_four_bins_is_four_and_zero() {
+        let c = concentration(&[2.; 4]).unwrap();
+        assert_eq!(c.effective_rows, 4.);
+        assert_eq!(c.normalized, 0.);
+    }
+    #[test]
+    fn concentration_single_bin_is_one_and_zero() {
+        assert_eq!(concentration(&[9.]).unwrap(), Concentration { occupied: 1, effective_rows: 1., normalized: 0. });
+    }
+    #[test]
+    fn concentration_nonuniform_vector_matches_hand_calculation() {
+        let c = concentration(&[1., 3.]).unwrap();
+        assert!((c.effective_rows - 1.6).abs() < 1e-12);
+        assert!((c.normalized - 0.2).abs() < 1e-12);
+    }
+    #[test]
+    fn concentration_zero_volume_is_unavailable() {
+        assert!(concentration(&[0.; 4]).is_none());
+        assert!(concentration(&[]).is_none());
+    }
+    #[test]
+    fn concentration_ignores_zero_bins_but_refuses_invalid_volume() {
+        assert_eq!(concentration(&[0., 1., 0., 3.]), concentration(&[1., 3.]));
+        for v in [f64::NAN, f64::INFINITY, -1.] {
+            assert!(concentration(&[1., v]).is_none());
+        }
+        assert!(concentration(&[f64::MAX; 4]).unwrap().effective_rows.is_finite());
     }
 }

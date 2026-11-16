@@ -1,0 +1,3 @@
+[alias]
+perf-gate = "run --release --offline -p tr-perf --bin perf-gate --"
+perf-paint = "test --release --offline -p terminal-rs perf_gate_paint -- --ignored --nocapture --test-threads=1"

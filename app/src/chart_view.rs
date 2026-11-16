@@ -27,11 +27,13 @@ use crate::worker::{BuiltIndicator, PaneId, Request, Worker, archive_page, initi
 use tr_data::anchored_vwap::AvwapKey;
 
 mod auction;
+mod session_cache;
 mod cockpit;
 mod stop_cloud;
 mod trend_cone;
 mod vault_footer;
 pub use cockpit::{LinkBus, LinkPublish, resolve_hover};
+pub use session_cache::SessionSummaryKey;
 
 const AXIS_W: f32 = 66.0;
 const TIME_H: f32 = 16.0;
@@ -81,6 +83,7 @@ fn corner_mark(
 
 /// Session stats for an intraday equity/ETF/index series whose bars match `tf`.
 /// Missing VWAP or relative volume is an em dash, not a made-up number.
+#[cfg(test)]
 fn session_line(tf: Timeframe, sec: &Security, bars: &[Bar]) -> Option<String> {
     if !tf.is_intraday() || !matches!(sec.class, AssetClass::Equity | AssetClass::Etf | AssetClass::Index) {
         return None;
@@ -110,6 +113,7 @@ fn session_line(tf: Timeframe, sec: &Security, bars: &[Bar]) -> Option<String> {
 
 /// Opening range of the latest regular session, when every bucket of the first half-hour is present.
 /// A missing print stays blank. Premarket and later bars do not move the printed high and low.
+#[cfg(test)]
 fn opening_line(tf: Timeframe, sec: &Security, bars: &[Bar]) -> Option<String> {
     if !tf.is_intraday() || !matches!(sec.class, AssetClass::Equity | AssetClass::Etf | AssetClass::Index) {
         return None;
@@ -120,6 +124,7 @@ fn opening_line(tf: Timeframe, sec: &Security, bars: &[Bar]) -> Option<String> {
 }
 
 /// Prior cash session high, low, and close, when that session is complete in `bars`.
+#[cfg(test)]
 fn prior_line(tf: Timeframe, sec: &Security, bars: &[Bar]) -> Option<String> {
     if !tf.is_intraday() || !matches!(sec.class, AssetClass::Equity | AssetClass::Etf | AssetClass::Index) {
         return None;
@@ -147,6 +152,7 @@ fn profile_share(volume: f64, total: f64) -> Option<String> {
 }
 
 /// Latest regular session's verified volume profile. Empty when no verified volume is present.
+#[cfg(test)]
 fn profile_line(tf: Timeframe, sec: &Security, bars: &[Bar]) -> Option<String> {
     if !tf.is_intraday() || !matches!(sec.class, AssetClass::Equity | AssetClass::Etf | AssetClass::Index) {
         return None;
@@ -166,6 +172,7 @@ fn profile_line(tf: Timeframe, sec: &Security, bars: &[Bar]) -> Option<String> {
 }
 
 /// Value area of the latest regular session's verified profile.
+#[cfg(test)]
 fn value_line(tf: Timeframe, sec: &Security, bars: &[Bar]) -> Option<String> {
     if !tf.is_intraday() || !matches!(sec.class, AssetClass::Equity | AssetClass::Etf | AssetClass::Index) {
         return None;
@@ -300,6 +307,7 @@ pub struct ChartState {
     cone: trend_cone::ConeState,
     stops: stop_cloud::StopState,
     auction: auction::AuctionState,
+    session: session_cache::SessionCache,
     edge: Option<Result<Arc<tr_data::edge::EdgeReport>, String>>,
     edge_work: Option<Request>,
     edge_pending: Option<EdgeKey>,
@@ -447,6 +455,7 @@ impl ChartState {
             cone: Default::default(),
             stops: Default::default(),
             auction: Default::default(),
+            session: Default::default(),
             edge: None,
             edge_paint: Default::default(),
             edge_work: None,
@@ -594,6 +603,7 @@ impl ChartState {
     /// (Re)load history for the current symbol and timeframe.
     pub fn load(&mut self, w: &Worker) {
         self.generation += 1;
+        self.invalidate_session_summary();
         self.stitch = None;
         self.edge_pending = None;
         self.edge_work = None;
@@ -1392,6 +1402,11 @@ impl ChartState {
 
     pub fn on_vault_stitch(&mut self, generation: u64, info: Arc<tr_data::vault::StitchInfo>) {
         if generation == self.generation {
+            if self.stitch.as_ref().map(|old| &old.source) != Some(&info.source) {
+                self.invalidate_session_summary();
+            }
+            self.session.stitch_revision =
+                self.session.stitch_revision.checked_add(1).expect("stitch revision overflow");
             self.stitch = Some(info);
         }
     }
@@ -1740,7 +1755,11 @@ impl ChartState {
             g.from.right += shift;
             g.to.right += shift;
         }
+        self.session.bars_revision = self.session.bars_revision.checked_add(1).expect("bars revision overflow");
         self.provenance = Bar::provenance(&bars);
+        if !self.provenance.is_verified() {
+            self.invalidate_session_summary();
+        }
         self.bars = bars;
         self.gpu = Some(gpu);
         self.paging = false;
@@ -1946,6 +1965,7 @@ impl ChartState {
     }
 
     pub fn show(&mut self, ui: &mut Ui, rect: Rect, focused: bool, w: &Worker) -> bool {
+        let _chart_scope = crate::perf::scope(crate::perf::Layer::ChartTotal);
         if let Some(work) = self.edge_work.take() {
             w.send(work);
         }
@@ -1956,6 +1976,9 @@ impl ChartState {
         let mut clicked = false;
         self.link_out = LinkPublish::default();
         self.request_avwap(w);
+        if let Some(wait) = self.request_session_summary(w) {
+            ui.ctx().request_repaint_after(wait);
+        }
         if let Some(wait) = self.request_auction(w) {
             ui.ctx().request_repaint_after(wait);
         }
@@ -2164,6 +2187,7 @@ impl ChartState {
             self.viewport.get_or_insert_with(|| Viewport::fit_last(len, DEFAULT_VISIBLE, price_rect.width() as f64));
         v.set_width(price_rect.width() as f64);
 
+        let _perf_input = crate::perf::scope(crate::perf::Layer::Input);
         // ---- input ----
         let plot_resp = ui.interact(plot_all, ui.id().with((self.id, "plot")), Sense::click_and_drag());
         let axis_rect =
@@ -2262,6 +2286,8 @@ impl ChartState {
             }
         }
 
+        drop(_perf_input);
+        let _perf_scene = crate::perf::scope(crate::perf::Layer::Scene);
         // ---- price pane GPU frame ----
         let mut overlays: Vec<Overlay> = self
             .built
@@ -2358,6 +2384,8 @@ impl ChartState {
             self.manual_scale = None;
         }
 
+        drop(_perf_scene);
+        let _perf_gridaxes = crate::perf::scope(crate::perf::Layer::GridAxes);
         // Grid first (under the GPU geometry is not possible inside one pass, so draw it
         // faintly; candles are opaque on top visually).
         let price_painter = ui.painter_at(price_rect);
@@ -2368,21 +2396,35 @@ impl ChartState {
             let y = price_rect.top() + scale.y_of(*t) as f32;
             price_painter.hline(price_rect.x_range(), y, Stroke::new(1.0, theme::grid()));
         }
+        drop(_perf_gridaxes);
+        let _perf_zband = crate::perf::scope(crate::perf::Layer::ZBand);
         self.prepare_zband_paint(price_rect, &v, &scale);
         ui.painter_at(price_rect).extend(self.zband_paint.cloud.iter().cloned());
+        drop(_perf_zband);
+        let _perf_link = crate::perf::scope(crate::perf::Layer::Link);
         self.paint_lens(ui, price_rect, &v);
+        drop(_perf_link);
+        let _perf_stack = crate::perf::scope(crate::perf::Layer::Stack);
         if self.show_stack {
             self.prepare_stack_paint(price_rect, stack_rect, &v, &scale);
             self.paint_stack_cloud(ui, price_rect, &v, &scale, &reveal);
         }
-        self.paint_stop_cloud(ui, price_rect, &v, &scale);
+        drop(_perf_stack);
+        {
+            let _s = crate::perf::scope(crate::perf::Layer::Stops);
+            self.paint_stop_cloud(ui, price_rect, &v, &scale);
+        }
         let frame_no = ui.ctx().cumulative_frame_nr();
         let frame = Frame { pane: self.id * 8, frame_no, cmds: out.cmds };
         ui.painter().add(tr_chart::egui_wgpu::Callback::new_paint_callback(price_rect, ChartCallback(Arc::new(frame))));
 
         if self.show_stack {
-            self.paint_stack_pulse(ui, price_rect, &v, &scale);
+            {
+                let _s = crate::perf::scope(crate::perf::Layer::Stack);
+                self.paint_stack_pulse(ui, price_rect, &v, &scale);
+            }
         }
+        let _perf_scene = crate::perf::scope(crate::perf::Layer::Scene);
         // Sub panes.
         let mut sub_rects = Vec::new();
         for (k, &bi) in pane_specs.iter().take(n_sub).enumerate() {
@@ -2407,15 +2449,21 @@ impl ChartState {
             sub_rects.push((r, bi, so.scale));
         }
 
+        drop(_perf_scene);
+        let _perf_stack = crate::perf::scope(crate::perf::Layer::Stack);
         if self.show_stack && stack_h > 0.0 {
             if let Some(tf) = self.paint_stack_lanes(ui, stack_rect, &v, hover, &reveal) {
                 self.set_timeframe(tf, w);
                 return true;
             }
         }
+        drop(_perf_stack);
+        let _perf_rail = crate::perf::scope(crate::perf::Layer::Rail);
         if rail_h > 0.0 {
             self.paint_truth_rail(ui, rail_rect, &v);
         }
+        drop(_perf_rail);
+        let _perf_stack = crate::perf::scope(crate::perf::Layer::Stack);
         if self.show_stack {
             if let Some(frames) = &self.stack_ladder {
                 let label = format!("LADDER {}", frames.iter().map(|tf| tf.label()).collect::<Vec<_>>().join("·"));
@@ -2439,6 +2487,8 @@ impl ChartState {
                 );
             }
         }
+        drop(_perf_stack);
+        let _perf_gridaxes = crate::perf::scope(crate::perf::Layer::GridAxes);
         // ---- axes ----
         let axis_painter = ui.painter_at(Rect::from_min_max(pos2(plot_all.right(), body.top()), body.max));
         axis_painter.vline(plot_all.right(), body.y_range(), Stroke::new(1.0, theme::border()));
@@ -2520,6 +2570,8 @@ impl ChartState {
             }
         }
 
+        drop(_perf_gridaxes);
+        let _perf_auction = crate::perf::scope(crate::perf::Layer::Auction);
         // ---- drawings ----
         if self.auction.enabled {
             self.paint_auction(ui, price_rect, &v, &scale);
@@ -2530,16 +2582,32 @@ impl ChartState {
             self.paint_volume_profile(ui, price_rect, &scale);
             self.paint_value_area(ui, price_rect, &scale);
         }
+        drop(_perf_auction);
+        let _perf_levels = crate::perf::scope(crate::perf::Layer::Levels);
         self.paint_review_levels(ui, price_rect, &scale);
         self.paint_alert_levels(ui, price_rect, &scale);
         self.paint_opening_range(ui, price_rect, &scale);
         self.paint_prior_session(ui, price_rect, &scale);
+        drop(_perf_levels);
         let click = plot_resp.interact_pointer_pos().filter(|_| plot_resp.clicked() && drawing_click);
-        self.paint_drawings(ui, price_rect, &v, &scale, hover, click);
-        self.paint_avwap(ui, price_rect, &v, &scale, hover);
-        self.paint_cone(ui, price_rect, &v, &scale);
-        self.paint_stop_odds(ui, price_rect);
+        {
+            let _s = crate::perf::scope(crate::perf::Layer::Drawings);
+            self.paint_drawings(ui, price_rect, &v, &scale, hover, click);
+        }
+        {
+            let _s = crate::perf::scope(crate::perf::Layer::Avwap);
+            self.paint_avwap(ui, price_rect, &v, &scale, hover);
+        }
+        {
+            let _s = crate::perf::scope(crate::perf::Layer::Cone);
+            self.paint_cone(ui, price_rect, &v, &scale);
+        }
+        {
+            let _s = crate::perf::scope(crate::perf::Layer::Stops);
+            self.paint_stop_odds(ui, price_rect);
+        }
 
+        let _perf_markers = crate::perf::scope(crate::perf::Layer::Markers);
         // ---- congress markers ----
         self.hover_marker = None;
         if self.show_congress {
@@ -2553,6 +2621,8 @@ impl ChartState {
             self.paint_journal(ui, price_rect, &v, hover, &reveal);
         }
 
+        drop(_perf_markers);
+        let _perf_crosshair = crate::perf::scope(crate::perf::Layer::Crosshair);
         // ---- crosshair + legend ----
         let hovered_bar = hover.and_then(|p| v.bar_at((p.x - price_rect.left()) as f64, len));
         self.hover_bar = hovered_bar;
@@ -2585,19 +2655,26 @@ impl ChartState {
                 ui.ctx().set_cursor_icon(CursorIcon::Crosshair);
             }
         }
+        drop(_perf_crosshair);
+        let _perf_link = crate::perf::scope(crate::perf::Layer::Link);
         let ghost = self.paint_link_ghost(ui, price_rect, plot_all, time_rect, &v, &scale);
         let cursor_price =
             hover.filter(|p| price_rect.contains(*p)).map(|p| scale.price_at((p.y - price_rect.top()) as f64));
         self.publish_link(hovered_bar, cursor_price, &v);
         self.link_geom =
             Some(cockpit::LinkGeom { plot_id: plot_resp.id, plot: plot_all, price_rect, viewport: v, scale, len });
+        drop(_perf_link);
+        let _perf_legend = crate::perf::scope(crate::perf::Layer::Legend);
         self.paint_legend(ui, price_rect, hovered_bar.or(ghost).unwrap_or(len.saturating_sub(1)), &sub_rects);
         self.paint_cockpit_chip(ui, price_rect);
         self.paint_vault_footer(ui, price_rect, &v);
+        drop(_perf_legend);
+        let _perf_edge = crate::perf::scope(crate::perf::Layer::Edge);
         if self.show_edge {
             self.paint_flip_outcomes(ui, price_rect, &v, &scale);
             self.paint_edge_card(ui, price_rect);
         }
+        drop(_perf_edge);
         if matches!(self.sec.class, tr_core::AssetClass::Equity | tr_core::AssetClass::Etf) {
             clicked |= self.trade_buttons(ui, plot_all);
         }
@@ -3182,38 +3259,10 @@ impl ChartState {
 
         // Overlay indicator values, one per line.
         let mut ly = y + 16.0;
-        if let Some(line) = session_line(self.tf, &self.sec, &self.bars) {
-            p.text(pos2(price_rect.left() + 6.0, ly), Align2::LEFT_TOP, line, mono(11.0), muted());
-            ly += 14.0;
-        }
-        if let Some(line) = opening_line(self.tf, &self.sec, &self.bars) {
-            p.text(pos2(price_rect.left() + 6.0, ly), Align2::LEFT_TOP, line, mono(11.0), theme::up());
-            ly += 14.0;
-        }
-        if let Some(line) = prior_line(self.tf, &self.sec, &self.bars) {
-            p.text(pos2(price_rect.left() + 6.0, ly), Align2::LEFT_TOP, line, mono(11.0), amber());
-            ly += 14.0;
-        }
-        if !self.auction.enabled
-            && let Some(line) = profile_line(self.tf, &self.sec, &self.bars)
-        {
-            p.text(pos2(price_rect.left() + 6.0, ly), Align2::LEFT_TOP, line, mono(11.0), theme::series(2));
-            ly += 14.0;
-        }
-        if !self.auction.enabled
-            && let Some(line) = value_line(self.tf, &self.sec, &self.bars)
-        {
-            p.text(pos2(price_rect.left() + 6.0, ly), Align2::LEFT_TOP, line, mono(11.0), theme::accent());
-            ly += 14.0;
-        }
+        self.paint_session_lines(ui, price_rect, &mut ly);
         // With the Auction Map on, one line from its report replaces VP / VAH.
         if let Some(line) = self.auction_legend_line() {
             p.text(pos2(price_rect.left() + 6.0, ly), Align2::LEFT_TOP, line, mono(11.0), theme::series(2));
-            ly += 14.0;
-        }
-        if self.extended && self.offers_extended() {
-            let line = tr_data::intraday::extended_summary(&self.bars);
-            p.text(pos2(price_rect.left() + 6.0, ly), Align2::LEFT_TOP, line, mono(11.0), amber());
             ly += 14.0;
         }
         if let Some(line) = &self.earnings {
@@ -4003,9 +4052,9 @@ impl ChartState {
         {
             return;
         }
-        let Some(range) = tr_data::intraday::opening_range(self.tf, &self.bars) else { return };
+        let Some(range) = self.session_snapshot().and_then(|s| s.opening) else { return };
         let p = ui.painter_at(rect);
-        let rows = [(range.high, "ORH", theme::up()), (range.low, "ORL", theme::down())];
+        let rows = [(range.high, "ORH", theme::series(0)), (range.low, "ORL", theme::series(1))];
         for (price, tag, color) in rows {
             let y = rect.top() + scale.y_of(price) as f32;
             if !rect.y_range().contains(y) {
@@ -4028,8 +4077,9 @@ impl ChartState {
         {
             return;
         }
-        let profile: Vec<_> = tr_data::intraday::verified_profile(self.tf, &self.bars, 24)
-            .into_iter()
+        let Some(summary) = self.session_snapshot() else { return };
+        let profile: Vec<_> = summary.stats.profile
+            .iter()
             .filter(|b| b.volume.is_finite() && b.volume > 0.0)
             .collect();
         if profile.is_empty() {
@@ -4045,7 +4095,7 @@ impl ChartState {
         }
         let p = ui.painter_at(rect);
         let max_w = (rect.width() * 0.18).clamp(28.0, 80.0);
-        for bin in &profile {
+        for bin in profile {
             let y = rect.top() + scale.y_of(bin.price) as f32;
             if !rect.y_range().contains(y) {
                 continue;
@@ -4066,7 +4116,7 @@ impl ChartState {
         {
             return;
         }
-        let Some(area) = tr_data::intraday::value_area(self.tf, &self.bars, 24) else { return };
+        let Some(area) = self.session_snapshot().and_then(|s| s.value_area) else { return };
         let p = ui.painter_at(rect);
         let color = theme::accent();
         for (price, tag) in [(area.high, "VAH"), (area.low, "VAL")] {
@@ -4091,7 +4141,7 @@ impl ChartState {
         {
             return;
         }
-        let Some(prior) = tr_data::intraday::prior_session(self.tf, &self.bars) else { return };
+        let Some(prior) = self.session_snapshot().and_then(|s| s.prior) else { return };
         let p = ui.painter_at(rect);
         let rows =
             [(prior.high, "PDH", amber()), (prior.low, "PDL", theme::cyan()), (prior.close, "PDC", theme::series(4))];
@@ -4628,6 +4678,9 @@ fn hover_card(ui: &Ui, at: Pos2, t: &Trade) {
 }
 
 #[cfg(test)]
+mod perf_gate;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -4838,7 +4891,7 @@ mod tests {
         complete_edge(&mut c, chrono::Utc::now().timestamp());
         assert!(matches!(c.edge, Some(Ok(_))));
     }
-    fn complete_edge(c: &mut ChartState, now: i64) {
+    pub(super) fn complete_edge(c: &mut ChartState, now: i64) {
         c.refresh_edge(now);
         if let Some(Request::StackEdge { key, bars, state, entry_long, entry_short, stitch, .. }) = c.edge_work.take() {
             let input = tr_data::vault::research_bars(&bars, stitch.as_deref()).unwrap();
@@ -5864,9 +5917,11 @@ mod tests {
             bar(wall(2026, 3, 9, 16, 0), 5.5),
         ]);
         chart.on_history(chart.generation, bars.clone(), SeriesGpu::build(&bars), 0, false, true, false, &worker);
+        session_cache::tests::accept(&mut chart);
         let output = chart_frame(&ctx, &mut chart, &worker, vec![]);
         assert!(contains_text(&output.shapes, "Extended hours: 1 pre-market · 1 after hours"));
         chart.extended = false;
+        session_cache::tests::accept(&mut chart);
         let output = chart_frame(&ctx, &mut chart, &worker, vec![]);
         assert!(!contains_text(&output.shapes, "Extended hours: 1 pre-market · 1 after hours"));
     }
@@ -5902,6 +5957,7 @@ mod tests {
             false,
             &worker,
         );
+        session_cache::tests::accept(&mut chart);
         let output = chart_frame(&ctx, &mut chart, &worker, vec![]);
         assert!(contains_text(&output.shapes, "OR30  H 13.00  L 8.00"));
         assert!(contains_text(&output.shapes, "ORH 13.00"));
@@ -5919,6 +5975,7 @@ mod tests {
             false,
             &worker,
         );
+        session_cache::tests::accept(&mut chart);
         let output = chart_frame(&ctx, &mut chart, &worker, vec![]);
         assert!(!contains_text(&output.shapes, "OR30  H 13.00  L 8.00"));
         assert!(!contains_text(&output.shapes, "ORH 13.00"));
@@ -5966,6 +6023,7 @@ mod tests {
             false,
             &worker,
         );
+        session_cache::tests::accept(&mut chart);
         let output = chart_frame(&ctx, &mut chart, &worker, vec![]);
         assert!(contains_text(&output.shapes, "PDH 12.00  PDL 9.00  PDC 10.50"));
         assert!(contains_text(&output.shapes, "PDH 12.00"));
@@ -5984,6 +6042,7 @@ mod tests {
             false,
             &worker,
         );
+        session_cache::tests::accept(&mut chart);
         let output = chart_frame(&ctx, &mut chart, &worker, vec![]);
         assert!(!contains_text(&output.shapes, "PDH 12.00  PDL 9.00  PDC 10.50"));
         assert!(!contains_text(&output.shapes, "PDH 12.00"));
@@ -6012,6 +6071,7 @@ mod tests {
         let (worker, _) = Worker::test_channel();
         let mut chart = ChartState::new(15, "AAPL", Timeframe::M5);
         chart.on_history(chart.generation, bars.clone(), SeriesGpu::build(&bars), 0, false, true, false, &worker);
+        session_cache::tests::accept(&mut chart);
         let output = chart_frame(&ctx, &mut chart, &worker, vec![]);
         assert!(contains_text(&output.shapes, "VP 2  peak 18.96  75%"));
         assert!(contains_text(&output.shapes, "75%"));
@@ -6052,6 +6112,7 @@ mod tests {
         let (worker, _) = Worker::test_channel();
         let mut chart = ChartState::new(17, "AAPL", Timeframe::M5);
         chart.on_history(chart.generation, bars.clone(), SeriesGpu::build(&bars), 0, false, true, false, &worker);
+        session_cache::tests::accept(&mut chart);
         let output = chart_frame(&ctx, &mut chart, &worker, vec![]);
         assert!(contains_text(&output.shapes, "VAH 19.17  VAL 18.75  75%"));
         assert!(contains_text(&output.shapes, "VAH 19.17"));
@@ -6572,6 +6633,7 @@ mod tests {
         assert_eq!(built.len(), 1, "indicators run on the intraday series");
         chart.built = built;
         let ctx = egui::Context::default();
+        session_cache::tests::accept(&mut chart);
         let output = chart_frame(&ctx, &mut chart, &worker, vec![]);
         let text = shape_text(&output.shapes);
         assert!(text.contains("VWAP") && text.contains("RVOL —"), "{text}");
@@ -6642,7 +6704,7 @@ mod tests {
             .filter_map(|r| if let Request::StopCloud { key, .. } = r { Some(key) } else { None })
             .collect()
     }
-    fn stop_result(
+    pub(super) fn stop_result(
         c: &ChartState,
         key: &tr_data::stop_cloud::StopKey,
     ) -> Result<Arc<tr_data::stop_cloud::StopReport>, String> {
@@ -6971,7 +7033,7 @@ mod tests {
         }
         out
     }
-    fn cone_result(
+    pub(super) fn cone_result(
         c: &ChartState,
         key: &tr_data::trend_cone::ConeKey,
     ) -> Result<Arc<tr_data::trend_cone::ConeReport>, String> {
@@ -7128,6 +7190,7 @@ mod tests {
         let ctx = egui::Context::default();
         let (w, _) = Worker::test_channel();
         let mut c = cockpit_chart(&w, Timeframe::M5, Provenance::Real, &[]);
+        session_cache::tests::accept(&mut c);
         let off = shape_text(&chart_frame(&ctx, &mut c, &w, vec![]).shapes);
         assert!(off.contains("VP "), "{off}");
         assert!(off.contains("VAH "), "{off}");

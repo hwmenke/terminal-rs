@@ -1,0 +1,127 @@
+{
+  "schema": 1,
+  "cases": {
+    "data.vault_read_5k": {
+      "budget_us": 15000,
+      "relative": true,
+      "class": "load"
+    },
+    "data.vault_stitch_7800": {
+      "budget_us": 25000,
+      "relative": true,
+      "class": "load"
+    },
+    "data.vault_ingest_390": {
+      "budget_us": 60000,
+      "relative": true,
+      "class": "load",
+      "over_target": true
+    },
+    "data.bars_digest_23k": {
+      "budget_us": 5000,
+      "relative": true,
+      "class": "load"
+    },
+    "data.series_gpu_23k": {
+      "budget_us": 5000,
+      "relative": true,
+      "class": "load"
+    },
+    "scene.price_pane_all": {
+      "budget_us": 500,
+      "relative": true,
+      "class": "frame"
+    },
+    "scene.price_pane_200": {
+      "budget_us": 300,
+      "relative": true,
+      "class": "frame"
+    },
+    "stack.trend_stack_5k": {
+      "budget_us": 20000,
+      "relative": true,
+      "class": "interactive"
+    },
+    "edge.regime_edge_5k": {
+      "budget_us": 93000,
+      "relative": true,
+      "class": "interactive",
+      "over_target": true
+    },
+    "edge.wall_edge_5k": {
+      "budget_us": 50000,
+      "relative": true,
+      "class": "interactive"
+    },
+    "nulls.bh_10k": {
+      "budget_us": 3000,
+      "relative": true,
+      "class": "interactive"
+    },
+    "nulls.sign_test": {
+      "budget_us": 210,
+      "relative": true,
+      "class": "interactive"
+    },
+    "clock.build_60d_30m": {
+      "budget_us": 50000,
+      "relative": true,
+      "class": "command"
+    },
+    "stack.tune_7x7_5k": {
+      "budget_us": 500000,
+      "relative": false,
+      "class": "command"
+    },
+    "avwap.report_23k_x4": {
+      "budget_us": 2000,
+      "relative": true,
+      "class": "interactive"
+    },
+    "avwap.time_link_span": {
+      "budget_us": 20,
+      "relative": true,
+      "class": "frame"
+    },
+    "auction.build_20x390": {
+      "budget_us": 6000,
+      "relative": true,
+      "class": "interactive"
+    },
+    "auction.composite_20": {
+      "budget_us": 50,
+      "relative": true,
+      "class": "interactive"
+    },
+    "stops.report_5k": {
+      "budget_us": 50000,
+      "relative": true,
+      "class": "interactive"
+    },
+    "cone.report_5k": {
+      "budget_us": 250000,
+      "relative": true,
+      "class": "command"
+    },
+    "bt.report_5y": {
+      "budget_us": 40000,
+      "relative": true,
+      "class": "command"
+    },
+    "bt.dsr_family_64": {
+      "budget_us": 60000,
+      "relative": true,
+      "class": "command"
+    },
+    "chart.session_summary_7800": {
+      "budget_us": 35000,
+      "relative": true,
+      "class": "interactive"
+    },
+    "auction.concentration_20": {
+      "budget_us": 200,
+      "relative": true,
+      "class": "interactive"
+    }
+  }
+}
