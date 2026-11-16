@@ -266,38 +266,75 @@ fn regime_color(i: usize) -> Color32 {
 }
 const REGIMES: [&str; 3] = ["Calm", "Normal", "Stressed"];
 fn metric_cards(ui: &mut Ui, r: &Report) {
+    use crate::widgets::{MathCard, stat_tile};
     let m = &r.moments;
+    let from = tr_data::stats::bar_date(r.start).to_string();
+    let to = tr_data::stats::bar_date(r.end).to_string();
+    let bar = r.timeframe.label();
+    // Every card carries n, the span and provenance; the formula and inputs are per tile.
+    let base = |title: &str, formula: &str| {
+        MathCard::new(title, formula)
+            .n(m.n, "log returns")
+            .span(from.clone(), to.clone())
+            .provenance(r.provenance)
+            .source(r.source.clone())
+    };
+    let opt = |card: MathCard, v: Option<f64>, why: &str| match v {
+        Some(v) => card.value(format!("{v:.3}")),
+        None => card.unavailable(why.to_string()),
+    };
+    let flat = "zero variance: every return is identical";
     ui.horizontal_wrapped(|ui| {
-        for (label, value) in [
-            ("MEAN / BAR", pct(m.mean)),
-            ("STDEV / ANN.", pct(m.annual_vol)),
-            ("SKEW", number(m.skew)),
-            ("EXCESS KURT.", number(m.excess_kurtosis)),
-            ("JARQUE–BERA", number(m.jarque_bera)),
-            ("JB P-VALUE", number(m.jb_p_value)),
-            ("VaR 95 / 99", format!("{} / {}", pct(m.var95), pct(m.var99))),
-            ("CVaR 95 / 99", format!("{} / {}", pct(m.cvar95), pct(m.cvar99))),
-            ("TAIL RATIO", number(m.tail_ratio)),
-        ] {
-            egui::Frame::new().fill(theme::card()).inner_margin(dp(8.0)).show(ui, |ui| {
-                ui.set_min_width(dp(112.0));
-                ui.label(RichText::new(label).font(mono(10.0)).color(muted()));
-                ui.label(RichText::new(value).font(mono(15.0)).color(theme::cyan()));
-            });
-        }
+        stat_tile(ui, "MEAN / BAR", &pct(m.mean), theme::sign(m.mean), || {
+            base("MEAN / BAR", "μ = Σ rᵢ / n,  rᵢ = ln(Cᵢ / Cᵢ₋₁)")
+                .value(pct(m.mean))
+                .input("n", m.n.to_string())
+                .note(format!("Close-to-close log return over one closed {bar} bar."))
+        });
+        stat_tile(ui, "STDEV / ANN.", &pct(m.annual_vol), theme::text(), || {
+            base("STDEV / ANN.", "σₐ = s × √P,  s = √(Σ(rᵢ − μ)² / (n − 1))")
+                .value(pct(m.annual_vol))
+                .input("s", pct(m.sigma))
+                .input("P", format!("{:.0} periods/year", r.annual_periods))
+                .note("Sample σ (n−1).")
+        });
+        stat_tile(ui, "SKEW", &number(m.skew), theme::text(), || {
+            opt(base("SKEW", "g₁ = Σ zᵢ³ / n,  zᵢ = (rᵢ − μ) / σ"), m.skew, flat)
+                .note("Population moment (σ with n in the denominator).")
+        });
+        stat_tile(ui, "EXCESS KURT.", &number(m.excess_kurtosis), theme::text(), || {
+            opt(base("EXCESS KURT.", "g₂ = Σ zᵢ⁴ / n − 3"), m.excess_kurtosis, flat)
+                .note("Population moment; 0 for a normal distribution.")
+        });
+        stat_tile(ui, "JARQUE–BERA", &number(m.jarque_bera), theme::text(), || {
+            let card = base("JARQUE–BERA", "JB = n/6 × (g₁² + g₂²/4)")
+                .input("g₁", number(m.skew))
+                .input("g₂", number(m.excess_kurtosis));
+            opt(card, m.jarque_bera, flat)
+        });
+        stat_tile(ui, "JB P-VALUE", &number(m.jb_p_value), theme::text(), || {
+            opt(base("JB P-VALUE", "p = exp(−JB / 2)  (χ²(2) upper tail)").input("JB", number(m.jarque_bera)), m.jb_p_value, flat)
+                .caveat("Asymptotic; unreliable for small n.")
+        });
+        let var = format!("{} / {}", pct(m.var95), pct(m.var99));
+        stat_tile(ui, "VaR 95 / 99", &var, theme::text(), || {
+            base("VaR 95 / 99", "VaRₐ = −Q(α),  α = 5% / 1%  (historical quantile)")
+                .value(var.clone())
+                .note(format!("Horizon = one closed {bar} bar; no √h scaling to other horizons."))
+                .note("Signed log-loss: negative values mean gains.")
+        });
+        let cvar = format!("{} / {}", pct(m.cvar95), pct(m.cvar99));
+        stat_tile(ui, "CVaR 95 / 99", &cvar, theme::text(), || {
+            base("CVaR 95 / 99", "CVaRₐ = −mean{ rᵢ : rᵢ ≤ Q(α) }")
+                .value(cvar.clone())
+                .input("VaR 95", pct(m.var95))
+                .input("VaR 99", pct(m.var99))
+                .note("Mean loss of returns at or beyond VaR, so CVaR ≥ VaR.")
+        });
+        stat_tile(ui, "TAIL RATIO", &number(m.tail_ratio), theme::text(), || {
+            opt(base("TAIL RATIO", "TR = |Q(95%)| / |Q(5%)|"), m.tail_ratio, "the 5% quantile is zero")
+        });
     });
-    ui.label(
-        RichText::new(format!(
-            "Volatility: sample σ (n−1) × √{:.0} periods/year. VaR/CVaR: historical, horizon = one closed {} bar \
-             (no √h scaling to other horizons); CVaR = mean loss of returns at or beyond VaR, so CVaR ≥ VaR. \
-             Signed log-loss: negative values mean gains. Skew/kurtosis are population moments; \
-             JB p-value is the asymptotic χ²(2) tail (unreliable for small n).",
-            r.annual_periods,
-            r.timeframe.label()
-        ))
-        .size(11.0)
-        .color(muted()),
-    );
 }
 
 /// Shared painter axes. Coordinates stay in f64 until mapped into the viewport.
@@ -909,5 +946,42 @@ mod tests {
                 }
             }
         }
+    }
+    #[test]
+    fn dist_tiles_have_cards() {
+        let report = dist::compute("AAPL", &fixture(), Timeframe::D1, Window::All, "unit", None).unwrap();
+        let ctx = egui::Context::default();
+        ctx.all_styles_mut(|s| s.interaction.tooltip_delay = 0.0);
+        let mut mean = Rect::NOTHING;
+        let mut texts = Vec::new();
+        for frame in 0..6 {
+            let events = if frame > 0 { vec![egui::Event::PointerMoved(mean.center())] } else { vec![] };
+            let mut out = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(1200.0, 800.0))),
+                    events,
+                    time: Some(frame as f64),
+                    ..Default::default()
+                },
+                |ui| {
+                    metric_cards(ui, &report);
+                    // The first tile's label is MEAN / BAR; find its rect via the painted text.
+                },
+            );
+            out.textures_delta.clear();
+            for s in &out.shapes {
+                if let egui::Shape::Text(t) = &s.shape {
+                    if t.galley.job.text == "MEAN / BAR" && mean == Rect::NOTHING {
+                        mean = Rect::from_min_size(t.pos, t.galley.size()).expand2(vec2(4.0, 14.0));
+                    }
+                    texts.push(t.galley.job.text.clone());
+                }
+            }
+        }
+        let n = format!("n={} log returns", report.moments.n);
+        let from = tr_data::stats::bar_date(report.start);
+        let to = tr_data::stats::bar_date(report.end);
+        assert!(texts.iter().any(|t| t.contains(&n) && t.contains(&from) && t.contains(&to)), "{n} {from} {to}: {texts:?}");
+        assert!(texts.iter().any(|t| t.starts_with("μ = Σ rᵢ / n")), "{texts:?}");
     }
 }

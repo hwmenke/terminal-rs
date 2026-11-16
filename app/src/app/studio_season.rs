@@ -4,10 +4,11 @@ use crate::{
     congress_view::Action,
     dock::PaneId,
     theme,
+    widgets::{self, MathCard, MathCardExt},
     worker::{Request, Worker},
 };
 use egui::{Align2, Color32, Rect, RichText, ScrollArea, Sense, Stroke, Ui, pos2, vec2};
-use tr_data::studio_season::{self as math, Bucket, MIN_N, SeasonReport};
+use tr_data::studio_season::{self as math, Bucket, MIN_N, MonthCell, SeasonReport};
 
 pub struct SeasonPane {
     pub symbol: String,
@@ -169,14 +170,32 @@ fn heading(ui: &mut Ui, label: &str) {
     super::studio_dist::studio_heading(ui, label);
 }
 fn color(v: f64) -> Color32 {
-    if v >= 0.0 { theme::up() } else { theme::down() }
+    theme::sign(v)
 }
-fn tint(v: Option<f64>, n: usize, scale: f64) -> Color32 {
-    if n < MIN_N {
-        return theme::control();
+/// A fraction printed as a percentage with enough digits for small heat thresholds.
+fn key_pct(x: f64) -> String {
+    let v = x * 100.0;
+    let d = if v >= 10.0 {
+        0
+    } else if v >= 1.0 {
+        1
+    } else if v >= 0.1 {
+        2
+    } else {
+        3
+    };
+    format!("{v:.d$}%")
+}
+/// The return heat scale for a grid: diverging, rounded up to a 1-2-5 step.
+fn return_scale(scale: f64) -> widgets::HeatScale {
+    widgets::HeatScale::diverging(scale, "Return", key_pct).nice()
+}
+/// Cell ink: on-fill when the cell is coloured, muted otherwise.
+fn cell_ink(hs: &widgets::HeatScale, v: Option<f64>, enough: bool) -> Color32 {
+    match v {
+        Some(v) if enough && v.is_finite() => hs.ink(v),
+        _ => theme::muted(),
     }
-    let Some(v) = v else { return theme::control() };
-    theme::card().lerp_to_gamma(color(v), (0.18 + 0.65 * (v.abs() / scale.max(1e-9)).min(1.0)) as f32)
 }
 fn details(b: &Bucket) -> String {
     format!(
@@ -194,6 +213,8 @@ fn details(b: &Bucket) -> String {
 
 fn daily(ui: &mut Ui, r: &SeasonReport) {
     heading(ui, "YEAR × MONTH · actual compounded returns");
+    let hs = return_scale(r.months.iter().filter_map(|m| m.value).map(f64::abs).fold(0.01, f64::max));
+    hs.key(ui);
     ScrollArea::horizontal().id_salt("season-month-heat").show(ui, |ui| {
         let years: Vec<i32> = r.months.iter().map(|m| m.year).collect::<std::collections::BTreeSet<_>>().into_iter().collect();
         let width = ui.available_width().max(850.0);
@@ -202,7 +223,6 @@ fn daily(ui: &mut Ui, r: &SeasonReport) {
         for (m, label) in math::MONTHS.iter().enumerate() {
             ui.painter().text(pos2(rect.left() + 52.0 + (m as f32 + 0.5) * cell_w, rect.top() + 10.0), Align2::CENTER_CENTER, label, theme::mono(11.0), theme::muted());
         }
-        let scale = r.months.iter().filter_map(|m| m.value).map(f64::abs).fold(0.01, f64::max);
         for (y, year) in years.iter().enumerate() {
             let top = rect.top() + 24.0 + y as f32 * 44.0;
             ui.painter().text(pos2(rect.left(), top + 20.0), Align2::LEFT_CENTER, year, theme::mono(12.0), theme::text());
@@ -210,13 +230,12 @@ fn daily(ui: &mut Ui, r: &SeasonReport) {
                 let cell = r.months.iter().find(|m| m.year == *year && m.month == month);
                 let (value, n) = cell.map(|c| (c.value, c.n)).unwrap_or((None, 0));
                 let rc = Rect::from_min_size(pos2(rect.left() + 52.0 + (month - 1) as f32 * cell_w, top), vec2(cell_w - 3.0, 40.0));
-                ui.painter().rect_filled(rc, 3.0, tint(value, n, scale));
-                ui.painter().text(rc.center_top() + vec2(0.0, 12.0), Align2::CENTER_CENTER, pct(value), theme::mono(11.0), if value.is_some() && n >= MIN_N { theme::text() } else { theme::muted() });
-                ui.painter().text(rc.center_bottom() - vec2(0.0, 9.0), Align2::CENTER_CENTER, format!("n={n}"), theme::mono(9.0), theme::muted());
-                ui.interact(rc, ui.id().with(("month", year, month)), Sense::hover()).on_hover_text(match cell {
-                    Some(c) => format!("{year}-{:02} · {}\n{} / {} daily returns\nRequires every session and prior month closing anchor.", month, pct(value), n, c.expected),
-                    None => "No observations · n=0".into(),
-                });
+                let enough = n >= MIN_N;
+                ui.painter().rect_filled(rc, 3.0, hs.fill_gated(value, enough));
+                let ink = cell_ink(&hs, value, enough);
+                ui.painter().text(rc.center_top() + vec2(0.0, 12.0), Align2::CENTER_CENTER, pct(value), theme::mono(11.0), if value.is_some() && enough { ink } else { theme::muted() });
+                ui.painter().text(rc.center_bottom() - vec2(0.0, 9.0), Align2::CENTER_CENTER, format!("n={n}"), theme::mono(9.0), if enough { ink.gamma_multiply(0.8) } else { theme::muted() });
+                ui.interact(rc, ui.id().with(("month", year, month)), Sense::hover()).math_card(|| month_card(*year, month, cell, r.provenance));
             }
         }
     });
@@ -242,6 +261,26 @@ fn daily(ui: &mut Ui, r: &SeasonReport) {
         .small()
         .color(theme::muted()),
     );
+}
+
+fn month_card(year: i32, month: u32, cell: Option<&MonthCell>, provenance: tr_core::Provenance) -> MathCard {
+    let card = MathCard::new(format!("{year}-{month:02} RETURN"), "R = Π(1 + rᵢ) − 1  over the month's daily returns")
+        .provenance(provenance);
+    match cell {
+        Some(c) => {
+            let card = card
+                .input("observed", format!("{} daily returns", c.n))
+                .input("expected", format!("{} sessions", c.expected))
+                .n(c.n, "daily returns")
+                .note("Requires every session and the prior month's closing anchor.");
+            let card = if c.n < MIN_N { card.caveat("Small sample (n < 10); shown uncoloured.") } else { card };
+            match c.value {
+                Some(v) => card.value(pct(Some(v))),
+                None => card.unavailable(format!("incomplete month ({} of {} sessions)", c.n, c.expected)),
+            }
+        }
+        None => card.unavailable("no observations"),
+    }
 }
 
 /// Signed bar plot, with a shared zero axis and median markers.
@@ -425,18 +464,20 @@ fn intraday(ui: &mut Ui, r: &SeasonReport) {
     profile(ui, &absolute, "Mean absolute bar return · volatility smile", true);
     profile(ui, &volume, "Mean share of session volume", true);
     heading(ui, "DAY OF WEEK × NEW YORK CLOCK · mean bar return");
-    ScrollArea::horizontal().id_salt("season-clock-heat").show(ui, |ui| {
-        let width = ui.available_width().max(r.clock.len() as f32 * 55.0 + 42.0);
-        let cell_w = (width - 42.0) / r.clock.len().max(1) as f32;
-        let (rect, _) = ui.allocate_exact_size(vec2(width, 235.0), Sense::hover());
-        let scale = r
-            .clock
+    let hs = return_scale(
+        r.clock
             .iter()
             .flat_map(|c| &c.weekdays)
             .filter(|b| b.stats.count >= MIN_N)
             .filter_map(|b| b.stats.mean)
             .map(f64::abs)
-            .fold(0.0001, f64::max);
+            .fold(0.0001, f64::max),
+    );
+    hs.key(ui);
+    ScrollArea::horizontal().id_salt("season-clock-heat").show(ui, |ui| {
+        let width = ui.available_width().max(r.clock.len() as f32 * 55.0 + 42.0);
+        let cell_w = (width - 42.0) / r.clock.len().max(1) as f32;
+        let (rect, _) = ui.allocate_exact_size(vec2(width, 235.0), Sense::hover());
         for (col, c) in r.clock.iter().enumerate() {
             let x = rect.left() + 42.0 + col as f32 * cell_w;
             ui.painter().text(
@@ -448,13 +489,14 @@ fn intraday(ui: &mut Ui, r: &SeasonReport) {
             );
             for (day, b) in c.weekdays.iter().enumerate() {
                 let rc = Rect::from_min_size(pos2(x, rect.top() + 25.0 + day as f32 * 41.0), vec2(cell_w - 2.0, 38.0));
-                ui.painter().rect_filled(rc, 3.0, tint(b.stats.mean, b.stats.count, scale));
+                let enough = b.stats.count >= MIN_N;
+                ui.painter().rect_filled(rc, 3.0, hs.fill_gated(b.stats.mean, enough));
                 ui.painter().text(
                     rc.center() - vec2(0.0, 6.0),
                     Align2::CENTER_CENTER,
                     pct(b.stats.mean),
                     theme::mono(9.0),
-                    if b.stats.count >= MIN_N { theme::text() } else { theme::muted() },
+                    cell_ink(&hs, b.stats.mean, enough),
                 );
                 ui.painter().text(
                     rc.center() + vec2(0.0, 9.0),
@@ -647,6 +689,57 @@ mod tests {
             output.textures_delta.clear();
             assert!(!output.shapes.is_empty());
         }
+    }
+    #[test]
+    fn season_paints_heat_keys_with_cell_thresholds() {
+        let start: chrono::NaiveDate = "2025-01-02".parse().unwrap();
+        let daily_bars: Vec<_> = (0..120)
+            .map(|i| start + chrono::Days::new(i))
+            .filter(|d| tr_data::history::calendar::is_session(*d))
+            .enumerate()
+            .map(|(i, d)| {
+                let ts = d.and_hms_opt(0, 0, 0).unwrap().and_utc().timestamp();
+                let c = 100.0 * (1.0 + 0.01 * ((i % 7) as f64 - 3.0));
+                tr_core::Bar::new(ts, c, c, c, c, 10.0).with_provenance(tr_core::Provenance::Real)
+            })
+            .collect();
+        let now = daily_bars.last().unwrap().ts + 3 * 86_400;
+        let r = math::compute("X", tr_core::Timeframe::D1, &daily_bars, "unit", now).unwrap();
+        let ctx = egui::Context::default();
+        let mut out = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(egui::Pos2::ZERO, vec2(1200.0, 2400.0))),
+                ..Default::default()
+            },
+            |ui| daily(ui, &r),
+        );
+        out.textures_delta.clear();
+        let texts: Vec<String> = out
+            .shapes
+            .iter()
+            .filter_map(|s| if let egui::Shape::Text(t) = &s.shape { Some(t.galley.job.text.clone()) } else { None })
+            .collect();
+        let hs = return_scale(r.months.iter().filter_map(|m| m.value).map(f64::abs).fold(0.01, f64::max));
+        assert!(texts.iter().any(|t| t == "Return"), "{texts:?}");
+        for (_, label) in hs.entries() {
+            assert!(texts.contains(&label), "key label {label} missing: {texts:?}");
+        }
+        // Coloured cells use only the key's five fills (or the neutral control fill).
+        let allowed: Vec<_> = hs.entries().iter().map(|(v, _)| hs.fill(*v)).chain([theme::control()]).collect();
+        let cells: Vec<_> = out
+            .shapes
+            .iter()
+            .filter_map(|s| match &s.shape {
+                egui::Shape::Rect(rc) if rc.rect.height() == 40.0 => Some(rc.fill),
+                _ => None,
+            })
+            .collect();
+        assert!(!cells.is_empty());
+        assert!(cells.iter().all(|c| allowed.contains(c)), "{cells:?}");
+        assert!(hs.scale >= 0.01 && [1.0, 2.0, 5.0].iter().any(|m| {
+            let k = (hs.scale / m).log10();
+            (k - k.round()).abs() < 1e-9
+        }));
     }
     #[test]
     fn view_warns_when_series_spans_vault_gap() {

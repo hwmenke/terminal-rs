@@ -58,7 +58,7 @@ fn corner_mark(
     if archive {
         return (
             format!("{} · RESEARCH ARCHIVE · {}", provenance.label(), tf.label()),
-            if provenance.is_verified() { amber() } else { theme::down() },
+            if provenance.is_verified() { amber() } else { theme::provenance(provenance) },
             if provenance.is_verified() { 10.0 } else { 13.0 },
         );
     }
@@ -66,14 +66,14 @@ fn corner_mark(
         .and_then(|ts| tr_data::intraday::freshness(tr_data::intraday::MarketClock::for_class(class), tf, ts, now));
     match fresh {
         Some(tr_data::intraday::Freshness::Stale { .. }) => {
-            (format!("STALE · {}", provenance.label()), theme::down(), 11.0)
+            (format!("STALE · {}", provenance.label()), theme::caution(), 11.0)
         }
         Some(tr_data::intraday::Freshness::Closed) => {
             (format!("{} · SESSION CLOSED", provenance.label()), amber(), 10.0)
         }
         _ => (
             provenance.label().to_string(),
-            if provenance.is_verified() { amber() } else { theme::down() },
+            if provenance.is_verified() { amber() } else { theme::provenance(provenance) },
             if provenance.is_verified() { 10.0 } else { 13.0 },
         ),
     }
@@ -1574,10 +1574,10 @@ impl ChartState {
 
     fn stack_hud(&self, now: i64) -> (String, Color32) {
         if !self.bars.is_empty() && !self.provenance.is_verified() {
-            return (format!("TREND STACK REFUSED · {}", self.provenance.label()), theme::down());
+            return (format!("TREND STACK REFUSED · {}", self.provenance.label()), theme::alert());
         }
         if let Some(error) = &self.stack_error {
-            return (format!("TREND STACK REFUSED · {error}"), theme::down());
+            return (format!("TREND STACK REFUSED · {error}"), theme::alert());
         }
         if let Some(Freshness::Stale { lag_secs }) = self.stack_freshness(now) {
             return (
@@ -1586,7 +1586,7 @@ impl ChartState {
                     (lag_secs + 59) / 60,
                     self.bars.last().map(|b| tr_core::ny::civil(b.ts).format("%H:%M").to_string()).unwrap_or_default()
                 ),
-                theme::down(),
+                theme::caution(),
             );
         }
         let Some(stack) = &self.stack else {
@@ -2068,19 +2068,19 @@ impl ChartState {
                     .unwrap_or_default()
             ),
             mono(if provenance.is_verified() { 10.5 } else { 12.0 }),
-            if provenance.is_verified() { muted() } else { theme::down() },
+            theme::provenance(provenance),
         );
 
         let warning_h = if provenance == Provenance::Sample { 28.0 } else { 0.0 };
         if warning_h > 0.0 {
             let warning = Rect::from_min_size(pos2(rect.left(), header.bottom()), vec2(rect.width(), warning_h));
-            painter.rect_filled(warning, 0.0, Color32::from_rgb(150, 25, 25));
+            painter.rect_filled(warning, 0.0, theme::alert());
             painter.text(
                 warning.center(),
                 Align2::CENTER_CENTER,
                 "SAMPLE DATA · SYNTHETIC PRICES",
                 mono(14.0),
-                Color32::WHITE,
+                theme::on_fill(theme::alert()),
             );
         }
         let body = Rect::from_min_max(
@@ -2316,6 +2316,8 @@ impl ChartState {
             neutral: theme::rgba(theme::grid()),
             up: theme::rgba(theme::candle_up()),
             down: theme::rgba(theme::candle_down()),
+            regime_up: theme::rgba(theme::regime(1)),
+            regime_down: theme::rgba(theme::regime(-1)),
             color: theme::rgba(amber()),
             pixels_per_point: ui.ctx().pixels_per_point(),
             reveal,
@@ -3020,15 +3022,7 @@ impl ChartState {
                 for (fold, f) in cell.folds.iter().enumerate() {
                     let color = f
                         .delta
-                        .map(|d| {
-                            stack_color(if d > 0.0 {
-                                1
-                            } else if d < 0.0 {
-                                -1
-                            } else {
-                                0
-                            })
-                        })
+                        .map(theme::sign)
                         .unwrap_or_else(muted)
                         .gamma_multiply(if solid { 1.0 } else { 0.5 });
                     let x = r.left() + 8.0 + fold as f32 * segment;
@@ -3291,7 +3285,7 @@ impl ChartState {
             } else if bi.spec.code == "ZBAND"
                 && let Some(reason) = &bi.refused
             {
-                p.text(pos2(price_rect.left() + 6.0, ly), Align2::LEFT_TOP, reason, mono(10.0), theme::down());
+                p.text(pos2(price_rect.left() + 6.0, ly), Align2::LEFT_TOP, reason, mono(10.0), theme::alert());
                 ly += 14.0;
             }
         }
@@ -3397,7 +3391,7 @@ impl ChartState {
                     Align2::LEFT_TOP,
                     format!("ADTREND  {msg}"),
                     mono(11.0),
-                    theme::down(),
+                    theme::alert(),
                 );
                 ly += 14.0;
             } else if let Some(note) = &bi.note {
@@ -3436,8 +3430,8 @@ impl ChartState {
             v.left().to_bits(),
             v.bar_px.to_bits(),
             if stale { tail_end.to_bits() as u64 } else { 0 },
-            u32::from_le_bytes(theme::up().to_array()) as u64,
-            u32::from_le_bytes(theme::down().to_array()) as u64,
+            u32::from_le_bytes(theme::rail(Provenance::Real).to_array()) as u64,
+            u32::from_le_bytes(theme::alert().to_array()) as u64,
             u32::from_le_bytes(amber().to_array()) as u64,
         ];
         if self.rail_paint.mesh_key != key {
@@ -3448,9 +3442,11 @@ impl ChartState {
                 let index = v.index_at(x as f64).floor();
                 if index >= 0.0 && index < self.bars.len() as f64 {
                     *color = match self.rail_paint.cells[index as usize].kind {
-                        RailKind::Real => theme::up(),
-                        RailKind::Cached => Color32::from_rgb(35, 110, 125),
-                        _ => theme::down().gamma_multiply(if x % 6 < 3 { 1.0 } else { 0.15 }),
+                        // Verified data has no hue; only exceptions are coloured and hatched.
+                        RailKind::Real => theme::rail(Provenance::Real),
+                        RailKind::Cached if x % 6 < 4 => theme::rail(Provenance::Cached),
+                        RailKind::Cached => Color32::TRANSPARENT,
+                        _ => theme::alert().gamma_multiply(if x % 6 < 3 { 1.0 } else { 0.15 }),
                     };
                 } else if stale && index >= self.bars.len() as f64 && rect.left() + (x as f32) < tail_end {
                     *color = amber().gamma_multiply(if x % 6 < 3 { 0.9 } else { 0.15 });
@@ -3464,7 +3460,7 @@ impl ChartState {
                         if xx >= 0
                             && let Some(color) = columns.get_mut(xx as usize)
                         {
-                            *color = theme::down();
+                            *color = theme::alert();
                         }
                     }
                 }
@@ -3774,13 +3770,13 @@ impl ChartState {
         p.hline(rect.x_range(), rect.top(), Stroke::new(1.0, theme::border()));
         let now = chrono::Utc::now().timestamp();
         if !self.provenance.is_verified() || self.stack_error.is_some() {
-            stack_hatch(&p, rect, theme::down());
+            stack_hatch(&p, rect, theme::alert());
             let label = if !self.provenance.is_verified() {
                 format!("TREND STACK REFUSED · {}", self.provenance.label())
             } else {
                 format!("TREND STACK REFUSED · {}", self.stack_error.as_deref().unwrap_or_default())
             };
-            p.text(rect.left_center() + vec2(6.0, 0.0), Align2::LEFT_CENTER, label, mono(11.0), theme::down());
+            p.text(rect.left_center() + vec2(6.0, 0.0), Align2::LEFT_CENTER, label, mono(11.0), theme::alert());
             return None;
         }
         let Some(stack) = &self.stack else {
@@ -3821,7 +3817,7 @@ impl ChartState {
             p.text(pos2(rect.left() + 2.0, top + 3.5), Align2::LEFT_CENTER, lane.tf.label(), mono(10.0), col);
             let status = match &lane.status {
                 LaneStatus::Warming { have, need } => Some((format!("{} WARMING {have}/{need}", lane.tf), muted())),
-                LaneStatus::Refused(_) => Some((format!("{} REFUSED · UNVERIFIED", lane.tf), theme::down())),
+                LaneStatus::Refused(_) => Some((format!("{} REFUSED · UNVERIFIED", lane.tf), theme::alert())),
                 LaneStatus::Unavailable(e) if e == "Loading…" => {
                     Some((format!("{} loading…", lane.tf), theme::grid()))
                 }
@@ -3969,7 +3965,7 @@ impl ChartState {
         let card = Rect::from_min_size(pos, size);
         let p =
             ui.ctx().layer_painter(egui::LayerId::new(egui::Order::Tooltip, egui::Id::new((self.id, "stack-card"))));
-        p.rect_filled(card, 0.0, Color32::from_rgb(16, 16, 16));
+        p.rect_filled(card, 0.0, theme::scrim());
         p.rect_stroke(card, 0.0, Stroke::new(1.0, amber_dim()), StrokeKind::Inside);
         for (k, line) in lines.iter().enumerate() {
             p.text(
@@ -4446,7 +4442,7 @@ impl ChartState {
             }
             let r = full_r * swept;
             let c = Pos2::new(x, rect.bottom() - 8.0);
-            p.circle_filled(c, r, Color32::from_rgb(90, 200, 250).gamma_multiply(swept));
+            p.circle_filled(c, r, theme::cyan().gamma_multiply(swept));
             if full_r >= 4.5 {
                 p.text(c, Align2::CENTER_CENTER, "J", mono(full_r * 1.45), Color32::BLACK.gamma_multiply(swept));
             }
@@ -4505,15 +4501,12 @@ fn dashed_v(p: &egui::Painter, x: f32, y: egui::Rangef, s: Stroke) {
     }
 }
 
+/// Model-state colour (regime role; never the sign colours).
 fn stack_color(state: i8) -> Color32 {
-    match state {
-        1 => theme::up(),
-        -1 => theme::down(),
-        _ => muted(),
-    }
+    theme::regime(state)
 }
 fn stack_lane_color(state: i8) -> Color32 {
-    if state == 0 { theme::grid() } else { stack_color(state) }
+    theme::regime_lane(state)
 }
 fn stack_hatch(p: &egui::Painter, rect: Rect, color: Color32) {
     p.rect_filled(rect, 0.0, color.gamma_multiply(0.08));
@@ -4576,7 +4569,7 @@ fn news_hover_card(ui: &Ui, at: Pos2, item: &tr_data::NewsItem) {
     let card = Rect::from_min_size(min, vec2(w.min(420.0), h));
     let layer = egui::LayerId::new(egui::Order::Tooltip, egui::Id::new("news-card"));
     let p = ui.ctx().layer_painter(layer);
-    p.rect_filled(card, 0.0, Color32::from_rgb(16, 16, 16));
+    p.rect_filled(card, 0.0, theme::scrim());
     p.rect_stroke(card, 0.0, Stroke::new(1.0, amber_dim()), StrokeKind::Inside);
     for (k, (l, c)) in lines.iter().enumerate() {
         let shown = if l.len() > 72 { format!("{}…", &l[..71]) } else { l.clone() };
@@ -4627,7 +4620,7 @@ fn hover_card(ui: &Ui, at: Pos2, t: &Trade) {
     let card = Rect::from_min_size(min, vec2(w, h));
     let layer = egui::LayerId::new(egui::Order::Tooltip, egui::Id::new("congress-card"));
     let p = ui.ctx().layer_painter(layer);
-    p.rect_filled(card, 0.0, Color32::from_rgb(16, 16, 16));
+    p.rect_filled(card, 0.0, theme::scrim());
     p.rect_stroke(card, 0.0, Stroke::new(1.0, amber_dim()), StrokeKind::Inside);
     for (k, (l, c)) in lines.iter().enumerate() {
         p.text(card.left_top() + vec2(7.0, 4.0 + k as f32 * 14.0), Align2::LEFT_TOP, l, mono(11.5), *c);
@@ -5561,6 +5554,29 @@ mod tests {
         assert!(Arc::ptr_eq(&first, &hover));
         assert!(first.vertices.len() <= rect.width().ceil() as usize * 4);
         assert!(c.rail_paint.cells.iter().all(|cell| cell.kind == tr_data::truth_rail::RailKind::Hatched));
+    }
+
+    #[test]
+    fn rail_verified_is_neutral_and_sample_is_hatched() {
+        let (worker, _) = Worker::test_channel();
+        let rect = Rect::from_min_size(pos2(10.0, 200.0), vec2(500.0, 5.0));
+        let colours = |p: Provenance| {
+            let mut c = stack_chart(&worker, p);
+            c.show_stack = false;
+            let v = Viewport::fit_last(c.bars.len(), 100, 500.0);
+            let ctx = egui::Context::default();
+            ctx.run_ui(egui::RawInput::default(), |ui| c.paint_truth_rail(ui, rect, &v)).textures_delta.clear();
+            let mut set: Vec<Color32> = c.rail_paint.mesh.vertices.iter().map(|v| v.color).collect();
+            set.dedup();
+            set
+        };
+        let real = colours(Provenance::Real);
+        assert!(!real.is_empty());
+        assert!(real.iter().all(|&c| c == theme::rail(Provenance::Real)), "verified rail has no hue: {real:?}");
+        assert!(real.iter().all(|&c| c != theme::up() && c != theme::down()));
+        let sample = colours(Provenance::Sample);
+        assert!(sample.contains(&theme::alert()), "{sample:?}");
+        assert!(sample.contains(&theme::alert().gamma_multiply(0.15)), "hatched: {sample:?}");
     }
 
     #[test]
@@ -6576,7 +6592,7 @@ mod tests {
         let (text, color, _) =
             corner_mark(false, Timeframe::M5, AssetClass::Equity, real, Some(ny(3, 9, 9, 30)), ny(3, 9, 10, 7));
         assert_eq!(text, "STALE · REAL");
-        assert_eq!(color, theme::down());
+        assert_eq!(color, theme::caution());
         let (text, _, _) =
             corner_mark(false, Timeframe::M5, AssetClass::Equity, real, Some(ny(3, 9, 10, 0)), ny(3, 9, 10, 7));
         assert_eq!(text, "REAL");
@@ -6591,7 +6607,7 @@ mod tests {
         let (text, color, _) =
             corner_mark(false, Timeframe::M5, AssetClass::Crypto, real, Some(saturday - 86_400), saturday);
         assert_eq!(text, "STALE · REAL");
-        assert_eq!(color, theme::down());
+        assert_eq!(color, theme::caution());
         assert!(!text.contains("SESSION CLOSED"));
     }
 

@@ -584,7 +584,7 @@ impl TerminalApp {
                     Align2::LEFT_BOTTOM,
                     provenance.label(),
                     mono(10.0),
-                    if provenance.is_verified() { muted() } else { theme::down() },
+                    theme::provenance(provenance),
                 );
                 if let Some(q) = self.quotes.get(key) {
                     let up = q.change() >= 0.0;

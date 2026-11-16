@@ -31,6 +31,9 @@ pub struct Uniforms {
     pub anim: [f32; 4],
     pub neutral: [f32; 4],
     pub tint: [f32; 4],
+    /// Candle-tint (regime) colours; the app keeps them distinct from `up`/`down`.
+    pub regime_up: [f32; 4],
+    pub regime_down: [f32; 4],
 }
 
 /// Load-in sweep for a pane. Bars right of `front` (a fractional bar index) are hidden
@@ -91,6 +94,9 @@ pub struct Style {
     pub reveal: Reveal,
     pub tint_mix: f32,
     pub neutral: [f32; 4],
+    /// Regime colours for the candle tint (model state, not price sign).
+    pub regime_up: [f32; 4],
+    pub regime_down: [f32; 4],
 }
 
 impl Default for Style {
@@ -111,6 +117,8 @@ impl Default for Style {
             reveal: Reveal::DONE,
             tint_mix: 0.0,
             neutral: [0.25, 0.25, 0.25, 1.0],
+            regime_up: [0.15, 0.82, 0.49, 1.0],
+            regime_down: [1.0, 0.27, 0.27, 1.0],
         }
     }
 }
@@ -137,6 +145,8 @@ impl Uniforms {
             anim: [rel(r.front), r.ramp.max(1e-3), rel(r.line_front), r.opacity],
             neutral: s.neutral,
             tint: [s.tint_mix, 0.0, 0.0, 0.0],
+            regime_up: s.regime_up,
+            regime_down: s.regime_down,
         }
     }
 }

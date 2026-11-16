@@ -679,7 +679,7 @@ impl ChartState {
             let g = p.layout(
                 text,
                 mono(11.),
-                if reason.is_some() { theme::down() } else { theme::muted() },
+                if reason.is_some() { theme::alert() } else { theme::muted() },
                 (rect.width() - 28.).max(1.),
             );
             let offset = if self.cone.enabled && !matches!(self.cone.result, Some(Ok(_))) { 110. } else { 44. };
@@ -714,7 +714,6 @@ impl ChartState {
         widgets::seq_key(
             &p,
             pos2(rect.left() + 8., base - 13.),
-            theme::series(2),
             &["20", "40", "60", "80", "100% of POC"],
         );
         let fallback = matches!(&self.auction.result, Some(Ok(r)) if r.fine_note.is_some());
@@ -875,7 +874,7 @@ fn profile_rows(
                 top.max(rect.top())..=bottom.min(rect.bottom()),
             );
             let inside = first + start as i64 >= va.0 && first + i as i64 <= va.1;
-            let color = widgets::seq_ramp((ratio * 5.).ceil() as usize, theme::series(2)).gamma_multiply(if inside {
+            let color = widgets::seq_ramp((ratio * 5.).ceil() as usize).gamma_multiply(if inside {
                 1.
             } else {
                 0.45

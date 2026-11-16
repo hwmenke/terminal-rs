@@ -94,6 +94,12 @@ pub struct ThemeColors {
     pub candle_down: Hex,
     /// Indicator and comparison line colours.
     pub series: [Hex; 6],
+    /// Model-state (regime) colours; absent = the role default for light/dark.
+    /// Never green/red: those mean sign.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub regime_up: Option<Hex>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub regime_down: Option<Hex>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -144,6 +150,7 @@ impl Theme {
             control_hover: c.control_hover.0,
             accent: c.accent.map_or(system_accent, |a| a.0),
             series: c.series.map(|s| s.0),
+            roles: crate::theme::Roles::for_theme(self.dark, c),
         }
     }
 
@@ -242,6 +249,8 @@ pub fn terminal_dark() -> Theme {
                 Hex::rgb(200, 200, 205),
                 Hex::rgb(255, 159, 10),
             ],
+            regime_up: None,
+            regime_down: None,
         },
         fonts: fonts(UiFont::System, MonoFont::System, 1.0),
         density: Density::Regular,
@@ -281,6 +290,8 @@ pub fn terminal_light() -> Theme {
                 Hex::rgb(90, 90, 96),
                 Hex::rgb(220, 110, 0),
             ],
+            regime_up: None,
+            regime_down: None,
         },
         fonts: fonts(UiFont::System, MonoFont::System, 1.0),
         density: Density::Regular,
@@ -321,6 +332,8 @@ fn bloomberg() -> Theme {
                 Hex::rgb(255, 214, 102),
                 Hex::rgb(180, 140, 255),
             ],
+            regime_up: None,
+            regime_down: None,
         },
         fonts: fonts(UiFont::Monospace, MonoFont::System, 1.0),
         density: Density::Compact,
@@ -360,6 +373,8 @@ fn high_contrast() -> Theme {
                 Hex::rgb(255, 255, 255),
                 Hex::rgb(255, 150, 0),
             ],
+            regime_up: None,
+            regime_down: None,
         },
         fonts: fonts(UiFont::System, MonoFont::System, 1.1),
         density: Density::Comfortable,
@@ -409,6 +424,8 @@ fn solarized_dark() -> Theme {
             candle_up: S_GREEN,
             candle_down: S_RED,
             series: [S_BLUE, S_MAGENTA, S_YELLOW, S_CYAN, S_VIOLET, S_ORANGE],
+            regime_up: None,
+            regime_down: None,
         },
         fonts: fonts(UiFont::System, MonoFont::System, 1.0),
         density: Density::Regular,
@@ -441,6 +458,8 @@ fn solarized_light() -> Theme {
             candle_up: S_GREEN,
             candle_down: S_RED,
             series: [S_BLUE, S_MAGENTA, S_YELLOW, S_CYAN, S_VIOLET, S_ORANGE],
+            regime_up: None,
+            regime_down: None,
         },
         fonts: fonts(UiFont::System, MonoFont::System, 1.0),
         density: Density::Regular,
@@ -481,6 +500,8 @@ fn nord() -> Theme {
                 Hex::rgb(0xd8, 0xde, 0xe9),
                 Hex::rgb(0xd0, 0x87, 0x70),
             ],
+            regime_up: None,
+            regime_down: None,
         },
         fonts: fonts(UiFont::System, MonoFont::System, 1.0),
         density: Density::Regular,
@@ -521,6 +542,8 @@ fn monokai() -> Theme {
                 Hex::rgb(0xf8, 0xf8, 0xf2),
                 Hex::rgb(0xfd, 0x97, 0x1f),
             ],
+            regime_up: None,
+            regime_down: None,
         },
         fonts: fonts(UiFont::System, MonoFont::System, 1.0),
         density: Density::Regular,

@@ -12,8 +12,8 @@ pub(super) fn auto_retry_ready(state: &FeedState) -> bool {
 fn color(state: &FeedState) -> Color32 {
     match state {
         FeedState::Live { .. } => theme::up(),
-        FeedState::Stale { .. } => theme::amber(),
-        FeedState::Unavailable(_) => Color32::from_rgb(225, 74, 83),
+        FeedState::Stale { .. } => theme::caution(),
+        FeedState::Unavailable(_) => theme::alert(),
         _ => theme::muted(),
     }
 }
@@ -205,7 +205,7 @@ impl TerminalApp {
                             p.rect_filled(r, 0.0, theme::up());
                         }
                         Outcome::Failed => {
-                            p.rect_filled(r, 0.0, Color32::from_rgb(225, 74, 83));
+                            p.rect_filled(r, 0.0, theme::alert());
                         }
                         Outcome::None => {
                             p.hline(r.x_range(), r.center().y, Stroke::new(1.0, theme::border()));
@@ -237,7 +237,7 @@ impl TerminalApp {
             let (text, color) = if self.data_mode == DataMode::ExplicitSample {
                 ("SAMPLE · SYNTHETIC", theme::amber())
             } else {
-                ("OFFLINE · NO DATA SOURCE", Color32::from_rgb(225, 74, 83))
+                ("OFFLINE · NO DATA SOURCE", theme::alert())
             };
             p.rect_filled(rect.shrink2(vec2(3.0, 3.0)), 5.0, color);
             p.text(rect.center(), Align2::CENTER_CENTER, text, theme::mono(10.0), Color32::BLACK);

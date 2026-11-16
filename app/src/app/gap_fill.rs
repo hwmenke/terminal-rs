@@ -179,7 +179,7 @@ fn render_gap(ui: &mut Ui, gap: &GapFill) {
             gap.source
         ))
         .font(mono(11.5))
-        .color(if gap.provenance.is_verified() { muted() } else { theme::down() }),
+        .color(theme::provenance(gap.provenance)),
     );
     ui.label(RichText::new(summary_line(gap)).font(mono(12.0)).color(text()));
     for note in &gap.notes {

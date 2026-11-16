@@ -351,19 +351,46 @@ fn render(ui: &mut Ui, r: &CorrReport) {
         ))
         .color(theme::muted()),
     );
-    ui.horizontal_wrapped(|ui| {
-        for (label, value, color) in [
-            ("BETA", number(m.beta), theme::cyan()),
-            ("CORRELATION", number(m.correlation), theme::up()),
-            ("R²", number(m.r_squared), theme::amber()),
-            ("ALPHA / YR", percent(m.alpha_annual), theme::text()),
-        ] {
-            ui.group(|ui| {
-                ui.label(RichText::new(label).font(theme::mono(10.0)).color(theme::muted()));
-                ui.label(RichText::new(value).font(theme::mono(22.0)).strong().color(color));
+    {
+        use crate::widgets::{MathCard, stat_tile_sized};
+        let from = tr_data::stats::bar_date(r.path[0].ts);
+        let to = tr_data::stats::bar_date(r.as_of);
+        let base = |title: &str, formula: &str| {
+            MathCard::new(title, formula)
+                .n(m.n, "common returns")
+                .span(from.clone(), to.clone())
+                .provenance(r.provenance)
+                .source(r.source.clone())
+        };
+        let opt = |card: MathCard, v: Option<f64>| match v {
+            Some(v) => card.value(format!("{v:.3}")),
+            None => card.unavailable("zero variance or too few common returns"),
+        };
+        ui.horizontal_wrapped(|ui| {
+            stat_tile_sized(ui, "BETA", &number(m.beta), theme::text(), 22.0, || {
+                opt(base("BETA", "β = Cov(rₐ, r_b) / Var(r_b)  (OLS slope)"), m.beta)
+                    .input("β SE", number(m.beta_se))
+                    .input("β t", number(m.beta_t))
             });
-        }
-    });
+            let rho_ink = m.correlation.map_or(theme::muted(), theme::sign);
+            stat_tile_sized(ui, "CORRELATION", &number(m.correlation), rho_ink, 22.0, || {
+                opt(base("CORRELATION", "ρ = Cov(rₐ, r_b) / (σₐ σ_b)  (Pearson)"), m.correlation)
+            });
+            stat_tile_sized(ui, "R²", &number(m.r_squared), theme::text(), 22.0, || {
+                opt(base("R²", "R² = 1 − SS_res / SS_tot  (= ρ² for one regressor)"), m.r_squared)
+                    .input("ρ", number(m.correlation))
+            });
+            stat_tile_sized(ui, "ALPHA / YR", &percent(m.alpha_annual), theme::text(), 22.0, || {
+                let card = base("ALPHA / YR", "αₐ = α × P  (OLS intercept, annualised)")
+                    .input("α SE", number(m.alpha_se))
+                    .input("α t", number(m.alpha_t));
+                match m.alpha_annual {
+                    Some(_) => card.value(percent(m.alpha_annual)),
+                    None => card.unavailable("zero variance or too few common returns"),
+                }
+            });
+        });
+    }
     ui.label(
         RichText::new(format!(
             "α SE {}  t {}   ·   β SE {}  t {}   ·   Residual vol / yr {}",
@@ -633,7 +660,17 @@ fn scatter(ui: &mut Ui, r: &CorrReport) {
     }
     ui.label(RichText::new("x: benchmark log return · y: asset log return · band: fitted mean ±2 residual σ (not a confidence interval)").font(theme::ui_font(10.5)).color(theme::muted()));
 }
+fn two_dp(x: f64) -> String {
+    format!("{x:.2}")
+}
+/// Fixed ρ heat scale for the matrix (never auto-scaled).
+fn rho_scale() -> crate::widgets::HeatScale {
+    crate::widgets::HeatScale::diverging(1.0, "ρ", two_dp)
+}
 fn matrix(ui: &mut Ui, m: &maths::Matrix) {
+    use crate::widgets::{MathCard, MathCardExt};
+    let hs = rho_scale();
+    hs.key(ui);
     egui::ScrollArea::horizontal().id_salt("corr-matrix").show(ui, |ui| {
         egui::Grid::new("corr-matrix-grid").spacing(egui::vec2(3.0, 3.0)).show(ui, |ui| {
             ui.label("");
@@ -643,30 +680,30 @@ fn matrix(ui: &mut Ui, m: &maths::Matrix) {
             ui.end_row();
             for (i, row) in m.cells.iter().enumerate() {
                 ui.label(RichText::new(tr_data::security(&m.symbols[i]).ticker).font(theme::mono(10.0)));
-                for cell in row {
-                    let color = cell
-                        .correlation
-                        .map(|r| if r >= 0.0 { theme::up() } else { theme::down() })
-                        .unwrap_or(theme::muted());
-                    let label = format!(
-                        "{}\nn={}",
-                        cell.correlation.map(|v| format!("{v:.2}")).unwrap_or_else(|| "—".into()),
-                        cell.n
-                    );
+                for (j, cell) in row.iter().enumerate() {
+                    let rho = cell.correlation.filter(|v| v.is_finite());
+                    let ink = rho.map_or(theme::muted(), |v| hs.ink(v));
+                    let label = format!("{}\nn={}", rho.map(two_dp).unwrap_or_else(|| "—".into()), cell.n);
                     egui::Frame::new()
-                        .fill(
-                            color.linear_multiply(
-                                cell.correlation.map(|v| 0.10 + 0.35 * v.abs() as f32).unwrap_or(0.06),
-                            ),
-                        )
+                        .fill(hs.fill_gated(rho, true))
                         .inner_margin(5.0)
-                        .show(ui, |ui| ui.label(RichText::new(label).font(theme::mono(10.0)).color(color)))
+                        .show(ui, |ui| ui.label(RichText::new(label).font(theme::mono(10.0)).color(ink)))
                         .inner
-                        .on_hover_text(
-                            cell.reason
-                                .as_deref()
-                                .unwrap_or("Pairwise common endpoints; sample size may differ by pair"),
-                        );
+                        .math_card(|| {
+                            let pair = format!(
+                                "{} / {}",
+                                tr_data::security(&m.symbols[i]).ticker,
+                                tr_data::security(&m.symbols[j]).ticker
+                            );
+                            let card = MathCard::new(format!("ρ {pair}"), "ρ = Cov(rₓ, r_y) / (σₓ σ_y)  (Pearson, log returns)")
+                                .n(cell.n, "common returns")
+                                .note("Pairwise common endpoints; sample size may differ by pair.");
+                            match (rho, &cell.reason) {
+                                (Some(v), _) => card.value(two_dp(v)),
+                                (None, Some(why)) => card.unavailable(why.clone()),
+                                (None, None) => card.unavailable("not computed"),
+                            }
+                        });
                 }
                 ui.end_row();
             }
@@ -901,5 +938,32 @@ mod tests {
             assert!(!output.shapes.is_empty());
             output.textures_delta.clear();
         }
+    }
+    #[test]
+    fn corr_matrix_paints_rho_key_and_keyed_fills() {
+        let cell = |r: Option<f64>, n| maths::MatrixCell { correlation: r, n, reason: r.is_none().then(|| "n<20".into()) };
+        let m = maths::Matrix {
+            symbols: vec!["AAPL".into(), "SPY".into()],
+            cells: vec![vec![cell(Some(1.0), 250), cell(Some(-0.45), 240)], vec![cell(Some(-0.45), 240), cell(None, 3)]],
+            unavailable: vec![],
+        };
+        let ctx = egui::Context::default();
+        let mut out = ctx.run_ui(Default::default(), |ui| matrix(ui, &m));
+        out.textures_delta.clear();
+        let texts: Vec<String> = out
+            .shapes
+            .iter()
+            .filter_map(|s| if let egui::Shape::Text(t) = &s.shape { Some(t.galley.job.text.clone()) } else { None })
+            .collect();
+        let hs = rho_scale();
+        assert_eq!(hs.entries().map(|e| e.1), ["≤−1.00", "−1.00…−0.20", "±0.20", "+0.20…+1.00", "≥+1.00"]);
+        for (_, label) in hs.entries() {
+            assert!(texts.contains(&label), "{label}: {texts:?}");
+        }
+        let fills: Vec<_> =
+            out.shapes.iter().filter_map(|s| if let egui::Shape::Rect(r) = &s.shape { Some(r.fill) } else { None }).collect();
+        assert!(fills.contains(&hs.fill(-0.45)) && fills.contains(&hs.fill(1.0)) && fills.contains(&theme::control()));
+        // Correlation is never printed in the sign colours on the matrix.
+        assert!(!fills.contains(&theme::up()) && !fills.contains(&theme::down()));
     }
 }

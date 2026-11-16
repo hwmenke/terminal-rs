@@ -168,7 +168,7 @@ fn render_chart(ui: &mut Ui, chart: &CompareChart) {
             chart.source
         ))
         .font(mono(11.5))
-        .color(if chart.provenance.is_verified() { muted() } else { theme::down() }),
+        .color(theme::provenance(chart.provenance)),
     );
     for note in &chart.notes {
         ui.label(RichText::new(note).font(ui_font(11.5)).color(amber()));

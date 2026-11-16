@@ -171,7 +171,7 @@ fn render_breadth(ui: &mut Ui, chart: &Breadth) {
             chart.source
         ))
         .font(mono(11.5))
-        .color(if chart.provenance.is_verified() { muted() } else { theme::down() }),
+        .color(theme::provenance(chart.provenance)),
     );
     ui.label(RichText::new(summary_line(chart)).font(mono(12.0)).color(text()));
     for note in &chart.notes {

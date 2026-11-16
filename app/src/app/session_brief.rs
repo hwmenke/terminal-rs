@@ -150,7 +150,7 @@ fn render_brief(ui: &mut Ui, brief: &SessionBrief) {
             if stale { " · last bar is not current" } else { "" }
         ))
         .font(mono(11.5))
-        .color(if brief.provenance.is_verified() { muted() } else { theme::down() }),
+        .color(theme::provenance(brief.provenance)),
     );
     for line in &brief.lines {
         let color = match line.active {
