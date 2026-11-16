@@ -650,6 +650,10 @@ impl PaneKind {
                 shorts: b.allow_short,
                 intraday: b.intraday,
                 tf: b.tf.clone(),
+                honesty: b.honesty,
+                holdout_tables: b.holdout_tables,
+                selected_variant: b.selected_variant,
+                selected_fold: b.selected_fold,
             },
             PaneKind::IntradayCompare(c) => {
                 PaneSettings::IntradayCompare { symbol: c.symbol.clone(), peers: c.peers.clone(), tf: c.tf.clone() }
@@ -829,7 +833,20 @@ impl PaneKind {
             PaneSettings::Stats { symbol, condition, conditional } => {
                 PaneKind::Stats(Box::new(stats::StatsPane::new(symbol, condition, conditional)))
             }
-            PaneSettings::Backtest { symbol, spec, holdout, commission, slippage, shorts, intraday, tf } => {
+            PaneSettings::Backtest {
+                symbol,
+                spec,
+                holdout,
+                commission,
+                slippage,
+                shorts,
+                intraday,
+                tf,
+                honesty,
+                holdout_tables,
+                selected_variant,
+                selected_fold,
+            } => {
                 let mut pane = if intraday {
                     backtest::BacktestPane::intraday(symbol, spec)
                 } else {
@@ -839,6 +856,10 @@ impl PaneKind {
                 pane.commission = commission;
                 pane.slippage = slippage;
                 pane.allow_short = shorts;
+                pane.honesty = honesty;
+                pane.holdout_tables = holdout_tables;
+                pane.selected_variant = selected_variant;
+                pane.selected_fold = selected_fold;
                 if !tf.is_empty() {
                     pane.tf = tf;
                 }
@@ -1969,12 +1990,16 @@ impl TerminalApp {
                     }
                 }
                 Response::StudioCorr { pane, generation, result } => {
-                    if let Some(PaneKind::StudioCorr(s)) = self.panes.iter_mut().find(|p| p.id == pane).map(|p| &mut p.kind) {
+                    if let Some(PaneKind::StudioCorr(s)) =
+                        self.panes.iter_mut().find(|p| p.id == pane).map(|p| &mut p.kind)
+                    {
                         s.accept(generation, result);
                     }
                 }
                 Response::StudioSeason { pane, generation, result } => {
-                    if let Some(PaneKind::StudioSeason(s)) = self.panes.iter_mut().find(|p| p.id == pane).map(|p| &mut p.kind) {
+                    if let Some(PaneKind::StudioSeason(s)) =
+                        self.panes.iter_mut().find(|p| p.id == pane).map(|p| &mut p.kind)
+                    {
                         s.accept(generation, result);
                     }
                 }
@@ -1982,6 +2007,15 @@ impl TerminalApp {
                     if let Some(PaneKind::Stats(s)) = self.panes.iter_mut().find(|p| p.id == pane).map(|p| &mut p.kind)
                     {
                         s.accept(generation, result);
+                    }
+                }
+                Response::BacktestTrialRevision { scope, revision } => {
+                    for pane in &mut self.panes {
+                        if let PaneKind::Backtest(b) = &mut pane.kind
+                            && b.note_revision(&scope, revision)
+                        {
+                            b.request(pane.id, &self.worker);
+                        }
                     }
                 }
                 Response::Backtest { pane, generation, result } => {
@@ -2529,6 +2563,9 @@ impl TerminalApp {
         if !cmd_focused && !self.focus_cmd && self.cmd.is_empty() && self.handoff_keys(ctx) {
             return;
         }
+        if !cmd_focused && !self.focus_cmd && self.cmd.is_empty() && self.backtest_keys(ctx) {
+            return;
+        }
         if !cmd_focused && !self.focus_cmd && self.cmd.is_empty() && self.clock_keys(ctx) {
             return;
         }
@@ -3054,8 +3091,9 @@ mod tests {
         use std::sync::atomic::{AtomicU64, Ordering};
         static NEXT: AtomicU64 = AtomicU64::new(0);
         let dir = std::env::temp_dir().join(format!(
-            "terminal-rs-bar-{}-{}",
+            "terminal-rs-bar-{}-{}-{}",
             std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos(),
             NEXT.fetch_add(1, Ordering::Relaxed)
         ));
         let (worker, _) = Worker::test_channel();
@@ -3272,6 +3310,10 @@ mod tests {
                 shorts: false,
                 intraday: false,
                 tf: String::new(),
+                honesty: Default::default(),
+                holdout_tables: false,
+                selected_variant: 0,
+                selected_fold: 0,
             },
             {
                 let mut c = ChartState::new(0, "AAPL", tr_core::Timeframe::D1);

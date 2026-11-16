@@ -413,14 +413,18 @@ pub enum Function {
         timeframe: Timeframe,
     },
     /// Relationship Studio: benchmark OLS and correlation.
-    StudioCorr { spec: String },
+    StudioCorr {
+        spec: String,
+    },
     /// Historical risk/return and conditional forward returns (`STATS`, `AAPL COND RSI < 30`).
     Stats {
         condition: String,
         conditional: bool,
     },
     /// Calendar seasonality on verified daily or intraday history.
-    StudioSeason { spec: String },
+    StudioSeason {
+        spec: String,
+    },
     /// Paper strategy backtest vs buy-and-hold (`BACKTEST`, `AAPL BT ADTREND`).
     Backtest {
         spec: String,
@@ -959,6 +963,12 @@ pub fn parse(input: &str) -> Option<Command> {
     if input.len() > MAX_INPUT_BYTES {
         return None;
     }
+    let input = input.trim();
+    let input = if input.get(input.len().saturating_sub(4)..).is_some_and(|t| t.eq_ignore_ascii_case("<GO>")) {
+        &input[..input.len() - 4]
+    } else {
+        input
+    };
     let tokens: Vec<&str> = input.split_whitespace().filter(|t| !t.eq_ignore_ascii_case("<GO>")).collect();
     let (&head, rest) = tokens.split_first()?;
     // `<TICKER> <YELLOW KEY>` is always a security, even if the ticker spells a function.
@@ -1214,11 +1224,11 @@ fn describe(f: &Function) -> String {
             timeframe.label()
         ),
         Function::Backtest { spec } if spec.is_empty() => {
-            "Paper backtest: declared strategies vs buy-and-hold on a chronological holdout".into()
+            "Honest backtest: DSR, purged walk-forward and holdout tables vs buy-and-hold".into()
         }
         Function::Backtest { spec } => format!("Paper backtest vs buy-and-hold ({spec})"),
         Function::IntradayBacktest { spec } if spec.is_empty() => {
-            "Paper intraday backtest: session VWAP and opening range vs holding the cash session".into()
+            "Honest intraday backtest: DSR and session walk-forward vs session hold".into()
         }
         Function::IntradayBacktest { spec } => format!("Paper intraday backtest ({spec})"),
         Function::IntradayCompare { spec } if spec.is_empty() => {
@@ -1334,9 +1344,18 @@ mod tests {
         for alias in ["CORR", "RBETA"] {
             assert_eq!(parse(alias), Some(Command::Function(Function::StudioCorr { spec: String::new() })));
         }
-        assert_eq!(parse("AAPL CORR"), Some(Command::SymbolFunction("AAPL US Equity".into(), Function::StudioCorr { spec: String::new() })));
-        assert_eq!(parse("AAPL CORR QQQ"), Some(Command::SymbolFunction("AAPL US Equity".into(), Function::StudioCorr { spec: "QQQ".into() })));
-        assert_eq!(parse("AAPL RBETA QQQ 1H"), Some(Command::SymbolFunction("AAPL US Equity".into(), Function::StudioCorr { spec: "QQQ 1H".into() })));
+        assert_eq!(
+            parse("AAPL CORR"),
+            Some(Command::SymbolFunction("AAPL US Equity".into(), Function::StudioCorr { spec: String::new() }))
+        );
+        assert_eq!(
+            parse("AAPL CORR QQQ"),
+            Some(Command::SymbolFunction("AAPL US Equity".into(), Function::StudioCorr { spec: "QQQ".into() }))
+        );
+        assert_eq!(
+            parse("AAPL RBETA QQQ 1H"),
+            Some(Command::SymbolFunction("AAPL US Equity".into(), Function::StudioCorr { spec: "QQQ 1H".into() }))
+        );
     }
 
     #[test]
@@ -1391,7 +1410,11 @@ mod tests {
                 "{with_args}"
             );
             // Market-suffix forms load the ticker.
-            for text in [format!("{word} US Equity"), format!("{word} Equity"), format!("{} us equity <GO>", word.to_lowercase())] {
+            for text in [
+                format!("{word} US Equity"),
+                format!("{word} Equity"),
+                format!("{} us equity <GO>", word.to_lowercase()),
+            ] {
                 assert_eq!(parse(&text), Some(Command::Symbol(key.clone())), "{text}");
             }
             assert_eq!(
@@ -1400,7 +1423,9 @@ mod tests {
                 "{word} US Equity 1h"
             );
             // The ticker's own Studio pane.
-            assert!(matches!(parse(&format!("{word} US Equity DIST")), Some(Command::SymbolFunction(k, Function::StudioDist { .. })) if k == key));
+            assert!(
+                matches!(parse(&format!("{word} US Equity DIST")), Some(Command::SymbolFunction(k, Function::StudioDist { .. })) if k == key)
+            );
             // Arguments that are not Studio arguments load the ticker with an interval.
             assert_eq!(
                 parse(&format!("{word} 1W")),
@@ -1410,7 +1435,10 @@ mod tests {
         }
         assert_eq!(parse("CORR QQQ 1H"), Some(Command::Function(Function::StudioCorr { spec: "QQQ 1H".into() })));
         assert_eq!(parse("SSN 1h"), Some(Command::Function(Function::StudioSeason { spec: "1h".into() })));
-        assert_eq!(parse("SEASON 4H"), Some(Command::SymbolFunction("SEASON US Equity".into(), Function::Timeframe(Timeframe::H4))));
+        assert_eq!(
+            parse("SEASON 4H"),
+            Some(Command::SymbolFunction("SEASON US Equity".into(), Function::Timeframe(Timeframe::H4)))
+        );
         assert_eq!(parse("RDIST 1D"), Some(Command::Function(Function::StudioDist { timeframe: Timeframe::D1 })));
         for word in ["DIST", "RDIST", "SEASON", "SSN", "CORR", "RBETA"] {
             assert!(hint(word).contains(&format!("{word} US Equity")), "{word}");
@@ -1808,10 +1836,19 @@ mod tests {
         for alias in ["DIST", "RDIST", "dist"] {
             assert_eq!(parse(alias), Some(Command::Function(Function::StudioDist { timeframe: Timeframe::D1 })));
         }
-        assert_eq!(parse("AAPL DIST"), Some(Command::SymbolFunction("AAPL US Equity".into(), Function::StudioDist { timeframe: Timeframe::D1 })));
+        assert_eq!(
+            parse("AAPL DIST"),
+            Some(Command::SymbolFunction("AAPL US Equity".into(), Function::StudioDist { timeframe: Timeframe::D1 }))
+        );
         assert_eq!(parse("DIST 1H"), Some(Command::Function(Function::StudioDist { timeframe: Timeframe::H1 })));
-        assert_eq!(parse("AAPL RDIST 30m"), Some(Command::SymbolFunction("AAPL US Equity".into(), Function::StudioDist { timeframe: Timeframe::M30 })));
-        assert_eq!(parse("AAPL US Equity DIST 1m"), Some(Command::SymbolFunction("AAPL US Equity".into(), Function::StudioDist { timeframe: Timeframe::M1 })));
+        assert_eq!(
+            parse("AAPL RDIST 30m"),
+            Some(Command::SymbolFunction("AAPL US Equity".into(), Function::StudioDist { timeframe: Timeframe::M30 }))
+        );
+        assert_eq!(
+            parse("AAPL US Equity DIST 1m"),
+            Some(Command::SymbolFunction("AAPL US Equity".into(), Function::StudioDist { timeframe: Timeframe::M1 }))
+        );
         for invalid in ["AAPL DIST 1W", "AAPL DIST nonsense", "AAPL DIST 1H junk"] {
             assert_eq!(parse(invalid), None);
         }
@@ -1888,9 +1925,18 @@ mod tests {
         assert_eq!(parse("SEASON"), Some(Command::Function(Function::StudioSeason { spec: String::new() })));
         assert_eq!(parse("SSN"), Some(Command::Function(Function::StudioSeason { spec: String::new() })));
         assert_eq!(parse("SEASON 1H"), Some(Command::Function(Function::StudioSeason { spec: "1H".into() })));
-        assert_eq!(parse("AAPL SEASON"), Some(Command::SymbolFunction("AAPL US Equity".into(), Function::StudioSeason { spec: String::new() })));
-        assert_eq!(parse("AAPL SEASON 30M"), Some(Command::SymbolFunction("AAPL US Equity".into(), Function::StudioSeason { spec: "30M".into() })));
-        assert_eq!(parse("AAPL SSN 30M"), Some(Command::SymbolFunction("AAPL US Equity".into(), Function::StudioSeason { spec: "30M".into() })));
+        assert_eq!(
+            parse("AAPL SEASON"),
+            Some(Command::SymbolFunction("AAPL US Equity".into(), Function::StudioSeason { spec: String::new() }))
+        );
+        assert_eq!(
+            parse("AAPL SEASON 30M"),
+            Some(Command::SymbolFunction("AAPL US Equity".into(), Function::StudioSeason { spec: "30M".into() }))
+        );
+        assert_eq!(
+            parse("AAPL SSN 30M"),
+            Some(Command::SymbolFunction("AAPL US Equity".into(), Function::StudioSeason { spec: "30M".into() }))
+        );
         assert_eq!(parse("EXPORT STATS"), Some(Command::Function(Function::Export(ExportKind::Stats, String::new()))));
         assert_eq!(parse("BACKTEST"), Some(Command::Function(Function::Backtest { spec: String::new() })));
         assert_eq!(
@@ -2340,5 +2386,20 @@ mod auction_tests {
         assert!(matches!(parse("ZZZQ"), Some(Command::Symbol(_))));
         assert!(tr_core::catalog::lookup("AUCTION", None).is_none());
         assert!(tr_core::catalog::lookup("AMAP", None).is_none());
+    }
+    #[test]
+    fn honest_backtest_words_remain_explicit_tickers() {
+        for word in ["BT", "IBT", "BACKTEST", "BTEST", "IBACKTEST", "SETUPBT", "DSR", "WF", "HONEST"] {
+            let key = format!("{word} US Equity");
+            for text in
+                [key.clone(), format!("{} us equity <GO>", word.to_lowercase()), format!("{word} US Equity<GO>")]
+            {
+                assert_eq!(parse(&text), Some(Command::Symbol(key.clone())), "{text}");
+            }
+            assert_eq!(
+                parse(&format!("{key} 1h")),
+                Some(Command::SymbolFunction(key, Function::Timeframe(Timeframe::H1)))
+            );
+        }
     }
 }

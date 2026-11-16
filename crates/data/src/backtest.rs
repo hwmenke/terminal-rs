@@ -70,9 +70,10 @@ impl CostModel {
 }
 
 /// Fill assumption. Always stated with results.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum FillRule {
     /// Decision after bar *i* close; order fills at bar *i+1* open.
+    #[default]
     NextOpen,
 }
 
@@ -83,12 +84,6 @@ impl FillRule {
                 "next session open (signal after the prior close; no same-bar fill, no close-to-close lookahead)"
             }
         }
-    }
-}
-
-impl Default for FillRule {
-    fn default() -> Self {
-        Self::NextOpen
     }
 }
 
@@ -224,7 +219,7 @@ pub fn parse_strategies(line: &str, allow_short: bool) -> Result<Vec<StrategySpe
         return Ok(default_strategies(allow_short));
     }
     let mut out = Vec::new();
-    for chunk in raw.split(|c: char| c == ',' || c == ';' || c == '|') {
+    for chunk in raw.split([',', ';', '|']) {
         let chunk = chunk.trim();
         if chunk.is_empty() {
             continue;
@@ -340,6 +335,8 @@ pub struct BacktestReport {
     pub evaluate_bars: usize,
     pub train_bars: usize,
     pub results: Vec<StrategyResult>,
+    #[serde(default)]
+    pub honesty: Option<crate::backtest_honesty::HonestReport>,
 }
 
 #[derive(Clone)]
@@ -353,6 +350,7 @@ struct OpenTrade {
 struct Sim {
     cash: f64,
     qty: f64,
+    labels: Vec<crate::backtest_honesty::HoldingLabel>,
     completed: Vec<CompletedTrade>,
     open: Option<OpenTrade>,
     equity: Vec<Option<f64>>,
@@ -366,6 +364,7 @@ impl Sim {
         Self {
             cash: 1.0,
             qty: 0.0,
+            labels: Vec::new(),
             completed: Vec::new(),
             open: None,
             equity: vec![None; n],
@@ -394,6 +393,13 @@ impl Sim {
             self.qty = 0.0;
             return;
         };
+        self.labels.push(crate::backtest_honesty::HoldingLabel {
+            decision_ts: daily_close(bars[open.entry_i.saturating_sub(1)].ts),
+            entry_ts: daily_open(bars[open.entry_i].ts),
+            exit_ts: Some(if fill.is_finite() { daily_open(bars[i].ts) } else { bars[i].ts }),
+            first_return: open.entry_i,
+            last_return: i,
+        });
         let proceeds = self.qty * fill;
         self.cash += proceeds;
         self.qty = 0.0;
@@ -407,7 +413,6 @@ impl Sim {
             ret,
             bars_held: i.saturating_sub(open.entry_i).max(1),
         });
-        let _ = bars;
     }
 
     fn open_side(&mut self, side: i8, fill: f64, date: &str, i: usize) {
@@ -490,6 +495,9 @@ fn simulate(bars: &[Bar], targets: &[i8], costs: CostModel, start: usize, end: u
                 }
             }
             prev_eq = Some(eq);
+            if !eq.is_finite() || eq <= 0.0 {
+                break;
+            }
         }
     }
     sim
@@ -577,10 +585,12 @@ fn targets_for(spec: &StrategySpec, bars: &[Bar], allow_short: bool) -> Result<V
     match spec {
         StrategySpec::BuyAndHold => Ok(vec![1; n]),
         StrategySpec::AdaptiveTrend { long_only, atr_n, confirm, method } => {
-            let mut p = AdaptiveTrendParams::default();
-            p.atr_n = (*atr_n).max(1);
-            p.confirm_mult = *confirm;
-            p.method = tr_core::indicators::AdaptiveMethod::from_param(*method);
+            let p = AdaptiveTrendParams {
+                atr_n: (*atr_n).max(1),
+                confirm_mult: *confirm,
+                method: tr_core::indicators::AdaptiveMethod::from_param(*method),
+                ..Default::default()
+            };
             let trend = adaptive_trend_research(bars, p)?;
             Ok(trend
                 .medium_state
@@ -768,6 +778,121 @@ pub fn compute_report(
         evaluate_bars: n - eval_start,
         train_bars: eval_start,
         results,
+        honesty: None,
+    })
+}
+
+/// Archive bars are UTC date stamps, not New York midnight.
+fn daily_day(ts: i64) -> chrono::NaiveDate {
+    chrono::DateTime::from_timestamp(ts, 0).unwrap().date_naive()
+}
+fn daily_open(ts: i64) -> i64 {
+    tr_core::ny::to_utc(daily_day(ts).and_hms_opt(9, 30, 0).unwrap())
+}
+pub(crate) fn daily_close(ts: i64) -> i64 {
+    let d = daily_day(ts);
+    let close = crate::intraday::close_minute(d);
+    tr_core::ny::to_utc(d.and_hms_opt(close / 60, close % 60, 0).unwrap())
+}
+/// First scoreable fill after causal signal warm-up. Adaptive medium state uses
+/// short/medium ER, a medium slope, ATR and sticky state; no long-leg dependency.
+pub fn strategy_warmup(spec: &StrategySpec) -> usize {
+    match spec {
+        StrategySpec::BuyAndHold => 1,
+        StrategySpec::AdaptiveTrend { atr_n, .. } => 21.max(*atr_n),
+        StrategySpec::SmaCross { fast, slow } => *slow.max(fast),
+        StrategySpec::RsiReversion { period, .. } => period.saturating_add(1),
+    }
+}
+pub(crate) fn honest_evaluation(
+    bars: &[Bar],
+    spec: &StrategySpec,
+    costs: CostModel,
+    allow_short: bool,
+    protocol: &crate::backtest_trials::Protocol,
+) -> Result<crate::backtest_honesty::Evaluation, crate::backtest_honesty::Reason> {
+    use crate::backtest_honesty::{self as h, HoldingLabel, Reason, ReturnPoint, Tape};
+    require_backtest_bars(bars, "Honest backtest").map_err(Reason::ReplayFailed)?;
+    h::validate_daily(bars)?;
+    if !costs.commission_bps.is_finite()
+        || !costs.slippage_bps.is_finite()
+        || costs.commission_bps < 0.
+        || costs.slippage_bps < 0.
+        || costs.per_side_frac() >= 1.
+        || strategy_warmup(spec) > 10_000
+    {
+        return Err(Reason::InvalidSettings);
+    }
+    // Reject unsupported/nonfinite parameters before computing indicators.
+    match spec {
+        StrategySpec::AdaptiveTrend { atr_n, confirm, method, .. }
+            if *atr_n == 0 || !confirm.is_finite() || !method.is_finite() =>
+        {
+            return Err(Reason::InvalidSettings);
+        }
+        StrategySpec::SmaCross { fast, slow } if *fast == 0 || slow <= fast => return Err(Reason::InvalidSettings),
+        StrategySpec::RsiReversion { period, oversold, overbought }
+            if *period < 2 || !oversold.is_finite() || !overbought.is_finite() =>
+        {
+            return Err(Reason::InvalidSettings);
+        }
+        _ => {}
+    }
+    let units: Vec<_> = bars
+        .iter()
+        .map(|b| ReturnPoint {
+            session_date: bar_date(b.ts),
+            period_start: daily_open(b.ts),
+            period_end: daily_close(b.ts),
+            net_return: 0.,
+        })
+        .collect();
+    h::evaluate_protocol(&units, strategy_warmup(spec), false, protocol, |start, end, liquidate| {
+        // Prefix-only signal construction is deliberate: training never inspects
+        // a later exit or even invokes an indicator on its test bars.
+        let prefix = &bars[..end];
+        let targets = targets_for(spec, prefix, allow_short).map_err(Reason::ReplayFailed)?;
+        let mut sim = simulate(prefix, &targets, costs, start, end - 1);
+        if liquidate && sim.open.is_some() {
+            sim.flatten(
+                prefix,
+                end - 1,
+                fill_for_action(bars[end - 1].close, sim.side(), 0, costs.per_side_frac()),
+                &bar_date(bars[end - 1].ts),
+            );
+            if let Some(label) = sim.labels.last_mut() {
+                label.exit_ts = Some(daily_close(bars[end - 1].ts));
+            }
+            sim.equity[end - 1] = Some(sim.cash);
+        }
+        let mut returns = Vec::with_capacity(end - start);
+        let mut previous = 1.;
+        for (i, unit) in units.iter().enumerate().take(end).skip(start) {
+            let equity = sim.equity[i].ok_or(Reason::Ruin)?;
+            if !equity.is_finite() || equity <= 0. {
+                return Err(Reason::Ruin);
+            }
+            let r = equity / previous - 1.;
+            if !r.is_finite() {
+                return Err(Reason::InvalidNumeric);
+            }
+            returns.push(ReturnPoint { net_return: r, ..unit.clone() });
+            previous = equity;
+        }
+        if let Some(open) = sim.open {
+            sim.labels.push(HoldingLabel {
+                decision_ts: daily_close(bars[open.entry_i.saturating_sub(1)].ts),
+                entry_ts: daily_open(bars[open.entry_i].ts),
+                exit_ts: None,
+                first_return: open.entry_i,
+                last_return: end - 1,
+            });
+        }
+        for label in &mut sim.labels {
+            label.first_return = label.first_return.saturating_sub(start);
+            label.last_return = label.last_return.saturating_sub(start);
+        }
+        Ok(Tape { returns, labels: sim.labels })
     })
 }
 

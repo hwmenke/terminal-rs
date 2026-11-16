@@ -1,9 +1,12 @@
 //! Strategy backtest pane (`BACKTEST`, `BT`) versus buy-and-hold.
+mod honesty;
 use super::{PaneKind, TerminalApp};
 use crate::theme::{self, amber, mono, muted, text, ui_font};
 use crate::{congress_view::Action, dock::PaneId, worker::Request};
 use egui::{RichText, ScrollArea, Ui};
+use std::{collections::BTreeMap, sync::Arc};
 use tr_data::backtest::{self, BacktestReport, StrategyResult};
+use tr_data::backtest_honesty::{HonestReport, HonestySettings};
 
 pub struct BacktestPane {
     pub symbol: String,
@@ -17,10 +20,29 @@ pub struct BacktestPane {
     /// Intraday bar size. Empty on a daily archive backtest.
     pub tf: String,
     pub generation: u64,
-    pub report: Option<BacktestReport>,
-    pub intraday_report: Option<tr_data::intraday_backtest::IntradayReport>,
+    pub report: Option<Arc<BacktestReport>>,
+    pub intraday_report: Option<Arc<tr_data::intraday_backtest::IntradayReport>>,
+    pub honesty: HonestySettings,
+    pub holdout_tables: bool,
+    pub selected_variant: usize,
+    pub selected_fold: usize,
+    pub receipt: String,
+    snapshot: Option<Controls>,
+    revisions: BTreeMap<String, u64>,
     pub loading: bool,
     pub error: Option<String>,
+}
+
+#[derive(Clone, PartialEq)]
+struct Controls {
+    symbol: String,
+    strategies: String,
+    holdout: String,
+    commission: String,
+    slippage: String,
+    shorts: bool,
+    tf: String,
+    honesty: HonestySettings,
 }
 
 impl BacktestPane {
@@ -45,6 +67,13 @@ impl BacktestPane {
             allow_short: false,
             intraday,
             tf: if intraday { "5m".into() } else { String::new() },
+            honesty: HonestySettings::default(),
+            holdout_tables: false,
+            selected_variant: 0,
+            selected_fold: 0,
+            receipt: String::new(),
+            snapshot: None,
+            revisions: BTreeMap::new(),
             generation: 0,
             report: None,
             intraday_report: None,
@@ -53,13 +82,17 @@ impl BacktestPane {
         }
     }
 
-    pub fn accept(&mut self, generation: u64, result: Result<BacktestReport, String>) {
+    pub fn accept(&mut self, generation: u64, result: Result<(Arc<BacktestReport>, String), String>) {
         if generation != self.generation {
             return;
         }
         self.loading = false;
         match result {
-            Ok(report) => {
+            Ok((report, receipt)) => {
+                if self.stale_family(report.honesty.as_ref()) {
+                    return;
+                }
+                self.receipt = receipt;
                 if let Err(e) = report.provenance.require_verified("Backtest") {
                     self.error = Some(e);
                     self.report = None;
@@ -78,14 +111,18 @@ impl BacktestPane {
     pub fn accept_intraday(
         &mut self,
         generation: u64,
-        result: Result<tr_data::intraday_backtest::IntradayReport, String>,
+        result: Result<(Arc<tr_data::intraday_backtest::IntradayReport>, String), String>,
     ) {
         if generation != self.generation {
             return;
         }
         self.loading = false;
         match result {
-            Ok(report) => {
+            Ok((report, receipt)) => {
+                if self.stale_family(report.honesty.as_ref()) {
+                    return;
+                }
+                self.receipt = receipt;
                 if let Err(e) = report.provenance.require_verified("Intraday backtest") {
                     self.error = Some(e);
                     self.intraday_report = None;
@@ -101,7 +138,35 @@ impl BacktestPane {
         }
     }
 
+    fn controls(&self) -> Controls {
+        Controls {
+            symbol: self.symbol.clone(),
+            strategies: self.strategies.clone(),
+            holdout: self.holdout.clone(),
+            commission: self.commission.clone(),
+            slippage: self.slippage.clone(),
+            shorts: self.allow_short,
+            tf: self.tf.clone(),
+            honesty: self.honesty,
+        }
+    }
+    fn stale_family(&self, honest: Option<&HonestReport>) -> bool {
+        honest
+            .and_then(|h| h.trial_family.value())
+            .is_some_and(|f| self.revisions.get(&f.scope).is_some_and(|r| *r > f.revision))
+    }
+    pub(super) fn note_revision(&mut self, scope: &str, revision: u64) -> bool {
+        let floor = self.revisions.entry(scope.into()).or_default();
+        *floor = (*floor).max(revision);
+        let honest = self
+            .report
+            .as_ref()
+            .and_then(|r| r.honesty.as_ref())
+            .or_else(|| self.intraday_report.as_ref().and_then(|r| r.honesty.as_ref()));
+        self.stale_family(honest) && !self.loading
+    }
     pub fn request(&mut self, pane: PaneId, worker: &crate::worker::Worker) {
+        self.snapshot = Some(self.controls());
         let symbol = self.symbol.trim();
         if symbol.is_empty() {
             self.error = Some(if self.intraday {
@@ -130,6 +195,7 @@ impl BacktestPane {
                 commission_bps,
                 slippage_bps,
                 allow_short: self.allow_short,
+                honesty: self.honesty,
             });
         } else {
             worker.send(Request::Backtest {
@@ -141,6 +207,7 @@ impl BacktestPane {
                 commission_bps,
                 slippage_bps,
                 allow_short: self.allow_short,
+                honesty: self.honesty,
             });
         }
     }
@@ -288,6 +355,28 @@ impl TerminalApp {
                 }
             });
 
+            ui.horizontal_wrapped(|ui| {
+                ui.label(RichText::new("Folds").color(muted()));
+                ui.add(egui::DragValue::new(&mut pane.honesty.folds).range(2..=6));
+                ui.label(RichText::new("Embargo sessions").color(muted()));
+                ui.add(egui::DragValue::new(&mut pane.honesty.embargo_sessions).range(0..=252));
+                if ui.selectable_label(!pane.holdout_tables, "Honest").clicked() {
+                    pane.holdout_tables = false;
+                }
+                if ui.selectable_label(pane.holdout_tables, "Holdout tables").clicked() {
+                    pane.holdout_tables = true;
+                }
+            });
+            if pane.snapshot.as_ref().is_some_and(|s| *s != pane.controls()) {
+                ui.label(
+                    RichText::new("CONTROLS CHANGED · RUN to apply. Evidence below uses the accepted run settings.")
+                        .color(amber())
+                        .font(mono(11.0)),
+                );
+            }
+            if !pane.receipt.is_empty() {
+                ui.label(RichText::new(&pane.receipt).color(muted()).font(mono(11.0)));
+            }
             if let Some(err) = &pane.error {
                 ui.label(RichText::new(err).font(mono(12.0)).color(theme::down()));
             } else if pane.loading {
@@ -302,19 +391,45 @@ impl TerminalApp {
                 );
             }
 
-            if intraday {
-                if let Some(report) = &pane.intraday_report {
-                    render_intraday(ui, report);
+            if sample_offline {
+                // A provider-mode switch must not leave prior confidence visible
+                // while its refusal response is still in flight.
+            } else if pane.holdout_tables {
+                if intraday {
+                    if let Some(report) = &pane.intraday_report {
+                        render_intraday(ui, report);
+                    }
+                } else if let Some(report) = &pane.report {
+                    render_report(ui, report);
                 }
-            } else if let Some(report) = &pane.report {
-                render_report(ui, report);
+            } else {
+                let honest = pane
+                    .report
+                    .as_ref()
+                    .and_then(|r| r.honesty.as_ref())
+                    .or_else(|| pane.intraday_report.as_ref().and_then(|r| r.honesty.as_ref()));
+                if let Some(h) = honest {
+                    let accepted_symbol = pane
+                        .report
+                        .as_ref()
+                        .map(|r| r.symbol.as_str())
+                        .or_else(|| pane.intraday_report.as_ref().map(|r| r.symbol.as_str()))
+                        .unwrap_or("");
+                    ui.label(RichText::new(format!("Evidence: {accepted_symbol}")).strong().color(text()));
+                    let settings_line = pane
+                        .report
+                        .as_ref()
+                        .map(|r| r.settings_line.as_str())
+                        .or_else(|| pane.intraday_report.as_ref().map(|r| r.settings_line.as_str()))
+                        .unwrap_or("");
+                    ui.label(RichText::new(settings_line).color(muted()).font(mono(11.0)));
+                    honesty::render(ui, h, &mut pane.selected_variant, &mut pane.selected_fold);
+                }
             }
         }
 
-        if reload {
-            if let PaneKind::Backtest(pane) = &mut self.panes[i].kind {
-                pane.request(id, &self.worker);
-            }
+        if reload && let PaneKind::Backtest(pane) = &mut self.panes[i].kind {
+            pane.request(id, &self.worker);
         }
         if export {
             actions.push(Action::Command("EXPORT BACKTEST".into()));
@@ -614,7 +729,7 @@ mod tests {
             crate::command::parse("AAPL BT ADTREND"),
             Some(Command::SymbolFunction("AAPL US Equity".into(), Function::Backtest { spec: "ADTREND".into() }))
         );
-        assert_eq!(parse_alias("BT"), true);
+        assert!(parse_alias("BT"));
     }
 
     #[test]
@@ -654,7 +769,7 @@ mod tests {
         pane.generation = 1;
         let mut report = intraday_dummy();
         report.provenance = tr_core::Provenance::Sample;
-        pane.accept_intraday(1, Ok(report));
+        pane.accept_intraday(1, Ok((Arc::new(report), String::new())));
         assert!(pane.intraday_report.is_none());
         assert!(pane.error.as_deref().unwrap().contains("SAMPLE"));
     }
@@ -698,7 +813,7 @@ mod tests {
         pane.generation = 1;
         let mut report = dummy_report();
         report.provenance = tr_core::Provenance::Sample;
-        pane.accept(1, Ok(report));
+        pane.accept(1, Ok((Arc::new(report), String::new())));
         assert!(pane.report.is_none());
         assert!(pane.error.as_deref().unwrap().contains("SAMPLE"));
     }
@@ -713,5 +828,213 @@ mod tests {
             .collect();
         let settings = backtest::RunSettings::default().with_strategies(vec![backtest::StrategySpec::BuyAndHold]);
         backtest::compute_report("AAPL US Equity", "AAPL", &bars, &settings, "unit").unwrap()
+    }
+    pub(super) fn honest_report() -> Arc<BacktestReport> {
+        use tr_data::{
+            backtest_honesty::Estimate,
+            backtest_trials::{self, FamilySnapshot, Trial},
+        };
+        let mut date = "2025-01-02".parse().unwrap();
+        let mut bars = Vec::new();
+        for i in 0..180 {
+            let p = 100. + i as f64 * 0.1 + (i as f64 * 0.4).sin() * 3.;
+            bars.push(
+                tr_core::Bar::new(
+                    chrono::NaiveDate::and_hms_opt(&date, 0, 0, 0).unwrap().and_utc().timestamp(),
+                    p,
+                    p + 1.,
+                    p - 1.,
+                    p + 0.3,
+                    100.,
+                )
+                .with_provenance(tr_core::Provenance::Real),
+            );
+            date = tr_data::history::calendar::next_session(date);
+        }
+        let settings = backtest::RunSettings::default().with_strategies(vec![
+            backtest::StrategySpec::BuyAndHold,
+            backtest::StrategySpec::SmaCross { fast: 3, slow: 8 },
+        ]);
+        let wf = HonestySettings::default();
+        let experiments = backtest_trials::daily_experiments(&settings, wf);
+        let family = FamilySnapshot {
+            scope: "AAPL / BT / 1D / verified fixture".into(),
+            revision: 4,
+            tracked_since: bars[0].ts,
+            digest: "fixture".into(),
+            trials: experiments
+                .iter()
+                .map(|e| Trial {
+                    id: e.canonical(),
+                    experiment: e.clone(),
+                    first_seen: bars[0].ts,
+                    original_digest: "fixture".into(),
+                    original_start: bars[0].ts,
+                    original_end: bars.last().unwrap().ts,
+                    status: "computed".into(),
+                })
+                .collect(),
+        };
+        let mut report =
+            backtest::compute_report("AAPL US Equity", "AAPL", &bars, &settings, "verified fixture").unwrap();
+        report.honesty = Some(backtest_trials::compute(
+            &bars,
+            tr_core::Timeframe::D1,
+            wf,
+            &experiments,
+            Estimate::Available(family),
+            "VERIFIED fixture".into(),
+        ));
+        Arc::new(report)
+    }
+    #[test]
+    fn honest_backtest_paint_has_all_evidence_and_never_requests_again() {
+        let mut app = test_app();
+        app.open_backtest(Some("AAPL"), "ALL");
+        app.provider = "verified fixture".into();
+        let id = app.focus;
+        let i = app.idx(id).unwrap();
+        let (worker, mut requests) = crate::worker::Worker::test_channel();
+        app.worker = worker;
+        let PaneKind::Backtest(p) = &mut app.panes[i].kind else { panic!("backtest") };
+        p.report = Some(honest_report());
+        p.selected_variant = 1;
+        let ctx = egui::Context::default();
+        for width in [900., 360.] {
+            let mut output = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(width, 1800.))),
+                    ..Default::default()
+                },
+                |ui| {
+                    app.backtest_pane(ui, id);
+                },
+            );
+            let texts = output
+                .shapes
+                .iter()
+                .filter_map(
+                    |s| if let egui::Shape::Text(t) = &s.shape { Some(t.galley.job.text.as_str()) } else { None },
+                )
+                .collect::<Vec<_>>()
+                .join("\n");
+            for label in ["OOS EQUITY", "FOLD RIBBON", "DSR", "IS vs OOS", "COMMON COMPARISON", "FULL STITCHED OOS"] {
+                assert!(texts.contains(label), "missing {label} at {width}");
+            }
+            output.textures_delta.clear();
+            assert!(requests.try_recv().is_err());
+        }
+        app.provider = "sample".into();
+        let mut output = ctx.run_ui(Default::default(), |ui| {
+            app.backtest_pane(ui, id);
+        });
+        let text = output
+            .shapes
+            .iter()
+            .filter_map(|s| if let egui::Shape::Text(t) = &s.shape { Some(t.galley.job.text.as_str()) } else { None })
+            .collect::<Vec<_>>()
+            .join("\n");
+        output.textures_delta.clear();
+        assert!(!text.contains("OOS EQUITY"));
+        assert!(!text.contains("COMMON COMPARISON"));
+        let PaneKind::Backtest(p) = &mut app.panes[i].kind else { panic!() };
+        p.accept(p.generation, Err("SAMPLE refused".into()));
+        let mut output = ctx.run_ui(Default::default(), |ui| {
+            app.backtest_pane(ui, id);
+        });
+        let texts = output
+            .shapes
+            .iter()
+            .filter_map(|s| if let egui::Shape::Text(t) = &s.shape { Some(t.galley.job.text.as_str()) } else { None })
+            .collect::<Vec<_>>()
+            .join("\n");
+        output.textures_delta.clear();
+        assert!(texts.contains("SAMPLE refused"));
+        assert!(!texts.contains("OOS EQUITY"));
+        assert!(!texts.contains("COMMON COMPARISON"));
+    }
+    #[test]
+    fn honest_backtest_revisions_and_generations_cannot_restore_stale_confidence() {
+        let report = honest_report();
+        let family = report.honesty.as_ref().unwrap().trial_family.value().unwrap();
+        let mut p = BacktestPane::new("AAPL", "ALL");
+        p.generation = 2;
+        p.loading = true;
+        p.accept(1, Ok((report.clone(), "old".into())));
+        assert!(p.report.is_none());
+        assert!(p.loading);
+        assert!(!p.note_revision(&family.scope, family.revision + 1));
+        p.accept(2, Ok((report.clone(), "stale".into())));
+        assert!(p.report.is_none());
+        assert!(!p.loading);
+        let mut newest = (*report).clone();
+        if let tr_data::backtest_honesty::Estimate::Available(f) = &mut newest.honesty.as_mut().unwrap().trial_family {
+            f.revision += 1;
+        }
+        p.accept(2, Ok((Arc::new(newest), "current".into())));
+        assert!(p.report.is_some());
+        assert!(!p.note_revision(&family.scope, family.revision + 1));
+        assert!(p.note_revision(&family.scope, family.revision + 2));
+    }
+    #[test]
+    fn honest_backtest_keys_respect_focus_text_and_custom_bindings() {
+        use egui::{Key, Modifiers};
+        let mut app = test_app();
+        app.open_backtest(Some("AAPL"), "ALL");
+        app.focus_cmd = false;
+        app.cmd.clear();
+        let i = app.idx(app.focus).unwrap();
+        let PaneKind::Backtest(p) = &mut app.panes[i].kind else { panic!() };
+        p.report = Some(honest_report());
+        let ctx = egui::Context::default();
+        let key = |k| egui::RawInput {
+            events: vec![egui::Event::Key {
+                key: k,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: Modifiers::NONE,
+            }],
+            ..Default::default()
+        };
+        for (k, want) in [(Key::PageDown, 1), (Key::End, 2), (Key::PageUp, 1), (Key::Home, 0)] {
+            let mut output = ctx.run_ui(key(k), |ui| {
+                assert!(app.backtest_keys(ui.ctx()));
+            });
+            output.textures_delta.clear();
+            let PaneKind::Backtest(p) = &app.panes[i].kind else { panic!() };
+            assert_eq!(p.selected_fold, want);
+        }
+        app.cmd = "AAPL".into();
+        let mut output = ctx.run_ui(key(Key::PageDown), |ui| {
+            assert!(!app.backtest_keys(ui.ctx()));
+        });
+        output.textures_delta.clear();
+        app.cmd.clear();
+        app.prefs.hotkeys.bind(crate::prefs::Action::Refresh, crate::prefs::Chord::new(Key::PageDown));
+        let mut output = ctx.run_ui(key(Key::PageDown), |ui| {
+            assert!(!app.backtest_keys(ui.ctx()));
+        });
+        output.textures_delta.clear();
+        app.palette.open = true;
+        let mut output = ctx.run_ui(key(Key::End), |ui| {
+            assert!(!app.backtest_keys(ui.ctx()));
+        });
+        output.textures_delta.clear();
+    }
+    #[test]
+    fn honest_backtest_layout_defaults_and_round_trip() {
+        let old = serde_json::json!({"Backtest":{"symbol":"AAPL US Equity","spec":"ALL","holdout":"20%","commission":"5","slippage":"5","shorts":false,"intraday":false,"tf":""}});
+        let settings: crate::layouts::PaneSettings = serde_json::from_value(old).unwrap();
+        let PaneKind::Backtest(mut p) = PaneKind::from_settings(settings) else { panic!() };
+        assert_eq!(p.honesty, HonestySettings::default());
+        assert!(!p.holdout_tables);
+        p.honesty = HonestySettings { folds: 5, embargo_sessions: 3 };
+        p.holdout_tables = true;
+        p.selected_fold = 3;
+        p.selected_variant = 1;
+        let saved = PaneKind::Backtest(p).settings();
+        let decoded = serde_json::from_str(&serde_json::to_string(&saved).unwrap()).unwrap();
+        assert_eq!(PaneKind::from_settings(decoded).settings(), saved);
     }
 }

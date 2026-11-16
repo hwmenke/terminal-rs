@@ -414,9 +414,7 @@ fn expanding_terciles(vol: &[Option<f64>]) -> Vec<Option<[f64; 2]>> {
     };
     let mut out = Vec::with_capacity(vol.len() + 1);
     for r in 0..=vol.len() {
-        out.push(
-            (count >= REGIME_MIN_HISTORY).then(|| [at(&tree, count, 1.0 / 3.0), at(&tree, count, 2.0 / 3.0)]),
-        );
+        out.push((count >= REGIME_MIN_HISTORY).then(|| [at(&tree, count, 1.0 / 3.0), at(&tree, count, 2.0 / 3.0)]));
         if r < vol.len() && vol[r].is_some() {
             let mut i = rank[r] + 1;
             while i <= n {
@@ -518,7 +516,7 @@ pub fn describe(values: &[f64], annual: f64) -> Result<Moments, String> {
 }
 
 // Acklam's inverse-normal rational approximation. Error is below 1e-7 over plotted probabilities.
-fn normal_quantile(p: f64) -> f64 {
+pub(crate) fn normal_quantile(p: f64) -> f64 {
     let a = [
         -39.69683028665376,
         220.9460984245205,
@@ -679,8 +677,7 @@ mod tests {
     }
     #[test]
     fn expanding_terciles_match_sorted_type7_quantiles() {
-        let vol: Vec<Option<f64>> =
-            (0..90).map(|i| (i >= 3).then(|| ((i * 37 % 89) as f64).sin().abs())).collect();
+        let vol: Vec<Option<f64>> = (0..90).map(|i| (i >= 3).then(|| ((i * 37 % 89) as f64).sin().abs())).collect();
         let t = expanding_terciles(&vol);
         assert_eq!(t.len(), vol.len() + 1);
         for (r, got) in t.iter().enumerate() {

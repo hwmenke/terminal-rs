@@ -110,7 +110,7 @@ pub fn parse_request(spec: &str, tf_field: &str) -> Result<(Vec<Setup>, Timefram
     if raw.is_empty() || raw.eq_ignore_ascii_case("all") || raw.eq_ignore_ascii_case("default") {
         all = true;
     } else {
-        for chunk in raw.split(|c: char| c == ',' || c == ';' || c == '|') {
+        for chunk in raw.split([',', ';', '|']) {
             for word in chunk.split_whitespace() {
                 match word.to_ascii_uppercase().as_str() {
                     "ALL" | "DEFAULT" => all = true,
@@ -260,6 +260,8 @@ pub struct Skips {
     pub missing_open: usize,
     pub ambiguous: usize,
     pub bad_price: usize,
+    #[serde(default)]
+    pub partial: usize,
 }
 
 impl Skips {
@@ -275,7 +277,10 @@ impl Skips {
             parts.push(format!("{} with two prints in one bucket", self.ambiguous));
         }
         if self.bad_price > 0 {
-            parts.push(format!("{} with a non-positive or crossed price", self.bad_price));
+            parts.push(format!("{} with an invalid price or off-grid timestamp", self.bad_price));
+        }
+        if self.partial > 0 {
+            parts.push(format!("{} incomplete sessions", self.partial));
         }
         if parts.is_empty() {
             "No session was skipped for a hole or a bad print.".into()
@@ -315,6 +320,8 @@ pub struct IntradayReport {
     pub evaluate_sessions: usize,
     pub train_sessions: usize,
     pub results: Vec<SetupResult>,
+    #[serde(default)]
+    pub honesty: Option<crate::backtest_honesty::HonestReport>,
 }
 
 /// First evaluate session. Earlier sessions are train.
@@ -341,7 +348,6 @@ pub fn holdout_split(sessions: usize, frac: f64) -> Result<usize, String> {
 struct Session {
     date: NaiveDate,
     bars: Vec<Bar>,
-    partial: bool,
 }
 
 struct Built {
@@ -366,7 +372,7 @@ fn step_minutes(tf: Timeframe) -> Option<u32> {
 
 fn opening_need(tf: Timeframe) -> Option<usize> {
     let step = step_minutes(tf)?;
-    if step == 0 || OPENING_MINUTES % step != 0 {
+    if step == 0 || !OPENING_MINUTES.is_multiple_of(step) {
         return None;
     }
     Some((OPENING_MINUTES / step) as usize)
@@ -380,6 +386,8 @@ fn price_ok(b: &Bar) -> bool {
         && b.high.is_finite()
         && b.low.is_finite()
         && b.high >= b.low
+        && b.high >= b.open.max(b.close)
+        && b.low <= b.open.min(b.close)
 }
 
 fn ny_day(ts: i64) -> NaiveDate {
@@ -439,7 +447,7 @@ fn sessionize(tf: Timeframe, bars: &[Bar]) -> Result<Built, String> {
                 bad = true;
                 break;
             };
-            if !price_ok(bar) {
+            if !price_ok(bar) || bar.ts != t {
                 bad = true;
                 break;
             }
@@ -449,8 +457,11 @@ fn sessionize(tf: Timeframe, bars: &[Bar]) -> Result<Built, String> {
             skips.bad_price += 1;
             continue;
         }
-        let partial = opens.last().copied() != Some(last);
-        sessions.push(Session { date, bars: seq, partial });
+        if opens.last().copied() != Some(last) {
+            skips.partial += 1;
+            continue;
+        }
+        sessions.push(Session { date, bars: seq });
     }
     Ok(Built { sessions, skips })
 }
@@ -460,9 +471,12 @@ struct OpenTrade {
     entry_date: String,
     entry_px: f64,
     entry_i: usize,
+    decision_ts: i64,
+    entry_ts: i64,
 }
 
 struct Ledger {
+    labels: Vec<crate::backtest_honesty::HoldingLabel>,
     cash: f64,
     qty: f64,
     open: Option<OpenTrade>,
@@ -476,6 +490,7 @@ struct Ledger {
 impl Ledger {
     fn new() -> Self {
         Self {
+            labels: Vec::new(),
             cash: 1.0,
             qty: 0.0,
             open: None,
@@ -501,11 +516,18 @@ impl Ledger {
         self.cash + self.qty * px
     }
 
-    fn flatten(&mut self, fill: f64, date: &str, i: usize) {
+    fn flatten(&mut self, fill: f64, date: &str, i: usize, exit_ts: i64) {
         let Some(open) = self.open.take() else {
             self.qty = 0.0;
             return;
         };
+        self.labels.push(crate::backtest_honesty::HoldingLabel {
+            decision_ts: open.decision_ts,
+            entry_ts: open.entry_ts,
+            exit_ts: Some(exit_ts),
+            first_return: open.entry_i,
+            last_return: i,
+        });
         self.cash += self.qty * fill;
         self.qty = 0.0;
         self.completed.push(CompletedTrade {
@@ -519,7 +541,8 @@ impl Ledger {
         });
     }
 
-    fn open_side(&mut self, side: i8, fill: f64, date: &str, i: usize) {
+    #[allow(clippy::too_many_arguments)]
+    fn open_side(&mut self, side: i8, fill: f64, date: &str, i: usize, decision_ts: i64, entry_ts: i64) {
         if side == 0 || !(fill.is_finite() && fill > 0.0) || self.cash <= 0.0 {
             return;
         }
@@ -527,7 +550,8 @@ impl Ledger {
         let qty = side as f64 * (equity / fill);
         self.cash = equity - qty * fill;
         self.qty = qty;
-        self.open = Some(OpenTrade { side, entry_date: date.to_string(), entry_px: fill, entry_i: i });
+        self.open =
+            Some(OpenTrade { side, entry_date: date.to_string(), entry_px: fill, entry_i: i, decision_ts, entry_ts });
     }
 }
 
@@ -572,14 +596,17 @@ fn run_hold(ledger: &mut Ledger, session: &Session, cost: f64, base: usize, prev
     let n = session.bars.len();
     if let Some(first) = session.bars.first() {
         let fill = buy_fill(first.open, cost);
-        ledger.open_side(1, fill, &date, base);
+        ledger.open_side(1, fill, &date, base, first.ts, first.ts);
     }
     for (i, bar) in session.bars.iter().enumerate() {
         let held = ledger.side() != 0;
         if i + 1 == n && held {
-            ledger.flatten(exit_fill(ledger.side(), bar.close, cost), &date, base + i);
+            ledger.flatten(exit_fill(ledger.side(), bar.close, cost), &date, base + i, session_close(session.date));
         }
         mark(ledger, bar.close, held, prev);
+        if !prev.is_finite() || *prev <= 0. {
+            return;
+        }
     }
 }
 
@@ -592,19 +619,22 @@ fn run_signals(ledger: &mut Ledger, session: &Session, signals: &[i8], cost: f64
             let have = ledger.side();
             if want != have && bar.open.is_finite() && bar.open > 0.0 {
                 if have != 0 {
-                    ledger.flatten(fill_for_action(bar.open, have, 0, cost), &date, base + i);
+                    ledger.flatten(fill_for_action(bar.open, have, 0, cost), &date, base + i, bar.ts);
                 }
                 if want != 0 {
                     let fill = fill_for_action(bar.open, 0, want, cost);
-                    ledger.open_side(want, fill, &date, base + i);
+                    ledger.open_side(want, fill, &date, base + i, bar.ts, bar.ts);
                 }
             }
         }
         let held = ledger.side() != 0;
         if i + 1 == n && held {
-            ledger.flatten(exit_fill(ledger.side(), bar.close, cost), &date, base + i);
+            ledger.flatten(exit_fill(ledger.side(), bar.close, cost), &date, base + i, session_close(session.date));
         }
         mark(ledger, bar.close, held, prev);
+        if !prev.is_finite() || *prev <= 0. {
+            return;
+        }
     }
 }
 
@@ -719,6 +749,9 @@ fn run_range(
                     run_flat(&mut ledger, session, &mut prev);
                 }
             },
+        }
+        if !prev.is_finite() || prev <= 0. {
+            break;
         }
         base += session.bars.len();
     }
@@ -881,7 +914,7 @@ pub fn compute_report(
     let train_end_d = day_text(built.sessions[train_end].date);
     let evaluate_start = day_text(built.sessions[eval_start].date);
     let evaluate_end = day_text(built.sessions[n - 1].date);
-    let partial = built.sessions.iter().filter(|s| s.partial).count();
+    let partial = built.skips.partial;
     let bar_count: usize = built.sessions.iter().map(|s| s.bars.len()).sum();
     let provenance = Bar::provenance(bars);
     let opening = opening_note(settings.timeframe, &results);
@@ -926,7 +959,7 @@ pub fn compute_report(
             let mut line = built.skips.line();
             if partial > 0 {
                 line.push_str(&format!(
-                    " {partial} eligible session(s) end before the cash close and are flattened at the last regular bar present."
+                    " {partial} incomplete session(s) were excluded; the scheduled final bucket must be closed."
                 ));
             }
             line
@@ -940,6 +973,73 @@ pub fn compute_report(
         evaluate_sessions: n - eval_start,
         train_sessions: eval_start,
         results,
+        honesty: None,
+    })
+}
+
+fn session_close(date: NaiveDate) -> i64 {
+    let close = intraday::close_minute(date);
+    tr_core::ny::to_utc(date.and_hms_opt(close / 60, close % 60, 0).unwrap())
+}
+pub(crate) fn admitted_through(tf: Timeframe, bars: &[Bar]) -> Option<i64> {
+    sessionize(tf, bars).ok()?.sessions.last().map(|s| session_close(s.date))
+}
+pub(crate) fn honest_evaluation(
+    bars: &[Bar],
+    tf: Timeframe,
+    setup: Setup,
+    costs: CostModel,
+    allow_short: bool,
+    protocol: &crate::backtest_trials::Protocol,
+) -> Result<crate::backtest_honesty::Evaluation, crate::backtest_honesty::Reason> {
+    use crate::backtest_honesty::{self as h, Reason, ReturnPoint, Tape};
+    Bar::require_verified(bars, "Honest intraday backtest").map_err(Reason::ReplayFailed)?;
+    if bars.is_empty() {
+        return Err(Reason::TooFewReturns);
+    }
+    if !costs.commission_bps.is_finite()
+        || !costs.slippage_bps.is_finite()
+        || costs.commission_bps < 0.
+        || costs.slippage_bps < 0.
+        || costs.per_side_frac() >= 1.
+    {
+        return Err(Reason::InvalidSettings);
+    }
+    let built = sessionize(tf, bars).map_err(Reason::ReplayFailed)?;
+    let units: Vec<_> = built
+        .sessions
+        .iter()
+        .map(|s| ReturnPoint {
+            session_date: day_text(s.date),
+            period_start: s.bars[0].ts,
+            period_end: session_close(s.date),
+            net_return: 0.,
+        })
+        .collect();
+    h::evaluate_protocol(&units, 0, true, protocol, |start, end, _| {
+        let mut returns = Vec::new();
+        let mut labels = Vec::new();
+        for (i, session) in built.sessions.iter().enumerate().take(end).skip(start) {
+            if setup == Setup::VwapCross && session.bars.iter().any(|b| b.volume_value().is_none()) {
+                return Err(Reason::ReplayFailed("VWAP needs verified volume".into()));
+            }
+            // Unit funding each day is equivalent to successive session-end equity
+            // ratios for these all-in, session-flat rules, including all fill costs.
+            let run = run_range(setup, tf, &built.sessions, i, i, costs.per_side_frac(), allow_short);
+            if run.ledger.equity.len() != session.bars.len()
+                || run.ledger.equity.iter().any(|e| !e.is_finite() || *e <= 0.)
+            {
+                return Err(Reason::Ruin);
+            }
+            let equity = *run.ledger.equity.last().ok_or(Reason::TooFewReturns)?;
+            returns.push(ReturnPoint { net_return: equity - 1., ..units[i].clone() });
+            labels.extend(run.ledger.labels.into_iter().map(|mut l| {
+                l.first_return = i - start;
+                l.last_return = i - start;
+                l
+            }));
+        }
+        Ok(Tape { returns, labels })
     })
 }
 
@@ -1187,14 +1287,17 @@ mod tests {
                 short.push(px(ts, 10.0, 11.0, 9.0, 10.5));
             }
         }
-        let short = report(&short, vec![Setup::OpeningRange, Setup::SessionHold], Timeframe::M5);
-        let or = setup(&short, "opening_range");
-        let hold = setup(&short, "session_hold");
-        assert_eq!(or.evaluate.trades.completed, 0);
-        assert!(or.evaluate.opening_skipped + or.train.opening_skipped >= 10);
-        assert!(hold.evaluate.trades.completed >= 1);
-        assert!(short.opening_note.contains("incomplete"));
-        assert_eq!(short.partial_sessions, short.sessions);
+        let err = compute_report(
+            "AAPL",
+            &short,
+            &settings(vec![Setup::OpeningRange, Setup::SessionHold], Timeframe::M5),
+            "unit",
+        )
+        .unwrap_err();
+        assert!(err.contains("complete regular sessions"));
+        let built = sessionize(Timeframe::M5, &short).unwrap();
+        assert!(built.sessions.is_empty());
+        assert_eq!(built.skips.partial, 12);
     }
 
     #[test]
@@ -1290,5 +1393,67 @@ mod tests {
         assert_eq!(doc.kind, crate::portable::Kind::IntradayBacktest);
         assert!(!doc.sample);
         assert_eq!(doc.source, "yahoo 15m");
+    }
+    #[test]
+    fn backtest_honesty_intraday_session_units_costs_half_day_and_partial_exclusions() {
+        use crate::{backtest_honesty::*, backtest_trials::Protocol};
+        let mut bars = flat_days(40, Timeframe::M5, 10.);
+        let wf = Protocol::WalkForward(HonestySettings::default());
+        let report = honest_evaluation(
+            &bars,
+            Timeframe::M5,
+            Setup::SessionHold,
+            CostModel { commission_bps: 100., slippage_bps: 0. },
+            false,
+            &wf,
+        )
+        .unwrap();
+        assert_eq!(report.returns.len(), 18);
+        assert_eq!(report.folds[0].removed_labels, 0);
+        assert_eq!(report.folds[1].removed_labels, 1);
+        for r in &report.returns {
+            assert!((r.net_return - (9.9 / 10.1 - 1.)).abs() < 1e-12);
+        }
+        let settings = settings(vec![Setup::SessionHold], Timeframe::M5);
+        let mut exported = compute_report("AAPL", &bars, &settings, "fixture").unwrap();
+        exported.honesty = Some(crate::backtest_trials::compute(
+            &bars,
+            Timeframe::M5,
+            HonestySettings::default(),
+            &crate::backtest_trials::intraday_experiments(&settings, HonestySettings::default()),
+            Estimate::Unavailable(Reason::RegisterUnavailable),
+            "fixture".into(),
+        ));
+        let doc = crate::portable::intraday_backtest_document(&exported, "2026-11-14").unwrap();
+        let decoded: IntradayReport = serde_json::from_value(doc.payload.clone()).unwrap();
+        assert_eq!(decoded, exported);
+        let mut old = doc.payload;
+        old.as_object_mut().unwrap().remove("honesty");
+        assert!(serde_json::from_value::<IntradayReport>(old).unwrap().honesty.is_none());
+        let expected = (9.9_f64 / 10.1).powi(18);
+        assert!((report.equity.last().unwrap().equity - expected).abs() < 1e-12);
+        bars.pop();
+        let built = sessionize(Timeframe::M5, &bars).unwrap();
+        assert_eq!(built.sessions.len(), 39);
+        assert_eq!(built.skips.partial, 1);
+        let date = "2026-11-27".parse().unwrap();
+        let half: Vec<_> =
+            intraday::regular_opens(date, Timeframe::M5).into_iter().map(|ts| px(ts, 10., 11., 9., 10.)).collect();
+        assert_eq!(half.len(), 42);
+        let built = sessionize(Timeframe::M5, &half).unwrap();
+        assert_eq!(built.sessions.len(), 1);
+        assert_eq!(built.skips, Skips::default());
+        let built = sessionize(Timeframe::M5, &half[..41]).unwrap();
+        assert!(built.sessions.is_empty());
+        assert_eq!(built.skips.partial, 1);
+        let mut duplicate = half.clone();
+        duplicate.push(half[0]);
+        assert_eq!(sessionize(Timeframe::M5, &duplicate).unwrap().skips.ambiguous, 1);
+        let mut off_grid = half.clone();
+        off_grid[3].ts += 1;
+        assert_eq!(sessionize(Timeframe::M5, &off_grid).unwrap().skips.bad_price, 1);
+        let mut invalid = half;
+        invalid[3].high = 1.;
+        assert_eq!(sessionize(Timeframe::M5, &invalid).unwrap().skips.bad_price, 1);
     }
 }

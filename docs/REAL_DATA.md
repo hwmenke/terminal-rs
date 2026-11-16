@@ -138,3 +138,17 @@ extension. Extra compilation/test dependencies touched are `yahoo.rs` (Guarded r
 - `docs/REAL_DATA.md`
 
 The [Bar Vault](BARVAULT.md) accumulates verified closed native US cash-session bars in separate source-specific tables. Sample mode bypasses it entirely. Legacy display-cache rows are preserved but never promoted into the vault.
+
+
+## Honest BT / IBT
+
+Both backtest engines refuse explicit sample mode, sample/unverified inputs and
+unwitnessed mixed provenance before science-cache lookup. Daily input is trimmed
+with the request-time archive clock (including close grace); missing daily
+sessions refuse the request rather than bridge unknown holding returns. IBT
+uses the successful fetch clock, complete expected cash grids and actual early
+closes. Vault-only input retains the conservative pending tail; partial sessions
+are excluded. Refresh/failure receipts remain current even on science-cache hits.
+Trial history is durable and scoped by security/mode/native interval/source, not
+by dates or pane. A disabled, unavailable or memory-only register cannot produce
+DSR. Details and statistical limitations: [Honest Backtest](HONEST_BACKTEST.md).

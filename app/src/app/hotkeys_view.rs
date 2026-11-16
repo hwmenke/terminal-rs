@@ -327,11 +327,11 @@ impl TerminalApp {
                     ),
                     (
                         &["BACKTEST", "AAPL BACKTEST", "AAPL BT ADTREND"],
-                        "Paper backtest vs buy-and-hold: costs, next-open fills, chronological holdout, completed-trade win rate",
+                        "Honest backtest: DSR, purged walk-forward, net OOS equity and holdout tables. Focused pane: PageUp/Down, Home/End select folds; text entry, menus and customized bindings take priority.",
                     ),
                     (
                         &["IBT", "AAPL IBT", "AAPL IBT VWAP", "AAPL IBT OR 15m"],
-                        "Paper intraday backtest: session VWAP and opening range vs holding the cash session",
+                        "Honest intraday backtest: DSR and complete-session walk-forward vs session hold; same fold keys as BT.",
                     ),
                     (
                         &["LOOKALIKE", "AAPL LOOKALIKE", "AAPL KNN 2024-01-15", "GOTO 2024-01-15"],
