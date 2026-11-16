@@ -1,55 +1,51 @@
-//! Coverage is delivered by the worker; paint only maps session dates to indices.
+//! Coverage indices, cells and text all come from the same immutable receipt.
 use super::*;
+use crate::widgets::{MathCard, MathCardExt};
 impl ChartState {
     pub(super) fn paint_vault_footer(&self, ui: &mut Ui, price: Rect, v: &Viewport) {
         if self.extended || !self.tf.is_intraday() {
             return;
         }
-        let Some(info) = &self.stitch else {
+        let Some(summary) = self.session_snapshot() else {
             return;
         };
-        for c in &info.cells {
-            let lo = self.bars.partition_point(|b| tr_core::ny::civil(b.ts).date() < c.date);
-            let hi = self.bars.partition_point(|b| tr_core::ny::civil(b.ts).date() <= c.date);
-            if lo == hi {
-                continue;
-            }
-            let left = (price.left() + v.x_center(lo) as f32 - v.bar_px as f32 / 2.).max(price.left());
-            let right = (price.left() + v.x_center(hi - 1) as f32 + v.bar_px as f32 / 2.).min(price.right());
+        let Some(info) = &self.session.stitch else {
+            return;
+        };
+        for span in &summary.coverage {
+            let c = &info.cells[span.cell_index];
+            let left = (price.left() + v.x_center(span.lo) as f32 - v.bar_px as f32 / 2.).max(price.left());
+            let right = (price.left() + v.x_center(span.hi - 1) as f32 + v.bar_px as f32 / 2.).min(price.right());
             if left >= right {
                 continue;
             }
             let r = Rect::from_min_max(pos2(left, price.bottom() - 6.), pos2(right, price.bottom()));
             crate::app::vault_view::paint_cell(ui, r, c);
-            ui.interact(r, ui.id().with(("chart-vault", self.id, c.date)), Sense::hover()).on_hover_text(format!(
-                "{} · {:?} {}/{} · {} holes · {} · epoch {}",
-                c.date, c.state, c.present, c.expected, c.holes, info.source, info.epoch
-            ));
+            ui.interact(r, ui.id().with(("chart-vault", self.id, span.cell_index)), Sense::hover()).math_card(|| {
+                MathCard::new("Coverage", "coverage = present / expected cash-session buckets; a gap marker requires both exact neighbouring bars")
+                    .value(format!("{}/{}", c.present, c.expected)).input("present / expected", format!("{} / {}", c.present, c.expected))
+                    .n(c.present as usize, "buckets").span(c.date.to_string(), c.date.to_string())
+                    .source(&summary.source).provenance(summary.provenance)
+                    .closed_thru(summary.closed_thru.map_or("unavailable".into(), |t| tr_core::ny::civil(t).to_string()))
+                    .note(&span.hover).caveat("Adjustment continuity not proven; absent buckets are never filled.")
+            });
         }
-        // Whole missing sessions: a marker at the join, never bars inside it.
-        for &(before, after) in &info.gaps {
-            let i = self.bars.partition_point(|b| b.ts < after);
-            if i == 0 || self.bars.get(i).is_none_or(|b| b.ts != after) || self.bars[i - 1].ts != before {
-                continue;
-            }
-            let x = price.left() + (v.x_center(i - 1) + v.x_center(i)) as f32 / 2.;
+        for gap in &summary.gap_marks {
+            let x = price.left() + (v.x_center(gap.left_index) + v.x_center(gap.right_index)) as f32 / 2.;
             if x < price.left() || x > price.right() {
                 continue;
             }
             let line = Rect::from_min_max(pos2(x - 0.5, price.top()), pos2(x + 0.5, price.bottom()));
             ui.painter().rect_filled(line, 0., theme::amber_dim());
             let hit = Rect::from_min_max(pos2(x - 3., price.top()), pos2(x + 3., price.bottom()));
-            ui.interact(hit, ui.id().with(("chart-vault-gap", self.id, after)), Sense::hover()).on_hover_text(format!(
-                "GAP · no bars {} → {} · unverified join (adjustment continuity not proven)",
-                tr_core::ny::civil(before).date(),
-                tr_core::ny::civil(after).date()
-            ));
+            ui.interact(hit, ui.id().with(("chart-vault-gap", self.id, gap.right_index)), Sense::hover())
+                .on_hover_text(&gap.hover);
         }
-        if !info.cells.is_empty() {
+        if let Some(label) = &summary.vault_label {
             ui.painter().text(
                 pos2(price.left() + 8., price.bottom() - 9.),
                 Align2::LEFT_BOTTOM,
-                info.label(),
+                label,
                 mono(9.),
                 theme::muted(),
             );
@@ -88,6 +84,7 @@ mod tests {
             epoch: 1,
             ..Default::default()
         }));
+        super::super::session_cache::tests::accept(&mut chart);
         let ctx = egui::Context::default();
         for (count, expected) in [(chart.bars.len(), 2), (78, 1)] {
             let v = Viewport::fit_last(chart.bars.len(), count, 800.);
@@ -114,7 +111,8 @@ mod tests {
         let gap = (bars[77].ts, bars[78].ts);
         chart.bars = Arc::new(bars);
         let ctx = egui::Context::default();
-        let marks = |chart: &ChartState| {
+        let marks = |chart: &mut ChartState| {
+            super::super::session_cache::tests::accept(chart);
             let v = Viewport::fit_last(chart.bars.len(), chart.bars.len(), 800.);
             let mut out = ctx.run_ui(egui::RawInput::default(), |ui| {
                 chart.paint_vault_footer(ui, Rect::from_min_size(Pos2::ZERO, vec2(800., 500.)), &v)
@@ -126,10 +124,10 @@ mod tests {
                 .count()
         };
         chart.stitch = Some(Arc::new(tr_data::vault::StitchInfo { gaps: vec![gap], ..Default::default() }));
-        assert_eq!(marks(&chart), 1);
+        assert_eq!(marks(&mut chart), 1);
         // A gap whose bars are not both on the chart is not drawn at a guessed spot.
         chart.stitch =
             Some(Arc::new(tr_data::vault::StitchInfo { gaps: vec![(gap.0 - 300, gap.1)], ..Default::default() }));
-        assert_eq!(marks(&chart), 0);
+        assert_eq!(marks(&mut chart), 0);
     }
 }

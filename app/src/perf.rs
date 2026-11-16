@@ -93,15 +93,14 @@ impl Layer {
             Self::Dock => 6.0,
             Self::Windows => 1.5,
             Self::Hud => 0.3,
-            // Calibrated 2026-11-16: AAPL 7,800-bar legend/footer and levels
-            // exceed the design targets. Keep 3x measured headroom, see PERF.md.
-            Self::ChartTotal => 45.0,
+            // Slice 1: worker session summaries restore the original frame targets.
+            Self::ChartTotal => 2.0,
             Self::Scene | Self::Auction => 0.3,
             Self::GridAxes | Self::Stops | Self::Avwap | Self::Cone => 0.25,
             Self::ZBand | Self::Markers => 0.15,
             Self::Stack => 0.4,
-            Self::Legend => 33.0,
-            Self::Levels => 12.0,
+            Self::Legend => 0.4,
+            Self::Levels => 0.1,
             Self::Edge => 0.2,
             _ => 0.1,
         }

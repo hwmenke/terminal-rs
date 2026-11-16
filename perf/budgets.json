@@ -112,6 +112,16 @@
       "budget_us": 60000,
       "relative": true,
       "class": "command"
+    },
+    "chart.session_summary_7800": {
+      "budget_us": 35000,
+      "relative": true,
+      "class": "interactive"
+    },
+    "auction.concentration_20": {
+      "budget_us": 200,
+      "relative": true,
+      "class": "interactive"
     }
   }
 }

@@ -121,6 +121,13 @@ pub enum Request {
         archive: bool,
         base: Arc<Vec<Bar>>,
     },
+    ChartSessionSummary {
+        pane: PaneId,
+        key: crate::chart_view::SessionSummaryKey,
+        bars: Arc<Vec<Bar>>,
+        class: tr_core::AssetClass,
+        stitch: Option<Arc<tr_data::vault::StitchInfo>>,
+    },
     /// Verified closed-session profiles with an optional shared fine-bar read.
     AuctionMap {
         pane: PaneId,
@@ -521,6 +528,7 @@ impl Request {
             Self::TrendStack { .. } => "TrendStack",
             Self::DailyStrength { .. } => "DailyStrength",
             Self::AuctionMap { .. } => "AuctionMap",
+            Self::ChartSessionSummary { .. } => "ChartSessionSummary",
             Self::StopCloud { .. } => "StopCloud",
             Self::TrendCone { .. } => "TrendCone",
             Self::AnchoredVwap { .. } => "AnchoredVwap",
@@ -761,6 +769,11 @@ pub enum Response {
         generation: u64,
         base_len: usize,
         result: Result<LineRef, String>,
+    },
+    ChartSessionSummary {
+        pane: PaneId,
+        key: crate::chart_view::SessionSummaryKey,
+        result: Result<Arc<tr_data::chart_session::SessionSummary>, String>,
     },
     /// Timestamp-anchored profiles for exactly the keyed chart input.
     AuctionMap {
@@ -4183,6 +4196,16 @@ async fn handle_inner(s: &Arc<Shared>, req: Request, force: bool) {
                 base_len: base.len(),
                 result: result.map_err(|e: anyhow::Error| format!("{e:#}")),
             });
+        }
+        Request::ChartSessionSummary { pane, key, bars, class, stitch } => {
+            let sample = s.sample_mode();
+            let jobs = s.jobs.clone();
+            let result = tokio::task::spawn_blocking(move || {
+                let _job = crate::perf::JobTimer::new(&jobs, "ChartSessionSummary");
+                if sample { return Err("Session summary refused: sample / offline display mode".into()); }
+                tr_data::chart_session::build(&bars, key.tf, class, key.extended, key.as_of, stitch.as_deref()).map(Arc::new)
+            }).await.unwrap_or_else(|e| Err(format!("Session summary task failed: {e}")));
+            s.send(Response::ChartSessionSummary { pane, key, result });
         }
         Request::AuctionMap { pane, key, symbol, class, bars, as_of, stitch } => {
             let result = auction_map(s, &symbol, class, bars, &key, as_of, stitch).await;
@@ -9089,6 +9112,23 @@ mod auction_tests {
             Some(Arc::new(tr_data::vault::StitchInfo { epoch, source: "yahoo".into(), ..Default::default() })),
         )
         .await
+    }
+    #[tokio::test]
+    async fn session_summary_admits_full_input_refuses_sample_mode_and_performs_no_provider_calls() {
+        for scenario in 0..4 {
+            let provider = Arc::new(VaultProvider { bars: Default::default(), calls: Default::default(), fail: Default::default(), sample: scenario == 0 });
+            let (s, rx) = shared(provider.clone(), None);
+            let mut bars = fine_day();
+            if scenario == 2 { bars.last_mut().unwrap().provenance = tr_core::Provenance::Sample; }
+            if scenario == 3 { bars[0].provenance = tr_core::Provenance::Cached; }
+            let key = crate::chart_view::SessionSummaryKey { generation: 7, bars_revision: 2, stitch_revision: 0, tf: Timeframe::M1, extended: false, as_of: Some(bars.last().unwrap().ts+60) };
+            handle(&s,Request::ChartSessionSummary { pane: 9, key, bars: Arc::new(bars), class: tr_core::AssetClass::Equity, stitch: None }).await;
+            let Response::ChartSessionSummary { pane, key: received, result } = rx.recv().unwrap() else { panic!("wrong response") };
+            assert_eq!(pane,9); assert_eq!(received,key);
+            assert_eq!(result.is_ok(),scenario==1);
+            if let Ok(r) = result { assert!(r.stats.vwap.is_some() && r.opening.is_some()); }
+            assert_eq!(provider.calls.load(Ordering::SeqCst),0);
+        }
     }
     #[tokio::test]
     async fn auction_refuses_sample_mode_and_unverified_bars_without_network() {

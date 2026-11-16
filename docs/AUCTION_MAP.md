@@ -14,6 +14,34 @@ Annotated screenshot description (no GUI or screenshot was captured for this imp
 
 Strips become VAL–VAH spines with POC dots below 28 pixels of session width, or below 200 pixels of pane height. Status tags sit under the session low; when the full tag does not fit the session width, a one-letter tag (`D`, `P`, `½`) is shown, and below 10 pixels none. Adjacent rows shorter than two pixels merge for display only. The composite hides below 420 pixels of pane width and below 200 pixels of height. None of these changes alters the calculation or autoscale.
 
+## Session concentration ribbon
+
+A 14 px ribbon aligns each tile with its session's chart span above the footer.
+The printed **CONCENTRATION c [0,1]** key uses the same five-step sequential slate
+scale as the tiles. Darker/lighter intensity describes concentration, never return
+sign or statistical significance. Narrow panes keep the ribbon and key, with a
+shorter key label. Partial/developing sessions retain outlines/hatching and P/D
+labels when wide enough; even a one-pixel tile has a hover target.
+
+For positive-volume row count K, `p_j = volume_j / total_volume`, effective rows
+`D₂ = 1 / Σp_j²`, and concentration `c = 1 − D₂/K`. Zero-volume rows do not count
+in K. Uniform volume gives c=0; one occupied row gives D₂=1, K=1, c=0. A profile
+with no positive finite volume has an unavailable descriptor. The score depends
+on price-bin width; it does not compare raw volume totals or supply a trading signal.
+
+Hover a tile for its MathCard: formula, effective/occupied rows, bin width, total
+allocated volume, bars used/expected, session date/status, source, observation time
+and CLOSED THRU. **Descriptive allocated volume; no confidence interval or
+predictive significance.** The input is allocated OHLCV volume, not exchange
+trade-at-price observations. Tile click navigation is deferred; existing level
+click and Alt-click actions are unchanged.
+
+VWAP/RVOL, OR30 and prior-level legend rows also have MathCards. The session
+receipt prints its source, provenance, observation clock and CLOSED THRU. Live
+descriptive summaries identify forming input explicitly; Auction still uses its
+existing closed-bar report. Coverage cards print present/expected buckets and the
+exact-neighbour gap rule. Missing windows/denominators remain unavailable.
+
 ## Controls
 
 | Command | Effect |
@@ -127,3 +155,20 @@ Composite size and level age cap at 20. Calculation retains up to 21 observed se
 ## Verification in this environment
 
 On 2026-11-14, after merging `opus/tstack-plateau` and the review fixes, `cargo test --workspace --no-fail-fast` passed: **1,323 passed, 0 failed, 8 ignored** (the 8 ignored are pre-existing). Auction-focused tests: 33 in `tr-data` and 34 in the app, all passing. `cargo clippy -p tr-data -p terminal-rs --all-targets` reports no warnings in Auction Map code; existing repository warnings remain. No GUI was launched and no live provider was contacted, so the layout rules above are checked by headless geometry tests, not screenshots.
+
+The session legend, legacy 24-bin profile/value area, opening/prior levels and
+vault strip now share one immutable worker-built session summary. Full input
+admission uses the existing verified/stitch rules before deriving values. The
+worker performs no provider or SQLite call for this report. Bar and stitch receipt
+revisions advance on every accepted replacement, including same-length corrections
+and receipts at the same epoch. The key also includes generation, timeframe,
+extended-hours mode and observation time. Hover/pan/zoom/theme changes reuse it.
+
+Each pane permits one in-flight summary with a 300 ms send throttle. Obsolete
+responses release their slot but cannot replace current output; newer revisions
+coalesce into the next request. Symbol/timeframe/source identity changes and
+sample/refusal clear numeric output. While recomputing, a retained report is
+identified by its own **PREVIOUS SNAPSHOT** observation/cut receipt; numeric rows
+and index-based coverage wait for the current revision. Coverage spans and gap
+indices refer to the exact accepted receipt, preventing paging from moving old
+coverage onto different bars. Legacy numerical definitions are unchanged.

@@ -165,6 +165,33 @@ pub fn all(scale: Scale) -> Vec<Case> {
     add!("avwap.time_link_span", move || bb(time_link::bars_in_span(bb(&b), Timeframe::M1, true, span)).len());
     let now = auc.last().unwrap().ts + 60;
     let r = auction::build(&auc, Timeframe::M1, None, AssetClass::Equity, now, &[], Default::default(), 0.01).unwrap();
+    let summary_bars = auc.clone();
+    let receipt = fixtures::stitch(&summary_bars, Timeframe::M1);
+    add!("chart.session_summary_7800", move || {
+        let r = bb(tr_data::chart_session::build(
+            bb(&summary_bars),
+            Timeframe::M1,
+            AssetClass::Equity,
+            false,
+            Some(now),
+            Some(&receipt),
+        )
+        .unwrap());
+        assert!(r.stats.vwap.is_some() && r.stats.relative_volume.is_some());
+        assert!(r.opening.is_some() && r.prior.is_some() && r.value_area.is_some());
+        assert_eq!(r.coverage.len(), if full { 20 } else { 4 });
+        assert_eq!(r.coverage.iter().map(|s| s.hi - s.lo).sum::<usize>(), summary_bars.len());
+        r.bars
+    });
+    let profiles = r.sessions.clone();
+    add!("auction.concentration_20", move || {
+        assert_eq!(profiles.len(), if full { 20 } else { 4 });
+        for s in &profiles {
+            let c = bb(auction::concentration(bb(&s.volume)).unwrap());
+            assert!(c.occupied > 0 && c.effective_rows.is_finite() && (0. ..=1.).contains(&c.normalized));
+        }
+        profiles.len()
+    });
     add!("auction.build_20x390", move || bb(auction::build(
         bb(&auc),
         Timeframe::M1,

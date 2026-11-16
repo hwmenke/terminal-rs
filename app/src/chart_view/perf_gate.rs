@@ -27,6 +27,7 @@ fn chart(w: &Worker, auction: bool, n: usize) -> ChartState {
     assert!(r.lines.iter().all(|l| l.as_ref().is_ok_and(|l| l.used > 0)));
     c.on_anchored_vwap(key, Ok(Arc::new(r)));
     if auction {
+        c.on_vault_stitch(c.generation, Arc::new(tr_perf::fixtures::stitch(&bars, c.tf)));
         c.set_auction(crate::command::AuctionCmd::Toggle(Some(true)), w);
     } else {
         c.indicators = vec![IndicatorSpec::new("ZBAND", &[]).unwrap()];
@@ -66,11 +67,19 @@ fn chart(w: &Worker, auction: bool, n: usize) -> ChartState {
         c.previous_stack_lanes = None;
     }
     c.viewport = Some(Viewport { right: bars.len() as f64 + 40., bar_px: 5., width_px: 1500. });
+    c.request_session_summary(w);
     c
 }
 fn complete(c: &mut ChartState, rx: &mut tokio::sync::mpsc::UnboundedReceiver<Request>) {
     while let Ok(req) = rx.try_recv() {
         match req {
+            Request::ChartSessionSummary { key, bars, class, stitch, .. } => {
+                let r = tr_data::chart_session::build(&bars, key.tf, class, key.extended, key.as_of, stitch.as_deref())
+                    .unwrap();
+                assert!(r.stats.vwap.is_some() && r.opening.is_some() && r.prior.is_some());
+                assert_eq!(r.coverage.len(), 20);
+                c.on_session_summary(key, Ok(Arc::new(r)));
+            }
             Request::StopCloud { key, .. } => {
                 let r = super::tests::stop_result(c, &key).unwrap();
                 assert!(r.closed > 0);
@@ -128,7 +137,7 @@ fn text(shapes: &[egui::epaint::ClippedShape]) -> String {
 fn assert_painted(c: &ChartState, out: &egui::FullOutput, auction: bool, sums: &[f32; 23]) {
     let txt = text(&out.shapes);
     let expected = if auction {
-        vec!["AUCTION · bin", "AVWAP"]
+        vec!["AUCTION · bin", "AVWAP", "VWAP", "RVOL", "OR30", "PDH", "CONCENTRATION", "[0,1]", "CLOSED THRU", "VAULT"]
     } else {
         vec!["STOP ODDS", "P90", "P10", "TSTACK EDGE", "AVWAP", "ZBAND"]
     };
@@ -141,6 +150,13 @@ fn assert_painted(c: &ChartState, out: &egui::FullOutput, auction: bool, sums: &
         vec![Layer::Stack, Layer::Stops, Layer::Cone, Layer::Edge, Layer::Avwap, Layer::ZBand, Layer::Rail]
     } {
         assert!(sums[l as usize] > 0., "no timing for {l:?}");
+    }
+    if auction {
+        assert!(
+            c.session_snapshot()
+                .is_some_and(|s| s.coverage.len() == 20 && !s.stats.profile.is_empty() && s.stats.profile.len() <= 24)
+        );
+        assert!(c.concentration_paint_is_present());
     }
     if !auction {
         assert!(!c.stack_paint.cloud.is_empty());
@@ -162,13 +178,19 @@ fn sample(auction: bool, n: usize) -> BTreeMap<String, Summary> {
         perf::end_frame();
     }
     let mut results = BTreeMap::new();
-    for pan in [false, true] {
+    let refresh_report = c.session.snapshot.clone();
+    for mode in if auction { vec!["steady", "pan", "refresh"] } else { vec!["steady", "pan"] } {
+        let pan = mode == "pan";
         let mut times: BTreeMap<String, Vec<f64>> = BTreeMap::new();
         for i in 0..120 {
             if pan {
                 c.viewport.as_mut().unwrap().pan_px(if i % 2 == 0 { 24. } else { -24. });
             }
             let start = Instant::now();
+            if mode == "refresh" {
+                // Include actual response acceptance/formatting in timed UI work.
+                super::session_cache::tests::deliver(&mut c, refresh_report.as_ref().unwrap().clone());
+            }
             let out = frame(&ctx, &mut c, &w, i);
             let ui_us = start.elapsed().as_secs_f64() * 1e6;
             let sums = perf::end_frame();
@@ -188,9 +210,18 @@ fn sample(auction: bool, n: usize) -> BTreeMap<String, Summary> {
             }
         }
         let scenario = if auction { "auction" } else { "intraday" };
-        let mode = if pan { "pan" } else { "steady" };
+        while let Ok(req) = rx.try_recv() {
+            assert!(!matches!(req, Request::ChartSessionSummary { .. }), "unchanged frames sent a new summary job");
+        }
         for (id, mut samples) in times {
-            results.insert(format!("paint.{scenario}.{mode}.{id}"), tr_perf::summarize(&mut samples));
+            results.insert(
+                if mode == "refresh" {
+                    format!("paint.auction_refresh.{id}")
+                } else {
+                    format!("paint.{scenario}.{mode}.{id}")
+                },
+                tr_perf::summarize(&mut samples),
+            );
         }
     }
     perf::set_enabled(false);

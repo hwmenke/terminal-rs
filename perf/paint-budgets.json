@@ -32,38 +32,49 @@
       "class": "frame"
     },
     "paint.auction.steady.ui": {
-      "budget_us": 45000,
-      "relative": false,
-      "class": "frame",
-      "over_target": true
-    },
-    "paint.auction.steady.tess": {
       "budget_us": 1500,
       "relative": false,
       "class": "frame"
     },
-    "paint.auction.steady.total": {
-      "budget_us": 46000,
+    "paint.auction.steady.tess": {
+      "budget_us": 1000,
       "relative": false,
-      "class": "frame",
-      "over_target": true
+      "class": "frame"
+    },
+    "paint.auction.steady.total": {
+      "budget_us": 2500,
+      "relative": false,
+      "class": "frame"
     },
     "paint.auction.pan.ui": {
-      "budget_us": 46000,
-      "relative": false,
-      "class": "frame",
-      "over_target": true
-    },
-    "paint.auction.pan.tess": {
       "budget_us": 2000,
       "relative": false,
       "class": "frame"
     },
-    "paint.auction.pan.total": {
-      "budget_us": 47000,
+    "paint.auction.pan.tess": {
+      "budget_us": 1000,
       "relative": false,
-      "class": "frame",
-      "over_target": true
+      "class": "frame"
+    },
+    "paint.auction.pan.total": {
+      "budget_us": 2800,
+      "relative": false,
+      "class": "frame"
+    },
+    "paint.auction_refresh.ui": {
+      "budget_us": 2000,
+      "relative": false,
+      "class": "frame"
+    },
+    "paint.auction_refresh.tess": {
+      "budget_us": 1000,
+      "relative": false,
+      "class": "frame"
+    },
+    "paint.auction_refresh.total": {
+      "budget_us": 2800,
+      "relative": false,
+      "class": "frame"
     }
   }
 }

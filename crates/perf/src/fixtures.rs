@@ -78,3 +78,22 @@ pub fn returns_family(trials: usize, n: usize, seed: u64) -> BTreeMap<String, Re
         })
         .collect()
 }
+
+/// Matching coverage receipt for the dev-only cash fixture.
+pub fn stitch(bars: &[Bar], tf: Timeframe) -> tr_data::vault::StitchInfo {
+    let mut dates = bars.iter().map(|b| tr_core::ny::civil(b.ts).date()).collect::<Vec<_>>();
+    dates.dedup();
+    let at = bars.last().unwrap().ts + tf.seconds();
+    let cells =
+        dates.into_iter().map(|date| tr_data::vault::merge::classify_session(date, tf, bars, 1, 0, at)).collect();
+    tr_data::vault::StitchInfo {
+        cells,
+        source: "benchmark fixture only".into(),
+        epoch: 1,
+        vault_bars: bars.len(),
+        sessions: 20,
+        live_ok: true,
+        fetched_at: Some(at),
+        ..Default::default()
+    }
+}

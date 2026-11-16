@@ -1,5 +1,6 @@
 //! Auction Map: worker requests and timestamp-based cached chart geometry.
 use super::*;
+use crate::widgets::{HeatScale, MathCard, MathCardExt};
 use crate::{command::AuctionCmd, layouts::AuctionSettings};
 use tr_data::auction::{
     self as math, AuctionKey, AuctionParams, AuctionReport, Level, LevelEnd, LevelKind, SessionStatus,
@@ -16,6 +17,8 @@ pub(super) struct AuctionState {
     menu_level: Option<Level>,
     revision: u64,
     paint: AuctionPaint,
+    concentrations: Vec<Option<math::Concentration>>,
+    concentration_cards: Vec<MathCard>,
 }
 impl AuctionState {
     pub fn invalidate(&mut self) {
@@ -25,6 +28,8 @@ impl AuctionState {
         self.previous = None;
         self.menu_level = None;
         self.paint = AuctionPaint::default();
+        self.concentrations.clear();
+        self.concentration_cards.clear();
     }
 }
 #[derive(Default)]
@@ -38,6 +43,7 @@ struct AuctionPaint {
     note: String,
     detail: String,
     footer_rect: Option<Rect>,
+    ribbon: Vec<(Rect, usize)>,
 }
 struct Hit {
     rect: Rect,
@@ -74,6 +80,11 @@ impl Hit {
             None => self.detail.to_string(),
         }
     }
+}
+fn concentration_heat(narrow: bool) -> HeatScale {
+    HeatScale::sequential(1., if narrow { "" } else { "CONCENTRATION c [0,1]" }, |v| {
+        format!("{v:.1}").trim_start_matches('0').to_string()
+    })
 }
 fn line(shapes: &mut Vec<egui::Shape>, a: Pos2, b: Pos2, color: Color32, width: f32) {
     shapes.push(egui::Shape::line_segment([a, b], Stroke::new(width, color)));
@@ -223,6 +234,33 @@ impl ChartState {
         if self.auction_key() != key {
             return;
         }
+        self.auction.concentrations.clear();
+        self.auction.concentration_cards.clear();
+        if let Ok(r) = &result {
+            for s in &r.sessions {
+                let c = math::concentration(&s.volume);
+                let card = MathCard::new("Session concentration", "D₂ = 1 / Σ(volume_j / total_volume)²; c = 1 − D₂ / K; K = positive-volume rows")
+                    .n(s.bars_used, "closed bars").span(s.date.to_string(), s.date.to_string())
+                    .closed_thru(tr_core::ny::civil(r.closed_thru).to_string()).source(&r.source)
+                    .provenance(self.provenance)
+                    .input("bars used / expected", format!("{} / {}", s.bars_used, s.expected))
+                    .input("total allocated volume", format!("{:.4}", s.total))
+                    .input("bin width", format!("{:.4}", r.bin))
+                    .note(format!("{:?} · {} holes · observed {}", s.status, s.holes, self.last_refresh.map_or("unavailable".into(), |t| tr_core::ny::civil(t).to_string())))
+                    .note("Allocated OHLCV volume, not exchange trade-at-price observations. Bin-width dependent; K=1 means uniform over the sole occupied row.")
+                    .caveat("Descriptive allocated volume; no confidence interval or predictive significance.");
+                let card = match c {
+                    Some(c) => card
+                        .value(format!("c {:.4} · D₂ {:.2} · K {}", c.normalized, c.effective_rows, c.occupied))
+                        .input("effective rows D₂", format!("{:.6}", c.effective_rows))
+                        .input("occupied rows K", c.occupied.to_string())
+                        .input("concentration c", format!("{:.6}", c.normalized)),
+                    None => card.unavailable("No positive finite allocated volume"),
+                };
+                self.auction.concentrations.push(c);
+                self.auction.concentration_cards.push(card);
+            }
+        }
         self.auction.previous = result.as_ref().ok().map(|_| (key, self.bars.clone()));
         self.auction.result = Some(result);
         self.auction.revision = self.auction.revision.wrapping_add(1);
@@ -239,7 +277,7 @@ impl ChartState {
     /// whatever sits under it. Zero when the map is off or has no report.
     pub(super) fn auction_footer_room(&self) -> f32 {
         if self.auction.enabled && matches!(self.auction.result, Some(Ok(_))) {
-            self.auction_footer_lift() + 32.
+            self.auction_footer_lift() + 78.
         } else {
             0.
         }
@@ -567,7 +605,7 @@ impl ChartState {
                 .collect();
             let last = r.sessions.last().map_or(0., |s| s.close);
             levels.sort_by(|a, b| (a.price - last).abs().total_cmp(&(b.price - last).abs()));
-            let bottom = rect.bottom() - lift - 40.;
+            let bottom = rect.bottom() - lift - 86.;
             levels.truncate((((bottom - rect.top() - 57.) / 17.).floor().max(1.) as usize).min(12));
             levels.sort_by(|a, b| b.price.total_cmp(&a.price));
             let count = levels.len();
@@ -642,6 +680,61 @@ impl ChartState {
                 paint.hits.push(Hit { rect:tag,detail:format!("{:?} {:.4}\nOrigin {} · {} sessions · {} tests\nDistance {:+.4} ({:+.2}%)\n{:?}\nUntouched in closed regular-session bars until the recorded end.\nClick: centre origin · Alt+click: anchor VWAP at open",l.kind,l.price,l.origin,l.age,l.tests,l.price-last,(l.price/last-1.)*100.,l.end).into(),level:Some(l.clone()),row:None });
             }
         }
+        // Session-aligned, 14 px ribbon; descriptors/cards were prepared on acceptance.
+        let heat = concentration_heat(false);
+        for (index, s) in r.sessions.iter().enumerate() {
+            let i = self.bars.partition_point(|b| b.ts < s.open_ts);
+            if self.bars.get(i).is_none_or(|b| b.ts >= s.close_ts) {
+                continue;
+            }
+            let raw_left = rect.left() + v.x_of(i as f64) as f32;
+            let raw_right = x(s.close_ts).max(raw_left + 1.);
+            let left = raw_left.max(rect.left());
+            let right = raw_right.min(rect.right());
+            if left >= right {
+                continue;
+            }
+            let tile =
+                Rect::from_min_max(pos2(left, rect.bottom() - lift - 74.), pos2(right, rect.bottom() - lift - 60.));
+            let c = a.concentrations.get(index).copied().flatten();
+            paint.shapes.push(egui::Shape::rect_filled(
+                tile,
+                0.,
+                c.map_or(theme::control(), |c| heat.fill(c.normalized)),
+            ));
+            if tile.width() > 42. {
+                let tag = match s.status {
+                    SessionStatus::Partial => "P ",
+                    SessionStatus::Developing => "D ",
+                    _ => "",
+                };
+                paint.labels.push((
+                    tile.min + vec2(2., 2.),
+                    c.map_or("—".into(), |c| format!("{tag}{:.2}", c.normalized)),
+                    c.map_or(theme::muted(), |c| heat.ink(c.normalized)),
+                ));
+            }
+            if s.status != SessionStatus::Complete {
+                paint.shapes.push(egui::Shape::rect_stroke(
+                    tile,
+                    0.,
+                    Stroke::new(1., theme::caution()),
+                    StrokeKind::Inside,
+                ));
+                let mut xx = tile.left();
+                while xx < tile.right() {
+                    line(
+                        &mut paint.shapes,
+                        pos2(xx, tile.bottom()),
+                        pos2((xx + 6.).min(tile.right()), tile.top()),
+                        theme::text().gamma_multiply(0.3),
+                        1.,
+                    );
+                    xx += 10.;
+                }
+            }
+            paint.ribbon.push((tile, index));
+        }
         // One mesh for all profile rows. Lines and labels remain separate, cached shapes.
         paint.shapes.insert(0, egui::Shape::mesh(mesh));
         let time = tr_core::ny::civil(r.closed_thru).format("%H:%M").to_string();
@@ -664,6 +757,10 @@ impl ChartState {
             pos2((rect.left() + 12. + width).min(rect.right()), rect.bottom() - lift),
         ));
         self.auction.paint = paint;
+    }
+    #[cfg(test)]
+    pub(super) fn concentration_paint_is_present(&self) -> bool {
+        !self.auction.paint.ribbon.is_empty() && self.auction.concentrations.iter().all(Option::is_some)
     }
     pub(super) fn paint_auction(&mut self, ui: &mut Ui, rect: Rect, v: &Viewport, scale: &PriceScale) {
         if !self.auction.enabled {
@@ -711,11 +808,24 @@ impl ChartState {
             mono(9.),
             theme::text(),
         );
-        widgets::seq_key(
-            &p,
-            pos2(rect.left() + 8., base - 13.),
-            &["20", "40", "60", "80", "100% of POC"],
-        );
+        widgets::seq_key(&p, pos2(rect.left() + 8., base - 13.), &["20", "40", "60", "80", "100% of POC"]);
+        let narrow = rect.width() < 430.;
+        if narrow {
+            p.text(
+                pos2(rect.left() + 8., base - 59.),
+                Align2::LEFT_TOP,
+                "CONCENTRATION c [0,1]",
+                mono(9.),
+                theme::muted(),
+            );
+        }
+        concentration_heat(narrow).key_at(&p, pos2(rect.left() + 8., base - 44.));
+        for (tile, index) in &paint.ribbon {
+            if let Some(card) = self.auction.concentration_cards.get(*index) {
+                ui.interact(*tile, ui.id().with((self.id, "concentration", index)), Sense::hover())
+                    .math_card(|| card.clone());
+            }
+        }
         let fallback = matches!(&self.auction.result, Some(Ok(r)) if r.fine_note.is_some());
         p.text(
             pos2(rect.left() + 222., base - 13.),
@@ -874,11 +984,7 @@ fn profile_rows(
                 top.max(rect.top())..=bottom.min(rect.bottom()),
             );
             let inside = first + start as i64 >= va.0 && first + i as i64 <= va.1;
-            let color = widgets::seq_ramp((ratio * 5.).ceil() as usize).gamma_multiply(if inside {
-                1.
-            } else {
-                0.45
-            });
+            let color = widgets::seq_ramp((ratio * 5.).ceil() as usize).gamma_multiply(if inside { 1. } else { 0.45 });
             mesh.add_colored_rect(row, color);
             paint.hits.push(Hit {
                 rect: row,
@@ -1288,7 +1394,7 @@ mod tests {
         let mut c = fixture();
         Arc::make_mut(&mut c.bars).remove(3);
         ready(&mut c);
-        assert_eq!(c.auction_footer_room(), 38.);
+        assert_eq!(c.auction_footer_room(), 84.);
         c.stitch = Some(Arc::new(tr_data::vault::StitchInfo {
             cells: vec![tr_data::vault::SessionCell {
                 date: "2026-11-10".parse().unwrap(),
@@ -1304,7 +1410,7 @@ mod tests {
             }],
             ..Default::default()
         }));
-        assert_eq!(c.auction_footer_room(), 54.);
+        assert_eq!(c.auction_footer_room(), 100.);
         geometry(&mut c);
         let footer = c.auction.paint.footer_rect.unwrap();
         assert!(footer.bottom() <= 500. - 22.);
@@ -1314,6 +1420,42 @@ mod tests {
         geometry(&mut c);
         assert!(c.auction.paint.labels.iter().any(|(_, s, _)| s == "P"));
         assert!(!c.auction.paint.labels.iter().any(|(_, s, _)| s.starts_with("PARTIAL")));
+    }
+    #[test]
+    fn concentration_ribbon_and_key_fit_narrow_and_wide_and_reserve_footer() {
+        for width in [254., 320., 1440.] {
+            let mut c = fixture();
+            ready(&mut c);
+            let ctx = egui::Context::default();
+            let rect = Rect::from_min_size(Pos2::ZERO, vec2(width, 600.));
+            let v = Viewport::fit_last(c.bars.len(), c.bars.len(), width as f64);
+            let mut out = ctx.run_ui(egui::RawInput { screen_rect: Some(rect), ..Default::default() }, |ui| {
+                c.paint_auction(ui, rect, &v, &PriceScale::padded(98., 108., 0.01, false, 600.));
+                let key = concentration_heat(width < 430.);
+                assert!(key.key_at(&ui.painter_at(rect), pos2(8., 100.)) <= width - 8., "key clipped at {width}");
+            });
+            out.textures_delta.clear();
+            assert!(all_text(&out).contains("CONCENTRATION"));
+            assert!(all_text(&out).contains("[0,1]"));
+            assert_eq!(c.auction.paint.ribbon.len(), 3);
+            let footer = c.auction.paint.footer_rect.unwrap();
+            for (tile, index) in &c.auction.paint.ribbon {
+                assert!(tile.is_finite() && tile.is_positive());
+                assert!(tile.bottom() < footer.top());
+                assert!(tile.top() >= rect.bottom() - c.auction_footer_room());
+                let card = c.auction.concentration_cards[*index].to_text();
+                for text in [
+                    "D₂",
+                    "occupied rows",
+                    "bin width",
+                    "bars used / expected",
+                    "CLOSED THRU",
+                    "no confidence interval or predictive significance",
+                ] {
+                    assert!(card.contains(text), "missing {text}: {card}");
+                }
+            }
+        }
     }
     #[test]
     fn legend_line_names_the_latest_session_value_and_open_location() {

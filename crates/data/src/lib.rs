@@ -1226,3 +1226,5 @@ mod tests {
 }
 
 pub mod stop_cloud;
+
+pub mod chart_session;

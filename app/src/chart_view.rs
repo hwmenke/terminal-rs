@@ -27,11 +27,13 @@ use crate::worker::{BuiltIndicator, PaneId, Request, Worker, archive_page, initi
 use tr_data::anchored_vwap::AvwapKey;
 
 mod auction;
+mod session_cache;
 mod cockpit;
 mod stop_cloud;
 mod trend_cone;
 mod vault_footer;
 pub use cockpit::{LinkBus, LinkPublish, resolve_hover};
+pub use session_cache::SessionSummaryKey;
 
 const AXIS_W: f32 = 66.0;
 const TIME_H: f32 = 16.0;
@@ -81,6 +83,7 @@ fn corner_mark(
 
 /// Session stats for an intraday equity/ETF/index series whose bars match `tf`.
 /// Missing VWAP or relative volume is an em dash, not a made-up number.
+#[cfg(test)]
 fn session_line(tf: Timeframe, sec: &Security, bars: &[Bar]) -> Option<String> {
     if !tf.is_intraday() || !matches!(sec.class, AssetClass::Equity | AssetClass::Etf | AssetClass::Index) {
         return None;
@@ -110,6 +113,7 @@ fn session_line(tf: Timeframe, sec: &Security, bars: &[Bar]) -> Option<String> {
 
 /// Opening range of the latest regular session, when every bucket of the first half-hour is present.
 /// A missing print stays blank. Premarket and later bars do not move the printed high and low.
+#[cfg(test)]
 fn opening_line(tf: Timeframe, sec: &Security, bars: &[Bar]) -> Option<String> {
     if !tf.is_intraday() || !matches!(sec.class, AssetClass::Equity | AssetClass::Etf | AssetClass::Index) {
         return None;
@@ -120,6 +124,7 @@ fn opening_line(tf: Timeframe, sec: &Security, bars: &[Bar]) -> Option<String> {
 }
 
 /// Prior cash session high, low, and close, when that session is complete in `bars`.
+#[cfg(test)]
 fn prior_line(tf: Timeframe, sec: &Security, bars: &[Bar]) -> Option<String> {
     if !tf.is_intraday() || !matches!(sec.class, AssetClass::Equity | AssetClass::Etf | AssetClass::Index) {
         return None;
@@ -147,6 +152,7 @@ fn profile_share(volume: f64, total: f64) -> Option<String> {
 }
 
 /// Latest regular session's verified volume profile. Empty when no verified volume is present.
+#[cfg(test)]
 fn profile_line(tf: Timeframe, sec: &Security, bars: &[Bar]) -> Option<String> {
     if !tf.is_intraday() || !matches!(sec.class, AssetClass::Equity | AssetClass::Etf | AssetClass::Index) {
         return None;
@@ -166,6 +172,7 @@ fn profile_line(tf: Timeframe, sec: &Security, bars: &[Bar]) -> Option<String> {
 }
 
 /// Value area of the latest regular session's verified profile.
+#[cfg(test)]
 fn value_line(tf: Timeframe, sec: &Security, bars: &[Bar]) -> Option<String> {
     if !tf.is_intraday() || !matches!(sec.class, AssetClass::Equity | AssetClass::Etf | AssetClass::Index) {
         return None;
@@ -300,6 +307,7 @@ pub struct ChartState {
     cone: trend_cone::ConeState,
     stops: stop_cloud::StopState,
     auction: auction::AuctionState,
+    session: session_cache::SessionCache,
     edge: Option<Result<Arc<tr_data::edge::EdgeReport>, String>>,
     edge_work: Option<Request>,
     edge_pending: Option<EdgeKey>,
@@ -447,6 +455,7 @@ impl ChartState {
             cone: Default::default(),
             stops: Default::default(),
             auction: Default::default(),
+            session: Default::default(),
             edge: None,
             edge_paint: Default::default(),
             edge_work: None,
@@ -594,6 +603,7 @@ impl ChartState {
     /// (Re)load history for the current symbol and timeframe.
     pub fn load(&mut self, w: &Worker) {
         self.generation += 1;
+        self.invalidate_session_summary();
         self.stitch = None;
         self.edge_pending = None;
         self.edge_work = None;
@@ -1392,6 +1402,11 @@ impl ChartState {
 
     pub fn on_vault_stitch(&mut self, generation: u64, info: Arc<tr_data::vault::StitchInfo>) {
         if generation == self.generation {
+            if self.stitch.as_ref().map(|old| &old.source) != Some(&info.source) {
+                self.invalidate_session_summary();
+            }
+            self.session.stitch_revision =
+                self.session.stitch_revision.checked_add(1).expect("stitch revision overflow");
             self.stitch = Some(info);
         }
     }
@@ -1740,7 +1755,11 @@ impl ChartState {
             g.from.right += shift;
             g.to.right += shift;
         }
+        self.session.bars_revision = self.session.bars_revision.checked_add(1).expect("bars revision overflow");
         self.provenance = Bar::provenance(&bars);
+        if !self.provenance.is_verified() {
+            self.invalidate_session_summary();
+        }
         self.bars = bars;
         self.gpu = Some(gpu);
         self.paging = false;
@@ -1957,6 +1976,9 @@ impl ChartState {
         let mut clicked = false;
         self.link_out = LinkPublish::default();
         self.request_avwap(w);
+        if let Some(wait) = self.request_session_summary(w) {
+            ui.ctx().request_repaint_after(wait);
+        }
         if let Some(wait) = self.request_auction(w) {
             ui.ctx().request_repaint_after(wait);
         }
@@ -3237,38 +3259,10 @@ impl ChartState {
 
         // Overlay indicator values, one per line.
         let mut ly = y + 16.0;
-        if let Some(line) = session_line(self.tf, &self.sec, &self.bars) {
-            p.text(pos2(price_rect.left() + 6.0, ly), Align2::LEFT_TOP, line, mono(11.0), muted());
-            ly += 14.0;
-        }
-        if let Some(line) = opening_line(self.tf, &self.sec, &self.bars) {
-            p.text(pos2(price_rect.left() + 6.0, ly), Align2::LEFT_TOP, line, mono(11.0), theme::up());
-            ly += 14.0;
-        }
-        if let Some(line) = prior_line(self.tf, &self.sec, &self.bars) {
-            p.text(pos2(price_rect.left() + 6.0, ly), Align2::LEFT_TOP, line, mono(11.0), amber());
-            ly += 14.0;
-        }
-        if !self.auction.enabled
-            && let Some(line) = profile_line(self.tf, &self.sec, &self.bars)
-        {
-            p.text(pos2(price_rect.left() + 6.0, ly), Align2::LEFT_TOP, line, mono(11.0), theme::series(2));
-            ly += 14.0;
-        }
-        if !self.auction.enabled
-            && let Some(line) = value_line(self.tf, &self.sec, &self.bars)
-        {
-            p.text(pos2(price_rect.left() + 6.0, ly), Align2::LEFT_TOP, line, mono(11.0), theme::accent());
-            ly += 14.0;
-        }
+        self.paint_session_lines(ui, price_rect, &mut ly);
         // With the Auction Map on, one line from its report replaces VP / VAH.
         if let Some(line) = self.auction_legend_line() {
             p.text(pos2(price_rect.left() + 6.0, ly), Align2::LEFT_TOP, line, mono(11.0), theme::series(2));
-            ly += 14.0;
-        }
-        if self.extended && self.offers_extended() {
-            let line = tr_data::intraday::extended_summary(&self.bars);
-            p.text(pos2(price_rect.left() + 6.0, ly), Align2::LEFT_TOP, line, mono(11.0), amber());
             ly += 14.0;
         }
         if let Some(line) = &self.earnings {
@@ -4058,9 +4052,9 @@ impl ChartState {
         {
             return;
         }
-        let Some(range) = tr_data::intraday::opening_range(self.tf, &self.bars) else { return };
+        let Some(range) = self.session_snapshot().and_then(|s| s.opening) else { return };
         let p = ui.painter_at(rect);
-        let rows = [(range.high, "ORH", theme::up()), (range.low, "ORL", theme::down())];
+        let rows = [(range.high, "ORH", theme::series(0)), (range.low, "ORL", theme::series(1))];
         for (price, tag, color) in rows {
             let y = rect.top() + scale.y_of(price) as f32;
             if !rect.y_range().contains(y) {
@@ -4083,8 +4077,9 @@ impl ChartState {
         {
             return;
         }
-        let profile: Vec<_> = tr_data::intraday::verified_profile(self.tf, &self.bars, 24)
-            .into_iter()
+        let Some(summary) = self.session_snapshot() else { return };
+        let profile: Vec<_> = summary.stats.profile
+            .iter()
             .filter(|b| b.volume.is_finite() && b.volume > 0.0)
             .collect();
         if profile.is_empty() {
@@ -4100,7 +4095,7 @@ impl ChartState {
         }
         let p = ui.painter_at(rect);
         let max_w = (rect.width() * 0.18).clamp(28.0, 80.0);
-        for bin in &profile {
+        for bin in profile {
             let y = rect.top() + scale.y_of(bin.price) as f32;
             if !rect.y_range().contains(y) {
                 continue;
@@ -4121,7 +4116,7 @@ impl ChartState {
         {
             return;
         }
-        let Some(area) = tr_data::intraday::value_area(self.tf, &self.bars, 24) else { return };
+        let Some(area) = self.session_snapshot().and_then(|s| s.value_area) else { return };
         let p = ui.painter_at(rect);
         let color = theme::accent();
         for (price, tag) in [(area.high, "VAH"), (area.low, "VAL")] {
@@ -4146,7 +4141,7 @@ impl ChartState {
         {
             return;
         }
-        let Some(prior) = tr_data::intraday::prior_session(self.tf, &self.bars) else { return };
+        let Some(prior) = self.session_snapshot().and_then(|s| s.prior) else { return };
         let p = ui.painter_at(rect);
         let rows =
             [(prior.high, "PDH", amber()), (prior.low, "PDL", theme::cyan()), (prior.close, "PDC", theme::series(4))];
@@ -5922,9 +5917,11 @@ mod tests {
             bar(wall(2026, 3, 9, 16, 0), 5.5),
         ]);
         chart.on_history(chart.generation, bars.clone(), SeriesGpu::build(&bars), 0, false, true, false, &worker);
+        session_cache::tests::accept(&mut chart);
         let output = chart_frame(&ctx, &mut chart, &worker, vec![]);
         assert!(contains_text(&output.shapes, "Extended hours: 1 pre-market · 1 after hours"));
         chart.extended = false;
+        session_cache::tests::accept(&mut chart);
         let output = chart_frame(&ctx, &mut chart, &worker, vec![]);
         assert!(!contains_text(&output.shapes, "Extended hours: 1 pre-market · 1 after hours"));
     }
@@ -5960,6 +5957,7 @@ mod tests {
             false,
             &worker,
         );
+        session_cache::tests::accept(&mut chart);
         let output = chart_frame(&ctx, &mut chart, &worker, vec![]);
         assert!(contains_text(&output.shapes, "OR30  H 13.00  L 8.00"));
         assert!(contains_text(&output.shapes, "ORH 13.00"));
@@ -5977,6 +5975,7 @@ mod tests {
             false,
             &worker,
         );
+        session_cache::tests::accept(&mut chart);
         let output = chart_frame(&ctx, &mut chart, &worker, vec![]);
         assert!(!contains_text(&output.shapes, "OR30  H 13.00  L 8.00"));
         assert!(!contains_text(&output.shapes, "ORH 13.00"));
@@ -6024,6 +6023,7 @@ mod tests {
             false,
             &worker,
         );
+        session_cache::tests::accept(&mut chart);
         let output = chart_frame(&ctx, &mut chart, &worker, vec![]);
         assert!(contains_text(&output.shapes, "PDH 12.00  PDL 9.00  PDC 10.50"));
         assert!(contains_text(&output.shapes, "PDH 12.00"));
@@ -6042,6 +6042,7 @@ mod tests {
             false,
             &worker,
         );
+        session_cache::tests::accept(&mut chart);
         let output = chart_frame(&ctx, &mut chart, &worker, vec![]);
         assert!(!contains_text(&output.shapes, "PDH 12.00  PDL 9.00  PDC 10.50"));
         assert!(!contains_text(&output.shapes, "PDH 12.00"));
@@ -6070,6 +6071,7 @@ mod tests {
         let (worker, _) = Worker::test_channel();
         let mut chart = ChartState::new(15, "AAPL", Timeframe::M5);
         chart.on_history(chart.generation, bars.clone(), SeriesGpu::build(&bars), 0, false, true, false, &worker);
+        session_cache::tests::accept(&mut chart);
         let output = chart_frame(&ctx, &mut chart, &worker, vec![]);
         assert!(contains_text(&output.shapes, "VP 2  peak 18.96  75%"));
         assert!(contains_text(&output.shapes, "75%"));
@@ -6110,6 +6112,7 @@ mod tests {
         let (worker, _) = Worker::test_channel();
         let mut chart = ChartState::new(17, "AAPL", Timeframe::M5);
         chart.on_history(chart.generation, bars.clone(), SeriesGpu::build(&bars), 0, false, true, false, &worker);
+        session_cache::tests::accept(&mut chart);
         let output = chart_frame(&ctx, &mut chart, &worker, vec![]);
         assert!(contains_text(&output.shapes, "VAH 19.17  VAL 18.75  75%"));
         assert!(contains_text(&output.shapes, "VAH 19.17"));
@@ -6630,6 +6633,7 @@ mod tests {
         assert_eq!(built.len(), 1, "indicators run on the intraday series");
         chart.built = built;
         let ctx = egui::Context::default();
+        session_cache::tests::accept(&mut chart);
         let output = chart_frame(&ctx, &mut chart, &worker, vec![]);
         let text = shape_text(&output.shapes);
         assert!(text.contains("VWAP") && text.contains("RVOL —"), "{text}");
@@ -7186,6 +7190,7 @@ mod tests {
         let ctx = egui::Context::default();
         let (w, _) = Worker::test_channel();
         let mut c = cockpit_chart(&w, Timeframe::M5, Provenance::Real, &[]);
+        session_cache::tests::accept(&mut c);
         let off = shape_text(&chart_frame(&ctx, &mut c, &w, vec![]).shapes);
         assert!(off.contains("VP "), "{off}");
         assert!(off.contains("VAH "), "{off}");

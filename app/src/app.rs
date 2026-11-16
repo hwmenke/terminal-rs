@@ -2212,6 +2212,9 @@ impl TerminalApp {
                         }
                     }
                 }
+                Response::ChartSessionSummary { pane, key, result } => {
+                    if let Some(c) = self.chart_mut(pane) { c.on_session_summary(key, result); }
+                }
                 Response::AuctionMap { pane, key, result } => {
                     if let Some(c) = self.chart_mut(pane) {
                         c.on_auction_map(key, result);

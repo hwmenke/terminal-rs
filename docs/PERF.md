@@ -115,8 +115,8 @@ are separate. CPU timing runs inside cache misses for StackEdge, TrendStack,
 StopCloud, TrendCone, AVWAP, AuctionMap, Tune, honest backtests and cached studies;
 indicator construction and CPU pyramid builds are also timed. Each kind/phase keeps
 64 recent samples plus its count/EMA/max. Jobs are collected even with the HUD shut,
-so opening it shows recent work. No formulas, worker decisions, cache keys, throttles
-or persisted settings/layout fields were changed.
+so opening it shows recent work. Instrumentation preserved formulas and persisted settings/layout fields. Slice 1
+adds the ephemeral session-summary revisions described below.
 
 ## Adding a case
 
@@ -145,7 +145,7 @@ budget does not certify disk or network latency. GPU upload, rendering and prese
 remain outside these headless measurements; use the existing `framebench` for GPU
 work.
 
-## Measured calibration on this box
+## Pre-slice 1 calibration on this box (historical)
 
 Recorded 2026-11-16, release profile, Intel(R) Xeon(R) Processor, 8 available cores, linux. Idle-host calibration median: **6000.22 µs** (nine runs). The initial run overlapped a build and was discarded for compute baseline purposes; this table uses the subsequent idle run. Baseline contains raw paint measurements and all compute summaries.
 
@@ -197,15 +197,15 @@ Recorded 2026-11-16, release profile, Intel(R) Xeon(R) Processor, 8 available co
 
 All other per-layer ceilings retain their planned values. Pan uses 4× the steady layer ceiling. The calibration rule uses medians, not p95.
 
-### Over target
+### Historical over target
 
-The **auction pane misses the intended frame target**: about 15 ms of UI CPU for one pane, even while steady. Its legend/footer and session-level paths dominate; Auction Map geometry itself is roughly 0.013 ms steady. The calibrated gate ceilings of 45–47 ms are honest regression limits, not a claim that the pane meets the 2 ms design target or that a 2×2 desk fits in 8 ms. No optimisation was attempted in this instrumentation row.
+Before Slice 1, the **auction pane missed the intended frame target**: about 15 ms of UI CPU for one pane, even while steady. Its legend/footer and session-level paths dominate; Auction Map geometry itself is roughly 0.013 ms steady. The calibrated gate ceilings of 45–47 ms are honest regression limits, not a claim that the pane meets the 2 ms design target or that a 2×2 desk fits in 8 ms. No optimisation was attempted in this instrumentation row.
 
 `edge.regime_edge_5k` has a 93 ms calibrated ceiling (3× the 30.728 ms median, rounded up), exceeding the 50 ms interactive class cap; it is marked `over_target`. Its measured median is still below that class target. `data.vault_ingest_390` retains the plan's 60 ms ceiling and is also flagged because that ceiling exceeds the 50 ms load class; its measured median is only 1.486 ms. Auction paint UI/total entries carry `over_target` flags. These flags describe target/ceiling debt rather than suppressing failures.
 
 The loaded intraday pane is inside the original frame ceilings: 0.209 ms UI / 0.604 ms total steady, and 0.477 ms UI / 1.085 ms total panning. TUNE measured 91.995 ms against its retained 500 ms ceiling.
 
-## Validation in this session
+## Perf instrumentation validation (historical)
 
 `cargo test --workspace --offline`: **1,516 passed, 0 failed, 9 ignored**. The new
 coverage comprises 14 harness/fixture tests, five meter/scope/HUD tests, two chart
@@ -236,3 +236,101 @@ normalised Cone warning (1.36×, below the 1.5× failure threshold); all ceiling
 regression rules passed. Final reports remain in `$CARGO_TARGET_DIR/perf/`. A
 normal-edge `cargo tree` check confirms `tr-perf` is absent from the shipped app's
 dependency graph; Cargo.lock adds no external packages or version changes.
+
+## Slice 1: Auction at frame speed
+
+The unchanged release scenario was remeasured before editing: **14.643 ms UI /
+14.906 ms total steady**, **14.699 ms UI / 14.972 ms total panning**. Steady
+Legend was **10.693 ms**, Levels **3.718 ms**, ChartTotal **14.605 ms**. This
+confirmed repeated intraday summaries/date maps as the bottleneck, rather than
+Auction geometry. These are fresh measurements; the earlier table is historical.
+
+The worker now builds a complete, admitted `chart_session::SessionSummary` with
+legacy numeric summaries, coverage index spans, exact-neighbour gap marks and
+invariant text. It validates all original bars through `vault::research_bars`
+before taking latest/prior-session slices for helpers whose definitions depend
+only on those sessions. Legacy formulas, Auction allocation/value area, fine-data
+fetching and level-touch math are unchanged. Live descriptive forming input has
+an explicit receipt; CLOSED THRU uses bar ends and the observation clock. No
+provider/SQLite work is added by the summary request.
+
+Each pane tracks generation, monotonic bars/stitch receipt revisions, timeframe,
+extended-hours mode and observation time. Same-length corrections and new
+receipts at the same epoch invalidate. One in-flight job and a 300 ms throttle
+coalesce changes; obsolete completions release the slot and cannot overwrite
+current values. Identity changes, sample input and refusal clear numeric output.
+During recomputation the old receipt says PREVIOUS SNAPSHOT with its own clock;
+numeric rows and index maps wait for the new acceptance. Hover/pan/zoom/theme
+changes reuse the summary. The exact accepted receipt supplies the vault cells.
+
+The ribbon's concentration descriptors/cards are computed when the Auction
+report is accepted; geometry reuses the existing viewport/palette cache. The
+printed sequential key shares its thresholds with the tiles. Narrow/wide tests
+check finite tiles, key width, cards and footer reservations. Tile click navigation,
+extra visual polish, and caching the existing short Auction legend formatter were
+cut; the latter is negligible after the session scan removal.
+
+The first successful extended paint run measured **0.440 ms total steady**, **0.633
+ms total panning**, and **0.464 ms refresh**. Only after this measurement were the
+Auction ceilings tightened to the planned values:
+
+| Mode | UI ceiling ms | Tessellation ceiling ms | Total ceiling ms |
+| --- | ---: | ---: | ---: |
+| Steady | 1.5 | 1.0 | 2.5 |
+| Pan | 2.0 | 1.0 | 2.8 |
+| Refresh (acceptance included) | 2.0 | 1.0 | 2.8 |
+
+ChartTotal/Legend/Levels steady ceilings are restored to **2.0 / 0.4 / 0.1 ms**;
+the existing 4× pan layer multiplier remains. No existing budget was widened.
+`paint.auction_refresh` times repeated precomputed response acceptance **and** the
+frame, including formatting. All modes retain 7,800 bars, twenty sessions, four
+AVWAP anchors, moving pointer and the original viewport/pan motion, with vault
+coverage now also supplied. Guards assert actual session/OR/prior legend content,
+legacy profile data, coverage, ribbon/key and no new summary jobs on unchanged
+frames. Rebuild work is independently timed in the compute gate:
+`chart.session_summary_7800` ≤35 ms (target median <12 ms), and
+`auction.concentration_20` ≤0.2 ms. Both closures also run at smoke scale.
+
+Final release measurements (2026-11-16, same 8-core Linux host; calibration **6,042.972 µs**):
+
+| Auction metric | Before median ms | Final median ms | Final p95 ms | Ceiling ms |
+| --- | ---: | ---: | ---: | ---: |
+| steady ui | 14.643 | 0.170 | 0.188 | 1.5 |
+| steady tess | 0.262 | 0.240 | 0.256 | 1.0 |
+| steady total | 14.906 | 0.410 | 0.431 | 2.5 |
+| pan ui | 14.699 | 0.318 | 0.358 | 2.0 |
+| pan tess | 0.267 | 0.255 | 0.269 | 1.0 |
+| pan total | 14.972 | 0.572 | 0.617 | 2.8 |
+| refresh ui | — | 0.187 | 0.212 | 2.0 |
+| refresh tess | — | 0.252 | 0.263 | 1.0 |
+| refresh total | — | 0.439 | 0.466 | 2.8 |
+
+Steady ChartTotal / Legend / Levels medians are **0.155 / 0.021 / 0.024 ms**
+against **2.0 / 0.4 / 0.1 ms** ceilings. The full session rebuild measured
+**5.783 ms median / 6.217 ms p95** against 35 ms; twenty concentrations measured
+**2.797 µs median / 3.024 µs p95** against 200 µs. All existing Auction compute
+ceilings remain unchanged. The reviewed baseline now records all 24 compute cases
+under the current calibration and all 105 actual paint metrics.
+
+Final validation:
+
+- `cargo test --workspace --offline`: **1,557 passed, 0 failed, 9 ignored**.
+- `cargo build --release --offline`: **passed**.
+- `scripts/perf-gate.sh`: **24 compute/data passed, 0 failed, 0 harness errors**;
+  **1 release paint test passed, 0 failed, 0 ignored**, checking **105 metrics**.
+- **22 new focused tests** cover helper equality and metadata, full-input admission,
+  DST-adjacent spans, exact gap neighbours, observation clocks (including extended
+  and UTC-stamped H4 actual ends), concentration arithmetic, correction/paging/stitch
+  invalidation, coalescing, stale responses, identity/sample/refusal clearing, dynamic
+  hovered OHLC, and narrow/wide ribbon/key/card/footer geometry. Existing legacy
+  paint tests explicitly receive snapshots before asserting their unchanged values.
+- Clippy completed for the selected data/perf/app packages and all targets. No
+  diagnostics point to the new code; existing repository warnings remain.
+- The final compute run emitted one advisory `bt.report_5y` normalised slowdown
+  warning (**1.41×**, below the 1.5× failure threshold); all absolute and regression
+  gates passed. No backtest code or budget was changed.
+
+The p95 values are reported observations; the harness continues to gate medians.
+Headless timings cover CPU UI/tessellation, without GPU presentation or a four-pane
+desk. Concentration is bin-dependent descriptive allocated volume with no CI or
+predictive significance. Existing strict Clippy debt remains separate.
