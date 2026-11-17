@@ -24,8 +24,13 @@ use crate::widgets::{self, Icon};
 use crate::worker::{Request, Worker};
 
 /// Panels offered by the + menus: label and command word.
-pub const PANELS: [(&str, &str); 31] = [
+pub const PANELS: [(&str, &str); 36] = [
     ("Chart", "CHART"),
+    ("Studio", "STUDIO"),
+    ("Answers (unavailable)", "QUICK"),
+    ("Factor Lab (unavailable)", "LAB"),
+    ("Residual (unavailable)", "RESID"),
+    ("Attribution (unavailable)", "ATTR"),
     ("Watchlist", "WL"),
     ("News", "NEWS"),
     ("Order Book", "BOOK"),
@@ -329,7 +334,7 @@ impl TerminalApp {
     }
 
     pub(super) fn focused_is_chart(&self) -> bool {
-        self.idx(self.focus).is_some_and(|i| matches!(self.panes[i].kind, PaneKind::Chart(_)))
+        self.idx(self.focus).is_some_and(|i| matches!(self.panes[i].kind, PaneKind::Chart(_) | PaneKind::Studio(_)))
     }
 
     /// The focused pane if it is docked, else the first visible docked pane.
@@ -406,6 +411,11 @@ impl TerminalApp {
 
     fn init_kind(&mut self, id: PaneId, kind: PaneKind) -> PaneKind {
         match kind {
+            PaneKind::Studio(mut s) => {
+                s.chart.id = id;
+                s.sample_mode(self.provider.eq_ignore_ascii_case("sample"));
+                PaneKind::Studio(s)
+            }
             PaneKind::Research(mut r) => {
                 r.request(id, &self.worker);
                 PaneKind::Research(r)
@@ -679,6 +689,9 @@ impl TerminalApp {
         let Some(sec) = tr_core::Security::parse(symbol) else { return false };
         let key = sec.key();
         match &mut self.panes[i].kind {
+            PaneKind::Studio(s) => {
+                s.set_context_symbol(&key);
+            }
             PaneKind::Chart(c) => {
                 if c.symbol != key {
                     c.set_symbol(&key, &self.worker);
@@ -968,7 +981,7 @@ impl TerminalApp {
         if self.focused_is_chart() {
             return self.focus;
         }
-        let is_chart = |p: &Pane| matches!(p.kind, PaneKind::Chart(_));
+        let is_chart = |p: &Pane| matches!(p.kind, PaneKind::Chart(_) | PaneKind::Studio(_));
         let visible = self.dock.visible();
         if let Some(id) = visible.iter().copied().find(|&id| self.idx(id).is_some_and(|i| is_chart(&self.panes[i]))) {
             return id;
@@ -989,6 +1002,7 @@ impl TerminalApp {
         let chart = |id: PaneId| {
             self.idx(id).and_then(|i| match &self.panes[i].kind {
                 PaneKind::Chart(c) => Some(&**c),
+                PaneKind::Studio(s) => Some(&*s.chart),
                 _ => None,
             })
         };
@@ -1001,9 +1015,12 @@ impl TerminalApp {
         let id = self.chart_target();
         self.focus = id;
         if let Some(i) = self.idx(id)
-            && let PaneKind::Chart(c) = &mut self.panes[i].kind
+            && let Some(c) = self.panes[i].kind.native_chart_mut()
         {
             f(c, &self.worker);
+            if let PaneKind::Studio(s) = &mut self.panes[i].kind {
+                s.sync_chart_context();
+            }
         }
     }
 
@@ -1057,6 +1074,21 @@ impl TerminalApp {
                 let filter = given.clone().or(current.clone()).unwrap_or_default();
                 PaneKind::Journal(Box::new(super::journal::JournalPane::new(filter)))
             }
+            "STUDIO" => {
+                let (lens, tf, benchmark) =
+                    tr_data::studio::parse_spec(&words.get(1..).unwrap_or(&[]).join(" ")).ok()?;
+                let symbol = symbol.map(|s| tr_data::security(s).key()).or(current).unwrap_or_default();
+                PaneKind::Studio(Box::new(super::studio_hub::StudioPane::new(super::studio_hub::StudioViewSpec {
+                    context: tr_data::studio::StudioContext { symbol, tf, ..Default::default() },
+                    lens,
+                    benchmark,
+                    ..Default::default()
+                })))
+            }
+            "QUICK" => PaneKind::StudioRoute(tr_data::studio::StudioRoute::Quick),
+            "LAB" => PaneKind::StudioRoute(tr_data::studio::StudioRoute::Lab),
+            "RESID" => PaneKind::StudioRoute(tr_data::studio::StudioRoute::Resid),
+            "ATTR" => PaneKind::StudioRoute(tr_data::studio::StudioRoute::Attr),
             "DIST" | "RDIST" => {
                 let symbol =
                     symbol.map(|s| tr_data::security(s).key()).or_else(|| self.focused_symbol()).unwrap_or_default();

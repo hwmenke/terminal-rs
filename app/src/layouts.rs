@@ -210,6 +210,13 @@ pub enum PaneSettings {
         #[serde(default)]
         params: tr_core::indicators::AdaptiveTrendParams,
     },
+    Studio {
+        #[serde(default)]
+        view: crate::app::studio_hub::StudioViewSpec,
+    },
+    StudioRoute {
+        route: tr_data::studio::StudioRoute,
+    },
     StudioDist {
         #[serde(default)]
         symbol: String,

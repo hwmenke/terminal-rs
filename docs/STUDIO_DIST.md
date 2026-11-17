@@ -239,3 +239,14 @@ Shape and bootstrap results are immutable Arcs, single-flighted in ReportCache;
 Overview's owned report remains unchanged. Generation and seed gates reject late
 responses; sample mode refuses both jobs without provider calls. Every displayed
 statistic carries a stable `dist.shape.*` MathCard with source, method, n and clock.
+
+## Studio shell route
+
+`AAPL STUDIO 5m lens=dist` embeds this exact pane state below the native time
+canvas. Overview, Regimes and Shape keep their original workers and methods;
+switching back retains accepted reports without another compute request. Shell
+context controls live in Inspector; standalone DIST controls remain available.
+Research request tokens are now process-wide and monotonic, so recreated child
+panes cannot accept an older completion. Overview MathCards also print stable
+`dist.overview.*` IDs, CLOSED THRU and observation-clock metadata. See
+[Studio](STUDIO.md) for selection semantics, persistence and limits.

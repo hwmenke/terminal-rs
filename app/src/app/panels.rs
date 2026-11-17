@@ -50,6 +50,16 @@ impl TerminalApp {
             }
             return (actions, clicked);
         }
+        if let PaneKind::Studio(s) = &mut self.panes[i].kind {
+            let mut child = ui.new_child(UiBuilder::new().max_rect(rect.shrink(4.)).id_salt(("studio", id)));
+            let actions = s.show(&mut child, id, &self.worker, self.provider.eq_ignore_ascii_case("sample"), focused);
+            let clicked = child.response().contains_pointer() && child.input(|i| i.pointer.any_pressed());
+            return (actions, clicked);
+        }
+        if let PaneKind::StudioRoute(route) = self.panes[i].kind {
+            super::studio_frame::unavailable(ui, rect, route.code(), route.reason());
+            return (vec![], false);
+        }
         let freshness = self.congress_freshness();
         let has_leaders = self.panes.iter().any(|p| matches!(&p.kind, PaneKind::Research(r) if r.results.is_some()));
         let inner = rect.shrink2(vec2(dp(8.0), dp(4.0)));
@@ -188,6 +198,8 @@ impl TerminalApp {
             | PaneKind::TstackTune(_)
             | PaneKind::StudioCorr(_)
             | PaneKind::Stats(_)
+            | PaneKind::Studio(_)
+            | PaneKind::StudioRoute(_)
             | PaneKind::StudioDist(_)
             | PaneKind::StudioSeason(_)
             | PaneKind::Backtest(_)

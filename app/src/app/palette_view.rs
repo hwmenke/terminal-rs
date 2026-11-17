@@ -21,6 +21,16 @@ const VISIBLE_ROWS: usize = 10;
 /// Function codes offered by the palette: code, description (empty uses the command
 /// line's own hint), extra search words, and the action whose shortcut is shown.
 const COMMANDS: &[(&str, &str, &str, Option<Action>)] = &[
+    ("STUDIO", "Native canvas and named research lenses", "distribution relate when season backtest", None),
+    ("STUDIO lens=dist", "Distribution lens", "studio dist", None),
+    ("STUDIO lens=relate benchmark=QQQ", "Relationship lens", "studio corr regression", None),
+    ("STUDIO lens=when", "Daily conditional returns", "studio condition", None),
+    ("STUDIO lens=season", "Seasonality lens", "studio calendar", None),
+    ("STUDIO lens=backtest", "Research backtest lens", "studio simulation", None),
+    ("QUICK", "Answers route · unavailable", "studio answers", None),
+    ("LAB", "Factor Lab route · unavailable", "studio factors", None),
+    ("RESID", "Residual route · unavailable", "studio residual", None),
+    ("ATTR", "Attribution route · unavailable", "studio attribution", None),
     (
         "STOPS",
         "ATR Stop Cloud and empirical Stop Odds",

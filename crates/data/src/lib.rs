@@ -1232,3 +1232,5 @@ pub mod stop_cloud;
 pub mod chart_session;
 
 pub mod studio_shape;
+
+pub mod studio;

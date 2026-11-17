@@ -233,6 +233,10 @@ pub enum Action {
     Journal,
     Refresh,
     FrameTiming,
+    StudioPrevLens,
+    StudioNextLens,
+    StudioCloseInspector,
+    StudioUndo,
     Portfolio,
     Positions,
     Orders,
@@ -286,7 +290,7 @@ pub enum Action {
 }
 
 impl Action {
-    pub const ALL: [Action; 60] = [
+    pub const ALL: [Action; 64] = [
         Action::Vault,
         Action::Help,
         Action::Congress,
@@ -297,6 +301,10 @@ impl Action {
         Action::Journal,
         Action::Refresh,
         Action::FrameTiming,
+        Action::StudioPrevLens,
+        Action::StudioNextLens,
+        Action::StudioCloseInspector,
+        Action::StudioUndo,
         Action::Portfolio,
         Action::Positions,
         Action::Orders,
@@ -360,6 +368,10 @@ impl Action {
             Action::Journal => "Trade journal".into(),
             Action::Refresh => "Refresh Congress filings".into(),
             Action::FrameTiming => "Frame timing readout".into(),
+            Action::StudioPrevLens => "Studio: previous lens (local)".into(),
+            Action::StudioNextLens => "Studio: next lens (local)".into(),
+            Action::StudioCloseInspector => "Studio: close inspector (local)".into(),
+            Action::StudioUndo => "Studio: parameter undo (outside text editing)".into(),
             Action::Portfolio => "Brokerage portfolio".into(),
             Action::Positions => "Brokerage positions".into(),
             Action::Orders => "Brokerage orders".into(),
@@ -412,6 +424,7 @@ impl Action {
         use Action as A;
         match self {
             a if a.panel_spec().is_some() => "New panels",
+            A::StudioPrevLens | A::StudioNextLens | A::StudioCloseInspector | A::StudioUndo => "Workspace",
             A::NextPane
             | A::PrevPane
             | A::ToggleSidebar
@@ -612,6 +625,10 @@ impl Default for Keymap {
         bind(Action::Journal, "F11");
         bind(Action::Refresh, "F6");
         bind(Action::FrameTiming, "F12");
+        bind(Action::StudioPrevLens, "Alt+ArrowLeft");
+        bind(Action::StudioNextLens, "Alt+ArrowRight");
+        bind(Action::StudioCloseInspector, "Escape");
+        bind(Action::StudioUndo, "Ctrl+Z");
         bind(Action::Portfolio, "F7");
         bind(Action::Positions, "F8");
         bind(Action::Orders, "F9");
@@ -817,9 +834,9 @@ mod tests {
         assert_eq!(restored.0.get(&Action::ToggleStopCloud).unwrap(), "Alt+S");
     }
     #[test]
-    fn alt_b_opens_vault_and_action_all_has_60_entries() {
+    fn alt_b_opens_vault_and_action_all_has_64_entries() {
         let keys = Keymap::default();
-        assert_eq!(Action::ALL.len(), 60);
+        assert_eq!(Action::ALL.len(), 64);
         assert_eq!(keys.0.get(&Action::Vault), Some(&"Alt+B".to_string()));
     }
     #[test]

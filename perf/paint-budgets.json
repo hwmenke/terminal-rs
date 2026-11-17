@@ -225,6 +225,51 @@
       "budget_us": 2500,
       "relative": false,
       "class": "frame"
+    },
+    "paint.studio_shell.steady.ui": {
+      "budget_us": 1200,
+      "relative": false,
+      "class": "frame"
+    },
+    "paint.studio_shell.steady.tess": {
+      "budget_us": 800,
+      "relative": false,
+      "class": "frame"
+    },
+    "paint.studio_shell.steady.total": {
+      "budget_us": 2000,
+      "relative": false,
+      "class": "frame"
+    },
+    "paint.studio_shell.hover.ui": {
+      "budget_us": 1200,
+      "relative": false,
+      "class": "frame"
+    },
+    "paint.studio_shell.hover.tess": {
+      "budget_us": 800,
+      "relative": false,
+      "class": "frame"
+    },
+    "paint.studio_shell.hover.total": {
+      "budget_us": 2000,
+      "relative": false,
+      "class": "frame"
+    },
+    "paint.studio_shell.chart_dist.ui": {
+      "budget_us": 3000,
+      "relative": false,
+      "class": "frame"
+    },
+    "paint.studio_shell.chart_dist.tess": {
+      "budget_us": 1500,
+      "relative": false,
+      "class": "frame"
+    },
+    "paint.studio_shell.chart_dist.total": {
+      "budget_us": 4500,
+      "relative": false,
+      "class": "frame"
     }
   }
 }

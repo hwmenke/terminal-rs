@@ -172,6 +172,11 @@
       "budget_us": 200000,
       "relative": true,
       "class": "command"
+    },
+    "studio.route_1000": {
+      "budget_us": 500,
+      "relative": true,
+      "class": "interactive"
     }
   }
 }

@@ -9890,3 +9890,9 @@ mod honest_backtest_tests {
         assert_eq!(b.honesty.as_ref().unwrap().variants[0].evaluation.value().unwrap().returns.len(), 17);
     }
 }
+
+/// Process-wide tokens prevent recreated research children accepting an old completion.
+pub(crate) fn studio_token() -> u64 {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1 << 32);
+    NEXT.try_update(std::sync::atomic::Ordering::Relaxed,std::sync::atomic::Ordering::Relaxed,|n|n.checked_add(1)).expect("Studio request token exhausted")
+}

@@ -441,6 +441,10 @@ pub enum Function {
     /// Trade journal / checklist (`JOURNAL`, `AAPL JOURNAL`, `AAPL JOURNAL 2026-10-24`).
     Journal(String),
     /// Distribution Studio for verified daily or intraday log returns.
+    Studio {
+        spec: String,
+    },
+    StudioRoute(tr_data::studio::StudioRoute),
     StudioDist {
         timeframe: Timeframe,
     },
@@ -914,6 +918,15 @@ fn parse_function(head: &str, rest: &[&str]) -> Option<Function> {
         "JOURNAL" | "JRNL" | "CHECKLIST" | "TRADELOG" => Function::Journal(joined()),
         // Studio words are also listed tickers: only valid Studio arguments make
         // the command; anything else falls through to the ticker (see parse()).
+        "STUDIO" => {
+            let spec = joined();
+            tr_data::studio::parse_spec(&spec).ok()?;
+            Function::Studio { spec }
+        }
+        "QUICK" if rest.is_empty() => Function::StudioRoute(tr_data::studio::StudioRoute::Quick),
+        "LAB" if rest.is_empty() => Function::StudioRoute(tr_data::studio::StudioRoute::Lab),
+        "RESID" if rest.is_empty() => Function::StudioRoute(tr_data::studio::StudioRoute::Resid),
+        "ATTR" if rest.is_empty() => Function::StudioRoute(tr_data::studio::StudioRoute::Attr),
         "CORR" | "RBETA" => {
             let spec = joined();
             crate::app::studio_corr::parse_spec(&spec).ok()?;
@@ -1025,7 +1038,7 @@ pub fn parse(input: &str) -> Option<Command> {
             return Some(Command::Function(f));
         }
         // Invalid stack arguments must not become a ticker followed by an interval.
-        if ["TSTACK", "STACK", "MTF", "REGIME", "RAIL", "AVWAP", "AUCTION", "AMAP", "STOPS", "SCLOUD"]
+        if ["STUDIO", "TSTACK", "STACK", "MTF", "REGIME", "RAIL", "AVWAP", "AUCTION", "AMAP", "STOPS", "SCLOUD"]
             .iter()
             .any(|word| head.eq_ignore_ascii_case(word))
         {
@@ -1248,6 +1261,8 @@ fn describe(f: &Function) -> String {
             "Trade journal: setups, checklist, planned risk, outcomes in $ and R".into()
         }
         Function::Journal(q) => format!("Trade journal: {q}"),
+        Function::Studio { spec } => format!("Studio · native canvas and named lenses · {spec}"),
+        Function::StudioRoute(route) => route.reason().into(),
         Function::StudioCorr { spec } => format!(
             "Relationship Studio · {} · for the tickers type CORR US Equity / RBETA US Equity",
             if spec.is_empty() { "SPY" } else { spec }

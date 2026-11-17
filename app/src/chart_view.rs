@@ -27,8 +27,8 @@ use crate::worker::{BuiltIndicator, PaneId, Request, Worker, archive_page, initi
 use tr_data::anchored_vwap::AvwapKey;
 
 mod auction;
-mod session_cache;
 mod cockpit;
+mod session_cache;
 mod stop_cloud;
 mod trend_cone;
 mod vault_footer;
@@ -337,6 +337,8 @@ pub struct ChartState {
     provenance: Provenance,
     gpu: Option<SeriesGpu>,
     generation: u64,
+    studio_owned: bool,
+    studio_plot: Option<Rect>,
     viewport: Option<Viewport>,
     manual_scale: Option<PriceScale>,
     glide: Option<Glide>,
@@ -484,6 +486,8 @@ impl ChartState {
             provenance: Provenance::Missing,
             gpu: None,
             generation: 0,
+            studio_owned: false,
+            studio_plot: None,
             viewport: None,
             manual_scale: None,
             glide: None,
@@ -602,7 +606,7 @@ impl ChartState {
 
     /// (Re)load history for the current symbol and timeframe.
     pub fn load(&mut self, w: &Worker) {
-        self.generation += 1;
+        self.generation = if self.studio_owned {crate::worker::studio_token()} else {self.generation + 1};
         self.invalidate_session_summary();
         self.stitch = None;
         self.edge_pending = None;
@@ -2170,6 +2174,7 @@ impl ChartState {
             pos2(plot_all.right(), plot_all.bottom() - stack_h - sub_h * n_sub as f32),
         );
 
+        self.studio_plot=Some(price_rect);
         let stack_rect = Rect::from_min_max(
             pos2(plot_all.left(), price_rect.bottom()),
             pos2(plot_all.right(), price_rect.bottom() + stack_h),
@@ -2675,7 +2680,7 @@ impl ChartState {
             self.paint_edge_card(ui, price_rect);
         }
         drop(_perf_edge);
-        if matches!(self.sec.class, tr_core::AssetClass::Equity | tr_core::AssetClass::Etf) {
+        if !self.studio_owned && matches!(self.sec.class, tr_core::AssetClass::Equity | tr_core::AssetClass::Etf) {
             clicked |= self.trade_buttons(ui, plot_all);
         }
 
@@ -2872,6 +2877,7 @@ impl ChartState {
             ui.close();
         }
         ui.separator();
+        if !self.studio_owned {
         ui.label(RichText::new("Price / VWAP / RVOL / setup alerts").small().color(muted()));
         if let Some(last) = self.bars.last() {
             let px = last.close;
@@ -2954,6 +2960,7 @@ impl ChartState {
         }
         ui.checkbox(&mut self.show_journal, "Journal date markers")
             .on_hover_text("Pins on dates with a saved setup or a date note");
+        }
         ui.checkbox(&mut self.show_news, "News catalyst markers")
             .on_hover_text("Headlines whose publication time falls on a loaded bar — click to open");
         if self.sec.has_congress_trades() {
@@ -3097,11 +3104,8 @@ impl ChartState {
                 p.text(pos2(r.right() - 4.0, top + 36.0), Align2::RIGHT_CENTER, detail, mono(8.0), muted());
                 let segment = (r.width() - 16.0) / 4.0;
                 for (fold, f) in cell.folds.iter().enumerate() {
-                    let color = f
-                        .delta
-                        .map(theme::sign)
-                        .unwrap_or_else(muted)
-                        .gamma_multiply(if solid { 1.0 } else { 0.5 });
+                    let color =
+                        f.delta.map(theme::sign).unwrap_or_else(muted).gamma_multiply(if solid { 1.0 } else { 0.5 });
                     let x = r.left() + 8.0 + fold as f32 * segment;
                     p.line_segment([pos2(x, top + 47.0), pos2(x + segment - 2.0, top + 47.0)], Stroke::new(3.0, color));
                 }
@@ -4078,10 +4082,7 @@ impl ChartState {
             return;
         }
         let Some(summary) = self.session_snapshot() else { return };
-        let profile: Vec<_> = summary.stats.profile
-            .iter()
-            .filter(|b| b.volume.is_finite() && b.volume > 0.0)
-            .collect();
+        let profile: Vec<_> = summary.stats.profile.iter().filter(|b| b.volume.is_finite() && b.volume > 0.0).collect();
         if profile.is_empty() {
             return;
         }
@@ -4678,7 +4679,7 @@ fn hover_card(ui: &Ui, at: Pos2, t: &Trade) {
 }
 
 #[cfg(test)]
-mod perf_gate;
+pub(crate) mod perf_gate;
 
 #[cfg(test)]
 mod tests {
@@ -7213,5 +7214,53 @@ mod tests {
         assert!(!on.contains("VP "), "{on}");
         assert!(!on.contains("VAH "), "{on}");
         assert!(on.contains("AUCTION · bin"), "{on}");
+    }
+}
+
+impl ChartState {
+    /// Studio owns this chart's lifecycle. A fresh token also rejects pre-shell responses.
+    pub(crate) fn studio_reset(&mut self) {
+        let (id, symbol, tf) = (self.id, self.symbol.clone(), self.tf);
+        *self = Self::new(id, &symbol, tf);
+        self.generation = crate::worker::studio_token();
+        self.studio_owned = true;
+        self.show_journal = false;
+        self.show_congress = false;
+    }
+    pub(crate) fn studio_context(&mut self, symbol: &str, tf: Timeframe) {
+        if self.symbol != symbol || self.tf != tf {
+            self.symbol = symbol.into();
+            self.tf = tf;
+            self.studio_reset();
+        }
+    }
+    /// Binary-search UTC bounds; no statistical scan or filtering is done in paint.
+    pub(crate) fn studio_selection(&self, ui: &egui::Ui, rect: egui::Rect, span: Option<(i64, i64)>) {
+        let (Some((a, b)), Some(v)) = (span, self.viewport) else { return };
+        let rect=self.studio_plot.unwrap_or(rect);
+        let start = self.bars.partition_point(|bar| bar.ts < a);
+        let end = self.bars.partition_point(|bar| bar.ts < b);
+        if start == end {
+            return;
+        }
+        let left = rect.left() + v.x_of(start as f64) as f32;
+        let right = rect.left() + v.x_of(end as f64) as f32;
+        let selection =
+            egui::Rect::from_min_max(egui::pos2(left, rect.top()), egui::pos2(right, rect.bottom())).intersect(rect);
+        if selection.is_positive() {
+            ui.painter().with_clip_rect(rect.intersect(ui.clip_rect())).rect_stroke(
+                selection,
+                0.,
+                egui::Stroke::new(1., crate::theme::series(0)),
+                egui::StrokeKind::Inside,
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+impl ChartState {
+    pub(crate) fn studio_test_receipt(&self) -> (u64, usize, bool, usize, Option<&str>) {
+        (self.generation,self.bars.len(),self.compare_line.is_some(),self.news.len(),self.error.as_deref())
     }
 }

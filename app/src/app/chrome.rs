@@ -646,6 +646,27 @@ impl TerminalApp {
             }
             if nav_row(
                 ui,
+                Icon::Chart,
+                "Studio",
+                Some("STUDIO"),
+                self.panes.iter().any(|p| p.id == self.focus && matches!(p.kind, PaneKind::Studio(_))),
+            )
+            .clicked()
+            {
+                out.push(SidebarCmd::Function(Function::Studio { spec: String::new() }));
+            }
+            for route in [
+                tr_data::studio::StudioRoute::Quick,
+                tr_data::studio::StudioRoute::Lab,
+                tr_data::studio::StudioRoute::Resid,
+                tr_data::studio::StudioRoute::Attr,
+            ] {
+                if nav_row(ui, Icon::Chart, route.code(), Some("Unavailable"), false).clicked() {
+                    out.push(SidebarCmd::Function(Function::StudioRoute(route)));
+                }
+            }
+            if nav_row(
+                ui,
                 Icon::Gauge,
                 "Statistics",
                 Some("STATS"),

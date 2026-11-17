@@ -166,6 +166,7 @@ fn perf_gate_paint_studios() {
     best.extend(corr_sample());
     best.extend(regime_sample());
     best.extend(shape_sample());
+    best.extend(shell_sample());
     let ids: BTreeSet<_> = budgets.cases.keys().filter(|id| id.starts_with("paint.studio_")).cloned().collect();
     assert_eq!(best.keys().cloned().collect::<BTreeSet<_>>(), ids, "stale/missing studio budgets");
     for _ in 0..2 {
@@ -181,6 +182,7 @@ fn perf_gate_paint_studios() {
             .chain(corr_sample())
             .chain(regime_sample())
             .chain(shape_sample())
+            .chain(shell_sample())
         {
             if s.median_us < best[&id].median_us {
                 best.insert(id, s);
@@ -935,6 +937,162 @@ fn shape_geometry_finite_320_1440() {
         let out = shape_frame(&ctx, &r, &s, &b, 1440., i > 140, i);
         if i == 179 {
             assert!(text(&out.shapes).contains("dist.shape.scale"));
+        }
+        finite(&ctx, out);
+    }
+}
+
+fn shell_frame(
+    ctx: &egui::Context,
+    pane: &mut super::studio_hub::StudioPane,
+    worker: &crate::worker::Worker,
+    width: f32,
+    hover: bool,
+    index: usize,
+) -> egui::FullOutput {
+    let pointer = if hover {
+        ctx.data(|d| d.get_temp::<Rect>(egui::Id::new("studio-mean-probe"))).unwrap_or(Rect::NOTHING).center()
+            + vec2(if index >= 160 { (index % 2) as f32 } else { 0. }, 0.)
+    } else {
+        pos2(15. + (index % 2) as f32, 15.)
+    };
+    let events = if ctx.input(|i| i.pointer.hover_pos()) == Some(pointer) {
+        vec![]
+    } else {
+        vec![egui::Event::PointerMoved(pointer)]
+    };
+    let mut out = ctx.run_ui(
+        egui::RawInput {
+            time: Some(1. + index as f64 * 0.2),
+            screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(width, 900.))),
+            events,
+            ..Default::default()
+        },
+        |ui| {
+            pane.show(ui, 201, worker, false, true);
+        },
+    );
+    out.textures_delta.clear();
+    out
+}
+fn shell_guard(out: &egui::FullOutput) {
+    let txt = text(&out.shapes);
+    for word in [
+        "STUDIO",
+        "Distribution",
+        "Relate",
+        "When",
+        "Season",
+        "Backtest",
+        "CLOSED THRU",
+        "MEAN / BAR",
+        "STDEV / ANN.",
+        "DISTRIBUTION STUDIO",
+    ] {
+        assert!(txt.contains(word), "missing {word}: {txt}");
+    }
+    assert!(out.shapes.iter().any(|s| matches!(s.shape, egui::Shape::Callback(_))), "native chart geometry absent");
+    assert!(out.shapes.len() > 120, "empty shell content");
+}
+fn shell_sample() -> BTreeMap<String, Summary> {
+    let mut result = BTreeMap::new();
+    for mode in ["steady", "hover", "chart_dist"] {
+        let ctx = egui::Context::default();
+        let (worker, mut requests) = crate::worker::Worker::test_channel();
+        let mut pane = super::studio_hub::prepared(&worker, &mut requests, mode == "chart_dist");
+        let hover = mode == "hover";
+        for i in 0..20 {
+            finite(&ctx, shell_frame(&ctx, &mut pane, &worker, 1440., false, i));
+        }
+        if hover {
+            for i in 140..160 {
+                finite(&ctx, shell_frame(&ctx, &mut pane, &worker, 1440., true, i));
+            }
+        }
+        while requests.try_recv().is_ok() {}
+        let mut times: BTreeMap<String, Vec<f64>> = BTreeMap::new();
+        for i in 0..120 {
+            let start = Instant::now();
+            let mut out = shell_frame(&ctx, &mut pane, &worker, 1440., hover, i + if hover { 160 } else { 20 });
+            let ui_us = start.elapsed().as_secs_f64() * 1e6;
+            if i == 60 {
+                shell_guard(&out);
+                crate::chart_view::perf_gate::studio_assert_canvas(&pane.chart, &out, mode == "chart_dist");
+                if hover {
+                    assert!(text(&out.shapes).contains("dist.overview."), "shell hover did not paint DIST MathCard");
+                    assert!(text(&out.shapes).contains("Observation clock:"));
+                }
+            }
+            let start = Instant::now();
+            let primitives = ctx.tessellate(std::mem::take(&mut out.shapes), out.pixels_per_point);
+            let tess_us = start.elapsed().as_secs_f64() * 1e6;
+            assert!(!primitives.is_empty());
+            std::hint::black_box(primitives);
+            for (metric, v) in [("ui", ui_us), ("tess", tess_us), ("total", ui_us + tess_us)] {
+                times.entry(format!("paint.studio_shell.{mode}.{metric}")).or_default().push(v);
+            }
+        }
+        // Unchanged accepted lenses must not dispatch any statistical recompute.
+        while let Ok(r) = requests.try_recv() {
+            assert!(
+                !matches!(
+                    r,
+                    crate::worker::Request::StudioDist { .. }
+                        | crate::worker::Request::StudioCorr { .. }
+                        | crate::worker::Request::StudioSeason { .. }
+                        | crate::worker::Request::Stats { .. }
+                        | crate::worker::Request::Backtest { .. }
+                        | crate::worker::Request::IntradayBacktest { .. }
+                        | crate::worker::Request::StudioShape { .. }
+                        | crate::worker::Request::StudioShapeBootstrap { .. }
+                ),
+                "steady shell dispatched research"
+            );
+        }
+        for (id, mut samples) in times {
+            result.insert(id, tr_perf::summarize(&mut samples));
+        }
+    }
+    result
+}
+#[test]
+fn studio_shell_geometry_and_actual_hover_320_1440() {
+    for width in [320., 599., 899., 1440.] {
+        let ctx = egui::Context::default();
+        let (worker, mut requests) = crate::worker::Worker::test_channel();
+        let mut pane = super::studio_hub::prepared(&worker, &mut requests, false);
+        let out = shell_frame(&ctx, &mut pane, &worker, width, false, 0);
+        if width == 1440. {
+            shell_guard(&out);
+        }
+        finite(&ctx, out);
+        pane.inspector_open = true;
+        finite(&ctx, shell_frame(&ctx, &mut pane, &worker, width, false, 1));
+    }
+    let ctx = egui::Context::default();
+    ctx.all_styles_mut(|s| s.interaction.tooltip_delay = 0.);
+    let (worker, mut requests) = crate::worker::Worker::test_channel();
+    let mut pane = super::studio_hub::prepared(&worker, &mut requests, false);
+    for i in 0..180 {
+        let out = shell_frame(&ctx, &mut pane, &worker, 1440., i > 140, i);
+        if i == 179 {
+            assert!(text(&out.shapes).contains("dist.overview."));
+            assert!(text(&out.shapes).contains("CLOSED THRU"));
+        }
+        finite(&ctx, out);
+    }
+}
+
+#[test]
+fn studio_shell_integrated_populated_canvas_and_dist() {
+    let ctx = egui::Context::default();
+    let (worker, mut requests) = crate::worker::Worker::test_channel();
+    let mut pane = super::studio_hub::prepared(&worker, &mut requests, true);
+    for i in 0..21 {
+        let out = shell_frame(&ctx, &mut pane, &worker, 1440., false, i);
+        if i == 20 {
+            shell_guard(&out);
+            crate::chart_view::perf_gate::studio_assert_canvas(&pane.chart, &out, true);
         }
         finite(&ctx, out);
     }

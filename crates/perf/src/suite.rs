@@ -33,6 +33,30 @@ pub fn all(scale: Scale) -> Vec<Case> {
             cases.push(Case { id: $id, run: Box::new($f) });
         };
     }
+    let routes = fixtures::studio_routes();
+    add!("studio.route_1000", move || {
+        use tr_data::studio::{StudioContext, StudioLens};
+        let context = StudioContext {
+            symbol: "AAPL US Equity".into(),
+            tf: Timeframe::M5,
+            selected_span: Some((20, 40)),
+            as_of: None,
+        };
+        let mut lens = StudioLens::Backtest;
+        let mut visits = [0usize; 5];
+        let mut transitions = 0;
+        for i in 0..1000 {
+            let (next, tf, benchmark) = tr_data::studio::parse_spec(bb(routes[i % 5])).unwrap();
+            assert_eq!(tf, context.tf);
+            transitions += usize::from(lens.select(next));
+            visits[i % 5] += 1;
+            bb((&context, lens, benchmark));
+        }
+        assert_eq!(transitions, 1000);
+        assert_eq!(visits, [200; 5]);
+        assert!(context.contains(20) && context.contains(30) && !context.contains(40));
+        transitions
+    });
     let regime_bars = fixtures::regime_walk(if full { 5000 } else { 1500 });
     let regime = tr_data::studio_dist::compute(
         "AAPL",
