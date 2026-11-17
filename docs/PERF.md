@@ -724,3 +724,75 @@ Outside-sandbox re-verification (2026-11-17, box, rustc 1.100.0): `cargo test --
 **1,644 passed, 0 failed, 10 ignored** (the 14 loopback-bind failures above are sandbox-only);
 `cargo build --release` passed; `scripts/perf-gate.sh` passed (`studio.shape_5k` 20.3 ms / 45,
 `studio.shape_bootstrap_5k_x500` 77.3 ms / 200). Baseline unchanged.
+
+## Studio port slice 1: Shell and named lenses
+
+Validated on 2026-11-17, branch `codex/studio-shell`, with rustc 1.100.0 stable,
+`/home/box/.cargo/bin/cargo`, offline, `CARGO_TARGET_DIR=/workspace/tr-auction-target`.
+Calibration **6,472.00 µs**; slack **1.0**. No baseline was recorded. All existing
+compute budgets, paint ceilings and workloads remain unchanged.
+
+`studio.route_1000` runs the shipped shell spec parser and shared lens transition
+method 1,000 times over all five named routes, including the QQQ benchmark input.
+It asserts 1,000 actual changes, 200 visits per route, retained interval and
+half-open selection membership. Both full and smoke suites exercise all 1,000
+transitions. The new case uses `relative:true`, class `interactive`, 500 µs.
+
+Shell steady/hover paint uses the actual composed renderer at **1440×900** with
+5,000 admitted dev-only daily bars, native GPU-series geometry and the complete
+accepted DIST report (4,999 returns). The integrated case retains the existing
+5,000-bar crypto chart fixture, its stack, ZBAND, Stop Cloud, cone and four AVWAP
+anchors, alongside DIST computed from those exact fixture bars. Preparation and
+response acceptance occur before timing. Assertions require full report/sample
+counts, histogram mass, an actual native chart callback, populated overlay
+geometry and visible chart/analysis content. The compact integrated canvas hides
+the optional TSTACK Edge card; the full standalone chart case and all of its
+original guards are unchanged.
+
+Hover warms egui's real tooltip delay, moves inside the actual mean tile and
+requires the open `dist.overview.*` MathCard, observation clock and CLOSED THRU.
+Steady accepted frames must dispatch no statistical requests. Each paint mode
+measures 120 frames after warmup; UI and tessellation are separate. Ordinary tests
+also exercise finite geometry at 320/599/899/1440 points, inspector/drawer states,
+the integrated workload, actual hover and zero-request accepted lens roundtrips.
+
+| Case / metric | Median ms | p95 ms | Ceiling ms |
+| --- | ---: | ---: | ---: |
+| `studio.route_1000` | 0.05491 | 0.08493 | 0.5 |
+| `paint.studio_shell.steady.ui` | 0.58290 | 0.67030 | 1.2 |
+| `paint.studio_shell.steady.tess` | 0.19039 | 0.22056 | 0.8 |
+| `paint.studio_shell.steady.total` | 0.77711 | 0.89085 | 2.0 |
+| `paint.studio_shell.hover.ui` | 0.86346 | 0.95694 | 1.2 |
+| `paint.studio_shell.hover.tess` | 0.28955 | 0.32468 | 0.8 |
+| `paint.studio_shell.hover.total` | 1.15831 | 1.26560 | 2.0 |
+| `paint.studio_shell.chart_dist.ui` | 0.68664 | 0.96203 | 3.0 |
+| `paint.studio_shell.chart_dist.tess` | 0.47259 | 0.63873 | 1.5 |
+| `paint.studio_shell.chart_dist.total` | 1.16868 | 1.56714 | 4.5 |
+
+Final required checks:
+
+- `cargo test --workspace --offline --no-fail-fast`: **1,661 passed, 0 failed,
+  10 ignored** across 31 test/doc-test targets. All existing loopback HTTP mock
+  tests passed in this session; **zero sandbox bind failures** occurred.
+- `cargo build --release --offline`: **passed**.
+- `scripts/perf-gate.sh`: **35 compute cases passed, 0 failed, 0 harness errors**;
+  **2 release paint tests passed, 0 failed, 0 ignored**, checking **144 metrics**.
+  All existing relative gates passed; no slowdown advisories occurred.
+- **17 new ordinary tests**: thirteen shell tests, two shared route/selection
+  tests and two populated paint/hover tests. Coverage includes all named
+  acceptance tests, backward layout defaults, exact report/Arc reuse, unique
+  tokens, late responses across context/lens epochs, queued sample replies,
+  original native history/compare/news/errors, input undo, key conflicts and
+  focused text-editor ownership.
+- `perf/baseline.json`, Cargo.lock and dependencies are unchanged. The existing
+  unused `workspace.package.rust-version` manifest warning remains.
+
+No estimator, hypothesis family, threshold or return convention was introduced.
+The shell reuses existing DIST/CORR/SEASON, daily conditional-return and research
+backtest methods. Selection is canvas-only and does not silently change accepted
+analytical inputs. There is no as-of analytical filter. Cuts are animated lens
+transitions, persisted divider position and separate per-lens undo histories;
+basic bounded parameter undo remains. The existing synchronous workspace
+save/dirty serialization flow is inherited (see STUDIO.md); no new report/model
+persistence or provider path was added. Measurements cover headless CPU work,
+not GPU/presentation, whole-desktop latency or live-provider availability.

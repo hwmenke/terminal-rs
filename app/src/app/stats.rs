@@ -70,7 +70,7 @@ impl StatsPane {
             self.loading = false;
             return;
         }
-        self.generation += 1;
+        self.generation = crate::worker::studio_token();
         self.loading = true;
         self.error = None;
         worker.send(Request::Stats {
@@ -113,51 +113,67 @@ impl TerminalApp {
     }
 
     pub(super) fn stats_pane(&mut self, ui: &mut Ui, id: PaneId) -> Vec<Action> {
-        let mut actions = Vec::new();
-        let i = self.idx(id).expect("stats pane");
-        let sample_offline = self.provider.eq_ignore_ascii_case("sample");
-        let mut reload = false;
-        let mut export = false;
-        {
-            let PaneKind::Stats(pane) = &mut self.panes[i].kind else { return vec![] };
-            if !pane.loading && pane.snapshot.is_none() && pane.error.is_none() && !pane.symbol.trim().is_empty() {
-                pane.request(id, &self.worker);
-            }
+        let i = self.idx(id).expect("research pane");
+        let PaneKind::Stats(pane) = &mut self.panes[i].kind else { return vec![] };
+        show(ui, id, pane, &self.worker, self.provider.eq_ignore_ascii_case("sample"), false)
+    }
+}
 
-            ui.horizontal_wrapped(|ui| {
-                ui.label(RichText::new("Statistics").strong().color(text()));
-                for (tab, label) in [(StatsTab::Overview, "Overview"), (StatsTab::Conditional, "Conditional")] {
-                    if ui.selectable_label(pane.tab == tab, label).clicked() {
-                        pane.tab = tab;
-                    }
+/// Shared renderer/action adapter for the standalone pane and Studio shell.
+pub(super) fn show(
+    ui: &mut Ui,
+    id: PaneId,
+    pane: &mut StatsPane,
+    worker: &crate::worker::Worker,
+    sample: bool,
+    embedded: bool,
+) -> Vec<Action> {
+    let mut actions = Vec::new();
+    let sample_offline = sample;
+    let mut reload = false;
+    let mut export = false;
+    {
+        if !sample && !pane.loading && pane.snapshot.is_none() && pane.error.is_none() && !pane.symbol.trim().is_empty()
+        {
+            pane.request(id, worker);
+        }
+
+        ui.horizontal_wrapped(|ui| {
+            ui.label(RichText::new("Statistics").strong().color(text()));
+            for (tab, label) in [(StatsTab::Overview, "Overview"), (StatsTab::Conditional, "Conditional")] {
+                if ui.selectable_label(pane.tab == tab, label).clicked() {
+                    pane.tab = tab;
                 }
-                if ui.small_button("Reload").on_hover_text("Recompute from the research archive").clicked() {
-                    reload = true;
-                }
-                if ui
+            }
+            if ui.small_button("Reload").on_hover_text("Recompute from the research archive").clicked() {
+                reload = true;
+            }
+            if !embedded
+                && ui
                     .small_button("Export")
                     .on_hover_text("Write stats JSON with source, as-of and provenance (EXPORT STATS)")
                     .clicked()
-                {
-                    export = true;
-                }
-            });
-            ui.label(
+            {
+                export = true;
+            }
+        });
+        ui.label(
                 RichText::new(
                     "Compare a name's historical risk and returns, then see what followed conditions such as low RSI or price above a moving average. Numbers use verified daily archive bars only.",
                 )
                 .font(ui_font(11.5))
                 .color(muted()),
             );
-            if sample_offline {
-                ui.label(
-                    RichText::new(
-                        "Sample / offline display mode does not feed this pane. Statistics never fall back to sample bars.",
-                    )
-                    .font(ui_font(12.0))
-                    .color(theme::down()),
-                );
-            }
+        if sample_offline {
+            ui.label(
+                RichText::new(
+                    "Sample / offline display mode does not feed this pane. Statistics never fall back to sample bars.",
+                )
+                .font(ui_font(12.0))
+                .color(theme::down()),
+            );
+        }
+        if !embedded {
             ui.horizontal_wrapped(|ui| {
                 ui.label(RichText::new("Ticker").color(muted()));
                 let changed = ui
@@ -168,73 +184,72 @@ impl TerminalApp {
                     reload = true;
                 }
             });
+        }
+        if let Some(err) = &pane.error {
+            ui.label(RichText::new(err).font(mono(12.0)).color(theme::down()));
+        } else if pane.loading {
+            ui.label(RichText::new("Reading research archive…").font(mono(12.0)).color(muted()));
+        }
 
-            if let Some(err) = &pane.error {
-                ui.label(RichText::new(err).font(mono(12.0)).color(theme::down()));
-            } else if pane.loading {
-                ui.label(RichText::new("Reading research archive…").font(mono(12.0)).color(muted()));
-            }
+        if let Some(snap) = &pane.snapshot {
+            provenance_line(ui, &snap.stats);
+        }
 
-            if let Some(snap) = &pane.snapshot {
-                provenance_line(ui, &snap.stats);
-            }
-
-            match pane.tab {
-                StatsTab::Overview => {
-                    if let Some(snap) = &pane.snapshot {
-                        overview(ui, &snap.stats);
-                    }
+        match pane.tab {
+            StatsTab::Overview => {
+                if let Some(snap) = &pane.snapshot {
+                    overview(ui, &snap.stats);
                 }
-                StatsTab::Conditional => {
-                    ui.horizontal_wrapped(|ui| {
-                        ui.label(RichText::new("Condition").color(muted()));
-                        ui.add(
-                            egui::TextEdit::singleline(&mut pane.condition)
-                                .desired_width(280.0)
-                                .hint_text("RSI(14) < 30 AND close > SMA(50)"),
-                        );
-                    });
-                    ui.horizontal_wrapped(|ui| {
-                        ui.label(RichText::new("Horizons").color(muted()));
-                        ui.add(egui::TextEdit::singleline(&mut pane.horizons).desired_width(72.0).hint_text("5, 10"));
-                        ui.label(RichText::new("completed trading days").font(ui_font(11.0)).color(muted()));
-                        if ui.button(RichText::new("APPLY").font(mono(11.5))).clicked() {
-                            pane.tab = StatsTab::Conditional;
+            }
+            StatsTab::Conditional => {
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(RichText::new("Condition").color(muted()));
+                    ui.add(
+                        egui::TextEdit::singleline(&mut pane.condition)
+                            .desired_width(280.0)
+                            .hint_text("RSI(14) < 30 AND close > SMA(50)"),
+                    );
+                });
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(RichText::new("Horizons").color(muted()));
+                    ui.add(egui::TextEdit::singleline(&mut pane.horizons).desired_width(72.0).hint_text("5, 10"));
+                    ui.label(RichText::new("completed trading days").font(ui_font(11.0)).color(muted()));
+                    if ui.button(RichText::new("APPLY").font(mono(11.5))).clicked() {
+                        pane.tab = StatsTab::Conditional;
+                        reload = true;
+                    }
+                });
+                ui.horizontal_wrapped(|ui| {
+                    for (label, line) in stats::presets() {
+                        if ui.selectable_label(pane.condition.trim() == *line, *label).clicked() {
+                            pane.condition = (*line).into();
                             reload = true;
                         }
-                    });
-                    ui.horizontal_wrapped(|ui| {
-                        for (label, line) in stats::presets() {
-                            if ui.selectable_label(pane.condition.trim() == *line, *label).clicked() {
-                                pane.condition = (*line).into();
-                                reload = true;
-                            }
-                        }
-                    });
-                    ui.label(
-                        RichText::new(
-                            "AAPL COND RSI(14) < 30   ·   features look backward only; forward returns are the outcome",
-                        )
-                        .font(ui_font(11.0))
-                        .color(muted()),
-                    );
-                    if let Some(snap) = &pane.snapshot {
-                        conditional(ui, &snap.conditional);
                     }
+                });
+                ui.label(
+                    RichText::new(
+                        "AAPL COND RSI(14) < 30   ·   features look backward only; forward returns are the outcome",
+                    )
+                    .font(ui_font(11.0))
+                    .color(muted()),
+                );
+                if let Some(snap) = &pane.snapshot {
+                    conditional(ui, &snap.conditional);
                 }
             }
         }
-
-        if reload {
-            if let PaneKind::Stats(pane) = &mut self.panes[i].kind {
-                pane.request(id, &self.worker);
-            }
-        }
-        if export {
-            actions.push(Action::Command("EXPORT STATS".into()));
-        }
-        actions
     }
+
+    if reload {
+        if !sample {
+            pane.request(id, worker);
+        }
+    }
+    if export {
+        actions.push(Action::Command("EXPORT STATS".into()));
+    }
+    actions
 }
 
 fn provenance_line(ui: &mut Ui, s: &StatsReport) {

@@ -259,6 +259,8 @@ impl TerminalApp {
                         "Scan archived bars; Enter opens the linked archive chart (REVIEW for daily+weekly)",
                     ),
                     (&["WEI"], "World markets overview"),
+                    (&["STUDIO", "AAPL STUDIO 5m lens=dist", "STUDIO lens=relate benchmark=QQQ", "STUDIO lens=when", "STUDIO lens=season", "STUDIO lens=backtest"], "Native time canvas and retained research lenses; local Alt+Left/Right, Escape inspector, Ctrl+Z parameter undo; daily-only When"),
+                    (&["QUICK", "LAB", "RESID", "ATTR"], "Named Studio screen routes; precise unavailable cards until their implementation lands"),
                     (&["VAULT", "VLT"], "Closed intraday bars and session coverage · Alt+B · VERIFY / PRUNE / DROP · tickers: VAULT US Equity, VLT 5m"),
                     (&["HEALTH", "SRC"], "Feed states, last success, errors and retry; R retries a failed pane or selected feed"),
                     (&["GC"], "US Treasury yield curve"),

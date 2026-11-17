@@ -83,7 +83,15 @@ impl DistPane {
                 if s.horizon == self.horizon
                     && s.overlap == self.overlap
                     && s.thresholds.iter().map(|t| t.level).eq(self.thresholds)
-                    && self.report.as_ref().is_some_and(|r| s.seed==tr_data::studio_shape::key_with_thresholds(r,self.horizon,self.overlap,&self.thresholds)) =>
+                    && self.report.as_ref().is_some_and(|r| {
+                        s.seed
+                            == tr_data::studio_shape::key_with_thresholds(
+                                r,
+                                self.horizon,
+                                self.overlap,
+                                &self.thresholds,
+                            )
+                    }) =>
             {
                 self.shape = Some(s);
                 self.shape_error = None;
@@ -106,8 +114,8 @@ impl DistPane {
         }
         self.shape_boot_loading = false;
         match result {
-            Ok(b) if b.seed==key => self.shape_intervals = Some(b),
-            Ok(_) => {},
+            Ok(b) if b.seed == key => self.shape_intervals = Some(b),
+            Ok(_) => {}
             Err(e) => {
                 self.shape_intervals = None;
                 self.shape_boot_error = Some(e);
@@ -115,7 +123,7 @@ impl DistPane {
         }
     }
     pub fn request(&mut self, pane: PaneId, worker: &crate::worker::Worker) {
-        self.generation += 1;
+        self.generation = crate::worker::studio_token();
         self.clear_shape();
         self.report = None;
         self.rotation = None;
@@ -138,7 +146,7 @@ impl DistPane {
     }
     fn deny_sample(&mut self) {
         if self.loading || self.report.is_some() {
-            self.generation += 1;
+            self.generation = crate::worker::studio_token();
         }
         self.clear_shape();
         self.report = None;
@@ -252,7 +260,7 @@ impl TerminalApp {
                 p.horizon = h;
                 p.shape_tab = true;
                 if p.report.is_some() {
-                    p.generation += 1;
+                    p.generation = crate::worker::studio_token();
                 }
                 p.clear_shape();
                 p.rotation_loading = false;
@@ -271,21 +279,35 @@ impl TerminalApp {
         self.open_panel(PaneKind::StudioDist(Box::new(DistPane::new(symbol, timeframe, Window::All))));
     }
     pub(super) fn studio_dist_pane(&mut self, ui: &mut Ui, id: PaneId) -> Vec<Action> {
-        let i = self.idx(id).expect("distribution pane");
+        let i = self.idx(id).expect("research pane");
         let PaneKind::StudioDist(pane) = &mut self.panes[i].kind else { return vec![] };
-        let sample = self.provider.eq_ignore_ascii_case("sample");
-        if sample {
-            pane.deny_sample();
-        }
-        if !sample && !pane.loading && pane.report.is_none() && pane.error.is_none() {
-            pane.request(id, &self.worker);
-        }
-        let mut reload = false;
-        ui.horizontal_wrapped(|ui| {
-            studio_title(ui, "DISTRIBUTION STUDIO");
-            reload |= ui.small_button("Reload").clicked();
-        });
-        ui.horizontal_wrapped(|ui| {
+        show(ui, id, pane, &self.worker, self.provider.eq_ignore_ascii_case("sample"), false)
+    }
+}
+
+/// Shared renderer/action adapter for the standalone pane and Studio shell.
+pub(super) fn show(
+    ui: &mut Ui,
+    id: PaneId,
+    pane: &mut DistPane,
+    worker: &crate::worker::Worker,
+    sample: bool,
+    embedded: bool,
+) -> Vec<Action> {
+    let sample = sample;
+    if sample {
+        pane.deny_sample();
+    }
+    if !sample && !pane.loading && pane.report.is_none() && pane.error.is_none() {
+        pane.request(id, worker);
+    }
+    let mut reload = false;
+    ui.horizontal_wrapped(|ui| {
+        studio_title(ui, "DISTRIBUTION STUDIO");
+        reload |= ui.small_button("Reload").clicked();
+    });
+    ui.horizontal_wrapped(|ui| {
+        if !embedded {
             let input = ui.add(egui::TextEdit::singleline(&mut pane.symbol).desired_width(dp(105.0)).hint_text("AAPL"));
             reload |= input.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
             egui::ComboBox::from_id_salt((id, "dist-tf"))
@@ -304,95 +326,95 @@ impl TerminalApp {
                         reload |= ui.selectable_value(&mut pane.timeframe, tf, tf.label()).changed();
                     }
                 });
-            for window in Window::ALL {
-                reload |= ui.selectable_value(&mut pane.window, window, window.label()).changed();
-            }
-        });
-        if reload && !sample {
-            pane.request(id, &self.worker);
         }
-        studio_states(ui, pane.loading, pane.error.as_deref(), None);
-        if let Some(r) = &pane.report {
-            let mut tab = if pane.shape_tab { 2 } else { usize::from(pane.regimes_tab) };
-            super::studio_frame::tabs(ui, &mut tab, &["Overview", "Regimes", "Shape"]);
-            pane.shape_tab = tab == 2;
-            pane.regimes_tab = tab == 1;
-            if pane.shape_tab {
-                super::studio_frame::evidence_mode(ui, &mut pane.shape_evidence);
-                let mut changed = false;
-                ui.horizontal_wrapped(|ui| {
-                    ui.label("Horizon / bars");
-                    changed |= ui.add(egui::DragValue::new(&mut pane.horizon).range(1..=250)).changed();
-                    changed |= ui.checkbox(&mut pane.overlap, "Overlapping").changed();
-                    ui.label("|move| thresholds (log-return units)");
-                    for level in &mut pane.thresholds {
-                        changed |= ui.add(egui::DragValue::new(level).range(0.0..=10.).speed(0.001)).changed();
-                    }
-                });
-                if changed {
-                    pane.generation += 1;
-                    pane.shape = None;
-                    pane.shape_loading = false;
-                    pane.shape_error = None;
-                    pane.shape_intervals = None;
-                    pane.shape_boot_loading = false;
-                    pane.shape_boot_error = None;
-                    pane.rotation_loading = false;
+        for window in Window::ALL {
+            reload |= ui.selectable_value(&mut pane.window, window, window.label()).changed();
+        }
+    });
+    if reload && !sample {
+        pane.request(id, worker);
+    }
+    studio_states(ui, pane.loading, pane.error.as_deref(), None);
+    if let Some(r) = &pane.report {
+        let mut tab = if pane.shape_tab { 2 } else { usize::from(pane.regimes_tab) };
+        super::studio_frame::tabs(ui, &mut tab, &["Overview", "Regimes", "Shape"]);
+        pane.shape_tab = tab == 2;
+        pane.regimes_tab = tab == 1;
+        if pane.shape_tab {
+            super::studio_frame::evidence_mode(ui, &mut pane.shape_evidence);
+            let mut changed = false;
+            ui.horizontal_wrapped(|ui| {
+                ui.label("Horizon / bars");
+                changed |= ui.add(egui::DragValue::new(&mut pane.horizon).range(1..=250)).changed();
+                changed |= ui.checkbox(&mut pane.overlap, "Overlapping").changed();
+                ui.label("|move| thresholds (log-return units)");
+                for level in &mut pane.thresholds {
+                    changed |= ui.add(egui::DragValue::new(level).range(0.0..=10.).speed(0.001)).changed();
                 }
-                if pane.shape.is_none() && !pane.shape_loading && pane.shape_error.is_none() {
-                    pane.shape_loading = true;
-                    self.worker.send(Request::StudioShape {
+            });
+            if changed {
+                pane.generation = crate::worker::studio_token();
+                pane.shape = None;
+                pane.shape_loading = false;
+                pane.shape_error = None;
+                pane.shape_intervals = None;
+                pane.shape_boot_loading = false;
+                pane.shape_boot_error = None;
+                pane.rotation_loading = false;
+            }
+            if pane.shape.is_none() && !pane.shape_loading && pane.shape_error.is_none() {
+                pane.shape_loading = true;
+                worker.send(Request::StudioShape {
+                    pane: id,
+                    generation: pane.generation,
+                    report: Arc::new(r.clone()),
+                    horizon: pane.horizon,
+                    overlap: pane.overlap,
+                    thresholds: pane.thresholds,
+                });
+            }
+            studio_states(ui, pane.shape_loading, pane.shape_error.as_deref(), None);
+            if let Some(s) = &pane.shape {
+                if pane.shape_intervals.is_none() && !pane.shape_boot_loading && pane.shape_boot_error.is_none() {
+                    pane.shape_boot_loading = true;
+                    worker.send(Request::StudioShapeBootstrap {
                         pane: id,
                         generation: pane.generation,
-                        report: Arc::new(r.clone()),
-                        horizon: pane.horizon,
-                        overlap: pane.overlap,
-                        thresholds: pane.thresholds,
+                        input: s.clone(),
                     });
                 }
-                studio_states(ui, pane.shape_loading, pane.shape_error.as_deref(), None);
-                if let Some(s) = &pane.shape {
-                    if pane.shape_intervals.is_none() && !pane.shape_boot_loading && pane.shape_boot_error.is_none() {
-                        pane.shape_boot_loading = true;
-                        self.worker.send(Request::StudioShapeBootstrap {
-                            pane: id,
-                            generation: pane.generation,
-                            input: s.clone(),
-                        });
-                    }
-                    if let Some(e) = &pane.shape_boot_error {
-                        ui.label(format!("Bootstrap unavailable: {e}"));
-                    }
-                    egui::ScrollArea::vertical().id_salt((id, "dist-shape")).show(ui, |ui| {
-                        shape::view_mode(ui, r, s, pane.shape_intervals.as_deref(), pane.shape_evidence);
-                    });
+                if let Some(e) = &pane.shape_boot_error {
+                    ui.label(format!("Bootstrap unavailable: {e}"));
                 }
-            } else if pane.regimes_tab {
-                if pane.rotation.is_none() && !pane.rotation_loading && pane.rotation_error.is_none() {
-                    if let Some(input) = &r.regime.rotation_input {
-                        pane.rotation_loading = true;
-                        self.worker.send(Request::StudioDistRotation {
-                            pane: id,
-                            generation: pane.generation,
-                            symbol: r.symbol.clone(),
-                            timeframe: r.timeframe,
-                            source: r.source.clone(),
-                            input: input.clone(),
-                        });
-                    }
-                }
-                if let Some(e) = &pane.rotation_error {
-                    ui.label(format!("distance p unavailable: {e}"));
-                }
-                egui::ScrollArea::vertical().id_salt((id, "dist-regimes")).show(ui, |ui| {
-                    regimes::view(ui, r, pane.rotation.as_deref(), pane.rotation_loading, &mut pane.regime_sel);
+                egui::ScrollArea::vertical().id_salt((id, "dist-shape")).show(ui, |ui| {
+                    shape::view_mode(ui, r, s, pane.shape_intervals.as_deref(), pane.shape_evidence);
                 });
-            } else {
-                ui.push_id(id, |ui| report_view(ui, id, r, &mut pane.best_k));
             }
+        } else if pane.regimes_tab {
+            if pane.rotation.is_none() && !pane.rotation_loading && pane.rotation_error.is_none() {
+                if let Some(input) = &r.regime.rotation_input {
+                    pane.rotation_loading = true;
+                    worker.send(Request::StudioDistRotation {
+                        pane: id,
+                        generation: pane.generation,
+                        symbol: r.symbol.clone(),
+                        timeframe: r.timeframe,
+                        source: r.source.clone(),
+                        input: input.clone(),
+                    });
+                }
+            }
+            if let Some(e) = &pane.rotation_error {
+                ui.label(format!("distance p unavailable: {e}"));
+            }
+            egui::ScrollArea::vertical().id_salt((id, "dist-regimes")).show(ui, |ui| {
+                regimes::view(ui, r, pane.rotation.as_deref(), pane.rotation_loading, &mut pane.regime_sel);
+            });
+        } else {
+            ui.push_id(id, |ui| report_view(ui, id, r, &mut pane.best_k));
         }
-        vec![]
     }
+    vec![]
 }
 
 /// The whole report below the controls. Split out so it can be rendered headless.
@@ -482,11 +504,19 @@ fn metric_cards(ui: &mut Ui, r: &Report) {
     let bar = r.timeframe.label();
     // Every card carries n, the span and provenance; the formula and inputs are per tile.
     let base = |title: &str, formula: &str| {
-        MathCard::new(title, formula)
-            .n(m.n, "log returns")
-            .span(from.clone(), to.clone())
-            .provenance(r.provenance)
-            .source(r.source.clone())
+        MathCard::new(
+            format!("dist.overview.{} · {title}", title.to_ascii_lowercase().replace([' ', '/', '.'], "_")),
+            formula,
+        )
+        .closed_thru(stamp(r.end))
+        .note(format!(
+            "Observation clock: {}",
+            r.observed_at.map(stamp).unwrap_or_else(|| "unavailable; final bar withheld".into())
+        ))
+        .n(m.n, "log returns")
+        .span(from.clone(), to.clone())
+        .provenance(r.provenance)
+        .source(r.source.clone())
     };
     let opt = |card: MathCard, v: Option<f64>, why: &str| match v {
         Some(v) => card.value(format!("{v:.3}")),
@@ -494,12 +524,16 @@ fn metric_cards(ui: &mut Ui, r: &Report) {
     };
     let flat = "zero variance: every return is identical";
     ui.horizontal_wrapped(|ui| {
-        stat_tile(ui, "MEAN / BAR", &pct(m.mean), theme::sign(m.mean), || {
+        let mean_tile = stat_tile(ui, "MEAN / BAR", &pct(m.mean), theme::sign(m.mean), || {
             base("MEAN / BAR", "μ = Σ rᵢ / n,  rᵢ = ln(Cᵢ / Cᵢ₋₁)")
                 .value(pct(m.mean))
                 .input("n", m.n.to_string())
                 .note(format!("Close-to-close log return over one closed {bar} bar."))
         });
+        #[cfg(test)]
+        ui.ctx().data_mut(|d| d.insert_temp(egui::Id::new("studio-mean-probe"), mean_tile.rect));
+        #[cfg(not(test))]
+        let _ = mean_tile;
         stat_tile(ui, "STDEV / ANN.", &pct(m.annual_vol), theme::text(), || {
             base("STDEV / ANN.", "σₐ = s × √P,  s = √(Σ(rᵢ − μ)² / (n − 1))")
                 .value(pct(m.annual_vol))
@@ -1211,7 +1245,7 @@ mod tests {
         pane.accept(2, Ok(report));
         assert!(pane.report.is_none() && !pane.loading);
         assert!(pane.error.as_deref().unwrap().contains("no real data"));
-        assert_eq!(pane.generation, 3);
+        assert!(pane.generation > 2);
     }
     #[test]
     fn new_pane_timeframe_is_not_interpreted_as_a_ticker() {

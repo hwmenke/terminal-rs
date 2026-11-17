@@ -291,3 +291,12 @@ The v2 inference tests also cover deterministic stationary draws, common-row max
 statistics, unavailable clock retention, second-stage cache reuse without fetches,
 and rejection of wrong-generation/digest results. The release season paint gate
 includes the accepted simultaneous band without changing its existing budgets.
+
+## Studio shell route
+
+`STUDIO lens=season` embeds this same state, report Arc and second-stage band
+worker. Supported intervals and US cash-session admission are unchanged. The
+shell explains unsupported intervals without substituting another timeframe.
+Accepted reports remain available after lens roundtrips; sample/context changes
+clear all dependent children. Globally allocated request tokens and existing
+band keys reject obsolete responses. See [Studio](STUDIO.md).

@@ -168,3 +168,12 @@ non-PSD fallback labelling, fan transformation, unchanged OLS/classical errors,
 chronological frozen holdout, Theil–Sen outlier resistance, overlap horizons,
 causal rolling prefixes, gap breaks, cache invalidation and actual hover cards
 with finite narrow/wide geometry. See PERF.md for measured gates and limitations.
+
+## Studio shell route
+
+`STUDIO lens=relate benchmark=QQQ` embeds the same CORR state and immutable Arc
+report below a native chart. No regression or covariance implementation is copied.
+The shell's context inspector owns symbol, interval and benchmark; the existing
+horizon/method views retain their conventions. An accepted Relate roundtrip
+reuses the exact Arc with zero compute requests. Globally allocated request
+tokens isolate recreated children and context changes. See [Studio](STUDIO.md).

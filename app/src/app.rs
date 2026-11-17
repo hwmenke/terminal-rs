@@ -41,9 +41,10 @@ mod stats;
 pub(crate) mod studio_corr;
 pub(crate) mod studio_dist;
 pub(crate) mod studio_frame;
-mod studio_season;
+pub(crate) mod studio_hub;
 #[cfg(test)]
 mod studio_perf_gate;
+mod studio_season;
 mod theming;
 mod trading;
 mod trend_wall;
@@ -119,6 +120,8 @@ pub enum PaneKind {
     Journal(Box<journal::JournalPane>),
     /// Historical risk/return and conditional forward returns (`STATS` / `COND`).
     Stats(Box<stats::StatsPane>),
+    Studio(Box<studio_hub::StudioPane>),
+    StudioRoute(tr_data::studio::StudioRoute),
     StudioDist(Box<studio_dist::DistPane>),
     StudioCorr(Box<studio_corr::CorrPane>),
     TstackTune(Box<tstack_tune::TunePane>),
@@ -289,11 +292,55 @@ impl BookPane {
 }
 
 impl PaneKind {
+    fn native_chart_mut(&mut self) -> Option<&mut ChartState> {
+        match self {
+            Self::Chart(c) => Some(c),
+            Self::Studio(s) => Some(&mut s.chart),
+            _ => None,
+        }
+    }
+    fn dist_mut(&mut self) -> Option<&mut studio_dist::DistPane> {
+        match self {
+            Self::StudioDist(p) => Some(p),
+            Self::Studio(s) => s.dist_mut(),
+            _ => None,
+        }
+    }
+    fn corr_mut(&mut self) -> Option<&mut studio_corr::CorrPane> {
+        match self {
+            Self::StudioCorr(p) => Some(p),
+            Self::Studio(s) => s.corr_mut(),
+            _ => None,
+        }
+    }
+    fn season_mut(&mut self) -> Option<&mut studio_season::SeasonPane> {
+        match self {
+            Self::StudioSeason(p) => Some(p),
+            Self::Studio(s) => s.season_mut(),
+            _ => None,
+        }
+    }
+    fn stats_mut(&mut self) -> Option<&mut stats::StatsPane> {
+        match self {
+            Self::Stats(p) => Some(p),
+            Self::Studio(s) => s.stats_mut(),
+            _ => None,
+        }
+    }
+    fn backtest_mut(&mut self) -> Option<&mut backtest::BacktestPane> {
+        match self {
+            Self::Backtest(p) => Some(p),
+            Self::Studio(s) => s.backtest_mut(),
+            _ => None,
+        }
+    }
+
     /// Price history has its own panel identity, so opening research keeps job progress visible.
     fn panel_type(&self) -> (std::mem::Discriminant<Self>, u8) {
         let kind = match self {
             Self::Research(r) if r.history => 1,
             Self::Backtest(b) if b.intraday => 2,
+            Self::StudioRoute(r) => 10 + *r as u8,
             _ => 0,
         };
         (std::mem::discriminant(self), kind)
@@ -351,6 +398,8 @@ impl PaneKind {
                     format!("{} Journal", tr_data::security(&j.filter).ticker)
                 }
             }
+            PaneKind::Studio(s) => format!("{} Studio · {}", short(&s.context.symbol), s.lens.label()),
+            PaneKind::StudioRoute(route) => route.code().into(),
             PaneKind::StudioDist(s) => format!("{} Distribution", tr_data::security(&s.symbol).ticker),
             PaneKind::TstackTune(s) => format!("{} TSTACK Tune", tr_data::security(&s.symbol).ticker),
             PaneKind::StudioCorr(s) => format!("{} CORR", tr_data::security(&s.symbol).ticker),
@@ -490,6 +539,8 @@ impl PaneKind {
             PaneKind::Desk(_) => "DESK",
             PaneKind::Journal(_) => "JRNL",
             PaneKind::Stats(_) => "STATS",
+            PaneKind::Studio(_) => "STUDIO",
+            PaneKind::StudioRoute(route) => route.code(),
             PaneKind::StudioDist(_) => "DIST",
             PaneKind::StudioCorr(_) => "CORR",
             PaneKind::TstackTune(_) => "TUNE",
@@ -518,6 +569,7 @@ impl PaneKind {
     fn symbol(&self) -> Option<&str> {
         match self {
             PaneKind::Chart(c) => Some(&c.symbol),
+            PaneKind::Studio(s) => Some(&s.context.symbol),
             PaneKind::Ticker { symbol, .. } => Some(symbol),
             PaneKind::News(n) if n.scope == tr_data::news::NewsScope::Symbol => n.symbol.as_deref(),
             PaneKind::News(_) => None,
@@ -538,6 +590,7 @@ impl PaneKind {
         matches!(
             self,
             PaneKind::Chart(_)
+                | PaneKind::Studio(_)
                 | PaneKind::Ticker { .. }
                 | PaneKind::OrderBook(_)
                 | PaneKind::Options(_)
@@ -632,6 +685,8 @@ impl PaneKind {
             },
             PaneKind::Desk(d) => PaneSettings::Desk { group: d.group.clone(), selected: d.selected.clone() },
             PaneKind::Journal(j) => PaneSettings::Journal { filter: j.filter.clone() },
+            PaneKind::Studio(s) => PaneSettings::Studio { view: s.view() },
+            PaneKind::StudioRoute(route) => PaneSettings::StudioRoute { route: *route },
             PaneKind::StudioDist(s) => {
                 PaneSettings::StudioDist { symbol: s.symbol.clone(), timeframe: s.timeframe, window: s.window }
             }
@@ -824,6 +879,8 @@ impl PaneKind {
                 PaneKind::Desk(Box::new(d))
             }
             PaneSettings::Journal { filter } => PaneKind::Journal(Box::new(journal::JournalPane::new(filter))),
+            PaneSettings::Studio { view } => PaneKind::Studio(Box::new(studio_hub::StudioPane::new(view))),
+            PaneSettings::StudioRoute { route } => PaneKind::StudioRoute(route),
             PaneSettings::StudioDist { symbol, timeframe, window } => {
                 PaneKind::StudioDist(Box::new(studio_dist::DistPane::new(symbol, timeframe, window)))
             }
@@ -1519,6 +1576,8 @@ impl TerminalApp {
             Command::SymbolFunction(s, Function::Review) => self.open_review(Some(&s)),
             Command::SymbolFunction(s, Function::Desk) => self.open_desk(Some(&s)),
             Command::SymbolFunction(s, Function::Journal(extra)) => self.open_journal(Some(&s), &extra),
+            Command::SymbolFunction(s, Function::Studio { spec }) => self.open_studio(Some(&s), &spec),
+            Command::SymbolFunction(_, Function::StudioRoute(route)) => self.open_panel(PaneKind::StudioRoute(route)),
             Command::SymbolFunction(s, Function::StudioDistHorizon(h)) => self.set_shape_horizon(Some(&s), h),
             Command::SymbolFunction(s, Function::StudioDist { timeframe }) => {
                 self.open_studio_dist(Some(&s), timeframe)
@@ -1795,6 +1854,8 @@ impl TerminalApp {
             Function::Desk => self.open_desk(symbol.as_deref()),
             Function::Journal(extra) => self.open_journal(symbol.as_deref(), &extra),
             Function::TstackTune(tf) => self.open_tstack_tune(symbol.as_deref(), tf),
+            Function::Studio { spec } => self.open_studio(symbol.as_deref(), &spec),
+            Function::StudioRoute(route) => self.open_panel(PaneKind::StudioRoute(route)),
             Function::StudioCorr { spec } => self.open_studio_corr(symbol.as_deref(), &spec),
             Function::StudioSeason { spec } => self.open_studio_season(symbol.as_deref(), &spec),
             Function::Stats { condition, conditional } => self.open_stats(symbol.as_deref(), &condition, conditional),
@@ -1846,7 +1907,7 @@ impl TerminalApp {
             let key = x.symbol.clone();
             self.quotes.insert(key.clone(), x);
             for pane in &mut self.panes {
-                if let PaneKind::Chart(c) = &mut pane.kind
+                if let Some(c) = pane.kind.native_chart_mut()
                     && c.symbol == key
                 {
                     c.set_earnings(earnings.clone());
@@ -1858,13 +1919,16 @@ impl TerminalApp {
     }
 
     fn chart_mut(&mut self, pane: PaneId) -> Option<&mut ChartState> {
-        match self.panes.iter_mut().find(|p| p.id == pane).map(|p| &mut p.kind) {
-            Some(PaneKind::Chart(c)) => Some(c),
-            _ => None,
-        }
+        self.panes.iter_mut().find(|p| p.id == pane).and_then(|p| p.kind.native_chart_mut())
     }
 
     fn drain(&mut self) {
+        let sample = self.provider.eq_ignore_ascii_case("sample");
+        for pane in &mut self.panes {
+            if let PaneKind::Studio(s) = &mut pane.kind {
+                s.sample_mode(sample);
+            }
+        }
         while let Ok(r) = self.worker.rx.try_recv() {
             let r = match r {
                 Response::WhatsNews { epoch, response } if epoch == self.whats_news_epoch => *response,
@@ -1931,6 +1995,7 @@ impl TerminalApp {
                             PaneKind::Research(r) => r.request(pane.id, &self.worker),
                             PaneKind::Chart(c) if c.archive => c.load(&self.worker),
                             PaneKind::Stats(s) => s.request(pane.id, &self.worker),
+                            PaneKind::Studio(s) => s.invalidate(),
                             PaneKind::StudioDist(s) => s.request(pane.id, &self.worker),
                             PaneKind::TstackTune(s) => s.request(pane.id, &self.worker),
                             PaneKind::StudioCorr(s) => s.request(pane.id, &self.worker),
@@ -1998,9 +2063,7 @@ impl TerminalApp {
                     }
                 }
                 Response::StudioDist { pane, generation, result } => {
-                    if let Some(PaneKind::StudioDist(s)) =
-                        self.panes.iter_mut().find(|p| p.id == pane).map(|p| &mut p.kind)
-                    {
+                    if let Some(s) = self.panes.iter_mut().find(|p| p.id == pane).and_then(|p| p.kind.dist_mut()) {
                         s.accept(generation, result);
                     }
                 }
@@ -2012,52 +2075,43 @@ impl TerminalApp {
                     }
                 }
                 Response::StudioCorr { pane, generation, result } => {
-                    if let Some(PaneKind::StudioCorr(s)) =
-                        self.panes.iter_mut().find(|p| p.id == pane).map(|p| &mut p.kind)
-                    {
+                    if let Some(s) = self.panes.iter_mut().find(|p| p.id == pane).and_then(|p| p.kind.corr_mut()) {
                         s.accept_shared(generation, result);
                     }
                 }
                 Response::StudioShape { pane, generation, result } => {
-                    if let Some(PaneKind::StudioDist(s)) =
-                        self.panes.iter_mut().find(|p| p.id == pane).map(|p| &mut p.kind)
-                    {
+                    if let Some(s) = self.panes.iter_mut().find(|p| p.id == pane).and_then(|p| p.kind.dist_mut()) {
                         s.accept_shape(generation, result);
                     }
                 }
                 Response::StudioShapeBootstrap { pane, generation, key, result } => {
-                    if let Some(PaneKind::StudioDist(s)) =
-                        self.panes.iter_mut().find(|p| p.id == pane).map(|p| &mut p.kind)
-                    {
+                    if let Some(s) = self.panes.iter_mut().find(|p| p.id == pane).and_then(|p| p.kind.dist_mut()) {
                         s.accept_shape_bootstrap(generation, key, result);
                     }
                 }
                 Response::StudioDistRotation { pane, generation, key, result } => {
-                    if let Some(PaneKind::StudioDist(s)) =
-                        self.panes.iter_mut().find(|p| p.id == pane).map(|p| &mut p.kind)
-                    {
+                    if let Some(s) = self.panes.iter_mut().find(|p| p.id == pane).and_then(|p| p.kind.dist_mut()) {
                         s.accept_rotation(generation, key, result);
                     }
                 }
-                Response::StudioSeasonBand {pane,generation,key,result} => {
-                    if let Some(PaneKind::StudioSeason(s))=self.panes.iter_mut().find(|p|p.id==pane).map(|p|&mut p.kind) {s.accept_band(generation,key,result);}
+                Response::StudioSeasonBand { pane, generation, key, result } => {
+                    if let Some(s) = self.panes.iter_mut().find(|p| p.id == pane).and_then(|p| p.kind.season_mut()) {
+                        s.accept_band(generation, key, result);
+                    }
                 }
                 Response::StudioSeason { pane, generation, result } => {
-                    if let Some(PaneKind::StudioSeason(s)) =
-                        self.panes.iter_mut().find(|p| p.id == pane).map(|p| &mut p.kind)
-                    {
+                    if let Some(s) = self.panes.iter_mut().find(|p| p.id == pane).and_then(|p| p.kind.season_mut()) {
                         s.accept_shared(generation, result);
                     }
                 }
                 Response::Stats { pane, generation, result } => {
-                    if let Some(PaneKind::Stats(s)) = self.panes.iter_mut().find(|p| p.id == pane).map(|p| &mut p.kind)
-                    {
+                    if let Some(s) = self.panes.iter_mut().find(|p| p.id == pane).and_then(|p| p.kind.stats_mut()) {
                         s.accept(generation, result);
                     }
                 }
                 Response::BacktestTrialRevision { scope, revision } => {
                     for pane in &mut self.panes {
-                        if let PaneKind::Backtest(b) = &mut pane.kind
+                        if let Some(b) = pane.kind.backtest_mut()
                             && b.note_revision(&scope, revision)
                         {
                             b.request(pane.id, &self.worker);
@@ -2065,16 +2119,12 @@ impl TerminalApp {
                     }
                 }
                 Response::Backtest { pane, generation, result } => {
-                    if let Some(PaneKind::Backtest(b)) =
-                        self.panes.iter_mut().find(|p| p.id == pane).map(|p| &mut p.kind)
-                    {
+                    if let Some(b) = self.panes.iter_mut().find(|p| p.id == pane).and_then(|p| p.kind.backtest_mut()) {
                         b.accept(generation, result);
                     }
                 }
                 Response::IntradayBacktest { pane, generation, result } => {
-                    if let Some(PaneKind::Backtest(b)) =
-                        self.panes.iter_mut().find(|p| p.id == pane).map(|p| &mut p.kind)
-                    {
+                    if let Some(b) = self.panes.iter_mut().find(|p| p.id == pane).and_then(|p| p.kind.backtest_mut()) {
                         b.accept_intraday(generation, result);
                     }
                 }
@@ -2214,7 +2264,8 @@ impl TerminalApp {
                     live,
                 } => {
                     let worker = &self.worker;
-                    if let Some(PaneKind::Chart(c)) = self.panes.iter_mut().find(|p| p.id == pane).map(|p| &mut p.kind)
+                    if let Some(c) =
+                        self.panes.iter_mut().find(|p| p.id == pane).and_then(|p| p.kind.native_chart_mut())
                         && c.symbol == symbol
                         && c.tf == tf
                     {
@@ -2242,7 +2293,9 @@ impl TerminalApp {
                     }
                 }
                 Response::ChartSessionSummary { pane, key, result } => {
-                    if let Some(c) = self.chart_mut(pane) { c.on_session_summary(key, result); }
+                    if let Some(c) = self.chart_mut(pane) {
+                        c.on_session_summary(key, result);
+                    }
                 }
                 Response::AuctionMap { pane, key, result } => {
                     if let Some(c) = self.chart_mut(pane) {
@@ -2323,6 +2376,7 @@ impl TerminalApp {
                         match &mut p.kind {
                             PaneKind::News(n) => n.accept(batch.clone()),
                             PaneKind::Chart(c) => c.on_news(&batch),
+                            PaneKind::Studio(s) => s.chart.on_news(&batch),
                             _ => {}
                         }
                     }
@@ -2330,7 +2384,7 @@ impl TerminalApp {
                         if p.id == pane {
                             continue;
                         }
-                        if let PaneKind::Chart(c) = &mut p.kind {
+                        if let Some(c) = p.kind.native_chart_mut() {
                             let ours = symbols.as_ref().is_some_and(|s| s.iter().any(|k| k == &c.symbol))
                                 || batch.queried.iter().any(|k| k == &c.symbol);
                             if ours {
@@ -2614,6 +2668,22 @@ impl TerminalApp {
         if other_text_focused {
             return;
         }
+        if !cmd_focused && !ctx.text_edit_focused() && !self.focus_cmd && self.cmd.is_empty() {
+            for &(key, m) in &presses {
+                if let Some(
+                    a @ (prefs::Action::StudioPrevLens
+                    | prefs::Action::StudioNextLens
+                    | prefs::Action::StudioCloseInspector
+                    | prefs::Action::StudioUndo),
+                ) = self.prefs.hotkeys.action_for(key, m)
+                    && self.hotkey_applies(a)
+                {
+                    ctx.input_mut(|i| i.consume_key(m, key));
+                    self.run_hotkey(a);
+                    return;
+                }
+            }
+        }
         if !cmd_focused && !self.focus_cmd && self.cmd.is_empty() && self.handoff_keys(ctx) {
             return;
         }
@@ -2649,6 +2719,9 @@ impl TerminalApp {
         let mut swallow_text = false;
         for &(key, m) in &presses {
             let Some(action) = self.prefs.hotkeys.action_for(key, m) else { continue };
+            if action == prefs::Action::StudioUndo && ctx.text_edit_focused() {
+                continue;
+            }
             let chorded = m.command || m.ctrl || m.alt;
             if !chorded && (!self.cmd.is_empty() || (cmd_focused && key == Key::Tab)) {
                 continue;
@@ -2738,6 +2811,9 @@ impl TerminalApp {
     fn hotkey_applies(&self, a: prefs::Action) -> bool {
         use prefs::Action as A;
         match a {
+            A::StudioPrevLens | A::StudioNextLens | A::StudioCloseInspector | A::StudioUndo => {
+                self.panes.iter().any(|p| p.id == self.focus && matches!(p.kind, PaneKind::Studio(_)))
+            }
             A::DrawTrendline
             | A::DrawHorizontal
             | A::DrawVertical
@@ -2757,6 +2833,21 @@ impl TerminalApp {
     fn run_hotkey(&mut self, a: prefs::Action) {
         use prefs::Action as A;
         match a {
+            A::StudioPrevLens | A::StudioNextLens | A::StudioCloseInspector | A::StudioUndo => {
+                if let Some(PaneKind::Studio(s)) =
+                    self.panes.iter_mut().find(|p| p.id == self.focus).map(|p| &mut p.kind)
+                {
+                    match a {
+                        A::StudioPrevLens => s.cycle_lens(-1),
+                        A::StudioNextLens => s.cycle_lens(1),
+                        A::StudioCloseInspector => s.inspector_open = false,
+                        A::StudioUndo => {
+                            s.undo_inputs();
+                        }
+                        _ => {}
+                    }
+                }
+            }
             A::Help => self.apply(Function::Help),
             A::Vault => self.vault_command(command::VaultCmd::Open, self.focused_symbol()),
             A::Congress => self.apply(Function::Congress),
@@ -2885,6 +2976,14 @@ impl TerminalApp {
                         tr_data::news::NewsScope::Top => None,
                     };
                     self.worker.send(Request::News { pane: p.id, symbols });
+                }
+                PaneKind::Studio(s)
+                    if !self.provider.eq_ignore_ascii_case("sample")
+                        && s.chart.show_news
+                        && s.chart.news_fetched.is_none_or(|t| t.elapsed() > Duration::from_secs(300)) =>
+                {
+                    s.chart.news_fetched = Some(Instant::now());
+                    self.worker.send(Request::News { pane: p.id, symbols: Some(vec![s.context.symbol.clone()]) });
                 }
                 PaneKind::Chart(c)
                     if c.show_news && c.news_fetched.is_none_or(|t| t.elapsed() > Duration::from_secs(300)) =>

@@ -31,7 +31,7 @@ impl CorrPane {
         }
     }
     pub fn request(&mut self, pane: PaneId, worker: &crate::worker::Worker) {
-        self.generation += 1;
+        self.generation = crate::worker::studio_token();
         self.report = None;
         self.loading = false;
         self.error = None;
@@ -380,17 +380,30 @@ impl TerminalApp {
         self.open_panel(PaneKind::StudioCorr(Box::new(CorrPane::new(symbol, spec))));
     }
     pub(super) fn studio_corr_pane(&mut self, ui: &mut Ui, id: PaneId) -> Vec<Action> {
-        let i = self.idx(id).expect("relationship pane");
+        let i = self.idx(id).expect("research pane");
         let PaneKind::StudioCorr(pane) = &mut self.panes[i].kind else { return vec![] };
-        let mut reload = false;
-        ui.horizontal_wrapped(|ui| {
-            super::studio_dist::studio_title(ui, "RELATIONSHIP STUDIO");
-            if ui.small_button("Reload").on_hover_text("Re-read every series, bypassing the short bar cache").clicked()
-            {
-                reload = true;
-                pane.fresh = true;
-            }
-        });
+        show(ui, id, pane, &self.worker, self.provider.eq_ignore_ascii_case("sample"), false)
+    }
+}
+
+/// Shared renderer/action adapter for the standalone pane and Studio shell.
+pub(super) fn show(
+    ui: &mut Ui,
+    id: PaneId,
+    pane: &mut CorrPane,
+    worker: &crate::worker::Worker,
+    sample: bool,
+    embedded: bool,
+) -> Vec<Action> {
+    let mut reload = false;
+    ui.horizontal_wrapped(|ui| {
+        super::studio_dist::studio_title(ui, "RELATIONSHIP STUDIO");
+        if ui.small_button("Reload").on_hover_text("Re-read every series, bypassing the short bar cache").clicked() {
+            reload = true;
+            pane.fresh = true;
+        }
+    });
+    if !embedded {
         ui.horizontal_wrapped(|ui| {
             ui.label("Asset");
             let a = ui.add(egui::TextEdit::singleline(&mut pane.symbol).desired_width(100.0).hint_text("AAPL"));
@@ -399,35 +412,34 @@ impl TerminalApp {
             reload |= (a.lost_focus() || b.lost_focus()) && ui.input(|i| i.key_pressed(egui::Key::Enter));
             reload |= ui.small_button("Apply").clicked();
         });
-        ui.label(
-            RichText::new("Log returns · common closed timestamps · no fill-forward · default SPY")
-                .font(theme::ui_font(11.0))
-                .color(theme::muted()),
-        );
-        ui.horizontal_wrapped(|ui| {
-            ui.label("Return horizon");
-            for h in [1, 5, 20] {
-                if ui.selectable_label(pane.horizon == h, format!("{h} bars")).clicked() {
-                    pane.horizon = h;
-                    reload = true;
-                }
-            }
-        });
-        if self.provider.eq_ignore_ascii_case("sample") {
-            pane.report = None;
-            pane.loading = false;
-            pane.error = Some(
-                "No real data in sample / demo display mode. Relationship Studio never uses sample prices.".into(),
-            );
-        } else if reload || (!pane.loading && pane.report.is_none() && pane.error.is_none()) {
-            pane.request(id, &self.worker);
-        }
-        super::studio_dist::studio_states(ui, pane.loading, pane.error.as_deref(), None);
-        if let Some(r) = &pane.report {
-            ui.push_id(id, |ui| report_view(ui, id, r));
-        }
-        vec![]
     }
+    ui.label(
+        RichText::new("Log returns · common closed timestamps · no fill-forward · default SPY")
+            .font(theme::ui_font(11.0))
+            .color(theme::muted()),
+    );
+    ui.horizontal_wrapped(|ui| {
+        ui.label("Return horizon");
+        for h in [1, 5, 20] {
+            if ui.selectable_label(pane.horizon == h, format!("{h} bars")).clicked() {
+                pane.horizon = h;
+                reload = true;
+            }
+        }
+    });
+    if sample {
+        pane.report = None;
+        pane.loading = false;
+        pane.error =
+            Some("No real data in sample / demo display mode. Relationship Studio never uses sample prices.".into());
+    } else if reload || (!pane.loading && pane.report.is_none() && pane.error.is_none()) {
+        pane.request(id, worker);
+    }
+    super::studio_dist::studio_states(ui, pane.loading, pane.error.as_deref(), None);
+    if let Some(r) = &pane.report {
+        ui.push_id(id, |ui| report_view(ui, id, r));
+    }
+    vec![]
 }
 
 fn stamp(ts: i64) -> String {

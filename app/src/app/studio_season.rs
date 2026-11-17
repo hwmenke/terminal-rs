@@ -47,7 +47,7 @@ impl SeasonPane {
         }
     }
     pub fn request(&mut self, id: PaneId, worker: &Worker) {
-        self.generation += 1;
+        self.generation = crate::worker::studio_token();
         self.band = None;
         self.band_loading = false;
         self.band_error = None;
@@ -121,29 +121,42 @@ impl TerminalApp {
         self.open_panel(PaneKind::StudioSeason(Box::new(SeasonPane::new(symbol, spec))));
     }
     pub(super) fn studio_season_pane(&mut self, ui: &mut Ui, id: PaneId) -> Vec<Action> {
-        let i = self.idx(id).expect("season pane");
+        let i = self.idx(id).expect("research pane");
         let PaneKind::StudioSeason(pane) = &mut self.panes[i].kind else { return vec![] };
-        let sample = self.provider.eq_ignore_ascii_case("sample");
-        if sample {
-            // Same empty state as DIST / CORR: never send a request for display prices.
-            pane.report = None;
-            pane.band = None;
-            pane.band_loading = false;
-            pane.band_error = None;
-            pane.loading = false;
-            pane.error = Some(
-                "No real data in sample / demo display mode. Seasonality never uses display or demo prices.".into(),
-            );
-        } else if pane.generation == 0 {
-            pane.request(id, &self.worker);
+        show(ui, id, pane, &self.worker, self.provider.eq_ignore_ascii_case("sample"), false)
+    }
+}
+
+/// Shared renderer/action adapter for the standalone pane and Studio shell.
+pub(super) fn show(
+    ui: &mut Ui,
+    id: PaneId,
+    pane: &mut SeasonPane,
+    worker: &crate::worker::Worker,
+    sample: bool,
+    embedded: bool,
+) -> Vec<Action> {
+    let sample = sample;
+    if sample {
+        // Same empty state as DIST / CORR: never send a request for display prices.
+        pane.report = None;
+        pane.band = None;
+        pane.band_loading = false;
+        pane.band_error = None;
+        pane.loading = false;
+        pane.error =
+            Some("No real data in sample / demo display mode. Seasonality never uses display or demo prices.".into());
+    } else if !pane.loading && pane.report.is_none() && pane.error.is_none() {
+        pane.request(id, worker);
+    }
+    let mut reload = false;
+    ui.horizontal_wrapped(|ui| {
+        super::studio_dist::studio_title(ui, "SEASONALITY STUDIO");
+        if ui.small_button("Reload").clicked() {
+            reload = true;
         }
-        let mut reload = false;
-        ui.horizontal_wrapped(|ui| {
-            super::studio_dist::studio_title(ui, "SEASONALITY STUDIO");
-            if ui.small_button("Reload").clicked() {
-                reload = true;
-            }
-        });
+    });
+    if !embedded {
         ui.horizontal_wrapped(|ui| {
             ui.label("Ticker");
             let edit = ui.add(egui::TextEdit::singleline(&mut pane.symbol).desired_width(100.0));
@@ -156,70 +169,70 @@ impl TerminalApp {
                 }
             }
         });
-        if reload && !sample {
-            pane.request(id, &self.worker);
-        }
-        super::studio_dist::studio_states(ui, pane.loading, pane.error.as_deref(), None);
-        if let Some(r) = &pane.report {
-            ui.horizontal(|ui| {
-                if ui.selectable_label(!pane.or_tab && !pane.evidence_tab, "Calendar").clicked() {
-                    pane.or_tab = false;
-                    pane.evidence_tab = false;
-                }
-                if r.timeframe.is_intraday() {
-                    if ui.selectable_label(pane.evidence_tab, "Evidence").clicked() {
-                        pane.or_tab = false;
-                        pane.evidence_tab = true;
-                    }
-                } else {
-                    pane.evidence_tab = false;
-                }
-                if r.timeframe == tr_core::Timeframe::M30 {
-                    if ui.selectable_label(pane.or_tab, "OR Lens").clicked() {
-                        pane.or_tab = true;
-                        pane.evidence_tab = false;
-                    }
-                } else {
-                    pane.or_tab = false;
-                }
-            });
-            ui.push_id(id, |ui| {
-                if pane.evidence_tab {
-                    if pane.band.is_none()
-                        && !pane.band_loading
-                        && pane.band_error.is_none()
-                        && let Some(e) = &r.evidence
-                    {
-                        pane.band_loading = true;
-                        self.worker.send(Request::StudioSeasonBand {
-                            pane: id,
-                            generation: pane.generation,
-                            symbol: r.symbol.clone(),
-                            tf: r.timeframe,
-                            source: r.source.clone(),
-                            input: e.band_input.clone(),
-                        });
-                    }
-                    evidence::view_with_band(ui, r, &mut pane.evidence_mode, pane.band.as_deref());
-                    if pane.band_loading {
-                        ui.label("ALL simultaneous band · computing 500 session-block draws…");
-                    }
-                    if let Some(e) = &pane.band_error {
-                        ui.label(format!("ALL simultaneous band unavailable: {e}"));
-                    }
-                } else if pane.or_tab {
-                    if let Some(lens) = &r.or_lens {
-                        or_lens::view(ui, lens, &mut pane.or_selection);
-                    } else {
-                        ui.label(r.or_unavailable.as_deref().unwrap_or("OR Lens unavailable"));
-                    }
-                } else {
-                    report_view(ui, id, r);
-                }
-            });
-        }
-        vec![]
     }
+    if reload && !sample {
+        pane.request(id, worker);
+    }
+    super::studio_dist::studio_states(ui, pane.loading, pane.error.as_deref(), None);
+    if let Some(r) = &pane.report {
+        ui.horizontal(|ui| {
+            if ui.selectable_label(!pane.or_tab && !pane.evidence_tab, "Calendar").clicked() {
+                pane.or_tab = false;
+                pane.evidence_tab = false;
+            }
+            if r.timeframe.is_intraday() {
+                if ui.selectable_label(pane.evidence_tab, "Evidence").clicked() {
+                    pane.or_tab = false;
+                    pane.evidence_tab = true;
+                }
+            } else {
+                pane.evidence_tab = false;
+            }
+            if r.timeframe == tr_core::Timeframe::M30 {
+                if ui.selectable_label(pane.or_tab, "OR Lens").clicked() {
+                    pane.or_tab = true;
+                    pane.evidence_tab = false;
+                }
+            } else {
+                pane.or_tab = false;
+            }
+        });
+        ui.push_id(id, |ui| {
+            if pane.evidence_tab {
+                if pane.band.is_none()
+                    && !pane.band_loading
+                    && pane.band_error.is_none()
+                    && let Some(e) = &r.evidence
+                {
+                    pane.band_loading = true;
+                    worker.send(Request::StudioSeasonBand {
+                        pane: id,
+                        generation: pane.generation,
+                        symbol: r.symbol.clone(),
+                        tf: r.timeframe,
+                        source: r.source.clone(),
+                        input: e.band_input.clone(),
+                    });
+                }
+                evidence::view_with_band(ui, r, &mut pane.evidence_mode, pane.band.as_deref());
+                if pane.band_loading {
+                    ui.label("ALL simultaneous band · computing 500 session-block draws…");
+                }
+                if let Some(e) = &pane.band_error {
+                    ui.label(format!("ALL simultaneous band unavailable: {e}"));
+                }
+            } else if pane.or_tab {
+                if let Some(lens) = &r.or_lens {
+                    or_lens::view(ui, lens, &mut pane.or_selection);
+                } else {
+                    ui.label(r.or_unavailable.as_deref().unwrap_or("OR Lens unavailable"));
+                }
+            } else {
+                report_view(ui, id, r);
+            }
+        });
+    }
+    vec![]
 }
 
 fn report_view(ui: &mut Ui, id: PaneId, r: &SeasonReport) {

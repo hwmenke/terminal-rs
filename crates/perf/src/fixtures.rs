@@ -169,3 +169,8 @@ pub fn regime_walk(n: usize) -> Vec<Bar> {
     }
     bars
 }
+
+/// Shell routing inputs only: the same validated routes as the shipped command parser.
+pub fn studio_routes() -> [&'static str; 5] {
+    ["5m lens=dist", "5m lens=relate benchmark=QQQ", "5m lens=when", "5m lens=season", "5m lens=backtest"]
+}

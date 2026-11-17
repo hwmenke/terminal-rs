@@ -662,3 +662,12 @@ cargo bench -p tr-core && cargo bench -p tr-chart
 See [Bar Vault](docs/BARVAULT.md) for admission, merge, retention and current limits.
 
 - **Relationship Studio** (`AAPL CORR QQQ`, alias `RBETA`): verified-data OLS, rolling beta/correlation, return scatter, ratio z-scores and peer matrix. See [STUDIO_CORR.md](docs/STUDIO_CORR.md).
+
+`AAPL STUDIO 5m lens=dist` connects a native time canvas to Distribution, Relate,
+When (daily conditional returns), Season and Backtest. `STUDIO lens=relate
+benchmark=QQQ` selects a benchmark. Local Alt+Left/Right cycles lenses, Escape
+closes Inspector, and Ctrl+Z undoes parameters outside text editing. Accepted
+lenses are retained without recomputing. QUICK, LAB, RESID and ATTR currently
+show precise unavailable route cards. Legacy standalone research commands stay
+available. See [Studio shell](docs/STUDIO.md) for selection, data and persistence
+limits.

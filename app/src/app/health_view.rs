@@ -43,6 +43,7 @@ impl TerminalApp {
             }
             match &mut p.kind {
                 PaneKind::Chart(c) if feed == Feed::Bars => c.on_feed(generation, state.clone()),
+                PaneKind::Studio(s) if feed == Feed::Bars => s.chart.on_feed(generation, state.clone()),
                 PaneKind::OrderBook(b) if feed == Feed::Book => {
                     b.feed_state = if b.book.as_ref().is_some_and(|b| !b.simulated) {
                         state.stale(b.last_ok.unwrap_or(now), &b.book.as_ref().unwrap().source, now)
@@ -93,6 +94,7 @@ impl TerminalApp {
         for p in &self.panes {
             let state = match (&p.kind, feed) {
                 (PaneKind::Chart(c), Feed::Bars) => c.feed_display(),
+                (PaneKind::Studio(s), Feed::Bars) => s.chart.feed_display(),
                 (PaneKind::OrderBook(b), Feed::Book) => b.feed_state.clone(),
                 (PaneKind::Options(o), Feed::Options) => o.feed_state.clone(),
                 _ => continue,
@@ -115,6 +117,11 @@ impl TerminalApp {
         let Some(p) = self.panes.iter().find(|p| p.id == self.focus) else { return false };
         let (feed, pane, available) = match &p.kind {
             PaneKind::Health => (self.health_selected, None, true),
+            PaneKind::Studio(s) if !s.chart.archive => (
+                Feed::Bars,
+                Some(p.id),
+                s.chart.feed_state.is_down() || matches!(s.chart.feed_state, FeedState::Stale { .. }),
+            ),
             PaneKind::Chart(c) if !c.archive => {
                 (Feed::Bars, Some(p.id), c.feed_state.is_down() || matches!(c.feed_state, FeedState::Stale { .. }))
             }

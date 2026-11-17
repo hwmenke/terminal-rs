@@ -338,3 +338,40 @@ fn perf_scopes_do_not_change_painted_shapes() {
     }
     assert_eq!(render(false), render(true));
 }
+
+/// Native canvas fixture shared with the integrated Studio gate; all preparation is untimed.
+pub(crate) fn studio_canvas(
+    w: &Worker,
+    rx: &mut tokio::sync::mpsc::UnboundedReceiver<Request>,
+    integrated: bool,
+) -> (ChartState, Arc<Vec<Bar>>) {
+    if integrated {
+        let mut c = chart(w, false, 5000);
+        complete(&mut c, rx);
+        assert!(c.gpu.as_ref().is_some_and(|g| g.len() == 5000));
+        let bars = c.bars.clone();
+        (c, bars)
+    } else {
+        let bars = Arc::new(tr_perf::fixtures::daily(5000, 71));
+        let mut c = ChartState::new(201, "AAPL US Equity", Timeframe::D1);
+        c.studio_reset();
+        c.indicators.clear();
+        c.show_news = false;
+        c.on_history(c.generation, bars.clone(), SeriesGpu::build(&bars), 0, false, true, false, w);
+        c.last_refresh = Some(bars.last().unwrap().ts + 86400);
+        assert_eq!(c.gpu.as_ref().unwrap().len(), 5000);
+        (c, bars)
+    }
+}
+
+pub(crate) fn studio_assert_canvas(c: &ChartState, out: &egui::FullOutput, integrated: bool) {
+    assert!(c.gpu.as_ref().is_some_and(|g| g.len() == 5000));
+    assert!(out.shapes.iter().any(|s| matches!(s.shape, egui::Shape::Callback(_))));
+    if integrated {
+        for word in ["AVWAP", "ZBAND"] {
+            assert!(text(&out.shapes).contains(word), "integrated canvas missing {word}");
+        }
+        assert!(!c.stack_paint.cloud.is_empty() && !c.stack_paint.lanes.is_empty());
+        assert!(!c.zband_paint.cloud.is_empty() && !c.stops.paint.shapes.is_empty() && !c.cone.paint.shapes.is_empty());
+    }
+}

@@ -51,3 +51,11 @@ pub fn low_n(ui: &mut Ui, n: usize, min: usize) {
         );
     }
 }
+
+/// Same final region for missing, loading and unavailable shell content.
+pub(super) fn unavailable(ui: &mut Ui, rect: egui::Rect, title: &str, reason: &str) {
+    let mut child = ui.new_child(egui::UiBuilder::new().max_rect(rect.shrink(10.)).id_salt(title));
+    child.set_clip_rect(rect.intersect(ui.clip_rect()));
+    child.label(egui::RichText::new(title).font(theme::ui_font(18.)).strong());
+    child.add(egui::Label::new(egui::RichText::new(reason).font(theme::ui_font(12.)).color(theme::muted())).wrap());
+}

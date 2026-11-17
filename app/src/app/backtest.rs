@@ -177,7 +177,7 @@ impl BacktestPane {
             self.loading = false;
             return;
         }
-        self.generation += 1;
+        self.generation = crate::worker::studio_token();
         self.loading = true;
         self.error = None;
         self.report = None;
@@ -237,46 +237,61 @@ impl TerminalApp {
     }
 
     pub(super) fn backtest_pane(&mut self, ui: &mut Ui, id: PaneId) -> Vec<Action> {
-        let mut actions = Vec::new();
-        let i = self.idx(id).expect("backtest pane");
-        let sample_offline = self.provider.eq_ignore_ascii_case("sample");
-        let mut reload = false;
-        let mut export = false;
-        {
-            let PaneKind::Backtest(pane) = &mut self.panes[i].kind else { return vec![] };
-            let intraday = pane.intraday;
-            if !pane.loading
-                && pane.report.is_none()
-                && pane.intraday_report.is_none()
-                && pane.error.is_none()
-                && !pane.symbol.trim().is_empty()
-            {
-                pane.request(id, &self.worker);
-            }
+        let i = self.idx(id).expect("research pane");
+        let PaneKind::Backtest(pane) = &mut self.panes[i].kind else { return vec![] };
+        show(ui, id, pane, &self.worker, self.provider.eq_ignore_ascii_case("sample"), false)
+    }
+}
 
-            ui.horizontal_wrapped(|ui| {
-                ui.label(RichText::new(if intraday { "Intraday" } else { "Backtest" }).strong().color(text()));
-                ui.label(RichText::new("paper / research only").font(mono(11.0)).color(amber()));
-                if ui
-                    .small_button("Reload")
-                    .on_hover_text(if intraday {
-                        "Recompute from verified regular-session bars"
-                    } else {
-                        "Recompute from the research archive"
-                    })
-                    .clicked()
-                {
-                    reload = true;
-                }
-                if ui
+/// Shared renderer/action adapter for the standalone pane and Studio shell.
+pub(super) fn show(
+    ui: &mut Ui,
+    id: PaneId,
+    pane: &mut BacktestPane,
+    worker: &crate::worker::Worker,
+    sample: bool,
+    embedded: bool,
+) -> Vec<Action> {
+    let mut actions = Vec::new();
+    let sample_offline = sample;
+    let mut reload = false;
+    let mut export = false;
+    {
+        let intraday = pane.intraday;
+        if !sample
+            && !pane.loading
+            && pane.report.is_none()
+            && pane.intraday_report.is_none()
+            && pane.error.is_none()
+            && !pane.symbol.trim().is_empty()
+        {
+            pane.request(id, worker);
+        }
+
+        ui.horizontal_wrapped(|ui| {
+            ui.label(RichText::new(if intraday { "Intraday" } else { "Backtest" }).strong().color(text()));
+            ui.label(RichText::new("paper / research only").font(mono(11.0)).color(amber()));
+            if ui
+                .small_button("Reload")
+                .on_hover_text(if intraday {
+                    "Recompute from verified regular-session bars"
+                } else {
+                    "Recompute from the research archive"
+                })
+                .clicked()
+            {
+                reload = true;
+            }
+            if !embedded
+                && ui
                     .small_button("Export")
                     .on_hover_text("Write backtest JSON with source, as-of, costs and holdout (EXPORT BACKTEST)")
                     .clicked()
-                {
-                    export = true;
-                }
-            });
-            ui.label(
+            {
+                export = true;
+            }
+        });
+        ui.label(
                 RichText::new(if intraday {
                     "Compare session VWAP and the opening range to holding each cash session. Signals fill at the next regular open and flatten at that session's close. The last fraction of sessions is unseen. Do not pick a winner from this table."
                 } else {
@@ -285,17 +300,18 @@ impl TerminalApp {
                 .font(ui_font(11.5))
                 .color(muted()),
             );
-            if sample_offline {
-                ui.label(
-                    RichText::new(
-                        "Sample / offline display mode does not feed this pane. Backtests never fall back to sample bars.",
-                    )
-                    .font(ui_font(12.0))
-                    .color(theme::down()),
-                );
-            }
+        if sample_offline {
+            ui.label(
+                RichText::new(
+                    "Sample / offline display mode does not feed this pane. Backtests never fall back to sample bars.",
+                )
+                .font(ui_font(12.0))
+                .color(theme::down()),
+            );
+        }
 
-            ui.horizontal_wrapped(|ui| {
+        ui.horizontal_wrapped(|ui| {
+            if !embedded {
                 ui.label(RichText::new("Ticker").color(muted()));
                 let changed = ui
                     .add(egui::TextEdit::singleline(&mut pane.symbol).desired_width(110.0).hint_text("AAPL"))
@@ -304,138 +320,132 @@ impl TerminalApp {
                 if changed {
                     reload = true;
                 }
-                ui.label(RichText::new("Strategies").color(muted()));
-                ui.add(egui::TextEdit::singleline(&mut pane.strategies).desired_width(200.0).hint_text(if intraday {
-                    "ALL, VWAP, OR"
-                } else {
-                    "ALL or ADTREND, SMA 20 50, RSI"
-                }));
-                if intraday {
-                    ui.label(RichText::new("Bars").color(muted()));
-                    ui.add(egui::TextEdit::singleline(&mut pane.tf).desired_width(48.0).hint_text("5m"));
-                }
-            });
-            ui.horizontal_wrapped(|ui| {
-                ui.label(RichText::new("Holdout").color(muted()));
-                ui.add(egui::TextEdit::singleline(&mut pane.holdout).desired_width(48.0).hint_text("20%"));
-                ui.label(
-                    RichText::new(if intraday { "last fraction of sessions" } else { "last fraction, chronological" })
-                        .font(ui_font(11.0))
-                        .color(muted()),
-                );
-                ui.label(RichText::new("Comm bps").color(muted()));
-                ui.add(egui::TextEdit::singleline(&mut pane.commission).desired_width(36.0));
-                ui.label(RichText::new("Slip bps").color(muted()));
-                ui.add(egui::TextEdit::singleline(&mut pane.slippage).desired_width(36.0));
-                if ui.selectable_label(pane.allow_short, "Shorts").clicked() {
-                    pane.allow_short = !pane.allow_short;
-                    reload = true;
-                }
-                if ui.button(RichText::new("RUN").font(mono(11.5))).clicked() {
-                    reload = true;
-                }
-            });
-            ui.horizontal_wrapped(|ui| {
-                let chips: &[(&str, &str)] = if intraday {
-                    &[("ALL", "ALL"), ("Hold", "HOLD"), ("VWAP", "VWAP"), ("OR", "OR")]
-                } else {
-                    &[
-                        ("ALL", "ALL"),
-                        ("Hold", "HOLD"),
-                        ("ADTREND", "ADTREND"),
-                        ("SMA 20/50", "SMA 20 50"),
-                        ("RSI", "RSI"),
-                    ]
-                };
-                for (label, line) in chips {
-                    if ui.selectable_label(pane.strategies.trim().eq_ignore_ascii_case(line), *label).clicked() {
-                        pane.strategies = (*line).into();
-                        reload = true;
-                    }
-                }
-            });
-
-            ui.horizontal_wrapped(|ui| {
-                ui.label(RichText::new("Folds").color(muted()));
-                ui.add(egui::DragValue::new(&mut pane.honesty.folds).range(2..=6));
-                ui.label(RichText::new("Embargo sessions").color(muted()));
-                ui.add(egui::DragValue::new(&mut pane.honesty.embargo_sessions).range(0..=252));
-                if ui.selectable_label(!pane.holdout_tables, "Honest").clicked() {
-                    pane.holdout_tables = false;
-                }
-                if ui.selectable_label(pane.holdout_tables, "Holdout tables").clicked() {
-                    pane.holdout_tables = true;
-                }
-            });
-            if pane.snapshot.as_ref().is_some_and(|s| *s != pane.controls()) {
-                ui.label(
-                    RichText::new("CONTROLS CHANGED · RUN to apply. Evidence below uses the accepted run settings.")
-                        .color(amber())
-                        .font(mono(11.0)),
-                );
             }
-            if !pane.receipt.is_empty() {
-                ui.label(RichText::new(&pane.receipt).color(muted()).font(mono(11.0)));
-            }
-            if let Some(err) = &pane.error {
-                ui.label(RichText::new(err).font(mono(12.0)).color(theme::down()));
-            } else if pane.loading {
-                ui.label(
-                    RichText::new(if intraday {
-                        "Reading verified intraday bars…"
-                    } else {
-                        "Reading research archive…"
-                    })
-                    .font(mono(12.0))
-                    .color(muted()),
-                );
-            }
-
-            if sample_offline {
-                // A provider-mode switch must not leave prior confidence visible
-                // while its refusal response is still in flight.
-            } else if pane.holdout_tables {
-                if intraday {
-                    if let Some(report) = &pane.intraday_report {
-                        render_intraday(ui, report);
-                    }
-                } else if let Some(report) = &pane.report {
-                    render_report(ui, report);
-                }
+            ui.label(RichText::new("Strategies").color(muted()));
+            ui.add(egui::TextEdit::singleline(&mut pane.strategies).desired_width(200.0).hint_text(if intraday {
+                "ALL, VWAP, OR"
             } else {
-                let honest = pane
+                "ALL or ADTREND, SMA 20 50, RSI"
+            }));
+            if intraday && !embedded {
+                ui.label(RichText::new("Bars").color(muted()));
+                ui.add(egui::TextEdit::singleline(&mut pane.tf).desired_width(48.0).hint_text("5m"));
+            }
+        });
+        ui.horizontal_wrapped(|ui| {
+            ui.label(RichText::new("Holdout").color(muted()));
+            ui.add(egui::TextEdit::singleline(&mut pane.holdout).desired_width(48.0).hint_text("20%"));
+            ui.label(
+                RichText::new(if intraday { "last fraction of sessions" } else { "last fraction, chronological" })
+                    .font(ui_font(11.0))
+                    .color(muted()),
+            );
+            ui.label(RichText::new("Comm bps").color(muted()));
+            ui.add(egui::TextEdit::singleline(&mut pane.commission).desired_width(36.0));
+            ui.label(RichText::new("Slip bps").color(muted()));
+            ui.add(egui::TextEdit::singleline(&mut pane.slippage).desired_width(36.0));
+            if ui.selectable_label(pane.allow_short, "Shorts").clicked() {
+                pane.allow_short = !pane.allow_short;
+                reload = true;
+            }
+            if ui.button(RichText::new("RUN").font(mono(11.5))).clicked() {
+                reload = true;
+            }
+        });
+        ui.horizontal_wrapped(|ui| {
+            let chips: &[(&str, &str)] = if intraday {
+                &[("ALL", "ALL"), ("Hold", "HOLD"), ("VWAP", "VWAP"), ("OR", "OR")]
+            } else {
+                &[("ALL", "ALL"), ("Hold", "HOLD"), ("ADTREND", "ADTREND"), ("SMA 20/50", "SMA 20 50"), ("RSI", "RSI")]
+            };
+            for (label, line) in chips {
+                if ui.selectable_label(pane.strategies.trim().eq_ignore_ascii_case(line), *label).clicked() {
+                    pane.strategies = (*line).into();
+                    reload = true;
+                }
+            }
+        });
+
+        ui.horizontal_wrapped(|ui| {
+            ui.label(RichText::new("Folds").color(muted()));
+            ui.add(egui::DragValue::new(&mut pane.honesty.folds).range(2..=6));
+            ui.label(RichText::new("Embargo sessions").color(muted()));
+            ui.add(egui::DragValue::new(&mut pane.honesty.embargo_sessions).range(0..=252));
+            if ui.selectable_label(!pane.holdout_tables, "Honest").clicked() {
+                pane.holdout_tables = false;
+            }
+            if ui.selectable_label(pane.holdout_tables, "Holdout tables").clicked() {
+                pane.holdout_tables = true;
+            }
+        });
+        if pane.snapshot.as_ref().is_some_and(|s| *s != pane.controls()) {
+            ui.label(
+                RichText::new("CONTROLS CHANGED · RUN to apply. Evidence below uses the accepted run settings.")
+                    .color(amber())
+                    .font(mono(11.0)),
+            );
+        }
+        if !pane.receipt.is_empty() {
+            ui.label(RichText::new(&pane.receipt).color(muted()).font(mono(11.0)));
+        }
+        if let Some(err) = &pane.error {
+            ui.label(RichText::new(err).font(mono(12.0)).color(theme::down()));
+        } else if pane.loading {
+            ui.label(
+                RichText::new(if intraday {
+                    "Reading verified intraday bars…"
+                } else {
+                    "Reading research archive…"
+                })
+                .font(mono(12.0))
+                .color(muted()),
+            );
+        }
+
+        if sample_offline {
+            // A provider-mode switch must not leave prior confidence visible
+            // while its refusal response is still in flight.
+        } else if pane.holdout_tables {
+            if intraday {
+                if let Some(report) = &pane.intraday_report {
+                    render_intraday(ui, report);
+                }
+            } else if let Some(report) = &pane.report {
+                render_report(ui, report);
+            }
+        } else {
+            let honest = pane
+                .report
+                .as_ref()
+                .and_then(|r| r.honesty.as_ref())
+                .or_else(|| pane.intraday_report.as_ref().and_then(|r| r.honesty.as_ref()));
+            if let Some(h) = honest {
+                let accepted_symbol = pane
                     .report
                     .as_ref()
-                    .and_then(|r| r.honesty.as_ref())
-                    .or_else(|| pane.intraday_report.as_ref().and_then(|r| r.honesty.as_ref()));
-                if let Some(h) = honest {
-                    let accepted_symbol = pane
-                        .report
-                        .as_ref()
-                        .map(|r| r.symbol.as_str())
-                        .or_else(|| pane.intraday_report.as_ref().map(|r| r.symbol.as_str()))
-                        .unwrap_or("");
-                    ui.label(RichText::new(format!("Evidence: {accepted_symbol}")).strong().color(text()));
-                    let settings_line = pane
-                        .report
-                        .as_ref()
-                        .map(|r| r.settings_line.as_str())
-                        .or_else(|| pane.intraday_report.as_ref().map(|r| r.settings_line.as_str()))
-                        .unwrap_or("");
-                    ui.label(RichText::new(settings_line).color(muted()).font(mono(11.0)));
-                    honesty::render(ui, h, &mut pane.selected_variant, &mut pane.selected_fold);
-                }
+                    .map(|r| r.symbol.as_str())
+                    .or_else(|| pane.intraday_report.as_ref().map(|r| r.symbol.as_str()))
+                    .unwrap_or("");
+                ui.label(RichText::new(format!("Evidence: {accepted_symbol}")).strong().color(text()));
+                let settings_line = pane
+                    .report
+                    .as_ref()
+                    .map(|r| r.settings_line.as_str())
+                    .or_else(|| pane.intraday_report.as_ref().map(|r| r.settings_line.as_str()))
+                    .unwrap_or("");
+                ui.label(RichText::new(settings_line).color(muted()).font(mono(11.0)));
+                honesty::render(ui, h, &mut pane.selected_variant, &mut pane.selected_fold);
             }
         }
-
-        if reload && let PaneKind::Backtest(pane) = &mut self.panes[i].kind {
-            pane.request(id, &self.worker);
-        }
-        if export {
-            actions.push(Action::Command("EXPORT BACKTEST".into()));
-        }
-        actions
     }
+
+    if reload && !sample {
+        pane.request(id, worker);
+    }
+    if export {
+        actions.push(Action::Command("EXPORT BACKTEST".into()));
+    }
+    actions
 }
 
 fn render_report(ui: &mut Ui, report: &BacktestReport) {
