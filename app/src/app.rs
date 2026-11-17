@@ -2015,6 +2015,13 @@ impl TerminalApp {
                         s.accept_shared(generation, result);
                     }
                 }
+                Response::StudioDistRotation { pane, generation, key, result } => {
+                    if let Some(PaneKind::StudioDist(s)) =
+                        self.panes.iter_mut().find(|p| p.id == pane).map(|p| &mut p.kind)
+                    {
+                        s.accept_rotation(generation, key, result);
+                    }
+                }
                 Response::StudioSeasonBand {pane,generation,key,result} => {
                     if let Some(PaneKind::StudioSeason(s))=self.panes.iter_mut().find(|p|p.id==pane).map(|p|&mut p.kind) {s.accept_band(generation,key,result);}
                 }

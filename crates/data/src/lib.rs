@@ -58,6 +58,7 @@ pub mod stack_wall;
 pub mod stats;
 pub mod studio_corr;
 pub mod studio_dist;
+pub mod studio_regime;
 pub mod studio_season;
 pub mod studio_inference;
 pub mod time_link;

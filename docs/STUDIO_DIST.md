@@ -122,3 +122,51 @@ insufficient input, invalid floats/prices/timestamps, sample/missing/mixed bars,
 command parsing, pane settings, generation/provenance gates, pending-bar removal, sourced-vault loading / outage
 closure, sample-mode transitions and finite headless chart geometry at 320/1440px.
 No new dependencies are required.
+
+## Regime fingerprints
+
+Select **Regimes** beside Overview. Calm / Normal / Stressed retain the existing
+causal labels, joined to returns by timestamp. Warm-up and vault gap exclusions
+are printed separately. The loader, full-input verification, closure clock and
+sample refusal remain unchanged. CLOSED THRU names the final analysed bar.
+
+Three ridges share 48 edges over ±W, where W is the larger absolute type-7
+0.5th/99.5th percentile of classified returns, and one maximum bin-mass scale.
+Mass uses each regime's n; observations outside the axis remain counted.
+Type-7 q05/q25/q50/q75/q95 and at most 20 observations per tail are descriptive,
+not confidence limits. Tails count strict exceedances of pooled μ ± 2s, with
+sample standard deviation s (n−1). Flat or unclassified inputs show a reason.
+Click a regime to select its binned ECDF against other classified returns;
+its exact D uses complete tie groups and the smallest maximizing x.
+
+Mean contrast is regime minus its classified complement. Newey–West (1987)
+Bartlett HAC uses a declared L=min(20,T−1) on the original bar grid, retaining
+missing slots and resetting products at vault gaps. Normal-tail p and pointwise
+Δ±1.96 SE require 30 observations on each side and nondegenerate variance.
+L=20 follows the volatility label window; results remain bandwidth-sensitive
+(Andrews 1991). The three contrasts form fixed BY (2001) family
+`dist.regime.mean`; unavailable tests retain p=1.
+
+Distance D has no iid KS p-value. A background cached job circularly rotates
+labels against fixed real returns on the compact classified sequence. Shifts
+40…m−40 are exhausted or sampled without replacement by seeded partial
+Fisher–Yates, at most 499 draws and 12 million observation-draws. Fewer than
+99 admissible shifts or draws withholds inference. Add-one p=(1+extremes)/(K+1)
+and a 95% surrogate band use the same shifts for all three regimes. A separate
+fixed BY family `dist.regime.distance` retains all three slots. Seeds hash the
+selected verified bars and gaps. Generation and seed checks reject obsolete
+responses; repeated requests share the report cache and make no provider calls.
+
+The time-shift surrogate (Theiler et al. 1992; Phipson–Smyth 2010 add-one rule)
+assumes stationarity, preserves each series' dependence and introduces a wrap
+seam; vault gaps add seams. A small p mainly reflects volatility persistence,
+since the labels depend on past absolute returns. It is not directional edge.
+P(r>0) includes zeros in n and carries a Wilson (1927) 95% interval with z=1.96;
+that interval assumes independent signs.
+
+Every statistic has a method/source/count/closure MathCard. Categorical series
+colours identify the regimes on both tabs. Signed contrast numbers/endpoints
+use sign ink; q≤0.10 adds a neutral outline, while LOW N adds a caution tick.
+There is no heat surface. Tab/row selection is ephemeral; existing saved settings
+remain compatible. Tests pin HAC variances, tie-complete D, Wilson intervals,
+BY membership, exact rotation p/q, calibration and real-data/state gates.

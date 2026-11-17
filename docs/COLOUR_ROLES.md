@@ -64,3 +64,10 @@ colour. Coefficient/holdout/robust-slope numbers and interval endpoints use sign
 ink; BY q text and method labels stay neutral. SEASON's two fixed family chips
 are neutral counts, and its simultaneous ALL band shares the ALL curve identity.
 Neither the family split nor the band introduces a significance hue.
+
+DIST volatility classes use categorical `series([0,4,5][i])` on both tabs, with
+Calm / Normal / Stressed printed beside swatches. Their identities do not encode
+return sign or caution. Fingerprint Δμ and CI endpoints use explicit signed ink;
+whiskers use identity colour, zero is muted, and q≤0.10 uses a neutral outline.
+LOW N uses an amber corner tick. Ridges are probability masses, with shared axes
+and scales rather than heat fills.

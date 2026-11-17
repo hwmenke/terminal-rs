@@ -578,3 +578,73 @@ Post-baseline verification also passed: **30/30 compute cases**, all `Pass`
 CORR **31.068 ms**, stationary bootstrap **19.545 ms**, max-|t| **3.765 ms**;
 CORR steady **1.300 ms UI / 1.790 ms total**, hover **1.346 / 1.865 ms**.
 These final checks used the completed source; the committed baseline is the pre-slice one.
+
+## Master slice 2: Regime distribution fingerprints
+
+The DIST report now computes timestamp-joined fingerprints in its existing
+blocking worker path. Shared 48-bin masses, type-7 quantiles, sample-sd tails,
+Wilson intervals, exact tie-complete distances and three L=20 gap-reset HAC
+contrasts are immutable before painting. The mean and distance BY families each
+retain exactly three members, including unavailable tests at p=1.
+
+Circular label rotations run as a separate single-flight cached blocking job.
+The digest covers selected verified closed bars and gaps; generation and seed
+checks reject obsolete responses. No provider work is added. Runtime rotations
+only shift labels against the original real returns. The main DIST report remains
+owned and uncached; its optional Arc/cache conversion was cut. ECDF inset, rugs,
+Wilson intervals and rotation inference were retained.
+
+The dev-only `regime_walk` fixture has seeded aperiodic 40–160-return volatility
+blocks and valid OHLC. Full compute uses 5,000 returns, smoke uses 1,500. Both
+scales assert ≥300 classified returns and an available HAC interval in every
+regime, unit mass including outside-axis counts, 499 rotations, all three p-values
+and Stressed distance q≤0.10. The fingerprint case times the entire DIST rebuild;
+the second case times rotation inference only, including shift choice and sorting.
+
+New paint scenarios `paint.studio_regime.{steady,hover}` measure UI, tessellation
+and total at unchanged planned ceilings 1.2 / 0.8 / 2.0 ms. The 1440×1600 headless
+view contains all three ridges, at least 144 actual bin rectangles, the full
+receipt, both family labels, 499-rotation count, HAC method, up-shares and an
+actual open mean-contrast MathCard under pointer motion. No observation sorting,
+binning or inference occurs in paint. Ordinary geometry checks also exercise
+320-point width and unavailable reports. All previous budgets and the committed
+baseline are unchanged. Measurements cover CPU UI/tessellation, not GPU or a
+whole desk.
+
+Release measurement on 2026-11-16 (same 8-core Linux host, rustc 1.100.0 stable,
+calibration **6068.75 µs**, slack **1.0**):
+
+| New case / metric | Median ms | p95 ms | Ceiling ms |
+| --- | ---: | ---: | ---: |
+| `studio.regime_fingerprints_5k` | 2.46717 | 2.56523 | 40 |
+| `studio.regime_rotation_5k_x499` | 17.11768 | 22.87217 | 150 |
+| `paint.studio_regime.steady.ui` | 0.10275 | 0.12698 | 1.2 |
+| `paint.studio_regime.steady.tess` | 0.05170 | 0.05865 | 0.8 |
+| `paint.studio_regime.steady.total` | 0.15450 | 0.17842 | 2 |
+| `paint.studio_regime.hover.ui` | 0.12654 | 0.13978 | 1.2 |
+| `paint.studio_regime.hover.tess` | 0.05999 | 0.06671 | 0.8 |
+| `paint.studio_regime.hover.total` | 0.18654 | 0.20649 | 2 |
+
+Validation:
+
+- `cargo build --release --offline`: **passed**.
+- `scripts/perf-gate.sh`: **32 compute/data passed, 0 failed, 0 harness errors**;
+  **2 release paint tests passed, 0 failed, 0 ignored**, checking **129 paint
+  metrics**. All absolute and existing relative gates passed without advisories.
+  The committed `perf/baseline.json` and all previous budgets remain unchanged.
+- `cargo test --workspace --offline` outside the Codex sandbox: **1,626 passed,
+  0 failed, 10 ignored** (inside the sandbox 14 existing loopback-bind HTTP mock
+  tests could not run; they pass outside it). Release build and
+  `scripts/perf-gate.sh` re-run and green outside the sandbox.
+- All **23 new tests passed**: three HAC references/default-preservation checks,
+  fourteen fingerprint/rotation/quantile/Wilson/BY tests, five app geometry/card/
+  lifecycle/colour tests and one cached worker/sample-refusal/no-fetch test.
+  The existing unedited DIST prefix-invariance test and colour guards pass.
+  The seeded-noise calibration test used its original bounds, without seed search.
+- No dependencies, lockfile, persisted settings or loader changes. The existing
+  unused `workspace.package.rust-version` manifest warning remains.
+
+Limits: label rotation assumes stationarity, compacts classified returns and has
+wrap/vault seams; small p can reflect volatility persistence, not directional
+edge. HAC remains bandwidth-sensitive and asymptotic; Wilson assumes independent
+signs. Provider coverage and corporate actions remain upstream limitations.
