@@ -21,6 +21,25 @@ pub fn benjamini_yekutieli(p: &[f64]) -> Vec<f64> {
     benjamini_hochberg(p).into_iter().map(|q| (q * harmonic).min(1.0)).collect()
 }
 
+/// Predeclared test family. Missing tests retain their slot with p=1.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Family {
+    pub name: String,
+    pub q: Vec<f64>,
+}
+impl Family {
+    pub fn by(name: &str, p: &[Option<f64>]) -> Self {
+        let p: Vec<_> = p.iter().map(|p| p.unwrap_or(1.)).collect();
+        Self { name: name.into(), q: benjamini_yekutieli(&p) }
+    }
+    pub fn len(&self) -> usize {
+        self.q.len()
+    }
+    pub fn is_empty(&self) -> bool {
+        self.q.is_empty()
+    }
+}
+
 /// Exact two-sided Binomial(n, 1/2) sign test; callers drop zero returns.
 /// Log probabilities avoid underflow from starting at 2^-n on long histories.
 pub fn sign_test(positive: usize, negative: usize) -> Option<f64> {
@@ -223,5 +242,19 @@ mod tests {
             rotation_test(&[Some(1.0)], &offsets[..98], |_| panic!("too few offsets"))[0],
             RotationResult::default()
         );
+    }
+}
+
+#[cfg(test)]
+mod family_tests {
+    use super::*;
+    #[test]
+    fn family_keeps_unavailable_slots_and_order() {
+        let f = Family::by("predeclared", &[Some(0.01), None, Some(0.03)]);
+        assert_eq!(f.name, "predeclared");
+        assert_eq!(f.len(), 3);
+        assert!(!f.is_empty());
+        assert_eq!(f.q, benjamini_yekutieli(&[0.01, 1., 0.03]));
+        assert!(Family::by("empty", &[]).is_empty());
     }
 }

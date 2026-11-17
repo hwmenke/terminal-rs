@@ -229,23 +229,49 @@ L = min(5, T−1)
 Var(mean) = Σ u[s]² + 2 Σ(l=1…L) (1−l/(L+1)) Σ u[s]u[s−l]
 SE = sqrt(Var); pointwise CI = mean ± 1.96 SE
 p = 2 Φ(−abs(mean/SE))
-q = min(1, H_m × BH(p)), H_m = Σ(j=1…m) 1/j, m = 6B
+q = min(1, H_m × BH(p)), H_m = Σ(j=1…m) 1/j, m = B (ALL family), or 5B (weekday family)
 ```
 
 The existing `studio_inference::hac_mean` supplies this five-session Bartlett
 HAC estimator. Missing sessions and nonselected weekdays have zero score and
 retain lag distance. Explicit vault joins reset lag products while preserving
-the expected grid and bandwidth. The full **single 6B family** includes ALL and
-weekday means together; unavailable/low-n cells enter at p=1. For 5m bars,
-B=78 and m=468. The later two-family split is intentionally excluded.
+the expected grid and bandwidth. There are now **two fixed predeclared BY
+families**: the B ALL-row clocks, and the 5B weekday-row clocks. At 5m, their
+sizes are 78 and 390. Unavailable/LOW N tests stay in their family at p=1.
+Family chips print membership; selection or presentation cannot change q-values.
+This avoids penalising the ALL row with hundreds of mostly sparse weekday tests.
 
-Intervals are **pointwise**, not simultaneous coverage of the curve. BY gates
-mean-against-zero tests; it does not make the whiskers simultaneous and cannot
-repair inaccurate marginal asymptotic p-values. Five-session bandwidth sensitivity,
-provider/vault depth, source corporate-action evidence and repeated exploration
-across symbols/dates/settings remain limitations. With around 120 sessions most
-weekday rows are honestly below n=30, and the combined family can leave very
-little evidence. The threshold and family are never relaxed to fill the display.
+The thin whiskers remain **pointwise** HAC intervals. A separately labelled shaded
+**simultaneous 95% ALL band** arrives from a second worker response when Evidence
+opens. Stationary bootstrap (Politis–Romano, 1994) samples whole expected-session
+rows using shared geometric blocks of mean ceil(T^(1/3)), 500 draws, seeded from
+the admitted bars digest and gap/timeframe identity. Missing cells remain missing;
+block continuation stops at joins (including circular wrap when runs differ).
+Original HAC SEs use each clock’s own join boundaries. For each draw,
+`M* = max_clock |(mean*−mean)/SE_HAC|`; the upper 95th empirical critical value c
+forms `mean ± c SE_HAC`. These are **fixed-original-HAC studentizers**, not a
+refitted/bootstrap-t pivot or a stepdown hypothesis test. This max-statistic
+construction follows the simultaneous-inference principle of Romano–Wolf (2005).
+
+Only ALL clocks with valid original n≥30 HAC inference enter the max. Other clocks
+retain no interval, and no simultaneous coverage is claimed for them. If any draw
+has fewer than 30 observations in an eligible clock, the whole band is unavailable;
+replicates are never silently dropped. The MathCard prints the critical value,
+block length, draws, seed, eligible membership and unavailable reason. Independent
+polygon strips skip unavailable clocks. This curve is indexed by aggregate clock,
+not chronological bars; no polygon connects dates across a vault gap.
+
+The band runs in a separate cached blocking job, adds no provider calls and does
+not delay the mean/BY report. Generation and digest checks reject late band
+responses. Reload/sample/refusal clears it. The immutable first-stage report retains
+the session grid used by the bootstrap; paint performs no resampling or inference.
+
+Both HAC and block-bootstrap coverage are approximations. BY cannot repair invalid
+marginal p-values and does not make pointwise whiskers simultaneous. The separate
+band does not change BY hypotheses or q-values. Provider/vault depth, bandwidth and
+block-length sensitivity, source corporate-action evidence and repeated exploration
+across symbols/dates/settings remain limitations. Sparse weekday rows stay sparse;
+thresholds and memberships are never relaxed to fill the display.
 
 Complete input validation precedes trimming, digesting and cache reuse. Reports
 are built in the existing worker job and stored as immutable `Arc<SeasonReport>`
@@ -255,8 +281,13 @@ clock changes and changed gaps invalidate. Sample mode, refusal and generation
 rejection retain the existing clear/no-fetch rules. No statistics or history
 scans occur in the new painter.
 
-New tests cover direct mean/SE/CI references, the combined ALL/weekday BY family,
+New tests cover direct mean/SE/CI references, the two fixed ALL/weekday BY families,
 missing-session lag spacing, join resets, early closes, pending closure, empty/
 zero/sparse cells, n=29/30, complete-input refusal, cache identity/invalidation,
 mode invariance, matching heat keys/fills, complete cards, actual hover cards and
 finite 320/1440-point geometry. See PERF.md for gate IDs and verification status.
+
+The v2 inference tests also cover deterministic stationary draws, common-row max
+statistics, unavailable clock retention, second-stage cache reuse without fetches,
+and rejection of wrong-generation/digest results. The release season paint gate
+includes the accepted simultaneous band without changing its existing budgets.

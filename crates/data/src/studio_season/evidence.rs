@@ -1,4 +1,4 @@
-//! One predeclared ALL + weekday clock family. Construction uses admitted bars only.
+//! Two predeclared families: ALL clocks and weekday clocks. Construction uses admitted bars only.
 use super::*;
 use crate::studio_inference::{HacEstimate, hac_mean, hac_mean_with_breaks};
 
@@ -8,8 +8,30 @@ pub struct SeasonEvidenceCell {
     pub q: f64,
 }
 
+/// Worker-produced bootstrap inputs. They retain the uncompressed session grid
+/// and travel only with the admitted immutable report; no fetch or re-fit later.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SessionBandInput {
+    pub columns: Vec<Vec<Option<f64>>>,
+    pub clock_breaks: Vec<Vec<bool>>,
+    pub breaks: Vec<bool>,
+    pub seed: u64,
+}
+impl SessionBandInput {
+    pub fn compute(&self) -> crate::studio_inference::MaxTBand {
+        crate::studio_inference::session_max_t_with_clock_breaks(
+            &self.columns,
+            &self.clock_breaks,
+            &self.breaks,
+            500,
+            self.seed,
+        )
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct SeasonEvidence {
+    pub band_input: std::sync::Arc<SessionBandInput>,
     /// Row major: ALL, Monday, ..., Friday. Every expected full-session bucket.
     pub cells: Vec<SeasonEvidenceCell>,
     pub buckets: usize,
@@ -26,8 +48,12 @@ impl SeasonEvidence {
     pub fn cell(&self, row: usize, clock: usize) -> &SeasonEvidenceCell {
         &self.cells[row * self.buckets + clock]
     }
+    /// Total declared membership across both families (for coverage checks).
     pub fn family_size(&self) -> usize {
         self.cells.len()
+    }
+    pub fn row_family_size(&self, row: usize) -> usize {
+        if row == 0 { self.buckets } else { 5 * self.buckets }
     }
 }
 
@@ -59,10 +85,8 @@ pub(super) fn build(
                 return Vec::new();
             }
             let minute = 570 + (k * step) as u32;
-            let timestamps: Vec<_> = grid
-                .iter()
-                .map(|d| tr_core::ny::to_utc(d.and_hms_opt(minute / 60, minute % 60, 0).unwrap()))
-                .collect();
+            let timestamps: Vec<_> =
+                grid.iter().map(|d| tr_core::ny::to_utc(d.and_hms_opt(minute / 60, minute % 60, 0).unwrap())).collect();
             (0..grid.len())
                 // Cut at the first clock at/after the right witness. A join may
                 // span several missing sessions, so no adjacent grid pair need
@@ -76,25 +100,23 @@ pub(super) fn build(
             let selected: Vec<_> = values[k]
                 .iter()
                 .zip(&grid)
-                .map(|(v, d)| {
-                    if row == 0 || d.weekday().num_days_from_monday() as usize + 1 == row {
-                        *v
-                    } else {
-                        None
-                    }
-                })
+                .map(
+                    |(v, d)| {
+                        if row == 0 || d.weekday().num_days_from_monday() as usize + 1 == row { *v } else { None }
+                    },
+                )
                 .collect();
-            let inference = if gaps.is_empty() {
-                hac_mean(&selected)
-            } else {
-                hac_mean_with_breaks(&selected, &breaks[k])
-            };
+            let inference =
+                if gaps.is_empty() { hac_mean(&selected) } else { hac_mean_with_breaks(&selected, &breaks[k]) };
             cells.push(SeasonEvidenceCell { inference, q: 1. });
         }
     }
     let ps: Vec<_> = cells.iter().map(|c| c.inference.p.unwrap_or(1.)).collect();
-    for (c, q) in cells.iter_mut().zip(crate::nulls::benjamini_yekutieli(&ps)) {
-        c.q = q;
+    for (name, range) in [("ALL family", 0..buckets), ("weekday family", buckets..6 * buckets)] {
+        let family = crate::nulls::Family::by(name, &ps[range.clone()].iter().map(|p| Some(*p)).collect::<Vec<_>>());
+        for (c, q) in cells[range].iter_mut().zip(family.q) {
+            c.q = q;
+        }
     }
     let heat_scale = cells.iter().filter_map(|c| c.inference.estimate).map(f64::abs).fold(0.0001, f64::max);
     let ribbon_scale = cells[..buckets]
@@ -105,10 +127,27 @@ pub(super) fn build(
         })
         .fold(0.0001, f64::max)
         * 1.1;
+    let mut digest = crate::stable_hash::Fnv64::default();
+    digest.write_u64(crate::stable_hash::bars_digest(bars));
+    digest.write_i64(tf.seconds());
+    for &(a, b) in gaps {
+        digest.write_i64(a);
+        digest.write_i64(b);
+    }
+    let clock_breaks: Vec<_> =
+        breaks.into_iter().map(|b| if b.is_empty() { vec![false; grid.len()] } else { b }).collect();
+    let resample_breaks = (0..grid.len()).map(|s| clock_breaks.iter().any(|b| b[s])).collect();
+    let band_input = std::sync::Arc::new(SessionBandInput {
+        columns: values,
+        clock_breaks,
+        breaks: resample_breaks,
+        seed: digest.finish(),
+    });
     let last = bars.last().unwrap();
     let close = close_minute(*dates.last().unwrap());
     let end = tr_core::ny::to_utc(dates.last().unwrap().and_hms_opt(close / 60, close % 60, 0).unwrap());
     SeasonEvidence {
+        band_input,
         cells,
         buckets,
         grid_sessions: grid.len(),
@@ -127,117 +166,152 @@ mod tests {
         let mut d: NaiveDate = "2026-01-05".parse().unwrap();
         let mut bars = Vec::new();
         for s in 0..sessions {
-            for (k,ts) in regular_opens(d,Timeframe::M5).into_iter().enumerate() {
-                let c = 100. * (1. + ((s%7) as f64 - 2.) * 0.0001 + k as f64*0.000001);
-                bars.push(Bar::new(ts,100.,101.,99.,c,10.).with_provenance(Provenance::Real));
+            for (k, ts) in regular_opens(d, Timeframe::M5).into_iter().enumerate() {
+                let c = 100. * (1. + ((s % 7) as f64 - 2.) * 0.0001 + k as f64 * 0.000001);
+                bars.push(Bar::new(ts, 100., 101., 99., c, 10.).with_provenance(Provenance::Real));
             }
-            d=next_session(d);
+            d = next_session(d);
         }
         bars
     }
-    fn report(b: &[Bar], gaps: &[(i64,i64)]) -> SeasonReport {
-        let now=b.last().unwrap().ts+3600;
-        compute_with_gaps("AAPL",Timeframe::M5,b,"test",now,now,gaps).unwrap()
+    fn report(b: &[Bar], gaps: &[(i64, i64)]) -> SeasonReport {
+        let now = b.last().unwrap().ts + 3600;
+        compute_with_gaps("AAPL", Timeframe::M5, b, "test", now, now, gaps).unwrap()
     }
-    fn direct(grid: &[Option<f64>], breaks: &[bool]) -> (f64,f64) {
-        let n=grid.iter().flatten().count() as f64;
-        let mean=grid.iter().flatten().sum::<f64>()/n;
-        let scores: Vec<_>=grid.iter().map(|v|v.map(|r|(r-mean)/n).unwrap_or(0.)).collect();
-        let mut v=0.;
+    fn direct(grid: &[Option<f64>], breaks: &[bool]) -> (f64, f64) {
+        let n = grid.iter().flatten().count() as f64;
+        let mean = grid.iter().flatten().sum::<f64>() / n;
+        let scores: Vec<_> = grid.iter().map(|v| v.map(|r| (r - mean) / n).unwrap_or(0.)).collect();
+        let mut v = 0.;
         for s in 0..scores.len() {
-            v+=scores[s]*scores[s];
+            v += scores[s] * scores[s];
             for l in 1..=5.min(s) {
-                if !breaks[s-l+1..=s].iter().any(|b|*b) {
-                    v+=2.*(1.-l as f64/6.)*scores[s]*scores[s-l];
+                if !breaks[s - l + 1..=s].iter().any(|b| *b) {
+                    v += 2. * (1. - l as f64 / 6.) * scores[s] * scores[s - l];
                 }
             }
         }
-        (mean,v.sqrt())
+        (mean, v.sqrt())
     }
     #[test]
-    fn known_mean_se_and_single_all_weekday_family() {
-        let b=fixture(160);
-        let r=report(&b,&[]); let e=r.evidence.as_ref().unwrap();
-        assert_eq!((e.family_size(),e.buckets,e.grid_sessions),(468,78,160));
-        let grid: Vec<_>=b.iter().step_by(78).map(|b|Some(b.close/b.open-1.)).collect();
-        let (mean,se)=direct(&grid,&vec![false;160]);
-        let i=&e.cell(0,0).inference;
-        assert!((i.estimate.unwrap()-mean).abs()<1e-14);
-        assert!((i.se.unwrap()-se).abs()<1e-14);
-        assert!((i.interval.unwrap().0-(mean-1.96*se)).abs()<1e-14);
-        for (k,c) in r.clock.iter().enumerate() {
-            assert_eq!(e.cell(0,k).inference.n,c.returns.stats.count);
-            assert!((e.cell(0,k).inference.estimate.unwrap()-c.returns.stats.mean.unwrap()).abs()<1e-14);
-            for d in 0..5 { assert_eq!(e.cell(d+1,k).inference.n,c.weekdays[d].stats.count); }
+    fn season_families_are_fixed_under_selection() {
+        let b = fixture(160);
+        let r = report(&b, &[]);
+        let e = r.evidence.as_ref().unwrap();
+        assert_eq!((e.family_size(), e.buckets, e.grid_sessions), (468, 78, 160));
+        let grid: Vec<_> = b.iter().step_by(78).map(|b| Some(b.close / b.open - 1.)).collect();
+        let (mean, se) = direct(&grid, &vec![false; 160]);
+        let i = &e.cell(0, 0).inference;
+        assert!((i.estimate.unwrap() - mean).abs() < 1e-14);
+        assert!((i.se.unwrap() - se).abs() < 1e-14);
+        assert!((i.interval.unwrap().0 - (mean - 1.96 * se)).abs() < 1e-14);
+        for (k, c) in r.clock.iter().enumerate() {
+            assert_eq!(e.cell(0, k).inference.n, c.returns.stats.count);
+            assert!((e.cell(0, k).inference.estimate.unwrap() - c.returns.stats.mean.unwrap()).abs() < 1e-14);
+            for d in 0..5 {
+                assert_eq!(e.cell(d + 1, k).inference.n, c.weekdays[d].stats.count);
+            }
         }
-        let ps:Vec<_>=e.cells.iter().map(|c|c.inference.p.unwrap_or(1.)).collect();
-        assert_eq!(e.cells.iter().map(|c|c.q).collect::<Vec<_>>(),crate::nulls::benjamini_yekutieli(&ps));
-        assert!(e.cells[78..].iter().any(|c|c.inference.p.is_some()));
-        // A row-only adjustment would give different q-values: ALL shares the family.
-        assert_ne!(e.cells[..78].iter().map(|c|c.q).collect::<Vec<_>>(),crate::nulls::benjamini_yekutieli(&ps[..78]));
+        let ps: Vec<_> = e.cells.iter().map(|c| c.inference.p.unwrap_or(1.)).collect();
+        for range in [0..78, 78..468] {
+            assert_eq!(
+                e.cells[range.clone()].iter().map(|c| c.q).collect::<Vec<_>>(),
+                crate::nulls::benjamini_yekutieli(&ps[range])
+            );
+        }
+        assert_eq!((e.row_family_size(0), e.row_family_size(1)), (78, 390));
+        assert!(e.cells[78..].iter().any(|c| c.inference.p.is_some()));
+        // Combining families would penalize ALL clocks with unavailable weekdays.
+        assert_ne!(e.cells[..78].iter().map(|c| c.q).collect::<Vec<_>>(), crate::nulls::benjamini_yekutieli(&ps)[..78]);
     }
     #[test]
     fn missing_sessions_preserve_distance_and_vault_joins_break_products() {
-        let mut b=fixture(60);
-        let all_grid:Vec<_>=b.iter().step_by(78).map(|b|Some(b.close/b.open-1.)).collect();
-        let lost=tr_core::ny::civil(b[20*78].ts).date();
-        b.retain(|b|tr_core::ny::civil(b.ts).date()!=lost);
-        let gap=(b[29*78+2].ts,b[29*78+3].ts);
-        let r=report(&b,&[gap]); let e=r.evidence.unwrap();
-        assert_eq!((e.grid_sessions,e.sessions),(60,59));
-        let mut grid=all_grid; grid[20]=None;
-        let mut breaks=vec![false;60]; breaks[31]=true; // opening clock crosses intraday join on the following session
-        let (_,se)=direct(&grid,&breaks);
-        assert!((e.cell(0,0).inference.se.unwrap()-se).abs()<1e-14);
-        let without=report(&b,&[]).evidence.unwrap();
-        let (_,unbroken)=direct(&grid,&vec![false;60]);
-        assert!((without.cell(0,0).inference.se.unwrap()-unbroken).abs()<1e-14);
-        assert_ne!(without.cell(0,0).inference.variance,e.cell(0,0).inference.variance);
+        let mut b = fixture(60);
+        let all_grid: Vec<_> = b.iter().step_by(78).map(|b| Some(b.close / b.open - 1.)).collect();
+        let lost = tr_core::ny::civil(b[20 * 78].ts).date();
+        b.retain(|b| tr_core::ny::civil(b.ts).date() != lost);
+        let gap = (b[29 * 78 + 2].ts, b[29 * 78 + 3].ts);
+        let r = report(&b, &[gap]);
+        let e = r.evidence.unwrap();
+        assert_eq!((e.grid_sessions, e.sessions), (60, 59));
+        let mut grid = all_grid;
+        grid[20] = None;
+        let mut breaks = vec![false; 60];
+        breaks[31] = true; // opening clock crosses intraday join on the following session
+        let (_, se) = direct(&grid, &breaks);
+        assert!((e.cell(0, 0).inference.se.unwrap() - se).abs() < 1e-14);
+        let without = report(&b, &[]).evidence.unwrap();
+        let (_, unbroken) = direct(&grid, &vec![false; 60]);
+        assert!((without.cell(0, 0).inference.se.unwrap() - unbroken).abs() < 1e-14);
+        assert_ne!(without.cell(0, 0).inference.variance, e.cell(0, 0).inference.variance);
         let mut wide = fixture(60);
         let gap = (wide[29 * 78 + 77].ts, wide[32 * 78].ts);
-        let grid: Vec<_> = wide.iter().step_by(78).enumerate().map(|(s,b)| {
-            if s == 30 || s == 31 { None } else { Some(b.close / b.open - 1.) }
-        }).collect();
+        let grid: Vec<_> = wide
+            .iter()
+            .step_by(78)
+            .enumerate()
+            .map(|(s, b)| if s == 30 || s == 31 { None } else { Some(b.close / b.open - 1.) })
+            .collect();
         wide.retain(|b| !(b.ts > gap.0 && b.ts < gap.1));
-        let mut boundaries = vec![false; 60]; boundaries[32] = true;
+        let mut boundaries = vec![false; 60];
+        boundaries[32] = true;
         let (_, expected) = direct(&grid, &boundaries);
         let e = report(&wide, &[gap]).evidence.unwrap();
         assert_eq!((e.grid_sessions, e.sessions), (60, 58));
-        assert!((e.cell(0,0).inference.se.unwrap() - expected).abs() < 1e-14);
+        assert!((e.cell(0, 0).inference.se.unwrap() - expected).abs() < 1e-14);
     }
     #[test]
     fn half_day_sparse_zero_and_source_closure() {
-        let mut b: Vec<_>=["2026-11-27","2026-11-30"].iter().flat_map(|d|regular_opens(d.parse().unwrap(),Timeframe::M5)).map(|ts|
-            Bar::new(ts,100.,100.,100.,100.,0.).with_provenance(Provenance::Real)).collect();
-        let r=report(&b,&[]); let e=r.evidence.unwrap();
-        assert_eq!((e.expected_bars,e.cell(0,0).inference.n,e.cell(0,42).inference.n),(120,2,1));
-        assert!(e.cells.iter().all(|c|c.inference.p.is_none() && c.q==1.));
-        let observed=b.last().unwrap().ts+299;
-        let r=compute_at("AAPL",Timeframe::M5,&b,"test",observed,observed+86400).unwrap();
-        assert_eq!(r.evidence.unwrap().closed_thru,b[b.len()-2].ts+300);
-        b.retain(|b|tr_core::ny::civil(b.ts).date().to_string()=="2026-11-27");
-        let e=report(&b,&[]).evidence.unwrap();
-        assert!(e.cell(0,42).inference.estimate.is_none());
-        assert_eq!(e.cell(0,0).inference.estimate,Some(0.));
-        let mut b=fixture(35); for b in &mut b { b.close=b.open; }
-        assert!(report(&b,&[]).evidence.unwrap().cells.iter().all(|c|c.inference.p.is_none() && c.q==1.));
+        let mut b: Vec<_> = ["2026-11-27", "2026-11-30"]
+            .iter()
+            .flat_map(|d| regular_opens(d.parse().unwrap(), Timeframe::M5))
+            .map(|ts| Bar::new(ts, 100., 100., 100., 100., 0.).with_provenance(Provenance::Real))
+            .collect();
+        let r = report(&b, &[]);
+        let e = r.evidence.unwrap();
+        assert_eq!((e.expected_bars, e.cell(0, 0).inference.n, e.cell(0, 42).inference.n), (120, 2, 1));
+        assert!(e.cells.iter().all(|c| c.inference.p.is_none() && c.q == 1.));
+        let observed = b.last().unwrap().ts + 299;
+        let r = compute_at("AAPL", Timeframe::M5, &b, "test", observed, observed + 86400).unwrap();
+        assert_eq!(r.evidence.unwrap().closed_thru, b[b.len() - 2].ts + 300);
+        b.retain(|b| tr_core::ny::civil(b.ts).date().to_string() == "2026-11-27");
+        let e = report(&b, &[]).evidence.unwrap();
+        assert!(e.cell(0, 42).inference.estimate.is_none());
+        assert_eq!(e.cell(0, 0).inference.estimate, Some(0.));
+        let mut b = fixture(35);
+        for b in &mut b {
+            b.close = b.open;
+        }
+        assert!(report(&b, &[]).evidence.unwrap().cells.iter().all(|c| c.inference.p.is_none() && c.q == 1.));
     }
     #[test]
     fn full_input_refusal_before_pending_filter_and_no_daily_inference() {
-        let b=fixture(35); let observed=b[100].ts;
-        for p in [Provenance::Sample,Provenance::Missing,Provenance::Cached] {
-            let mut bad=b.clone(); bad.last_mut().unwrap().provenance=p;
-            assert!(compute_at("AAPL",Timeframe::M5,&bad,"test",observed,observed).is_err());
+        let b = fixture(35);
+        let observed = b[100].ts;
+        for p in [Provenance::Sample, Provenance::Missing, Provenance::Cached] {
+            let mut bad = b.clone();
+            bad.last_mut().unwrap().provenance = p;
+            assert!(compute_at("AAPL", Timeframe::M5, &bad, "test", observed, observed).is_err());
         }
-        let mut bad=b.clone(); bad.last_mut().unwrap().close=f64::NAN;
-        assert!(compute_at("AAPL",Timeframe::M5,&bad,"test",observed,observed).is_err());
-        let mut bad=b.clone(); bad.last_mut().unwrap().volume=-1.;
-        assert!(compute_at("AAPL",Timeframe::M5,&bad,"test",observed,observed).is_err());
-        let mut bad=b.clone(); bad.last_mut().unwrap().ts+=1;
-        assert!(compute_at("AAPL",Timeframe::M5,&bad,"test",observed,observed).is_err());
-        let daily:Vec<_>=b.iter().step_by(78).map(|b| {
-            let d=tr_core::ny::civil(b.ts).date(); Bar { ts:d.and_hms_opt(0,0,0).unwrap().and_utc().timestamp(),..*b }
-        }).collect();
-        assert!(compute("AAPL",Timeframe::D1,&daily,"test",b.last().unwrap().ts+86400).unwrap().evidence.is_none());
+        let mut bad = b.clone();
+        bad.last_mut().unwrap().close = f64::NAN;
+        assert!(compute_at("AAPL", Timeframe::M5, &bad, "test", observed, observed).is_err());
+        let mut bad = b.clone();
+        bad.last_mut().unwrap().volume = -1.;
+        assert!(compute_at("AAPL", Timeframe::M5, &bad, "test", observed, observed).is_err());
+        let mut bad = b.clone();
+        bad.last_mut().unwrap().ts += 1;
+        assert!(compute_at("AAPL", Timeframe::M5, &bad, "test", observed, observed).is_err());
+        let daily: Vec<_> = b
+            .iter()
+            .step_by(78)
+            .map(|b| {
+                let d = tr_core::ny::civil(b.ts).date();
+                Bar { ts: d.and_hms_opt(0, 0, 0).unwrap().and_utc().timestamp(), ..*b }
+            })
+            .collect();
+        assert!(
+            compute("AAPL", Timeframe::D1, &daily, "test", b.last().unwrap().ts + 86400).unwrap().evidence.is_none()
+        );
     }
 }

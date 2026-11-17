@@ -2012,8 +2012,11 @@ impl TerminalApp {
                     if let Some(PaneKind::StudioCorr(s)) =
                         self.panes.iter_mut().find(|p| p.id == pane).map(|p| &mut p.kind)
                     {
-                        s.accept(generation, result);
+                        s.accept_shared(generation, result);
                     }
+                }
+                Response::StudioSeasonBand {pane,generation,key,result} => {
+                    if let Some(PaneKind::StudioSeason(s))=self.panes.iter_mut().find(|p|p.id==pane).map(|p|&mut p.kind) {s.accept_band(generation,key,result);}
                 }
                 Response::StudioSeason { pane, generation, result } => {
                     if let Some(PaneKind::StudioSeason(s)) =

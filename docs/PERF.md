@@ -431,7 +431,7 @@ Remaining limits are provider/vault depth and corporate-action evidence,
 asymptotic bandwidth sensitivity, exploration outside the displayed family, and
 the distinction between headless CPU cost and GPU/whole-desk presentation.
 
-## Slice 3 / master slice 0: Season evidence ribbon
+## Slice 3 / master slice 0: Season evidence ribbon (historical)
 
 New exact compute case `studio.season_evidence_120d_5m` builds the complete
 SEASON report, including admission, legacy summaries, all 468 HAC/BY cells and
@@ -461,17 +461,16 @@ also exercise 320/1440-point finite tessellation and both presentation modes.
 The chart and studio gates retain exact-ID checks and merge their paint results
 without overwriting one another. Existing ceilings are unchanged.
 
-Verification in the current workspace environment is **blocked before Cargo
-compilation**. The rustup launcher has no installed toolchain; `/usr/bin/cargo`
+The original slice-0 verification was **blocked before Cargo compilation**.
+This historical toolchain/cache limitation is resolved in master slice 1 below. At that time, the rustup launcher had no installed toolchain; `/usr/bin/cargo`
 (1.85.1) reports `no matching package named serde found` in offline mode because
-there is no local crates.io registry cache. The installed compiler also predates
+there was no local crates.io registry cache. The installed compiler also predates
 the app's egui 0.36 toolchain requirement. All three required commands were
 attempted offline: `cargo test --workspace --offline`, `cargo build --release
 --offline`, and `scripts/perf-gate.sh`; each exited 101 at dependency resolution.
-No new timing measurements or workspace pass counts are available. The reviewed
-baseline is deliberately unchanged; historical tables above do not measure this
-slice. New compute/paint medians and p95 versus the stated ceilings must be
-recorded once the toolchain/cache is restored.
+No new timing measurements or workspace pass counts were available at that
+point, so the baseline was unchanged. Master slice 1 below records the successful
+full offline validation and measurements with the restored stable toolchain.
 
 The dependency-free `studio_inference.rs` was compiled directly with the installed
 system rustc and its five tests passed (**5 passed / 0 failed / 0 ignored**),
@@ -479,3 +478,103 @@ including two new join-reset/threshold tests. This checks only that helper, not
 the full data or UI implementation. Rust parser checks of the changed modules
 and `git diff --check` also pass; they do not substitute for compilation or the
 required release gates. No dependency or lockfile changes were made.
+
+## Master slice 1: Robust relationship fan + inference kit v2
+
+Validated offline with `/home/box/.cargo/bin/cargo` (rustc 1.100.0 stable), using
+`CARGO_TARGET_DIR=/workspace/tr-auction-target`. No dependencies or lockfile
+changes. All feature cuts were avoided: Theil–Sen, the separate SEASON max-|t|
+band response, and 1/5/20-observation horizon chips are retained.
+
+The two-series CORR case builds the unchanged OLS/classical results, all four
+covariance modes, legacy rolling curves, four selected-SE 60-return bands with
+at most 1,000 endpoints each, frozen 80/20 holdout and exact Theil–Sen on at most
+2,000 points. Assertions require all intervals, the full rolling endpoint count,
+available holdout score and a finite robust slope. The generic k-column inference
+API is retained; the two-column implementation avoids per-score allocations.
+
+Stationary-bootstrap work consumes all 5,000 sampled values in each of 500 draws,
+not just the generated indices. The max-|t| case resamples the entire 120-session ×
+78-clock grid jointly for 500 draws and requires all 78 finite simultaneous
+intervals. Smoke cases use smaller admitted inputs but retain 500 draws and the
+same APIs. Source bars/digests seed reproducible resampling; missing cells remain
+missing and blocks cannot continue across vault joins. These are dev fixtures
+only, never application data.
+
+The SEASON compute case keeps all 468 cells but now adjusts fixed ALL B and
+weekday 5B families separately. Its first report retains the expected-session
+grid. The max-|t| band is a separately cached blocking job with no provider work;
+wrong generation/digest responses cannot overwrite the pane. Five-session HAC
+studentizers remain fixed across bootstrap draws, as printed in its MathCard.
+The existing season paint scenario now includes the accepted band and both family
+chips with every existing ceiling retained.
+
+CORR paint covers 5,000 scatter observations, all 1,000 rolling endpoints, the
+mean-response fan, holdout strip/gauge, selected-SE tiles and an actual open beta
+MathCard under pointer movement. Guards count both the complete older-observation
+mesh and the rolling-band mesh; they cannot pass with missing geometry. Tests also
+check finite 320/1440-point rendering and statistic cards. Dense point/line meshes
+batch every observation/segment; clipped plots skip geometry while preserving
+layout allocation. Polygon segments stop at unavailable windows and joins.
+No covariance estimation, resampling or Theil–Sen computation occurs in paint.
+
+Reviewed release measurement (2026-11-17 UTC, Xeon, 8 available cores, Linux;
+calibration **6084.03 µs**):
+
+| Compute case | Median ms | p95 ms | Ceiling ms |
+| --- | ---: | ---: | ---: |
+| `studio.corr_hac_5k` | 31.066 | 31.299 | 40 |
+| `inference.stationary_bootstrap_5k_x500` | 19.389 | 20.007 | 120 |
+| `inference.maxt_78x500` | 3.770 | 4.051 | 150 |
+| `studio.season_evidence_120d_5m` | 9.907 | 10.428 | 40 |
+
+| Paint metric | Median ms | p95 ms | Ceiling ms |
+| --- | ---: | ---: | ---: |
+| `paint.studio_corr.steady.ui` | 1.314 | 1.481 | 1.5 |
+| `paint.studio_corr.steady.tess` | 0.494 | 0.554 | 0.8 |
+| `paint.studio_corr.steady.total` | 1.811 | 1.979 | 2.5 |
+| `paint.studio_corr.hover.ui` | 1.341 | 1.465 | 1.5 |
+| `paint.studio_corr.hover.tess` | 0.506 | 0.548 | 0.8 |
+| `paint.studio_corr.hover.total` | 1.850 | 1.982 | 2.5 |
+| `paint.studio_season.steady.ui` | 0.518 | 0.777 | 1.2 |
+| `paint.studio_season.steady.tess` | 0.580 | 0.692 | 0.8 |
+| `paint.studio_season.steady.total` | 1.099 | 1.464 | 2.0 |
+| `paint.studio_season.hover.ui` | 0.563 | 0.923 | 1.2 |
+| `paint.studio_season.hover.tess` | 0.643 | 0.702 | 0.8 |
+| `paint.studio_season.hover.total` | 1.211 | 1.567 | 2.0 |
+
+Before optimisation, CORR computed in 41.55 ms. The allocation-bounded sandwich
+path brought it inside 40 ms, including the subsequently retained Theil–Sen fit.
+The initial paint probe was approximately 3.0 ms UI / 6.5 ms total; batching and
+clipping reached the unchanged ceilings without dropping observations. Only
+medians are hard-gated; p95 remains visible. No previous budgets were loosened.
+`perf/baseline.json` is intentionally left unchanged in this slice (new cases report as New); refresh it only after a human review, because the run below showed a 1.35× advisory on `data.series_gpu_23k`.
+
+Final workspace tests: **1,603 passed / 0 failed / 10 ignored**, including **22
+new test functions**. Coverage adds direct 2×2 HAC, hand HC3, h=3 overlap,
+non-PSD fallback, fan transformation, unchanged OLS/classical errors, frozen
+holdout/no skill, outlier-resistant Theil–Sen, overlap horizon/gap windows,
+rolling prefix invariance, deterministic bootstrap, common-row max statistics,
+fixed families, cache identity/admission, second-stage lifecycle/no-fetch,
+clock receipts, complete cards and narrow/wide finite geometry. Existing fixture
+shipping and colour guards pass. `cargo build --release --offline` succeeds.
+`scripts/perf-gate.sh` passes **30 compute/data cases, 0 failures, 0 harness
+errors**, plus **2 release paint tests passed / 0 failed / 0 ignored**, checking
+**123 paint metrics**. An advisory 1.35× normalised `data.series_gpu_23k`
+slowdown occurred in the reviewed run; it remained inside the existing absolute
+and relative failure rules. The unchanged manifest `workspace.package.rust-version`
+warning remains; no new Rust diagnostics are introduced.
+
+Limits: robust/overlap inference and the fixed-studentizer simultaneous band are
+asymptotic approximations. Repeated setting/symbol/date exploration is outside
+the displayed families. Overlapping holdout horizons reuse up to h−1 boundary
+prices, explicitly disclosed; this is a simple chronological score, not purged
+walk-forward validation. Headless gates cover CPU UI/tessellation only, not GPU
+presentation or a four-pane desktop. Theil–Sen has bounded quadratic scratch
+memory (about 16 MB for two million slopes). Unavailable evidence stays unavailable.
+
+Post-baseline verification also passed: **30/30 compute cases**, all `Pass`
+(without advisories), then **2/2 paint tests**, 123 metrics. Final medians were
+CORR **31.068 ms**, stationary bootstrap **19.545 ms**, max-|t| **3.765 ms**;
+CORR steady **1.300 ms UI / 1.790 ms total**, hover **1.346 / 1.865 ms**.
+These final checks used the completed source; the committed baseline is the pre-slice one.

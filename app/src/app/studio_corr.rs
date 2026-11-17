@@ -9,9 +9,10 @@ pub struct CorrPane {
     pub symbol: String,
     pub spec: String,
     pub generation: u64,
+    pub horizon: usize,
     pub loading: bool,
     pub error: Option<String>,
-    pub report: Option<CorrReport>,
+    pub report: Option<std::sync::Arc<CorrReport>>,
     /// Next request bypasses the bar cache (set by the Reload button).
     fresh: bool,
 }
@@ -22,6 +23,7 @@ impl CorrPane {
             symbol: symbol.into(),
             spec: spec.into(),
             generation: 0,
+            horizon: 1,
             loading: false,
             error: None,
             report: None,
@@ -48,9 +50,14 @@ impl CorrPane {
             symbol: tr_data::security(&self.symbol).key(),
             spec: self.spec.clone(),
             fresh: std::mem::take(&mut self.fresh),
+            horizon: self.horizon,
         });
     }
+    #[cfg(test)]
     pub fn accept(&mut self, generation: u64, result: Result<CorrReport, String>) {
+        self.accept_shared(generation, result.map(std::sync::Arc::new));
+    }
+    pub fn accept_shared(&mut self, generation: u64, result: Result<std::sync::Arc<CorrReport>, String>) {
         if generation != self.generation {
             return;
         }
@@ -98,6 +105,7 @@ struct Loaded {
     bars: Vec<Bar>,
     source: String,
     gaps: Vec<(i64, i64)>,
+    observed_at: Option<i64>,
 }
 
 /// Successful real-data loads keyed by (symbol, interval). Failures are never
@@ -105,6 +113,7 @@ struct Loaded {
 /// reuses the bars; Reload bypasses the cache.
 #[derive(Default)]
 pub(crate) struct CorrCache {
+    reports: std::sync::Arc<tr_data::report_cache::ReportCache>,
     entries: std::sync::Mutex<std::collections::HashMap<(String, Timeframe), (std::time::Instant, Loaded)>>,
 }
 pub(crate) static CORR_CACHE: std::sync::LazyLock<CorrCache> = std::sync::LazyLock::new(CorrCache::default);
@@ -139,16 +148,18 @@ impl CorrCache {
 /// loader is the existing vault-aware analysis_bars path (history_sourced underneath).
 /// Symbols load concurrently (bounded by [`CORR_CONCURRENCY`]) through `cache`.
 #[allow(clippy::too_many_arguments)]
-pub(crate) async fn research<F, Fut>(
+pub(crate) async fn research_horizon<F, Fut>(
     cache: &CorrCache,
     fresh: bool,
+    horizon: usize,
+    jobs: Option<std::sync::Arc<crate::perf::JobLog>>,
     history: &tr_data::history::Service,
     bridge: &tr_data::whats_news::Bridge,
     sample: bool,
     symbol: &str,
     spec: &str,
     load_intraday: F,
-) -> anyhow::Result<CorrReport>
+) -> anyhow::Result<std::sync::Arc<CorrReport>>
 where
     F: Fn(String, Timeframe) -> Fut,
     Fut: std::future::Future<Output = anyhow::Result<(Vec<Bar>, tr_data::vault::StitchInfo)>>,
@@ -174,14 +185,19 @@ where
                 return (key, Ok(hit));
             }
             let result = if tf == Timeframe::D1 {
-                daily(history, bridge, &key).await.map(|(bars, source)| Loaded { bars, source, gaps: Vec::new() })
+                daily(history, bridge, &key).await.map(|(bars, source)| Loaded {
+                    bars,
+                    source,
+                    gaps: Vec::new(),
+                    observed_at: Some(chrono::Utc::now().timestamp()),
+                })
             } else {
                 load_intraday(key.clone(), tf).await.and_then(|(mut bars, info)| {
                     tr_data::stats::require_research_bars(&bars, "Relationship intraday")
                         .map_err(anyhow::Error::msg)?;
                     let n = tr_data::closed::closed_len(tf, &bars, tr_data::security(&key).class, info.fetched_at);
                     bars.truncate(n);
-                    Ok(Loaded { bars, source: info.label(), gaps: info.gaps })
+                    Ok(Loaded { bars, source: info.label(), gaps: info.gaps, observed_at: info.fetched_at })
                 })
             };
             if let Ok(loaded) = &result {
@@ -192,10 +208,11 @@ where
     };
     let loaded: Vec<(String, anyhow::Result<Loaded>)> =
         futures::stream::iter(names.into_iter().map(load)).buffered(CORR_CONCURRENCY).collect().await;
+    let observed_at = loaded.iter().filter_map(|(_, r)| r.as_ref().ok().and_then(|r| r.observed_at)).min();
     let rows: Vec<NamedBars> = loaded
         .into_iter()
         .map(|(key, result)| match result {
-            Ok(Loaded { bars, source, gaps }) => NamedBars { symbol: key, bars, source, error: None, gaps },
+            Ok(Loaded { bars, source, gaps, .. }) => NamedBars { symbol: key, bars, source, error: None, gaps },
             // A failed ticker is listed as unavailable; never substituted.
             Err(e) => NamedBars { symbol: key, error: Some(format!("{e:#}")), ..Default::default() },
         })
@@ -219,9 +236,106 @@ where
         daily: tf == Timeframe::D1,
     };
     let (a, b) = (asset.clone(), other.clone());
-    tokio::task::spawn_blocking(move || maths::compute_series(&a, &b, &rows, options, &source))
-        .await?
-        .map_err(anyhow::Error::msg)
+    let reports = cache.reports.clone();
+    tokio::task::spawn_blocking(move || {
+        let _job = jobs.as_ref().map(|j| crate::perf::JobTimer::new(j, "StudioCorr"));
+        compute_cached(&reports, &a, &b, &rows, options, tf, &source, horizon, observed_at)
+    })
+    .await?
+    .map_err(anyhow::Error::msg)
+}
+
+#[cfg(test)]
+async fn research<F, Fut>(
+    cache: &CorrCache,
+    fresh: bool,
+    history: &tr_data::history::Service,
+    bridge: &tr_data::whats_news::Bridge,
+    sample: bool,
+    symbol: &str,
+    spec: &str,
+    load: F,
+) -> anyhow::Result<std::sync::Arc<CorrReport>>
+where
+    F: Fn(String, Timeframe) -> Fut,
+    Fut: std::future::Future<Output = anyhow::Result<(Vec<Bar>, tr_data::vault::StitchInfo)>>,
+{
+    research_horizon(cache, fresh, 1, None, history, bridge, sample, symbol, spec, load).await
+}
+
+/// Hash all admitted inputs and peer failures before cache lookup. Selection is
+/// deliberately absent: each immutable report contains all four covariance modes.
+fn compute_cached(
+    reports: &tr_data::report_cache::ReportCache,
+    a: &NamedBars,
+    b: &NamedBars,
+    rows: &[NamedBars],
+    options: maths::Options,
+    tf: Timeframe,
+    source: &str,
+    horizon: usize,
+    observed_at: Option<i64>,
+) -> Result<std::sync::Arc<CorrReport>, String> {
+    tr_data::stats::require_research_bars(&a.bars, "Relationship asset")?;
+    tr_data::stats::require_research_bars(&b.bars, "Relationship benchmark")?;
+    let mut h = tr_data::stable_hash::Fnv64::default();
+    for row in rows {
+        if row.error.is_none() {
+            tr_data::stats::require_research_bars(&row.bars, "Relationship peer")?;
+        }
+        h.write_str(&row.symbol);
+        h.write_str(&row.source);
+        h.write_str(&format!("{:?} {:?} {:?}", row.gaps, row.error, Bar::provenance(&row.bars)));
+        h.write_u64(tr_data::stable_hash::bars_digest(&row.bars));
+    }
+    h.write_str(&b.symbol);
+    h.write_str(&b.source);
+    h.write_str(&format!("{:?} {:?}", Bar::provenance(&a.bars), Bar::provenance(&b.bars)));
+    h.write_u64(tr_data::stable_hash::bars_digest(&b.bars));
+    h.write_str(&format!("{:?} {:?} {:?} horizon={horizon} observed={observed_at:?}", options, a.gaps, b.gaps));
+    let mut key = tr_data::report_cache::ReportKey::new(
+        "studio_corr_v2",
+        &a.symbol,
+        tf,
+        source,
+        &a.bars,
+        "all covariance methods; 80/20 holdout; rolling60x1000",
+    );
+    key.params = h.finish();
+    reports.get_or_compute(key, || {
+        let mut r = maths::compute_series_at_horizon(a, b, rows, options, source, horizon)?;
+        r.observed_at = observed_at;
+        r.closed_thru = closed_thru(tf, tr_data::security(&a.symbol).class, r.as_of);
+        Ok(r)
+    })
+}
+
+/// Match the existing closed_len end convention, including short cash buckets.
+fn closed_thru(tf: Timeframe, class: tr_core::AssetClass, ts: i64) -> i64 {
+    let equity = matches!(class, tr_core::AssetClass::Equity | tr_core::AssetClass::Etf | tr_core::AssetClass::Index);
+    if !equity {
+        return ts + tf.seconds();
+    }
+    let d = if tf == Timeframe::D1 {
+        chrono::DateTime::from_timestamp(ts, 0).unwrap().date_naive()
+    } else {
+        tr_core::ny::civil(ts).date()
+    };
+    let close = tr_data::intraday::close_minute(d);
+    let cash = tr_core::ny::to_utc(d.and_hms_opt(close / 60, close % 60, 0).unwrap());
+    if tf == Timeframe::D1 {
+        return cash;
+    }
+    let mut end = ts + tf.seconds();
+    if tf == Timeframe::H4 && ts == tf.bucket_start(ts) {
+        end = tr_data::intraday::regular_opens(d, Timeframe::H1)
+            .into_iter()
+            .filter(|&open| (ts..end).contains(&open))
+            .last()
+            .map(|open| open + 3600)
+            .unwrap_or(end);
+    }
+    end.min(cash)
 }
 
 async fn daily(
@@ -271,7 +385,8 @@ impl TerminalApp {
         let mut reload = false;
         ui.horizontal_wrapped(|ui| {
             super::studio_dist::studio_title(ui, "RELATIONSHIP STUDIO");
-            if ui.small_button("Reload").on_hover_text("Re-read every series, bypassing the short bar cache").clicked() {
+            if ui.small_button("Reload").on_hover_text("Re-read every series, bypassing the short bar cache").clicked()
+            {
                 reload = true;
                 pane.fresh = true;
             }
@@ -289,6 +404,15 @@ impl TerminalApp {
                 .font(theme::ui_font(11.0))
                 .color(theme::muted()),
         );
+        ui.horizontal_wrapped(|ui| {
+            ui.label("Return horizon");
+            for h in [1, 5, 20] {
+                if ui.selectable_label(pane.horizon == h, format!("{h} bars")).clicked() {
+                    pane.horizon = h;
+                    reload = true;
+                }
+            }
+        });
         if self.provider.eq_ignore_ascii_case("sample") {
             pane.report = None;
             pane.loading = false;
@@ -323,13 +447,14 @@ fn heading(ui: &mut Ui, title: &str) {
 }
 
 /// Gap banner pinned above the scrolling report.
-fn report_view(ui: &mut Ui, id: PaneId, r: &CorrReport) {
+pub(in crate::app) fn report_view(ui: &mut Ui, id: PaneId, r: &CorrReport) {
     super::studio_dist::gap_warning(ui, &r.gaps);
     egui::ScrollArea::vertical().id_salt(("studio-corr", id)).auto_shrink([false, false]).show(ui, |ui| render(ui, r));
 }
 
 fn render(ui: &mut Ui, r: &CorrReport) {
     let m = &r.ols;
+    let selected = se_controls(ui, r);
     ui.label(
         RichText::new(format!(
             "{} / {}  ·  {}  ·  {} … {}  ·  N={} common returns",
@@ -361,13 +486,14 @@ fn render(ui: &mut Ui, r: &CorrReport) {
                 .span(from.clone(), to.clone())
                 .provenance(r.provenance)
                 .source(r.source.clone())
+                .closed_thru(stamp(r.closed_thru))
         };
         let opt = |card: MathCard, v: Option<f64>| match v {
             Some(v) => card.value(format!("{v:.3}")),
             None => card.unavailable("zero variance or too few common returns"),
         };
         ui.horizontal_wrapped(|ui| {
-            stat_tile_sized(ui, "BETA", &number(m.beta), theme::text(), 22.0, || {
+            stat_tile_sized(ui, "BETA", &number(m.beta), m.beta.map_or_else(theme::muted, theme::sign), 22.0, || {
                 opt(base("BETA", "β = Cov(rₐ, r_b) / Var(r_b)  (OLS slope)"), m.beta)
                     .input("β SE", number(m.beta_se))
                     .input("β t", number(m.beta_t))
@@ -380,20 +506,27 @@ fn render(ui: &mut Ui, r: &CorrReport) {
                 opt(base("R²", "R² = 1 − SS_res / SS_tot  (= ρ² for one regressor)"), m.r_squared)
                     .input("ρ", number(m.correlation))
             });
-            stat_tile_sized(ui, "ALPHA / YR", &percent(m.alpha_annual), theme::text(), 22.0, || {
-                let card = base("ALPHA / YR", "αₐ = α × P  (OLS intercept, annualised)")
-                    .input("α SE", number(m.alpha_se))
-                    .input("α t", number(m.alpha_t));
-                match m.alpha_annual {
-                    Some(_) => card.value(percent(m.alpha_annual)),
-                    None => card.unavailable("zero variance or too few common returns"),
-                }
-            });
+            stat_tile_sized(
+                ui,
+                "ALPHA / YR",
+                &percent(m.alpha_annual),
+                m.alpha_annual.map_or_else(theme::muted, theme::sign),
+                22.0,
+                || {
+                    let card = base("ALPHA / YR", "αₐ = α × P  (OLS intercept, annualised)")
+                        .input("α SE", number(m.alpha_se))
+                        .input("α t", number(m.alpha_t));
+                    match m.alpha_annual {
+                        Some(_) => card.value(percent(m.alpha_annual)),
+                        None => card.unavailable("zero variance or too few common returns"),
+                    }
+                },
+            );
         });
     }
     ui.label(
         RichText::new(format!(
-            "α SE {}  t {}   ·   β SE {}  t {}   ·   Residual vol / yr {}",
+            "Classical: α SE {}  t {}   ·   β SE {}  t {}   ·   Residual vol / yr {}",
             number(m.alpha_se),
             number(m.alpha_t),
             number(m.beta_se),
@@ -417,7 +550,7 @@ fn render(ui: &mut Ui, r: &CorrReport) {
     ui.label(
         RichText::new(format!(
             "OLS of asset on benchmark log returns over common closed timestamps (dates for daily bars); \
-             non-overlapping one-bar returns, classical (iid, n−2) standard errors, no HAC, no risk-free rate. \
+             selected-horizon returns, classical (iid, n−2) errors retained above; selected covariance shown separately. No risk-free rate. \
              α / yr = per-bar α × {:.0} periods/year. Capture = mean asset ÷ mean benchmark log return on \
              benchmark up / down bars. Undefined values = —.",
             r.annual_periods
@@ -426,7 +559,8 @@ fn render(ui: &mut Ui, r: &CorrReport) {
         .color(theme::muted()),
     );
     heading(ui, "RETURN CLOUD · CYAN = MOST RECENT 20");
-    scatter(ui, r);
+    scatter_selected(ui, r, selected);
+    robust_rolling(ui, r, selected);
     for correlation in [false, true] {
         heading(
             ui,
@@ -490,6 +624,264 @@ fn render(ui: &mut Ui, r: &CorrReport) {
     matrix(ui, &r.matrix);
 }
 
+/// Stable MathCard id: corr.coefficient.{alpha,beta}. All numbers here read the
+/// accepted snapshot; covariance and testing never run on the interactive thread.
+pub(in crate::app) fn inference_card(r: &CorrReport, selected: usize, coefficient: usize) -> crate::widgets::MathCard {
+    use crate::widgets::MathCard;
+    let fit = &r.robust.fits[selected];
+    let estimate = [r.ols.alpha, r.ols.beta][coefficient];
+    let interval = fit.intervals[coefficient].map(|(a, b)| format!("{a:+.6} … {b:+.6}")).unwrap_or_else(|| "—".into());
+    let mut card=MathCard::new(if coefficient==0 {"CORR ALPHA · corr.coefficient.alpha"} else {"CORR BETA · corr.coefficient.beta"},
+        "OLS θ=(XᵀX)⁻¹Xᵀy; V=A⁻¹SA⁻¹; CI=θ±1.96√Vjj; HAC S=Σggᵀ+Σwℓ(gglagᵀ+glaggᵀ); HC3 g=xe/(1−hii)")
+        .n(r.ols.n,"common closed returns")
+        .span(stamp(r.path[0].ts),stamp(r.as_of)).closed_thru(stamp(r.closed_thru))
+        .source(&r.source).provenance(r.provenance)
+        .input("SE method / bandwidth",fit.covariance.label())
+        .input("observed source clock",r.observed_at.map(stamp).unwrap_or_else(||"closed input receipt; clock unavailable".into()))
+        .input("95% pointwise CI",interval)
+        .input("normal p / BY q",format!("{} / {:.6e}",number(fit.p[coefficient]),fit.q[coefficient]))
+        .input("fixed family", "m=2: alpha=0 and beta=1; unavailable enters p=1")
+        .note(format!("Span {} → {}; CLOSED THRU {}; {}",stamp(r.path[0].ts),stamp(r.as_of),stamp(r.closed_thru),r.source))
+        .caveat("Robust inference is asymptotic and bandwidth-sensitive. Classical is iid with n−2 residual scaling. Irregular common endpoints are per observation, not per fixed elapsed minute. BY covers only these two tests per declared SE method; repeated exploration is outside the family.");
+    if let Some(e) = &fit.covariance.unavailable {
+        card = card.note(format!("Inference unavailable: {e}; interval and p unavailable, BY input p=1."));
+    }
+    match estimate {
+        Some(v) => card.value(format!("{v:+.6}")),
+        None => card.unavailable("singular benchmark or fewer than three returns"),
+    }
+}
+
+fn coloured_label(ui: &mut Ui, parts: impl IntoIterator<Item = (String, Color32)>) -> egui::Response {
+    let mut job = egui::text::LayoutJob::default();
+    let font = egui::TextStyle::Body.resolve(ui.style());
+    for (text, color) in parts {
+        job.append(&text, 0., egui::TextFormat { font_id: font.clone(), color, ..Default::default() });
+    }
+    ui.label(job)
+}
+
+fn se_controls(ui: &mut Ui, r: &CorrReport) -> usize {
+    use crate::widgets::{MathCardExt, stat_tile_sized};
+    let id = ui.id().with("corr-se-method");
+    let mut selected = ui.ctx().data(|d| d.get_temp::<usize>(id)).unwrap_or(2).min(3);
+    if r.horizon > 1 && selected == 3 {
+        selected = 2;
+    }
+    ui.horizontal_wrapped(|ui| {
+        ui.label("SE");
+        for (i, fit) in r.robust.fits.iter().enumerate() {
+            if r.horizon > 1 && i == 3 {
+                continue;
+            }
+            ui.selectable_value(&mut selected, i, fit.covariance.label());
+        }
+    });
+    ui.ctx().data_mut(|d| d.insert_temp(id, selected));
+    ui.label(format!(
+        "CLOSED THRU {} · {}-observation returns · mean-response CI · alpha=0 / beta=1 family m=2",
+        stamp(r.closed_thru),
+        r.horizon
+    ));
+    if r.horizon > 1 {
+        ui.label("Overlapping outcomes: default uniform h−1 kernel with labelled Bartlett fallback. Classical/HC3 omit serial overlap; holdout shares up to h−1 boundary prices.");
+    }
+    if let Some(sen) = &r.robust.theil_sen {
+        coloured_label(ui,[("Theil–Sen slope ".into(),theme::text()),(sen.slope.map(|v|format!("{v:+.4}")).unwrap_or_else(||"—".into()),sen.slope.map_or_else(theme::muted,theme::sign)),(format!(" · latest n={} · descriptive cross-check",sen.n),theme::text())]).math_card(|| {
+            let card=crate::widgets::MathCard::new("CORR THEIL–SEN · corr.theil_sen","slope=median_i<j [(y[j]−y[i])/(x[j]−x[i])], x[j]≠x[i]")
+                .n(sen.n,"latest common closed returns, capped at 2,000").source(&r.source).provenance(r.provenance)
+                .span(stamp(r.returns[r.returns.len().saturating_sub(2000)].start),stamp(r.as_of)).closed_thru(stamp(r.closed_thru))
+                .input("pairwise slopes",sen.slopes.to_string()).caveat("Descriptive cross-check only; no p-value or interval. Equal-x pairs are omitted; no causal or predictive interpretation.");
+            match sen.slope {Some(v)=>card.value(format!("{v:+.5}")),None=>card.unavailable("no distinct benchmark returns")}
+        });
+    }
+    if let Some(fit) = r.robust.fits.get(selected) {
+        ui.horizontal_wrapped(|ui| {
+            for (i, title) in ["ALPHA / OBS · selected SE", "BETA · selected SE"].iter().enumerate() {
+                let v = [r.ols.alpha, r.ols.beta][i];
+                let response = stat_tile_sized(
+                    ui,
+                    title,
+                    &v.map(|v| format!("{v:+.5}")).unwrap_or_else(|| "—".into()),
+                    v.map_or_else(theme::muted, theme::sign),
+                    20.,
+                    || inference_card(r, selected, i),
+                );
+                if i == 1 {
+                    ui.ctx().data_mut(|d| d.insert_temp(egui::Id::new("corr-probe"), response.rect));
+                }
+                ui.vertical(|ui| {
+                    let parts = fit.intervals[i]
+                        .map(|(a, b)| {
+                            vec![
+                                ("95% CI [".into(), theme::text()),
+                                (format!("{a:+.5}"), theme::sign(a)),
+                                (", ".into(), theme::text()),
+                                (format!("{b:+.5}"), theme::sign(b)),
+                                ("]".into(), theme::text()),
+                            ]
+                        })
+                        .unwrap_or_else(|| vec![("95% CI —".into(), theme::muted())]);
+                    coloured_label(ui, parts).math_card(|| inference_card(r, selected, i));
+                    ui.label(format!(
+                        "BY q={:.4} · {}",
+                        fit.q[i],
+                        if fit.p[i].is_none() {
+                            "unavailable"
+                        } else if fit.q[i] <= 0.10 {
+                            "q ≤ 0.10"
+                        } else {
+                            "q > 0.10"
+                        }
+                    ));
+                });
+            }
+        });
+        if let Some(why) = &fit.covariance.unavailable {
+            ui.label(RichText::new(format!("Selected inference unavailable: {why}")).color(theme::muted()));
+        }
+    }
+    if let Some(h) = &r.robust.holdout {
+        let card = || {
+            let card=crate::widgets::MathCard::new("CORR HOLDOUT · corr.holdout.r2","R²_oos=1−Σtest(y−α_train−β_train x)²/Σtest(y−mean_train)²")
+                .n(h.test_n,"test returns, frozen training coefficients")
+                .span(stamp(r.returns.first().unwrap().start),stamp(r.as_of)).closed_thru(stamp(r.closed_thru))
+                .source(&r.source).provenance(r.provenance)
+                .input("train / test",format!("{} / {}; split {}",h.train_n,h.test_n,stamp(h.split_ts)))
+                .input("alpha / beta / train mean",format!("{} / {} / {}",number(h.alpha),number(h.beta),number(h.train_mean)))
+                .caveat("Chronological first 80% fit, last 20% scored without refitting; negative R²_oos reads no skill. One split is descriptive, not a strategy test.");
+            match h.r_squared_oos {
+                Some(v) => card.value(format!("{v:+.4}")),
+                None => card.unavailable(h.unavailable.as_deref().unwrap_or("unavailable")),
+            }
+        };
+        coloured_label(
+            ui,
+            [
+                (format!("HOLDOUT · train {} | test {} · R²_oos ", h.train_n, h.test_n), theme::text()),
+                (
+                    h.r_squared_oos.map(|v| format!("{v:+.4}")).unwrap_or_else(|| "—".into()),
+                    h.r_squared_oos.map_or_else(theme::muted, theme::sign),
+                ),
+                (
+                    if h.r_squared_oos.is_some_and(|r| r < 0.) { " · no skill".into() } else { String::new() },
+                    theme::text(),
+                ),
+            ],
+        )
+        .math_card(card);
+        let (rect, response) = ui.allocate_exact_size(egui::vec2(ui.available_width().max(120.), 24.), Sense::hover());
+        let split = rect.left() + rect.width() * h.train_n as f32 / (h.train_n + h.test_n).max(1) as f32;
+        ui.painter().rect_filled(
+            Rect::from_min_max(rect.min, egui::pos2(split, rect.bottom())),
+            0.,
+            theme::series(0).linear_multiply(0.15),
+        );
+        ui.painter().rect_filled(
+            Rect::from_min_max(egui::pos2(split, rect.top()), rect.max),
+            0.,
+            theme::series(1).linear_multiply(0.15),
+        );
+        ui.painter().text(
+            rect.left_center() + egui::vec2(5., 0.),
+            egui::Align2::LEFT_CENTER,
+            "TRAIN · frozen α / β",
+            theme::mono(10.),
+            theme::text(),
+        );
+        ui.painter().text(
+            rect.right_center() - egui::vec2(5., 0.),
+            egui::Align2::RIGHT_CENTER,
+            "TEST",
+            theme::mono(10.),
+            theme::text(),
+        );
+        response.math_card(card);
+        let (gauge, response) = ui.allocate_exact_size(egui::vec2(180., 18.), Sense::hover());
+        let mid = gauge.center().x;
+        ui.painter().hline(gauge.x_range(), gauge.center().y, Stroke::new(1., theme::border()));
+        ui.painter().vline(mid, gauge.y_range(), Stroke::new(1., theme::muted()));
+        if let Some(v) = h.r_squared_oos {
+            let x = mid + v.clamp(-1., 1.) as f32 * gauge.width() / 2.;
+            ui.painter().circle_filled(egui::pos2(x, gauge.center().y), 3., theme::series(1));
+        }
+        response.math_card(|| {
+            card().note(
+                "Gauge spans −1 to +1 with a zero tick; marker clips outside that span. The printed R² is unclipped.",
+            )
+        });
+    }
+    selected
+}
+
+fn quad(mesh: &mut egui::epaint::Mesh, points: [Pos2; 4], color: Color32) {
+    let base = mesh.vertices.len() as u32;
+    for pos in points {
+        mesh.vertices.push(egui::epaint::Vertex { pos, uv: egui::epaint::WHITE_UV, color });
+    }
+    mesh.indices.extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
+}
+
+fn segment(mesh: &mut egui::epaint::Mesh, a: Pos2, b: Pos2, width: f32, color: Color32) {
+    let d = b - a;
+    let length = d.length();
+    if length > 0. {
+        let normal = egui::vec2(-d.y, d.x) * (0.5 * width / length);
+        quad(mesh, [a + normal, b + normal, b - normal, a - normal], color);
+    }
+}
+
+fn robust_rolling(ui: &mut Ui, r: &CorrReport, selected: usize) {
+    use crate::widgets::MathCardExt;
+    let Some(points) = r.robust.rolling.get(selected).filter(|p| !p.is_empty()) else {
+        return;
+    };
+    heading(ui, "ROLLING BETA · 60 RETURNS · POINTWISE 95% BAND · LAST 1,000 ENDPOINTS");
+    let x = bounds(points.iter().map(|p| p.ts as f64), false);
+    let y = bounds(points.iter().flat_map(|p| p.interval.into_iter().flat_map(|(a, b)| [a, b]).chain(p.beta)), true);
+    let (plot, response) = axes(ui, x, y, false, true);
+    if !ui.is_rect_visible(plot.rect) {
+        return;
+    }
+    let painter = ui.painter_at(plot.rect);
+    let mut mesh = egui::epaint::Mesh::default();
+    let mut stroke = egui::epaint::Mesh::default();
+    for w in points.windows(2) {
+        if w[1].break_before || w[0].interval.is_none() || w[1].interval.is_none() {
+            continue;
+        }
+        if let (Some((a, b)), Some((c, d)), Some(ba), Some(bb)) = (w[0].interval, w[1].interval, w[0].beta, w[1].beta) {
+            quad(
+                &mut mesh,
+                [
+                    plot.pos(w[0].ts as f64, a),
+                    plot.pos(w[1].ts as f64, c),
+                    plot.pos(w[1].ts as f64, d),
+                    plot.pos(w[0].ts as f64, b),
+                ],
+                theme::series(0).linear_multiply(0.15),
+            );
+            segment(&mut stroke, plot.pos(w[0].ts as f64, ba), plot.pos(w[1].ts as f64, bb), 1.3, theme::series(0));
+        }
+    }
+    painter.add(egui::Shape::mesh(mesh));
+    painter.add(egui::Shape::mesh(stroke));
+    let at = response
+        .hover_pos()
+        .map(|p| plot.x.0 + (p.x - plot.rect.left()) as f64 / plot.rect.width() as f64 * (plot.x.1 - plot.x.0))
+        .unwrap_or(x.1);
+    response.math_card(|| {
+        let p=points.iter().min_by(|a,b|(a.ts as f64-at).abs().total_cmp(&(b.ts as f64-at).abs())).unwrap();
+        let card=crate::widgets::MathCard::new("CORR ROLLING BETA · corr.rolling60","β_window=Cov(x,y)/Var(x); pointwise CI=β±1.96√Vββ")
+            .n(60,"common closed returns per window").span(stamp(p.start),stamp(p.ts)).closed_thru(stamp(r.closed_thru))
+            .source(&r.source).provenance(r.provenance)
+            .input("window SE / bandwidth",&p.covariance_label)
+            .input("95% pointwise CI",p.interval.map(|(a,b)|format!("{a:+.6} … {b:+.6}")).unwrap_or_else(||"—".into()))
+            .note("Each window refits only its 60 past returns. Last 1,000 endpoints; pointwise descriptions, no significance badges. Any window crossing a vault join is unavailable; no band polygon crosses one.");
+        match p.beta {Some(beta)=>card.value(format!("{beta:+.5}")),None=>card.unavailable("window crosses a vault join, singular design or insufficient observations")}
+    });
+}
+
 struct PlotLine {
     label: String,
     color: Color32,
@@ -529,6 +921,9 @@ fn axes(ui: &mut Ui, x: (f64, f64), y: (f64, f64), pct: bool, dates: bool) -> (P
         ui.allocate_exact_size(egui::vec2(ui.available_width().max(80.0), theme::dp(180.0)), Sense::hover());
     let rect = Rect::from_min_max(outer.min + egui::vec2(48.0, 8.0), outer.max - egui::vec2(10.0, 24.0));
     let p = Plot { rect, x, y };
+    if !ui.is_rect_visible(outer) {
+        return (p, response);
+    }
     let painter = ui.painter_at(outer);
     painter.rect_filled(outer, 3.0, theme::card());
     for i in 0..=4 {
@@ -583,13 +978,20 @@ fn line_chart(ui: &mut Ui, lines: &[PlotLine], pct: bool, dates: bool) {
     let x = bounds(lines.iter().flat_map(|l| l.points.iter().filter(|p| p.1.is_some()).map(|p| p.0)), false);
     let y = bounds(lines.iter().flat_map(|l| l.points.iter().filter_map(|p| p.1)), true);
     let (plot, response) = axes(ui, x, y, pct, dates);
+    if !ui.is_rect_visible(plot.rect) {
+        return;
+    }
     let painter = ui.painter_at(plot.rect);
     for line in lines {
+        let mut mesh = egui::epaint::Mesh::default();
+        mesh.vertices.reserve(line.points.len() * 4);
+        mesh.indices.reserve(line.points.len() * 6);
         for w in line.points.windows(2) {
             if let (Some(a), Some(b)) = (w[0].1, w[1].1) {
-                painter.line_segment([plot.pos(w[0].0, a), plot.pos(w[1].0, b)], Stroke::new(1.6, line.color));
+                segment(&mut mesh, plot.pos(w[0].0, a), plot.pos(w[1].0, b), 1.6, line.color);
             }
         }
+        painter.add(egui::Shape::mesh(mesh));
     }
     if let Some(pos) = response.hover_pos().filter(|p| plot.rect.contains(*p)) {
         let x = plot.x.0 + (pos.x - plot.rect.left()) as f64 / plot.rect.width() as f64 * (plot.x.1 - plot.x.0);
@@ -611,38 +1013,62 @@ fn line_chart(ui: &mut Ui, lines: &[PlotLine], pct: bool, dates: bool) {
         response.on_hover_text(labels.join("\n"));
     }
 }
-fn scatter(ui: &mut Ui, r: &CorrReport) {
+fn scatter_selected(ui: &mut Ui, r: &CorrReport, selected: usize) {
     let x = bounds(r.returns.iter().map(|p| p.benchmark), true);
     let mut ys: Vec<_> = r.returns.iter().map(|p| p.asset).collect();
-    if let (Some(a), Some(b), Some(s)) = (r.ols.alpha, r.ols.beta, r.ols.residual_sigma) {
-        for x in [x.0, x.1] {
-            ys.extend([a + b * x - 2.0 * s, a + b * x + 2.0 * s]);
+    let fit = r.robust.fits.get(selected);
+    if let (Some(a), Some(b), Some(fit)) = (r.ols.alpha, r.ols.beta, fit) {
+        for at in [x.0, x.1] {
+            if let Some(se) = fit.covariance.mean_se(&[1., at]) {
+                ys.extend([a + b * at - 1.96 * se, a + b * at + 1.96 * se]);
+            }
         }
     }
     let (plot, response) = axes(ui, x, bounds(ys.into_iter(), true), true, false);
+    if !ui.is_rect_visible(plot.rect) {
+        scatter_caption(ui, r, selected);
+        return;
+    }
     let painter = ui.painter_at(plot.rect);
-    if let (Some(a), Some(b), Some(s)) = (r.ols.alpha, r.ols.beta, r.ols.residual_sigma) {
-        let polygon = vec![
-            plot.pos(x.0, a + b * x.0 - 2.0 * s),
-            plot.pos(x.1, a + b * x.1 - 2.0 * s),
-            plot.pos(x.1, a + b * x.1 + 2.0 * s),
-            plot.pos(x.0, a + b * x.0 + 2.0 * s),
-        ];
-        painter.add(egui::Shape::convex_polygon(polygon, theme::cyan().linear_multiply(0.10), Stroke::NONE));
-        for offset in [-2.0 * s, 0.0, 2.0 * s] {
-            painter.line_segment(
-                [plot.pos(x.0, a + b * x.0 + offset), plot.pos(x.1, a + b * x.1 + offset)],
-                Stroke::new(if offset == 0.0 { 1.7 } else { 0.7 }, theme::cyan()),
+    if let (Some(a), Some(b)) = (r.ols.alpha, r.ols.beta) {
+        // Independent convex strips along the x-axis. This fan is a function
+        // of benchmark return, never a time polygon linking across a vault gap.
+        for k in 0..64 {
+            let lo = x.0 + (x.1 - x.0) * k as f64 / 64.;
+            let hi = x.0 + (x.1 - x.0) * (k + 1) as f64 / 64.;
+            if let Some((sl, sh)) =
+                fit.and_then(|f| f.covariance.mean_se(&[1., lo]).zip(f.covariance.mean_se(&[1., hi])))
+            {
+                painter.add(egui::Shape::convex_polygon(
+                    vec![
+                        plot.pos(lo, a + b * lo - 1.96 * sl),
+                        plot.pos(hi, a + b * hi - 1.96 * sh),
+                        plot.pos(hi, a + b * hi + 1.96 * sh),
+                        plot.pos(lo, a + b * lo + 1.96 * sl),
+                    ],
+                    theme::series(0).linear_multiply(0.16),
+                    Stroke::NONE,
+                ));
+            }
+        }
+        painter
+            .line_segment([plot.pos(x.0, a + b * x.0), plot.pos(x.1, a + b * x.1)], Stroke::new(1.7, theme::series(0)));
+    }
+    let mut cloud = egui::epaint::Mesh::default();
+    cloud.vertices.reserve(r.returns.len() * 4);
+    cloud.indices.reserve(r.returns.len() * 6);
+    for (i, p) in r.returns.iter().enumerate() {
+        let point = plot.pos(p.benchmark, p.asset);
+        if i < r.returns.len().saturating_sub(20) {
+            cloud.add_colored_rect(
+                Rect::from_center_size(point, egui::vec2(3., 3.)),
+                theme::muted().linear_multiply(0.45),
             );
         }
     }
-    for (i, p) in r.returns.iter().enumerate() {
-        let recent = i >= r.returns.len().saturating_sub(20);
-        painter.circle_filled(
-            plot.pos(p.benchmark, p.asset),
-            if recent { 3.0 } else { 2.0 },
-            if recent { theme::cyan() } else { theme::muted().linear_multiply(0.45) },
-        );
+    painter.add(egui::Shape::mesh(cloud));
+    for p in r.returns.iter().rev().take(20) {
+        painter.circle_filled(plot.pos(p.benchmark, p.asset), 3., theme::cyan());
     }
     if let Some(pos) = response.hover_pos().filter(|p| plot.rect.contains(*p))
         && let Some(p) = r.returns.iter().min_by(|a, b| {
@@ -658,8 +1084,21 @@ fn scatter(ui: &mut Ui, r: &CorrReport) {
             percent(Some(p.asset))
         ));
     }
-    ui.label(RichText::new("x: benchmark log return · y: asset log return · band: fitted mean ±2 residual σ (not a confidence interval)").font(theme::ui_font(10.5)).color(theme::muted()));
+    scatter_caption(ui, r, selected);
 }
+fn scatter_caption(ui: &mut Ui, r: &CorrReport, selected: usize) {
+    use crate::widgets::MathCardExt;
+    ui.label(
+        RichText::new("x: benchmark log return · y: asset log return · mean-response CI (95%, pointwise)")
+            .font(theme::ui_font(10.5))
+            .color(theme::muted()),
+    )
+    .math_card(|| {
+        inference_card(r, selected, 0)
+            .note("Fan: ŷ(x) ± 1.96 √((1,x)V(1,x)ᵀ). Mean response, not a prediction interval.")
+    });
+}
+
 fn two_dp(x: f64) -> String {
     format!("{x:.2}")
 }
@@ -695,9 +1134,12 @@ fn matrix(ui: &mut Ui, m: &maths::Matrix) {
                                 tr_data::security(&m.symbols[i]).ticker,
                                 tr_data::security(&m.symbols[j]).ticker
                             );
-                            let card = MathCard::new(format!("ρ {pair}"), "ρ = Cov(rₓ, r_y) / (σₓ σ_y)  (Pearson, log returns)")
-                                .n(cell.n, "common returns")
-                                .note("Pairwise common endpoints; sample size may differ by pair.");
+                            let card = MathCard::new(
+                                format!("ρ {pair}"),
+                                "ρ = Cov(rₓ, r_y) / (σₓ σ_y)  (Pearson, log returns)",
+                            )
+                            .n(cell.n, "common returns")
+                            .note("Pairwise common endpoints; sample size may differ by pair.");
                             match (rho, &cell.reason) {
                                 (Some(v), _) => card.value(two_dp(v)),
                                 (None, Some(why)) => card.unavailable(why.clone()),
@@ -824,22 +1266,23 @@ mod tests {
         let history = history(tr_data::history::Archive::memory().unwrap());
         let bridge = tr_data::whats_news::Config { enabled: false, ..Default::default() }.bridge();
         let start = "2025-01-06T14:30:00Z".parse::<chrono::DateTime<chrono::Utc>>().unwrap().timestamp();
-        let r = research(&CorrCache::default(), false, &history, &bridge, false, "AAPL", "SPY 30m", |key, tf| async move {
-            assert_eq!(tf, Timeframe::M30);
-            if tr_data::security(&key).ticker == "UUP" {
-                anyhow::bail!("missing verified fixture");
-            }
-            Ok((
-                test_bars(start, 1800),
-                tr_data::vault::StitchInfo {
-                    fetched_at: Some(start + 5 * 1800 + 900),
-                    source: "verified fixture".into(),
-                    ..Default::default()
-                },
-            ))
-        })
-        .await
-        .unwrap();
+        let r =
+            research(&CorrCache::default(), false, &history, &bridge, false, "AAPL", "SPY 30m", |key, tf| async move {
+                assert_eq!(tf, Timeframe::M30);
+                if tr_data::security(&key).ticker == "UUP" {
+                    anyhow::bail!("missing verified fixture");
+                }
+                Ok((
+                    test_bars(start, 1800),
+                    tr_data::vault::StitchInfo {
+                        fetched_at: Some(start + 5 * 1800 + 900),
+                        source: "verified fixture".into(),
+                        ..Default::default()
+                    },
+                ))
+            })
+            .await
+            .unwrap();
         assert_eq!(r.aligned_bars, 5); // Sixth bar is still forming at the observation clock.
         assert_eq!(r.ols.n, 4);
         assert_eq!(r.as_of, start + 4 * 1800);
@@ -908,12 +1351,13 @@ mod tests {
         let bridge = tr_data::whats_news::Config { enabled: false, ..Default::default() }.bridge();
         let start = "2025-01-06T14:30:00Z".parse::<chrono::DateTime<chrono::Utc>>().unwrap().timestamp();
         let gap = (start + 2 * 1800, start + 3 * 1800);
-        let r = research(&CorrCache::default(), false, &history, &bridge, false, "AAPL", "SPY 30m", |key, _| async move {
-            let gaps = if tr_data::security(&key).ticker == "AAPL" { vec![gap] } else { vec![] };
-            Ok(intraday_fixture(start, gaps))
-        })
-        .await
-        .unwrap();
+        let r =
+            research(&CorrCache::default(), false, &history, &bridge, false, "AAPL", "SPY 30m", |key, _| async move {
+                let gaps = if tr_data::security(&key).ticker == "AAPL" { vec![gap] } else { vec![] };
+                Ok(intraday_fixture(start, gaps))
+            })
+            .await
+            .unwrap();
         assert_eq!(r.gaps, vec![gap]);
         assert_eq!(r.ols.n, 4); // 6 closed common prices → 5 returns, minus the gap pair.
         assert!(r.returns.iter().all(|p| !(p.start <= gap.0 && p.end >= gap.1)));
@@ -941,10 +1385,14 @@ mod tests {
     }
     #[test]
     fn corr_matrix_paints_rho_key_and_keyed_fills() {
-        let cell = |r: Option<f64>, n| maths::MatrixCell { correlation: r, n, reason: r.is_none().then(|| "n<20".into()) };
+        let cell =
+            |r: Option<f64>, n| maths::MatrixCell { correlation: r, n, reason: r.is_none().then(|| "n<20".into()) };
         let m = maths::Matrix {
             symbols: vec!["AAPL".into(), "SPY".into()],
-            cells: vec![vec![cell(Some(1.0), 250), cell(Some(-0.45), 240)], vec![cell(Some(-0.45), 240), cell(None, 3)]],
+            cells: vec![
+                vec![cell(Some(1.0), 250), cell(Some(-0.45), 240)],
+                vec![cell(Some(-0.45), 240), cell(None, 3)],
+            ],
             unavailable: vec![],
         };
         let ctx = egui::Context::default();
@@ -960,10 +1408,69 @@ mod tests {
         for (_, label) in hs.entries() {
             assert!(texts.contains(&label), "{label}: {texts:?}");
         }
-        let fills: Vec<_> =
-            out.shapes.iter().filter_map(|s| if let egui::Shape::Rect(r) = &s.shape { Some(r.fill) } else { None }).collect();
+        let fills: Vec<_> = out
+            .shapes
+            .iter()
+            .filter_map(|s| if let egui::Shape::Rect(r) = &s.shape { Some(r.fill) } else { None })
+            .collect();
         assert!(fills.contains(&hs.fill(-0.45)) && fills.contains(&hs.fill(1.0)) && fills.contains(&theme::control()));
         // Correlation is never printed in the sign colours on the matrix.
         assert!(!fills.contains(&theme::up()) && !fills.contains(&theme::down()));
+    }
+}
+
+#[cfg(test)]
+mod cache_v2_tests {
+    use super::*;
+    #[test]
+    fn report_cache_identity_corrections_peer_failures_clocks_gaps_horizons() {
+        let reports = tr_data::report_cache::ReportCache::new(16);
+        let (a, b) = tr_perf::fixtures::relationship(80);
+        let a = NamedBars { symbol: "A".into(), bars: a, source: "verified fixture".into(), ..Default::default() };
+        let b = NamedBars { symbol: "B".into(), bars: b, source: "verified fixture".into(), ..Default::default() };
+        let options = maths::Options { annual_periods: 252., daily: true };
+        let call = |a: &NamedBars, b: &NamedBars, rows: &[NamedBars], h, observed| {
+            compute_cached(&reports, a, b, rows, options, Timeframe::D1, "test", h, observed).unwrap()
+        };
+        let first = call(&a, &b, &[], 1, Some(100));
+        let same = call(&a, &b, &[], 1, Some(100));
+        assert!(std::sync::Arc::ptr_eq(&first, &same));
+        let mut corrected = a.clone();
+        corrected.bars[2].close += 0.001;
+        assert!(!std::sync::Arc::ptr_eq(&first, &call(&corrected, &b, &[], 1, Some(100))));
+        let mut gap = a.clone();
+        gap.gaps.push((a.bars[20].ts, a.bars[21].ts));
+        assert!(!std::sync::Arc::ptr_eq(&first, &call(&gap, &b, &[], 1, Some(100))));
+        assert!(!std::sync::Arc::ptr_eq(&first, &call(&a, &b, &[], 5, Some(100))));
+        assert!(!std::sync::Arc::ptr_eq(&first, &call(&a, &b, &[], 1, Some(101))));
+        let peer = NamedBars { symbol: "SPY".into(), error: Some("missing".into()), ..Default::default() };
+        let with_peer = call(&a, &b, &[peer], 1, Some(100));
+        assert!(!std::sync::Arc::ptr_eq(&first, &with_peer));
+        let mut bad = a.clone();
+        bad.bars.last_mut().unwrap().provenance = tr_core::Provenance::Sample;
+        assert!(compute_cached(&reports, &bad, &b, &[], options, Timeframe::D1, "test", 1, Some(100)).is_err());
+    }
+}
+
+#[cfg(test)]
+mod clock_tests {
+    use super::*;
+    fn ts(s: &str) -> i64 {
+        s.parse::<chrono::DateTime<chrono::Utc>>().unwrap().timestamp()
+    }
+    #[test]
+    fn closed_thru_respects_short_cash_buckets_and_crypto_days() {
+        assert_eq!(
+            closed_thru(Timeframe::H1, tr_core::AssetClass::Equity, ts("2026-11-27T17:30:00Z")),
+            ts("2026-11-27T18:00:00Z")
+        );
+        assert_eq!(
+            closed_thru(Timeframe::D1, tr_core::AssetClass::Equity, ts("2026-11-27T00:00:00Z")),
+            ts("2026-11-27T18:00:00Z")
+        );
+        assert_eq!(
+            closed_thru(Timeframe::D1, tr_core::AssetClass::Crypto, ts("2026-11-27T00:00:00Z")),
+            ts("2026-11-28T00:00:00Z")
+        );
     }
 }

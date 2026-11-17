@@ -137,6 +137,21 @@
       "budget_us": 40000,
       "relative": true,
       "class": "interactive"
+    },
+    "studio.corr_hac_5k": {
+      "budget_us": 40000,
+      "relative": true,
+      "class": "interactive"
+    },
+    "inference.stationary_bootstrap_5k_x500": {
+      "budget_us": 120000,
+      "relative": true,
+      "class": "command"
+    },
+    "inference.maxt_78x500": {
+      "budget_us": 150000,
+      "relative": true,
+      "class": "command"
     }
   }
 }

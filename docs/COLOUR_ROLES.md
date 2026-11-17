@@ -58,3 +58,9 @@ unchanged.
 - `widgets::colour_guards::no_new_raw_colours`: raw `Color32::from_rgb` /
   `Color32::RED` outside the theme files must stay within `RAW_COLOUR_BUDGET`.
   Lower the budget; never raise it.
+
+Relationship Studio's covariance fan and rolling band use categorical series
+colour. Coefficient/holdout/robust-slope numbers and interval endpoints use sign
+ink; BY q text and method labels stay neutral. SEASON's two fixed family chips
+are neutral counts, and its simultaneous ALL band shares the ALL curve identity.
+Neither the family split nor the band introduces a significance hue.
