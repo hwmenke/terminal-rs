@@ -34,8 +34,8 @@ pub(crate) fn normal_p(z: f64) -> f64 {
     (poly * (-x * x).exp()).clamp(0.0, 1.0)
 }
 
-fn infer(grid: &[Option<(bool, f64)>], contrast: bool, breaks: &[bool]) -> HacEstimate {
-    let lag = 5.min(grid.len().saturating_sub(1));
+fn infer(grid: &[Option<(bool, f64)>], contrast: bool, breaks: &[bool], lag: usize) -> HacEstimate {
+    let lag = lag.min(grid.len().saturating_sub(1));
     let mut sums = [0.0; 2];
     let mut counts = [0usize; 2];
     let mut invalid = false;
@@ -127,7 +127,7 @@ fn infer(grid: &[Option<(bool, f64)>], contrast: bool, breaks: &[bool]) -> HacEs
 }
 
 pub fn hac_mean(grid: &[Option<f64>]) -> HacEstimate {
-    infer(&grid.iter().map(|r| r.map(|r| (true, r))).collect::<Vec<_>>(), false, &[])
+    infer(&grid.iter().map(|r| r.map(|r| (true, r))).collect::<Vec<_>>(), false, &[], 5)
 }
 
 /// Same mean and expected-session bandwidth as `hac_mean`, with lag products
@@ -136,17 +136,60 @@ pub fn hac_mean(grid: &[Option<f64>]) -> HacEstimate {
 pub fn hac_mean_with_breaks(grid: &[Option<f64>], breaks: &[bool]) -> HacEstimate {
     assert_eq!(grid.len(), breaks.len());
     let boundaries = if breaks.iter().any(|b| *b) { breaks } else { &[] };
-    infer(&grid.iter().map(|r| r.map(|r| (true, r))).collect::<Vec<_>>(), false, boundaries)
+    infer(&grid.iter().map(|r| r.map(|r| (true, r))).collect::<Vec<_>>(), false, boundaries, 5)
 }
 
 /// Each observed session belongs to the selected group (`true`) or its
 /// same-clock/horizon complement (`false`). Unavailable sessions remain None.
 pub fn hac_contrast(grid: &[Option<(bool, f64)>]) -> HacEstimate {
-    infer(grid, true, &[])
+    infer(grid, true, &[], 5)
+}
+
+/// Bartlett contrast on the original bar grid. A true break starts a new run.
+pub fn hac_contrast_with(grid: &[Option<(bool, f64)>], lag: usize, breaks: &[bool]) -> HacEstimate {
+    assert!(breaks.is_empty() || breaks.len() == grid.len());
+    infer(grid, true, breaks, lag)
 }
 
 #[cfg(test)]
 mod tests {
+    fn contrast_vector() -> Vec<Option<(bool, f64)>> {
+        (0..60)
+            .map(|i| {
+                Some((
+                    i % 2 == 0,
+                    if i % 2 == 1 {
+                        0.5
+                    } else if i % 4 == 0 {
+                        1.
+                    } else {
+                        -1.
+                    },
+                ))
+            })
+            .collect()
+    }
+    #[test]
+    fn hac_contrast_with_lag20_known_answer() {
+        let r = super::hac_contrast_with(&contrast_vector(), 20, &[]);
+        assert_eq!((r.estimate, r.n, r.complement_n, r.lag), (Some(-0.5), 30, 30, 20));
+        assert!((r.variance.unwrap() - 2. / 945.).abs() < 1e-12);
+        assert!((r.interval.unwrap().0 + 0.590169).abs() < 1e-6);
+    }
+    #[test]
+    fn hac_contrast_with_break_resets_products() {
+        let mut b = vec![false; 60];
+        b[30] = true;
+        assert!((super::hac_contrast_with(&contrast_vector(), 20, &b).variance.unwrap() - 1. / 378.).abs() < 1e-12);
+    }
+    #[test]
+    fn hac_contrast_default_is_unchanged() {
+        let g = contrast_vector();
+        let r = super::hac_contrast_with(&g, 5, &[]);
+        assert_eq!(r, super::hac_contrast(&g));
+        assert!((r.variance.unwrap() - 1. / 90.).abs() < 1e-12);
+    }
+
     use super::*;
     #[test]
     fn hand_bartlett_variance_and_missing_lag_distance() {

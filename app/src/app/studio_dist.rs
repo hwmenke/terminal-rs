@@ -1,10 +1,13 @@
 //! Distribution Studio pane and worker-side report assembly. All price loading is off the UI thread.
+pub(super) mod regimes;
 use super::{PaneKind, TerminalApp};
 use crate::theme::{self, dp, mono, muted, text};
 use crate::{congress_view::Action, dock::PaneId, worker::Request};
 use egui::{Align2, Color32, Painter, Pos2, Rect, Response, RichText, Sense, Stroke, Ui, pos2, vec2};
+use std::sync::Arc;
 use tr_core::{Bar, Timeframe};
 use tr_data::studio_dist::{self as dist, Report, Window};
+use tr_data::studio_regime::RegimeRotation;
 
 pub struct DistPane {
     pub symbol: String,
@@ -14,6 +17,11 @@ pub struct DistPane {
     pub report: Option<Report>,
     pub loading: bool,
     pub error: Option<String>,
+    pub regimes_tab: bool,
+    pub regime_sel: usize,
+    pub rotation: Option<Arc<RegimeRotation>>,
+    pub rotation_loading: bool,
+    pub rotation_error: Option<String>,
     best_k: usize,
 }
 impl DistPane {
@@ -26,12 +34,20 @@ impl DistPane {
             report: None,
             loading: false,
             error: None,
+            regimes_tab: false,
+            regime_sel: 2,
+            rotation: None,
+            rotation_loading: false,
+            rotation_error: None,
             best_k: 5,
         }
     }
     pub fn request(&mut self, pane: PaneId, worker: &crate::worker::Worker) {
         self.generation += 1;
         self.report = None;
+        self.rotation = None;
+        self.rotation_loading = false;
+        self.rotation_error = None;
         self.error = None;
         self.loading = false;
         if self.symbol.trim().is_empty() {
@@ -52,9 +68,26 @@ impl DistPane {
             self.generation += 1;
         }
         self.report = None;
+        self.rotation = None;
+        self.rotation_loading = false;
+        self.rotation_error = None;
         self.loading = false;
         self.error =
             Some("Sample / demo mode: no real data. Distribution Studio never computes from display prices.".into());
+    }
+    pub fn accept_rotation(&mut self, generation: u64, key: u64, result: Result<Arc<RegimeRotation>, String>) {
+        if generation != self.generation
+            || self.report.as_ref().and_then(|r| r.regime.rotation_input.as_ref()).is_none_or(|i| i.seed != key)
+        {
+            return;
+        }
+        self.rotation_loading = false;
+        self.rotation = None;
+        self.rotation_error = None;
+        match result {
+            Ok(r) => self.rotation = Some(r),
+            Err(e) => self.rotation_error = Some(e),
+        }
     }
     pub fn accept(&mut self, generation: u64, result: Result<Report, String>) {
         if generation != self.generation {
@@ -62,6 +95,9 @@ impl DistPane {
         }
         self.loading = false;
         self.report = None;
+        self.rotation = None;
+        self.rotation_loading = false;
+        self.rotation_error = None;
         match result {
             Ok(report) => match report.provenance.require_verified("Distribution Studio") {
                 Ok(()) => {
@@ -180,7 +216,33 @@ impl TerminalApp {
         }
         studio_states(ui, pane.loading, pane.error.as_deref(), None);
         if let Some(r) = &pane.report {
-            ui.push_id(id, |ui| report_view(ui, id, r, &mut pane.best_k));
+            ui.horizontal(|ui| {
+                ui.selectable_value(&mut pane.regimes_tab, false, "Overview");
+                ui.selectable_value(&mut pane.regimes_tab, true, "Regimes");
+            });
+            if pane.regimes_tab {
+                if pane.rotation.is_none() && !pane.rotation_loading && pane.rotation_error.is_none() {
+                    if let Some(input) = &r.regime.rotation_input {
+                        pane.rotation_loading = true;
+                        self.worker.send(Request::StudioDistRotation {
+                            pane: id,
+                            generation: pane.generation,
+                            symbol: r.symbol.clone(),
+                            timeframe: r.timeframe,
+                            source: r.source.clone(),
+                            input: input.clone(),
+                        });
+                    }
+                }
+                if let Some(e) = &pane.rotation_error {
+                    ui.label(format!("distance p unavailable: {e}"));
+                }
+                egui::ScrollArea::vertical().id_salt((id, "dist-regimes")).show(ui, |ui| {
+                    regimes::view(ui, r, pane.rotation.as_deref(), pane.rotation_loading, &mut pane.regime_sel);
+                });
+            } else {
+                ui.push_id(id, |ui| report_view(ui, id, r, &mut pane.best_k));
+            }
         }
         vec![]
     }
@@ -261,8 +323,8 @@ fn number(x: Option<f64>) -> String {
 fn heading(ui: &mut Ui, s: &str) {
     studio_heading(ui, s);
 }
-fn regime_color(i: usize) -> Color32 {
-    [theme::cyan(), theme::amber(), theme::down()][i]
+pub(in crate::app) fn regime_color(i: usize) -> Color32 {
+    theme::series([0, 4, 5][i])
 }
 const REGIMES: [&str; 3] = ["Calm", "Normal", "Stressed"];
 fn metric_cards(ui: &mut Ui, r: &Report) {
@@ -313,8 +375,12 @@ fn metric_cards(ui: &mut Ui, r: &Report) {
             opt(card, m.jarque_bera, flat)
         });
         stat_tile(ui, "JB P-VALUE", &number(m.jb_p_value), theme::text(), || {
-            opt(base("JB P-VALUE", "p = exp(−JB / 2)  (χ²(2) upper tail)").input("JB", number(m.jarque_bera)), m.jb_p_value, flat)
-                .caveat("Asymptotic; unreliable for small n.")
+            opt(
+                base("JB P-VALUE", "p = exp(−JB / 2)  (χ²(2) upper tail)").input("JB", number(m.jarque_bera)),
+                m.jb_p_value,
+                flat,
+            )
+            .caveat("Asymptotic; unreliable for small n.")
         });
         let var = format!("{} / {}", pct(m.var95), pct(m.var99));
         stat_tile(ui, "VaR 95 / 99", &var, theme::text(), || {
@@ -582,7 +648,10 @@ fn volatility(ui: &mut Ui, r: &Report) {
     heading(ui, "20-BAR REALIZED VOLATILITY · ANNUALISED");
     let xs = &r.underwater;
     let Some(high) = xs.iter().filter_map(|p| p.rolling_vol).reduce(f64::max) else {
-        ui.label(RichText::new("Needs 21 closed bars for rolling vol and 41 before the first point-in-time regime label.").color(muted()));
+        ui.label(
+            RichText::new("Needs 21 closed bars for rolling vol and 41 before the first point-in-time regime label.")
+                .color(muted()),
+        );
         return;
     };
     let p = Plot::new(
@@ -796,6 +865,54 @@ mod tests {
     use super::*;
     use crate::layouts::PaneSettings;
     #[test]
+    fn rotation_generation_and_seed_gate() {
+        let r = dist::compute("AAPL", &tr_perf::fixtures::regime_walk(1500), Timeframe::D1, Window::All, "unit", None)
+            .unwrap();
+        let input = r.regime.rotation_input.as_ref().unwrap().clone();
+        let rotation = Arc::new(input.compute());
+        let mut pane = DistPane::new("AAPL", Timeframe::D1, Window::All);
+        pane.generation = 2;
+        pane.accept(2, Ok(r));
+        pane.rotation_loading = true;
+        pane.accept_rotation(1, input.seed, Ok(rotation.clone()));
+        assert!(pane.rotation_loading && pane.rotation.is_none());
+        pane.accept_rotation(2, input.seed.wrapping_add(1), Ok(rotation.clone()));
+        assert!(pane.rotation_loading && pane.rotation.is_none());
+        pane.accept_rotation(2, input.seed, Ok(rotation));
+        assert!(!pane.rotation_loading && pane.rotation.is_some());
+        pane.accept_rotation(2, input.seed, Err("refused".into()));
+        assert!(pane.rotation.is_none() && pane.rotation_error.is_some());
+        pane.deny_sample();
+        pane.accept_rotation(2, input.seed, Ok(Arc::new(input.compute())));
+        assert!(pane.rotation.is_none());
+    }
+    #[test]
+    fn sample_mode_clears_rotation() {
+        let mut pane = DistPane::new("AAPL", Timeframe::D1, Window::All);
+        pane.rotation = Some(Arc::new(
+            tr_data::studio_regime::RotationInput { seed: 1, labels: vec![], values: vec![], observed: [None; 3] }
+                .compute(),
+        ));
+        pane.rotation_loading = true;
+        pane.rotation_error = Some("old".into());
+        pane.deny_sample();
+        assert!(pane.rotation.is_none() && !pane.rotation_loading && pane.rotation_error.is_none());
+    }
+    #[test]
+    fn regime_identity_colours_are_not_sign_or_caution() {
+        let old = theme::palette();
+        for t in [crate::themes::terminal_dark(), crate::themes::terminal_light()] {
+            theme::set_palette(t.palette(theme::DEFAULT_ACCENT));
+            for i in 0..3 {
+                let c = regime_color(i);
+                assert_ne!(c, theme::up());
+                assert_ne!(c, theme::down());
+                assert_ne!(c, theme::amber());
+            }
+        }
+        theme::set_palette(old);
+    }
+    #[test]
     fn gap_text_is_absent_without_gaps_and_names_ny_dates() {
         assert!(gap_text(&[]).is_none());
         let a = "2026-11-09T20:55:00Z".parse::<chrono::DateTime<chrono::Utc>>().unwrap().timestamp();
@@ -981,7 +1098,10 @@ mod tests {
         let n = format!("n={} log returns", report.moments.n);
         let from = tr_data::stats::bar_date(report.start);
         let to = tr_data::stats::bar_date(report.end);
-        assert!(texts.iter().any(|t| t.contains(&n) && t.contains(&from) && t.contains(&to)), "{n} {from} {to}: {texts:?}");
+        assert!(
+            texts.iter().any(|t| t.contains(&n) && t.contains(&from) && t.contains(&to)),
+            "{n} {from} {to}: {texts:?}"
+        );
         assert!(texts.iter().any(|t| t.starts_with("μ = Σ rᵢ / n")), "{texts:?}");
     }
 }

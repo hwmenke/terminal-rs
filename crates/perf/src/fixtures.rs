@@ -147,3 +147,25 @@ pub fn inference_clocks(sessions: usize) -> Vec<Vec<Option<f64>>> {
         .map(|k| (0..sessions).map(|s| Some(common[s] + 0.0005 * (rng.next() - 0.5) + k as f64 * 0.000001)).collect())
         .collect()
 }
+
+/// Aperiodic volatility blocks, exclusively for offline regime admissions.
+pub fn regime_walk(n: usize) -> Vec<Bar> {
+    let mut bars = daily(n + 1, 42);
+    let mut rng = Rng(42);
+    let mut left = 0;
+    let mut level = 1.;
+    let mut price = 100.;
+    for (i, b) in bars.iter_mut().enumerate() {
+        let open = price;
+        if i > 0 {
+            if left == 0 {
+                left = 40 + (121. * rng.next()).floor() as usize;
+                level = [0.4, 1., 2.5][(3. * rng.next()).floor() as usize];
+            }
+            price *= (level * 0.006 * (rng.next() - 0.5) + 0.0001).exp();
+            left -= 1;
+        }
+        *b = Bar::new(b.ts, open, open.max(price), open.min(price), price, 1000.).with_provenance(Provenance::Real);
+    }
+    bars
+}

@@ -33,6 +33,43 @@ pub fn all(scale: Scale) -> Vec<Case> {
             cases.push(Case { id: $id, run: Box::new($f) });
         };
     }
+    let regime_bars = fixtures::regime_walk(if full { 5000 } else { 1500 });
+    let regime = tr_data::studio_dist::compute(
+        "AAPL",
+        &regime_bars,
+        Timeframe::D1,
+        tr_data::studio_dist::Window::All,
+        "benchmark fixture only",
+        None,
+    )
+    .unwrap();
+    let rotation = regime.regime.rotation_input.clone().unwrap();
+    add!("studio.regime_fingerprints_5k", move || {
+        let r = bb(tr_data::studio_dist::compute(
+            "AAPL",
+            bb(&regime_bars),
+            Timeframe::D1,
+            tr_data::studio_dist::Window::All,
+            "benchmark fixture only",
+            None,
+        )
+        .unwrap());
+        assert!(r.regime.unavailable.is_none());
+        for ridge in &r.regime.ridges {
+            assert!(ridge.n >= 300 && ridge.contrast.interval.is_some());
+            let mass =
+                (ridge.counts.iter().sum::<usize>() + ridge.outside.iter().sum::<usize>()) as f64 / ridge.n as f64;
+            assert!((mass - 1.).abs() < 1e-12);
+        }
+        r.regime.classified
+    });
+    add!("studio.regime_rotation_5k_x499", move || {
+        let r = bb(rotation.compute());
+        assert_eq!(r.draws, 499);
+        assert!(r.p.iter().all(Option::is_some));
+        assert!(r.q[2] <= 0.10, "Stressed rotation q {}", r.q[2]);
+        r.draws
+    });
     let (v, i) = (vault.clone(), id.clone());
     add!("data.vault_read_5k", move || bb(v.borrow().read(&i, None, 5000).unwrap()).len());
     let (v, i) = (vault.clone(), id.clone());

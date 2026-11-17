@@ -152,6 +152,16 @@
       "budget_us": 150000,
       "relative": true,
       "class": "command"
+    },
+    "studio.regime_fingerprints_5k": {
+      "budget_us": 40000,
+      "relative": true,
+      "class": "interactive"
+    },
+    "studio.regime_rotation_5k_x499": {
+      "budget_us": 150000,
+      "relative": true,
+      "class": "command"
     }
   }
 }

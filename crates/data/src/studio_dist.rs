@@ -130,6 +130,7 @@ pub struct RegimeStats {
 }
 #[derive(Debug, Clone, PartialEq)]
 pub struct Report {
+    pub regime: crate::studio_regime::RegimeFingerprints,
     pub symbol: String,
     pub source: String,
     pub provenance: Provenance,
@@ -343,7 +344,15 @@ pub fn compute_with_gaps(
             hit_rate: mean.map(|_| xs.iter().filter(|x| **x > 0.0).count() as f64 / xs.len() as f64),
         }
     });
-    Ok(Report {
+    let mut hash = crate::stable_hash::Fnv64::default();
+    hash.write_u64(crate::stable_hash::bars_digest(bars));
+    for &(a, b) in &gaps {
+        hash.write_i64(a);
+        hash.write_i64(b);
+    }
+    hash.write_str("dist.regime.v1");
+    let mut report = Report {
+        regime: crate::studio_regime::fingerprints(&[], &[], hash.finish()),
         symbol: symbol.into(),
         source: source.into(),
         provenance: Bar::provenance(bars),
@@ -368,7 +377,10 @@ pub fn compute_with_gaps(
         regimes,
         transitions,
         gaps,
-    })
+    };
+    let (slots, breaks) = crate::studio_regime::regime_slots(&report);
+    report.regime = crate::studio_regime::fingerprints(&slots, &breaks, hash.finish());
+    Ok(report)
 }
 
 /// True when the price pair `(from, to)` straddles a vault UNVERIFIED JOIN gap.
@@ -439,12 +451,12 @@ fn episode(bars: &[Bar], peak: usize, trough: usize, recovery: Option<usize>) ->
     }
 }
 
-fn population_sigma(xs: &[f64], mean: f64) -> f64 {
+pub(crate) fn population_sigma(xs: &[f64], mean: f64) -> f64 {
     (xs.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / xs.len() as f64).sqrt()
 }
 
 /// Linear-interpolated empirical quantile (type 7). Requires finite sorted input.
-fn quantile(xs: &[f64], p: f64) -> f64 {
+pub(crate) fn quantile(xs: &[f64], p: f64) -> f64 {
     let index = (xs.len() - 1) as f64 * p;
     let lo = index.floor() as usize;
     let hi = index.ceil() as usize;

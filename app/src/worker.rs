@@ -200,6 +200,15 @@ pub enum Request {
         symbol: String,
         tf: Timeframe,
     },
+    StudioDistRotation {
+        pane: PaneId,
+        generation: u64,
+        symbol: String,
+        timeframe: Timeframe,
+        source: String,
+        input: Arc<tr_data::studio_regime::RotationInput>,
+    },
+
     StudioSeasonBand {
         pane: PaneId,
         generation: u64,
@@ -546,6 +555,7 @@ impl Request {
             Self::TstackTune { .. } => "TstackTune",
             Self::StudioCorr { .. } => "StudioCorr",
             Self::StudioSeason { .. } => "StudioSeason",
+            Self::StudioDistRotation { .. } => "StudioDistRotation",
             Self::StudioSeasonBand { .. } => "StudioSeasonBand",
             Self::Stats { .. } => "Stats",
             Self::Backtest { .. } => "Backtest",
@@ -829,6 +839,13 @@ pub enum Response {
         generation: u64,
         result: Result<Arc<tr_data::studio_season::SeasonReport>, String>,
     },
+    StudioDistRotation {
+        pane: PaneId,
+        generation: u64,
+        key: u64,
+        result: Result<Arc<tr_data::studio_regime::RegimeRotation>, String>,
+    },
+
     StudioSeasonBand {
         pane: PaneId,
         generation: u64,
@@ -4469,6 +4486,33 @@ async fn handle_inner(s: &Arc<Shared>, req: Request, force: bool) {
             }.await.map_err(|e| format!("{e:#}"));
             send(Response::StudioSeason { pane, generation, result });
         }
+        Request::StudioDistRotation { pane, generation, symbol, timeframe, source, input } => {
+            let key = input.seed;
+            let reports = s.reports.clone();
+            let jobs = s.jobs.clone();
+            let result = if s.sample_mode() {
+                Err("DIST rotation: no real data in sample mode".into())
+            } else {
+                tokio::task::spawn_blocking(move || {
+                    let mut cache_key = tr_data::report_cache::ReportKey::new(
+                        "dist.regime.rotation.v1",
+                        &symbol,
+                        timeframe,
+                        &source,
+                        &[],
+                        "499 circular label rotations; min shift 40; BY m=3",
+                    );
+                    cache_key.inputs = key;
+                    reports.get_or_compute(cache_key, || {
+                        let _job = crate::perf::JobTimer::new(&jobs, "StudioDistRotation");
+                        Ok::<_, String>(input.compute())
+                    })
+                })
+                .await
+                .unwrap_or_else(|e| Err(format!("DIST rotation task: {e}")))
+            };
+            send(Response::StudioDistRotation { pane, generation, key, result });
+        }
         Request::StudioSeasonBand {pane,generation,symbol,tf,source,input} => {
             let key=input.seed;
             let reports=s.reports.clone();let jobs=s.jobs.clone();
@@ -7748,6 +7792,68 @@ mod tests {
                 assert_eq!(*held_spy, spy);
             }
         }
+    }
+
+    #[tokio::test]
+    async fn studio_dist_rotation_is_cached_and_refuses_sample_mode() {
+        let bars = tr_perf::fixtures::regime_walk(1500);
+        let r = tr_data::studio_dist::compute(
+            "AAPL",
+            &bars,
+            Timeframe::D1,
+            tr_data::studio_dist::Window::All,
+            "fixture",
+            None,
+        )
+        .unwrap();
+        let input = r.regime.rotation_input.unwrap();
+        let provider = vault_provider(vault_day("2026-11-09"));
+        let (s, rx) = shared(provider.clone(), Some(BarCache::open_in_memory().unwrap()));
+        let mut previous = None;
+        for generation in [1, 2] {
+            handle(
+                &s,
+                Request::StudioDistRotation {
+                    pane: 19,
+                    generation,
+                    symbol: "AAPL".into(),
+                    timeframe: Timeframe::D1,
+                    source: "fixture".into(),
+                    input: input.clone(),
+                },
+            )
+            .await;
+            let Response::WhatsNews { response, .. } = rx.try_recv().unwrap() else { panic!("band envelope") };
+            let Response::StudioDistRotation { key, result, .. } = *response else { panic!("band response") };
+            assert_eq!(key, input.seed);
+            let band = result.unwrap();
+            assert_eq!(band.draws, 499);
+            assert!(band.p.iter().all(Option::is_some));
+            if let Some(p) = previous {
+                assert!(Arc::ptr_eq(&p, &band));
+            }
+            previous = Some(band);
+        }
+        assert_eq!(provider.calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+        let mut provider = vault_provider(vault_day("2026-11-09"));
+        Arc::get_mut(&mut provider).unwrap().sample = true;
+        let (s, rx) = shared(provider.clone(), Some(BarCache::open_in_memory().unwrap()));
+        handle(
+            &s,
+            Request::StudioDistRotation {
+                pane: 19,
+                generation: 3,
+                symbol: "AAPL".into(),
+                timeframe: Timeframe::D1,
+                source: "fixture".into(),
+                input,
+            },
+        )
+        .await;
+        let Response::WhatsNews { response, .. } = rx.try_recv().unwrap() else { panic!("band envelope") };
+        let Response::StudioDistRotation { result, .. } = *response else { panic!("band response") };
+        assert!(result.unwrap_err().contains("sample"));
+        assert_eq!(provider.calls.load(std::sync::atomic::Ordering::SeqCst), 0);
     }
 
     #[tokio::test]

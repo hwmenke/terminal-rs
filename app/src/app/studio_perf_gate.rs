@@ -164,6 +164,7 @@ fn perf_gate_paint_studios() {
     let mut best = sample();
     best.extend(season_sample());
     best.extend(corr_sample());
+    best.extend(regime_sample());
     let ids: BTreeSet<_> = budgets.cases.keys().filter(|id| id.starts_with("paint.studio_")).cloned().collect();
     assert_eq!(best.keys().cloned().collect::<BTreeSet<_>>(), ids, "stale/missing studio budgets");
     for _ in 0..2 {
@@ -173,7 +174,7 @@ fn perf_gate_paint_studios() {
         {
             break;
         }
-        for (id, s) in sample().into_iter().chain(season_sample()).chain(corr_sample()) {
+        for (id, s) in sample().into_iter().chain(season_sample()).chain(corr_sample()).chain(regime_sample()) {
             if s.median_us < best[&id].median_us {
                 best.insert(id, s);
             }
@@ -634,4 +635,171 @@ fn corr_cards_modes_and_finite_geometry() {
         }
         finite(&ctx, out);
     }
+}
+
+fn regime_report() -> tr_data::studio_dist::Report {
+    tr_data::studio_dist::compute(
+        "AAPL",
+        &tr_perf::fixtures::regime_walk(5000),
+        tr_core::Timeframe::D1,
+        tr_data::studio_dist::Window::All,
+        "benchmark fixture only",
+        None,
+    )
+    .unwrap()
+}
+fn regime_frame(
+    ctx: &egui::Context,
+    r: &tr_data::studio_dist::Report,
+    rotation: &tr_data::studio_regime::RegimeRotation,
+    width: f32,
+    hover: bool,
+    index: usize,
+) -> egui::FullOutput {
+    let pointer = if hover {
+        ctx.data(|d| d.get_temp::<Rect>(egui::Id::new("regime-probe"))).unwrap_or(Rect::NOTHING).center()
+            + vec2(if index >= 160 { (index % 2) as f32 } else { 0. }, 0.)
+    } else {
+        pos2(15., 15.)
+    };
+    let events = if ctx.input(|i| i.pointer.hover_pos()) == Some(pointer) {
+        vec![]
+    } else {
+        vec![egui::Event::PointerMoved(pointer)]
+    };
+    let mut out = ctx.run_ui(
+        egui::RawInput {
+            time: Some(1. + index as f64 * 0.2),
+            screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(width, 1600.))),
+            events,
+            ..Default::default()
+        },
+        |ui| {
+            let cell = super::studio_dist::regimes::view(ui, r, Some(rotation), false, &mut 2);
+            ctx.data_mut(|d| d.insert_temp(egui::Id::new("regime-probe"), cell));
+        },
+    );
+    out.textures_delta.clear();
+    out
+}
+fn regime_guard(out: &egui::FullOutput) {
+    let txt = text(&out.shapes);
+    for word in [
+        "REGIME FINGERPRINTS",
+        "Calm",
+        "Normal",
+        "Stressed",
+        "CLOSED THRU",
+        "Δμ bp",
+        "HAC Bartlett L=20",
+        "mean family m=3",
+        "distance family m=3",
+        "499 rotations",
+        "P(r>0)",
+    ] {
+        assert!(txt.contains(word), "missing {word}: {txt}");
+    }
+    let bins=out.shapes.iter().filter(|s|matches!(&s.shape,egui::Shape::Rect(r) if r.fill==super::studio_dist::regime_color(0) || r.fill==super::studio_dist::regime_color(1) || r.fill==super::studio_dist::regime_color(2))).count();
+    assert!(bins >= 144, "missing bin rectangles: {bins}");
+}
+fn regime_sample() -> BTreeMap<String, Summary> {
+    let ctx = egui::Context::default();
+    let r = regime_report();
+    let rotation = r.regime.rotation_input.as_ref().unwrap().compute();
+    assert_eq!(rotation.draws, 499);
+    assert!(rotation.p.iter().all(Option::is_some));
+    assert!(rotation.q[2] <= 0.10);
+    for i in 0..20 {
+        finite(&ctx, regime_frame(&ctx, &r, &rotation, 1440., false, i));
+    }
+    let mut result = BTreeMap::new();
+    for hover in [false, true] {
+        let mode = if hover { "hover" } else { "steady" };
+        if hover {
+            for i in 140..160 {
+                finite(&ctx, regime_frame(&ctx, &r, &rotation, 1440., true, i));
+            }
+        }
+        let mut times: BTreeMap<String, Vec<f64>> = BTreeMap::new();
+        for i in 0..120 {
+            let start = Instant::now();
+            let mut out = regime_frame(&ctx, &r, &rotation, 1440., hover, i + if hover { 160 } else { 20 });
+            let ui_us = start.elapsed().as_secs_f64() * 1e6;
+            if i == 60 {
+                regime_guard(&out);
+                if hover {
+                    assert!(
+                        text(&out.shapes).contains("dist.regime.mean_contrast"),
+                        "hover did not paint mean contrast MathCard"
+                    );
+                }
+            }
+            let start = Instant::now();
+            let primitives = ctx.tessellate(std::mem::take(&mut out.shapes), out.pixels_per_point);
+            let tess_us = start.elapsed().as_secs_f64() * 1e6;
+            assert!(!primitives.is_empty());
+            std::hint::black_box(primitives);
+            for (metric, v) in [("ui", ui_us), ("tess", tess_us), ("total", ui_us + tess_us)] {
+                times.entry(format!("paint.studio_regime.{mode}.{metric}")).or_default().push(v);
+            }
+        }
+        for (id, mut samples) in times {
+            result.insert(id, tr_perf::summarize(&mut samples));
+        }
+    }
+    result
+}
+#[test]
+fn regimes_view_finite_geometry_320_1440() {
+    let r = regime_report();
+    let rotation = r.regime.rotation_input.as_ref().unwrap().compute();
+    for width in [320., 1440.] {
+        let ctx = egui::Context::default();
+        let out = regime_frame(&ctx, &r, &rotation, width, false, 0);
+        if width > 1000. {
+            regime_guard(&out);
+        }
+        finite(&ctx, out);
+        let mut sparse = r.clone();
+        sparse.regime = tr_data::studio_regime::fingerprints(&[], &[], 1);
+        finite(&ctx, regime_frame(&ctx, &sparse, &rotation, width, false, 1));
+    }
+    let ctx = egui::Context::default();
+    for i in 140..166 {
+        let out = regime_frame(&ctx, &r, &rotation, 1440., i > 140, i);
+        if i == 165 {
+            assert!(text(&out.shapes).contains("dist.regime.mean_contrast"));
+        }
+        finite(&ctx, out);
+    }
+}
+#[test]
+fn regime_cards_print_method_family_and_reason() {
+    use super::studio_dist::regimes::*;
+    let r = regime_report();
+    let rot = r.regime.rotation_input.as_ref().unwrap().compute();
+    for g in 0..3 {
+        let cards = [
+            mass_card(&r, g, 0),
+            quantiles_card(&r, g),
+            mean_card(&r, g),
+            distance_card(&r, g, Some(&rot)),
+            up_card(&r, g),
+            tails_card(&r, g),
+        ];
+        for card in cards {
+            let t = card.to_text();
+            assert!(t.contains("dist.regime.") && t.contains("CLOSED THRU"));
+            assert!(card.n.is_some() && card.span.is_some() && card.source.is_some() && card.provenance.is_some());
+        }
+        assert!(mean_card(&r, g).to_text().contains("BY q, m=3 (mean family)"));
+        assert!(distance_card(&r, g, Some(&rot)).to_text().contains("BY q, m=3 (distance family)"));
+        assert!(up_card(&r, g).to_text().contains("Wilson 95%"));
+    }
+    let mut sparse = r.clone();
+    sparse.regime = tr_data::studio_regime::fingerprints(&[Some((0, 0.1)), Some((1, -0.1))], &[false; 2], 1);
+    assert!(mean_card(&sparse, 0).to_text().contains("LOW N"));
+    assert!(distance_card(&sparse, 0, None).to_text().contains("LOW N"));
+    assert!(quantiles_card(&sparse, 2).unavailable.is_some());
+    assert!(tails_card(&sparse, 2).unavailable.is_some());
 }
