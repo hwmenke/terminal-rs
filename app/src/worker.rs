@@ -817,7 +817,7 @@ pub enum Response {
     StudioSeason {
         pane: PaneId,
         generation: u64,
-        result: Result<tr_data::studio_season::SeasonReport, String>,
+        result: Result<Arc<tr_data::studio_season::SeasonReport>, String>,
     },
     Stats {
         pane: PaneId,
@@ -3709,6 +3709,28 @@ async fn anchored_vwap(
     .map_err(|e| format!("Anchored VWAP task failed: {e}"))?
 }
 
+/// Complete-input admission always precedes the cache key and lookup.
+fn cached_season_report(
+    reports: &tr_data::report_cache::ReportCache,
+    jobs: &crate::perf::JobLog,
+    symbol: &str, tf: Timeframe, bars: &[Bar], source: &str,
+    observed: i64, now: i64, gaps: &[(i64,i64)],
+) -> Result<Arc<tr_data::studio_season::SeasonReport>,String> {
+    tr_data::studio_season::validate_input(tf,bars)?;
+    chrono::DateTime::<chrono::Utc>::from_timestamp(now, 0).ok_or("SEASON refused: invalid calendar clock")?;
+    chrono::DateTime::<chrono::Utc>::from_timestamp(observed, 0).ok_or("SEASON refused: invalid observation clock")?;
+    let mut key = tr_data::report_cache::ReportKey::new(
+        "studio.season", symbol, tf, source, bars,
+        &format!("evidence-v1;provenance={:?};observed={observed};gaps={gaps:?}", Bar::provenance(bars)),
+    );
+    // Calendar/OR classifications depend on the NY date, not the paint/reload second.
+    key.day = Some(tr_core::ny::civil(now).date());
+    reports.get_or_compute(key, || {
+        let _job=crate::perf::JobTimer::new(jobs,"StudioSeason");
+        tr_data::studio_season::compute_with_gaps(symbol,tf,bars,source,observed,now,gaps)
+    })
+}
+
 async fn handle(s: &Arc<Shared>, req: Request) {
     let kind = req.kind();
     let started = std::time::Instant::now();
@@ -4422,9 +4444,9 @@ async fn handle_inner(s: &Arc<Shared>, req: Request, force: bool) {
                 };
                 let now = chrono::Utc::now().timestamp();
                 let jobs = s.jobs.clone();
+                let reports = s.reports.clone();
                 tokio::task::spawn_blocking(move || {
-                    let _job = crate::perf::JobTimer::new(&jobs, "StudioSeason");
-                    tr_data::studio_season::compute_with_gaps(&symbol, tf, &bars, &source, observed.min(now), now, &gaps)
+                    cached_season_report(&reports, &jobs, &symbol, tf, &bars, &source, observed.min(now), now, &gaps)
                 }).await?.map_err(anyhow::Error::msg)
             }.await.map_err(|e| format!("{e:#}"));
             send(Response::StudioSeason { pane, generation, result });
@@ -7695,6 +7717,36 @@ mod tests {
         }
     }
 
+    #[test]
+    fn season_cache_reuses_arc_and_invalidates_corrections_clocks_source_and_gaps() {
+        let cache=tr_data::report_cache::ReportCache::new(16);
+        let jobs=crate::perf::JobLog::default();
+        let mut bars=tr_perf::fixtures::season_evidence(35);
+        let now=bars.last().unwrap().ts+300;
+        let a=cached_season_report(&cache,&jobs,"AAPL",Timeframe::M5,&bars,"test",now,now,&[]).unwrap();
+        let b=cached_season_report(&cache,&jobs,"AAPL",Timeframe::M5,&bars,"test",now,now,&[]).unwrap();
+        assert!(Arc::ptr_eq(&a,&b));
+        let same_day=cached_season_report(&cache,&jobs,"AAPL",Timeframe::M5,&bars,"test",now,now+1,&[]).unwrap();
+        assert!(Arc::ptr_eq(&a,&same_day));
+        let cached_bars:Vec<_>=bars.iter().map(|b|b.with_provenance(tr_core::Provenance::Cached)).collect();
+        let cached=cached_season_report(&cache,&jobs,"AAPL",Timeframe::M5,&cached_bars,"test",now,now,&[]).unwrap();
+        assert!(!Arc::ptr_eq(&a,&cached));
+        assert_eq!(cached.provenance,tr_core::Provenance::Cached);
+        for (source,observed,calendar,gaps) in [
+            ("other",now,now,vec![]), ("test",now-1,now,vec![]),
+            ("test",now,now+86400,vec![]), ("test",now,now,vec![(bars[78].ts,bars[79].ts)]),
+        ] {
+            let c=cached_season_report(&cache,&jobs,"AAPL",Timeframe::M5,&bars,source,observed,calendar,&gaps).unwrap();
+            assert!(!Arc::ptr_eq(&a,&c));
+        }
+        bars[2].close+=0.01;
+        let c=cached_season_report(&cache,&jobs,"AAPL",Timeframe::M5,&bars,"test",now,now,&[]).unwrap();
+        assert!(!Arc::ptr_eq(&a,&c));
+        // Even an excluded pending observation must be refused before a cached report can be reused.
+        bars.last_mut().unwrap().provenance=tr_core::Provenance::Sample;
+        assert!(cached_season_report(&cache,&jobs,"AAPL",Timeframe::M5,&bars,"test",now-1,now,&[]).is_err());
+    }
+
     #[tokio::test]
     async fn studio_season_uses_sourced_intraday_and_refuses_sample_without_fetching() {
         for sample in [false, true] {
@@ -7736,7 +7788,7 @@ mod tests {
         let Response::StudioSeason { generation, result, .. } = *response else { panic!("season report") };
         assert_eq!(generation, 11);
         let report = result.unwrap();
-        let lens = report.or_lens.unwrap();
+        let lens = report.or_lens.as_ref().unwrap();
         assert_eq!(lens.provenance, tr_core::Provenance::Cached);
         assert_eq!(lens.sessions, 3);
         assert_eq!(lens.observed_at, report.observed_at);

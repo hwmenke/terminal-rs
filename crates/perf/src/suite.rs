@@ -160,6 +160,20 @@ pub fn all(scale: Scale) -> Vec<Case> {
         assert!(r.cell(0, 12, 0).all_mean.is_none());
         r.cells.iter().map(|c| c.selected.len()).sum()
     });
+    let season = fixtures::season_evidence(if full { 120 } else { 40 });
+    let observed = season.last().unwrap().ts + 300;
+    add!("studio.season_evidence_120d_5m", move || {
+        let r = bb(tr_data::studio_season::compute_at("AAPL US Equity", Timeframe::M5, bb(&season), "benchmark fixture only", observed, observed).unwrap());
+        let e = r.evidence.as_ref().unwrap();
+        let sessions = if full {120} else {40};
+        assert_eq!((r.bars,e.expected_bars,e.sessions,e.grid_sessions), (sessions*78,sessions*78,sessions,sessions));
+        assert_eq!(e.family_size(),468);
+        assert_eq!(e.closed_thru,observed);
+        assert!(e.cells[..78].iter().all(|c| c.inference.n==sessions && c.inference.interval.is_some() && c.inference.p.is_some()));
+        assert!(e.cells[78..].iter().all(|c| c.inference.n<30 && c.q==1. && c.inference.p.is_none()));
+        assert!(e.cells.iter().all(|c| c.q.is_finite() && (0. ..=1.).contains(&c.q)));
+        e.cells.iter().map(|c|c.inference.n).sum()
+    });
     let by_ps = (0..117).map(|i| if i % 4 == 0 { 1. } else { (i as f64 + 1.) / 1170. }).collect::<Vec<_>>();
     add!("nulls.by_117", move || {
         let q = bb(nulls::benjamini_yekutieli(bb(&by_ps)));

@@ -2019,7 +2019,7 @@ impl TerminalApp {
                     if let Some(PaneKind::StudioSeason(s)) =
                         self.panes.iter_mut().find(|p| p.id == pane).map(|p| &mut p.kind)
                     {
-                        s.accept(generation, result);
+                        s.accept_shared(generation, result);
                     }
                 }
                 Response::Stats { pane, generation, result } => {

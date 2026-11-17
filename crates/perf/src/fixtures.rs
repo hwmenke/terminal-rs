@@ -117,3 +117,19 @@ pub fn or_lens(sessions: usize) -> Vec<Bar> {
     }
     out
 }
+
+/// Dev-only 5m evidence fixture; 120 full native sessions, varying clock effects.
+pub fn season_evidence(sessions: usize) -> Vec<Bar> {
+    let mut date = "2026-01-05".parse().unwrap();
+    let mut out = Vec::new();
+    for s in 0..sessions {
+        for (k, ts) in intraday::regular_opens(date, Timeframe::M5).into_iter().enumerate() {
+            let effect = 0.0002 * (k as f64 * 0.15).cos();
+            let noise = 0.001 * (s as f64 * 1.7 + k as f64 * 0.3).sin();
+            let close = 100. * (1. + effect + noise);
+            out.push(Bar::new(ts,100.,100.2,99.8,close,1000.+k as f64).with_provenance(Provenance::Real));
+        }
+        date = calendar::next_session(date);
+    }
+    out
+}

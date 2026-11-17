@@ -1,4 +1,6 @@
 //! Verified calendar seasonality. Returns are fractions, never annualised estimates.
+mod evidence;
+pub use evidence::*;
 mod or_lens;
 pub use or_lens::*;
 use std::collections::BTreeMap;
@@ -102,6 +104,7 @@ pub struct ForwardCompare {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct SeasonReport {
+    pub evidence: Option<SeasonEvidence>,
     pub or_lens: Option<OrLens>,
     pub or_unavailable: Option<String>,
     pub symbol: String,
@@ -158,6 +161,33 @@ fn month_sessions(d: NaiveDate) -> Vec<NaiveDate> {
     out
 }
 
+/// Validate the complete source input before filtering, digesting or cache reuse.
+pub fn validate_input(tf: Timeframe, input: &[Bar]) -> Result<(), String> {
+    parse_timeframe(tf.label())?;
+    require_research_bars(input, "Seasonality")?;
+    crate::vault::research_bars(input, None)?;
+    let mut previous_date = None;
+    for b in input {
+        let d = date(b.ts)?;
+        if b.volume < 0. || b.high < b.open.max(b.close) || b.low > b.open.min(b.close) || b.low > b.high {
+            return Err("SEASON refused: invalid archived OHLCV".into());
+        }
+        if tf == Timeframe::D1 {
+            if !is_session(d) {
+                return Err(format!("SEASON refused: daily timestamp {d} is not a US cash session"));
+            }
+            if previous_date == Some(d) {
+                return Err("SEASON refused: duplicate daily session".into());
+            }
+            previous_date = Some(d);
+        }
+        if tf.is_intraday() && crate::intraday::in_regular_session(b.ts) && regular_bucket(tf,b.ts) != Some(b.ts) {
+            return Err("SEASON refused: intraday timestamps must match the New York session grid".into());
+        }
+    }
+    Ok(())
+}
+
 /// A deterministic report at an explicit observation clock. All inputs pass the
 /// research gate before even pending/out-of-session bars are removed.
 pub fn compute(symbol: &str, tf: Timeframe, input: &[Bar], source: &str, now: i64) -> Result<SeasonReport, String> {
@@ -188,10 +218,8 @@ pub fn compute_with_gaps(
     now: i64,
     gaps: &[(i64, i64)],
 ) -> Result<SeasonReport, String> {
-    parse_timeframe(tf.label())?;
-    require_research_bars(input, "Seasonality")?;
+    validate_input(tf, input)?;
     let provenance = Bar::provenance(input);
-    provenance.require_verified("Seasonality")?;
     let current = DateTime::<Utc>::from_timestamp(observed, 0).ok_or("SEASON refused: invalid observation clock")?;
     date(now)?;
     let today = tr_core::ny::civil(now).date();
@@ -236,17 +264,26 @@ pub fn compute_with_gaps(
     if bars.len() < 2 {
         return Err("SEASON needs at least two verified closed bars; sample/display prices are never used.".into());
     }
+    // Reuse each date's expected grid instead of rebuilding it for every bar.
+    let mut session_opens = BTreeMap::new();
+    if tf.is_intraday() {
+        for d in &dates {
+            session_opens.entry(*d).or_insert_with(|| regular_opens(*d, tf));
+        }
+    }
     // A break in the expected session sequence invalidates crossing returns.
     let mut breaks = vec![0usize; bars.len()];
     for i in 1..bars.len() {
         let adjacent = if tf == Timeframe::D1 {
             next_session(dates[i - 1]) == dates[i]
         } else {
-            let opens = regular_opens(dates[i - 1], tf);
-            let next = opens
-                .into_iter()
-                .find(|t| *t > bars[i - 1].ts)
-                .or_else(|| regular_opens(next_session(dates[i - 1]), tf).first().copied());
+            let opens = &session_opens[&dates[i - 1]];
+            let k = opens.binary_search(&bars[i - 1].ts).expect("admitted grid bucket");
+            let next = opens.get(k + 1).copied().or_else(|| {
+                let next_date = next_session(dates[i - 1]);
+                session_opens.get(&next_date).and_then(|v| v.first().copied())
+                    .or_else(|| regular_opens(next_date, tf).first().copied())
+            });
             next == Some(bars[i].ts)
         };
         let adjacent = adjacent && !crate::studio_dist::spans_gap(gaps, bars[i - 1].ts, bars[i].ts);
@@ -273,11 +310,12 @@ pub fn compute_with_gaps(
     let mut weeks = vec![Vec::new(); 5];
     let mut turn = vec![Vec::new(); 2];
     let mut month_data: BTreeMap<(i32, u32), Vec<usize>> = BTreeMap::new();
+    let mut month_grids = BTreeMap::new();
     for (i, d) in dates.iter().enumerate() {
         if let Some(r) = returns[i] {
             weekdays[d.weekday().num_days_from_monday() as usize].push(r);
             weeks[((d.day() - 1) / 7) as usize].push(r);
-            let sessions = month_sessions(*d);
+            let sessions = month_grids.entry((d.year(), d.month())).or_insert_with(|| month_sessions(*d));
             let rank = sessions.iter().position(|day| day == d).unwrap();
             // Standard turn-of-month window (Lakonishok–Smidt): the last session
             // of the month (−1) through the third session of the month (+3).
@@ -311,9 +349,16 @@ pub fn compute_with_gaps(
             sessions.entry(*d).or_default().push(i);
         }
         let mut volumes = vec![None; bars.len()];
+        let step = (tf.seconds() / 60) as usize;
+        let mut clock_indices = vec![Vec::new(); 390_usize.div_ceil(step)];
+        for (i, b) in bars.iter().enumerate() {
+            let wall = tr_core::ny::civil(b.ts);
+            let k = (wall.hour() * 60 + wall.minute() - 570) as usize / step;
+            clock_indices[k].push(i);
+        }
         for (d, indices) in sessions {
-            let expected = regular_opens(d, tf);
-            if indices.len() == expected.len() && indices.iter().zip(&expected).all(|(i, ts)| bars[*i].ts == *ts) {
+            let expected = &session_opens[&d];
+            if indices.len() == expected.len() && indices.iter().zip(expected).all(|(i, ts)| bars[*i].ts == *ts) {
                 let total: f64 = indices.iter().map(|i| bars[*i].volume).sum();
                 if total > 0.0 && total.is_finite() {
                     for i in indices {
@@ -327,11 +372,7 @@ pub fn compute_with_gaps(
             let mut rs = Vec::new();
             let mut vs = Vec::new();
             let mut days = vec![Vec::new(); 5];
-            for (i, b) in bars.iter().enumerate() {
-                let wall = tr_core::ny::civil(b.ts);
-                if wall.hour() * 60 + wall.minute() != minute {
-                    continue;
-                }
+            for &i in &clock_indices[(minute - 570) as usize / step] {
                 if let Some(r) = returns[i] {
                     rs.push(r);
                     days[dates[i].weekday().num_days_from_monday() as usize].push(r);
@@ -398,7 +439,9 @@ pub fn compute_with_gaps(
         Some(Err(e)) => (None, Some(e)),
         None => (None, Some("OR Lens requires native 30m US cash bars".into())),
     };
+    let evidence = tf.is_intraday().then(|| evidence::build(tf, &bars, &dates, &returns, &gaps));
     Ok(SeasonReport {
+        evidence,
         or_lens,
         or_unavailable,
         symbol: symbol.into(),

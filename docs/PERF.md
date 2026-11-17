@@ -430,3 +430,52 @@ Final validation:
 Remaining limits are provider/vault depth and corporate-action evidence,
 asymptotic bandwidth sensitivity, exploration outside the displayed family, and
 the distinction between headless CPU cost and GPU/whole-desk presentation.
+
+## Slice 3 / master slice 0: Season evidence ribbon
+
+New exact compute case `studio.season_evidence_120d_5m` builds the complete
+SEASON report, including admission, legacy summaries, all 468 HAC/BY cells and
+precomputed heat/ribbon bounds. Ceiling: **40 ms**. Its dev-only native fixture
+contains 120 full 5m sessions / 9,360 bars; assertions require exact actual and
+expected coverage, all 78 ALL-clock intervals/p-values, 390 honestly low-n weekday
+members at p=1/q=1, the full fixed 6B family and actual CLOSED THRU. The report builder reuses each date/month calendar grid and groups clock indices
+in one pass, preserving legacy observation order and arithmetic. Smoke scale
+retains 40 sessions and still exercises real inference. Generated fixture data
+is never supplied to application analysis.
+
+The existing ignored release `perf_gate_paint_studios` additionally measures
+`paint.studio_season.{steady,hover}` with these ceilings:
+
+| Metric | Ceiling |
+| --- | ---: |
+| UI | 1.2 ms |
+| Tessellation | 0.8 ms |
+| Total | 2.0 ms |
+
+The 1440×1200 evidence pane is admitted through normal `SeasonPane::accept`;
+120 frames per mode follow warmup. Hover respects egui's actual tooltip delay,
+then moves inside a visible ALL cell with the MathCard open. Guards require the
+coverage receipt, six row labels, fixed family, printed key, sample-size ticks,
+ALL curve, all 78 actual interval stems and open MathCard text. Ordinary tests
+also exercise 320/1440-point finite tessellation and both presentation modes.
+The chart and studio gates retain exact-ID checks and merge their paint results
+without overwriting one another. Existing ceilings are unchanged.
+
+Verification in the current workspace environment is **blocked before Cargo
+compilation**. The rustup launcher has no installed toolchain; `/usr/bin/cargo`
+(1.85.1) reports `no matching package named serde found` in offline mode because
+there is no local crates.io registry cache. The installed compiler also predates
+the app's egui 0.36 toolchain requirement. All three required commands were
+attempted offline: `cargo test --workspace --offline`, `cargo build --release
+--offline`, and `scripts/perf-gate.sh`; each exited 101 at dependency resolution.
+No new timing measurements or workspace pass counts are available. The reviewed
+baseline is deliberately unchanged; historical tables above do not measure this
+slice. New compute/paint medians and p95 versus the stated ceilings must be
+recorded once the toolchain/cache is restored.
+
+The dependency-free `studio_inference.rs` was compiled directly with the installed
+system rustc and its five tests passed (**5 passed / 0 failed / 0 ignored**),
+including two new join-reset/threshold tests. This checks only that helper, not
+the full data or UI implementation. Rust parser checks of the changed modules
+and `git diff --check` also pass; they do not substitute for compilation or the
+required release gates. No dependency or lockfile changes were made.
