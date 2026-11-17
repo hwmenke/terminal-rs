@@ -1,5 +1,6 @@
 //! Distribution Studio pane and worker-side report assembly. All price loading is off the UI thread.
 pub(super) mod regimes;
+pub(super) mod shape;
 use super::{PaneKind, TerminalApp};
 use crate::theme::{self, dp, mono, muted, text};
 use crate::{congress_view::Action, dock::PaneId, worker::Request};
@@ -22,6 +23,17 @@ pub struct DistPane {
     pub rotation: Option<Arc<RegimeRotation>>,
     pub rotation_loading: bool,
     pub rotation_error: Option<String>,
+    pub shape_tab: bool,
+    pub shape_evidence: bool,
+    pub horizon: usize,
+    pub overlap: bool,
+    pub thresholds: [f64; 3],
+    pub shape: Option<Arc<tr_data::studio_shape::Shape>>,
+    pub shape_loading: bool,
+    pub shape_error: Option<String>,
+    pub shape_intervals: Option<Arc<tr_data::studio_shape::Intervals>>,
+    pub shape_boot_loading: bool,
+    pub shape_boot_error: Option<String>,
     best_k: usize,
 }
 impl DistPane {
@@ -39,11 +51,72 @@ impl DistPane {
             rotation: None,
             rotation_loading: false,
             rotation_error: None,
+            shape_tab: false,
+            shape_evidence: true,
+            horizon: 1,
+            overlap: false,
+            thresholds: [0.01, 0.02, 0.05],
+            shape: None,
+            shape_loading: false,
+            shape_error: None,
+            shape_intervals: None,
+            shape_boot_loading: false,
+            shape_boot_error: None,
             best_k: 5,
+        }
+    }
+    fn clear_shape(&mut self) {
+        self.shape = None;
+        self.shape_loading = false;
+        self.shape_error = None;
+        self.shape_intervals = None;
+        self.shape_boot_loading = false;
+        self.shape_boot_error = None;
+    }
+    pub fn accept_shape(&mut self, generation: u64, result: Result<Arc<tr_data::studio_shape::Shape>, String>) {
+        if generation != self.generation || self.report.is_none() {
+            return;
+        }
+        self.shape_loading = false;
+        match result {
+            Ok(s)
+                if s.horizon == self.horizon
+                    && s.overlap == self.overlap
+                    && s.thresholds.iter().map(|t| t.level).eq(self.thresholds)
+                    && self.report.as_ref().is_some_and(|r| s.seed==tr_data::studio_shape::key_with_thresholds(r,self.horizon,self.overlap,&self.thresholds)) =>
+            {
+                self.shape = Some(s);
+                self.shape_error = None;
+            }
+            Ok(_) => {}
+            Err(e) => {
+                self.shape = None;
+                self.shape_error = Some(e);
+            }
+        }
+    }
+    pub fn accept_shape_bootstrap(
+        &mut self,
+        generation: u64,
+        key: u64,
+        result: Result<Arc<tr_data::studio_shape::Intervals>, String>,
+    ) {
+        if generation != self.generation || self.shape.as_ref().is_none_or(|s| s.seed != key) {
+            return;
+        }
+        self.shape_boot_loading = false;
+        match result {
+            Ok(b) if b.seed==key => self.shape_intervals = Some(b),
+            Ok(_) => {},
+            Err(e) => {
+                self.shape_intervals = None;
+                self.shape_boot_error = Some(e);
+            }
         }
     }
     pub fn request(&mut self, pane: PaneId, worker: &crate::worker::Worker) {
         self.generation += 1;
+        self.clear_shape();
         self.report = None;
         self.rotation = None;
         self.rotation_loading = false;
@@ -67,6 +140,7 @@ impl DistPane {
         if self.loading || self.report.is_some() {
             self.generation += 1;
         }
+        self.clear_shape();
         self.report = None;
         self.rotation = None;
         self.rotation_loading = false;
@@ -94,6 +168,7 @@ impl DistPane {
             return;
         }
         self.loading = false;
+        self.clear_shape();
         self.report = None;
         self.rotation = None;
         self.rotation_loading = false;
@@ -168,6 +243,28 @@ pub(crate) async fn build_report(
 }
 
 impl TerminalApp {
+    pub(super) fn set_shape_horizon(&mut self, symbol: Option<&str>, h: usize) {
+        let focused = self.focused_visible();
+        if symbol.is_none() {
+            if let Some(PaneKind::StudioDist(p)) =
+                self.panes.iter_mut().find(|p| Some(p.id) == focused).map(|p| &mut p.kind)
+            {
+                p.horizon = h;
+                p.shape_tab = true;
+                if p.report.is_some() {
+                    p.generation += 1;
+                }
+                p.clear_shape();
+                p.rotation_loading = false;
+                return;
+            }
+        }
+        let sym = symbol.map(str::to_owned).or_else(|| self.focused_symbol()).unwrap_or_default();
+        let mut pane = DistPane::new(sym, Timeframe::D1, Window::All);
+        pane.horizon = h;
+        pane.shape_tab = true;
+        self.open_panel(PaneKind::StudioDist(Box::new(pane)));
+    }
     pub(super) fn open_studio_dist(&mut self, symbol: Option<&str>, timeframe: Timeframe) {
         let symbol = symbol.map(|s| tr_data::security(s).key()).or_else(|| self.focused_symbol()).unwrap_or_default();
         self.status = "Distribution Studio: log returns, tails, drawdowns and volatility regimes".into();
@@ -216,11 +313,61 @@ impl TerminalApp {
         }
         studio_states(ui, pane.loading, pane.error.as_deref(), None);
         if let Some(r) = &pane.report {
-            ui.horizontal(|ui| {
-                ui.selectable_value(&mut pane.regimes_tab, false, "Overview");
-                ui.selectable_value(&mut pane.regimes_tab, true, "Regimes");
-            });
-            if pane.regimes_tab {
+            let mut tab = if pane.shape_tab { 2 } else { usize::from(pane.regimes_tab) };
+            super::studio_frame::tabs(ui, &mut tab, &["Overview", "Regimes", "Shape"]);
+            pane.shape_tab = tab == 2;
+            pane.regimes_tab = tab == 1;
+            if pane.shape_tab {
+                super::studio_frame::evidence_mode(ui, &mut pane.shape_evidence);
+                let mut changed = false;
+                ui.horizontal_wrapped(|ui| {
+                    ui.label("Horizon / bars");
+                    changed |= ui.add(egui::DragValue::new(&mut pane.horizon).range(1..=250)).changed();
+                    changed |= ui.checkbox(&mut pane.overlap, "Overlapping").changed();
+                    ui.label("|move| thresholds (log-return units)");
+                    for level in &mut pane.thresholds {
+                        changed |= ui.add(egui::DragValue::new(level).range(0.0..=10.).speed(0.001)).changed();
+                    }
+                });
+                if changed {
+                    pane.generation += 1;
+                    pane.shape = None;
+                    pane.shape_loading = false;
+                    pane.shape_error = None;
+                    pane.shape_intervals = None;
+                    pane.shape_boot_loading = false;
+                    pane.shape_boot_error = None;
+                    pane.rotation_loading = false;
+                }
+                if pane.shape.is_none() && !pane.shape_loading && pane.shape_error.is_none() {
+                    pane.shape_loading = true;
+                    self.worker.send(Request::StudioShape {
+                        pane: id,
+                        generation: pane.generation,
+                        report: Arc::new(r.clone()),
+                        horizon: pane.horizon,
+                        overlap: pane.overlap,
+                        thresholds: pane.thresholds,
+                    });
+                }
+                studio_states(ui, pane.shape_loading, pane.shape_error.as_deref(), None);
+                if let Some(s) = &pane.shape {
+                    if pane.shape_intervals.is_none() && !pane.shape_boot_loading && pane.shape_boot_error.is_none() {
+                        pane.shape_boot_loading = true;
+                        self.worker.send(Request::StudioShapeBootstrap {
+                            pane: id,
+                            generation: pane.generation,
+                            input: s.clone(),
+                        });
+                    }
+                    if let Some(e) = &pane.shape_boot_error {
+                        ui.label(format!("Bootstrap unavailable: {e}"));
+                    }
+                    egui::ScrollArea::vertical().id_salt((id, "dist-shape")).show(ui, |ui| {
+                        shape::view_mode(ui, r, s, pane.shape_intervals.as_deref(), pane.shape_evidence);
+                    });
+                }
+            } else if pane.regimes_tab {
                 if pane.rotation.is_none() && !pane.rotation_loading && pane.rotation_error.is_none() {
                     if let Some(input) = &r.regime.rotation_input {
                         pane.rotation_loading = true;
@@ -309,7 +456,7 @@ fn report_view(ui: &mut Ui, id: PaneId, r: &Report, best_k: &mut usize) {
 fn date(ts: i64) -> String {
     tr_data::stats::bar_date(ts)
 }
-fn stamp(ts: i64) -> String {
+pub(super) fn stamp(ts: i64) -> String {
     chrono::DateTime::from_timestamp(ts, 0)
         .map(|t| t.format("%Y-%m-%d %H:%M UTC").to_string())
         .unwrap_or_else(|| "—".into())
@@ -864,6 +1011,48 @@ pub(crate) fn gap_warning(ui: &mut Ui, gaps: &[(i64, i64)]) {
 mod tests {
     use super::*;
     use crate::layouts::PaneSettings;
+    #[test]
+    fn shape_generation_seed_sample_and_refusal_gates() {
+        let r = dist::compute("AAPL", &tr_perf::fixtures::regime_walk(500), Timeframe::D1, Window::All, "unit", None)
+            .unwrap();
+        let shape = Arc::new(tr_data::studio_shape::compute(&r, 1, false).unwrap());
+        let ci = Arc::new(shape.bootstrap());
+        let mut p = DistPane::new("AAPL", Timeframe::D1, Window::All);
+        p.generation = 2;
+        p.accept(2, Ok(r));
+        p.shape_loading = true;
+        p.accept_shape(1, Ok(shape.clone()));
+        assert!(p.shape_loading && p.shape.is_none());
+        p.accept_shape(2, Ok(shape.clone()));
+        p.shape_boot_loading = true;
+        p.accept_shape_bootstrap(1, shape.seed, Ok(ci.clone()));
+        p.accept_shape_bootstrap(2, shape.seed + 1, Ok(ci.clone()));
+        assert!(p.shape_boot_loading && p.shape_intervals.is_none());
+        p.accept_shape_bootstrap(2, shape.seed, Ok(ci.clone()));
+        assert!(p.shape_intervals.is_some());
+        p.accept(2, Err("refused".into()));
+        assert!(p.shape.is_none() && p.shape_intervals.is_none());
+        p.accept_shape(2, Ok(shape.clone()));
+        assert!(p.shape.is_none());
+        p.deny_sample();
+        p.accept_shape_bootstrap(2, shape.seed, Ok(ci));
+        assert!(p.shape_intervals.is_none());
+    }
+    #[test]
+    fn shape_horizon_command_and_saved_defaults() {
+        assert_eq!(
+            crate::command::parse("DIST H=5"),
+            Some(crate::command::Command::Function(crate::command::Function::StudioDistHorizon(5)))
+        );
+        let mut app = super::super::tests::test_app();
+        app.apply(crate::command::Function::StudioDistHorizon(5));
+        assert!(app.panes.iter().any(|p| matches!(&p.kind,PaneKind::StudioDist(p) if p.shape_tab&&p.horizon==5)));
+        let settings: PaneSettings =
+            serde_json::from_str(r#"{"StudioDist":{"symbol":"AAPL","timeframe":"D1","window":"All"}}"#).unwrap();
+        let PaneKind::StudioDist(p) = PaneKind::from_settings(settings) else { panic!() };
+        assert_eq!(p.horizon, 1);
+        assert!(!p.overlap && !p.shape_tab);
+    }
     #[test]
     fn rotation_generation_and_seed_gate() {
         let r = dist::compute("AAPL", &tr_perf::fixtures::regime_walk(1500), Timeframe::D1, Window::All, "unit", None)

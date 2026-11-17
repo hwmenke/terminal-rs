@@ -200,6 +200,19 @@ pub enum Request {
         symbol: String,
         tf: Timeframe,
     },
+    StudioShape {
+        pane: PaneId,
+        generation: u64,
+        report: Arc<tr_data::studio_dist::Report>,
+        horizon: usize,
+        overlap: bool,
+        thresholds: [f64; 3],
+    },
+    StudioShapeBootstrap {
+        pane: PaneId,
+        generation: u64,
+        input: Arc<tr_data::studio_shape::Shape>,
+    },
     StudioDistRotation {
         pane: PaneId,
         generation: u64,
@@ -555,6 +568,8 @@ impl Request {
             Self::TstackTune { .. } => "TstackTune",
             Self::StudioCorr { .. } => "StudioCorr",
             Self::StudioSeason { .. } => "StudioSeason",
+            Self::StudioShape { .. } => "StudioShape",
+            Self::StudioShapeBootstrap { .. } => "StudioShapeBootstrap",
             Self::StudioDistRotation { .. } => "StudioDistRotation",
             Self::StudioSeasonBand { .. } => "StudioSeasonBand",
             Self::Stats { .. } => "Stats",
@@ -838,6 +853,17 @@ pub enum Response {
         pane: PaneId,
         generation: u64,
         result: Result<Arc<tr_data::studio_season::SeasonReport>, String>,
+    },
+    StudioShape {
+        pane: PaneId,
+        generation: u64,
+        result: Result<Arc<tr_data::studio_shape::Shape>, String>,
+    },
+    StudioShapeBootstrap {
+        pane: PaneId,
+        generation: u64,
+        key: u64,
+        result: Result<Arc<tr_data::studio_shape::Intervals>, String>,
     },
     StudioDistRotation {
         pane: PaneId,
@@ -4486,6 +4512,61 @@ async fn handle_inner(s: &Arc<Shared>, req: Request, force: bool) {
             }.await.map_err(|e| format!("{e:#}"));
             send(Response::StudioSeason { pane, generation, result });
         }
+        Request::StudioShape { pane, generation, report, horizon, overlap, thresholds } => {
+            let reports = s.reports.clone();
+            let jobs = s.jobs.clone();
+            let result = if s.sample_mode() {
+                Err("DIST Shape: no real data in sample mode".into())
+            } else {
+                tokio::task::spawn_blocking(move || {
+                    report.provenance.require_verified("DIST Shape")?;
+                    let seed = tr_data::studio_shape::key_with_thresholds(&report, horizon, overlap, &thresholds);
+                    let mut cache_key = tr_data::report_cache::ReportKey::new(
+                        "dist.shape.v1",
+                        &report.symbol,
+                        report.timeframe,
+                        &report.source,
+                        &[],
+                        "FD KDE horizon closed returns",
+                    );
+                    cache_key.inputs = seed;
+                    reports.get_or_compute(cache_key, || {
+                        let _job = crate::perf::JobTimer::new(&jobs, "StudioShape");
+                        tr_data::studio_shape::compute_with_thresholds(&report, horizon, overlap, &thresholds)
+                    })
+                })
+                .await
+                .unwrap_or_else(|e| Err(format!("Shape task: {e}")))
+            };
+            send(Response::StudioShape { pane, generation, result });
+        }
+        Request::StudioShapeBootstrap { pane, generation, input } => {
+            let key = input.seed;
+            let reports = s.reports.clone();
+            let jobs = s.jobs.clone();
+            let result = if s.sample_mode() {
+                Err("DIST Shape bootstrap: no real data in sample mode".into())
+            } else {
+                tokio::task::spawn_blocking(move || {
+                    let mut cache_key = tr_data::report_cache::ReportKey::new(
+                        "dist.shape.bootstrap.v1",
+                        "",
+                        tr_core::Timeframe::D1,
+                        "",
+                        &[],
+                        "500 stationary draws 90% percentile",
+                    );
+                    cache_key.inputs = key;
+                    reports.get_or_compute(cache_key, || {
+                        let _job = crate::perf::JobTimer::new(&jobs, "StudioShapeBootstrap");
+                        Ok::<_, String>(input.bootstrap())
+                    })
+                })
+                .await
+                .unwrap_or_else(|e| Err(format!("Shape bootstrap task: {e}")))
+            };
+            send(Response::StudioShapeBootstrap { pane, generation, key, result });
+        }
         Request::StudioDistRotation { pane, generation, symbol, timeframe, source, input } => {
             let key = input.seed;
             let reports = s.reports.clone();
@@ -7792,6 +7873,79 @@ mod tests {
                 assert_eq!(*held_spy, spy);
             }
         }
+    }
+
+    #[tokio::test]
+    async fn studio_shape_stages_are_cached_and_refuse_sample_without_fetch() {
+        let r = Arc::new(
+            tr_data::studio_dist::compute(
+                "AAPL",
+                &tr_perf::fixtures::regime_walk(500),
+                Timeframe::D1,
+                tr_data::studio_dist::Window::All,
+                "fixture",
+                None,
+            )
+            .unwrap(),
+        );
+        let provider = vault_provider(vault_day("2026-11-09"));
+        let (s, rx) = shared(provider.clone(), Some(BarCache::open_in_memory().unwrap()));
+        let mut prev = None;
+        let mut prev_ci = None;
+        for generation in [1, 2] {
+            handle(
+                &s,
+                Request::StudioShape {
+                    pane: 19,
+                    generation,
+                    report: r.clone(),
+                    horizon: 1,
+                    overlap: false,
+                    thresholds: [0.01, 0.02, 0.05],
+                },
+            )
+            .await;
+            let Response::WhatsNews { response, .. } = rx.try_recv().unwrap() else { panic!() };
+            let Response::StudioShape { result, .. } = *response else { panic!() };
+            let shape = result.unwrap();
+            if let Some(p) = prev {
+                assert!(Arc::ptr_eq(&p, &shape));
+            }
+            prev = Some(shape.clone());
+            handle(&s, Request::StudioShapeBootstrap { pane: 19, generation, input: shape }).await;
+            let Response::WhatsNews { response, .. } = rx.try_recv().unwrap() else { panic!() };
+            let Response::StudioShapeBootstrap { result, .. } = *response else { panic!() };
+            let b = result.unwrap();
+            assert_eq!(b.draws, 500);
+            if let Some(p) = prev_ci {
+                assert!(Arc::ptr_eq(&p, &b));
+            }
+            prev_ci = Some(b);
+        }
+        assert_eq!(provider.calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+        let mut provider = vault_provider(vault_day("2026-11-09"));
+        Arc::get_mut(&mut provider).unwrap().sample = true;
+        let (s, rx) = shared(provider.clone(), Some(BarCache::open_in_memory().unwrap()));
+        handle(
+            &s,
+            Request::StudioShape {
+                pane: 19,
+                generation: 3,
+                report: r,
+                horizon: 1,
+                overlap: false,
+                thresholds: [0.01, 0.02, 0.05],
+            },
+        )
+        .await;
+        let Response::WhatsNews { response, .. } = rx.try_recv().unwrap() else { panic!() };
+        let Response::StudioShape { result, .. } = *response else { panic!() };
+        assert!(result.unwrap_err().contains("sample"));
+        handle(&s, Request::StudioShapeBootstrap { pane: 19, generation: 3, input: prev.unwrap() }).await;
+        let Response::WhatsNews { response, .. } = rx.try_recv().unwrap() else { panic!() };
+        let Response::StudioShapeBootstrap { result, .. } = *response else { panic!() };
+        assert!(result.unwrap_err().contains("sample"));
+        assert_eq!(provider.calls.load(std::sync::atomic::Ordering::SeqCst), 0);
     }
 
     #[tokio::test]

@@ -648,3 +648,79 @@ Limits: label rotation assumes stationarity, compacts classified returns and has
 wrap/vault seams; small p can reflect volatility persistence, not directional
 edge. HAC remains bandwidth-sensitive and asymptotic; Wilson assumes independent
 signs. Provider coverage and corporate actions remain upstream limitations.
+
+## Slice 3: DIST Shape
+
+`studio.shape_5k` measures the entire Shape analysis over 5,000 admitted closed
+returns from the existing dev-only aperiodic `regime_walk` fixture. Smoke retains
+1,500 returns. Admissions assert complete histogram mass, 12–80 bins, 128 density
+grid points, an available bandwidth, sorted ladder, both-tail ES≥VaR and at least
+1,250 causal rolling windows. The fixture remains confined to the perf/dev graph.
+
+`studio.shape_bootstrap_5k_x500` measures 500 stationary-bootstrap draws and the
+eight tail intervals as the separately delivered second stage. Admissions require
+all eight finite ordered intervals and exactly 500 draws. Shape's first response
+contains no bootstrap computation. Both worker stages use immutable cached Arcs,
+with no loading or provider work in the view. Cache keys include the closed-bars
+digest, gaps and Shape controls; obsolete generations/input seeds are refused.
+
+New paint cases are `paint.studio_shape.{steady,hover}.{ui,tess,total}`. They retain
+5,000 observations, all tail rows, typed-threshold comparisons, year summaries,
+histogram/fits, the causal river and printed sequential key. The guard requires
+all sections, at least 12 actual histogram rectangles, more than 1,000 river/key
+rectangles and a real open `dist.shape.scale` MathCard on hover. The 320/1440-point
+geometry test checks finite tessellated vertices. Existing studio retry and exact
+ID-set checks include Shape. Paint scans precomputed geometry only; all sorting,
+binning, horizon construction, scale estimation and inference are worker work.
+
+Ceilings are unchanged from the slice: **45 ms** analysis, **200 ms** bootstrap;
+paint **1.5 ms UI / 0.8 ms tessellation / 2.5 ms total**. Existing budgets and
+`perf/baseline.json` are unchanged; no baseline refresh was performed. Qn was cut
+first under the declared cut order; the year strip and typed thresholds remain.
+The main DIST report stays owned as documented in slice 2; only the new Shape
+and bootstrap reports use the shared cache/Arc path. The inference kit already
+provided stationary-bootstrap resampling, so no duplicate helper was added.
+
+Final workspace validation on 2026-11-16, rustc 1.100.0 stable, offline:
+`cargo test --workspace --offline --no-fail-fast` reports **1,630 passed,
+14 failed, 10 ignored** inside this sandbox. All 14 failures are the existing
+broker/Whats-News HTTP mock tests at `TcpListener::bind(127.0.0.1)` with
+`PermissionDenied`; none are new statistical or UI failures. They were identified
+by the owner as already verified outside the sandbox; this run does not claim a
+new outside-sandbox verification. All **18 new Shape tests pass**: fourteen data
+references/invariants, two pane lifecycle/command/layout tests, one two-stage
+cache/sample-refusal/no-fetch test and one narrow/wide/hover geometry test.
+The original Overview/Regimes, closure, provenance, inference and colour guards
+pass without changing their assertions. Fixture bootstrap intervals bracket their
+point estimates; the implementation does not assume that property universally.
+
+Limits: stationary bootstrap intervals assume stationarity and depend on the
+chosen geometric block length; tail estimates remain sparse even at the n=100
+99% gate. Wilson threshold intervals assume independent events and are not
+valid overlap-robust intervals. The river resets at vault gaps; annualisation is
+nominal. Paint measurements exclude GPU/presentation and whole-desk latency.
+
+Final release gate (report timestamp 2026-11-17 UTC / 2026-11-16 New York), same
+8-core Linux host, stable rustc 1.100.0, calibration **6,092.584 µs**, slack **1**:
+
+| New metric | Median ms | p95 ms | Ceiling ms |
+| --- | ---: | ---: | ---: |
+| `studio.shape_5k` | 18.50609 | 18.62087 | 45 |
+| `studio.shape_bootstrap_5k_x500` | 70.30883 | 70.93694 | 200 |
+| `paint.studio_shape.steady.ui` | 0.29728 | 0.36341 | 1.5 |
+| `paint.studio_shape.steady.tess` | 0.45753 | 0.52108 | 0.8 |
+| `paint.studio_shape.steady.total` | 0.75920 | 0.85661 | 2.5 |
+| `paint.studio_shape.hover.ui` | 0.32871 | 0.45310 | 1.5 |
+| `paint.studio_shape.hover.tess` | 0.46929 | 0.65326 | 0.8 |
+| `paint.studio_shape.hover.total` | 0.79798 | 1.11185 | 2.5 |
+
+`cargo build --release --offline`: **passed**. Final `scripts/perf-gate.sh`:
+**34 compute/data cases passed, 0 failed, 0 harness errors**; **2 release paint
+tests passed, 0 failed, 0 ignored**, checking **135 paint metrics**. All existing
+absolute and relative gates passed without warnings. No ceiling was widened and
+no baseline was recorded. Cargo.lock and the dependency graph are unchanged.
+
+Outside-sandbox re-verification (2026-11-17, box, rustc 1.100.0): `cargo test --workspace`
+**1,644 passed, 0 failed, 10 ignored** (the 14 loopback-bind failures above are sandbox-only);
+`cargo build --release` passed; `scripts/perf-gate.sh` passed (`studio.shape_5k` 20.3 ms / 45,
+`studio.shape_bootstrap_5k_x500` 77.3 ms / 200). Baseline unchanged.

@@ -40,6 +40,7 @@ mod settings_writer;
 mod stats;
 pub(crate) mod studio_corr;
 pub(crate) mod studio_dist;
+pub(crate) mod studio_frame;
 mod studio_season;
 #[cfg(test)]
 mod studio_perf_gate;
@@ -1518,6 +1519,7 @@ impl TerminalApp {
             Command::SymbolFunction(s, Function::Review) => self.open_review(Some(&s)),
             Command::SymbolFunction(s, Function::Desk) => self.open_desk(Some(&s)),
             Command::SymbolFunction(s, Function::Journal(extra)) => self.open_journal(Some(&s), &extra),
+            Command::SymbolFunction(s, Function::StudioDistHorizon(h)) => self.set_shape_horizon(Some(&s), h),
             Command::SymbolFunction(s, Function::StudioDist { timeframe }) => {
                 self.open_studio_dist(Some(&s), timeframe)
             }
@@ -1796,6 +1798,7 @@ impl TerminalApp {
             Function::StudioCorr { spec } => self.open_studio_corr(symbol.as_deref(), &spec),
             Function::StudioSeason { spec } => self.open_studio_season(symbol.as_deref(), &spec),
             Function::Stats { condition, conditional } => self.open_stats(symbol.as_deref(), &condition, conditional),
+            Function::StudioDistHorizon(h) => self.set_shape_horizon(symbol.as_deref(), h),
             Function::StudioDist { timeframe } => self.open_studio_dist(symbol.as_deref(), timeframe),
             Function::Backtest { spec } => self.open_backtest(symbol.as_deref(), &spec),
             Function::IntradayBacktest { spec } => self.open_intraday_backtest(symbol.as_deref(), &spec),
@@ -2013,6 +2016,20 @@ impl TerminalApp {
                         self.panes.iter_mut().find(|p| p.id == pane).map(|p| &mut p.kind)
                     {
                         s.accept_shared(generation, result);
+                    }
+                }
+                Response::StudioShape { pane, generation, result } => {
+                    if let Some(PaneKind::StudioDist(s)) =
+                        self.panes.iter_mut().find(|p| p.id == pane).map(|p| &mut p.kind)
+                    {
+                        s.accept_shape(generation, result);
+                    }
+                }
+                Response::StudioShapeBootstrap { pane, generation, key, result } => {
+                    if let Some(PaneKind::StudioDist(s)) =
+                        self.panes.iter_mut().find(|p| p.id == pane).map(|p| &mut p.kind)
+                    {
+                        s.accept_shape_bootstrap(generation, key, result);
                     }
                 }
                 Response::StudioDistRotation { pane, generation, key, result } => {

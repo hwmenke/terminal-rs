@@ -170,3 +170,72 @@ use sign ink; q≤0.10 adds a neutral outline, while LOW N adds a caution tick.
 There is no heat surface. Tab/row selection is ephemeral; existing saved settings
 remain compatible. Tests pin HAC variances, tie-complete D, Wilson intervals,
 BY membership, exact rotation p/q, calibration and real-data/state gates.
+
+## Shape
+
+Select **Shape**, the third DIST tab, for the distribution of h-bar log returns.
+`DIST H=5` sets the focused DIST pane's horizon and opens Shape (or opens a new
+Shape pane using the focused symbol). Existing `AAPL DIST 15m` commands still open
+DIST with Overview selected. Horizon 1–250 and three absolute move thresholds
+are editable in Shape; overlapping sampling is optional and non-overlapping is
+the default. Controls and tab selection are ephemeral, preserving old workspace
+serialization without adding fields. No provider or archive path changes.
+
+A missing one-bar return resets the horizon anchor. Non-overlapping observations
+sum each complete group of h consecutive returns; incomplete end groups are
+omitted. Overlapping observations sum every trailing h-return group. No horizon
+crosses an UNVERIFIED JOIN. The latest sampled horizon return is the NOW pin;
+its percentile is the empirical right-continuous CDF including ties.
+
+The histogram uses Freedman–Diaconis (1981) width `2 IQR n^(-1/3)` with 12–80
+bins; zero IQR uses 12. Counts retain all observations. Density overlays use a
+128-point grid, padded by four KDE bandwidths. Gaussian KDE uses Silverman (1986)
+`0.9 min(sample_sd, IQR/1.34) n^(-1/5)`. Zero bandwidth is unavailable. Normal uses
+sample sd; the moment-matched Student-t uses population variance and
+`df=4+6/excess`, and is unavailable for nonpositive excess or zero variance.
+Curves are mathematical fits to real observations, never fabricated prices.
+
+The ladder prints type-7 p1/5/10/25/50/75/90/95/99. Scale names are sample sd
+(n−1) and MAD-σ = 1.4826 median absolute deviation about the median (Hampel 1974).
+More than 30% exactly-zero returns prints TICK-QUANTISED and switches the robust
+scale to `sqrt(pi/2) mean(abs(x−median))`. The sd/robust ratio is unavailable when
+the denominator is zero. Qn is the first permitted cut and is deferred.
+
+Both tails have 95/99 VaR and ES: loss VaR `−Q(alpha)` and loss ES
+`−mean(x≤Q(alpha))`; gain VaR `Q(1−alpha)` and gain ES
+`mean(x≥Q(1−alpha))`. This retains Overview's inclusive empirical tail convention
+(Acerbi–Tasche 2002), including ties. Values are signed log returns, not price
+levels or positive loss floors. No square-root horizon extrapolation is used.
+
+A separate cached worker response supplies 90% pointwise percentile intervals
+from 500 stationary-bootstrap draws. The existing inference kit's geometric mean
+block length is `ceil(n^(1/3))`; continuations reset at explicit joins and the wrap
+seam. Resampling only selects actual horizon observations. The seed hashes the
+closed-bar digest (including OHLCV), vault gaps, horizon, overlap and threshold
+parameters. Both sampling modes use this dependence-aware bootstrap. Inference
+needs n≥30, and 99% intervals additionally need n≥100. Percentile intervals need
+not contain their point estimate; they are not widened to force that result.
+Descriptive/Evidence changes interval visibility without a recompute. There is no
+hypothesis-test family or significance claim in Shape.
+
+Three user-entered nonnegative absolute thresholds show `P(|r|≥X)=k/n`, Wilson
+95% intervals (z=1.96) and fitted Normal probabilities. Wilson assumes independent
+events; in particular its interval is not overlap-robust. The year strip groups by
+UTC ending-bar year, reporting n, mean and sample sd annualised by
+`sqrt(nominal periods/year / h)`, with vol unavailable at n<2. Annualisation remains
+approximate for irregular bars and missing coverage.
+
+The river uses type-7 q05/25/50/75/95 from the preceding 250 horizon observations,
+excluding the current observation. It restarts after a gap, omits ineligible
+windows and breaks connecting segments there. The x axis is UTC ending time;
+central 90% and 50% ranges use a printed sequential slate probability-mass key.
+These ranges are descriptive, not confidence bands.
+
+`studio_frame.rs` owns the new receipt, tab strip, mode/family chip, LOW N tick and
+card metadata. As in slice 2, the existing pane has no FeedState: it prints the
+missing observation-clock/final-bar-withheld reason rather than inventing a STALE
+receipt. Reload/refusal clears old reports, so there is no previous snapshot.
+Shape and bootstrap results are immutable Arcs, single-flighted in ReportCache;
+Overview's owned report remains unchanged. Generation and seed gates reject late
+responses; sample mode refuses both jobs without provider calls. Every displayed
+statistic carries a stable `dist.shape.*` MathCard with source, method, n and clock.

@@ -130,6 +130,7 @@ pub struct RegimeStats {
 }
 #[derive(Debug, Clone, PartialEq)]
 pub struct Report {
+    pub bars_seed: u64,
     pub regime: crate::studio_regime::RegimeFingerprints,
     pub symbol: String,
     pub source: String,
@@ -352,6 +353,7 @@ pub fn compute_with_gaps(
     }
     hash.write_str("dist.regime.v1");
     let mut report = Report {
+        bars_seed: hash.finish(),
         regime: crate::studio_regime::fingerprints(&[], &[], hash.finish()),
         symbol: symbol.into(),
         source: source.into(),
@@ -574,7 +576,7 @@ fn log_gamma(z: f64) -> f64 {
     let t = z + 6.5;
     0.5 * (2.0 * std::f64::consts::PI).ln() + (z - 0.5) * t.ln() - t + x.ln()
 }
-fn student_density(t: f64, df: f64) -> f64 {
+pub(crate) fn student_density(t: f64, df: f64) -> f64 {
     if df > 1e6 {
         return (-0.5 * t * t).exp() / (2.0 * std::f64::consts::PI).sqrt();
     }
@@ -839,3 +841,5 @@ mod tests {
         near(periods_per_year(Timeframe::M5, AssetClass::Crypto), 105120.0);
     }
 }
+
+pub use crate::studio_shape::Shape;

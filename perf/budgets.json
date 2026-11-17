@@ -162,6 +162,16 @@
       "budget_us": 150000,
       "relative": true,
       "class": "command"
+    },
+    "studio.shape_5k": {
+      "budget_us": 45000,
+      "relative": true,
+      "class": "interactive"
+    },
+    "studio.shape_bootstrap_5k_x500": {
+      "budget_us": 200000,
+      "relative": true,
+      "class": "command"
     }
   }
 }
