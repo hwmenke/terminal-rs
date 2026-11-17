@@ -149,3 +149,20 @@ mod tests {
         }
     }
 }
+
+/// Dedicated brush selects whole loaded bars; commit once on release. The upper
+/// bound is the selected final bar's actual end, including cash half-days.
+pub fn brush_span(bars: &[Bar], tf: Timeframe, equity: bool, a: usize, b: usize) -> Option<(i64, i64)> {
+    let lo = a.min(b); let hi = a.max(b);
+    Some((bars.get(lo)?.ts, bar_end(tf,bars.get(hi)?.ts,equity)))
+}
+#[cfg(test)]
+#[test]
+fn brush_half_open_span() {
+    let bars:Vec<_>=[10,20,30,40].into_iter().map(|t|Bar::new(t,1.,1.,1.,1.,1.)).collect();
+    // Synthetic seconds used only for an algebra fixture; Timeframe ends stay explicit.
+    let span=brush_span(&bars,Timeframe::M1,false,2,1).unwrap();
+    assert_eq!(span,(20,90));
+    let context=crate::studio::StudioContext {selected_span:Some((20,40)),..Default::default()};
+    assert!(context.contains(20)&&context.contains(30)&&!context.contains(40));
+}

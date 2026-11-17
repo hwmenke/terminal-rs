@@ -147,3 +147,46 @@ mod tests {
         );
     }
 }
+
+/// Shared signed analytical values. These never masquerade as positive-price bars.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Transform {
+    Level,
+    Change { h: usize },
+    LogReturn { h: usize },
+    LogLevel,
+}
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SeriesUnit {
+    Native(String),
+    Index100,
+    Z,
+    BpPerBar,
+}
+impl SeriesUnit {
+    pub fn label(&self) -> &str {
+        match self {
+            Self::Native(s) => s,
+            Self::Index100 => "index (base=100)",
+            Self::Z => "z (prior sample σ)",
+            Self::BpPerBar => "bp/bar",
+        }
+    }
+}
+#[derive(Debug, Clone, PartialEq)]
+pub struct SeriesReceipt {
+    pub source: String,
+    pub provenance: tr_core::Provenance,
+    pub observed_at: Option<i64>,
+    pub closed_thru: i64,
+    pub input_digest: u64,
+    pub gaps: Vec<(i64, i64)>,
+}
+#[derive(Debug, Clone, PartialEq)]
+pub struct ScalarSeries {
+    pub ts: Vec<i64>,
+    pub values: Vec<Option<f64>>,
+    pub break_before: Vec<bool>,
+    pub unit: SeriesUnit,
+    pub receipt: SeriesReceipt,
+}

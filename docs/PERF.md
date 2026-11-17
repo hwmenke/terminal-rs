@@ -796,3 +796,95 @@ basic bounded parameter undo remains. The existing synchronous workspace
 save/dirty serialization flow is inherited (see STUDIO.md); no new report/model
 persistence or provider path was added. Measurements cover headless CPU work,
 not GPU/presentation, whole-desktop latency or live-provider availability.
+
+## Studio Slice 2 — Quick chart and time canvas
+
+The three new compute cases use public `studio_canvas` APIs and deterministic
+**dev-only** fixtures. `studio.canvas_4x7800` validates/digests four full 7,800-bar
+sources and computes prior-window Z paths and the visible closed strip; it asserts
+all four full source lengths, 30,948 actual scores, prior n=63 and histogram mass.
+Smoke retains four 1,560-bar sources and the same admission/window definitions.
+`chart.margin_strip_7800` sorts/counts an admitted 7,800-value strip and checks n,
+midrank availability and total mass. `studio.events_2000` aligns/sorts all 2,000
+actual fixture records, including date-only brackets, onto 7,800 native timestamps.
+Ceilings are 12,000 / 1,500 / 3,000 µs, `relative:true`, class `interactive`.
+No baseline entries were added or re-recorded.
+
+Quick steady/hover paint uses the actual full Quick/Studio renderer at 1440×900,
+four 7,800-bar native GPU line pyramids, a populated closed margin strip and 2,000
+dated events. Guards require all admitted source/report counts, finite native
+geometry, actual nonempty GPU segment ranges, events and visible content. The
+performance viewport must contain over 100 actual closed values; narrow-window
+tests instead assert their actual nonempty visible sample. The hover case opens
+the real `canvas.strip.midrank` MathCard after egui's tooltip delay and checks its
+formula, observation clock and CLOSED THRU. Hover/steady cannot dispatch a new
+StudioCanvas request. Both modes use 120 measured frames after warmup, with
+independent UI / tessellation / total ceilings of **1.5 / 1.0 / 2.5 ms**.
+
+The **existing native intraday and Auction steady/pan/refresh scenarios now enable
+the 44 px strip**, retaining their original 5,000/7,800 bars, indicators, stack,
+AVWAP anchors, motion and every prior assertion/ceiling. Worker fixture deliveries
+happen outside timed UI work; a previous viewport histogram is explicitly marked
+PREVIOUS SNAPSHOT with its own span/receipt. No old workload or ceiling was removed.
+
+There are **27 new ordinary tests**: fourteen arithmetic/admission/clock/gap/key/
+prefix/distribution tests, the Time Link brush-span test, seven populated canvas
+geometry/hover/stale/packing-pyramid/persistence/input tests, one composed Quick
+geometry/hover test, three worker cache/sample/peer-admission tests and one cockpit
+brush precedence test. Existing perf smoke tests also exercise all three new cases.
+The original Shape right-continuous percentile and research lens inference tests
+remain unchanged. See [STUDIO_CANVAS.md](STUDIO_CANVAS.md) for formulas, data bounds,
+source limitations, view persistence and the cuts.
+
+Final measurements, 2026-11-17, rustc/cargo **1.100.0**, release, Linux / Intel
+Xeon / 8 cores, calibration **6,520.741 µs**, slack **1.0**, relative gates enabled:
+
+| Case / metric | Median ms | p95 ms | Ceiling ms |
+| --- | ---: | ---: | ---: |
+| `studio.canvas_4x7800` | 8.79382 | 11.16406 | 12 |
+| `chart.margin_strip_7800` | 0.14024 | 0.16005 | 1.5 |
+| `studio.events_2000` | 0.55333 | 0.61888 | 3 |
+| `paint.studio_quick.steady.ui` | 0.06524 | 0.07496 | 1.5 |
+| `paint.studio_quick.steady.tess` | 0.03285 | 0.03738 | 1 |
+| `paint.studio_quick.steady.total` | 0.09833 | 0.11103 | 2.5 |
+| `paint.studio_quick.hover.ui` | 0.08361 | 0.10155 | 1.5 |
+| `paint.studio_quick.hover.tess` | 0.04320 | 0.05844 | 1 |
+| `paint.studio_quick.hover.total` | 0.12640 | 0.15450 | 2.5 |
+| `paint.intraday.steady.ui` | 0.24942 | 0.37829 | 1.5 |
+| `paint.intraday.steady.tess` | 0.39821 | 0.59483 | 1.5 |
+| `paint.intraday.steady.total` | 0.65848 | 0.96251 | 2.5 |
+| `paint.intraday.pan.ui` | 0.56293 | 0.78481 | 3.5 |
+| `paint.intraday.pan.tess` | 0.42974 | 0.55806 | 2 |
+| `paint.intraday.pan.total` | 1.00021 | 1.32082 | 5 |
+| `paint.auction.steady.ui` | 0.24118 | 0.36048 | 1.5 |
+| `paint.auction.steady.tess` | 0.29819 | 0.43349 | 1 |
+| `paint.auction.steady.total` | 0.53836 | 0.76932 | 2.5 |
+| `paint.auction.pan.ui` | 0.44111 | 0.65483 | 2 |
+| `paint.auction.pan.tess` | 0.32069 | 0.47422 | 1 |
+| `paint.auction.pan.total` | 0.75920 | 1.11373 | 2.8 |
+| `paint.auction_refresh.ui` | 0.26760 | 0.41544 | 2 |
+| `paint.auction_refresh.tess` | 0.31174 | 0.45560 | 1 |
+| `paint.auction_refresh.total` | 0.58131 | 0.86805 | 2.8 |
+
+Final required checks all passed:
+
+- `cargo test --workspace --offline --no-fail-fast`: **1,688 passed / 0 failed /
+  10 ignored**, across **31 test/doc-test targets**. Ignored timing/live tests are
+  unchanged. The existing broker/Whats-News loopback mocks ran successfully here:
+  **zero sandbox bind failures** occurred; none was skipped or modified.
+- `cargo build --release --offline`: **passed**.
+- `scripts/perf-gate.sh`: **38 compute cases passed / 0 failed / 0 harness errors**;
+  **2 release paint tests passed / 0 failed / 0 ignored**, checking **150 metrics**.
+  No regression failures or slowdown advisories. Quick steady/hover total p95 is
+  **0.11103 / 0.15450 ms**; these headless measurements exclude actual GPU work.
+- `perf/baseline.json`, Cargo.lock and dependencies are unchanged. No ceiling was
+  widened, no baseline recorded, and no git add/commit/push was performed.
+- Cuts: small multiples and event clustering animation. Overlay comparisons,
+  independent/shared axes, all five modes, exact pinned base, closed strip,
+  dated event lanes and a release-committed brush are implemented.
+
+The main remaining concerns are inherited synchronous workspace layout saving,
+source calendar/event coverage and absent per-record vendor metadata in Quote.
+Live provider availability and actual GPU presentation were not certified by the
+headless gates. The native chart remains the route for its existing study layers;
+scalar modes never project price studies onto incompatible transformed units.

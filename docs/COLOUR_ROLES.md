@@ -78,3 +78,9 @@ shared slate key. Mean/tail/quantile numbers use signed ink with explicit signs;
 scale, density, counts and probabilities are neutral. Year identity and unsigned
 volatility remain neutral beside signed mean ink. LOW N is a caution corner tick;
 pointwise bootstrap intervals carry no significance hue or test-family claim.
+
+Quick canvas lines/identifiers use categorical series roles. Change/Z values and
+base deltas use signed ink with explicit +/−. The count strip is neutral slate;
+its now pin and date lanes are neutral. Unit-specific Z/vol keys are printed; no
+heat surface or significance hue is added. LOW N reference/strip samples use a
+caution corner tick. See STUDIO_CANVAS.md for the separate midrank convention.

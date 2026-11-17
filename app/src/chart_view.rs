@@ -29,6 +29,7 @@ use tr_data::anchored_vwap::AvwapKey;
 mod auction;
 mod cockpit;
 mod session_cache;
+pub mod studio_canvas;
 mod stop_cloud;
 mod trend_cone;
 mod vault_footer;
@@ -308,6 +309,7 @@ pub struct ChartState {
     stops: stop_cloud::StopState,
     auction: auction::AuctionState,
     session: session_cache::SessionCache,
+    canvas: studio_canvas::CanvasState,
     edge: Option<Result<Arc<tr_data::edge::EdgeReport>, String>>,
     edge_work: Option<Request>,
     edge_pending: Option<EdgeKey>,
@@ -458,6 +460,7 @@ impl ChartState {
             stops: Default::default(),
             auction: Default::default(),
             session: Default::default(),
+            canvas: Default::default(),
             edge: None,
             edge_paint: Default::default(),
             edge_work: None,
@@ -608,6 +611,7 @@ impl ChartState {
     pub fn load(&mut self, w: &Worker) {
         self.generation = if self.studio_owned {crate::worker::studio_token()} else {self.generation + 1};
         self.invalidate_session_summary();
+        self.clear_canvas();
         self.stitch = None;
         self.edge_pending = None;
         self.edge_work = None;
@@ -712,6 +716,7 @@ impl ChartState {
             self.chart_type = ChartType::Candles;
         }
         if !same {
+            self.canvas.view.spec.base_ts=0;self.canvas.view.base_pinned=false;
             self.commit_drawings();
             self.drawing_undo = None;
             self.stash_anchors();
@@ -797,6 +802,8 @@ impl ChartState {
             self.draw.selected = None;
             let previous_lanes =
                 (self.show_stack && !self.stack_paint.lanes.is_empty()).then(|| self.stack_paint.lanes.clone());
+            self.canvas.view.spec.base_ts = 0;
+            self.canvas.view.base_pinned = false;
             self.tf = tf;
             if self.stack_ladder.as_ref().is_some_and(|frames| frames.first() != Some(&tf)) {
                 self.stack_ladder = None;
@@ -1760,8 +1767,10 @@ impl ChartState {
             g.to.right += shift;
         }
         self.session.bars_revision = self.session.bars_revision.checked_add(1).expect("bars revision overflow");
+        self.invalidate_canvas_source();
         self.provenance = Bar::provenance(&bars);
         if !self.provenance.is_verified() {
+            self.clear_canvas();
             self.invalidate_session_summary();
         }
         self.bars = bars;
@@ -1860,6 +1869,7 @@ impl ChartState {
     }
 
     pub fn on_news(&mut self, batch: &tr_data::news::NewsBatch) {
+        self.canvas.events_revision=crate::worker::studio_token();
         if batch.sample {
             self.news.clear();
             self.news_stale = false;
@@ -1970,6 +1980,9 @@ impl ChartState {
 
     pub fn show(&mut self, ui: &mut Ui, rect: Rect, focused: bool, w: &Worker) -> bool {
         let _chart_scope = crate::perf::scope(crate::perf::Layer::ChartTotal);
+        if self.canvas.view.enabled { return self.show_canvas(ui,rect,focused,w); }
+        let outer_rect=rect;
+        let rect=if self.canvas.view.spec.strip {Rect::from_min_max(rect.min,rect.max-vec2(studio_canvas::STRIP_W,0.))}else{rect};
         if let Some(work) = self.edge_work.take() {
             w.send(work);
         }
@@ -2379,6 +2392,17 @@ impl ChartState {
         let out = scene::price_pane(&pane);
         let mut scale = out.scale;
         scale.height_px = price_rect.height() as f64;
+        if self.canvas.view.spec.strip {
+            let (lo,hi)=v.visible_range(self.bars.len());
+            self.canvas.visible=tr_data::time_link::window_of(&self.bars,self.tf,self.equity(),lo,hi);
+            self.request_canvas(w);
+            if self.canvas.report.is_none(){ui.ctx().request_repaint_after(Duration::from_millis(210));}
+            if let Some(report)=self.canvas.report.clone(){
+                let strip=Rect::from_min_max(pos2(outer_rect.right()-studio_canvas::STRIP_W,price_rect.top()),pos2(outer_rect.right(),price_rect.bottom()));
+                self.paint_canvas_strip(ui,strip,&scale,&report);
+            }
+        }
+
         if axis_resp.dragged() {
             let mut s = self.manual_scale.unwrap_or(scale);
             s.stretch((axis_resp.drag_delta().y as f64 * -0.01).exp());

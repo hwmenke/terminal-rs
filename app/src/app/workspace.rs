@@ -27,7 +27,7 @@ use crate::worker::{Request, Worker};
 pub const PANELS: [(&str, &str); 36] = [
     ("Chart", "CHART"),
     ("Studio", "STUDIO"),
-    ("Answers (unavailable)", "QUICK"),
+    ("Quick canvas", "QUICK"),
     ("Factor Lab (unavailable)", "LAB"),
     ("Residual (unavailable)", "RESID"),
     ("Attribution (unavailable)", "ATTR"),
@@ -1085,7 +1085,12 @@ impl TerminalApp {
                     ..Default::default()
                 })))
             }
-            "QUICK" => PaneKind::StudioRoute(tr_data::studio::StudioRoute::Quick),
+            "QUICK" => {
+                let (tf,mode,peers)=tr_data::studio_canvas::parse_spec(&words.get(1..).unwrap_or(&[]).join(" ")).ok()?;
+                let symbol=symbol.map(|s|tr_data::security(s).key()).or(current).unwrap_or_default();
+                let mut canvas=crate::chart_view::studio_canvas::CanvasView {enabled:true,peers,..Default::default()};canvas.spec.mode=mode;
+                PaneKind::Studio(Box::new(super::studio_hub::StudioPane::new(super::studio_hub::StudioViewSpec {context:tr_data::studio::StudioContext {symbol,tf,..Default::default()},quick:true,canvas,..Default::default()})))
+            },
             "LAB" => PaneKind::StudioRoute(tr_data::studio::StudioRoute::Lab),
             "RESID" => PaneKind::StudioRoute(tr_data::studio::StudioRoute::Resid),
             "ATTR" => PaneKind::StudioRoute(tr_data::studio::StudioRoute::Attr),

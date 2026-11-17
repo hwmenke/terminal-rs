@@ -174,3 +174,19 @@ pub fn regime_walk(n: usize) -> Vec<Bar> {
 pub fn studio_routes() -> [&'static str; 5] {
     ["5m lens=dist", "5m lens=relate benchmark=QQQ", "5m lens=when", "5m lens=season", "5m lens=backtest"]
 }
+
+/// Four distinct admitted native sources, 7,800 bars apiece at full scale.
+/// Fabricated benchmark inputs only; never a runtime dependency of the app.
+pub fn canvas_inputs(sessions:usize)->Vec<tr_data::studio_canvas::CanvasInput> {
+    ["AAPL","QQQ","MSFT","SPY"].into_iter().enumerate().map(|(i,symbol)|{
+        let bars=intraday(Timeframe::M1,sessions,701+i as u64);
+        tr_data::studio_canvas::CanvasInput {symbol:format!("{symbol} US Equity"),tf:Timeframe::M1,observed_at:Some(bars.last().unwrap().ts+60),stitch:None,source:"benchmark fixture only".into(),bars:std::sync::Arc::new(bars)}
+    }).collect()
+}
+pub fn canvas_events(inputs:&[tr_data::studio_canvas::CanvasInput],n:usize)->Vec<tr_data::studio_canvas::CanvasEvent> {
+    use tr_data::studio_canvas::{CanvasEvent,EventTime,EventKind};
+    let bars=&inputs[0].bars;
+    (0..n).map(|i|CanvasEvent {kind:if i%9==0 {EventKind::Earnings}else{EventKind::News},
+        time:if i%9==0 {let date=tr_core::ny::civil(bars[i*bars.len()/n].ts).date();EventTime::Date {start:date,end:date}}else{EventTime::Instant(bars[i*bars.len()/n].ts+15)},
+        source:"benchmark event fixture only".into(),headline:format!("Fixture record {i}")}).collect()
+}
