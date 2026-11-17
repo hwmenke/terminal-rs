@@ -1,4 +1,5 @@
 //! Seasonality Studio pane and painter charts.
+pub(super) mod evidence;
 pub(super) mod or_lens;
 use super::{PaneKind, TerminalApp};
 use crate::{
@@ -17,8 +18,10 @@ pub struct SeasonPane {
     pub generation: u64,
     pub loading: bool,
     pub error: Option<String>,
-    pub report: Option<SeasonReport>,
+    pub report: Option<std::sync::Arc<SeasonReport>>,
     pub or_tab: bool,
+    pub evidence_tab: bool,
+    pub evidence_mode: bool,
     pub or_selection: or_lens::Selection,
 }
 
@@ -32,6 +35,8 @@ impl SeasonPane {
             error: None,
             report: None,
             or_tab: false,
+            evidence_tab: false,
+            evidence_mode: true,
             or_selection: Default::default(),
         }
     }
@@ -59,7 +64,11 @@ impl SeasonPane {
             tf,
         });
     }
+    #[cfg(test)]
     pub fn accept(&mut self, generation: u64, result: Result<SeasonReport, String>) {
+        self.accept_shared(generation, result.map(std::sync::Arc::new));
+    }
+    pub fn accept_shared(&mut self, generation: u64, result: Result<std::sync::Arc<SeasonReport>, String>) {
         if generation != self.generation {
             return;
         }
@@ -123,15 +132,31 @@ impl TerminalApp {
         super::studio_dist::studio_states(ui, pane.loading, pane.error.as_deref(), None);
         if let Some(r) = &pane.report {
             ui.horizontal(|ui| {
-                ui.selectable_value(&mut pane.or_tab, false, "Calendar");
+                if ui.selectable_label(!pane.or_tab && !pane.evidence_tab, "Calendar").clicked() {
+                    pane.or_tab = false;
+                    pane.evidence_tab = false;
+                }
+                if r.timeframe.is_intraday() {
+                    if ui.selectable_label(pane.evidence_tab, "Evidence").clicked() {
+                        pane.or_tab = false;
+                        pane.evidence_tab = true;
+                    }
+                } else {
+                    pane.evidence_tab = false;
+                }
                 if r.timeframe == tr_core::Timeframe::M30 {
-                    ui.selectable_value(&mut pane.or_tab, true, "OR Lens");
+                    if ui.selectable_label(pane.or_tab, "OR Lens").clicked() {
+                        pane.or_tab = true;
+                        pane.evidence_tab = false;
+                    }
                 } else {
                     pane.or_tab = false;
                 }
             });
             ui.push_id(id, |ui| {
-                if pane.or_tab {
+                if pane.evidence_tab {
+                    evidence::view(ui, r, &mut pane.evidence_mode);
+                } else if pane.or_tab {
                     if let Some(lens) = &r.or_lens {
                         or_lens::view(ui, lens, &mut pane.or_selection);
                     } else {
@@ -272,17 +297,17 @@ fn daily(ui: &mut Ui, r: &SeasonReport) {
         }
     });
     heading(ui, "MONTH OF YEAR · completed monthly returns");
-    profile(ui, &r.month_profile, "Mean monthly return", false);
+    profile(ui, &r.month_profile, "Mean monthly return", false, true);
     hit_rates(ui, &r.month_profile, r.month_baseline.stats.win_rate);
     profile_table(ui, &r.month_profile, "month-table", Some(&r.month_baseline));
     heading(ui, "DAY OF WEEK · close-to-close daily returns");
-    profile(ui, &r.weekdays, "Mean daily return", false);
+    profile(ui, &r.weekdays, "Mean daily return", false, true);
     profile_table(ui, &r.weekdays, "weekday-table", Some(&r.baseline));
     heading(ui, "TURN OF MONTH · last session (−1) through 3rd session (+3) vs rest");
-    profile(ui, &r.turn_of_month, "Mean daily return", false);
+    profile(ui, &r.turn_of_month, "Mean daily return", false, true);
     profile_table(ui, &r.turn_of_month, "turn-table", Some(&r.baseline));
     heading(ui, "WEEK OF MONTH · calendar days 1–7, 8–14, 15–21, 22–28, 29–31");
-    profile(ui, &r.weeks, "Mean daily return", false);
+    profile(ui, &r.weeks, "Mean daily return", false, true);
     profile_table(ui, &r.weeks, "week-table", Some(&r.baseline));
     ui.label(
         RichText::new(
@@ -315,8 +340,8 @@ fn month_card(year: i32, month: u32, cell: Option<&MonthCell>, provenance: tr_co
     }
 }
 
-/// Signed bar plot, with a shared zero axis and median markers.
-fn profile(ui: &mut Ui, buckets: &[Bucket], axis: &str, dense: bool) {
+/// Return profiles use a symmetric zero axis; descriptive magnitudes start at zero.
+fn profile(ui: &mut Ui, buckets: &[Bucket], axis: &str, dense: bool, signed: bool) {
     ScrollArea::horizontal().id_salt(axis).show(ui, |ui| {
         let width = ui.available_width().max(if dense { buckets.len() as f32 * 27.0 + 64.0 } else { 390.0 });
         let (outer, _) = ui.allocate_exact_size(vec2(width, 185.0), Sense::hover());
@@ -329,8 +354,14 @@ fn profile(ui: &mut Ui, buckets: &[Bucket], axis: &str, dense: bool) {
             .map(f64::abs)
             .fold(0.0001, f64::max)
             * 1.15;
-        let y = |v: f64| plot.center().y - (v / scale) as f32 * plot.height() * 0.5;
-        for step in -2..=2 {
+        let y = |v: f64| {
+            if signed {
+                plot.center().y - (v / scale) as f32 * plot.height() * 0.5
+            } else {
+                plot.bottom() - (v / scale) as f32 * plot.height()
+            }
+        };
+        for step in (if signed { -2 } else { 0 })..=2 {
             let v = scale * step as f64 / 2.0;
             ui.painter().line_segment(
                 [pos2(plot.left(), y(v)), pos2(plot.right(), y(v))],
@@ -353,7 +384,13 @@ fn profile(ui: &mut Ui, buckets: &[Bucket], axis: &str, dense: bool) {
                 ui.painter().rect_filled(
                     rc.intersect(plot),
                     2.0,
-                    if b.stats.count >= MIN_N { color(v) } else { theme::muted() },
+                    if b.stats.count < MIN_N {
+                        theme::muted()
+                    } else if signed {
+                        color(v)
+                    } else {
+                        theme::series(0)
+                    },
                 );
                 if b.stats.count >= MIN_N
                     && let Some(m) = b.stats.median
@@ -492,9 +529,9 @@ fn intraday(ui: &mut Ui, r: &SeasonReport) {
     let returns: Vec<_> = r.clock.iter().map(|c| c.returns.clone()).collect();
     let absolute: Vec<_> = r.clock.iter().map(|c| c.absolute.clone()).collect();
     let volume: Vec<_> = r.clock.iter().map(|c| c.volume_share.clone()).collect();
-    profile(ui, &returns, "Mean bar return", true);
-    profile(ui, &absolute, "Mean absolute bar return · volatility smile", true);
-    profile(ui, &volume, "Mean share of session volume", true);
+    profile(ui, &returns, "Mean bar return", true, true);
+    profile(ui, &absolute, "Mean absolute bar return · volatility smile · descriptive", true, false);
+    profile(ui, &volume, "Mean share of session volume · descriptive", true, false);
     heading(ui, "DAY OF WEEK × NEW YORK CLOCK · mean bar return");
     let hs = return_scale(
         r.clock

@@ -87,10 +87,11 @@ a window is kept when it starts at least H bars after the previously kept one.
 The independent n is printed under each table. Mean, median and hit rate still
 use every completed window. Profile (one-period) t-stat = mean / (sample stdev,
 n−1 / sqrt(n)); those returns do not overlap. Any t-stat is undefined for n < 2
-or (numerically) zero variance. There is no multiple-comparison correction:
-with many buckets, |t| ≈ 2 somewhere is expected by chance.
+or (numerically) zero variance. These legacy descriptive tables have no multiple-comparison correction:
+with many buckets, |t| ≈ 2 somewhere is expected by chance. The intraday Evidence
+view below supplies a separately labelled HAC mean test and fixed-family BY adjustment.
 
-Every heatmap cell and profile shows n; buckets with fewer than **10**
+Every legacy Calendar heatmap cell and profile shows n; buckets with fewer than **10**
 observations are flagged as small samples (grey). Sparse forward distributions
 have counts and grey summaries but no coloured curve. The threshold is a display
 flag, not evidence of statistical significance.
@@ -184,3 +185,78 @@ BY references, missing-session lag spacing, causal classification, missing openi
 and intervening prints, early closes, gaps, pending endpoints, full-input admission,
 shared histogram mass, selection invariance, generation/provenance refusals and
 finite geometry at 320/1440 px. All generated inputs are test/dev fixtures only.
+
+## Season evidence ribbon (intraday)
+
+Select **Evidence** in an intraday SEASON pane. A local **Descriptive / Evidence**
+control changes presentation only: both modes consume the same immutable cached
+report. No selection changes means, intervals, p-values, q-values or membership.
+These controls are ephemeral; existing saved layouts and preferences load unchanged.
+The original Calendar daily/monthly and forward views retain their methods. CLOCK's
+sign/permutation tests are unchanged and are not equivalent to this mean test.
+
+The clock heatmap includes **ALL** plus Monday–Friday, using the same closed
+open-to-close bar returns as Calendar, with NY **opening** clock labels. Every
+expected full-session bucket stays present, including n=0 cells. Signed mean
+numbers use sign ink. The shared diverging heat key uses exactly the cells'
+thresholds. Descriptive mode fills observed means without implying evidence;
+Evidence mode fills only cells with an available asymptotic **BY q ≤ 0.10**.
+A neutral outline also marks passing cells, and a caution corner tick marks
+**LOW N (<30)**. There is no significance hue. Absolute-return and volume-share
+profiles remain descriptive magnitudes, drawn with categorical rather than sign
+colour; their heights say nothing about directional evidence.
+
+Beneath the heatmap, the large **ALL CLOCK** curve plots means about a symmetric
+zero axis with approximate pointwise **95% HAC whiskers**. Descriptive means remain
+visible with sparse counts; inference requires **n ≥ 30**. Unavailable intervals
+are omitted. Zero or numerically degenerate variance has no interval or p-value,
+rather than an infinite statistic or fabricated certainty. Hover either a heat
+cell or an ALL curve bucket for the MathCard: formula, substituted inputs, n,
+expected session span T, bandwidth L, SE, interval, p, q, family size, coverage,
+dates, source/provenance, observation time and actual CLOSED THRU. Empty cells
+explain the unavailable reason. Partial days use the actual closed buckets only;
+an afternoon observation is never invented for an early close. Unlike OR Lens,
+this extension preserves Calendar's inclusion of today's actually closed bars.
+
+For each of the six rows and B full-session clocks, on the **expected exchange
+session grid** between the first and last admitted dates:
+
+```text
+R[s] = C[s]/O[s] − 1
+mean = Σ observed R / n
+u[s] = I[s] (R[s] − mean) / n
+L = min(5, T−1)
+Var(mean) = Σ u[s]² + 2 Σ(l=1…L) (1−l/(L+1)) Σ u[s]u[s−l]
+SE = sqrt(Var); pointwise CI = mean ± 1.96 SE
+p = 2 Φ(−abs(mean/SE))
+q = min(1, H_m × BH(p)), H_m = Σ(j=1…m) 1/j, m = 6B
+```
+
+The existing `studio_inference::hac_mean` supplies this five-session Bartlett
+HAC estimator. Missing sessions and nonselected weekdays have zero score and
+retain lag distance. Explicit vault joins reset lag products while preserving
+the expected grid and bandwidth. The full **single 6B family** includes ALL and
+weekday means together; unavailable/low-n cells enter at p=1. For 5m bars,
+B=78 and m=468. The later two-family split is intentionally excluded.
+
+Intervals are **pointwise**, not simultaneous coverage of the curve. BY gates
+mean-against-zero tests; it does not make the whiskers simultaneous and cannot
+repair inaccurate marginal asymptotic p-values. Five-session bandwidth sensitivity,
+provider/vault depth, source corporate-action evidence and repeated exploration
+across symbols/dates/settings remain limitations. With around 120 sessions most
+weekday rows are honestly below n=30, and the combined family can leave very
+little evidence. The threshold and family are never relaxed to fill the display.
+
+Complete input validation precedes trimming, digesting and cache reuse. Reports
+are built in the existing worker job and stored as immutable `Arc<SeasonReport>`
+in bounded `ReportCache`; the key includes the full bars digest, symbol, interval,
+source, provenance, observation clock, New York calendar date and vault gaps. Corrections,
+clock changes and changed gaps invalidate. Sample mode, refusal and generation
+rejection retain the existing clear/no-fetch rules. No statistics or history
+scans occur in the new painter.
+
+New tests cover direct mean/SE/CI references, the combined ALL/weekday BY family,
+missing-session lag spacing, join resets, early closes, pending closure, empty/
+zero/sparse cells, n=29/30, complete-input refusal, cache identity/invalidation,
+mode invariance, matching heat keys/fills, complete cards, actual hover cards and
+finite 320/1440-point geometry. See PERF.md for gate IDs and verification status.

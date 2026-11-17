@@ -132,6 +132,11 @@
       "budget_us": 500,
       "relative": true,
       "class": "interactive"
+    },
+    "studio.season_evidence_120d_5m": {
+      "budget_us": 40000,
+      "relative": true,
+      "class": "interactive"
     }
   }
 }

@@ -105,6 +105,36 @@
       "budget_us": 2000,
       "relative": false,
       "class": "frame"
+    },
+    "paint.studio_season.steady.ui": {
+      "budget_us": 1200,
+      "relative": false,
+      "class": "frame"
+    },
+    "paint.studio_season.steady.tess": {
+      "budget_us": 800,
+      "relative": false,
+      "class": "frame"
+    },
+    "paint.studio_season.steady.total": {
+      "budget_us": 2000,
+      "relative": false,
+      "class": "frame"
+    },
+    "paint.studio_season.hover.ui": {
+      "budget_us": 1200,
+      "relative": false,
+      "class": "frame"
+    },
+    "paint.studio_season.hover.tess": {
+      "budget_us": 800,
+      "relative": false,
+      "class": "frame"
+    },
+    "paint.studio_season.hover.total": {
+      "budget_us": 2000,
+      "relative": false,
+      "class": "frame"
     }
   }
 }

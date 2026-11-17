@@ -34,7 +34,7 @@ fn normal_p(z: f64) -> f64 {
     (poly * (-x * x).exp()).clamp(0.0, 1.0)
 }
 
-fn infer(grid: &[Option<(bool, f64)>], contrast: bool) -> HacEstimate {
+fn infer(grid: &[Option<(bool, f64)>], contrast: bool, breaks: &[bool]) -> HacEstimate {
     let lag = 5.min(grid.len().saturating_sub(1));
     let mut sums = [0.0; 2];
     let mut counts = [0usize; 2];
@@ -85,7 +85,24 @@ fn infer(grid: &[Option<(bool, f64)>], contrast: bool) -> HacEstimate {
             None => 0.0,
         })
         .collect();
-    let v = variance(&scores, lag);
+    let v = if breaks.is_empty() {
+        variance(&scores, lag)
+    } else {
+        assert_eq!(breaks.len(), grid.len());
+        let runs: Vec<_> = breaks.iter().scan(0usize, |run, b| {
+            *run += usize::from(*b);
+            Some(*run)
+        }).collect();
+        let mut v = scores.iter().map(|u| u * u).sum::<f64>();
+        for l in 1..=lag {
+            for s in l..scores.len() {
+                if runs[s] == runs[s - l] {
+                    v += 2. * (1. - l as f64 / (lag + 1) as f64) * scores[s] * scores[s - l];
+                }
+            }
+        }
+        v.max(0.)
+    };
     // Relative roundoff protection for constant returns. A zero SE does not
     // justify an infinite z or a p=0, even for a nonzero contrast.
     let se = v.sqrt();
@@ -107,13 +124,22 @@ fn infer(grid: &[Option<(bool, f64)>], contrast: bool) -> HacEstimate {
 }
 
 pub fn hac_mean(grid: &[Option<f64>]) -> HacEstimate {
-    infer(&grid.iter().map(|r| r.map(|r| (true, r))).collect::<Vec<_>>(), false)
+    infer(&grid.iter().map(|r| r.map(|r| (true, r))).collect::<Vec<_>>(), false, &[])
+}
+
+/// Same mean and expected-session bandwidth as `hac_mean`, with lag products
+/// reset at explicit vault discontinuities. `breaks[s]` starts a new run at s;
+/// missing sessions remain on the original grid and do not create a break.
+pub fn hac_mean_with_breaks(grid: &[Option<f64>], breaks: &[bool]) -> HacEstimate {
+    assert_eq!(grid.len(), breaks.len());
+    let boundaries = if breaks.iter().any(|b| *b) { breaks } else { &[] };
+    infer(&grid.iter().map(|r| r.map(|r| (true, r))).collect::<Vec<_>>(), false, boundaries)
 }
 
 /// Each observed session belongs to the selected group (`true`) or its
 /// same-clock/horizon complement (`false`). Unavailable sessions remain None.
 pub fn hac_contrast(grid: &[Option<(bool, f64)>]) -> HacEstimate {
-    infer(grid, true)
+    infer(grid, true, &[])
 }
 
 #[cfg(test)]
@@ -175,5 +201,37 @@ mod tests {
         let r = hac_contrast(&(0..60).map(|i| Some((i < 30, if i < 30 { 1. } else { 2. }))).collect::<Vec<_>>());
         assert_eq!(r.estimate, Some(-1.));
         assert!(r.p.is_none() && r.interval.is_none());
+    }
+}
+
+#[cfg(test)]
+mod break_tests {
+    use super::*;
+    #[test]
+    fn mean_join_reset_preserves_grid_bandwidth_and_known_variance() {
+        let grid:Vec<_>=(0..60).map(|s| if s==20 {None} else {Some((s%7) as f64)}).collect();
+        let mut breaks=vec![false;60];breaks[30]=true;
+        let n=59.;let mean=grid.iter().flatten().sum::<f64>()/n;
+        let scores:Vec<_>=grid.iter().map(|r|r.map(|r|(r-mean)/n).unwrap_or(0.)).collect();
+        let mut v=0.;
+        for s in 0..60 {
+            v+=scores[s]*scores[s];
+            for l in 1..=5.min(s) {if !(s-l<30 && s>=30) {v+=2.*(1.-l as f64/6.)*scores[s]*scores[s - l];}}
+        }
+        let result=hac_mean_with_breaks(&grid,&breaks);
+        assert_eq!((result.n,result.span,result.lag),(59,60,5));
+        assert!((result.estimate.unwrap()-mean).abs()<1e-14);
+        assert!((result.variance.unwrap()-v).abs()<1e-14);
+        assert_eq!(hac_mean_with_breaks(&grid,&vec![false;60]),hac_mean(&grid));
+        assert_ne!(result.variance,hac_mean(&grid).variance);
+    }
+    #[test]
+    fn exact_inference_threshold_and_zero_cells() {
+        let grid:Vec<_>=(0..30).map(|s|Some((s%7) as f64)).collect();
+        assert!(hac_mean(&grid[..29]).interval.is_none());
+        assert!(hac_mean(&grid).interval.is_some());
+        let zero=hac_mean_with_breaks(&[Some(0.);30],&[false;30]);
+        assert_eq!(zero.estimate,Some(0.));
+        assert!(zero.p.is_none() && zero.interval.is_none() && zero.unavailable.unwrap().contains("degenerate"));
     }
 }
