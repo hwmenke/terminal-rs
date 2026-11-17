@@ -71,3 +71,10 @@ return sign or caution. Fingerprint Δμ and CI endpoints use explicit signed in
 whiskers use identity colour, zero is muted, and q≤0.10 uses a neutral outline.
 LOW N uses an amber corner tick. Ridges are probability masses, with shared axes
 and scales rather than heat fills.
+
+DIST Shape uses categorical series colours for KDE / Normal / Student-t identities.
+Its river's central probability masses use `HeatScale::sequential` and print the
+shared slate key. Mean/tail/quantile numbers use signed ink with explicit signs;
+scale, density, counts and probabilities are neutral. Year identity and unsigned
+volatility remain neutral beside signed mean ink. LOW N is a caution corner tick;
+pointwise bootstrap intervals carry no significance hue or test-family claim.

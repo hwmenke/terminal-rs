@@ -444,6 +444,8 @@ pub enum Function {
     StudioDist {
         timeframe: Timeframe,
     },
+    /// Set DIST Shape horizon without changing the existing timeframe command.
+    StudioDistHorizon(usize),
     /// Relationship Studio: benchmark OLS and correlation.
     StudioCorr {
         spec: String,
@@ -924,6 +926,13 @@ fn parse_function(head: &str, rest: &[&str]) -> Option<Function> {
         }
         "STATS" | "STAT" | "STATISTICS" => Function::Stats { condition: joined(), conditional: !rest.is_empty() },
         "COND" | "CDIST" | "CONDRET" => Function::Stats { condition: joined(), conditional: true },
+        "DIST" | "RDIST" if rest.len() == 1 && rest[0].to_ascii_uppercase().starts_with("H=") => {
+            let h = rest[0][2..].parse::<usize>().ok()?;
+            if !(1..=250).contains(&h) {
+                return None;
+            }
+            Function::StudioDistHorizon(h)
+        }
         "DIST" | "RDIST" => Function::StudioDist {
             timeframe: match rest {
                 [] => Timeframe::D1,
@@ -1254,6 +1263,7 @@ fn describe(f: &Function) -> String {
             }
         }
         Function::Stats { condition, .. } => format!("Conditional returns after {condition}"),
+        Function::StudioDistHorizon(h) => format!("DIST Shape: {h}-bar log returns"),
         Function::StudioDist { timeframe } => format!(
             "Distribution Studio: {} log returns, tails, QQ, drawdowns and regimes · for the tickers type DIST US Equity / RDIST US Equity",
             timeframe.label()

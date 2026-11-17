@@ -43,6 +43,30 @@ pub fn all(scale: Scale) -> Vec<Case> {
         None,
     )
     .unwrap();
+    let shape_report = regime.clone();
+    let shape = tr_data::studio_shape::compute(&shape_report, 1, false).unwrap();
+    add!("studio.shape_5k", move || {
+        let s = bb(tr_data::studio_shape::compute(bb(&shape_report), 1, false).unwrap());
+        assert!(
+            s.values.len() >= 1500
+                && s.bins.len() >= 12
+                && s.curves.len() == 128
+                && s.river.len() >= 1250
+                && s.bandwidth.is_some()
+        );
+        assert_eq!(s.bins.iter().map(|b| b.2).sum::<usize>(), s.values.len());
+        assert!(s.ladder.windows(2).all(|w| w[0] <= w[1]));
+        for i in [0, 2, 4, 6] {
+            assert!(s.tails[i + 1] >= s.tails[i]);
+        }
+        s.values.len()
+    });
+    add!("studio.shape_bootstrap_5k_x500", move || {
+        let b = bb(shape.bootstrap());
+        assert_eq!(b.draws, 500);
+        assert!(b.tails.iter().all(|x| x.is_some_and(|(a, b)| a.is_finite() && b.is_finite() && a <= b)));
+        b.draws
+    });
     let rotation = regime.regime.rotation_input.clone().unwrap();
     add!("studio.regime_fingerprints_5k", move || {
         let r = bb(tr_data::studio_dist::compute(

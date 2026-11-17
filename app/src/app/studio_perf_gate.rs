@@ -165,6 +165,7 @@ fn perf_gate_paint_studios() {
     best.extend(season_sample());
     best.extend(corr_sample());
     best.extend(regime_sample());
+    best.extend(shape_sample());
     let ids: BTreeSet<_> = budgets.cases.keys().filter(|id| id.starts_with("paint.studio_")).cloned().collect();
     assert_eq!(best.keys().cloned().collect::<BTreeSet<_>>(), ids, "stale/missing studio budgets");
     for _ in 0..2 {
@@ -174,7 +175,13 @@ fn perf_gate_paint_studios() {
         {
             break;
         }
-        for (id, s) in sample().into_iter().chain(season_sample()).chain(corr_sample()).chain(regime_sample()) {
+        for (id, s) in sample()
+            .into_iter()
+            .chain(season_sample())
+            .chain(corr_sample())
+            .chain(regime_sample())
+            .chain(shape_sample())
+        {
             if s.median_us < best[&id].median_us {
                 best.insert(id, s);
             }
@@ -730,7 +737,7 @@ fn regime_sample() -> BTreeMap<String, Summary> {
                 if hover {
                     assert!(
                         text(&out.shapes).contains("dist.regime.mean_contrast"),
-                        "hover did not paint mean contrast MathCard"
+                        "hover did not paint scale MathCard"
                     );
                 }
             }
@@ -802,4 +809,133 @@ fn regime_cards_print_method_family_and_reason() {
     assert!(distance_card(&sparse, 0, None).to_text().contains("LOW N"));
     assert!(quantiles_card(&sparse, 2).unavailable.is_some());
     assert!(tails_card(&sparse, 2).unavailable.is_some());
+}
+
+fn shape_frame(
+    ctx: &egui::Context,
+    r: &tr_data::studio_dist::Report,
+    shape: &tr_data::studio_shape::Shape,
+    intervals: &tr_data::studio_shape::Intervals,
+    width: f32,
+    hover: bool,
+    index: usize,
+) -> egui::FullOutput {
+    let pointer = if hover {
+        ctx.data(|d| d.get_temp::<Rect>(egui::Id::new("shape-probe"))).unwrap_or(Rect::NOTHING).center()
+            + vec2(if index >= 160 { (index % 2) as f32 } else { 0. }, 0.)
+    } else {
+        pos2(15., 15.)
+    };
+    let events = if ctx.input(|i| i.pointer.hover_pos()) == Some(pointer) {
+        vec![]
+    } else {
+        vec![egui::Event::PointerMoved(pointer)]
+    };
+    let mut out = ctx.run_ui(
+        egui::RawInput {
+            time: Some(1. + index as f64 * 0.2),
+            screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(width, 1600.))),
+            events,
+            ..Default::default()
+        },
+        |ui| {
+            let cell = super::studio_dist::shape::view(ui, r, shape, Some(intervals));
+            ctx.data_mut(|d| d.insert_temp(egui::Id::new("shape-probe"), cell));
+        },
+    );
+    out.textures_delta.clear();
+    out
+}
+fn shape_guard(out: &egui::FullOutput) {
+    let txt = text(&out.shapes);
+    for word in [
+        "DISTRIBUTION SHAPE",
+        "CLOSED THRU",
+        "HISTOGRAM",
+        "KDE",
+        "ROLLING QUANTILE RIVER",
+        "BOTH TAILS",
+        "Loss 99 ES",
+        "Gain 99 ES",
+        "central probability mass",
+        "YEAR STRIP",
+        "ABSOLUTE MOVE THRESHOLDS",
+    ] {
+        assert!(txt.contains(word), "missing {word}: {txt}");
+    }
+    let histogram_bins = out
+        .shapes
+        .iter()
+        .filter(|s| matches!(&s.shape,egui::Shape::Rect(r) if r.fill==crate::theme::series(0).gamma_multiply(0.35)))
+        .count();
+    let rectangles = out.shapes.iter().filter(|s| matches!(&s.shape, egui::Shape::Rect(_))).count();
+    assert!(histogram_bins >= 12, "missing histogram geometry");
+    assert!(rectangles > 1000, "missing river geometry: {rectangles}");
+}
+fn shape_sample() -> BTreeMap<String, Summary> {
+    let ctx = egui::Context::default();
+    let r = regime_report();
+    let shape = tr_data::studio_shape::compute(&r, 1, false).unwrap();
+    let intervals = shape.bootstrap();
+    assert_eq!(intervals.draws, 500);
+    assert!(shape.river.len() > 4000);
+    for i in 0..20 {
+        finite(&ctx, shape_frame(&ctx, &r, &shape, &intervals, 1440., false, i));
+    }
+    let mut result = BTreeMap::new();
+    for hover in [false, true] {
+        let mode = if hover { "hover" } else { "steady" };
+        if hover {
+            for i in 140..160 {
+                finite(&ctx, shape_frame(&ctx, &r, &shape, &intervals, 1440., true, i));
+            }
+        }
+        let mut times: BTreeMap<String, Vec<f64>> = BTreeMap::new();
+        for i in 0..120 {
+            let start = Instant::now();
+            let mut out = shape_frame(&ctx, &r, &shape, &intervals, 1440., hover, i + if hover { 160 } else { 20 });
+            let ui_us = start.elapsed().as_secs_f64() * 1e6;
+            if i == 60 {
+                shape_guard(&out);
+                if hover {
+                    assert!(text(&out.shapes).contains("dist.shape.scale"), "hover did not paint scale MathCard");
+                }
+            }
+            let start = Instant::now();
+            let primitives = ctx.tessellate(std::mem::take(&mut out.shapes), out.pixels_per_point);
+            let tess_us = start.elapsed().as_secs_f64() * 1e6;
+            assert!(!primitives.is_empty());
+            std::hint::black_box(primitives);
+            for (metric, v) in [("ui", ui_us), ("tess", tess_us), ("total", ui_us + tess_us)] {
+                times.entry(format!("paint.studio_shape.{mode}.{metric}")).or_default().push(v);
+            }
+        }
+        for (id, mut samples) in times {
+            result.insert(id, tr_perf::summarize(&mut samples));
+        }
+    }
+    result
+}
+#[test]
+fn shape_geometry_finite_320_1440() {
+    let r = regime_report();
+    let s = tr_data::studio_shape::compute(&r, 1, false).unwrap();
+    let b = s.bootstrap();
+    for width in [320., 1440.] {
+        let ctx = egui::Context::default();
+        let out = shape_frame(&ctx, &r, &s, &b, width, false, 0);
+        if width > 1000. {
+            shape_guard(&out);
+        }
+        finite(&ctx, out);
+    }
+    let ctx = egui::Context::default();
+    ctx.all_styles_mut(|s| s.interaction.tooltip_delay = 0.);
+    for i in 0..180 {
+        let out = shape_frame(&ctx, &r, &s, &b, 1440., i > 140, i);
+        if i == 179 {
+            assert!(text(&out.shapes).contains("dist.shape.scale"));
+        }
+        finite(&ctx, out);
+    }
 }
