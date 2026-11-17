@@ -163,16 +163,81 @@ pub fn all(scale: Scale) -> Vec<Case> {
     let season = fixtures::season_evidence(if full { 120 } else { 40 });
     let observed = season.last().unwrap().ts + 300;
     add!("studio.season_evidence_120d_5m", move || {
-        let r = bb(tr_data::studio_season::compute_at("AAPL US Equity", Timeframe::M5, bb(&season), "benchmark fixture only", observed, observed).unwrap());
+        let r = bb(tr_data::studio_season::compute_at(
+            "AAPL US Equity",
+            Timeframe::M5,
+            bb(&season),
+            "benchmark fixture only",
+            observed,
+            observed,
+        )
+        .unwrap());
         let e = r.evidence.as_ref().unwrap();
-        let sessions = if full {120} else {40};
-        assert_eq!((r.bars,e.expected_bars,e.sessions,e.grid_sessions), (sessions*78,sessions*78,sessions,sessions));
-        assert_eq!(e.family_size(),468);
-        assert_eq!(e.closed_thru,observed);
-        assert!(e.cells[..78].iter().all(|c| c.inference.n==sessions && c.inference.interval.is_some() && c.inference.p.is_some()));
-        assert!(e.cells[78..].iter().all(|c| c.inference.n<30 && c.q==1. && c.inference.p.is_none()));
+        let sessions = if full { 120 } else { 40 };
+        assert_eq!(
+            (r.bars, e.expected_bars, e.sessions, e.grid_sessions),
+            (sessions * 78, sessions * 78, sessions, sessions)
+        );
+        assert_eq!(e.family_size(), 468);
+        assert_eq!(e.closed_thru, observed);
+        assert!(
+            e.cells[..78]
+                .iter()
+                .all(|c| c.inference.n == sessions && c.inference.interval.is_some() && c.inference.p.is_some())
+        );
+        assert!(e.cells[78..].iter().all(|c| c.inference.n < 30 && c.q == 1. && c.inference.p.is_none()));
         assert!(e.cells.iter().all(|c| c.q.is_finite() && (0. ..=1.).contains(&c.q)));
-        e.cells.iter().map(|c|c.inference.n).sum()
+        e.cells.iter().map(|c| c.inference.n).sum()
+    });
+    let n = if full { 5000 } else { 200 };
+    let (asset, benchmark) = fixtures::relationship(n);
+    add!("studio.corr_hac_5k", move || {
+        let r = bb(tr_data::studio_corr::compute(
+            "AAPL",
+            "QQQ",
+            bb(&asset),
+            bb(&benchmark),
+            252.,
+            &[],
+            "benchmark fixture only",
+        )
+        .unwrap());
+        assert_eq!(r.ols.n, n);
+        assert_eq!(r.robust.fits.len(), 4);
+        assert!(r.robust.fits.iter().all(|f| f.intervals.iter().all(Option::is_some)));
+        assert_eq!(r.robust.rolling[2].len(), if full { 1000 } else { 141 });
+        assert!(r.robust.rolling[2].iter().all(|p| p.interval.is_some()));
+        assert!(r.robust.holdout.as_ref().unwrap().r_squared_oos.is_some());
+        let sen = r.robust.theil_sen.as_ref().unwrap();
+        assert_eq!(sen.n, n.min(2000));
+        assert!(sen.slope.is_some() && sen.slopes > 0);
+        r.robust.rolling[2].len() + r.ols.n
+    });
+    let bars = fixtures::daily(if full { 5000 } else { 200 }, 83);
+    let seed = stable_hash::bars_digest(&bars);
+    let values: Vec<_> = bars.iter().map(|b| b.close / b.open - 1.).collect();
+    let breaks = vec![false; values.len()];
+    add!("inference.stationary_bootstrap_5k_x500", move || {
+        let mut work = 0;
+        let mut sum = 0.;
+        tr_data::studio_inference::stationary_bootstrap(values.len(), 500, seed, &breaks, |indices| {
+            // Consume every sampled value, rather than timing index generation alone.
+            sum += indices.iter().map(|&i| values[i]).sum::<f64>() / indices.len() as f64;
+            work += indices.len();
+        });
+        assert!(bb(sum).is_finite());
+        assert_eq!(work, values.len() * 500);
+        work
+    });
+    let columns = fixtures::inference_clocks(if full { 120 } else { 60 });
+    let breaks = vec![false; columns[0].len()];
+    add!("inference.maxt_78x500", move || {
+        let band = bb(tr_data::studio_inference::session_max_t(bb(&columns), &breaks, 500, seed));
+        assert_eq!(band.draws, 500);
+        assert!(band.critical.is_some_and(|v| v.is_finite() && v > 0.));
+        assert_eq!(band.intervals.len(), 78);
+        assert!(band.intervals.iter().all(Option::is_some));
+        band.intervals.len() * band.draws
     });
     let by_ps = (0..117).map(|i| if i % 4 == 0 { 1. } else { (i as f64 + 1.) / 1170. }).collect::<Vec<_>>();
     add!("nulls.by_117", move || {

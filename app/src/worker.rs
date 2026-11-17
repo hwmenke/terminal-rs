@@ -189,6 +189,7 @@ pub enum Request {
     StudioCorr {
         pane: PaneId,
         generation: u64,
+        horizon: usize,
         symbol: String,
         spec: String,
         fresh: bool,
@@ -198,6 +199,14 @@ pub enum Request {
         generation: u64,
         symbol: String,
         tf: Timeframe,
+    },
+    StudioSeasonBand {
+        pane: PaneId,
+        generation: u64,
+        symbol: String,
+        tf: Timeframe,
+        source: String,
+        input: Arc<tr_data::studio_season::SessionBandInput>,
     },
     /// Historical statistics and conditional forward returns for one archive symbol.
     Stats {
@@ -537,6 +546,7 @@ impl Request {
             Self::TstackTune { .. } => "TstackTune",
             Self::StudioCorr { .. } => "StudioCorr",
             Self::StudioSeason { .. } => "StudioSeason",
+            Self::StudioSeasonBand { .. } => "StudioSeasonBand",
             Self::Stats { .. } => "Stats",
             Self::Backtest { .. } => "Backtest",
             Self::IntradayCompare { .. } => "IntradayCompare",
@@ -812,12 +822,18 @@ pub enum Response {
     StudioCorr {
         pane: PaneId,
         generation: u64,
-        result: Result<tr_data::studio_corr::CorrReport, String>,
+        result: Result<Arc<tr_data::studio_corr::CorrReport>, String>,
     },
     StudioSeason {
         pane: PaneId,
         generation: u64,
         result: Result<Arc<tr_data::studio_season::SeasonReport>, String>,
+    },
+    StudioSeasonBand {
+        pane: PaneId,
+        generation: u64,
+        key: u64,
+        result: Result<Arc<tr_data::studio_inference::MaxTBand>, String>,
     },
     Stats {
         pane: PaneId,
@@ -3721,7 +3737,7 @@ fn cached_season_report(
     chrono::DateTime::<chrono::Utc>::from_timestamp(observed, 0).ok_or("SEASON refused: invalid observation clock")?;
     let mut key = tr_data::report_cache::ReportKey::new(
         "studio.season", symbol, tf, source, bars,
-        &format!("evidence-v1;provenance={:?};observed={observed};gaps={gaps:?}", Bar::provenance(bars)),
+        &format!("evidence-v2-two-families;provenance={:?};observed={observed};gaps={gaps:?}", Bar::provenance(bars)),
     );
     // Calendar/OR classifications depend on the NY date, not the paint/reload second.
     key.day = Some(tr_core::ny::civil(now).date());
@@ -4402,11 +4418,13 @@ async fn handle_inner(s: &Arc<Shared>, req: Request, force: bool) {
             .await;
             send(Response::TstackTune { pane, generation, result: result.map_err(|e| format!("{e:#}")) });
         }
-        Request::StudioCorr { pane, generation, symbol, spec, fresh } => {
+        Request::StudioCorr { pane, generation, symbol, spec, fresh, horizon } => {
             let bridge = config.bridge();
-            let result = crate::app::studio_corr::research(
+            let result = crate::app::studio_corr::research_horizon(
                 &crate::app::studio_corr::CORR_CACHE,
                 fresh,
+                horizon,
+                Some(s.jobs.clone()),
                 &s.history,
                 &bridge,
                 s.sample_mode(),
@@ -4450,6 +4468,21 @@ async fn handle_inner(s: &Arc<Shared>, req: Request, force: bool) {
                 }).await?.map_err(anyhow::Error::msg)
             }.await.map_err(|e| format!("{e:#}"));
             send(Response::StudioSeason { pane, generation, result });
+        }
+        Request::StudioSeasonBand {pane,generation,symbol,tf,source,input} => {
+            let key=input.seed;
+            let reports=s.reports.clone();let jobs=s.jobs.clone();
+            let result=if s.sample_mode() {Err("SEASON band: no real data in sample mode".into())} else {
+                tokio::task::spawn_blocking(move || {
+                    let mut cache_key=tr_data::report_cache::ReportKey::new("season.maxt.v2",&symbol,tf,&source,&[],"500 stationary draws; fixed HAC studentizers; simultaneous ALL clocks");
+                    cache_key.inputs=key;
+                    reports.get_or_compute(cache_key,|| {
+                        let _job=crate::perf::JobTimer::new(&jobs,"StudioSeasonBand");
+                        Ok::<_,String>(input.compute())
+                    })
+                }).await.unwrap_or_else(|e|Err(format!("SEASON band task: {e}")))
+            };
+            send(Response::StudioSeasonBand {pane,generation,key,result});
         }
         Request::Stats { pane, generation, symbol, condition, horizons } => {
             let bridge = config.bridge();
@@ -7715,6 +7748,33 @@ mod tests {
                 assert_eq!(*held_spy, spy);
             }
         }
+    }
+
+    #[tokio::test]
+    async fn season_band_second_stage_reuses_cache_and_never_fetches() {
+        let bars=tr_perf::fixtures::season_evidence(40);let now=bars.last().unwrap().ts+300;
+        let r=tr_data::studio_season::compute("AAPL",Timeframe::M5,&bars,"fixture",now).unwrap();
+        let input=r.evidence.unwrap().band_input;
+        let provider=vault_provider(vault_day("2026-11-09"));
+        let (s,rx)=shared(provider.clone(),Some(BarCache::open_in_memory().unwrap()));
+        let mut previous=None;
+        for generation in [1,2] {
+            handle(&s,Request::StudioSeasonBand {pane:19,generation,symbol:"AAPL".into(),tf:Timeframe::M5,source:"fixture".into(),input:input.clone()}).await;
+            let Response::WhatsNews {response,..}=rx.try_recv().unwrap() else {panic!("band envelope")};
+            let Response::StudioSeasonBand {key,result,..}=*response else {panic!("band response")};
+            assert_eq!(key,input.seed);
+            let band=result.unwrap();assert!(band.critical.is_some());
+            if let Some(p)=previous {assert!(Arc::ptr_eq(&p,&band));}
+            previous=Some(band);
+        }
+        assert_eq!(provider.calls.load(std::sync::atomic::Ordering::SeqCst),0);
+        let mut provider=vault_provider(vault_day("2026-11-09"));Arc::get_mut(&mut provider).unwrap().sample=true;
+        let (s,rx)=shared(provider.clone(),Some(BarCache::open_in_memory().unwrap()));
+        handle(&s,Request::StudioSeasonBand {pane:19,generation:3,symbol:"AAPL".into(),tf:Timeframe::M5,source:"fixture".into(),input}).await;
+        let Response::WhatsNews {response,..}=rx.try_recv().unwrap() else {panic!("band envelope")};
+        let Response::StudioSeasonBand {result,..}=*response else {panic!("band response")};
+        assert!(result.unwrap_err().contains("sample"));
+        assert_eq!(provider.calls.load(std::sync::atomic::Ordering::SeqCst),0);
     }
 
     #[test]

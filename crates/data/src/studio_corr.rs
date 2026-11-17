@@ -1,7 +1,12 @@
 //! Relationship Studio: verified, timestamp-aligned log returns and classical OLS.
-//! No fill-forward. Returns span adjacent common price endpoints, including gaps.
+//! No fill-forward. Returns span adjacent common price endpoints, excluding vault joins.
+use crate::studio_inference::{self as inference, CovarianceMethod, RegressionCovariance};
 use serde::{Deserialize, Serialize};
 use tr_core::{Bar, Provenance};
+
+fn one_horizon() -> usize {
+    1
+}
 
 pub const DEFAULT_SET: [&str; 7] = ["SPY", "QQQ", "IWM", "TLT", "GLD", "USO", "UUP"];
 pub const ROLLING_WINDOWS: [usize; 3] = [20, 60, 120];
@@ -86,12 +91,199 @@ pub struct Matrix {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FitInference {
+    pub covariance: RegressionCovariance,
+    /// Two fixed tests: alpha=0, beta=1. Never selected from observed results.
+    pub p: [Option<f64>; 2],
+    pub q: [f64; 2],
+    pub intervals: [Option<(f64, f64)>; 2],
+}
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct BetaBandPoint {
+    pub ts: i64,
+    pub start: i64,
+    pub beta: Option<f64>,
+    pub interval: Option<(f64, f64)>,
+    /// Starts a new polygon run, including the first available point after a join.
+    pub break_before: bool,
+    pub covariance_label: String,
+}
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Holdout {
+    pub train_n: usize,
+    pub test_n: usize,
+    pub split_ts: i64,
+    pub alpha: Option<f64>,
+    pub beta: Option<f64>,
+    pub train_mean: Option<f64>,
+    pub r_squared_oos: Option<f64>,
+    pub unavailable: Option<String>,
+}
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct RobustReport {
+    pub fits: Vec<FitInference>,
+    /// 60-observation pointwise bands; at most 1,000 trailing endpoints per SE.
+    pub rolling: Vec<Vec<BetaBandPoint>>,
+    pub holdout: Option<Holdout>,
+    #[serde(default)]
+    pub theil_sen: Option<TheilSen>,
+}
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TheilSen {
+    pub n: usize,
+    pub slopes: usize,
+    pub slope: Option<f64>,
+}
+/// Descriptive robust cross-check, no p-value; at most the latest 2,000 pairs.
+pub fn theil_sen(pairs: &[PairReturn]) -> TheilSen {
+    let p = &pairs[pairs.len().saturating_sub(2000)..];
+    let mut slopes = Vec::with_capacity(p.len().saturating_mul(p.len().saturating_sub(1)) / 2);
+    for (i, a) in p.iter().enumerate() {
+        for b in &p[i + 1..] {
+            if let Some(v) = divide(b.asset - a.asset, b.benchmark - a.benchmark) {
+                slopes.push(v);
+            }
+        }
+    }
+    let count = slopes.len();
+    let slope = if count == 0 {
+        None
+    } else {
+        let mid = count / 2;
+        slopes.select_nth_unstable_by(mid, f64::total_cmp);
+        Some(if count % 2 == 0 {
+            0.5 * slopes[mid] + 0.5 * slopes[..mid].iter().copied().max_by(f64::total_cmp).unwrap()
+        } else {
+            slopes[mid]
+        })
+    };
+    TheilSen { n: p.len(), slopes: count, slope }
+}
+
+pub const SE_METHODS: [CovarianceMethod; 4] =
+    [CovarianceMethod::Classical, CovarianceMethod::HC3, CovarianceMethod::HacFixed5, CovarianceMethod::HacAutomatic];
+
+fn fit_inference(pairs: &[PairReturn], ols: &Ols, breaks: &[bool], method: CovarianceMethod) -> FitInference {
+    let design: Vec<_> = pairs.iter().map(|p| vec![1., p.benchmark]).collect();
+    let residual: Vec<_> =
+        pairs.iter().map(|p| p.asset - ols.alpha.unwrap_or(0.) - ols.beta.unwrap_or(0.) * p.benchmark).collect();
+    let mut covariance = inference::regression_covariance(&design, &residual, breaks, method);
+    // Exact fits can have a few ulps of residual noise. Do not manufacture tests.
+    let magnitude = pairs.iter().map(|p| p.asset.abs()).fold(0., f64::max);
+    if ols.alpha.is_none()
+        || ols.beta.is_none()
+        || ols.residual_sigma.is_none_or(|s| s <= 64. * f64::EPSILON * magnitude)
+    {
+        covariance.covariance = None;
+        covariance.unavailable = Some("singular design or numerically zero residual variance".into());
+    }
+    if covariance.covariance.as_ref().is_some_and(|v| v[0][0] <= 0. || v[1][1] <= 0.) {
+        covariance.covariance = None;
+        covariance.unavailable = Some("zero or numerically degenerate coefficient variance".into());
+    }
+    let estimates = [ols.alpha, ols.beta];
+    let se = [covariance.mean_se(&[1., 0.]), covariance.mean_se(&[0., 1.])];
+    let intervals = std::array::from_fn(|i| {
+        estimates[i].zip(se[i]).filter(|(_, s)| *s > 0.).map(|(v, s)| (v - 1.96 * s, v + 1.96 * s))
+    });
+    let p = std::array::from_fn(|i| {
+        estimates[i].zip(se[i]).filter(|(_, s)| *s > 0.).map(|(v, s)| inference::normal_p((v - i as f64) / s))
+    });
+    let family = crate::nulls::Family::by("CORR alpha=0; beta=1", &p);
+    FitInference { covariance, p, q: [family.q[0], family.q[1]], intervals }
+}
+
+pub fn chronological_holdout(pairs: &[PairReturn], annual_periods: f64) -> Holdout {
+    let train_n = pairs.len() * 4 / 5;
+    let test_n = pairs.len() - train_n;
+    let mut out = Holdout {
+        train_n,
+        test_n,
+        split_ts: pairs.get(train_n).map_or(0, |p| p.end),
+        alpha: None,
+        beta: None,
+        train_mean: None,
+        r_squared_oos: None,
+        unavailable: None,
+    };
+    if train_n < 30 || test_n < 10 {
+        out.unavailable = Some("holdout needs ≥30 training and ≥10 test returns".into());
+        return out;
+    }
+    let fit = regress(&pairs[..train_n], annual_periods).expect("admitted finite returns");
+    out.alpha = fit.alpha;
+    out.beta = fit.beta;
+    let mean = pairs[..train_n].iter().map(|p| p.asset).sum::<f64>() / train_n as f64;
+    out.train_mean = Some(mean);
+    if let (Some(a), Some(b)) = (fit.alpha, fit.beta) {
+        let sse = pairs[train_n..].iter().map(|p| (p.asset - a - b * p.benchmark).powi(2)).sum();
+        let baseline = pairs[train_n..].iter().map(|p| (p.asset - mean).powi(2)).sum::<f64>();
+        out.r_squared_oos = divide(sse, baseline).and_then(|r| finite(1. - r));
+    }
+    if out.r_squared_oos.is_none() {
+        out.unavailable = Some("singular training fit or zero test baseline variance".into());
+    }
+    out
+}
+
+#[cfg(test)]
+fn robust_report(pairs: &[PairReturn], ols: &Ols, annual_periods: f64) -> RobustReport {
+    robust_report_horizon(pairs, ols, annual_periods, 1)
+}
+fn robust_report_horizon(pairs: &[PairReturn], ols: &Ols, annual_periods: f64, horizon: usize) -> RobustReport {
+    let breaks: Vec<_> = pairs.iter().enumerate().map(|(i, p)| i > 0 && pairs[i - 1].end < p.start).collect();
+    let effective = |method| {
+        if horizon > 1 && matches!(method, CovarianceMethod::HacFixed5 | CovarianceMethod::HacAutomatic) {
+            CovarianceMethod::Overlap(horizon)
+        } else {
+            method
+        }
+    };
+    let fits = SE_METHODS.iter().map(|&method| fit_inference(pairs, ols, &breaks, effective(method))).collect();
+    let mut rolling = vec![Vec::new(); SE_METHODS.len()];
+    for end in 60.max(pairs.len().saturating_sub(999))..=pairs.len() {
+        let start = end - 60;
+        let w = &pairs[start..end];
+        let crosses = breaks[start + 1..end].iter().any(|b| *b);
+        let m = regress(w, annual_periods).expect("admitted returns");
+        for (i, &method) in SE_METHODS.iter().enumerate() {
+            let fit = (!crosses).then(|| fit_inference(w, &m, &breaks[start..end], effective(method)));
+            rolling[i].push(BetaBandPoint {
+                ts: w[59].end,
+                start: w[0].start,
+                beta: (!crosses).then_some(m.beta).flatten(),
+                covariance_label: fit
+                    .as_ref()
+                    .map(|f| f.covariance.label())
+                    .unwrap_or_else(|| "window crosses a vault join".into()),
+                interval: fit.and_then(|f| f.intervals[1]),
+                break_before: breaks[end - 1] || crosses,
+            });
+        }
+    }
+    RobustReport {
+        fits,
+        rolling,
+        holdout: Some(chronological_holdout(pairs, annual_periods)),
+        theil_sen: Some(theil_sen(pairs)),
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CorrReport {
+    #[serde(default)]
+    pub robust: RobustReport,
+    #[serde(default = "one_horizon")]
+    pub horizon: usize,
     pub symbol: String,
     pub benchmark: String,
     pub provenance: Provenance,
     pub source: String,
     pub as_of: i64,
+    #[serde(default)]
+    pub closed_thru: i64,
+    #[serde(default)]
+    pub observed_at: Option<i64>,
     pub annual_periods: f64,
     pub aligned_bars: usize,
     pub asset_bars: usize,
@@ -110,9 +302,7 @@ fn aligned(asset: &[Bar], benchmark: &[Bar], daily: bool) -> Result<Vec<(i64, f6
     crate::stats::require_research_bars(asset, "Relationship asset")?;
     crate::stats::require_research_bars(benchmark, "Relationship benchmark")?;
     let key = |ts: i64| if daily { ts.div_euclid(86_400) } else { ts };
-    if daily
-        && [asset, benchmark].iter().any(|bars| bars.windows(2).any(|w| key(w[0].ts) == key(w[1].ts)))
-    {
+    if daily && [asset, benchmark].iter().any(|bars| bars.windows(2).any(|w| key(w[0].ts) == key(w[1].ts))) {
         return Err("Relationship refused: two daily bars share one calendar date".into());
     }
     let (mut i, mut j) = (0, 0);
@@ -321,7 +511,22 @@ pub fn compute_series(
     options: Options,
     source: &str,
 ) -> Result<CorrReport, String> {
+    compute_series_at_horizon(asset, benchmark, rows, options, source, 1)
+}
+
+pub fn compute_series_at_horizon(
+    asset: &NamedBars,
+    benchmark: &NamedBars,
+    rows: &[NamedBars],
+    options: Options,
+    source: &str,
+    horizon: usize,
+) -> Result<CorrReport, String> {
+    if ![1, 5, 20].contains(&horizon) {
+        return Err("CORR horizon must be 1, 5 or 20 observations".into());
+    }
     let Options { annual_periods, daily } = options;
+    let annual_periods = annual_periods / horizon as f64;
     let (symbol, other) = (&asset.symbol, &benchmark.bars);
     let prices = aligned(&asset.bars, other, daily)?;
     if prices.len() < 4 {
@@ -330,21 +535,40 @@ pub fn compute_series(
         );
     }
     let all_gaps = joined_gaps(asset, benchmark, daily);
-    let pairs = returns(&prices, &all_gaps);
+    let pairs = if horizon == 1 {
+        returns(&prices, &all_gaps)
+    } else {
+        prices
+            .windows(horizon + 1)
+            .filter(|w| !crate::studio_dist::spans_gap(&all_gaps, w[0].0, w[horizon].0))
+            .map(|w| PairReturn {
+                start: w[0].0,
+                end: w[horizon].0,
+                asset: w[horizon].1 - w[0].1,
+                benchmark: w[horizon].2 - w[0].2,
+            })
+            .collect()
+    };
     if pairs.len() < 3 {
         return Err("Relationship needs at least 3 common returns that do not span a vault gap.".into());
     }
     let (first, last) = (prices[0].0, prices[prices.len() - 1].0);
     let gaps: Vec<_> = all_gaps.iter().copied().filter(|g| g.1 > first && g.0 < last).collect();
     let ols = regress(&pairs, annual_periods)?;
+    let robust = robust_report_horizon(&pairs, &ols, annual_periods, horizon);
     let rolling = ROLLING_WINDOWS
         .iter()
         .map(|&window| {
             let points = pairs
                 .windows(window)
                 .map(|w| {
+                    let broken = w.windows(2).any(|p| p[0].end < p[1].start);
                     let m = regress(w, annual_periods)?;
-                    Ok((w[window - 1].end, m.beta, m.correlation))
+                    Ok((
+                        w[window - 1].end,
+                        if broken { None } else { m.beta },
+                        if broken { None } else { m.correlation },
+                    ))
                 })
                 .collect::<Result<Vec<_>, String>>()?;
             Ok(Rolling { window, points })
@@ -358,7 +582,7 @@ pub fn compute_series(
         .map(|(i, &(ts, a, b))| {
             let log_ratio = a - b;
             // Strictly trailing: mean/sd of the previous Z_WINDOW ratios, not including today.
-            let z60 = if i >= Z_WINDOW {
+            let z60 = if i >= Z_WINDOW && !crate::studio_dist::spans_gap(&all_gaps, prices[i - Z_WINDOW].0, ts) {
                 let w = &prices[i - Z_WINDOW..i];
                 let n = Z_WINDOW as f64;
                 let mean = w.iter().map(|p| p.1 - p.2).sum::<f64>() / n;
@@ -383,11 +607,15 @@ pub fn compute_series(
         })
         .collect();
     Ok(CorrReport {
+        robust,
+        horizon,
         symbol: symbol.clone(),
         benchmark: benchmark.symbol.clone(),
         provenance: Bar::provenance(&asset.bars).combine(Bar::provenance(other)),
         source: source.into(),
         as_of: prices.last().unwrap().0,
+        closed_thru: prices.last().unwrap().0,
+        observed_at: None,
         annual_periods,
         aligned_bars: prices.len(),
         asset_bars: asset.bars.len(),
@@ -572,7 +800,8 @@ mod tests {
             error,
             gaps: vec![],
         };
-        let rows = vec![row("A", a.clone(), None), row("B", b.clone(), None), row("TLT", vec![], Some("no archive".into()))];
+        let rows =
+            vec![row("A", a.clone(), None), row("B", b.clone(), None), row("TLT", vec![], Some("no archive".into()))];
         let m = matrix(&rows, false);
         assert_eq!(m.symbols, ["A", "B", "TLT"]);
         assert_eq!(m.cells[0][1].n, 5);
@@ -580,5 +809,152 @@ mod tests {
         near(m.cells[0][1].correlation, m.cells[1][0].correlation.unwrap());
         assert_eq!(m.unavailable, [("TLT".into(), "no archive".into())]);
         assert_eq!(m.cells[2][2].correlation, None);
+    }
+}
+
+#[cfg(test)]
+mod robust_tests {
+    use super::*;
+    fn pairs(n: usize) -> Vec<PairReturn> {
+        (0..n)
+            .map(|i| {
+                let x = ((i * 7 % 19) as f64 - 9.) * 0.001;
+                PairReturn {
+                    start: i as i64,
+                    end: i as i64 + 1,
+                    benchmark: x,
+                    asset: 0.001 + 1.5 * x + ((i % 7) as f64 - 3.) * 0.0002,
+                }
+            })
+            .collect()
+    }
+    #[test]
+    fn ols_point_estimates_unchanged() {
+        let p = pairs(100);
+        let ols = regress(&p, 252.).unwrap();
+        let r = robust_report(&p, &ols, 252.);
+        assert_eq!(ols, regress(&p, 252.).unwrap());
+        assert_eq!(r.fits.len(), 4);
+        let v = r.fits[0].covariance.covariance.as_ref().unwrap();
+        assert!((v[0][0].sqrt() - ols.alpha_se.unwrap()).abs() < 1e-12);
+        assert!((v[1][1].sqrt() - ols.beta_se.unwrap()).abs() < 1e-12);
+        for fit in &r.fits {
+            assert!(fit.intervals.iter().all(Option::is_some));
+            assert_eq!(fit.q, crate::nulls::benjamini_yekutieli(&fit.p.map(|p| p.unwrap_or(1.))).as_slice());
+        }
+    }
+    #[test]
+    fn holdout_never_refits_and_r2_negative_on_noise() {
+        let mut p = pairs(100);
+        let original = chronological_holdout(&p, 252.);
+        for p in &mut p[80..] {
+            p.asset = -5. * p.benchmark;
+        }
+        let held = chronological_holdout(&p, 252.);
+        assert_eq!((held.alpha, held.beta, held.train_mean), (original.alpha, original.beta, original.train_mean));
+        assert!(held.r_squared_oos.unwrap() < 0.);
+        let (a, b) = (held.alpha.unwrap(), held.beta.unwrap());
+        let mean = held.train_mean.unwrap();
+        let reference = 1.
+            - p[80..].iter().map(|p| (p.asset - a - b * p.benchmark).powi(2)).sum::<f64>()
+                / p[80..].iter().map(|p| (p.asset - mean).powi(2)).sum::<f64>();
+        assert_eq!(held.r_squared_oos, Some(reference));
+        assert!(chronological_holdout(&p[..35], 252.).r_squared_oos.is_none());
+    }
+    #[test]
+    fn appending_bars_keeps_earlier_rolling_estimates() {
+        let p = pairs(170);
+        let a = robust_report(&p[..150], &regress(&p[..150], 252.).unwrap(), 252.);
+        let b = robust_report(&p, &regress(&p, 252.).unwrap(), 252.);
+        for (a, b) in a.rolling.iter().zip(&b.rolling) {
+            assert_eq!(a, &b[..a.len()]);
+        }
+        let p = pairs(1300);
+        let r = robust_report(&p, &regress(&p, 252.).unwrap(), 252.);
+        assert!(r.rolling.iter().all(|r| r.len() == 1000));
+    }
+    #[test]
+    fn no_lag_product_or_polygon_across_vault_gap() {
+        let mut p = pairs(150);
+        for p in &mut p[70..] {
+            p.start += 10;
+            p.end += 10;
+        }
+        let r = robust_report(&p, &regress(&p, 252.).unwrap(), 252.);
+        for band in &r.rolling {
+            for point in band {
+                if point.start < 80 && point.ts > 70 {
+                    assert!(point.interval.is_none() && point.break_before);
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod horizon_tests {
+    use super::*;
+    #[test]
+    fn theil_sen_ignores_single_outlier() {
+        let mut p: Vec<_> = (0..101)
+            .map(|i| PairReturn { start: i, end: i + 1, benchmark: i as f64, asset: 2. + 3. * i as f64 })
+            .collect();
+        p[50].asset = 1e9;
+        assert_eq!(theil_sen(&p).slope, Some(3.));
+        assert_eq!(theil_sen(&p).slopes, 5050);
+        assert!(theil_sen(&[]).slope.is_none());
+        for p in &mut p {
+            p.benchmark = 1.;
+        }
+        assert!(theil_sen(&p).slope.is_none());
+    }
+    #[test]
+    fn horizons_preserve_one_bar_ols_and_use_uniform_overlap_without_gap_windows() {
+        let bars = |scale: f64| {
+            (0..150)
+                .map(|i| {
+                    let p = (4. + scale * (0.001 * i as f64 + (i % 7) as f64 * 0.0001)).exp();
+                    Bar::new(i * 1800, p, p, p, p, 10.).with_provenance(Provenance::Real)
+                })
+                .collect()
+        };
+        let mut a = NamedBars { symbol: "A".into(), bars: bars(1.2), ..Default::default() };
+        let b = NamedBars { symbol: "B".into(), bars: bars(0.9), ..Default::default() };
+        let options = Options { annual_periods: 3276., daily: false };
+        let one = compute_series(&a, &b, &[], options, "test").unwrap();
+        let explicit = compute_series_at_horizon(&a, &b, &[], options, "test", 1).unwrap();
+        assert_eq!(one, explicit);
+        a.gaps = vec![(a.bars[69].ts, a.bars[70].ts)];
+        for h in [5, 20] {
+            let r = compute_series_at_horizon(&a, &b, &[], options, "test", h).unwrap();
+            assert_eq!(r.horizon, h);
+            assert_eq!(r.ols.n, 150 - 2 * h);
+            assert_eq!(r.robust.fits[2].covariance.method, CovarianceMethod::Overlap(h));
+            assert_eq!(r.robust.fits[2].covariance.lag, h - 1);
+            assert!(r.returns.iter().all(|p| !crate::studio_dist::spans_gap(&a.gaps, p.start, p.end)));
+            for p in &r.robust.rolling[2] {
+                if p.start < a.gaps[0].1 && p.ts > a.gaps[0].0 {
+                    assert!(p.interval.is_none());
+                }
+            }
+            assert!((r.returns[0].asset - (a.bars[h].close / a.bars[0].close).ln()).abs() < 1e-12);
+        }
+        assert!(compute_series_at_horizon(&a, &b, &[], options, "test", 2).is_err());
+    }
+    #[test]
+    fn old_report_json_defaults_to_one_bar_and_unavailable_robust() {
+        let p: Vec<_> = (0..4)
+            .map(|i| {
+                let v = 100. + i as f64;
+                Bar::new(i, v, v, v, v, 1.).with_provenance(Provenance::Real)
+            })
+            .collect();
+        let r = compute("A", "B", &p, &p, 252., &[], "test").unwrap();
+        let mut old = serde_json::to_value(r).unwrap();
+        old.as_object_mut().unwrap().remove("horizon");
+        old.as_object_mut().unwrap().remove("robust");
+        let restored: CorrReport = serde_json::from_value(old).unwrap();
+        assert_eq!(restored.horizon, 1);
+        assert!(restored.robust.fits.is_empty());
     }
 }

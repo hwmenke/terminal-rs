@@ -127,9 +127,23 @@ pub fn season_evidence(sessions: usize) -> Vec<Bar> {
             let effect = 0.0002 * (k as f64 * 0.15).cos();
             let noise = 0.001 * (s as f64 * 1.7 + k as f64 * 0.3).sin();
             let close = 100. * (1. + effect + noise);
-            out.push(Bar::new(ts,100.,100.2,99.8,close,1000.+k as f64).with_provenance(Provenance::Real));
+            out.push(Bar::new(ts, 100., 100.2, 99.8, close, 1000. + k as f64).with_provenance(Provenance::Real));
         }
         date = calendar::next_session(date);
     }
     out
+}
+
+/// Verified flags are exclusively for exercising admission in offline benchmarks.
+pub fn relationship(n: usize) -> (Vec<Bar>, Vec<Bar>) {
+    (daily(n + 1, 71), daily(n + 1, 73))
+}
+
+/// A rectangular 78-clock session grid with nondegenerate common-row variation.
+pub fn inference_clocks(sessions: usize) -> Vec<Vec<Option<f64>>> {
+    let mut rng = Rng(311);
+    let common: Vec<_> = (0..sessions).map(|s| 0.0003 * (s as f64 * 0.3).sin() + 0.0007 * (rng.next() - 0.5)).collect();
+    (0..78)
+        .map(|k| (0..sessions).map(|s| Some(common[s] + 0.0005 * (rng.next() - 0.5) + k as f64 * 0.000001)).collect())
+        .collect()
 }

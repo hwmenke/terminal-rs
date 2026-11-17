@@ -135,6 +135,36 @@
       "budget_us": 2000,
       "relative": false,
       "class": "frame"
+    },
+    "paint.studio_corr.steady.ui": {
+      "budget_us": 1500,
+      "relative": false,
+      "class": "frame"
+    },
+    "paint.studio_corr.steady.tess": {
+      "budget_us": 800,
+      "relative": false,
+      "class": "frame"
+    },
+    "paint.studio_corr.steady.total": {
+      "budget_us": 2500,
+      "relative": false,
+      "class": "frame"
+    },
+    "paint.studio_corr.hover.ui": {
+      "budget_us": 1500,
+      "relative": false,
+      "class": "frame"
+    },
+    "paint.studio_corr.hover.tess": {
+      "budget_us": 800,
+      "relative": false,
+      "class": "frame"
+    },
+    "paint.studio_corr.hover.total": {
+      "budget_us": 2500,
+      "relative": false,
+      "class": "frame"
     }
   }
 }

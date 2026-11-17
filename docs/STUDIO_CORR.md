@@ -58,8 +58,8 @@ correlation is Pearson's r, R² = r². Alpha annualises linearly (a log-return r
 Classical coefficient standard errors use s² = SSE / (n−2):
 SE(β) = sqrt(s² / Sxx), SE(α) = sqrt(s²(1/n + mean(x)²/Sxx)).
 The displayed alpha SE is per observation. T-statistics divide coefficients by
-these SEs. Residual annual volatility is s sqrt(periods/year). These are ordinary
-homoskedastic, independent-error estimates; no robust/HAC correction, p-values,
+these SEs. Residual annual volatility is s sqrt(periods/year). These legacy fields remain ordinary homoskedastic, independent-error estimates.
+The separate selected-SE tiles and fan use the covariance methods below. No
 risk-free rate or predictive significance is claimed.
 
 Annualisation uses the same convention as Distribution Studio: daily 252 (crypto
@@ -76,8 +76,9 @@ Up/down capture is 100 × sum(y) / sum(x) on observations where x > 0 / x < 0.
 Upside/downside beta refits an intercept on each subset (at least three returns).
 Flat benchmark observations belong to neither subset. Undefined values show `—`,
 including zero-variance correlations and t-statistics with zero standard error.
-The scatter band is the fitted mean ±2 residual standard errors, not a confidence
-or prediction interval.
+The scatter fan is the selected covariance’s pointwise 95% mean-response CI,
+`ŷ(x) ± 1.96 sqrt((1,x)V(1,x)ᵀ)`. It does not include residual variance and is
+not a prediction interval.
 
 The ratio panel uses log(asset close) − log(benchmark close). Its z-score
 compares today's ratio with the mean and sample standard deviation of the
@@ -100,3 +101,70 @@ residuals, disjoint/misaligned timestamps, too few observations, invalid/NaN
 prices, provenance refusal, zero variance, missing matrix peers, command aliases,
 settings persistence, and stale/unverified response refusal. Tests perform no
 network requests. No dependencies were added.
+
+## Robust relationship fan and inference kit v2
+
+The SE chip selects **Classical**, **HC3**, **HAC Bartlett fixed 5**, or **HAC
+Bartlett automatic**. Default is fixed-5 HAC. These ephemeral controls and the
+1/5/20-observation return-horizon chips do not change saved layouts/preferences.
+The original one-observation OLS point estimates and classical errors are unchanged.
+Signed coefficient numbers use sign ink; covariance/series identities use categorical
+colours. No significance hue is used. The matrix retains its printed [−1,1] key.
+
+For design rows z=(1,x), residual e and score g=ze, let A=Σzzᵀ. The covariance
+is V=A⁻¹SA⁻¹. Bartlett HAC uses S=Σggᵀ+Σ(l=1…L)(1−l/(L+1))Σ(g_t g_(t−l)ᵀ+
+g_(t−l)g_tᵀ), with L=min(5,n−3), or min(floor(4(n/100)^(2/9)),n−3).
+HC3 uses S=Σzzᵀ e²/(1−h_ii)², h_ii=zᵀA⁻¹z. There is no extra small-sample
+multiplier on these robust sandwiches. The generic inference kit also supports
+k-column designs; the two-column rolling path uses the same arithmetic with
+bounded allocations. Methods follow Newey–West (1987/1994), MacKinnon–White
+(1985), and Hansen–Hodrick (1980).
+
+Five/twenty-observation log returns use overlapping common-price windows, omitting
+every window spanning a vault join. Default overlap covariance is the uniform
+kernel through h−1 lags. A non-PSD uniform meat falls back to Bartlett at the same
+bandwidth, explicitly labelled. Classical and HC3 remain selectable comparisons
+and do not account for serial overlap. Annualisation uses periods/year divided
+by h. “Bars” means common observations: irregular missing timestamps can lengthen
+elapsed time. Matrix peer correlations keep the original one-observation definition.
+
+Selected coefficient tiles show θ±1.96 SE. Inference needs n≥30 and nondegenerate
+residual/coefficient variance. Singular/flat/sparse input stays unavailable. The
+two-sided p uses a standard normal approximation; the **fixed m=2 BY family** is
+alpha=0 and beta=1, with unavailable p=1. Every covariance/horizon report declares
+the same two hypotheses before selection. Repeated comparisons across settings,
+horizons, symbols and dates are outside this displayed family. Classical errors
+remain unchanged; the newly displayed classical intervals/tests are normal
+approximations, not finite-sample Student t tests.
+
+The 60-return rolling beta band uses the selected method and only the latest
+1,000 endpoints. Windows crossing joins are withheld and adjacent polygons break
+there. Appending observations cannot change an earlier retained window. The
+rolling MathCard names its own window bandwidth; these are pointwise descriptive
+bands with no significance badges. Legacy 20/60/120 curves are retained and gap
+windows withheld. Ratio z60 also withholds windows crossing a join.
+
+The **holdout** fits the first floor(0.8n) observations, freezes alpha, beta and
+training mean, then scores the remaining observations. `R²_oos = 1 − SSE_test /
+Σtest(y−mean_train)²`; negative values read **no skill**. It needs at least 30
+training and 10 test observations and a nonzero test baseline. No refitting or
+parameter selection uses the test set. Overlapping horizons share up to h−1
+boundary prices across this simple split; the UI discloses this limitation.
+The train/test strip is descriptive, not an execution or strategy backtest.
+
+The **Theil–Sen** slope is the exact median of finite pairwise slopes on at most
+the latest 2,000 observations, excluding equal-x pairs. It is a descriptive robust
+cross-check with no p-value or interval. This bounded fit is worker-only.
+
+Reports are immutable Arcs in a bounded ReportCache. Keys include full admitted
+closed-bar digests, benchmark, peer errors, source/provenance, observation clock,
+gaps, interval, horizon and method parameters. Complete admission precedes cache
+reuse. Sample/refusal clears results and stale generations cannot overwrite the
+current pane. All new statistic MathCards have stable titles/ids, formulas,
+inputs, n, source, span, CLOSED THRU, methods and unavailable explanations.
+
+Tests include direct 2×2 HAC and hand HC3 references, h=3 uniform variance,
+non-PSD fallback labelling, fan transformation, unchanged OLS/classical errors,
+chronological frozen holdout, Theil–Sen outlier resistance, overlap horizons,
+causal rolling prefixes, gap breaks, cache invalidation and actual hover cards
+with finite narrow/wide geometry. See PERF.md for measured gates and limitations.

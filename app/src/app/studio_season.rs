@@ -23,6 +23,9 @@ pub struct SeasonPane {
     pub evidence_tab: bool,
     pub evidence_mode: bool,
     pub or_selection: or_lens::Selection,
+    pub band: Option<std::sync::Arc<tr_data::studio_inference::MaxTBand>>,
+    pub band_loading: bool,
+    pub band_error: Option<String>,
 }
 
 impl SeasonPane {
@@ -38,10 +41,16 @@ impl SeasonPane {
             evidence_tab: false,
             evidence_mode: true,
             or_selection: Default::default(),
+            band: None,
+            band_loading: false,
+            band_error: None,
         }
     }
     pub fn request(&mut self, id: PaneId, worker: &Worker) {
         self.generation += 1;
+        self.band = None;
+        self.band_loading = false;
+        self.band_error = None;
         self.report = None;
         self.loading = false;
         self.error = None;
@@ -63,6 +72,24 @@ impl SeasonPane {
             symbol: tr_data::security(&self.symbol).key(),
             tf,
         });
+    }
+    pub fn accept_band(
+        &mut self,
+        generation: u64,
+        key: u64,
+        result: Result<std::sync::Arc<tr_data::studio_inference::MaxTBand>, String>,
+    ) {
+        if generation != self.generation
+            || self.report.as_ref().and_then(|r| r.evidence.as_ref()).is_none_or(|e| e.band_input.seed != key)
+        {
+            return;
+        }
+        self.band_loading = false;
+        self.band = None;
+        match result {
+            Ok(b) => self.band = Some(b),
+            Err(e) => self.band_error = Some(e),
+        }
     }
     #[cfg(test)]
     pub fn accept(&mut self, generation: u64, result: Result<SeasonReport, String>) {
@@ -100,6 +127,9 @@ impl TerminalApp {
         if sample {
             // Same empty state as DIST / CORR: never send a request for display prices.
             pane.report = None;
+            pane.band = None;
+            pane.band_loading = false;
+            pane.band_error = None;
             pane.loading = false;
             pane.error = Some(
                 "No real data in sample / demo display mode. Seasonality never uses display or demo prices.".into(),
@@ -155,7 +185,28 @@ impl TerminalApp {
             });
             ui.push_id(id, |ui| {
                 if pane.evidence_tab {
-                    evidence::view(ui, r, &mut pane.evidence_mode);
+                    if pane.band.is_none()
+                        && !pane.band_loading
+                        && pane.band_error.is_none()
+                        && let Some(e) = &r.evidence
+                    {
+                        pane.band_loading = true;
+                        self.worker.send(Request::StudioSeasonBand {
+                            pane: id,
+                            generation: pane.generation,
+                            symbol: r.symbol.clone(),
+                            tf: r.timeframe,
+                            source: r.source.clone(),
+                            input: e.band_input.clone(),
+                        });
+                    }
+                    evidence::view_with_band(ui, r, &mut pane.evidence_mode, pane.band.as_deref());
+                    if pane.band_loading {
+                        ui.label("ALL simultaneous band · computing 500 session-block draws…");
+                    }
+                    if let Some(e) = &pane.band_error {
+                        ui.label(format!("ALL simultaneous band unavailable: {e}"));
+                    }
                 } else if pane.or_tab {
                     if let Some(lens) = &r.or_lens {
                         or_lens::view(ui, lens, &mut pane.or_selection);
@@ -273,26 +324,55 @@ fn daily(ui: &mut Ui, r: &SeasonReport) {
     let hs = return_scale(r.months.iter().filter_map(|m| m.value).map(f64::abs).fold(0.01, f64::max));
     hs.key(ui);
     ScrollArea::horizontal().id_salt("season-month-heat").show(ui, |ui| {
-        let years: Vec<i32> = r.months.iter().map(|m| m.year).collect::<std::collections::BTreeSet<_>>().into_iter().collect();
+        let years: Vec<i32> =
+            r.months.iter().map(|m| m.year).collect::<std::collections::BTreeSet<_>>().into_iter().collect();
         let width = ui.available_width().max(850.0);
         let cell_w = (width - 52.0) / 12.0;
         let (rect, _) = ui.allocate_exact_size(vec2(width, 24.0 + years.len() as f32 * 44.0), Sense::hover());
         for (m, label) in math::MONTHS.iter().enumerate() {
-            ui.painter().text(pos2(rect.left() + 52.0 + (m as f32 + 0.5) * cell_w, rect.top() + 10.0), Align2::CENTER_CENTER, label, theme::mono(11.0), theme::muted());
+            ui.painter().text(
+                pos2(rect.left() + 52.0 + (m as f32 + 0.5) * cell_w, rect.top() + 10.0),
+                Align2::CENTER_CENTER,
+                label,
+                theme::mono(11.0),
+                theme::muted(),
+            );
         }
         for (y, year) in years.iter().enumerate() {
             let top = rect.top() + 24.0 + y as f32 * 44.0;
-            ui.painter().text(pos2(rect.left(), top + 20.0), Align2::LEFT_CENTER, year, theme::mono(12.0), theme::text());
+            ui.painter().text(
+                pos2(rect.left(), top + 20.0),
+                Align2::LEFT_CENTER,
+                year,
+                theme::mono(12.0),
+                theme::text(),
+            );
             for month in 1..=12 {
                 let cell = r.months.iter().find(|m| m.year == *year && m.month == month);
                 let (value, n) = cell.map(|c| (c.value, c.n)).unwrap_or((None, 0));
-                let rc = Rect::from_min_size(pos2(rect.left() + 52.0 + (month - 1) as f32 * cell_w, top), vec2(cell_w - 3.0, 40.0));
+                let rc = Rect::from_min_size(
+                    pos2(rect.left() + 52.0 + (month - 1) as f32 * cell_w, top),
+                    vec2(cell_w - 3.0, 40.0),
+                );
                 let enough = n >= MIN_N;
                 ui.painter().rect_filled(rc, 3.0, hs.fill_gated(value, enough));
                 let ink = cell_ink(&hs, value, enough);
-                ui.painter().text(rc.center_top() + vec2(0.0, 12.0), Align2::CENTER_CENTER, pct(value), theme::mono(11.0), if value.is_some() && enough { ink } else { theme::muted() });
-                ui.painter().text(rc.center_bottom() - vec2(0.0, 9.0), Align2::CENTER_CENTER, format!("n={n}"), theme::mono(9.0), if enough { ink.gamma_multiply(0.8) } else { theme::muted() });
-                ui.interact(rc, ui.id().with(("month", year, month)), Sense::hover()).math_card(|| month_card(*year, month, cell, r.provenance));
+                ui.painter().text(
+                    rc.center_top() + vec2(0.0, 12.0),
+                    Align2::CENTER_CENTER,
+                    pct(value),
+                    theme::mono(11.0),
+                    if value.is_some() && enough { ink } else { theme::muted() },
+                );
+                ui.painter().text(
+                    rc.center_bottom() - vec2(0.0, 9.0),
+                    Align2::CENTER_CENTER,
+                    format!("n={n}"),
+                    theme::mono(9.0),
+                    if enough { ink.gamma_multiply(0.8) } else { theme::muted() },
+                );
+                ui.interact(rc, ui.id().with(("month", year, month)), Sense::hover())
+                    .math_card(|| month_card(*year, month, cell, r.provenance));
             }
         }
     });
@@ -805,10 +885,13 @@ mod tests {
             .collect();
         assert!(!cells.is_empty());
         assert!(cells.iter().all(|c| allowed.contains(c)), "{cells:?}");
-        assert!(hs.scale >= 0.01 && [1.0, 2.0, 5.0].iter().any(|m| {
-            let k = (hs.scale / m).log10();
-            (k - k.round()).abs() < 1e-9
-        }));
+        assert!(
+            hs.scale >= 0.01
+                && [1.0, 2.0, 5.0].iter().any(|m| {
+                    let k = (hs.scale / m).log10();
+                    (k - k.round()).abs() < 1e-9
+                })
+        );
     }
     #[test]
     fn view_warns_when_series_spans_vault_gap() {
@@ -871,5 +954,34 @@ mod tests {
         p.accept(2, Ok(report));
         assert!(p.error.as_deref().unwrap().contains("SAMPLE"));
         assert!(p.report.is_none());
+    }
+}
+
+#[cfg(test)]
+mod band_tests {
+    use super::*;
+    #[test]
+    fn second_stage_rejects_old_generation_and_digest_and_clears_on_request() {
+        let bars = tr_perf::fixtures::season_evidence(40);
+        let now = bars.last().unwrap().ts + 300;
+        let r = math::compute("AAPL", tr_core::Timeframe::M5, &bars, "verified fixture", now).unwrap();
+        let input = r.evidence.as_ref().unwrap().band_input.clone();
+        let band = std::sync::Arc::new(input.compute());
+        assert!(band.critical.is_some());
+        let mut pane = SeasonPane::new("AAPL", "5m");
+        pane.generation = 2;
+        pane.accept(2, Ok(r));
+        pane.band_loading = true;
+        pane.accept_band(1, input.seed, Ok(band.clone()));
+        assert!(pane.band.is_none() && pane.band_loading);
+        pane.accept_band(2, input.seed.wrapping_add(1), Ok(band.clone()));
+        assert!(pane.band.is_none() && pane.band_loading);
+        pane.accept_band(2, input.seed, Ok(band));
+        assert!(pane.band.is_some() && !pane.band_loading);
+        pane.accept_band(2, input.seed, Err("refused".into()));
+        assert!(pane.band.is_none() && pane.band_error.as_deref() == Some("refused"));
+        pane.report = None;
+        pane.accept_band(2, input.seed, Ok(std::sync::Arc::new(input.compute())));
+        assert!(pane.band.is_none());
     }
 }
