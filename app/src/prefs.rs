@@ -237,6 +237,8 @@ pub enum Action {
     StudioNextLens,
     StudioCloseInspector,
     StudioUndo,
+    CanvasBrush,
+    CanvasStrip,
     Portfolio,
     Positions,
     Orders,
@@ -290,7 +292,7 @@ pub enum Action {
 }
 
 impl Action {
-    pub const ALL: [Action; 64] = [
+    pub const ALL: [Action; 66] = [
         Action::Vault,
         Action::Help,
         Action::Congress,
@@ -305,6 +307,8 @@ impl Action {
         Action::StudioNextLens,
         Action::StudioCloseInspector,
         Action::StudioUndo,
+        Action::CanvasBrush,
+        Action::CanvasStrip,
         Action::Portfolio,
         Action::Positions,
         Action::Orders,
@@ -371,6 +375,8 @@ impl Action {
             Action::StudioPrevLens => "Studio: previous lens (local)".into(),
             Action::StudioNextLens => "Studio: next lens (local)".into(),
             Action::StudioCloseInspector => "Studio: close inspector (local)".into(),
+            Action::CanvasBrush => "Canvas: toggle dedicated brush (Escape cancels)".into(),
+            Action::CanvasStrip => "Canvas: toggle distribution strip".into(),
             Action::StudioUndo => "Studio: parameter undo (outside text editing)".into(),
             Action::Portfolio => "Brokerage portfolio".into(),
             Action::Positions => "Brokerage positions".into(),
@@ -424,6 +430,7 @@ impl Action {
         use Action as A;
         match self {
             a if a.panel_spec().is_some() => "New panels",
+            A::CanvasBrush | A::CanvasStrip => "Workspace",
             A::StudioPrevLens | A::StudioNextLens | A::StudioCloseInspector | A::StudioUndo => "Workspace",
             A::NextPane
             | A::PrevPane
@@ -629,6 +636,8 @@ impl Default for Keymap {
         bind(Action::StudioNextLens, "Alt+ArrowRight");
         bind(Action::StudioCloseInspector, "Escape");
         bind(Action::StudioUndo, "Ctrl+Z");
+        bind(Action::CanvasBrush, "Alt+Shift+B");
+        bind(Action::CanvasStrip, "Alt+Shift+D");
         bind(Action::Portfolio, "F7");
         bind(Action::Positions, "F8");
         bind(Action::Orders, "F9");
@@ -834,9 +843,9 @@ mod tests {
         assert_eq!(restored.0.get(&Action::ToggleStopCloud).unwrap(), "Alt+S");
     }
     #[test]
-    fn alt_b_opens_vault_and_action_all_has_64_entries() {
+    fn alt_b_opens_vault_and_action_registry_is_complete() {
         let keys = Keymap::default();
-        assert_eq!(Action::ALL.len(), 64);
+        assert_eq!(Action::ALL.len(), 66);
         assert_eq!(keys.0.get(&Action::Vault), Some(&"Alt+B".to_string()));
     }
     #[test]

@@ -250,3 +250,11 @@ Research request tokens are now process-wide and monotonic, so recreated child
 panes cannot accept an older completion. Overview MathCards also print stable
 `dist.overview.*` IDs, CLOSED THRU and observation-clock metadata. See
 [Studio](STUDIO.md) for selection semantics, persistence and limits.
+
+## Canvas brush comparison
+
+[Quick canvas](STUDIO_CANVAS.md) can compare selected and visible closed
+transformed values on shared histogram bins. This descriptive comparison retains
+each sample’s own n and includes overlap in its visible reference. It does not
+filter this lens, change its log returns, or replace Shape’s right-continuous
+percentile convention with the canvas’s midrank convention.

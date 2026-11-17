@@ -34,6 +34,18 @@ pub const PRICE_ALERT_EVAL_SECS: u64 = 20;
 use tr_data::health::{DataMode, DownKind, Feed, FeedState, Snapshot, Unavailable};
 
 pub enum Request {
+    StudioCanvas {
+        pane: PaneId,
+        token: u64,
+        key: crate::chart_view::studio_canvas::CanvasKey,
+        input: tr_data::studio_canvas::CanvasInput,
+        peers: Option<Arc<crate::chart_view::studio_canvas::PeerSources>>,
+        comparisons: Vec<String>,
+        spec: tr_data::studio_canvas::CanvasSpec,
+        news: Vec<tr_data::NewsItem>,
+        earnings: Option<tr_data::studio_canvas::CanvasEvent>,
+    },
+
     StackEdge {
         pane: PaneId,
         key: tr_data::edge::EdgeKey,
@@ -564,6 +576,7 @@ impl Request {
             Self::TrendCone { .. } => "TrendCone",
             Self::AnchoredVwap { .. } => "AnchoredVwap",
             Self::HoldingHistory { .. } => "HoldingHistory",
+            Self::StudioCanvas { .. } => "StudioCanvas",
             Self::StudioDist { .. } => "StudioDist",
             Self::TstackTune { .. } => "TstackTune",
             Self::StudioCorr { .. } => "StudioCorr",
@@ -718,6 +731,12 @@ pub struct Profile {
 }
 
 pub enum Response {
+    StudioCanvas {
+        pane: PaneId,
+        token: u64,
+        key: crate::chart_view::studio_canvas::CanvasKey,
+        result: Result<Arc<crate::chart_view::studio_canvas::PreparedCanvas>, String>,
+    },
     StackEdge {
         pane: PaneId,
         key: tr_data::edge::EdgeKey,
@@ -4405,6 +4424,129 @@ async fn handle_inner(s: &Arc<Shared>, req: Request, force: bool) {
                 generation,
                 result: research_desk(s, &bridge, &symbols).await.map_err(|e| format!("{e:#}")),
             });
+        }
+        Request::StudioCanvas { pane, token, key, input, peers, comparisons, spec, news, earnings } => {
+            let result = async {
+                if s.sample_mode() {
+                    anyhow::bail!("Quick canvas: no real data in sample mode");
+                }
+                if comparisons.len() > 4 {
+                    anyhow::bail!("Quick canvas: at most four comparisons");
+                }
+                // Validate native source before any comparison I/O, trimming or cache lookup.
+                let native = input.clone();
+                tokio::task::spawn_blocking(move || tr_data::studio_canvas::validate(&native))
+                    .await?
+                    .map_err(anyhow::Error::msg)?;
+                let peers = if let Some(p) = peers {
+                    if p.requested != comparisons {
+                        anyhow::bail!("Canvas comparison receipt mismatch");
+                    }
+                    p
+                } else {
+                    let mut p = crate::chart_view::studio_canvas::PeerSources {
+                        requested: comparisons.clone(),
+                        ..Default::default()
+                    };
+                    for symbol in comparisons {
+                        let load = async {
+                            if s.sample_mode() {
+                                anyhow::bail!("Sample mode: no comparison provider calls");
+                            }
+                            if input.tf == Timeframe::D1 {
+                                let (bars, source) =
+                                    crate::app::studio_dist::daily_bars(&s.history, &config.bridge(), &symbol).await?;
+                                Ok::<_, anyhow::Error>(tr_data::studio_canvas::CanvasInput {
+                                    symbol: symbol.clone(),
+                                    tf: input.tf,
+                                    bars: Arc::new(bars),
+                                    source,
+                                    observed_at: Some(chrono::Utc::now().timestamp()),
+                                    stitch: None,
+                                })
+                            } else {
+                                let (bars, info) =
+                                    analysis_bars(s, &symbol, input.tf, default_limit(input.tf), "Quick comparison")
+                                        .await?;
+                                let observed_at = info.fetched_at;
+                                Ok(tr_data::studio_canvas::CanvasInput {
+                                    symbol: symbol.clone(),
+                                    tf: input.tf,
+                                    bars: Arc::new(bars),
+                                    source: info.source.clone(),
+                                    observed_at,
+                                    stitch: Some(Arc::new(info)),
+                                })
+                            }
+                        }
+                        .await;
+                        match load {
+                            Ok(i) => p.inputs.push(i),
+                            Err(e) => p.failures.push(format!("{symbol}: unavailable · {e:#}")),
+                        }
+                    }
+                    Arc::new(p)
+                };
+                let jobs = s.jobs.clone();
+                tokio::task::spawn_blocking(move || {
+                    use tr_data::{
+                        report_cache::{ReportCache, ReportKey},
+                        studio_canvas as canvas,
+                    };
+                    static CACHE: std::sync::LazyLock<ReportCache> = std::sync::LazyLock::new(|| ReportCache::new(4));
+                    let mut inputs = vec![input];
+                    let mut failures = peers.failures.clone();
+                    for peer in &peers.inputs {
+                        match canvas::validate(peer) {
+                            Ok(()) => inputs.push(peer.clone()),
+                            Err(e) => failures.push(format!("{}: {e}", peer.symbol)),
+                        }
+                    }
+                    let peers = if inputs.len() == peers.inputs.len() + 1 && failures == peers.failures {
+                        peers
+                    } else {
+                        Arc::new(crate::chart_view::studio_canvas::PeerSources {
+                            inputs: inputs[1..].to_vec(),
+                            failures,
+                            requested: peers.requested.clone(),
+                        })
+                    };
+                    let mut events: Vec<_> = news
+                        .into_iter()
+                        .filter(|n| n.ts > 0)
+                        .take(canvas::MAX_EVENTS - 1)
+                        .map(|n| canvas::CanvasEvent {
+                            kind: canvas::EventKind::News,
+                            time: canvas::EventTime::Instant(n.ts),
+                            source: n.publisher,
+                            headline: n.title,
+                        })
+                        .collect();
+                    if let Some(e) = earnings {
+                        events.push(e);
+                    }
+                    let digest = canvas::input_key(&inputs, &spec, key.visible, key.selected, &events)?;
+                    let mut cache_key = ReportKey::new(
+                        "studio.canvas.v1",
+                        &inputs[0].symbol,
+                        inputs[0].tf,
+                        &inputs[0].source,
+                        &[],
+                        &format!("{:?}", peers.failures),
+                    );
+                    cache_key.inputs = digest;
+                    CACHE.get_or_compute(cache_key, || {
+                        let _job = crate::perf::JobTimer::new(&jobs, "StudioCanvas");
+                        let report = canvas::compute(&inputs, &spec, key.visible, key.selected, &events)?;
+                        Ok::<_, String>(crate::chart_view::studio_canvas::prepare(report, &inputs, peers))
+                    })
+                })
+                .await?
+                .map_err(anyhow::Error::msg)
+            }
+            .await
+            .map_err(|e| format!("{e:#}"));
+            send(Response::StudioCanvas { pane, token, key, result });
         }
         Request::StudioDist { pane, generation, symbol, timeframe, window } => {
             let result = async {
@@ -9895,4 +10037,127 @@ mod honest_backtest_tests {
 pub(crate) fn studio_token() -> u64 {
     static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1 << 32);
     NEXT.try_update(std::sync::atomic::Ordering::Relaxed,std::sync::atomic::Ordering::Relaxed,|n|n.checked_add(1)).expect("Studio request token exhausted")
+}
+
+#[cfg(test)]
+mod studio_canvas_tests {
+    use super::tests::{VaultProvider, shared, vault_provider};
+    use super::*;
+    use crate::chart_view::{
+        SessionSummaryKey,
+        studio_canvas::{CanvasKey, PeerSources},
+    };
+    use tr_data::studio_canvas::{CanvasInput, CanvasSpec, CompareMode};
+    fn fixture() -> (CanvasInput, CanvasKey, CanvasSpec) {
+        let i = tr_perf::fixtures::canvas_inputs(2).remove(0);
+        let key = CanvasKey {
+            session: SessionSummaryKey {
+                generation: studio_token(),
+                bars_revision: 1,
+                stitch_revision: 0,
+                tf: i.tf,
+                extended: false,
+                as_of: i.observed_at,
+            },
+            revision: studio_token(),
+            events_revision: 0,
+            visible: None,
+            selected: None,
+        };
+        let spec = CanvasSpec { mode: CompareMode::Index100, base_ts: i.bars[0].ts, ..Default::default() };
+        (i, key, spec)
+    }
+    fn request(
+        input: CanvasInput,
+        key: CanvasKey,
+        spec: CanvasSpec,
+        token: u64,
+        peers: Option<Arc<PeerSources>>,
+    ) -> Request {
+        Request::StudioCanvas {
+            pane: 19,
+            token,
+            key,
+            input,
+            peers,
+            comparisons: vec!["QQQ US Equity".into()],
+            spec,
+            news: vec![],
+            earnings: None,
+        }
+    }
+    fn response(
+        rx: &mpsc::Receiver<Response>,
+    ) -> (u64, CanvasKey, Result<Arc<crate::chart_view::studio_canvas::PreparedCanvas>, String>) {
+        let Response::WhatsNews { response, .. } = rx.try_recv().unwrap() else { panic!("response envelope") };
+        let Response::StudioCanvas { pane, token, key, result } = *response else { panic!("canvas response") };
+        assert_eq!(pane, 19);
+        (token, key, result)
+    }
+    #[tokio::test]
+    async fn canvas_worker_cache_corrections_and_peer_reuse() {
+        let (input, key, spec) = fixture();
+        let provider = vault_provider((*input.bars).clone());
+        let (s, rx) = shared(provider.clone(), Some(BarCache::open_in_memory().unwrap()));
+        let token = studio_token();
+        handle(&s, request(input.clone(), key, spec.clone(), token, None)).await;
+        let (returned, k, result) = response(&rx);
+        assert_eq!((returned, k), (token, key));
+        let a = result.unwrap();
+        assert_eq!(a.report.lines.len(), 2);
+        assert!(a.report.strip.as_ref().unwrap().n >= 780);
+        let calls = provider.calls.load(std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(calls, 1);
+        handle(&s, request(input.clone(), key, spec.clone(), studio_token(), Some(a.peers.clone()))).await;
+        let (_, _, result) = response(&rx);
+        let b = result.unwrap();
+        assert!(Arc::ptr_eq(&a, &b));
+        assert_eq!(provider.calls.load(std::sync::atomic::Ordering::SeqCst), calls);
+        let mut corrected = input.clone();
+        let bars = Arc::make_mut(&mut corrected.bars);
+        bars[100].close += 0.001;
+        let mut revised = key;
+        revised.session.bars_revision += 1;
+        handle(&s, request(corrected, revised, spec.clone(), studio_token(), Some(a.peers.clone()))).await;
+        let (_, _, result) = response(&rx);
+        let c = result.unwrap();
+        assert_ne!(a.report.key, c.report.key);
+        assert!(!Arc::ptr_eq(&a, &c));
+        assert_ne!(a.report.lines[0].values[100], c.report.lines[0].values[100]);
+        let mut invalid = input;
+        Arc::make_mut(&mut invalid.bars)[0].low = f64::NAN;
+        handle(&s, request(invalid, key, spec, studio_token(), Some(a.peers.clone()))).await;
+        assert!(response(&rx).2.is_err());
+        assert_eq!(provider.calls.load(std::sync::atomic::Ordering::SeqCst), calls);
+    }
+    #[tokio::test]
+    async fn sample_canvas_worker_makes_zero_provider_calls() {
+        let (input, key, spec) = fixture();
+        let provider = Arc::new(VaultProvider {
+            bars: Default::default(),
+            calls: Default::default(),
+            fail: Default::default(),
+            sample: true,
+        });
+        let (s, rx) = shared(provider.clone(), None);
+        handle(&s, request(input, key, spec, studio_token(), None)).await;
+        assert!(response(&rx).2.err().unwrap().contains("sample"));
+        assert_eq!(provider.calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+    #[tokio::test]
+    async fn canvas_bad_peer_stays_unavailable_without_substitution() {
+        let (input, key, spec) = fixture();
+        let provider = vault_provider(vec![]);
+        let (s, rx) = shared(provider.clone(), None);
+        let mut peer = input.clone();
+        peer.symbol = "QQQ US Equity".into();
+        Arc::make_mut(&mut peer.bars)[100].provenance = tr_core::Provenance::Sample;
+        let peers =
+            Arc::new(PeerSources { inputs: vec![peer], failures: vec![], requested: vec!["QQQ US Equity".into()] });
+        handle(&s, request(input, key, spec, studio_token(), Some(peers))).await;
+        let result = response(&rx).2.unwrap();
+        assert_eq!(result.report.lines.len(), 1);
+        assert!(result.failures.iter().any(|f| f.contains("QQQ") && f.to_ascii_lowercase().contains("sample")));
+        assert_eq!(provider.calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
 }

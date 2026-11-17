@@ -57,6 +57,8 @@ pub struct StudioViewSpec {
     pub benchmark: String,
     pub inspector_open: bool,
     pub inputs: StudioInputs,
+    pub quick: bool,
+    pub canvas: crate::chart_view::studio_canvas::CanvasView,
 }
 impl Default for StudioViewSpec {
     fn default() -> Self {
@@ -66,6 +68,8 @@ impl Default for StudioViewSpec {
             benchmark: "SPY".into(),
             inspector_open: false,
             inputs: Default::default(),
+            quick:false,
+            canvas: crate::chart_view::studio_canvas::CanvasView {enabled:false,..Default::default()},
         }
     }
 }
@@ -119,6 +123,7 @@ impl StudioLensState {
 }
 pub struct StudioPane {
     pub context: StudioContext,
+    pub quick: bool,
     pub chart: Box<ChartState>,
     pub lens: StudioLens,
     pub children: Vec<StudioLensState>,
@@ -143,10 +148,12 @@ impl StudioPane {
     pub fn new(view: StudioViewSpec) -> Self {
         let mut chart = Box::new(ChartState::new(0, &view.context.symbol, view.context.tf));
         chart.studio_reset();
+        chart.set_canvas_view(view.canvas.clone());
         let symbol_edit = view.context.symbol.clone();
         let benchmark_edit = view.benchmark.clone();
         Self {
             context: view.context,
+            quick:view.quick,
             chart,
             lens: view.lens,
             children: vec![],
@@ -200,6 +207,8 @@ impl StudioPane {
             benchmark: self.benchmark.clone(),
             inspector_open: self.inspector_open,
             inputs,
+            quick:self.quick,
+            canvas:self.chart.canvas_view(),
         }
     }
     fn remember(&mut self, before: StudioViewSpec) {
@@ -218,6 +227,8 @@ impl StudioPane {
     fn apply_view(&mut self, view: StudioViewSpec) {
         self.children.clear();
         self.context = view.context;
+        self.quick=view.quick;
+        self.chart.set_canvas_view(view.canvas);
         self.lens = view.lens;
         self.benchmark = view.benchmark;
         self.inputs = view.inputs;
@@ -284,7 +295,9 @@ impl StudioPane {
         if sample != self.sample {
             self.sample = sample;
             self.invalidate();
+            let canvas=self.chart.canvas_view();
             self.chart.studio_reset();
+            self.chart.set_canvas_view(canvas);
             self.chart_started = false;
         }
         if sample {
@@ -384,6 +397,7 @@ impl StudioPane {
         }
     }
     fn command(&self) -> String {
+        if self.quick {let c=self.chart.canvas_view();return format!("{} QUICK {} {} mode={}",self.context.symbol,c.peers.iter().map(|s|tr_data::security(s).ticker).collect::<Vec<_>>().join(" "),self.context.tf.label(),c.spec.mode.code());}
         format!(
             "{} STUDIO {} lens={} benchmark={}",
             self.context.symbol,
@@ -442,6 +456,7 @@ impl StudioPane {
                 self.invalidate();
             }
         }
+        if let Some(as_of)=self.context.as_of {ui.label(format!("Historical as_of {as_of} is unavailable"));if ui.button("Clear as_of").clicked(){self.context.as_of=None;self.invalidate();}}
         ui.separator();
         ui.label("Canvas selection [start, end) · UTC seconds");
         ui.add(egui::TextEdit::singleline(&mut self.span_start).desired_width(160.).hint_text("Start UTC seconds"));
@@ -464,7 +479,7 @@ impl StudioPane {
                 self.remember(before);
             }
         });
-        ui.label("Selection marks the canvas only. Lens reports retain their full accepted inputs; selected-span analysis is unavailable in this slice.");
+        ui.label("Brush marks the canvas and can compare selected/visible transformed values descriptively. Existing lens reports retain their full accepted inputs.");
         if let Some((a, b)) = self.context.selected_span {
             ui.label(RichText::new(format!("[{a}, {b}) UTC")).font(theme::mono(11.)));
         }
@@ -492,7 +507,7 @@ impl StudioPane {
         let header = ui.scope(|ui| {
             ui.set_min_height(44.);
             ui.horizontal_wrapped(|ui| {
-                ui.label(RichText::new("STUDIO").font(theme::ui_font(20.)).strong());
+                ui.label(RichText::new(if self.quick {"QUICK"}else{"STUDIO"}).font(theme::ui_font(20.)).strong());
                 ui.label(
                     RichText::new(format!("{} · {}", self.context.symbol, self.context.tf.label()))
                         .font(theme::mono(13.)),
@@ -515,20 +530,24 @@ impl StudioPane {
             ui.set_min_height(32.);
             ui.horizontal_wrapped(|ui| {
                 for lens in StudioLens::ALL {
-                    if ui.selectable_label(self.lens == lens, lens.label()).clicked() {
+                    if ui.selectable_label(!self.quick && self.lens == lens, lens.label()).clicked() {
+                        self.quick=false;
                         self.select_lens(lens);
                     }
                 }
+                let quick_canvas=self.chart.canvas_view().enabled;
+                if ui.selectable_label(quick_canvas,"Quick canvas").clicked(){let mut view=self.chart.canvas_view();view.enabled=true;self.chart.set_canvas_view(view);}
+                if ui.selectable_label(!quick_canvas,"Native chart").clicked(){let mut view=self.chart.canvas_view();view.enabled=false;self.chart.set_canvas_view(view);}
                 if ui.small_button("Build").clicked() {
                     self.build_open = !self.build_open;
                 }
             });
         });
         if self.about_open {
-            egui::Frame::group(ui.style()).show(ui,|ui|{ui.label("Studio connects the native time canvas to existing verified-data research. Each lens retains its original methods, MathCards and receipt. No new estimator. Copy command saves inputs, not historical data revisions.");});
+            egui::Frame::group(ui.style()).show(ui,|ui|{ui.label("Studio connects the native time canvas to existing verified-data research. Each lens retains its original methods, MathCards and receipt. Quick adds descriptive canvas arithmetic. Copy command saves inputs, not historical data revisions.");});
         }
         if self.build_open {
-            egui::Frame::group(ui.style()).show(ui,|ui|{ui.label("BUILD · derived series unavailable");ui.label("Derived operations, signed scalar series and model persistence have not been implemented. Open LAB, RESID or ATTR for their route status.");});
+            egui::Frame::group(ui.style()).show(ui,|ui|{ui.label("BUILD · derived series unavailable");ui.label("Derived operations and model persistence have not been implemented; Quick uses signed scalar series for its descriptive canvas. Open LAB, RESID or ATTR for their route status.");});
         }
         let content = ui.available_rect_before_wrap();
         let mut body = content;
@@ -541,15 +560,19 @@ impl StudioPane {
         let mut actions = vec![];
         let mut child = ui.new_child(UiBuilder::new().max_rect(body).id_salt((id, "studio-body")));
         child.set_clip_rect(body.intersect(ui.clip_rect()));
-        if narrow {
+        if self.quick {
+            self.canvas(&mut child,body,id,worker,sample,focused);
+        } else if narrow {
             egui::ScrollArea::vertical().id_salt((id, "studio-stack")).show(&mut child, |ui| {
-                let (canvas, _) = ui.allocate_exact_size(vec2(ui.available_width(), 240.), Sense::hover());
+                let height=if self.chart.canvas_view().enabled {480.}else{240.};
+                let (canvas, _) = ui.allocate_exact_size(vec2(ui.available_width(), height), Sense::hover());
                 self.canvas(ui, canvas, id, worker, sample, focused);
                 ui.set_min_height(480.);
                 actions.extend(self.analysis(ui, id, worker, sample));
             });
         } else {
-            let h = (body.height() * self.canvas_fraction).clamp(120., body.height().max(120.) - 1.);
+            let min:f32=if self.chart.canvas_view().enabled {280.}else{120.};
+            let h = (body.height() * self.canvas_fraction).clamp(min.min((body.height()-1.).max(1.)),(body.height()-1.).max(1.));
             let canvas = Rect::from_min_size(body.min, vec2(body.width(), h));
             self.canvas(&mut child, canvas, id, worker, sample, focused);
             let split = Rect::from_min_size(pos2(body.left(), canvas.bottom()), vec2(body.width(), 6.));
@@ -594,6 +617,9 @@ impl StudioPane {
             );
             return;
         }
+        if self.context.as_of.is_some() {
+            super::studio_frame::unavailable(ui,rect,"TIME CANVAS","Historical as-of canvas is unavailable. Clear as_of in Inspector to use a current verified snapshot.");return;
+        }
         if self.context.symbol.trim().is_empty() {
             super::studio_frame::unavailable(
                 ui,
@@ -605,11 +631,16 @@ impl StudioPane {
         }
         if !self.chart_started || self.chart.symbol != self.context.symbol || self.chart.tf != self.context.tf {
             self.chart.id = id;
+            let mut view=self.chart.canvas_view();
+            if self.chart.symbol!=self.context.symbol || self.chart.tf!=self.context.tf {view.spec.base_ts=0;view.base_pinned=false;}
             self.chart.studio_context(&self.context.symbol, self.context.tf);
+            self.chart.set_canvas_view(view);
             self.chart.load(worker);
             self.chart_started = true;
         }
+        self.chart.canvas_selection(self.context.selected_span);
         self.chart.show(ui, rect, focused, worker);
+        if let Some(span)=self.chart.take_canvas_selection(){self.context.selected_span=span;}
         self.sync_chart_context();
         self.chart.studio_selection(ui, rect, self.context.selected_span);
     }
@@ -718,6 +749,24 @@ impl StudioPane {
     }
 }
 impl TerminalApp {
+    pub(super) fn open_quick(&mut self,symbol:Option<&str>,spec:&str) {
+        use crate::chart_view::studio_canvas::CanvasView;
+        match tr_data::studio_canvas::parse_spec(spec) {
+            Ok((tf,mode,peers))=>{
+                if symbol.is_none() && !spec.is_empty() && spec.split_whitespace().all(|w|w.to_ascii_lowercase().starts_with("mode=")) {
+                    if let Some(PaneKind::Studio(s))=self.panes.iter_mut().find(|p|p.id==self.focus).map(|p|&mut p.kind) {
+                        let mut view=s.chart.canvas_view();view.spec.mode=mode;s.chart.set_canvas_view(view);s.quick=true;return;
+                    }
+                }
+                let symbol=symbol.map(|s|tr_data::security(s).key()).or_else(||self.focused_symbol()).unwrap_or_default();
+                let mut canvas=CanvasView {enabled:true,peers,..Default::default()};canvas.spec.mode=mode;
+                self.open_panel(PaneKind::Studio(Box::new(StudioPane::new(StudioViewSpec {
+                    context:StudioContext {symbol,tf,..Default::default()},quick:true,canvas,..Default::default()
+                }))));
+                self.status="Quick · pinned-base real-series canvas".into();
+            },Err(e)=>self.status=e,
+        }
+    }
     pub(super) fn open_studio(&mut self, symbol: Option<&str>, spec: &str) {
         match tr_data::studio::parse_spec(spec) {
             Ok((lens, tf, benchmark)) => {
@@ -770,3 +819,10 @@ pub(super) fn prepared(
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+pub(super) fn prepared_quick(worker:&Worker)->StudioPane {
+    let chart=crate::chart_view::studio_canvas::test_chart(worker,tr_data::studio_canvas::CompareMode::Index100);
+    let mut p=StudioPane::new(StudioViewSpec {quick:true,context:StudioContext {symbol:chart.symbol.clone(),tf:chart.tf,..Default::default()},..Default::default()});
+    p.chart=Box::new(chart);p.chart_started=true;p
+}

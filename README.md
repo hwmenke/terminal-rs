@@ -666,8 +666,10 @@ See [Bar Vault](docs/BARVAULT.md) for admission, merge, retention and current li
 `AAPL STUDIO 5m lens=dist` connects a native time canvas to Distribution, Relate,
 When (daily conditional returns), Season and Backtest. `STUDIO lens=relate
 benchmark=QQQ` selects a benchmark. Local Alt+Left/Right cycles lenses, Escape
-closes Inspector, and Ctrl+Z undoes parameters outside text editing. Accepted
-lenses are retained without recomputing. QUICK, LAB, RESID and ATTR currently
-show precise unavailable route cards. Legacy standalone research commands stay
+cancels Brush before closing Inspector, and Ctrl+Z undoes Studio parameters outside text editing. Accepted
+lenses are retained without recomputing. `AAPL QUICK QQQ 5m mode=index100` opens
+five comparison modes, pinned Base UTC, the 44 px Distribution strip, dated lanes
+and a release-committed Brush. `DSTRIP` toggles the strip. See [Quick canvas](docs/STUDIO_CANVAS.md).
+LAB, RESID and ATTR remain unavailable. Legacy standalone research commands stay
 available. See [Studio shell](docs/STUDIO.md) for selection, data and persistence
 limits.

@@ -177,6 +177,21 @@
       "budget_us": 500,
       "relative": true,
       "class": "interactive"
+    },
+    "studio.canvas_4x7800": {
+      "budget_us": 12000,
+      "relative": true,
+      "class": "interactive"
+    },
+    "chart.margin_strip_7800": {
+      "budget_us": 1500,
+      "relative": true,
+      "class": "interactive"
+    },
+    "studio.events_2000": {
+      "budget_us": 3000,
+      "relative": true,
+      "class": "interactive"
     }
   }
 }

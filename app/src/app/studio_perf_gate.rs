@@ -167,6 +167,7 @@ fn perf_gate_paint_studios() {
     best.extend(regime_sample());
     best.extend(shape_sample());
     best.extend(shell_sample());
+    best.extend(quick_sample());
     let ids: BTreeSet<_> = budgets.cases.keys().filter(|id| id.starts_with("paint.studio_")).cloned().collect();
     assert_eq!(best.keys().cloned().collect::<BTreeSet<_>>(), ids, "stale/missing studio budgets");
     for _ in 0..2 {
@@ -183,6 +184,7 @@ fn perf_gate_paint_studios() {
             .chain(regime_sample())
             .chain(shape_sample())
             .chain(shell_sample())
+            .chain(quick_sample())
         {
             if s.median_us < best[&id].median_us {
                 best.insert(id, s);
@@ -1095,5 +1097,47 @@ fn studio_shell_integrated_populated_canvas_and_dist() {
             crate::chart_view::perf_gate::studio_assert_canvas(&pane.chart, &out, true);
         }
         finite(&ctx, out);
+    }
+}
+
+fn quick_frame(ctx:&egui::Context,pane:&mut super::studio_hub::StudioPane,w:&crate::worker::Worker,width:f32,hover:bool,index:usize)->egui::FullOutput {
+    let point=if hover {ctx.data(|d|d.get_temp::<Rect>(egui::Id::new("canvas-strip-probe"))).unwrap_or(Rect::NOTHING).center()+vec2(if index>=160 {(index%2) as f32}else{0.},0.)}else{pos2(2.+(index%2) as f32,2.)};
+    let events=if ctx.input(|i|i.pointer.hover_pos())==Some(point){vec![]}else{vec![egui::Event::PointerMoved(point)]};
+    let mut out=ctx.run_ui(egui::RawInput {time:Some(1.+index as f64*0.2),screen_rect:Some(Rect::from_min_size(Pos2::ZERO,vec2(width,900.))),events,..Default::default()},|ui|{pane.show(ui,201,w,false,true);});out.textures_delta.clear();out
+}
+fn quick_guard(p:&super::studio_hub::StudioPane,out:&egui::FullOutput,hover:bool) {
+    let txt=text(&out.shapes);
+    for word in ["QUICK","Modes","Base UTC","Distribution","Events","Brush","Shared y","CLOSED THRU","now","n="] {assert!(txt.contains(word),"Quick missing {word}: {txt}");}
+    crate::chart_view::studio_canvas::assert_meaningful(&p.chart);
+    assert!(out.shapes.iter().any(|s|matches!(s.shape,egui::Shape::Callback(_))),"Quick omitted native GPU commands");
+    if hover {for s in ["canvas.strip.midrank","Observation clock","# < now"] {assert!(txt.contains(s),"Quick hover missing MathCard {s}: {txt}");}}
+}
+fn quick_sample()->BTreeMap<String,Summary> {
+    let mut result=BTreeMap::new();
+    for hover in [false,true] {
+        let ctx=egui::Context::default();let (w,mut rx)=crate::worker::Worker::test_channel();let mut p=super::studio_hub::prepared_quick(&w);
+        for i in 0..20 {finite(&ctx,quick_frame(&ctx,&mut p,&w,1440.,false,i));crate::chart_view::studio_canvas::complete_test_requests(&mut p.chart,&mut rx);}
+        if hover {for i in 140..160 {finite(&ctx,quick_frame(&ctx,&mut p,&w,1440.,true,i));}}
+        while rx.try_recv().is_ok(){}
+        crate::chart_view::studio_canvas::assert_perf_workload(&p.chart);
+        let mut times:BTreeMap<String,Vec<f64>>=BTreeMap::new();
+        for i in 0..120 {
+            let start=Instant::now();let mut out=quick_frame(&ctx,&mut p,&w,1440.,hover,i+if hover {160}else{20});let ui_us=start.elapsed().as_secs_f64()*1e6;
+            if i==60 {quick_guard(&p,&out,hover);}
+            let start=Instant::now();let prim=ctx.tessellate(std::mem::take(&mut out.shapes),out.pixels_per_point);let tess_us=start.elapsed().as_secs_f64()*1e6;
+            assert!(!prim.is_empty());std::hint::black_box(prim);
+            for (metric,v) in [("ui",ui_us),("tess",tess_us),("total",ui_us+tess_us)] {times.entry(format!("paint.studio_quick.{}.{}",if hover {"hover"}else{"steady"},metric)).or_default().push(v);}
+        }
+        while let Ok(req)=rx.try_recv(){assert!(!matches!(req,crate::worker::Request::StudioCanvas {..}),"unchanged Quick hover/steady created analytical jobs");}
+        for (id,mut values) in times {result.insert(id,tr_perf::summarize(&mut values));}
+    }result
+}
+#[test]
+fn studio_quick_geometry_and_actual_hover() {
+    for width in [320.,1440.] {
+        let ctx=egui::Context::default();let (w,mut rx)=crate::worker::Worker::test_channel();let mut p=super::studio_hub::prepared_quick(&w);
+        let out=quick_frame(&ctx,&mut p,&w,width,false,0);quick_guard(&p,&out,false);finite(&ctx,out);crate::chart_view::studio_canvas::complete_test_requests(&mut p.chart,&mut rx);
+        let mut last=None;for i in 140..160 {last=Some(quick_frame(&ctx,&mut p,&w,width,true,i));}
+        let out=last.unwrap();quick_guard(&p,&out,true);finite(&ctx,out);
     }
 }

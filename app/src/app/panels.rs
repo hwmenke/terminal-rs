@@ -50,6 +50,7 @@ impl TerminalApp {
             }
             return (actions, clicked);
         }
+        // QUICK shares Studio persistence and native response routing.
         if let PaneKind::Studio(s) = &mut self.panes[i].kind {
             let mut child = ui.new_child(UiBuilder::new().max_rect(rect.shrink(4.)).id_salt(("studio", id)));
             let actions = s.show(&mut child, id, &self.worker, self.provider.eq_ignore_ascii_case("sample"), focused);

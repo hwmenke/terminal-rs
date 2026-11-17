@@ -214,7 +214,7 @@ fn bits(x: f32) -> u64 {
 }
 
 impl ChartState {
-    fn equity(&self) -> bool {
+    pub(super) fn equity(&self) -> bool {
         time_link::cash_class(self.sec.class)
     }
 
@@ -442,7 +442,8 @@ impl ChartState {
             i.modifiers.shift
                 || i.events.iter().any(|e| matches!(e, egui::Event::PointerButton { modifiers, .. } if modifiers.shift))
         });
-        let owner = click_owner(self.link_in.is_some(), shift, self.avwap_armed);
+        let owner = canvas_click_owner(self.canvas.brush,self.link_in.is_some(), shift, self.avwap_armed);
+        if owner==ClickOwner::Brush {return Some(owner);}
         if owner == ClickOwner::TimeLink {
             if let Some(i) = at(pos) {
                 self.link_out.center = Some(self.bars[i].ts);
@@ -861,6 +862,8 @@ impl ChartState {
 /// Who handles a primary click on the plot.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum ClickOwner {
+    /// Dedicated canvas brush consumes clicks before other tools.
+    Brush,
     /// Shift+click on a time-linked chart: centre the linked charts and nothing else.
     TimeLink,
     /// The armed one-click AVWAP tool.
@@ -917,4 +920,18 @@ fn avwap_card(ui: &Ui, at: Pos2, lines: &[String], color: Color32) {
             if i == 0 { color } else { text() },
         );
     }
+}
+
+/// Brush is an explicit mode, so modifiers never place a drawing or AVWAP.
+pub(super) fn canvas_click_owner(brush:bool,linked:bool,shift:bool,avwap:bool)->ClickOwner {
+    if brush {ClickOwner::Brush}else{click_owner(linked,shift,avwap)}
+}
+#[cfg(test)]
+#[test]
+fn brush_click_precedence_is_exclusive() {
+    for linked in [false,true] {for shift in [false,true] {for avwap in [false,true] {
+        assert_eq!(canvas_click_owner(true,linked,shift,avwap),ClickOwner::Brush);
+        assert!(!drawing_gets_click(Some(ClickOwner::Brush)));
+        assert_eq!(canvas_click_owner(false,linked,shift,avwap),click_owner(linked,shift,avwap));
+    }}}
 }

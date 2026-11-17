@@ -398,7 +398,7 @@ impl PaneKind {
                     format!("{} Journal", tr_data::security(&j.filter).ticker)
                 }
             }
-            PaneKind::Studio(s) => format!("{} Studio · {}", short(&s.context.symbol), s.lens.label()),
+            PaneKind::Studio(s) => if s.quick {format!("{} Quick",short(&s.context.symbol))}else{format!("{} Studio · {}", short(&s.context.symbol), s.lens.label())},
             PaneKind::StudioRoute(route) => route.code().into(),
             PaneKind::StudioDist(s) => format!("{} Distribution", tr_data::security(&s.symbol).ticker),
             PaneKind::TstackTune(s) => format!("{} TSTACK Tune", tr_data::security(&s.symbol).ticker),
@@ -539,7 +539,7 @@ impl PaneKind {
             PaneKind::Desk(_) => "DESK",
             PaneKind::Journal(_) => "JRNL",
             PaneKind::Stats(_) => "STATS",
-            PaneKind::Studio(_) => "STUDIO",
+            PaneKind::Studio(s) => if s.quick {"QUICK"}else{"STUDIO"},
             PaneKind::StudioRoute(route) => route.code(),
             PaneKind::StudioDist(_) => "DIST",
             PaneKind::StudioCorr(_) => "CORR",
@@ -880,6 +880,7 @@ impl PaneKind {
             }
             PaneSettings::Journal { filter } => PaneKind::Journal(Box::new(journal::JournalPane::new(filter))),
             PaneSettings::Studio { view } => PaneKind::Studio(Box::new(studio_hub::StudioPane::new(view))),
+            PaneSettings::StudioRoute { route:tr_data::studio::StudioRoute::Quick } => PaneKind::Studio(Box::new(studio_hub::StudioPane::new(studio_hub::StudioViewSpec {quick:true,..Default::default()}))),
             PaneSettings::StudioRoute { route } => PaneKind::StudioRoute(route),
             PaneSettings::StudioDist { symbol, timeframe, window } => {
                 PaneKind::StudioDist(Box::new(studio_dist::DistPane::new(symbol, timeframe, window)))
@@ -1576,7 +1577,9 @@ impl TerminalApp {
             Command::SymbolFunction(s, Function::Review) => self.open_review(Some(&s)),
             Command::SymbolFunction(s, Function::Desk) => self.open_desk(Some(&s)),
             Command::SymbolFunction(s, Function::Journal(extra)) => self.open_journal(Some(&s), &extra),
+            Command::SymbolFunction(s, Function::StudioQuick {spec}) => self.open_quick(Some(&s),&spec),
             Command::SymbolFunction(s, Function::Studio { spec }) => self.open_studio(Some(&s), &spec),
+            Command::SymbolFunction(s, Function::StudioRoute(tr_data::studio::StudioRoute::Quick)) => self.open_quick(Some(&s),""),
             Command::SymbolFunction(_, Function::StudioRoute(route)) => self.open_panel(PaneKind::StudioRoute(route)),
             Command::SymbolFunction(s, Function::StudioDistHorizon(h)) => self.set_shape_horizon(Some(&s), h),
             Command::SymbolFunction(s, Function::StudioDist { timeframe }) => {
@@ -1854,7 +1857,10 @@ impl TerminalApp {
             Function::Desk => self.open_desk(symbol.as_deref()),
             Function::Journal(extra) => self.open_journal(symbol.as_deref(), &extra),
             Function::TstackTune(tf) => self.open_tstack_tune(symbol.as_deref(), tf),
+            Function::StudioQuick {spec} => self.open_quick(symbol.as_deref(),&spec),
+            Function::DistributionStrip => self.with_chart(|c,_|c.toggle_canvas_strip()),
             Function::Studio { spec } => self.open_studio(symbol.as_deref(), &spec),
+            Function::StudioRoute(tr_data::studio::StudioRoute::Quick) => self.open_quick(symbol.as_deref(),""),
             Function::StudioRoute(route) => self.open_panel(PaneKind::StudioRoute(route)),
             Function::StudioCorr { spec } => self.open_studio_corr(symbol.as_deref(), &spec),
             Function::StudioSeason { spec } => self.open_studio_season(symbol.as_deref(), &spec),
@@ -1904,6 +1910,8 @@ impl TerminalApp {
         for x in q {
             let earnings = x.stats.earnings_label();
             let ex_dividend = x.stats.ex_dividend_label();
+            let earnings_stats=x.stats.clone();
+            let earnings_provenance=x.provenance;
             let key = x.symbol.clone();
             self.quotes.insert(key.clone(), x);
             for pane in &mut self.panes {
@@ -1911,6 +1919,7 @@ impl TerminalApp {
                     && c.symbol == key
                 {
                     c.set_earnings(earnings.clone());
+                    c.set_canvas_earnings(&earnings_stats,earnings_provenance,&self.provider);
                     c.set_ex_dividend(ex_dividend.clone());
                 }
             }
@@ -2061,6 +2070,9 @@ impl TerminalApp {
                     if let Some(PaneKind::Desk(d)) = self.panes.iter_mut().find(|p| p.id == pane).map(|p| &mut p.kind) {
                         d.accept(generation, result);
                     }
+                }
+                Response::StudioCanvas {pane,token,key,result} => {
+                    if let Some(c)=self.chart_mut(pane) {c.on_studio_canvas(token,key,result);}
                 }
                 Response::StudioDist { pane, generation, result } => {
                     if let Some(s) = self.panes.iter_mut().find(|p| p.id == pane).and_then(|p| p.kind.dist_mut()) {
@@ -2811,6 +2823,8 @@ impl TerminalApp {
     fn hotkey_applies(&self, a: prefs::Action) -> bool {
         use prefs::Action as A;
         match a {
+            A::CanvasBrush => self.panes.iter().any(|p|p.id==self.focus&&matches!(p.kind,PaneKind::Studio(_))),
+            A::CanvasStrip => self.focused_is_chart(),
             A::StudioPrevLens | A::StudioNextLens | A::StudioCloseInspector | A::StudioUndo => {
                 self.panes.iter().any(|p| p.id == self.focus && matches!(p.kind, PaneKind::Studio(_)))
             }
@@ -2833,6 +2847,8 @@ impl TerminalApp {
     fn run_hotkey(&mut self, a: prefs::Action) {
         use prefs::Action as A;
         match a {
+            A::CanvasBrush => self.with_chart(|c,_|c.toggle_canvas_brush()),
+            A::CanvasStrip => self.with_chart(|c,_|c.toggle_canvas_strip()),
             A::StudioPrevLens | A::StudioNextLens | A::StudioCloseInspector | A::StudioUndo => {
                 if let Some(PaneKind::Studio(s)) =
                     self.panes.iter_mut().find(|p| p.id == self.focus).map(|p| &mut p.kind)
@@ -2840,7 +2856,7 @@ impl TerminalApp {
                     match a {
                         A::StudioPrevLens => s.cycle_lens(-1),
                         A::StudioNextLens => s.cycle_lens(1),
-                        A::StudioCloseInspector => s.inspector_open = false,
+                        A::StudioCloseInspector => {if !s.chart.cancel_canvas_brush(){s.inspector_open = false;}},
                         A::StudioUndo => {
                             s.undo_inputs();
                         }

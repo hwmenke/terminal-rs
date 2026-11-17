@@ -1234,3 +1234,4 @@ pub mod chart_session;
 pub mod studio_shape;
 
 pub mod studio;
+pub mod studio_canvas;

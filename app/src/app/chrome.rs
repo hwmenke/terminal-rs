@@ -655,8 +655,8 @@ impl TerminalApp {
             {
                 out.push(SidebarCmd::Function(Function::Studio { spec: String::new() }));
             }
+            if nav_row(ui,Icon::Chart,"Quick canvas",Some("QUICK"),false).clicked(){out.push(SidebarCmd::Function(Function::StudioQuick {spec:String::new()}));}
             for route in [
-                tr_data::studio::StudioRoute::Quick,
                 tr_data::studio::StudioRoute::Lab,
                 tr_data::studio::StudioRoute::Resid,
                 tr_data::studio::StudioRoute::Attr,

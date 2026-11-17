@@ -60,7 +60,6 @@ fn studio_legacy_commands_preserved() {
         ));
     }
     for r in [
-        tr_data::studio::StudioRoute::Quick,
         tr_data::studio::StudioRoute::Lab,
         tr_data::studio::StudioRoute::Resid,
         tr_data::studio::StudioRoute::Attr,
@@ -68,6 +67,7 @@ fn studio_legacy_commands_preserved() {
         assert_eq!(command::parse(r.code()), Some(Command::Function(Function::StudioRoute(r))));
         assert!(r.reason().contains("unavailable"));
     }
+    assert!(matches!(command::parse("AAPL QUICK QQQ 5m mode=index100"),Some(Command::SymbolFunction(_,Function::StudioQuick {..}))));
     assert!(command::parse("STUDIO lens=typo").is_none());
 }
 #[test]

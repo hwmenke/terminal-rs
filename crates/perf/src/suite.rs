@@ -33,6 +33,32 @@ pub fn all(scale: Scale) -> Vec<Case> {
             cases.push(Case { id: $id, run: Box::new($f) });
         };
     }
+    let expected_canvas_n=if full {7800}else{1560};
+    let canvas=fixtures::canvas_inputs(if full {20}else{4});
+    let canvas_spec=tr_data::studio_canvas::CanvasSpec {mode:tr_data::studio_canvas::CompareMode::Z,base_ts:canvas[0].bars[0].ts,..Default::default()};
+    let strip_line=tr_data::studio_canvas::compute(&canvas,&tr_data::studio_canvas::CanvasSpec::default(),None,None,&[]).unwrap().lines.remove(0);
+    let events=fixtures::canvas_events(&canvas,2000);
+    let event_ts=strip_line.ts.clone();
+    add!("studio.canvas_4x7800",move || {
+        let r=bb(tr_data::studio_canvas::compute(bb(&canvas),&canvas_spec,None,None,&[]).unwrap());
+        assert_eq!(r.lines.len(),4);
+        assert!(r.lines.iter().all(|l|l.ts.len()==expected_canvas_n));
+        let n=r.lines.iter().map(|l|l.values.iter().flatten().count()).sum::<usize>();
+        assert_eq!(n,4*(expected_canvas_n-63));
+        assert!(r.labels.iter().all(|l|l.unavailable.is_none()&&l.prior_n==63&&l.prior_sd.is_some()));
+        assert_eq!(r.strip.as_ref().unwrap().counts.iter().sum::<usize>(),r.strip.as_ref().unwrap().n);
+        n
+    });
+    add!("chart.margin_strip_7800",move || {
+        let r=bb(tr_data::studio_canvas::margin_distribution(bb(&strip_line),None));
+        assert_eq!(r.n,expected_canvas_n);
+        assert!(r.percentile.is_some());assert_eq!(r.counts.iter().sum::<usize>(),r.n);r.n
+    });
+    add!("studio.events_2000",move || {
+        let r=bb(tr_data::studio_canvas::align_events(bb(&events),bb(&event_ts),Timeframe::M1,true));
+        assert_eq!(r.len(),2000);assert!(r.iter().all(|e|e.hi>e.lo));
+        assert!(r.iter().any(|e|matches!(e.event.time,tr_data::studio_canvas::EventTime::Date {..})));r.len()
+    });
     let routes = fixtures::studio_routes();
     add!("studio.route_1000", move || {
         use tr_data::studio::{StudioContext, StudioLens};

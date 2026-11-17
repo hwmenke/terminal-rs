@@ -445,6 +445,8 @@ pub enum Function {
         spec: String,
     },
     StudioRoute(tr_data::studio::StudioRoute),
+    StudioQuick {spec:String},
+    DistributionStrip,
     StudioDist {
         timeframe: Timeframe,
     },
@@ -923,7 +925,8 @@ fn parse_function(head: &str, rest: &[&str]) -> Option<Function> {
             tr_data::studio::parse_spec(&spec).ok()?;
             Function::Studio { spec }
         }
-        "QUICK" if rest.is_empty() => Function::StudioRoute(tr_data::studio::StudioRoute::Quick),
+        "QUICK" => {let spec=joined();tr_data::studio_canvas::parse_spec(&spec).ok()?;Function::StudioQuick {spec}},
+        "DSTRIP" if rest.is_empty()=>Function::DistributionStrip,
         "LAB" if rest.is_empty() => Function::StudioRoute(tr_data::studio::StudioRoute::Lab),
         "RESID" if rest.is_empty() => Function::StudioRoute(tr_data::studio::StudioRoute::Resid),
         "ATTR" if rest.is_empty() => Function::StudioRoute(tr_data::studio::StudioRoute::Attr),
@@ -1262,6 +1265,8 @@ fn describe(f: &Function) -> String {
         }
         Function::Journal(q) => format!("Trade journal: {q}"),
         Function::Studio { spec } => format!("Studio · native canvas and named lenses · {spec}"),
+        Function::StudioQuick {spec} => format!("Quick canvas · level/index100/change/z/vol · {spec}"),
+        Function::DistributionStrip => "Toggle the closed-value distribution strip".into(),
         Function::StudioRoute(route) => route.reason().into(),
         Function::StudioCorr { spec } => format!(
             "Relationship Studio · {} · for the tickers type CORR US Equity / RBETA US Equity",

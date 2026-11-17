@@ -73,6 +73,15 @@ fn chart(w: &Worker, auction: bool, n: usize) -> ChartState {
 fn complete(c: &mut ChartState, rx: &mut tokio::sync::mpsc::UnboundedReceiver<Request>) {
     while let Ok(req) = rx.try_recv() {
         match req {
+            Request::StudioCanvas {token,key,input,spec,news,earnings,..}=> {
+                let mut events:Vec<_>=news.into_iter().map(|n|tr_data::studio_canvas::CanvasEvent {kind:tr_data::studio_canvas::EventKind::News,time:tr_data::studio_canvas::EventTime::Instant(n.ts),source:n.publisher,headline:n.title}).collect();
+                if let Some(e)=earnings{events.push(e);}
+                let inputs=vec![input];
+                let r=tr_data::studio_canvas::compute(&inputs,&spec,key.visible,key.selected,&events).unwrap();
+                assert!(r.strip.as_ref().is_some_and(|s|s.n>100));
+                let p=super::studio_canvas::prepare(r,&inputs,Arc::new(Default::default()));
+                c.on_studio_canvas(token,key,Ok(Arc::new(p)));
+            }
             Request::ChartSessionSummary { key, bars, class, stitch, .. } => {
                 let r = tr_data::chart_session::build(&bars, key.tf, class, key.extended, key.as_of, stitch.as_deref())
                     .unwrap();
@@ -170,13 +179,16 @@ fn sample(auction: bool, n: usize) -> BTreeMap<String, Summary> {
     let ctx = egui::Context::default();
     let (w, mut rx) = Worker::test_channel();
     let mut c = chart(&w, auction, n);
+    c.toggle_canvas_strip();
     complete(&mut c, &mut rx);
     perf::set_enabled(true);
     for i in 0..20 {
         let out = frame(&ctx, &mut c, &w, i);
         ctx.tessellate(out.shapes, out.pixels_per_point);
         perf::end_frame();
+        complete(&mut c,&mut rx);
     }
+    assert!(c.canvas.report.as_ref().is_some_and(|r|r.report.strip.as_ref().is_some_and(|s|s.n>100)));
     let mut results = BTreeMap::new();
     let refresh_report = c.session.snapshot.clone();
     for mode in if auction { vec!["steady", "pan", "refresh"] } else { vec!["steady", "pan"] } {
@@ -202,6 +214,7 @@ fn sample(auction: bool, n: usize) -> BTreeMap<String, Summary> {
             let tess_us = start.elapsed().as_secs_f64() * 1e6;
             assert!(!primitives.is_empty());
             std::hint::black_box(primitives);
+            complete(&mut c,&mut rx);
             for (id, v) in [("ui".to_owned(), ui_us), ("tess".into(), tess_us), ("total".into(), ui_us + tess_us)] {
                 times.entry(id).or_default().push(v);
             }
