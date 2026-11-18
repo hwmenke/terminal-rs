@@ -888,3 +888,63 @@ source calendar/event coverage and absent per-record vendor metadata in Quote.
 Live provider availability and actual GPU presentation were not certified by the
 headless gates. The native chart remains the route for its existing study layers;
 scalar modes never project price studies onto incompatible transformed units.
+
+## Studio Slice 3 — When lens and selected-range comparison
+
+Three compute cases use public `studio_when` APIs on dev-only fixtures.
+`studio.when_120d_5m` builds the full report (mask, four horizons, fixed BY
+family, prior-only quintiles) from 120 AAPL 5m sessions; it asserts the grid
+equals every expected bar (9,288 incl. two half days), 120 sessions, 4 cells and
+20 buckets, completed outcomes = slots − sessions·h (minus warm-up), available
+inference for all eight tests and >8,400 edge slots. Work token: Σ raw n.
+`studio.when_bootstrap_120d_x499` runs the 499-draw session-row bootstrap and
+asserts all four intervals. `studio.subset_5k` runs the selected/rest comparison
+over a 5,000-return daily Distribution report (complete partition, unit mass,
+session-block interval); token = returns × draws. Smoke uses 40 sessions / 500
+days. Budgets 45,000 / 200,000 / 15,000 µs, `relative:true`.
+
+`studio.subset_5k` first measured 61 ms. It now generates stationary-bootstrap
+blocks as runs (one uniform start + one geometric length per block), uses a
+difference array for session weights and an exact integer ECDF sweep; a test
+matches it against a brute-force replicate ECDF to 1e‑12. The Shape threshold
+intervals use the same run generator with prefix counts, so
+`studio.shape_bootstrap_5k_x500` stays near its baseline (79.5 ms; normalised
+≈1.07×).
+
+Paint: `paint.studio_when.{steady,hover}` render the real lens on the 120-session
+report and bootstrap at 1440 px (guards: every evidence row, n/episodes/q,
+shared-bin legend, probability tile with block interval, five buckets, CLOSED
+THRU; hover opens the real `when.contrast.mean` MathCard). Ceilings are the
+default **1.2 / 0.8 / 2.0 ms**. `paint.studio_when.chart_shaded` renders the full
+Studio shell on the 5,000-bar native AAPL daily GPU chart with the accepted rule
+wash and When lens, under the native-chart steady ceilings **1.5 / 1.5 / 2.5 ms**;
+guards require ≥3 painted wash rects, the printed rule label and native GPU
+callbacks, and that steady frames dispatch no When work. No existing workload or
+ceiling changed; no baseline was recorded.
+
+Measured 2026-11-17, release, calibration 6,646 µs, slack 1.0:
+
+| Case / metric | Median ms | p95 ms | Ceiling ms |
+| --- | ---: | ---: | ---: |
+| `studio.when_120d_5m` | 25.593 | 26.940 | 45 |
+| `studio.when_bootstrap_120d_x499` | 0.860 | 0.972 | 200 |
+| `studio.subset_5k` | 8.543 | 8.930 | 15 |
+| `studio.shape_bootstrap_5k_x500` | 79.496 | 80.607 | 200 |
+| `paint.studio_when.steady.ui` | 0.030 | 0.042 | 1.2 |
+| `paint.studio_when.steady.tess` | 0.023 | 0.036 | 0.8 |
+| `paint.studio_when.steady.total` | 0.053 | 0.079 | 2.0 |
+| `paint.studio_when.hover.ui` | 0.058 | 0.065 | 1.2 |
+| `paint.studio_when.hover.tess` | 0.041 | 0.061 | 0.8 |
+| `paint.studio_when.hover.total` | 0.101 | 0.111 | 2.0 |
+| `paint.studio_when.chart_shaded.ui` | 0.108 | 0.130 | 1.5 |
+| `paint.studio_when.chart_shaded.tess` | 0.073 | 0.084 | 1.5 |
+| `paint.studio_when.chart_shaded.total` | 0.183 | 0.212 | 2.5 |
+
+Gate status: compute **41 passed / 0 failed / 0 harness errors**; native chart
+paint test passed. The studio paint test **failed on two untouched metrics**:
+`paint.studio_corr.steady.ui` 1.574 ms and `paint.studio_corr.hover.ui` 1.580 ms
+against 1.5 ms (three runs, including one at load average 0.1; historical median
+1.314 ms from master slice 1). The CORR render path, report, fixture and shared
+widgets are unchanged in this slice, so the workload is identical; the cause
+(binary codegen/layout shift or host drift) was not isolated because an A/B
+build of HEAD was not run. The ceiling was not widened.

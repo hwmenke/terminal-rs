@@ -218,9 +218,19 @@ not contain their point estimate; they are not widened to force that result.
 Descriptive/Evidence changes interval visibility without a recompute. There is no
 hypothesis-test family or significance claim in Shape.
 
-Three user-entered nonnegative absolute thresholds show `P(|r|≥X)=k/n`, Wilson
-95% intervals (z=1.96) and fitted Normal probabilities. Wilson assumes independent
-events; in particular its interval is not overlap-robust. The year strip groups by
+Three user-entered nonnegative absolute thresholds show `P(|r|≥X)=k/n` and fitted
+Normal probabilities. **Studio slice 3 correction:** Evidence mode now prints a 95%
+percentile stationary block-bootstrap interval for each threshold probability
+(500 deterministic draws, seams reset blocks, n≥30). The mean geometric block
+length is `ceil(n^(1/3))`, and at least `h` when horizons overlap, because
+adjacent overlapping h-sums share h−1 returns. The interval comes from the same
+second-stage Shape bootstrap response but its own deterministic stream (seed
+`shape key ⊕ const`), so the existing tail intervals are unchanged; each draw
+uses prefix exceedance counts over resampled runs. Below n=30 the interval is
+unavailable rather than replaced by Wilson. Shape has no separate About tab: the
+iid Wilson (1927) interval (z=1.96) is retained in the threshold MathCard as an
+explicitly labelled “About — iid Wilson comparison”, not as the Evidence interval.
+Descriptive mode shows neither interval. The year strip groups by
 UTC ending-bar year, reporting n, mean and sample sd annualised by
 `sqrt(nominal periods/year / h)`, with vol unavailable at n<2. Annualisation remains
 approximate for irregular bars and missing coverage.

@@ -300,6 +300,51 @@
       "budget_us": 2500,
       "relative": false,
       "class": "frame"
+    },
+    "paint.studio_when.steady.ui": {
+      "budget_us": 1200,
+      "relative": false,
+      "class": "frame"
+    },
+    "paint.studio_when.steady.tess": {
+      "budget_us": 800,
+      "relative": false,
+      "class": "frame"
+    },
+    "paint.studio_when.steady.total": {
+      "budget_us": 2000,
+      "relative": false,
+      "class": "frame"
+    },
+    "paint.studio_when.hover.ui": {
+      "budget_us": 1200,
+      "relative": false,
+      "class": "frame"
+    },
+    "paint.studio_when.hover.tess": {
+      "budget_us": 800,
+      "relative": false,
+      "class": "frame"
+    },
+    "paint.studio_when.hover.total": {
+      "budget_us": 2000,
+      "relative": false,
+      "class": "frame"
+    },
+    "paint.studio_when.chart_shaded.ui": {
+      "budget_us": 1500,
+      "relative": false,
+      "class": "frame"
+    },
+    "paint.studio_when.chart_shaded.tess": {
+      "budget_us": 1500,
+      "relative": false,
+      "class": "frame"
+    },
+    "paint.studio_when.chart_shaded.total": {
+      "budget_us": 2500,
+      "relative": false,
+      "class": "frame"
     }
   }
 }

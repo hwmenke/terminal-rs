@@ -446,6 +446,9 @@ pub enum Function {
     },
     StudioRoute(tr_data::studio::StudioRoute),
     StudioQuick {spec:String},
+    StudioWhen {
+        spec: String,
+    },
     DistributionStrip,
     StudioDist {
         timeframe: Timeframe,
@@ -922,8 +925,13 @@ fn parse_function(head: &str, rest: &[&str]) -> Option<Function> {
         // the command; anything else falls through to the ticker (see parse()).
         "STUDIO" => {
             let spec = joined();
-            tr_data::studio::parse_spec(&spec).ok()?;
+            crate::app::studio_hub::parse_studio(&spec).ok()?;
             Function::Studio { spec }
+        }
+        "WHEN" => {
+            let spec = joined();
+            tr_data::studio_when::parse_command(&spec).ok()?;
+            Function::StudioWhen { spec }
         }
         "QUICK" => {let spec=joined();tr_data::studio_canvas::parse_spec(&spec).ok()?;Function::StudioQuick {spec}},
         "DSTRIP" if rest.is_empty()=>Function::DistributionStrip,
@@ -1265,6 +1273,7 @@ fn describe(f: &Function) -> String {
         }
         Function::Journal(q) => format!("Trade journal: {q}"),
         Function::Studio { spec } => format!("Studio · native canvas and named lenses · {spec}"),
+        Function::StudioWhen { spec } => format!("When · fixed-family within-clock rule evidence · {spec}"),
         Function::StudioQuick {spec} => format!("Quick canvas · level/index100/change/z/vol · {spec}"),
         Function::DistributionStrip => "Toggle the closed-value distribution strip".into(),
         Function::StudioRoute(route) => route.reason().into(),

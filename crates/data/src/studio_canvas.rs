@@ -222,7 +222,7 @@ fn sample_stats(v: &[f64]) -> Option<(f64, f64)> {
     let sd = (v.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / (v.len() - 1) as f64).sqrt();
     (mean.is_finite() && sd.is_finite()).then_some((mean, sd))
 }
-fn expected_breaks(input: &CanvasInput, bars: &[Bar]) -> Vec<bool> {
+pub(crate) fn expected_breaks(input: &CanvasInput, bars: &[Bar]) -> Vec<bool> {
     let class = crate::security(&input.symbol).class;
     let cash = crate::time_link::cash_class(class);
     let mut grid = BTreeMap::new();
@@ -260,7 +260,7 @@ fn expected_breaks(input: &CanvasInput, bars: &[Bar]) -> Vec<bool> {
         })
         .collect()
 }
-fn transform(input: &CanvasInput, spec: &CanvasSpec) -> Result<(ScalarSeries, CanvasLine), String> {
+pub(crate) fn transform(input: &CanvasInput, spec: &CanvasSpec) -> Result<(ScalarSeries, CanvasLine), String> {
     let bars = crate::vault::research_bars(&input.bars, input.stitch.as_deref())?;
     let class = crate::security(&input.symbol).class;
     let n = crate::closed::closed_len(input.tf, &bars, class, input.observed_at);

@@ -24,9 +24,10 @@ use crate::widgets::{self, Icon};
 use crate::worker::{Request, Worker};
 
 /// Panels offered by the + menus: label and command word.
-pub const PANELS: [(&str, &str); 36] = [
+pub const PANELS: [(&str, &str); 37] = [
     ("Chart", "CHART"),
     ("Studio", "STUDIO"),
+    ("When", "WHEN"),
     ("Quick canvas", "QUICK"),
     ("Factor Lab (unavailable)", "LAB"),
     ("Residual (unavailable)", "RESID"),
@@ -1075,15 +1076,21 @@ impl TerminalApp {
                 PaneKind::Journal(Box::new(super::journal::JournalPane::new(filter)))
             }
             "STUDIO" => {
-                let (lens, tf, benchmark) =
-                    tr_data::studio::parse_spec(&words.get(1..).unwrap_or(&[]).join(" ")).ok()?;
+                let (lens, tf, benchmark, inputs) =
+                    super::studio_hub::parse_studio(&words.get(1..).unwrap_or(&[]).join(" ")).ok()?;
                 let symbol = symbol.map(|s| tr_data::security(s).key()).or(current).unwrap_or_default();
                 PaneKind::Studio(Box::new(super::studio_hub::StudioPane::new(super::studio_hub::StudioViewSpec {
                     context: tr_data::studio::StudioContext { symbol, tf, ..Default::default() },
                     lens,
                     benchmark,
+                    inputs,
                     ..Default::default()
                 })))
+            }
+            "WHEN" => {
+                let cmd = tr_data::studio_when::parse_command(&words.get(1..).unwrap_or(&[]).join(" ")).ok()?;
+                let symbol = symbol.map(|s| tr_data::security(s).key()).or(current).unwrap_or_default();
+                PaneKind::Studio(Box::new(super::studio_hub::when_studio(symbol, cmd)))
             }
             "QUICK" => {
                 let (tf,mode,peers)=tr_data::studio_canvas::parse_spec(&words.get(1..).unwrap_or(&[]).join(" ")).ok()?;

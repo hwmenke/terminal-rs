@@ -71,6 +71,48 @@ fn studio_legacy_commands_preserved() {
     assert!(command::parse("STUDIO lens=typo").is_none());
 }
 #[test]
+fn when_commands_route_and_persist_backward_compatibly() {
+    let Some(Command::SymbolFunction(sym, Function::StudioWhen { spec })) = command::parse("AAPL WHEN 5m RSI(14)<30")
+    else {
+        panic!("AAPL WHEN parses")
+    };
+    assert_eq!(sym, "AAPL US Equity");
+    let cmd = tr_data::studio_when::parse_command(&spec).unwrap();
+    assert_eq!((cmd.tf, cmd.rule.as_deref()), (Some(Timeframe::M5), Some("RSI(14)<30")));
+    let s = when_studio(sym, cmd).view();
+    assert_eq!((s.lens, s.context.tf, s.inputs.condition.as_str()), (StudioLens::When, Timeframe::M5, "RSI(14)<30"));
+    let (lens, tf, _, inputs) = parse_studio("5m lens=when rule=\"RSI(14)<30 AND close>SMA(50)\" h=12").unwrap();
+    assert_eq!((lens, tf, inputs.when_horizon), (StudioLens::When, Timeframe::M5, 12));
+    assert_eq!(inputs.condition, "RSI(14)<30 AND close>SMA(50)");
+    assert!(parse_studio("5m lens=dist rule=\"RSI(14)<30\"").is_err(), "rule needs lens=when");
+    assert!(matches!(
+        command::parse("AAPL STUDIO 5m lens=when rule=\"RSI(14)<30\""),
+        Some(Command::SymbolFunction(_, Function::Studio { .. }))
+    ));
+    assert!(matches!(command::parse("WHEN h=6 threshold=10bp"), Some(Command::Function(Function::StudioWhen { .. }))));
+    assert!(command::parse("WHEN h=5").is_none());
+    // `WHEN h=…` adjusts the focused Studio instead of opening a new pane.
+    let mut app = test_app();
+    app.execute("AAPL WHEN 5m RSI(14)<30");
+    let panes = app.panes.len();
+    let id = app.panes.iter().find(|p| matches!(p.kind, PaneKind::Studio(_))).unwrap().id;
+    app.focus = id;
+    app.execute("WHEN h=12 threshold=15bp");
+    assert_eq!(app.panes.len(), panes);
+    let p = app_pane(&mut app, id).when_mut().unwrap();
+    assert_eq!((p.horizon, p.threshold, p.draft_threshold), (12, 15., 15.));
+    let copy = app_pane(&mut app, id).command();
+    assert!(copy.contains("lens=when") && copy.contains("rule=\"RSI(14)<30\"") && copy.contains("h=12"), "{copy}");
+    // Panel menu and older layouts.
+    assert!(crate::app::workspace::PANELS.iter().any(|(_, w)| *w == "WHEN"));
+    let Some(PaneKind::Studio(w)) = app.panel_from_spec("WHEN 15m close>SMA(20)", Some("MSFT")) else { panic!() };
+    assert_eq!((w.lens, w.context.tf), (StudioLens::When, Timeframe::M15));
+    let old: PaneSettings =
+        serde_json::from_str(r#"{"Studio":{"view":{"lens":"When","inputs":{"condition":"RSI(14)<30"}}}}"#).unwrap();
+    let PaneSettings::Studio { view } = old else { panic!() };
+    assert_eq!((view.inputs.when_threshold, view.inputs.when_horizon), (10., 6));
+}
+#[test]
 fn studio_layout_defaults_load() {
     let p: PaneSettings = serde_json::from_str(r#"{"Studio":{}}"#).unwrap();
     let PaneSettings::Studio { view } = p else { panic!() };
@@ -93,12 +135,24 @@ fn studio_lens_roundtrip_preserves_selection() {
     let mut s = prepared(&worker, &mut requests, false);
     s.context.selected_span = Some((20, 40));
     let before = format!("{:?}", s.dist_mut().unwrap().report.as_ref().unwrap()).into_bytes();
+    let ctx = egui::Context::default();
+    // A committed selection asks once for the selected/rest stage.
+    let mut out = ctx.run_ui(egui::RawInput::default(), |ui| {
+        s.analysis(ui, 201, &worker, false);
+    });
+    out.textures_delta.clear();
+    let Ok(Request::StudioSubset { generation, input, selection, .. }) = requests.try_recv() else {
+        panic!("selection requests the subset stage")
+    };
+    assert_eq!(selection, (20, 40));
+    let key = input.bars_seed;
+    s.accept_subset(generation, key, selection, super::studio_when::cached_subset(&input, selection));
+    assert!(s.subset.is_some() || s.subset_error.is_some());
     for lens in [StudioLens::Relate, StudioLens::Season, StudioLens::When, StudioLens::Backtest, StudioLens::Dist] {
         s.select_lens(lens);
         s.ensure_child();
     }
     assert_eq!(s.context.selected_span, Some((20, 40)));
-    let ctx = egui::Context::default();
     let mut out = ctx.run_ui(egui::RawInput::default(), |ui| {
         s.analysis(ui, 201, &worker, false);
     });
@@ -298,6 +352,9 @@ fn studio_cycles_supported_lenses_and_retains_explicit_unavailable_routes() {
     s.context.tf = Timeframe::M5;
     s.select_lens(StudioLens::Relate);
     s.cycle_lens(1);
+    // Slice 3: When supports native 5m cash sessions.
+    assert_eq!(s.lens, StudioLens::When);
+    s.cycle_lens(1);
     assert_eq!(s.lens, StudioLens::Season);
     let (worker, mut requests) = Worker::test_channel();
     let ctx = egui::Context::default();
@@ -391,7 +448,7 @@ fn studio_history_change_and_queued_sample_responses_cannot_restore_reports() {
     app.provider = "real".into();
     let mut s = prepared(&app.worker, &mut requests, false);
     let generation = s.dist_mut().unwrap().generation;
-    let report = s.dist_mut().unwrap().report.as_ref().unwrap().clone();
+    let report = (**s.dist_mut().unwrap().report.as_ref().unwrap()).clone();
     app.panes.push(Pane { id: 201, kind: PaneKind::Studio(Box::new(s)), link: None, title: None, window: None });
     let epoch = app_pane(&mut app, 201).context_epoch;
     tx.send(Response::HistoryChanged).unwrap();

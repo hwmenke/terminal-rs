@@ -79,6 +79,12 @@ scale, density, counts and probabilities are neutral. Year identity and unsigned
 volatility remain neutral beside signed mean ink. LOW N is a caution corner tick;
 pointwise bootstrap intervals carry no significance hue or test-family claim.
 
+Studio When uses signed ink for contrasts and bucket means, categorical
+`series(0/1)` for rule/complement and selected/rest distributions (legend
+printed), muted whiskers and zero ticks, a neutral outline for q≤0.10 and a
+caution corner tick for LOW N. The native-chart rule wash is the chrome accent at
+8% alpha with a muted printed label; it is not a heat surface. See STUDIO_WHEN.md.
+
 Quick canvas lines/identifiers use categorical series roles. Change/Z values and
 base deltas use signed ink with explicit +/−. The count strip is neutral slate;
 its now pin and date lanes are neutral. Unit-specific Z/vol keys are printed; no

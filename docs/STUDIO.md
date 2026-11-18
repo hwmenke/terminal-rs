@@ -11,6 +11,8 @@ STUDIO lens=relate benchmark=QQQ
 STUDIO lens=season
 STUDIO lens=when
 STUDIO lens=backtest
+AAPL STUDIO 5m lens=when rule="RSI(14)<30"
+AAPL WHEN 5m RSI(14)<30
 ```
 
 Legacy DIST/RDIST (including Shape), CORR/RBETA, SEASON/SSN, STATS/COND and
@@ -62,8 +64,12 @@ second-stage report keys remain the original implementations. See
 [Distribution](STUDIO_DIST.md), [Relate](STUDIO_CORR.md) and
 [Season](STUDIO_SEASON.md) for exact methods and data limitations.
 
-When adapts the existing daily STATS conditional-return pane. Intraday When
-explains the daily-only restriction. SEASON supports daily/5m/15m/30m/1h US cash
+When (slice 3) is a dedicated lens: rule mask shading on the native chart,
+fixed-family within-clock HAC/BY evidence at h=1,3,6,12, shared-bin
+distributions, session-block probability tiles and prior-only buckets, on
+verified daily or native 1m–1h US cash bars. See [When](STUDIO_WHEN.md); the
+standalone STATS/COND pane is unchanged and offers Open in When. A committed
+selection adds a selected-versus-rest comparison above Distribution. SEASON supports daily/5m/15m/30m/1h US cash
 sessions; unsupported intervals retain its refusal. Backtest chooses the existing
 daily archive or intraday session-research path from the Studio interval. No
 substituted timeframe, provider, price or peer fills missing inputs.

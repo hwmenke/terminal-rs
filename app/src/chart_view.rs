@@ -7258,6 +7258,38 @@ impl ChartState {
             self.studio_reset();
         }
     }
+    /// Native history identity; a change (reload, corrected bar, stitch) drops
+    /// dependent Studio research snapshots.
+    pub(crate) fn studio_data_revision(&self) -> (u64, u64, u64) {
+        (self.generation, self.session.bars_revision, self.session.stitch_revision)
+    }
+    /// Low-alpha accent wash over accepted When rule runs `[start,end)` with a
+    /// printed rule label. Runs are worker-built from the accepted mask; paint
+    /// only binary-searches native timestamps for the visible runs.
+    pub(crate) fn studio_rule_shading(&self, ui: &egui::Ui, rect: Rect, runs: &[(i64, i64)], label: &str) {
+        let Some(v) = self.viewport else { return };
+        let rect = self.studio_plot.unwrap_or(rect);
+        let painter = ui.painter_at(rect);
+        let first = self.bars.get(v.left().max(0.) as usize).map_or(i64::MIN, |b| b.ts);
+        let lo = runs.partition_point(|r| r.1 <= first);
+        for &(a, b) in &runs[lo..] {
+            let start = self.bars.partition_point(|bar| bar.ts < a);
+            let end = self.bars.partition_point(|bar| bar.ts < b);
+            let left = rect.left() + v.x_of(start as f64 - 0.5) as f32;
+            if left > rect.right() {
+                break;
+            }
+            if start == end {
+                continue;
+            }
+            let right = rect.left() + v.x_of(end as f64 - 0.5) as f32;
+            let wash = Rect::from_min_max(pos2(left, rect.top()), pos2(right, rect.bottom())).intersect(rect);
+            if wash.is_positive() {
+                painter.rect_filled(wash, 0., theme::accent().gamma_multiply(0.08));
+            }
+        }
+        painter.text(rect.left_top() + vec2(8., 8.), egui::Align2::LEFT_TOP, label, theme::ui_font(10.), theme::muted());
+    }
     /// Binary-search UTC bounds; no statistical scan or filtering is done in paint.
     pub(crate) fn studio_selection(&self, ui: &egui::Ui, rect: egui::Rect, span: Option<(i64, i64)>) {
         let (Some((a, b)), Some(v)) = (span, self.viewport) else { return };

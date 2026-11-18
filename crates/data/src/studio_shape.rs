@@ -45,6 +45,21 @@ pub struct Intervals {
     pub seed: u64,
     pub draws: usize,
     pub tails: [Option<(f64, f64)>; 8],
+    /// 95% percentile stationary-bootstrap interval for each P(|x| ≥ X), in
+    /// threshold order. Blocks respect seams; under overlap the mean block
+    /// length is at least the horizon, so overlapping sums stay together.
+    pub thresholds: Vec<Option<(f64, f64)>>,
+    pub threshold_block: usize,
+}
+
+/// Minimum horizon observations for a threshold-probability block interval.
+pub const THRESHOLD_MIN_N: usize = 30;
+
+/// Mean geometric block length for threshold intervals: ceil(n^(1/3)), and at
+/// least `h` for overlapping `h`-bar sums (adjacent values share h−1 returns).
+pub fn threshold_block(n: usize, h: usize, overlap: bool) -> usize {
+    let base = (n.max(1) as f64).cbrt().ceil() as usize;
+    if overlap { base.max(h) } else { base }
 }
 fn sorted(x: &[f64]) -> Vec<f64> {
     let mut x = x.to_vec();
@@ -253,7 +268,44 @@ impl Shape {
                 samples[i].push(*v);
             }
         });
+        let n = self.values.len();
+        let block = threshold_block(n, self.horizon, self.overlap);
+        let mut hits: Vec<Vec<f64>> = vec![Vec::with_capacity(500); self.thresholds.len()];
+        if n >= THRESHOLD_MIN_N && !self.thresholds.is_empty() {
+            // Prefix exceedance counts: a resampled run [a, a+len) contributes
+            // prefix[a+len] − prefix[a] events, so each draw costs O(blocks).
+            let prefix: Vec<Vec<u32>> = self
+                .thresholds
+                .iter()
+                .map(|t| {
+                    std::iter::once(0)
+                        .chain(self.values.iter().scan(0u32, |k, v| {
+                            *k += u32::from(v.abs() >= t.level);
+                            Some(*k)
+                        }))
+                        .collect()
+                })
+                .collect();
+            // Separate deterministic stream so existing tail intervals are unchanged.
+            let seed = self.seed ^ 0x7468_7265_7368_6f6c;
+            crate::studio_inference::stationary_bootstrap_runs(n, 500, seed, &self.breaks, block, |runs| {
+                for (p, out) in prefix.iter().zip(hits.iter_mut()) {
+                    let k: u32 = runs.iter().map(|&(a, len)| p[a + len] - p[a]).sum();
+                    out.push(f64::from(k) / n as f64);
+                }
+            });
+        }
         Intervals {
+            thresholds: hits
+                .iter()
+                .map(|h| {
+                    (h.len() == 500).then(|| {
+                        let s = sorted(h);
+                        (quantile(&s, 0.025), quantile(&s, 0.975))
+                    })
+                })
+                .collect(),
+            threshold_block: block,
             seed: self.seed,
             draws: 500,
             tails: std::array::from_fn(|i| {
@@ -292,6 +344,48 @@ mod tests {
             .collect();
         crate::studio_dist::compute("AAPL", &bars, Timeframe::D1, crate::studio_dist::Window::All, "test", None)
             .unwrap()
+    }
+    #[test]
+    fn shape_overlap_threshold_interval_is_block_based() {
+        // Seeded noise with slowly varying volatility (clustered exceedances).
+        let mut rng = crate::nulls::SplitMix64(7);
+        let mut price = 100.;
+        let bars: Vec<_> = (0..=1500)
+            .map(|i| {
+                let u = (rng.below(1_000_000) as f64 + 0.5) / 1e6 - 0.5;
+                price *= (u * 0.02 * (1.2 + (i as f64 * 0.013).sin())).exp();
+                Bar::new(1_600_000_000 + i as i64 * 86400, price, price, price, price, 1.)
+                    .with_provenance(Provenance::Real)
+            })
+            .collect();
+        let r = crate::studio_dist::compute("AAPL", &bars, Timeframe::D1, crate::studio_dist::Window::All, "test", None)
+            .unwrap();
+        let probe = compute(&r, 20, true).unwrap();
+        let mut abs: Vec<f64> = probe.values.iter().map(|v| v.abs()).collect();
+        abs.sort_by(f64::total_cmp);
+        let level = quantile(&abs, 0.6);
+        let s = compute_with_thresholds(&r, 20, true, &[level]).unwrap();
+        let n = s.values.len();
+        let b = s.bootstrap();
+        assert_eq!(b.threshold_block, 20, "overlapping h=20 sums need blocks of at least h");
+        assert_eq!(threshold_block(n, 20, false), (n as f64).cbrt().ceil() as usize);
+        // Reproduce the interval from the block resampler itself.
+        let mut draws = vec![];
+        crate::studio_inference::stationary_bootstrap_blocks(n, 500, s.seed ^ 0x7468_7265_7368_6f6c, &s.breaks, 20, |ix| {
+            draws.push(ix.iter().filter(|i| s.values[**i].abs() >= level).count() as f64 / n as f64)
+        });
+        let sorted_draws = sorted(&draws);
+        let expected = (quantile(&sorted_draws, 0.025), quantile(&sorted_draws, 0.975));
+        assert_eq!(b.thresholds, vec![Some(expected)]);
+        // Overlap dependence: the block interval is wider than iid Wilson.
+        let wilson = s.thresholds[0].interval;
+        let (lo, hi) = expected;
+        assert!(hi - lo > wilson.1 - wilson.0, "block {lo}..{hi} vs Wilson {wilson:?}");
+        // Existing tail intervals are unchanged by the added threshold stream.
+        assert_eq!(b.tails, s.bootstrap().tails);
+        // Below the sample gate the interval is unavailable, never Wilson.
+        let small = compute_with_thresholds(&report(25), 1, false, &[0.001]).unwrap();
+        assert_eq!(small.bootstrap().thresholds, vec![None]);
     }
     #[test]
     fn fd_bins_known_answer() {

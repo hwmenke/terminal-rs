@@ -175,6 +175,20 @@ pub fn studio_routes() -> [&'static str; 5] {
     ["5m lens=dist", "5m lens=relate benchmark=QQQ", "5m lens=when", "5m lens=season", "5m lens=backtest"]
 }
 
+/// Dev-only When input: AAPL 5m regular sessions (78 bars each) with a
+/// matching observation clock. Fabricated benchmark input only.
+pub fn when_input(sessions: usize) -> tr_data::studio_canvas::CanvasInput {
+    let bars = intraday(Timeframe::M5, sessions, 907);
+    tr_data::studio_canvas::CanvasInput {
+        symbol: "AAPL US Equity".into(),
+        tf: Timeframe::M5,
+        observed_at: Some(bars.last().unwrap().ts + 300),
+        stitch: None,
+        source: "benchmark fixture only".into(),
+        bars: std::sync::Arc::new(bars),
+    }
+}
+
 /// Four distinct admitted native sources, 7,800 bars apiece at full scale.
 /// Fabricated benchmark inputs only; never a runtime dependency of the app.
 pub fn canvas_inputs(sessions:usize)->Vec<tr_data::studio_canvas::CanvasInput> {

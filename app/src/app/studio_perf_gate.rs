@@ -168,6 +168,7 @@ fn perf_gate_paint_studios() {
     best.extend(shape_sample());
     best.extend(shell_sample());
     best.extend(quick_sample());
+    best.extend(when_sample());
     let ids: BTreeSet<_> = budgets.cases.keys().filter(|id| id.starts_with("paint.studio_")).cloned().collect();
     assert_eq!(best.keys().cloned().collect::<BTreeSet<_>>(), ids, "stale/missing studio budgets");
     for _ in 0..2 {
@@ -185,6 +186,7 @@ fn perf_gate_paint_studios() {
             .chain(shape_sample())
             .chain(shell_sample())
             .chain(quick_sample())
+            .chain(when_sample())
         {
             if s.median_us < best[&id].median_us {
                 best.insert(id, s);
@@ -1140,4 +1142,219 @@ fn studio_quick_geometry_and_actual_hover() {
         let mut last=None;for i in 140..160 {last=Some(quick_frame(&ctx,&mut p,&w,width,true,i));}
         let out=last.unwrap();quick_guard(&p,&out,true);finite(&ctx,out);
     }
+}
+
+// ---- Studio slice 3: When lens and shaded native chart ----
+
+fn when_pane(sessions: usize) -> super::studio_when::WhenPane {
+    let r = super::studio_when::fixture_report(sessions);
+    let mut p = super::studio_when::WhenPane::new("AAPL US Equity", tr_core::Timeframe::M5, "RSI(14)<45", 0., 6);
+    p.loading = true;
+    p.accept(p.generation, Ok(r.clone()));
+    p.boot_loading = true;
+    let boot = super::studio_when::cached_bootstrap(&r).unwrap();
+    p.accept_bootstrap(p.generation, r.report.key, Ok(boot));
+    assert!(p.report.is_some() && p.bootstrap.is_some());
+    p
+}
+fn when_frame(
+    ctx: &egui::Context,
+    p: &mut super::studio_when::WhenPane,
+    width: f32,
+    hover: bool,
+    index: usize,
+) -> egui::FullOutput {
+    let pointer = if hover {
+        ctx.data(|d| d.get_temp::<Rect>(egui::Id::new("when-probe"))).unwrap_or(Rect::NOTHING).center()
+            + vec2(if index >= 160 { (index % 2) as f32 } else { 0. }, 0.)
+    } else {
+        pos2(15. + (index % 2) as f32, 1150.)
+    };
+    let events = if ctx.input(|i| i.pointer.hover_pos()) == Some(pointer) {
+        vec![]
+    } else {
+        vec![egui::Event::PointerMoved(pointer)]
+    };
+    let mut out = ctx.run_ui(
+        egui::RawInput {
+            time: Some(1. + index as f64 * 0.2),
+            screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(width, 1200.))),
+            events,
+            ..Default::default()
+        },
+        |ui| {
+            let r = p.report.clone().unwrap();
+            let boot = p.bootstrap.clone();
+            let probe = super::studio_when::view(ui, &r, boot.as_deref(), None, &mut p.horizon);
+            ctx.data_mut(|d| d.insert_temp(egui::Id::new("when-probe"), probe));
+        },
+    );
+    out.textures_delta.clear();
+    out
+}
+fn when_guard(p: &super::studio_when::WhenPane, out: &egui::FullOutput, hover: bool) {
+    let txt = text(&out.shapes);
+    for word in [
+        "FIXED FAMILY m=8",
+        "Δ mean bp",
+        "q mean / event",
+        "raw n / episodes / n_eff",
+        "NORMALISED SHARED-BIN",
+        "Rule n=",
+        "Complement n=",
+        "P(R>0bp | rule)",
+        "block 95%",
+        "PRIOR-ONLY",
+        "Q5",
+        "CLOSED THRU",
+    ] {
+        assert!(txt.contains(word), "When missing {word}: {txt}");
+    }
+    let r = &p.report.as_ref().unwrap().report;
+    // 120 sessions incl. two half days = 9,288 expected slots; every horizon
+    // keeps its completed in-session outcomes (slots − sessions·h − warm-up).
+    assert_eq!(r.mask.ts.len(), 9288);
+    for c in &r.cells {
+        let complete = r.mask.ts.len() - r.sessions * c.horizon;
+        assert!(c.raw_n <= complete && c.raw_n + 20 >= complete && c.mean_contrast.p.is_some());
+    }
+    assert!(out.shapes.len() > 100, "empty When geometry");
+    if hover {
+        for word in ["WHEN MEAN CONTRAST", "Bartlett lag", "observation clock", "fixed m=8", "CLOSED THRU"] {
+            assert!(txt.contains(word), "When hover missing MathCard {word}: {txt}");
+        }
+    }
+}
+fn when_sample() -> BTreeMap<String, Summary> {
+    let mut result = BTreeMap::new();
+    for hover in [false, true] {
+        let ctx = egui::Context::default();
+        let mut p = when_pane(120);
+        for i in 0..20 {
+            finite(&ctx, when_frame(&ctx, &mut p, 1440., false, i));
+        }
+        if hover {
+            for i in 140..160 {
+                finite(&ctx, when_frame(&ctx, &mut p, 1440., true, i));
+            }
+        }
+        let mode = if hover { "hover" } else { "steady" };
+        let mut times: BTreeMap<String, Vec<f64>> = BTreeMap::new();
+        for i in 0..120 {
+            let start = Instant::now();
+            let mut out = when_frame(&ctx, &mut p, 1440., hover, i + if hover { 160 } else { 20 });
+            let ui_us = start.elapsed().as_secs_f64() * 1e6;
+            if i == 60 {
+                when_guard(&p, &out, hover);
+            }
+            let start = Instant::now();
+            let primitives = ctx.tessellate(std::mem::take(&mut out.shapes), out.pixels_per_point);
+            let tess_us = start.elapsed().as_secs_f64() * 1e6;
+            assert!(!primitives.is_empty());
+            std::hint::black_box(primitives);
+            for (metric, v) in [("ui", ui_us), ("tess", tess_us), ("total", ui_us + tess_us)] {
+                times.entry(format!("paint.studio_when.{mode}.{metric}")).or_default().push(v);
+            }
+        }
+        for (id, mut samples) in times {
+            result.insert(id, tr_perf::summarize(&mut samples));
+        }
+    }
+    result.extend(when_chart_sample());
+    result
+}
+
+/// Studio shell on the 5,000-bar native AAPL daily chart with an accepted
+/// When report: native GPU chart + accent rule wash + When lens.
+fn when_chart_pane(
+    worker: &crate::worker::Worker,
+    requests: &mut tokio::sync::mpsc::UnboundedReceiver<crate::worker::Request>,
+) -> super::studio_hub::StudioPane {
+    super::studio_hub::prepared_when(worker, requests)
+}
+fn when_chart_guard(pane: &super::studio_hub::StudioPane, out: &egui::FullOutput) {
+    let txt = text(&out.shapes);
+    for word in ["RULE · RSI(14) < 30", "FIXED FAMILY m=8", "CLOSED THRU"] {
+        assert!(txt.contains(word), "shaded chart missing {word}: {txt}");
+    }
+    assert!(when_washes(out) >= 3, "visible accepted rule runs must be shaded");
+    crate::chart_view::perf_gate::studio_assert_canvas(&pane.chart, out, false);
+}
+fn when_washes(out: &egui::FullOutput) -> usize {
+    let wash = crate::theme::accent().gamma_multiply(0.08);
+    out.shapes.iter().filter(|s| matches!(&s.shape, egui::Shape::Rect(r) if r.fill == wash && r.rect.width() > 0.)).count()
+}
+fn when_chart_sample() -> BTreeMap<String, Summary> {
+    let ctx = egui::Context::default();
+    let (worker, mut requests) = crate::worker::Worker::test_channel();
+    let mut pane = when_chart_pane(&worker, &mut requests);
+    for i in 0..20 {
+        finite(&ctx, shell_frame(&ctx, &mut pane, &worker, 1440., false, i));
+    }
+    while requests.try_recv().is_ok() {}
+    let mut times: BTreeMap<String, Vec<f64>> = BTreeMap::new();
+    for i in 0..120 {
+        let start = Instant::now();
+        let mut out = shell_frame(&ctx, &mut pane, &worker, 1440., false, i + 20);
+        let ui_us = start.elapsed().as_secs_f64() * 1e6;
+        if i == 60 {
+            when_chart_guard(&pane, &out);
+        }
+        let start = Instant::now();
+        let primitives = ctx.tessellate(std::mem::take(&mut out.shapes), out.pixels_per_point);
+        let tess_us = start.elapsed().as_secs_f64() * 1e6;
+        assert!(!primitives.is_empty());
+        std::hint::black_box(primitives);
+        for (metric, v) in [("ui", ui_us), ("tess", tess_us), ("total", ui_us + tess_us)] {
+            times.entry(format!("paint.studio_when.chart_shaded.{metric}")).or_default().push(v);
+        }
+    }
+    while let Ok(r) = requests.try_recv() {
+        assert!(
+            !matches!(r, crate::worker::Request::StudioWhen { .. } | crate::worker::Request::StudioWhenBootstrap { .. }),
+            "steady shaded chart dispatched When work"
+        );
+    }
+    times.into_iter().map(|(id, mut s)| (id, tr_perf::summarize(&mut s))).collect()
+}
+#[test]
+fn when_geometry_finite_and_actual_hover_320_1440() {
+    for width in [320., 1440.] {
+        let ctx = egui::Context::default();
+        ctx.all_styles_mut(|s| s.interaction.tooltip_delay = 0.);
+        let mut p = when_pane(40);
+        let out = when_frame(&ctx, &mut p, width, false, 0);
+        finite(&ctx, out);
+        let mut last = None;
+        for i in 140..160 {
+            last = Some(when_frame(&ctx, &mut p, width, true, i));
+        }
+        let out = last.unwrap();
+        if width == 1440. {
+            let txt = text(&out.shapes);
+            assert!(txt.contains("WHEN MEAN CONTRAST") && txt.contains("CLOSED THRU"), "{txt}");
+        }
+        finite(&ctx, out);
+    }
+}
+#[test]
+fn when_shaded_native_chart_paints_accepted_mask_only() {
+    let ctx = egui::Context::default();
+    let (worker, mut requests) = crate::worker::Worker::test_channel();
+    let mut pane = when_chart_pane(&worker, &mut requests);
+    let mut out = None;
+    for i in 0..21 {
+        out = Some(shell_frame(&ctx, &mut pane, &worker, 1440., false, i));
+    }
+    let out = out.unwrap();
+    when_chart_guard(&pane, &out);
+    finite(&ctx, out);
+    // A refusal for the next request clears the wash and its label.
+    let p = pane.when_mut().unwrap();
+    p.request(201, &worker);
+    let g = p.generation;
+    p.accept(g, Err("When: sample mode has no research data".into()));
+    let out = shell_frame(&ctx, &mut pane, &worker, 1440., false, 30);
+    assert!(!text(&out.shapes).contains("RULE · "), "refused report must not shade");
+    assert_eq!(when_washes(&out), 0);
 }

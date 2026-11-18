@@ -119,6 +119,13 @@ impl TerminalApp {
     }
 }
 
+/// COND → Studio When: daily bars, the same rule text (default RSI(14)<30).
+pub(super) fn when_command(symbol: &str, condition: &str) -> String {
+    let rule = condition.replace('"', "");
+    let rule = if rule.trim().is_empty() { tr_data::studio_when::DEFAULT_RULE } else { rule.trim() };
+    format!("{} WHEN 1D rule=\"{rule}\"", tr_data::security(symbol).ticker)
+}
+
 /// Shared renderer/action adapter for the standalone pane and Studio shell.
 pub(super) fn show(
     ui: &mut Ui,
@@ -144,6 +151,14 @@ pub(super) fn show(
                 if ui.selectable_label(pane.tab == tab, label).clicked() {
                     pane.tab = tab;
                 }
+            }
+            if pane.tab == StatsTab::Conditional
+                && ui
+                    .small_button("Open in When")
+                    .on_hover_text("Open this rule in Studio When: fixed-family within-clock evidence on daily bars")
+                    .clicked()
+            {
+                actions.push(Action::Command(when_command(&pane.symbol, &pane.condition)));
             }
             if ui.small_button("Reload").on_hover_text("Recompute from the research archive").clicked() {
                 reload = true;
@@ -448,6 +463,26 @@ mod tests {
     use crate::app::tests::test_app;
     use crate::command::{Command, Function};
 
+    #[test]
+    fn cond_open_in_when_routes_to_a_daily_when_studio() {
+        let cmd = when_command("AAPL US Equity", "RSI(14) < 30 AND close > SMA(50)");
+        assert_eq!(cmd, "AAPL WHEN 1D rule=\"RSI(14) < 30 AND close > SMA(50)\"");
+        let Some(Command::SymbolFunction(symbol, Function::StudioWhen { .. })) = crate::command::parse(&cmd) else {
+            panic!("{cmd} must parse as WHEN");
+        };
+        assert_eq!(symbol, "AAPL US Equity");
+        let mut app = test_app();
+        app.execute(&cmd);
+        let studio = app.panes.iter().find_map(|p| match &p.kind {
+            PaneKind::Studio(s) => Some(s),
+            _ => None,
+        });
+        let view = studio.expect("When opens a Studio").view();
+        assert_eq!(view.lens, tr_data::studio::StudioLens::When);
+        assert_eq!(view.context.tf, tr_core::Timeframe::D1);
+        assert_eq!(view.inputs.condition, "RSI(14) < 30 AND close > SMA(50)");
+        assert!(when_command("AAPL", "").contains("RSI(14)<30"));
+    }
     #[test]
     fn stats_commands_open_the_pane() {
         let mut app = test_app();
