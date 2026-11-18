@@ -1,5 +1,5 @@
 //! Studio composes native charts and existing research panes; no new estimator or loader.
-use super::{PaneKind, TerminalApp, backtest, stats, studio_corr, studio_dist, studio_season};
+use super::{PaneKind, TerminalApp, backtest, studio_corr, studio_dist, studio_season, studio_when};
 use crate::{
     chart_view::ChartState,
     congress_view::Action,
@@ -23,6 +23,8 @@ pub struct StudioInputs {
     pub corr_horizon: usize,
     pub condition: String,
     pub horizons: String,
+    pub when_threshold: f64,
+    pub when_horizon: usize,
     pub strategies: String,
     pub holdout: String,
     pub commission: String,
@@ -40,6 +42,8 @@ impl Default for StudioInputs {
             corr_horizon: 1,
             condition: String::new(),
             horizons: "5, 10".into(),
+            when_threshold: tr_data::studio_when::DEFAULT_THRESHOLD_BP,
+            when_horizon: 6,
             strategies: "ALL".into(),
             holdout: "20%".into(),
             commission: format!("{:.0}", tr_data::backtest::DEFAULT_COMMISSION_BPS),
@@ -76,7 +80,7 @@ impl Default for StudioViewSpec {
 pub enum StudioLensState {
     Dist(Box<studio_dist::DistPane>),
     Relate(Box<studio_corr::CorrPane>),
-    When(Box<stats::StatsPane>),
+    When(Box<studio_when::WhenPane>),
     Season(Box<studio_season::SeasonPane>),
     Backtest(Box<backtest::BacktestPane>),
 }
@@ -108,6 +112,7 @@ impl StudioLensState {
             Self::When(p) => {
                 p.generation = token;
                 p.loading = false;
+                p.boot_loading = false;
             }
             Self::Season(p) => {
                 p.generation = token;
@@ -143,6 +148,13 @@ pub struct StudioPane {
     span_start: String,
     span_end: String,
     input_error: Option<String>,
+    /// Accepted selected/rest comparison (Distribution lens only).
+    pub subset: Option<std::sync::Arc<studio_when::PreparedSubset>>,
+    /// (token, input digest, span) of the in-flight subset request.
+    pub subset_pending: Option<(u64, u64, (i64, i64))>,
+    pub subset_error: Option<String>,
+    subset_attempt: Option<(u64, (i64, i64))>,
+    chart_revision: Option<(u64, u64, u64)>,
 }
 impl StudioPane {
     pub fn new(view: StudioViewSpec) -> Self {
@@ -173,6 +185,11 @@ impl StudioPane {
             span_start: String::new(),
             span_end: String::new(),
             input_error: None,
+            subset: None,
+            subset_pending: None,
+            subset_error: None,
+            subset_attempt: None,
+            chart_revision: None,
         }
     }
     pub fn view(&self) -> StudioViewSpec {
@@ -188,7 +205,8 @@ impl StudioPane {
                 StudioLensState::Relate(p) => inputs.corr_horizon = p.horizon,
                 StudioLensState::When(p) => {
                     inputs.condition = p.condition.clone();
-                    inputs.horizons = p.horizons.clone();
+                    inputs.when_threshold = p.threshold;
+                    inputs.when_horizon = p.horizon;
                 }
                 StudioLensState::Season(_) => {}
                 StudioLensState::Backtest(p) => {
@@ -257,6 +275,7 @@ impl StudioPane {
         }
     }
     pub fn invalidate(&mut self) {
+        self.clear_subset();
         self.inputs = self.view().inputs;
         self.context_epoch = studio_token();
         self.next_request = studio_token();
@@ -278,7 +297,9 @@ impl StudioPane {
         for _ in 0..5 {
             next = next.cycle(direction);
             let supported = match next {
-                StudioLens::When => self.context.tf == Timeframe::D1,
+                StudioLens::When => {
+                    self.context.tf == Timeframe::D1 || tr_data::cash_session::cash_bar_size(self.context.tf)
+                }
                 StudioLens::Season => tr_data::studio_season::parse_timeframe(self.context.tf.label()).is_ok(),
                 StudioLens::Backtest => {
                     self.context.tf == Timeframe::D1 || tr_data::intraday_backtest::supported_timeframe(self.context.tf)
@@ -325,8 +346,7 @@ impl StudioPane {
                 StudioLensState::Relate(Box::new(c))
             }
             StudioLens::When => {
-                let mut c = stats::StatsPane::new(s, &p.condition, true);
-                c.horizons = p.horizons.clone();
+                let c = studio_when::WhenPane::new(s, tf, &p.condition, p.when_threshold, p.when_horizon);
                 StudioLensState::When(Box::new(c))
             }
             StudioLens::Season => StudioLensState::Season(Box::new(studio_season::SeasonPane::new(s, tf.label()))),
@@ -358,11 +378,75 @@ impl StudioPane {
     pub fn season_mut(&mut self) -> Option<&mut studio_season::SeasonPane> {
         self.children.iter_mut().find_map(|c| if let StudioLensState::Season(p) = c { Some(&mut **p) } else { None })
     }
-    pub fn stats_mut(&mut self) -> Option<&mut stats::StatsPane> {
+    pub fn when_mut(&mut self) -> Option<&mut studio_when::WhenPane> {
         self.children.iter_mut().find_map(|c| if let StudioLensState::When(p) = c { Some(&mut **p) } else { None })
     }
     pub fn backtest_mut(&mut self) -> Option<&mut backtest::BacktestPane> {
         self.children.iter_mut().find_map(|c| if let StudioLensState::Backtest(p) = c { Some(&mut **p) } else { None })
+    }
+    /// Accept a selected/rest report only for the exact pending token, input
+    /// digest and still-committed selection.
+    pub fn accept_subset(
+        &mut self,
+        token: u64,
+        key: u64,
+        selection: (i64, i64),
+        result: Result<std::sync::Arc<studio_when::PreparedSubset>, String>,
+    ) {
+        if self.subset_pending != Some((token, key, selection))
+            || self.context.selected_span != Some(selection)
+            || self.dist_mut().and_then(|p| p.report.as_ref()).is_none_or(|r| r.bars_seed != key)
+        {
+            return;
+        }
+        self.subset_pending = None;
+        self.subset = None;
+        match result {
+            Ok(r) if r.report.selection == selection && r.report.receipt.input_digest == key => self.subset = Some(r),
+            Ok(_) => self.subset_error = Some("Selected/rest response mismatch".into()),
+            Err(e) => self.subset_error = Some(e),
+        }
+    }
+    fn clear_subset(&mut self) {
+        self.subset = None;
+        self.subset_pending = None;
+        self.subset_error = None;
+        self.subset_attempt = None;
+    }
+    /// Selected-range comparison inside Distribution (worker-built, shared bins).
+    fn show_subset(&mut self, ui: &mut Ui, id: PaneId, worker: &Worker) {
+        let Some(span) = self.context.selected_span else {
+            self.clear_subset();
+            return;
+        };
+        let input = self.dist_mut().and_then(|p| p.report.clone());
+        let key = input.as_ref().map(|r| r.bars_seed);
+        // Any change of input digest or committed span invalidates the shown
+        // report, the pending token and a previous refusal.
+        if self.subset_attempt.is_some_and(|(k, s)| Some(k) != key || s != span) {
+            self.clear_subset();
+        }
+        if self.subset.is_none()
+            && self.subset_pending.is_none()
+            && self.subset_error.is_none()
+            && let Some(input) = input
+        {
+            let token = studio_token();
+            self.subset_pending = Some((token, input.bars_seed, span));
+            self.subset_attempt = Some((input.bars_seed, span));
+            worker.send(crate::worker::Request::StudioSubset { pane: id, generation: token, input, selection: span });
+        }
+        if let Some(s) = &self.subset {
+            studio_when::subset_view(ui, s);
+        } else {
+            let text = match (&self.subset_error, self.subset_pending.is_some()) {
+                (Some(e), _) => format!("Selected/rest comparison unavailable: {e}"),
+                (None, true) => "Selected/rest comparison loading…".into(),
+                (None, false) => "Selected/rest comparison waits for an accepted verified Distribution snapshot".into(),
+            };
+            ui.label(RichText::new(text).font(theme::ui_font(10.)).color(theme::muted()));
+            ui.allocate_space(vec2(ui.available_width(), 130.));
+        }
     }
     fn receipt(&self) -> String {
         match self.children.iter().find(|c| c.kind() == self.lens) {
@@ -388,22 +472,26 @@ impl StudioPane {
                 let r = p.report.as_ref().unwrap();
                 format!("{} · CLOSED THRU {} · observed {}", r.source, r.end, studio_dist::stamp(r.observed_at))
             }
-            Some(StudioLensState::When(p)) if p.snapshot.is_some() => {
-                let r = &p.snapshot.as_ref().unwrap().stats;
-                format!("{} · CLOSED THRU {} · observed {}", r.source, r.end, r.as_of)
-            }
+            Some(StudioLensState::When(p)) if p.report.is_some() => p.report.as_ref().unwrap().receipt.clone(),
             Some(StudioLensState::Backtest(p)) if !p.receipt.is_empty() => p.receipt.clone(),
             _ => "Source / CLOSED THRU unavailable · awaiting accepted real-data receipt".into(),
         }
     }
     fn command(&self) -> String {
         if self.quick {let c=self.chart.canvas_view();return format!("{} QUICK {} {} mode={}",self.context.symbol,c.peers.iter().map(|s|tr_data::security(s).ticker).collect::<Vec<_>>().join(" "),self.context.tf.label(),c.spec.mode.code());}
+        let rule = if self.lens == StudioLens::When {
+            let p = self.view().inputs;
+            let condition = if p.condition.trim().is_empty() { tr_data::studio_when::DEFAULT_RULE } else { &p.condition };
+            format!(" rule=\"{condition}\" h={} threshold={}bp", p.when_horizon, p.when_threshold)
+        } else {
+            String::new()
+        };
         format!(
-            "{} STUDIO {} lens={} benchmark={}",
+            "{} STUDIO {} lens={} benchmark={}{}",
             self.context.symbol,
             self.context.tf.label(),
             self.lens.code(),
-            self.benchmark
+            self.benchmark,rule
         )
     }
     fn inspector(&mut self, ui: &mut Ui) {
@@ -638,11 +726,27 @@ impl StudioPane {
             self.chart.load(worker);
             self.chart_started = true;
         }
+        // A native history revision (e.g. a corrected bar) drops dependent
+        // When/subset snapshots; the next frame requests fresh keyed reports.
+        let revision = self.chart.studio_data_revision();
+        if self.chart_revision.is_some_and(|r| r != revision) {
+            if let Some(p) = self.when_mut() {
+                p.clear();
+            }
+            self.clear_subset();
+        }
+        self.chart_revision = Some(revision);
         self.chart.canvas_selection(self.context.selected_span);
         self.chart.show(ui, rect, focused, worker);
         if let Some(span)=self.chart.take_canvas_selection(){self.context.selected_span=span;}
         self.sync_chart_context();
         self.chart.studio_selection(ui, rect, self.context.selected_span);
+        if self.lens == StudioLens::When
+            && let Some(StudioLensState::When(p)) = self.children.iter().find(|c| c.kind() == StudioLens::When)
+            && let Some((runs, rule)) = p.shading()
+        {
+            self.chart.studio_rule_shading(ui, rect, runs, rule);
+        }
     }
     fn analysis(&mut self, ui: &mut Ui, id: PaneId, worker: &Worker, sample: bool) -> Vec<Action> {
         if sample {
@@ -663,12 +767,15 @@ impl StudioPane {
             );
             return vec![];
         }
-        if self.lens == StudioLens::When && self.context.tf != Timeframe::D1 {
+        if self.lens == StudioLens::When
+            && self.context.tf != Timeframe::D1
+            && !tr_data::cash_session::cash_bar_size(self.context.tf)
+        {
             super::studio_frame::unavailable(
                 ui,
                 ui.available_rect_before_wrap(),
                 "WHEN",
-                "The existing conditional-return lens supports verified daily archive bars only. Choose 1D in Inspector. Intraday rules are unavailable until the rule slice.",
+                "When supports daily and native 1m, 5m, 15m, 30m or 1h US cash-session bars. Choose a supported interval in Inspector.",
             );
             return vec![];
         }
@@ -695,12 +802,15 @@ impl StudioPane {
             return vec![];
         }
         self.ensure_child();
+        if self.lens == StudioLens::Dist {
+            self.show_subset(ui, id, worker);
+        }
         let before = self.view();
         let child = self.children.iter_mut().find(|c| c.kind() == self.lens).unwrap();
         let actions = match child {
             StudioLensState::Dist(p) => studio_dist::show(ui, id, p, worker, false, true),
             StudioLensState::Relate(p) => studio_corr::show(ui, id, p, worker, false, true),
-            StudioLensState::When(p) => stats::show(ui, id, p, worker, false, true),
+            StudioLensState::When(p) => studio_when::show(ui, id, p, worker),
             StudioLensState::Season(p) => studio_season::show(ui, id, p, worker, false, true),
             StudioLensState::Backtest(p) => backtest::show(ui, id, p, worker, false, true),
         };
@@ -711,7 +821,7 @@ impl StudioPane {
                 let (b, t) = studio_corr::parse_spec(&p.spec).unwrap_or((self.benchmark.clone(), self.context.tf));
                 (p.symbol.clone(), t, tr_data::security(&b).ticker)
             }
-            StudioLensState::When(p) => (p.symbol.clone(), Timeframe::D1, self.benchmark.clone()),
+            StudioLensState::When(p) => (p.symbol.clone(), p.tf, self.benchmark.clone()),
             StudioLensState::Season(p) => (
                 p.symbol.clone(),
                 tr_data::studio_season::parse_timeframe(&p.spec).unwrap_or(self.context.tf),
@@ -768,14 +878,15 @@ impl TerminalApp {
         }
     }
     pub(super) fn open_studio(&mut self, symbol: Option<&str>, spec: &str) {
-        match tr_data::studio::parse_spec(spec) {
-            Ok((lens, tf, benchmark)) => {
+        match parse_studio(spec) {
+            Ok((lens, tf, benchmark, inputs)) => {
                 let symbol =
                     symbol.map(|s| tr_data::security(s).key()).or_else(|| self.focused_symbol()).unwrap_or_default();
                 self.open_panel(PaneKind::Studio(Box::new(StudioPane::new(StudioViewSpec {
                     context: StudioContext { symbol, tf, ..Default::default() },
                     lens,
                     benchmark,
+                    inputs,
                     ..Default::default()
                 }))));
                 self.status = "Studio · native canvas and verified research lenses".into();
@@ -817,6 +928,42 @@ pub(super) fn prepared(
     pane
 }
 
+/// Studio on the 5,000-bar native AAPL daily canvas with an accepted When
+/// report and bootstrap computed from those same bars (dev-only fixture).
+#[cfg(test)]
+pub(super) fn prepared_when(
+    worker: &Worker,
+    requests: &mut tokio::sync::mpsc::UnboundedReceiver<crate::worker::Request>,
+) -> StudioPane {
+    let (chart, bars) = crate::chart_view::perf_gate::studio_canvas(worker, requests, false);
+    let mut pane = StudioPane::new(StudioViewSpec {
+        context: StudioContext { symbol: chart.symbol.clone(), tf: chart.tf, ..Default::default() },
+        lens: StudioLens::When,
+        ..Default::default()
+    });
+    pane.chart = Box::new(chart);
+    pane.chart_started = true;
+    pane.ensure_child();
+    let p = pane.when_mut().unwrap();
+    let input = tr_data::studio_canvas::CanvasInput {
+        symbol: "AAPL US Equity".into(),
+        tf: Timeframe::D1,
+        observed_at: Some(bars.last().unwrap().ts + 86400),
+        stitch: None,
+        source: "benchmark fixture only".into(),
+        bars,
+    };
+    let r = studio_when::cached_report(&input, &p.condition, p.threshold).unwrap();
+    assert!(r.runs.len() > 20, "rule runs to shade");
+    p.loading = true;
+    p.accept(p.generation, Ok(r.clone()));
+    p.boot_loading = true;
+    p.accept_bootstrap(p.generation, r.report.key, studio_when::cached_bootstrap(&r));
+    assert!(p.shading().is_some() && p.bootstrap.is_some());
+    while requests.try_recv().is_ok() {}
+    pane
+}
+
 #[cfg(test)]
 mod tests;
 
@@ -825,4 +972,89 @@ pub(super) fn prepared_quick(worker:&Worker)->StudioPane {
     let chart=crate::chart_view::studio_canvas::test_chart(worker,tr_data::studio_canvas::CompareMode::Index100);
     let mut p=StudioPane::new(StudioViewSpec {quick:true,context:StudioContext {symbol:chart.symbol.clone(),tf:chart.tf,..Default::default()},..Default::default()});
     p.chart=Box::new(chart);p.chart_started=true;p
+}
+
+/// Shared shell parser. `rule=`, `h=` and `threshold=` belong to the bounded
+/// When parser (quoted rules keep their spaces) and require `lens=when`.
+pub(crate) fn parse_studio(spec: &str) -> Result<(StudioLens, Timeframe, String, StudioInputs), String> {
+    let mut shell = vec![];
+    let mut suffix = vec![];
+    let mut in_rule = false;
+    for word in spec.split_whitespace() {
+        let lower = word.to_ascii_lowercase();
+        if lower.starts_with("rule=") {
+            in_rule = true;
+        }
+        if lower.starts_with("lens=") || lower.starts_with("benchmark=") {
+            shell.push(word);
+        } else if in_rule || lower.starts_with("h=") || lower.starts_with("threshold=") {
+            suffix.push(word);
+        } else {
+            shell.push(word);
+        }
+    }
+    let (lens, tf, benchmark) = tr_data::studio::parse_spec(&shell.join(" "))?;
+    let mut inputs = StudioInputs::default();
+    if !suffix.is_empty() {
+        if lens != StudioLens::When {
+            return Err("rule/h/threshold inputs require lens=when".into());
+        }
+        when_inputs(&mut inputs, tr_data::studio_when::parse_command(&suffix.join(" "))?);
+    }
+    Ok((lens, tf, benchmark, inputs))
+}
+
+fn when_inputs(inputs: &mut StudioInputs, cmd: tr_data::studio_when::WhenCommand) {
+    inputs.condition = cmd.rule.unwrap_or_else(|| tr_data::studio_when::DEFAULT_RULE.into());
+    inputs.when_threshold = cmd.threshold.unwrap_or(tr_data::studio_when::DEFAULT_THRESHOLD_BP);
+    inputs.when_horizon = cmd.horizon.unwrap_or(6);
+}
+
+/// A Studio opened on the When lens from `WHEN` arguments (daily by default).
+pub(crate) fn when_studio(symbol: String, cmd: tr_data::studio_when::WhenCommand) -> StudioPane {
+    let tf = cmd.tf.unwrap_or(Timeframe::D1);
+    let mut inputs = StudioInputs::default();
+    when_inputs(&mut inputs, cmd);
+    StudioPane::new(StudioViewSpec {
+        context: StudioContext { symbol, tf, ..Default::default() },
+        lens: StudioLens::When,
+        inputs,
+        ..Default::default()
+    })
+}
+
+impl TerminalApp {
+    pub(super) fn open_when(&mut self, symbol: Option<&str>, spec: &str) {
+        let cmd = match tr_data::studio_when::parse_command(spec) {
+            Ok(cmd) => cmd,
+            Err(e) => {
+                self.status = e;
+                return;
+            }
+        };
+        // `WHEN h=6 threshold=10bp` adjusts the focused Studio instead of opening a pane.
+        if symbol.is_none() && cmd.tf.is_none() && cmd.rule.is_none() {
+            let focus = self.focus;
+            if let Some(PaneKind::Studio(s)) = self.panes.iter_mut().find(|p| p.id == focus).map(|p| &mut p.kind) {
+                s.select_lens(StudioLens::When);
+                s.ensure_child();
+                if let Some(p) = s.when_mut() {
+                    if let Some(h) = cmd.horizon {
+                        p.horizon = h;
+                    }
+                    if let Some(t) = cmd.threshold
+                        && p.threshold != t
+                    {
+                        p.threshold = t;
+                        p.draft_threshold = t;
+                        p.clear();
+                    }
+                }
+                return;
+            }
+        }
+        let symbol = symbol.map(|s| tr_data::security(s).key()).or_else(|| self.focused_symbol()).unwrap_or_default();
+        self.open_panel(PaneKind::Studio(Box::new(when_studio(symbol, cmd))));
+        self.status = "When · fixed-family within-clock rule evidence".into();
+    }
 }

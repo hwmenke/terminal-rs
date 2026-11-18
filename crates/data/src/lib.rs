@@ -1235,3 +1235,5 @@ pub mod studio_shape;
 
 pub mod studio;
 pub mod studio_canvas;
+
+pub mod studio_when;

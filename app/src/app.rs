@@ -42,6 +42,7 @@ pub(crate) mod studio_corr;
 pub(crate) mod studio_dist;
 pub(crate) mod studio_frame;
 pub(crate) mod studio_hub;
+pub(crate) mod studio_when;
 #[cfg(test)]
 mod studio_perf_gate;
 mod studio_season;
@@ -323,7 +324,6 @@ impl PaneKind {
     fn stats_mut(&mut self) -> Option<&mut stats::StatsPane> {
         match self {
             Self::Stats(p) => Some(p),
-            Self::Studio(s) => s.stats_mut(),
             _ => None,
         }
     }
@@ -1577,6 +1577,7 @@ impl TerminalApp {
             Command::SymbolFunction(s, Function::Review) => self.open_review(Some(&s)),
             Command::SymbolFunction(s, Function::Desk) => self.open_desk(Some(&s)),
             Command::SymbolFunction(s, Function::Journal(extra)) => self.open_journal(Some(&s), &extra),
+            Command::SymbolFunction(s, Function::StudioWhen { spec }) => self.open_when(Some(&s), &spec),
             Command::SymbolFunction(s, Function::StudioQuick {spec}) => self.open_quick(Some(&s),&spec),
             Command::SymbolFunction(s, Function::Studio { spec }) => self.open_studio(Some(&s), &spec),
             Command::SymbolFunction(s, Function::StudioRoute(tr_data::studio::StudioRoute::Quick)) => self.open_quick(Some(&s),""),
@@ -1857,6 +1858,7 @@ impl TerminalApp {
             Function::Desk => self.open_desk(symbol.as_deref()),
             Function::Journal(extra) => self.open_journal(symbol.as_deref(), &extra),
             Function::TstackTune(tf) => self.open_tstack_tune(symbol.as_deref(), tf),
+            Function::StudioWhen { spec } => self.open_when(symbol.as_deref(), &spec),
             Function::StudioQuick {spec} => self.open_quick(symbol.as_deref(),&spec),
             Function::DistributionStrip => self.with_chart(|c,_|c.toggle_canvas_strip()),
             Function::Studio { spec } => self.open_studio(symbol.as_deref(), &spec),
@@ -2069,6 +2071,26 @@ impl TerminalApp {
                 Response::Desk { pane, generation, result } => {
                     if let Some(PaneKind::Desk(d)) = self.panes.iter_mut().find(|p| p.id == pane).map(|p| &mut p.kind) {
                         d.accept(generation, result);
+                    }
+                }
+                Response::StudioWhen { pane, generation, result } => {
+                    if let Some(PaneKind::Studio(s)) = self.panes.iter_mut().find(|p| p.id == pane).map(|p| &mut p.kind)
+                        && let Some(p) = s.when_mut()
+                    {
+                        p.accept(generation, result);
+                    }
+                }
+                Response::StudioWhenBootstrap { pane, generation, key, result } => {
+                    if let Some(PaneKind::Studio(s)) = self.panes.iter_mut().find(|p| p.id == pane).map(|p| &mut p.kind)
+                        && let Some(p) = s.when_mut()
+                    {
+                        p.accept_bootstrap(generation, key, result);
+                    }
+                }
+                Response::StudioSubset { pane, generation, key, selection, result } => {
+                    if let Some(PaneKind::Studio(s)) = self.panes.iter_mut().find(|p| p.id == pane).map(|p| &mut p.kind)
+                    {
+                        s.accept_subset(generation, key, selection, result);
                     }
                 }
                 Response::StudioCanvas {pane,token,key,result} => {

@@ -664,7 +664,13 @@ See [Bar Vault](docs/BARVAULT.md) for admission, merge, retention and current li
 - **Relationship Studio** (`AAPL CORR QQQ`, alias `RBETA`): verified-data OLS, rolling beta/correlation, return scatter, ratio z-scores and peer matrix. See [STUDIO_CORR.md](docs/STUDIO_CORR.md).
 
 `AAPL STUDIO 5m lens=dist` connects a native time canvas to Distribution, Relate,
-When (daily conditional returns), Season and Backtest. `STUDIO lens=relate
+When, Season and Backtest. `AAPL WHEN 5m RSI(14)<30` (or `STUDIO lens=when
+rule="RSI(14)<30"`) shades the accepted rule mask on the native chart and prints
+fixed-family (m=8) within-clock HAC/BY evidence at h=1,3,6,12 bars, shared-bin
+distributions, session-block probability tiles and prior-only quintile buckets;
+`WHEN h=6 threshold=10bp` adjusts the focused When lens. COND has an explicit
+Open in When action. Committing a span in Distribution adds a selected-versus-rest
+comparison. See [When](docs/STUDIO_WHEN.md). `STUDIO lens=relate
 benchmark=QQQ` selects a benchmark. Local Alt+Left/Right cycles lenses, Escape
 cancels Brush before closing Inspector, and Ctrl+Z undoes Studio parameters outside text editing. Accepted
 lenses are retained without recomputing. `AAPL QUICK QQQ 5m mode=index100` opens

@@ -506,6 +506,19 @@ fn roc(closes: &[f64], period: usize) -> Vec<f64> {
         .collect()
 }
 
+/// Bounded access to the existing causal indicator implementation. Nonfinite
+/// warm-up values stay missing; callers must reset at missing expected intervals.
+pub fn bounded_feature(raw: &str, bars: &[Bar]) -> Result<Vec<Option<f64>>, ConditionError> {
+    let name = normalize_operand(raw)?;
+    if let Some((_, Some(p))) = split_name_period(&name) {
+        if !(1..=1000).contains(&p) {
+            return Err(ConditionError("Feature period must be 1..1000".into()));
+        }
+    }
+    if bars.len() > 120_000 { return Err(ConditionError("Feature input exceeds 120,000 bars".into())); }
+    Ok(operand_series(&name, bars)?.into_iter().map(|x| x.is_finite().then_some(x)).collect())
+}
+
 fn operand_series(raw: &str, bars: &[Bar]) -> Result<Vec<f64>, ConditionError> {
     if let Ok(n) = raw.trim().parse::<f64>() {
         return Ok(vec![n; bars.len()]);

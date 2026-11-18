@@ -34,6 +34,28 @@ pub const PRICE_ALERT_EVAL_SECS: u64 = 20;
 use tr_data::health::{DataMode, DownKind, Feed, FeedState, Snapshot, Unavailable};
 
 pub enum Request {
+    /// One When report (mask, all fixed horizons, buckets) for an applied rule.
+    StudioWhen {
+        pane: PaneId,
+        generation: u64,
+        symbol: String,
+        tf: Timeframe,
+        rule: String,
+        threshold: f64,
+    },
+    /// Second-stage session-block bootstrap for an accepted When report.
+    StudioWhenBootstrap {
+        pane: PaneId,
+        generation: u64,
+        input: Arc<crate::app::studio_when::PreparedWhen>,
+    },
+    /// Selected `[start,end)` versus rest over an accepted Distribution report.
+    StudioSubset {
+        pane: PaneId,
+        generation: u64,
+        input: Arc<tr_data::studio_dist::Report>,
+        selection: (i64, i64),
+    },
     StudioCanvas {
         pane: PaneId,
         token: u64,
@@ -576,6 +598,9 @@ impl Request {
             Self::TrendCone { .. } => "TrendCone",
             Self::AnchoredVwap { .. } => "AnchoredVwap",
             Self::HoldingHistory { .. } => "HoldingHistory",
+            Self::StudioWhen { .. } => "StudioWhen",
+            Self::StudioWhenBootstrap { .. } => "StudioWhenBootstrap",
+            Self::StudioSubset { .. } => "StudioSubset",
             Self::StudioCanvas { .. } => "StudioCanvas",
             Self::StudioDist { .. } => "StudioDist",
             Self::TstackTune { .. } => "TstackTune",
@@ -731,6 +756,24 @@ pub struct Profile {
 }
 
 pub enum Response {
+    StudioWhen {
+        pane: PaneId,
+        generation: u64,
+        result: Result<Arc<crate::app::studio_when::PreparedWhen>, String>,
+    },
+    StudioWhenBootstrap {
+        pane: PaneId,
+        generation: u64,
+        key: u64,
+        result: Result<Arc<tr_data::studio_when::WhenBootstrap>, String>,
+    },
+    StudioSubset {
+        pane: PaneId,
+        generation: u64,
+        key: u64,
+        selection: (i64, i64),
+        result: Result<Arc<crate::app::studio_when::PreparedSubset>, String>,
+    },
     StudioCanvas {
         pane: PaneId,
         token: u64,
@@ -4424,6 +4467,69 @@ async fn handle_inner(s: &Arc<Shared>, req: Request, force: bool) {
                 generation,
                 result: research_desk(s, &bridge, &symbols).await.map_err(|e| format!("{e:#}")),
             });
+        }
+        Request::StudioWhen { pane, generation, symbol, tf, rule, threshold } => {
+            let result = async {
+                if s.sample_mode() {
+                    anyhow::bail!("When: sample mode has no research data");
+                }
+                // Bounded string parse before any provider call.
+                tr_data::studio_when::WhenSpec::parse(&rule, threshold).map_err(anyhow::Error::msg)?;
+                let (bars, source, observed_at, stitch) = if tf == Timeframe::D1 {
+                    let (bars, source) =
+                        crate::app::studio_dist::daily_bars(&s.history, &config.bridge(), &symbol).await?;
+                    (bars, source, Some(chrono::Utc::now().timestamp()), None)
+                } else {
+                    if !tr_data::cash_session::cash_bar_size(tf) {
+                        anyhow::bail!("When: unsupported session interval");
+                    }
+                    let (bars, info) =
+                        analysis_bars(s, &symbol, tf, tr_data::cash_session::research_fetch_limit(tf), "When").await?;
+                    (bars, info.label(), info.fetched_at, Some(Arc::new(info)))
+                };
+                let input =
+                    tr_data::studio_canvas::CanvasInput { symbol, tf, bars: Arc::new(bars), source, observed_at, stitch };
+                let jobs = s.jobs.clone();
+                tokio::task::spawn_blocking(move || {
+                    let _job = crate::perf::JobTimer::new(&jobs, "StudioWhen");
+                    crate::app::studio_when::cached_report(&input, &rule, threshold)
+                })
+                .await?
+                .map_err(anyhow::Error::msg)
+            }
+            .await
+            .map_err(|e| format!("{e:#}"));
+            send(Response::StudioWhen { pane, generation, result });
+        }
+        Request::StudioWhenBootstrap { pane, generation, input } => {
+            let key = input.report.key;
+            let jobs = s.jobs.clone();
+            let result = if s.sample_mode() {
+                Err("When: sample mode clears bootstrap".into())
+            } else {
+                tokio::task::spawn_blocking(move || {
+                    let _job = crate::perf::JobTimer::new(&jobs, "StudioWhenBootstrap");
+                    crate::app::studio_when::cached_bootstrap(&input)
+                })
+                .await
+                .unwrap_or_else(|e| Err(e.to_string()))
+            };
+            send(Response::StudioWhenBootstrap { pane, generation, key, result });
+        }
+        Request::StudioSubset { pane, generation, input, selection } => {
+            let key = input.bars_seed;
+            let jobs = s.jobs.clone();
+            let result = if s.sample_mode() {
+                Err("Subset: sample mode clears comparison".into())
+            } else {
+                tokio::task::spawn_blocking(move || {
+                    let _job = crate::perf::JobTimer::new(&jobs, "StudioSubset");
+                    crate::app::studio_when::cached_subset(&input, selection)
+                })
+                .await
+                .unwrap_or_else(|e| Err(e.to_string()))
+            };
+            send(Response::StudioSubset { pane, generation, key, selection, result });
         }
         Request::StudioCanvas { pane, token, key, input, peers, comparisons, spec, news, earnings } => {
             let result = async {

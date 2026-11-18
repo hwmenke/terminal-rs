@@ -25,6 +25,36 @@ fn tail_card(r: &Report, s: &Shape, i: usize, ci: Option<(f64, f64)>) -> crate::
         c
     }
 }
+fn threshold_card(
+    r: &Report,
+    s: &Shape,
+    t: &tr_data::studio_shape::Threshold,
+    block: Option<(f64, f64)>,
+    length: Option<usize>,
+) -> crate::widgets::MathCard {
+    card(
+        r,
+        s,
+        "dist.shape.threshold",
+        "P(|r|≥X)=k/n; 95% percentile stationary block bootstrap; Normal=P(Z≥(X−μ)/s)+P(Z≤(−X−μ)/s)",
+    )
+    .value(format!("{} / {}", t.k, s.values.len()))
+    .input("X", pct(t.level))
+    .input(
+        "block-bootstrap 95% (Evidence)",
+        block.map(|(a, b)| format!("{:.4} … {:.4}", a, b)).unwrap_or_else(|| "unavailable / pending / Descriptive".into()),
+    )
+    .input(
+        "mean block length",
+        length.map(|l| format!("{l} = max(ceil(n^(1/3)), h if overlapping)")).unwrap_or_else(|| "pending".into()),
+    )
+    .note("500 deterministic draws; seams reset blocks; overlapping h-sums keep at least h neighbours together. Needs n≥30; otherwise unavailable (no Wilson substitution).")
+    .note(format!(
+        "About — iid Wilson comparison only: {:.4} … {:.4}. Wilson (1927) assumes independent events; overlapping observations violate that, so it is not the Evidence interval.",
+        t.interval.0, t.interval.1
+    ))
+    .caveat("Normal is a fitted descriptive comparator, not a forecast.")
+}
 #[cfg(test)]
 pub(in crate::app) fn view(ui: &mut Ui, r: &Report, s: &Shape, intervals: Option<&Intervals>) -> Rect {
     view_mode(ui, r, s, intervals, true)
@@ -179,8 +209,20 @@ pub(in crate::app) fn view_mode(
         });
     }
     ui.label("ABSOLUTE MOVE THRESHOLDS · empirical vs fitted Normal");
-    for t in &s.thresholds {
-        ui.label(format!("|r| ≥ {} · {:.2}% [Wilson 95% {:.2}…{:.2}%] · Normal {}",pct(t.level),100.*t.probability,100.*t.interval.0,100.*t.interval.1,t.normal.map(|v|format!("{:.2}%",100.*v)).unwrap_or_else(||"— zero variance".into()))).math_card(||card(r,s,"dist.shape.threshold","P(|r|≥X)=k/n; Wilson z=1.96; Normal=P(Z≥(X−μ)/s)+P(Z≤(−X−μ)/s)").value(format!("{} / {}",t.k,s.values.len())).input("X",pct(t.level)).note("Wilson (1927) interval assumes independent signs/events; overlapping observations violate independence. Normal is a fitted descriptive comparator, not a forecast."));
+    for (k, t) in s.thresholds.iter().enumerate() {
+        let block = intervals.and_then(|b| b.thresholds.get(k).copied().flatten());
+        let interval = if !evidence {
+            String::new()
+        } else if let Some((a, b)) = block {
+            format!(" [block 95% {:.2}…{:.2}%]", 100. * a, 100. * b)
+        } else if s.values.len() < tr_data::studio_shape::THRESHOLD_MIN_N {
+            format!(" [block CI — needs n≥{}]", tr_data::studio_shape::THRESHOLD_MIN_N)
+        } else {
+            " [block CI — pending / unavailable]".into()
+        };
+        let normal = t.normal.map(|v| format!("{:.2}%", 100. * v)).unwrap_or_else(|| "— zero variance".into());
+        ui.label(format!("|r| ≥ {} · {:.2}%{interval} · Normal {normal}", pct(t.level), 100. * t.probability))
+            .math_card(|| threshold_card(r, s, t, block, intervals.map(|b| b.threshold_block)));
     }
     ui.label("YEAR STRIP · mean / horizon; annualised sample sd");
     ui.horizontal_wrapped(|ui| {for y in &s.years {

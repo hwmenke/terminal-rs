@@ -59,6 +59,58 @@ pub fn all(scale: Scale) -> Vec<Case> {
         assert_eq!(r.len(),2000);assert!(r.iter().all(|e|e.hi>e.lo));
         assert!(r.iter().any(|e|matches!(e.event.time,tr_data::studio_canvas::EventTime::Date {..})));r.len()
     });
+    // Studio slice 3: When report, its session bootstrap and selected/rest subset.
+    let when_sessions = if full { 120 } else { 40 };
+    let when_input = fixtures::when_input(when_sessions);
+    let when_spec = tr_data::studio_when::WhenSpec::parse("RSI(14)<45", 0.).unwrap();
+    let when_report = tr_data::studio_when::compute(&when_input, &when_spec).unwrap();
+    add!("studio.when_120d_5m", move || {
+        let r = bb(tr_data::studio_when::compute(bb(&when_input), &when_spec).unwrap());
+        // Every expected regular-session bar (half days included) is on the grid.
+        assert_eq!(r.mask.ts.len(), when_input.bars.len());
+        assert!(r.mask.ts.len() > when_sessions * 77);
+        assert_eq!(r.sessions, when_sessions);
+        assert_eq!((r.cells.len(), r.buckets.len()), (4, 20));
+        assert!(r.mask.values.iter().flatten().filter(|v| **v == 1.).count() > 300, "rule must match");
+        for (c, h) in r.cells.iter().zip(tr_data::studio_when::HORIZONS) {
+            let complete = when_input.bars.len() - when_sessions * h;
+            assert!(c.raw_n <= complete && c.raw_n + 20 >= complete, "completed in-session outcomes after warm-up");
+            assert!(c.mean_contrast.p.is_some() && c.hit_contrast.p.is_some(), "inference available at h={h}");
+            assert!((0. ..=1.).contains(&c.q_mean) && (0. ..=1.).contains(&c.q_hit));
+        }
+        assert!(r.edges.iter().flatten().count() > when_sessions * 70);
+        r.cells.iter().map(|c| c.raw_n).sum()
+    });
+    add!("studio.when_bootstrap_120d_x499", move || {
+        let b = bb(when_report.bootstrap());
+        assert_eq!((b.draws, b.sessions), (tr_data::studio_when::DRAWS, when_sessions));
+        assert!(b.probability.iter().all(|p| p.is_some_and(|(a, z)| a.is_finite() && a <= z)));
+        assert!(b.unavailable.iter().all(Option::is_none));
+        b.draws * b.sessions
+    });
+    let subset_bars = fixtures::daily(if full { 5001 } else { 501 }, 17);
+    let subset_dist = tr_data::studio_dist::compute(
+        "AAPL US Equity",
+        &subset_bars,
+        Timeframe::D1,
+        tr_data::studio_dist::Window::All,
+        "benchmark fixture only",
+        None,
+    )
+    .unwrap();
+    let third = subset_bars.len() / 3;
+    let subset_span = (subset_bars[third].ts, subset_bars[2 * third].ts);
+    add!("studio.subset_5k", move || {
+        let s = bb(tr_data::studio_when::subset_from_dist(bb(&subset_dist), subset_span).unwrap());
+        let n = s.distribution.n;
+        assert_eq!(n[0] + n[1], subset_dist.returns.len());
+        assert!(n[0] >= third - 1 && n[1] >= 2 * third - 2);
+        for g in 0..2 {
+            assert!((s.distribution.mass[g].iter().sum::<f64>() - 1.).abs() < 1e-9);
+        }
+        assert!(s.distance_interval.is_some_and(|(a, b)| a <= b), "session-block interval");
+        (n[0] + n[1]) * s.draws
+    });
     let routes = fixtures::studio_routes();
     add!("studio.route_1000", move || {
         use tr_data::studio::{StudioContext, StudioLens};

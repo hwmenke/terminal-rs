@@ -15,7 +15,7 @@ pub struct DistPane {
     pub timeframe: Timeframe,
     pub window: Window,
     pub generation: u64,
-    pub report: Option<Report>,
+    pub report: Option<Arc<Report>>,
     pub loading: bool,
     pub error: Option<String>,
     pub regimes_tab: bool,
@@ -184,7 +184,7 @@ impl DistPane {
         match result {
             Ok(report) => match report.provenance.require_verified("Distribution Studio") {
                 Ok(()) => {
-                    self.report = Some(report);
+                    self.report = Some(Arc::new(report));
                     self.error = None;
                 }
                 Err(e) => self.error = Some(e),
@@ -367,7 +367,7 @@ pub(super) fn show(
                 worker.send(Request::StudioShape {
                     pane: id,
                     generation: pane.generation,
-                    report: Arc::new(r.clone()),
+                    report: r.clone(),
                     horizon: pane.horizon,
                     overlap: pane.overlap,
                     thresholds: pane.thresholds,
@@ -1239,7 +1239,7 @@ mod tests {
         let mut pane = DistPane::new("AAPL", Timeframe::D1, Window::All);
         pane.generation = 2;
         let report = dist::compute("AAPL", &fixture(), Timeframe::D1, Window::All, "unit", None).unwrap();
-        pane.report = Some(report.clone());
+        pane.report = Some(Arc::new(report.clone()));
         pane.loading = true;
         pane.deny_sample();
         pane.accept(2, Ok(report));

@@ -663,6 +663,87 @@ pub fn stationary_bootstrap(n: usize, draws: usize, seed: u64, breaks: &[bool], 
     }
 }
 
+/// Politis–Romano stationary bootstrap generated block-by-block: a uniform
+/// start and a Geometric(1/block) length per block (one pair of draws per
+/// block rather than per element). Blocks run forward, wrap only when no
+/// breaks exist, and stop at a break. Same distribution as
+/// [`stationary_bootstrap`], different deterministic stream.
+pub fn stationary_bootstrap_blocks(
+    n: usize,
+    draws: usize,
+    seed: u64,
+    breaks: &[bool],
+    block: usize,
+    mut consume: impl FnMut(&[usize]),
+) {
+    let mut indices = vec![0; n];
+    stationary_bootstrap_runs(n, draws, seed, breaks, block, |runs| {
+        let mut t = 0;
+        for &(start, len) in runs {
+            for (k, index) in indices[t..t + len].iter_mut().enumerate() {
+                *index = start + k;
+            }
+            t += len;
+        }
+        consume(&indices);
+    });
+}
+
+/// The same resampler exposed as contiguous runs `(start, len)` whose lengths
+/// sum to `n` per draw, so consumers can use difference arrays. Uniform starts
+/// use a multiply-shift bounded draw (bias below n/2⁶⁴).
+pub fn stationary_bootstrap_runs(
+    n: usize,
+    draws: usize,
+    seed: u64,
+    breaks: &[bool],
+    block: usize,
+    mut consume: impl FnMut(&[(usize, usize)]),
+) {
+    assert_eq!(n, breaks.len());
+    if n == 0 {
+        return;
+    }
+    let p = 1. / block.max(1) as f64;
+    let log_q = (1. - p).ln();
+    let mut rng = crate::nulls::SplitMix64(seed);
+    let separated = breaks.iter().any(|b| *b);
+    // next_break[i]: first j > i with breaks[j], else n. A block run is [at, next_break[at]).
+    let mut next_break = vec![n; n];
+    let mut upcoming = n;
+    for i in (0..n).rev() {
+        next_break[i] = upcoming;
+        if breaks[i] {
+            upcoming = i;
+        }
+    }
+    let mut runs = Vec::with_capacity(4 * n / block.max(1) + 8);
+    for _ in 0..draws {
+        runs.clear();
+        let mut t = 0;
+        while t < n {
+            let mut at = ((u128::from(rng.next()) * n as u128) >> 64) as usize;
+            let u = ((rng.next() >> 11) as f64 + 0.5) / (1u64 << 53) as f64;
+            let length = if p >= 1. { 1 } else { 1 + (u.ln() / log_q).floor().min(n as f64) as usize };
+            let mut left = length.min(n - t);
+            loop {
+                let stop = next_break[at];
+                let take = left.min(stop - at);
+                runs.push((at, take));
+                t += take;
+                left -= take;
+                // Stop at the requested length, at a break, or at the end of
+                // a separated series; otherwise wrap to the start.
+                if left == 0 || stop < n || separated {
+                    break;
+                }
+                at = 0;
+            }
+        }
+        consume(&runs);
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct MaxTBand {
     pub intervals: Vec<Option<(f64, f64)>>,
@@ -923,4 +1004,107 @@ mod v2_tests {
         assert!(a.intervals[2].is_none() && a.intervals[3].is_none());
         assert!(session_max_t(&columns, &[false; 100], 98, 123).critical.is_none());
     }
+}
+
+/// Scalar-score Bartlett HAC on the original (uncompressed) grid:
+/// `Σ s² + 2 Σ_{l=1..L} (1 − l/(L+1)) Σ_t s[t] s[t−l]`. Missing observations
+/// carry zero scores; a break starts a new run and excludes every product that
+/// crosses it.
+pub fn scalar_score_variance(scores: &[f64], lag: usize, breaks: &[bool]) -> f64 {
+    assert!(breaks.is_empty() || breaks.len() == scores.len());
+    let runs: Vec<usize> = breaks
+        .iter()
+        .scan(0usize, |run, b| {
+            *run += usize::from(*b);
+            Some(*run)
+        })
+        .collect();
+    let same_run = |a: usize, b: usize| runs.is_empty() || runs[a] == runs[b];
+    let mut v = scores.iter().map(|s| s * s).sum::<f64>();
+    for l in 1..=lag.min(scores.len().saturating_sub(1)) {
+        let w = 1. - l as f64 / (lag + 1) as f64;
+        for t in l..scores.len() {
+            if same_run(t, t - l) {
+                v += 2. * w * scores[t] * scores[t - l];
+            }
+        }
+    }
+    v.max(0.)
+}
+
+/// Overlap-weighted within-clock fixed-effects contrast of `y` on the rule
+/// indicator `g`. Grid entries are `(clock, rule, y)`; `None` slots keep their
+/// position (zero score) so HAC lags are counted in grid time.
+///
+/// `g̃ = g − ḡ_c`, `ỹ = y − ȳ_c`, `τ = Σ g̃ỹ / D`, `D = Σ g̃²`,
+/// `s = g̃ (ỹ − τ g̃) / D`, `Var τ = scalar-score Bartlett HAC(s)`.
+/// Clocks without both groups have g̃ = 0 and carry no identifying weight.
+pub fn clock_contrast(grid: &[Option<(usize, bool, f64)>], lag: usize, breaks: &[bool], min_n: usize) -> HacEstimate {
+    let mut counts = [0usize; 2];
+    let mut out = HacEstimate {
+        estimate: None,
+        n: 0,
+        complement_n: 0,
+        span: grid.len(),
+        lag,
+        variance: None,
+        se: None,
+        interval: None,
+        p: None,
+        unavailable: None,
+    };
+    let clocks = grid.iter().flatten().map(|r| r.0 + 1).max().unwrap_or(0);
+    if clocks > 1440 {
+        out.unavailable = Some("More than 1,440 clock buckets".into());
+        return out;
+    }
+    let mut sums = vec![[0.; 3]; clocks];
+    for &(c, g, y) in grid.iter().flatten() {
+        if !y.is_finite() {
+            out.unavailable = Some("nonfinite outcome".into());
+            return out;
+        }
+        sums[c][0] += 1.;
+        sums[c][1] += f64::from(g);
+        sums[c][2] += y;
+        counts[usize::from(!g)] += 1;
+    }
+    (out.n, out.complement_n) = (counts[0], counts[1]);
+    let mut d = 0.;
+    let mut numerator = 0.;
+    let centered: Vec<Option<(f64, f64)>> = grid
+        .iter()
+        .map(|r| {
+            r.map(|(c, g, y)| {
+                let a = &sums[c];
+                let x = f64::from(g) - a[1] / a[0];
+                let y = y - a[2] / a[0];
+                d += x * x;
+                numerator += x * y;
+                (x, y)
+            })
+        })
+        .collect();
+    let Some(tau) = (d > 64. * f64::EPSILON).then(|| numerator / d).filter(|t| t.is_finite()) else {
+        out.unavailable = Some("No within-clock rule/complement variation".into());
+        return out;
+    };
+    out.estimate = Some(tau);
+    let scores: Vec<f64> = centered.iter().map(|r| r.map_or(0., |(x, y)| x * (y - tau * x) / d)).collect();
+    let v = scalar_score_variance(&scores, lag, breaks);
+    let se = v.sqrt();
+    out.unavailable = if counts.iter().any(|n| *n < min_n) {
+        Some(format!("LOW N: need {min_n} observations in each group"))
+    } else if !se.is_finite() || se <= 64. * f64::EPSILON * tau.abs().max(1.) {
+        Some("Zero or degenerate scalar-score HAC variance".into())
+    } else {
+        None
+    };
+    if out.unavailable.is_none() {
+        out.variance = Some(v);
+        out.se = Some(se);
+        out.interval = Some((tau - 1.96 * se, tau + 1.96 * se));
+        out.p = Some(normal_p(tau / se));
+    }
+    out
 }

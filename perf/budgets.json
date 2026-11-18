@@ -192,6 +192,21 @@
       "budget_us": 3000,
       "relative": true,
       "class": "interactive"
+    },
+    "studio.when_120d_5m": {
+      "budget_us": 45000,
+      "relative": true,
+      "class": "interactive"
+    },
+    "studio.when_bootstrap_120d_x499": {
+      "budget_us": 200000,
+      "relative": true,
+      "class": "command"
+    },
+    "studio.subset_5k": {
+      "budget_us": 15000,
+      "relative": true,
+      "class": "interactive"
     }
   }
 }

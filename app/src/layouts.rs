@@ -210,7 +210,8 @@ pub enum PaneSettings {
         #[serde(default)]
         params: tr_core::indicators::AdaptiveTrendParams,
     },
-    /// Studio / Quick view inputs; new canvas fields default when loading older layouts.
+    /// Studio / Quick / When view inputs; new canvas and When fields
+    /// (`when_threshold`, `when_horizon`) default when loading older layouts.
     Studio {
         #[serde(default)]
         view: crate::app::studio_hub::StudioViewSpec,
