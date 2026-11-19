@@ -539,18 +539,58 @@ pub fn regression_covariance(
 
 // Allocation-bounded two-column path used by the rolling relationship windows.
 // Same sandwich as the generic k-column implementation above.
-fn covariance_two(x: &[Vec<f64>], e: &[f64], breaks: &[bool], mut out: RegressionCovariance) -> RegressionCovariance {
+fn covariance_two(x: &[Vec<f64>], e: &[f64], breaks: &[bool], out: RegressionCovariance) -> RegressionCovariance {
+    covariance_two_with(x.len(), |t| [x[t][0], x[t][1]], e, breaks, out)
+}
+
+/// Lean entry for a design whose rows are produced on demand (no `Vec<Vec<f64>>`), e.g. rolling
+/// `(1, x)` windows. Identical guards and arithmetic to [`regression_covariance`] for k = 2;
+/// inputs that fail the fast-path guards fall back to it, so results never differ.
+pub fn regression_covariance_two(
+    n: usize,
+    row: impl Fn(usize) -> [f64; 2],
+    residual: &[f64],
+    breaks: &[bool],
+    method: CovarianceMethod,
+) -> RegressionCovariance {
+    let lag = match method {
+        CovarianceMethod::HacFixed5 => 5,
+        CovarianceMethod::HacAutomatic => automatic_bandwidth(n),
+        CovarianceMethod::Overlap(h) => h.saturating_sub(1),
+        _ => 0,
+    }
+    .min(n.saturating_sub(3));
+    let out = RegressionCovariance { method, lag, n, covariance: None, fallback: false, unavailable: None };
+    if n >= MIN_N
+        && residual.len() == n
+        && breaks.len() == n
+        && (0..n).all(|t| row(t).iter().all(|v| v.is_finite()))
+        && residual.iter().all(|e| e.is_finite())
+    {
+        return covariance_two_with(n, row, residual, breaks, out);
+    }
+    let design: Vec<Vec<f64>> = (0..n).map(|t| row(t).to_vec()).collect();
+    regression_covariance(&design, residual, breaks, method)
+}
+
+fn covariance_two_with(
+    n: usize,
+    x: impl Fn(usize) -> [f64; 2],
+    e: &[f64],
+    breaks: &[bool],
+    mut out: RegressionCovariance,
+) -> RegressionCovariance {
     let result = (|| -> Result<Vec<Vec<f64>>, String> {
-        let n = x.len();
         let scales = [
-            (x.iter().map(|r| r[0] * r[0]).sum::<f64>() / n as f64).sqrt(),
-            (x.iter().map(|r| r[1] * r[1]).sum::<f64>() / n as f64).sqrt(),
+            ((0..n).map(|t| x(t)[0] * x(t)[0]).sum::<f64>() / n as f64).sqrt(),
+            ((0..n).map(|t| x(t)[1] * x(t)[1]).sum::<f64>() / n as f64).sqrt(),
         ];
         if scales.iter().any(|s| !s.is_finite() || *s == 0.) {
             return Err("singular design".into());
         }
         let mut a = [0.; 3];
-        for r in x {
+        for t in 0..n {
+            let r = x(t);
             let z = [r[0] / scales[0], r[1] / scales[1]];
             a[0] += z[0] * z[0];
             a[1] += z[0] * z[1];
@@ -578,7 +618,8 @@ fn covariance_two(x: &[Vec<f64>], e: &[f64], breaks: &[bool], mut out: Regressio
         for t in 0..n {
             run += usize::from(breaks[t]);
             runs.push(run);
-            let z = [x[t][0] / scales[0], x[t][1] / scales[1]];
+            let r = x(t);
+            let z = [r[0] / scales[0], r[1] / scales[1]];
             let d = if out.method == CovarianceMethod::HC3 {
                 1. - z[0] * z[0] * inv[0] - 2. * z[0] * z[1] * inv[1] - z[1] * z[1] * inv[2]
             } else {

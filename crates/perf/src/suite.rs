@@ -376,6 +376,60 @@ pub fn all(scale: Scale) -> Vec<Case> {
         assert!(sen.slope.is_some() && sen.slopes > 0);
         r.robust.rolling[2].len() + r.ols.n
     });
+    // Relate (dev-only `related` fixture: asset log return = 0.8·benchmark + noise). Each case times
+    // only its own function; the prerequisites are built once outside the closure.
+    {
+        use tr_data::studio::Transform;
+        use tr_data::studio_corr as sc;
+        let (ra, rb) = fixtures::related(n, 0.8, 91);
+        let named = |symbol: &str, bars: Vec<tr_core::Bar>| sc::NamedBars {
+            symbol: symbol.into(),
+            bars,
+            source: "benchmark fixture only".into(),
+            ..Default::default()
+        };
+        let (asset, bench) = (named("AAPL US Equity", ra), named("QQQ US Equity", rb));
+        let options = sc::Options { annual_periods: 252., daily: true };
+        let transform = Transform::LogReturn { h: 5 };
+        let closed = asset.bars.last().unwrap().ts + 86_400;
+        let prepare = {
+            let (a, b) = (asset.clone(), bench.clone());
+            move || sc::prepare(&a, &b, options, tr_core::Timeframe::D1, transform, "benchmark fixture only", closed, None)
+        };
+        add!("studio.relate_transforms_5k", {
+            let prepare = prepare.clone();
+            move || {
+                let p = bb(prepare().unwrap());
+                let fit = sc::training_fit(&p, 7, tr_data::studio_inference::CovarianceMethod::HacFixed5).unwrap();
+                // Strict h=5 grid on n+1 bars: the first five rows have no return.
+                assert_eq!(p.valid_rows().len(), n - 4);
+                assert_eq!(fit.n, (n - 4) * 4 / 5);
+                assert!(fit.beta > 0.5 && fit.beta < 1.1, "{}", fit.beta);
+                p.ts.len() + fit.n
+            }
+        });
+        let p = prepare().unwrap();
+        let pts: Vec<(i64, f64, f64, bool)> = p
+            .valid_rows()
+            .into_iter()
+            .map(|t| (p.ts[t], p.y.values[t].unwrap(), p.x.values[t].unwrap(), p.y.break_before[t]))
+            .collect();
+        let expect_expanding = pts.len().min(1000);
+        add!("studio.relate_expanding_5k", move || {
+            let out = bb(sc::expanding_beta(bb(&pts)));
+            assert_eq!(out.len(), expect_expanding);
+            assert!(out.last().unwrap().1.is_some());
+            out.len()
+        });
+        let fit = sc::training_fit(&p, 7, tr_data::studio_inference::CovarianceMethod::HacFixed5).unwrap();
+        add!("studio.fair_value_5k", move || {
+            let points = bb(sc::fair_value(bb(&p), bb(&fit)));
+            assert_eq!(points.len(), sc::MAX_POINTS.min(n - 4));
+            assert!(points.iter().any(|q| q.in_sample) && points.iter().any(|q| !q.in_sample));
+            assert!(points.iter().all(|q| q.bands[0] < q.centre && q.centre < q.bands[3]));
+            points.len()
+        });
+    }
     let bars = fixtures::daily(if full { 5000 } else { 200 }, 83);
     let seed = stable_hash::bars_digest(&bars);
     let values: Vec<_> = bars.iter().map(|b| b.close / b.open - 1.).collect();

@@ -141,6 +141,10 @@ pub fn parse_command(s: &str) -> Result<WhenCommand, String> {
         } else if let Ok(tf) = w.parse::<Timeframe>()
             && rule.is_empty()
         {
+            if tf != Timeframe::D1 && !crate::cash_session::cash_bar_size(tf) {
+                // Lets bare `WHEN 1W` fall through to the WHEN ticker, like QUICK 1W.
+                return Err("When supports daily or 1m–1h US cash bars".into());
+            }
             if out.tf.replace(tf).is_some() {
                 return Err("Repeated interval".into());
             }

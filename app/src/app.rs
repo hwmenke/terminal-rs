@@ -693,7 +693,12 @@ impl PaneKind {
             PaneKind::TstackTune(s) => {
                 PaneSettings::TstackTune { symbol: s.symbol.clone(), tf: s.tf, params: s.params }
             }
-            PaneKind::StudioCorr(s) => PaneSettings::StudioCorr { symbol: s.symbol.clone(), spec: s.spec.clone() },
+            PaneKind::StudioCorr(s) => PaneSettings::StudioCorr {
+                symbol: s.symbol.clone(),
+                spec: s.spec.clone(),
+                horizon: s.horizon,
+                relate: s.relate.clone(),
+            },
             PaneKind::StudioSeason(s) => PaneSettings::StudioSeason { symbol: s.symbol.clone(), spec: s.spec.clone() },
             PaneKind::Stats(s) => PaneSettings::Stats {
                 symbol: s.symbol.clone(),
@@ -888,8 +893,11 @@ impl PaneKind {
             PaneSettings::TstackTune { symbol, tf, params } => {
                 PaneKind::TstackTune(Box::new(tstack_tune::TunePane::new(symbol, tf, params)))
             }
-            PaneSettings::StudioCorr { symbol, spec } => {
-                PaneKind::StudioCorr(Box::new(studio_corr::CorrPane::new(symbol, spec)))
+            PaneSettings::StudioCorr { symbol, spec, horizon, relate } => {
+                let mut pane = studio_corr::CorrPane::new(symbol, spec);
+                pane.horizon = if [1, 5, 20].contains(&horizon) { horizon } else { 1 };
+                pane.relate = relate;
+                PaneKind::StudioCorr(Box::new(pane))
             }
             PaneSettings::StudioSeason { symbol, spec } => {
                 PaneKind::StudioSeason(Box::new(studio_season::SeasonPane::new(symbol, spec)))
@@ -1579,6 +1587,7 @@ impl TerminalApp {
             Command::SymbolFunction(s, Function::Journal(extra)) => self.open_journal(Some(&s), &extra),
             Command::SymbolFunction(s, Function::StudioWhen { spec }) => self.open_when(Some(&s), &spec),
             Command::SymbolFunction(s, Function::StudioQuick {spec}) => self.open_quick(Some(&s),&spec),
+            Command::SymbolFunction(s, Function::StudioRelate { spec }) => self.open_relate(Some(&s), &spec),
             Command::SymbolFunction(s, Function::Studio { spec }) => self.open_studio(Some(&s), &spec),
             Command::SymbolFunction(s, Function::StudioRoute(tr_data::studio::StudioRoute::Quick)) => self.open_quick(Some(&s),""),
             Command::SymbolFunction(_, Function::StudioRoute(route)) => self.open_panel(PaneKind::StudioRoute(route)),
@@ -1860,6 +1869,7 @@ impl TerminalApp {
             Function::TstackTune(tf) => self.open_tstack_tune(symbol.as_deref(), tf),
             Function::StudioWhen { spec } => self.open_when(symbol.as_deref(), &spec),
             Function::StudioQuick {spec} => self.open_quick(symbol.as_deref(),&spec),
+            Function::StudioRelate { spec } => self.open_relate(symbol.as_deref(), &spec),
             Function::DistributionStrip => self.with_chart(|c,_|c.toggle_canvas_strip()),
             Function::Studio { spec } => self.open_studio(symbol.as_deref(), &spec),
             Function::StudioRoute(tr_data::studio::StudioRoute::Quick) => self.open_quick(symbol.as_deref(),""),

@@ -28,6 +28,7 @@ use tr_data::anchored_vwap::AvwapKey;
 
 mod auction;
 mod cockpit;
+mod fair_value;
 mod session_cache;
 pub mod studio_canvas;
 mod stop_cloud;
@@ -341,6 +342,8 @@ pub struct ChartState {
     generation: u64,
     studio_owned: bool,
     studio_plot: Option<Rect>,
+    /// Price scale of the last native (non-canvas) frame; `y_of` handles log scale.
+    studio_scale: Option<tr_chart::viewport::PriceScale>,
     viewport: Option<Viewport>,
     manual_scale: Option<PriceScale>,
     glide: Option<Glide>,
@@ -491,6 +494,7 @@ impl ChartState {
             generation: 0,
             studio_owned: false,
             studio_plot: None,
+            studio_scale: None,
             viewport: None,
             manual_scale: None,
             glide: None,
@@ -2392,6 +2396,7 @@ impl ChartState {
         let out = scene::price_pane(&pane);
         let mut scale = out.scale;
         scale.height_px = price_rect.height() as f64;
+        self.studio_scale = Some(scale);
         if self.canvas.view.spec.strip {
             let (lo,hi)=v.visible_range(self.bars.len());
             self.canvas.visible=tr_data::time_link::window_of(&self.bars,self.tf,self.equity(),lo,hi);

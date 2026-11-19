@@ -948,3 +948,54 @@ against 1.5 ms (three runs, including one at load average 0.1; historical median
 widgets are unchanged in this slice, so the workload is identical; the cause
 (binary codegen/layout shift or host drift) was not isolated because an A/B
 build of HEAD was not run. The ceiling was not widened.
+
+## Studio Slice 4 — Relate transforms and fair-value bands
+
+New compute cases (`studio.relate_transforms_5k`, `studio.relate_expanding_5k`,
+`studio.fair_value_5k`; `relative:true`, class `interactive`) each time only their own
+function on the dev-only `fixtures::related(5000, 0.8, 91)` pair (asset log return =
+0.8·benchmark + noise; `relationship` stays independent walks). Prerequisites are built
+once outside the timed closure; each case asserts its work (strict h=5 valid-pair count,
+training n, a sensible β, the 1,000 expanding endpoints, band ordering and both in-sample
+and out-of-sample points).
+
+| Case | Median ms | p95 ms | Budget ms |
+| --- | ---: | ---: | ---: |
+| `studio.relate_transforms_5k` | 1.693 | 1.975 | 10 |
+| `studio.relate_expanding_5k` | 0.032 | 0.039 | 40 |
+| `studio.fair_value_5k` | 0.130 | 0.201 | 5 |
+
+Paint (`studio_perf_gate.rs`; ceilings 1.2/0.8/2.0 ms for the Relate panel, the native-chart
+1.5/1.5/2.5 ms for the fair-value overlay): the panel case paints the fit tile, expanding β,
+the 7×7 common-panel matrix and receipts; the overlay case paints the 5,000-bar native chart
+with the accepted overlay (`quick` body, so the chart plus overlay is what is measured).
+Guards assert the caption, band-fill meshes, the stable MathCard ids and, in hover mode, the
+open `relate.fair_value` card with “residual band”, “mean CI” and “prediction”.
+
+| Metric (µs, median) | steady | hover | Ceiling |
+| --- | ---: | ---: | ---: |
+| `paint.studio_relate.*.ui` | 124.9 | 138.5 | 1200 |
+| `paint.studio_relate.*.tess` | 44.8 | 52.4 | 800 |
+| `paint.studio_relate.*.total` | 169.8 | 190.8 | 2000 |
+| `paint.studio_fair_value.*.ui` | 99.8 | 149.2 | 1500 |
+| `paint.studio_fair_value.*.tess` | 78.0 | 120.2 | 1500 |
+| `paint.studio_fair_value.*.total` | 177.8 | 269.5 | 2500 |
+
+The overlay decimates to one point per pixel for display only; hover reads the exact point.
+
+### Fold-ins and their measured effect
+
+| Metric | Before (slice 3 tip) | After |
+| --- | ---: | ---: |
+| `studio.corr_hac_5k` median / p95 | 31.35 / 34.7 ms (budget 40) | 11.82 / 12.21 ms |
+| `paint.studio_corr.steady.ui` | 1.574 ms (ceiling 1.5, failing) | 0.146 ms |
+| `paint.studio_corr.hover.ui` | 1.580 ms (failing) | 0.175 ms |
+| `paint.studio_corr.steady.tess` / `.total` | not recorded | 0.580 / 0.725 ms (0.8 / 2.5) |
+
+F1 caches CORR geometry per (report, rect, selection) as `Arc<Mesh>` and builds plot lines once
+per report; F2(a)+(b) replace per-window `regress` and `fit_inference` calls with lean
+bit-identical routines (`corr_rolling_fast_paths_bit_identical` compares them with the old code
+kept as a `#[cfg(test)]` reference). F2(c) (fast Theil–Sen) was not needed: `corr_hac_5k` has
+over 70% headroom. The `paint.studio_corr` “before” values are from the slice 3 PERF notes; no
+A/B build of the base was run for tess/total. No budget or baseline was edited, except the
+new-case budgets added above.

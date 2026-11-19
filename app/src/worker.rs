@@ -227,6 +227,8 @@ pub enum Request {
         symbol: String,
         spec: String,
         fresh: bool,
+        /// Relate transforms / fair value. Legacy CORR and RBETA always send `None`.
+        relate: Option<tr_data::studio_corr::RelateSpec>,
     },
     StudioSeason {
         pane: PaneId,
@@ -4709,12 +4711,13 @@ async fn handle_inner(s: &Arc<Shared>, req: Request, force: bool) {
             .await;
             send(Response::TstackTune { pane, generation, result: result.map_err(|e| format!("{e:#}")) });
         }
-        Request::StudioCorr { pane, generation, symbol, spec, fresh, horizon } => {
+        Request::StudioCorr { pane, generation, symbol, spec, fresh, horizon, relate } => {
             let bridge = config.bridge();
             let result = crate::app::studio_corr::research_horizon(
                 &crate::app::studio_corr::CORR_CACHE,
                 fresh,
                 horizon,
+                relate,
                 Some(s.jobs.clone()),
                 &s.history,
                 &bridge,

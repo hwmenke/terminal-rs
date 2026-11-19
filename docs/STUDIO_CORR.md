@@ -177,3 +177,77 @@ The shell's context inspector owns symbol, interval and benchmark; the existing
 horizon/method views retain their conventions. An accepted Relate roundtrip
 reuses the exact Arc with zero compute requests. Globally allocated request
 tokens isolate recreated children and context changes. See [Studio](STUDIO.md).
+
+## Relate transforms and fair-value bands (Studio slice 4)
+
+```text
+STUDIO lens=relate benchmark=QQQ transform=logreturn h=5     # h ∈ {1,5,20}
+RELATE transform=level|change|logreturn|loglevel [h=1|5|20]
+RELATE beta=rolling|expanding   RELATE bands=on|off   RELATE matrix=common|pairwise
+```
+
+`RELATE` with arguments updates the focused Studio's Relate inputs; bare `RELATE`
+opens `STUDIO lens=relate`. Invalid arguments and `RELATE US Equity` fall through to
+the ticker. `CORR` / `RBETA` are unchanged: `relate: None`, pairwise matrix and the
+legacy common-timestamp returns; their JSON export gains no key. Inside a Studio,
+`h=` belongs to Relate only when the same command says `lens=relate` (`lens=when h=6`
+still routes to When, and h outside {1, 5, 20} is refused).
+
+**Strict convention.** Relate aligns as legacy `aligned()` (daily on the UTC date,
+intraday on the exact timestamp) and keeps each side's bar index. A transform at
+`t` over `h` exists only when both series' own bars are exactly `h` apart, no
+expected-grid break (`expected_breaks_for`: supported cash calendars, an explicit
+UTC grid otherwise) lies inside `(t−h, t]`, and no vault gap is spanned. Invalid
+points are `None`, the next valid point has `break_before`. Receipts print which
+convention applies; unavailable stays unavailable (no interpolation or carry).
+
+| Transform | Target `(y, x)` | Unit |
+| --- | --- | --- |
+| Level | `(P_t, X_t)` | native |
+| Log level | `(ln P_t, ln X_t)` | ln price |
+| Change h | `(P_t−P_{t−h}, X_t−X_{t−h})` | Δ native |
+| Log return h | `(ln P_t/P_{t−h}, ln X_t/X_{t−h})` | log-return |
+
+**Frozen training fit.** OLS on the chronological first 80% of valid pairs
+(`train_n = 4n/5`), σ = √(SSE/(n−2)) in target space; refused when n_train < 30, the
+benchmark has no variance, or σ ≤ 64·ε·max|y|. Points after `train_end` are out of
+sample; earlier points are drawn dimmed and labelled *in-sample descriptive*. Bands add
+`kσ` (k = ±1, ±2) **in target space and then invert**: level `ŷ+kσ`; log level
+`exp(a+b ln X+kσ)` (a conditional **median**, no σ²/2 term); change `P_{t−h}+a+bΔX+kσ`;
+log return `P_{t−h}·exp(a+b r^X+kσ)`. Residuals are never cumulated. Change and
+log-return fair values use the realised benchmark move to `t`: contemporaneous, not a
+forecast. Hover (MathCard `relate.fair_value`) distinguishes the residual band (±kσ
+only) from the mean-response CI `ŷ ± 1.96·se_m` and the prediction SE
+`√(σ²+se_m²)`, and prints formula, substituted α, β, x, anchor, σ, n, span, source,
+observation clock, CLOSED THRU and any unavailable reason. Level and log-level fits
+are labelled *descriptive: levels may be nonstationary*. No p, q, colour or cheap/rich
+verdict is shown, only the descriptive `z = (y−ŷ)/σ`.
+
+**Expanding β** (`relate.beta.expanding`, descriptive, no uncertainty): one-pass Welford
+co-moments, β = Cxy/Cxx for n ≥ 3 and Cxx > n·(16ε)²; a break resets; the latest 1,000
+endpoints are kept; it is prefix-invariant. **Common panel** (`corr.matrix.common`): one
+complete-case set whose returns are consecutive in every admitted row's own bars, so every
+cell shows the same n (printed as “same n=… all cells”).
+
+**Worker and cache.** Everything runs in the existing `research_horizon` blocking task and
+rides inside `Response::StudioCorr` as `CorrReport.relate` (≤ 5,000 overlay points, ≤ 1,000
+expanding endpoints), so the standalone pane and the hub share one stale-response route.
+Relate keys use the `studio_corr_v3` namespace and hash the full spec (band visibility
+excluded: it is an overlay toggle), the 0.8 split, the strict grid and the `relate.v1` method
+schema on top of every legacy input; `fit_id` hashes the key, `train_end` and the transform.
+Legacy `compute()` never builds `relate`. The chart paints the overlay only for an accepted
+report with the same symbol and inputs, a fit, and never in Quick-canvas mode; a context change
+drops the child on the same frame and a late response with the old token is ignored.
+
+Saved layouts stay backward compatible: `StudioInputs` gains `relate_transform`,
+`relate_beta`, `relate_bands`, `relate_matrix`, and the standalone CORR pane gains `horizon`
+(F10: it was silently reset to 1) and `relate`, all `#[serde(default)]`.
+
+### Scout fold-ins landed with this slice
+
+F1 cached CORR paint geometry (`Arc<Mesh>` + prepared lines, visibility-gated, hover from cached
+screen positions); F2(a)+(b) lean bit-identical rolling fits (`beta_corr`, prefix break count,
+`rolling_beta_interval`); F3 the idiosyncratic cumulative path is unavailable at h>1 (overlapping
+returns cannot be cumulated); F4 bare `LAB` / `RESID` / `ATTR` load their tickers, the routes
+are `STUDIO lab|resid|attr`; F5 `WHEN` / `QUICK` shadow rules; F6 the Backtest pane refuses in
+sample mode locally with no worker request; F10 persisted CORR horizon.

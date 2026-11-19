@@ -139,6 +139,49 @@ pub fn relationship(n: usize) -> (Vec<Bar>, Vec<Bar>) {
     (daily(n + 1, 71), daily(n + 1, 73))
 }
 
+/// Dev-only (asset, benchmark) with a known relationship: each asset log return is
+/// `beta · benchmark log return + noise`, so fair-value and Relate cases fit a real slope.
+/// `relationship` stays independent walks (β≈0).
+pub fn related(n: usize, beta: f64, seed: u64) -> (Vec<Bar>, Vec<Bar>) {
+    let benchmark = daily(n + 1, seed);
+    let mut rng = Rng(seed ^ 0xa5a5);
+    let mut price = 100.0;
+    let mut prev = benchmark[0].close;
+    let asset = benchmark
+        .iter()
+        .enumerate()
+        .map(|(i, b)| {
+            let open = price;
+            if i > 0 {
+                price *= (beta * (b.close / prev).ln() + 0.004 * (rng.next() - 0.5)).exp();
+            }
+            prev = b.close;
+            Bar::new(b.ts, open, open.max(price), open.min(price), price, 1000.).with_provenance(Provenance::Real)
+        })
+        .collect();
+    (asset, benchmark)
+}
+
+/// Dev-only benchmark for an existing `asset`: its log returns are `asset return / beta` plus a
+/// little seeded noise, so the asset's `beta` against it is about `beta` on the asset's own bars.
+pub fn benchmark_for(asset: &[Bar], beta: f64, seed: u64) -> Vec<Bar> {
+    let mut rng = Rng(seed ^ 0x5a5a);
+    let mut price = 100.0;
+    let mut prev = asset[0].close;
+    asset
+        .iter()
+        .enumerate()
+        .map(|(i, b)| {
+            let open = price;
+            if i > 0 {
+                price *= ((b.close / prev).ln() / beta + 0.002 * (rng.next() - 0.5)).exp();
+            }
+            prev = b.close;
+            Bar::new(b.ts, open, open.max(price), open.min(price), price, 1000.).with_provenance(Provenance::Real)
+        })
+        .collect()
+}
+
 /// A rectangular 78-clock session grid with nondegenerate common-row variation.
 pub fn inference_clocks(sessions: usize) -> Vec<Vec<Option<f64>>> {
     let mut rng = Rng(311);

@@ -3,7 +3,7 @@ use super::{PaneKind, TerminalApp};
 use crate::{congress_view::Action, dock::PaneId, theme, worker::Request};
 use egui::{Color32, Pos2, Rect, RichText, Sense, Stroke, Ui};
 use tr_core::{Bar, Timeframe};
-use tr_data::studio_corr::{self as maths, CorrReport, NamedBars};
+use tr_data::studio_corr::{self as maths, CorrReport, NamedBars, RelateSpec};
 
 pub struct CorrPane {
     pub symbol: String,
@@ -13,6 +13,8 @@ pub struct CorrPane {
     pub loading: bool,
     pub error: Option<String>,
     pub report: Option<std::sync::Arc<CorrReport>>,
+    /// Relate transform / fair-value inputs. `None` is legacy CORR / RBETA exactly.
+    pub relate: Option<RelateSpec>,
     /// Next request bypasses the bar cache (set by the Reload button).
     fresh: bool,
 }
@@ -27,6 +29,7 @@ impl CorrPane {
             loading: false,
             error: None,
             report: None,
+            relate: None,
             fresh: false,
         }
     }
@@ -44,6 +47,10 @@ impl CorrPane {
             return;
         }
         self.loading = true;
+        let benchmark = parse_spec(&self.spec).map(|(b, _)| b).unwrap_or_default();
+        if let Some(r) = &mut self.relate {
+            r.benchmark = benchmark;
+        }
         worker.send(Request::StudioCorr {
             pane,
             generation: self.generation,
@@ -51,7 +58,24 @@ impl CorrPane {
             spec: self.spec.clone(),
             fresh: std::mem::take(&mut self.fresh),
             horizon: self.horizon,
+            relate: self.relate.clone(),
         });
+    }
+    /// The accepted report + Relate fit when (and only when) it belongs to `symbol` and the current
+    /// inputs. Returns whether the band fills are shown.
+    pub fn fair_value_overlay(&self, symbol: &str) -> Option<(&CorrReport, &maths::RelateReport, bool)> {
+        let current = self.relate.as_ref()?;
+        let report = self.report.as_deref()?;
+        let rel = report.relate.as_deref()?;
+        let same = report.symbol == symbol
+            && !self.loading
+            && rel.fit.is_some()
+            && rel.spec.transform == current.transform
+            && rel.spec.beta_mode == current.beta_mode
+            && rel.spec.covariance == current.covariance
+            && rel.spec.matrix == current.matrix
+            && rel.spec.benchmark == current.benchmark;
+        same.then_some((report, rel, current.bands))
     }
     #[cfg(test)]
     pub fn accept(&mut self, generation: u64, result: Result<CorrReport, String>) {
@@ -152,6 +176,7 @@ pub(crate) async fn research_horizon<F, Fut>(
     cache: &CorrCache,
     fresh: bool,
     horizon: usize,
+    relate: Option<RelateSpec>,
     jobs: Option<std::sync::Arc<crate::perf::JobLog>>,
     history: &tr_data::history::Service,
     bridge: &tr_data::whats_news::Bridge,
@@ -237,9 +262,16 @@ where
     };
     let (a, b) = (asset.clone(), other.clone());
     let reports = cache.reports.clone();
+    // The parsed benchmark is authoritative; a caller's stale benchmark never keys the report.
+    let relate = relate.map(|mut r| {
+        r.benchmark = benchmark.clone();
+        // The band toggle only shows or hides the overlay; it is not part of the computation key.
+        r.bands = true;
+        r
+    });
     tokio::task::spawn_blocking(move || {
         let _job = jobs.as_ref().map(|j| crate::perf::JobTimer::new(j, "StudioCorr"));
-        compute_cached(&reports, &a, &b, &rows, options, tf, &source, horizon, observed_at)
+        compute_cached(&reports, &a, &b, &rows, options, tf, &source, horizon, observed_at, relate.as_ref())
     })
     .await?
     .map_err(anyhow::Error::msg)
@@ -260,7 +292,7 @@ where
     F: Fn(String, Timeframe) -> Fut,
     Fut: std::future::Future<Output = anyhow::Result<(Vec<Bar>, tr_data::vault::StitchInfo)>>,
 {
-    research_horizon(cache, fresh, 1, None, history, bridge, sample, symbol, spec, load).await
+    research_horizon(cache, fresh, 1, None, None, history, bridge, sample, symbol, spec, load).await
 }
 
 /// Hash all admitted inputs and peer failures before cache lookup. Selection is
@@ -275,6 +307,7 @@ fn compute_cached(
     source: &str,
     horizon: usize,
     observed_at: Option<i64>,
+    relate: Option<&RelateSpec>,
 ) -> Result<std::sync::Arc<CorrReport>, String> {
     tr_data::stats::require_research_bars(&a.bars, "Relationship asset")?;
     tr_data::stats::require_research_bars(&b.bars, "Relationship benchmark")?;
@@ -293,19 +326,34 @@ fn compute_cached(
     h.write_str(&format!("{:?} {:?}", Bar::provenance(&a.bars), Bar::provenance(&b.bars)));
     h.write_u64(tr_data::stable_hash::bars_digest(&b.bars));
     h.write_str(&format!("{:?} {:?} {:?} horizon={horizon} observed={observed_at:?}", options, a.gaps, b.gaps));
+    // Relate keys everything above plus the full spec, the split, the grid convention and the
+    // method schema, in a separate namespace so legacy keys and reports are untouched.
+    if let Some(spec) = relate {
+        h.write_str(&format!("{spec:?} train_frac=0.8 strict_grid=true {}", maths::METHOD_SCHEMA));
+    }
     let mut key = tr_data::report_cache::ReportKey::new(
-        "studio_corr_v2",
+        if relate.is_some() { "studio_corr_v3" } else { "studio_corr_v2" },
         &a.symbol,
         tf,
         source,
         &a.bars,
-        "all covariance methods; 80/20 holdout; rolling60x1000",
+        if relate.is_some() {
+            "all covariance methods; 80/20 holdout; rolling60x1000; relate transforms + frozen fair value"
+        } else {
+            "all covariance methods; 80/20 holdout; rolling60x1000"
+        },
     );
     key.params = h.finish();
+    let digest = key.params;
     reports.get_or_compute(key, || {
         let mut r = maths::compute_series_at_horizon(a, b, rows, options, source, horizon)?;
         r.observed_at = observed_at;
         r.closed_thru = closed_thru(tf, tr_data::security(&a.symbol).class, r.as_of);
+        if let Some(spec) = relate {
+            r.relate = Some(Box::new(maths::compute_relate(
+                a, b, rows, options, tf, spec, source, r.closed_thru, observed_at, digest,
+            )?));
+        }
         Ok(r)
     })
 }
@@ -418,15 +466,27 @@ pub(super) fn show(
             .font(theme::ui_font(11.0))
             .color(theme::muted()),
     );
-    ui.horizontal_wrapped(|ui| {
-        ui.label("Return horizon");
-        for h in [1, 5, 20] {
-            if ui.selectable_label(pane.horizon == h, format!("{h} bars")).clicked() {
-                pane.horizon = h;
+    if pane.relate.is_none() {
+        ui.horizontal_wrapped(|ui| {
+            ui.label("Return horizon");
+            for h in [1, 5, 20] {
+                if ui.selectable_label(pane.horizon == h, format!("{h} bars")).clicked() {
+                    pane.horizon = h;
+                    reload = true;
+                }
+            }
+            if embedded {
+                return;
+            }
+            if ui.small_button("Relate transforms").on_hover_text("Add Relate transforms and frozen-fit fair value").clicked() {
+                let benchmark = parse_spec(&pane.spec).map(|(b, _)| b).unwrap_or_default();
+                pane.relate = Some(RelateSpec::new(benchmark, tr_data::studio::Transform::LogReturn { h: pane.horizon }));
                 reload = true;
             }
-        }
-    });
+        });
+    } else {
+        reload |= relate_ui::controls(ui, pane);
+    }
     if sample {
         pane.report = None;
         pane.loading = false;
@@ -437,9 +497,58 @@ pub(super) fn show(
     }
     super::studio_dist::studio_states(ui, pane.loading, pane.error.as_deref(), None);
     if let Some(r) = &pane.report {
+        if r.relate.is_some() {
+            egui::ScrollArea::vertical()
+                .id_salt(("relate-scroll", id))
+                .max_height(ui.available_height().min(300.0))
+                .auto_shrink([false, true])
+                .show(ui, |ui| relate_panel(ui, id, r));
+        }
         ui.push_id(id, |ui| report_view(ui, id, r));
     }
     vec![]
+}
+
+mod relate_ui;
+pub(crate) use relate_ui::fair_value_card;
+#[cfg(test)]
+pub(crate) use relate_ui::fit_card;
+
+/// Dev/test fixture: a full CorrReport with its Relate report computed on the given daily bars.
+/// `peers` extend the correlation matrix rows. Never used outside tests and the paint gate.
+#[cfg(test)]
+pub(super) fn relate_fixture_report(
+    symbol: &str,
+    spec: &RelateSpec,
+    asset: &[Bar],
+    benchmark: &[Bar],
+    peers: &[NamedBars],
+) -> CorrReport {
+    let named = |symbol: &str, bars: &[Bar]| NamedBars {
+        symbol: symbol.into(),
+        bars: bars.to_vec(),
+        source: "benchmark fixture only".into(),
+        ..Default::default()
+    };
+    let (a, b) = (named(symbol, asset), named(&spec.benchmark, benchmark));
+    let mut rows = vec![a.clone(), b.clone()];
+    rows.extend(peers.iter().cloned());
+    let options = maths::Options { annual_periods: 252., daily: true };
+    let h = spec.transform.horizon();
+    let mut r = maths::compute_series_at_horizon(&a, &b, &rows, options, "benchmark fixture only", h).unwrap();
+    r.closed_thru = asset.last().unwrap().ts + 86_400;
+    r.relate = Some(Box::new(
+        maths::compute_relate(&a, &b, &rows, options, Timeframe::D1, spec, "benchmark fixture only", r.closed_thru, None, 1)
+            .unwrap(),
+    ));
+    r
+}
+
+/// The Relate panel (fit tile, expanding β, common-panel matrix, receipts) for a report that has one.
+pub(in crate::app) fn relate_panel(ui: &mut Ui, id: PaneId, r: &CorrReport) {
+    if let Some(rel) = r.relate.as_deref() {
+        relate_ui::panel(ui, id, r, rel);
+    }
 }
 
 fn stamp(ts: i64) -> String {
@@ -570,9 +679,13 @@ fn render(ui: &mut Ui, r: &CorrReport) {
         .font(theme::ui_font(10.5))
         .color(theme::muted()),
     );
+    // Prepared geometry is cached per report (pointer + content fingerprint) and per plot rect.
+    let fp = fingerprint(r);
+    let base = ui.id();
+    let chart = |slot: u8| Chart { id: base.with(("corr-chart", slot)), fp };
     heading(ui, "RETURN CLOUD · CYAN = MOST RECENT 20");
-    scatter_selected(ui, r, selected);
-    robust_rolling(ui, r, selected);
+    scatter_selected(ui, r, selected, chart(10));
+    robust_rolling(ui, r, selected, chart(11));
     for correlation in [false, true] {
         heading(
             ui,
@@ -582,56 +695,81 @@ fn render(ui: &mut Ui, r: &CorrReport) {
                 "ROLLING BETA · 20 / 60 / 120 RETURNS"
             },
         );
-        let lines: Vec<_> = r
-            .rolling
-            .iter()
-            .enumerate()
-            .map(|(i, roll)| PlotLine {
-                label: format!("{} returns", roll.window),
-                color: theme::series(i),
-                points: roll
-                    .points
+        line_chart(
+            ui,
+            chart(correlation as u8),
+            || {
+                r.rolling
                     .iter()
-                    .map(|&(ts, beta, corr)| (ts as f64, if correlation { corr } else { beta }))
-                    .collect(),
-            })
-            .collect();
-        line_chart(ui, &lines, false, true);
+                    .enumerate()
+                    .map(|(i, roll)| PlotLine {
+                        label: format!("{} returns", roll.window),
+                        color: theme::series(i),
+                        points: roll
+                            .points
+                            .iter()
+                            .map(|&(ts, beta, corr)| (ts as f64, if correlation { corr } else { beta }))
+                            .collect(),
+                    })
+                    .collect()
+            },
+            false,
+            true,
+        );
     }
     heading(ui, "LOG PRICE RATIO · LEVEL");
     line_chart(
         ui,
-        &[PlotLine {
-            label: "ln(asset / benchmark)".into(),
-            color: theme::cyan(),
-            points: r.path.iter().map(|p| (p.ts as f64, Some(p.log_ratio))).collect(),
-        }],
+        chart(2),
+        || {
+            vec![PlotLine {
+                label: "ln(asset / benchmark)".into(),
+                color: theme::cyan(),
+                points: r.path.iter().map(|p| (p.ts as f64, Some(p.log_ratio))).collect(),
+            }]
+        },
         false,
         true,
     );
     heading(ui, "RATIO Z-SCORE · VS PRIOR 60 COMMON PRICES (CURRENT EXCLUDED)");
     line_chart(
         ui,
-        &[PlotLine {
-            label: "z60".into(),
-            color: theme::amber(),
-            points: r.path.iter().map(|p| (p.ts as f64, p.z60)).collect(),
-        }],
+        chart(3),
+        || {
+            vec![PlotLine {
+                label: "z60".into(),
+                color: theme::amber(),
+                points: r.path.iter().map(|p| (p.ts as f64, p.z60)).collect(),
+            }]
+        },
         false,
         true,
     );
     heading(ui, "IDIOSYNCRATIC CUMULATIVE RETURN");
-    line_chart(
-        ui,
-        &[PlotLine {
-            label: "exp(Σ OLS residual) − 1".into(),
-            color: theme::up(),
-            points: r.path.iter().map(|p| (p.ts as f64, p.residual_return)).collect(),
-        }],
-        true,
-        true,
-    );
-    ui.label(RichText::new("In-sample residuals use the full-sample fit and sum to approximately zero. This path is descriptive and uses future fit information; the ratio z-score is not a cointegration test. Missing timestamps can make a return span several bars; no return spans a vault gap.").font(theme::ui_font(10.5)).color(theme::muted()));
+    if r.horizon > 1 {
+        ui.label(
+            RichText::new(format!(
+                "Unavailable at h={}: overlapping returns cannot be cumulated (each one-bar residual would be counted about {} times).",
+                r.horizon, r.horizon
+            ))
+            .color(theme::muted()),
+        );
+    } else {
+        line_chart(
+            ui,
+            chart(4),
+            || {
+                vec![PlotLine {
+                    label: "exp(Σ OLS residual) − 1".into(),
+                    color: theme::up(),
+                    points: r.path.iter().map(|p| (p.ts as f64, p.residual_return)).collect(),
+                }]
+            },
+            true,
+            true,
+        );
+        ui.label(RichText::new("In-sample residuals use the full-sample fit and sum to approximately zero. This path is descriptive and uses future fit information; the ratio z-score is not a cointegration test. Missing timestamps can make a return span several bars; no return spans a vault gap.").font(theme::ui_font(10.5)).color(theme::muted()));
+    }
     heading(ui, "CORRELATION MATRIX · PAIRWISE COMMON RETURNS");
     matrix(ui, &r.matrix);
 }
@@ -843,41 +981,130 @@ fn segment(mesh: &mut egui::epaint::Mesh, a: Pos2, b: Pos2, width: f32, color: C
     }
 }
 
-fn robust_rolling(ui: &mut Ui, r: &CorrReport, selected: usize) {
+/// One chart's identity for the paint caches: a stable widget id plus the report fingerprint.
+#[derive(Clone, Copy)]
+struct Chart {
+    id: egui::Id,
+    fp: u64,
+}
+
+/// Cheap identity of an accepted report. The address distinguishes live reports; the content
+/// fields guard against an allocator reusing that address for a different report.
+fn fingerprint(r: &CorrReport) -> u64 {
+    mix(&(
+        r as *const CorrReport as usize,
+        r.as_of,
+        r.closed_thru,
+        r.horizon,
+        r.returns.len(),
+        r.path.len(),
+        r.ols.beta.map(f64::to_bits),
+        r.ols.alpha.map(f64::to_bits),
+    ))
+}
+fn mix(v: &impl std::hash::Hash) -> u64 {
+    use std::hash::Hasher;
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    v.hash(&mut h);
+    h.finish()
+}
+fn rect_bits(r: Rect) -> [u32; 4] {
+    [r.min.x.to_bits(), r.min.y.to_bits(), r.max.x.to_bits(), r.max.y.to_bits()]
+}
+
+/// A single cached value per `id`, rebuilt only when `key` changes. Lives in egui temp data, so
+/// it needs no cleanup and is dropped with the context.
+fn cached<T: Send + Sync + 'static>(
+    ctx: &egui::Context,
+    id: egui::Id,
+    key: u64,
+    build: impl FnOnce() -> T,
+) -> std::sync::Arc<T> {
+    if let Some((k, v)) = ctx.data(|d| d.get_temp::<(u64, std::sync::Arc<T>)>(id))
+        && k == key
+    {
+        return v;
+    }
+    let v = std::sync::Arc::new(build());
+    ctx.data_mut(|d| d.insert_temp(id, (key, v.clone())));
+    v
+}
+
+/// Screen-space geometry prepared for one (report, rect, selection): shared meshes plus the
+/// screen positions used for nearest-point hover.
+struct Prepared {
+    meshes: Vec<std::sync::Arc<egui::epaint::Mesh>>,
+    pos: Vec<Pos2>,
+}
+
+/// Report-level (rect independent) line data: lines, their finite points and bounds.
+struct LineData {
+    lines: Vec<PlotLine>,
+    valid: Vec<Vec<(f64, f64)>>,
+    x: (f64, f64),
+    y: (f64, f64),
+    any: bool,
+}
+impl LineData {
+    fn new(lines: Vec<PlotLine>) -> Self {
+        let valid: Vec<Vec<(f64, f64)>> =
+            lines.iter().map(|l| l.points.iter().filter_map(|&(x, y)| y.map(|y| (x, y))).collect()).collect();
+        let x = bounds(valid.iter().flatten().map(|p| p.0), false);
+        let y = bounds(valid.iter().flatten().map(|p| p.1), true);
+        let any = valid.iter().any(|v| !v.is_empty());
+        Self { lines, valid, x, y, any }
+    }
+}
+
+struct RollingData {
+    x: (f64, f64),
+    y: (f64, f64),
+}
+
+fn robust_rolling(ui: &mut Ui, r: &CorrReport, selected: usize, chart: Chart) {
     use crate::widgets::MathCardExt;
     let Some(points) = r.robust.rolling.get(selected).filter(|p| !p.is_empty()) else {
         return;
     };
     heading(ui, "ROLLING BETA · 60 RETURNS · POINTWISE 95% BAND · LAST 1,000 ENDPOINTS");
-    let x = bounds(points.iter().map(|p| p.ts as f64), false);
-    let y = bounds(points.iter().flat_map(|p| p.interval.into_iter().flat_map(|(a, b)| [a, b]).chain(p.beta)), true);
+    let data = cached(ui.ctx(), chart.id.with("data"), mix(&(chart.fp, selected)), || RollingData {
+        x: bounds(points.iter().map(|p| p.ts as f64), false),
+        y: bounds(points.iter().flat_map(|p| p.interval.into_iter().flat_map(|(a, b)| [a, b]).chain(p.beta)), true),
+    });
+    let (x, y) = (data.x, data.y);
     let (plot, response) = axes(ui, x, y, false, true);
     if !ui.is_rect_visible(plot.rect) {
         return;
     }
     let painter = ui.painter_at(plot.rect);
-    let mut mesh = egui::epaint::Mesh::default();
-    let mut stroke = egui::epaint::Mesh::default();
-    for w in points.windows(2) {
-        if w[1].break_before || w[0].interval.is_none() || w[1].interval.is_none() {
-            continue;
+    let prepared = cached(ui.ctx(), chart.id.with("mesh"), mix(&(chart.fp, selected, rect_bits(plot.rect))), || {
+        let mut mesh = egui::epaint::Mesh::default();
+        let mut stroke = egui::epaint::Mesh::default();
+        for w in points.windows(2) {
+            if w[1].break_before || w[0].interval.is_none() || w[1].interval.is_none() {
+                continue;
+            }
+            if let (Some((a, b)), Some((c, d)), Some(ba), Some(bb)) =
+                (w[0].interval, w[1].interval, w[0].beta, w[1].beta)
+            {
+                quad(
+                    &mut mesh,
+                    [
+                        plot.pos(w[0].ts as f64, a),
+                        plot.pos(w[1].ts as f64, c),
+                        plot.pos(w[1].ts as f64, d),
+                        plot.pos(w[0].ts as f64, b),
+                    ],
+                    theme::series(0).linear_multiply(0.15),
+                );
+                segment(&mut stroke, plot.pos(w[0].ts as f64, ba), plot.pos(w[1].ts as f64, bb), 1.3, theme::series(0));
+            }
         }
-        if let (Some((a, b)), Some((c, d)), Some(ba), Some(bb)) = (w[0].interval, w[1].interval, w[0].beta, w[1].beta) {
-            quad(
-                &mut mesh,
-                [
-                    plot.pos(w[0].ts as f64, a),
-                    plot.pos(w[1].ts as f64, c),
-                    plot.pos(w[1].ts as f64, d),
-                    plot.pos(w[0].ts as f64, b),
-                ],
-                theme::series(0).linear_multiply(0.15),
-            );
-            segment(&mut stroke, plot.pos(w[0].ts as f64, ba), plot.pos(w[1].ts as f64, bb), 1.3, theme::series(0));
-        }
+        Prepared { meshes: vec![mesh.into(), stroke.into()], pos: vec![] }
+    });
+    for mesh in &prepared.meshes {
+        painter.add(egui::Shape::Mesh(mesh.clone()));
     }
-    painter.add(egui::Shape::mesh(mesh));
-    painter.add(egui::Shape::mesh(stroke));
     let at = response
         .hover_pos()
         .map(|p| plot.x.0 + (p.x - plot.rect.left()) as f64 / plot.rect.width() as f64 * (plot.x.1 - plot.x.0))
@@ -977,41 +1204,55 @@ fn axes(ui: &mut Ui, x: (f64, f64), y: (f64, f64), pct: bool, dates: bool) -> (P
     }
     (p, response)
 }
-fn line_chart(ui: &mut Ui, lines: &[PlotLine], pct: bool, dates: bool) {
-    if !lines.iter().any(|l| l.points.iter().any(|p| p.1.is_some())) {
+fn line_chart(ui: &mut Ui, chart: Chart, build: impl FnOnce() -> Vec<PlotLine>, pct: bool, dates: bool) {
+    let data = cached(ui.ctx(), chart.id.with("data"), chart.fp, || LineData::new(build()));
+    if !data.any {
         ui.label(RichText::new("Not enough common observations, or zero variance.").color(theme::muted()));
         return;
     }
     ui.horizontal_wrapped(|ui| {
-        for line in lines {
+        for line in &data.lines {
             ui.label(RichText::new(&line.label).font(theme::mono(10.0)).color(line.color));
         }
     });
-    let x = bounds(lines.iter().flat_map(|l| l.points.iter().filter(|p| p.1.is_some()).map(|p| p.0)), false);
-    let y = bounds(lines.iter().flat_map(|l| l.points.iter().filter_map(|p| p.1)), true);
-    let (plot, response) = axes(ui, x, y, pct, dates);
+    let (plot, response) = axes(ui, data.x, data.y, pct, dates);
     if !ui.is_rect_visible(plot.rect) {
         return;
     }
     let painter = ui.painter_at(plot.rect);
-    for line in lines {
-        let mut mesh = egui::epaint::Mesh::default();
-        mesh.vertices.reserve(line.points.len() * 4);
-        mesh.indices.reserve(line.points.len() * 6);
-        for w in line.points.windows(2) {
-            if let (Some(a), Some(b)) = (w[0].1, w[1].1) {
-                segment(&mut mesh, plot.pos(w[0].0, a), plot.pos(w[1].0, b), 1.6, line.color);
-            }
-        }
-        painter.add(egui::Shape::mesh(mesh));
+    let prepared = cached(ui.ctx(), chart.id.with("mesh"), mix(&(chart.fp, rect_bits(plot.rect))), || {
+        let meshes = data
+            .lines
+            .iter()
+            .map(|line| {
+                let mut mesh = egui::epaint::Mesh::default();
+                mesh.vertices.reserve(line.points.len() * 4);
+                mesh.indices.reserve(line.points.len() * 6);
+                for w in line.points.windows(2) {
+                    if let (Some(a), Some(b)) = (w[0].1, w[1].1) {
+                        segment(&mut mesh, plot.pos(w[0].0, a), plot.pos(w[1].0, b), 1.6, line.color);
+                    }
+                }
+                mesh.into()
+            })
+            .collect();
+        Prepared { meshes, pos: vec![] }
+    });
+    for mesh in &prepared.meshes {
+        painter.add(egui::Shape::Mesh(mesh.clone()));
     }
     if let Some(pos) = response.hover_pos().filter(|p| plot.rect.contains(*p)) {
         let x = plot.x.0 + (pos.x - plot.rect.left()) as f64 / plot.rect.width() as f64 * (plot.x.1 - plot.x.0);
         let mut labels = Vec::new();
-        for line in lines {
-            if let Some(&(ts, Some(v))) =
-                line.points.iter().filter(|p| p.1.is_some()).min_by(|a, b| (a.0 - x).abs().total_cmp(&(b.0 - x).abs()))
-            {
+        for (line, valid) in data.lines.iter().zip(&data.valid) {
+            // Nearest finite point by timestamp (points are in time order).
+            let at = valid.partition_point(|p| p.0 < x);
+            let nearest = [at.checked_sub(1), (at < valid.len()).then_some(at)]
+                .into_iter()
+                .flatten()
+                .map(|i| valid[i])
+                .min_by(|a, b| (a.0 - x).abs().total_cmp(&(b.0 - x).abs()));
+            if let Some((ts, v)) = nearest {
                 let p = plot.pos(ts, v);
                 painter.circle_filled(p, 3.0, line.color);
                 labels.push(format!(
@@ -1025,18 +1266,22 @@ fn line_chart(ui: &mut Ui, lines: &[PlotLine], pct: bool, dates: bool) {
         response.on_hover_text(labels.join("\n"));
     }
 }
-fn scatter_selected(ui: &mut Ui, r: &CorrReport, selected: usize) {
-    let x = bounds(r.returns.iter().map(|p| p.benchmark), true);
-    let mut ys: Vec<_> = r.returns.iter().map(|p| p.asset).collect();
-    let fit = r.robust.fits.get(selected);
-    if let (Some(a), Some(b), Some(fit)) = (r.ols.alpha, r.ols.beta, fit) {
-        for at in [x.0, x.1] {
-            if let Some(se) = fit.covariance.mean_se(&[1., at]) {
-                ys.extend([a + b * at - 1.96 * se, a + b * at + 1.96 * se]);
+fn scatter_selected(ui: &mut Ui, r: &CorrReport, selected: usize, chart: Chart) {
+    let data = cached(ui.ctx(), chart.id.with("data"), mix(&(chart.fp, selected)), || {
+        let x = bounds(r.returns.iter().map(|p| p.benchmark), true);
+        let mut ys: Vec<_> = r.returns.iter().map(|p| p.asset).collect();
+        if let (Some(a), Some(b), Some(fit)) = (r.ols.alpha, r.ols.beta, r.robust.fits.get(selected)) {
+            for at in [x.0, x.1] {
+                if let Some(se) = fit.covariance.mean_se(&[1., at]) {
+                    ys.extend([a + b * at - 1.96 * se, a + b * at + 1.96 * se]);
+                }
             }
         }
-    }
-    let (plot, response) = axes(ui, x, bounds(ys.into_iter(), true), true, false);
+        RollingData { x, y: bounds(ys.into_iter(), true) }
+    });
+    let fit = r.robust.fits.get(selected);
+    let x = data.x;
+    let (plot, response) = axes(ui, x, data.y, true, false);
     if !ui.is_rect_visible(plot.rect) {
         scatter_caption(ui, r, selected);
         return;
@@ -1066,28 +1311,39 @@ fn scatter_selected(ui: &mut Ui, r: &CorrReport, selected: usize) {
         painter
             .line_segment([plot.pos(x.0, a + b * x.0), plot.pos(x.1, a + b * x.1)], Stroke::new(1.7, theme::series(0)));
     }
-    let mut cloud = egui::epaint::Mesh::default();
-    cloud.vertices.reserve(r.returns.len() * 4);
-    cloud.indices.reserve(r.returns.len() * 6);
-    for (i, p) in r.returns.iter().enumerate() {
-        let point = plot.pos(p.benchmark, p.asset);
-        if i < r.returns.len().saturating_sub(20) {
-            cloud.add_colored_rect(
-                Rect::from_center_size(point, egui::vec2(3., 3.)),
-                theme::muted().linear_multiply(0.45),
-            );
+    let prepared = cached(ui.ctx(), chart.id.with("mesh"), mix(&(chart.fp, selected, rect_bits(plot.rect))), || {
+        let mut cloud = egui::epaint::Mesh::default();
+        cloud.vertices.reserve(r.returns.len() * 4);
+        cloud.indices.reserve(r.returns.len() * 6);
+        let mut pos = Vec::with_capacity(r.returns.len());
+        for (i, p) in r.returns.iter().enumerate() {
+            let point = plot.pos(p.benchmark, p.asset);
+            pos.push(point);
+            if i < r.returns.len().saturating_sub(20) {
+                cloud.add_colored_rect(
+                    Rect::from_center_size(point, egui::vec2(3., 3.)),
+                    theme::muted().linear_multiply(0.45),
+                );
+            }
         }
+        Prepared { meshes: vec![cloud.into()], pos }
+    });
+    for mesh in &prepared.meshes {
+        painter.add(egui::Shape::Mesh(mesh.clone()));
     }
-    painter.add(egui::Shape::mesh(cloud));
-    for p in r.returns.iter().rev().take(20) {
-        painter.circle_filled(plot.pos(p.benchmark, p.asset), 3., theme::cyan());
+    for &point in prepared.pos.iter().rev().take(20) {
+        painter.circle_filled(point, 3., theme::cyan());
     }
     if let Some(pos) = response.hover_pos().filter(|p| plot.rect.contains(*p))
-        && let Some(p) = r.returns.iter().min_by(|a, b| {
-            plot.pos(a.benchmark, a.asset).distance_sq(pos).total_cmp(&plot.pos(b.benchmark, b.asset).distance_sq(pos))
-        })
+        && let Some((i, point)) = prepared
+            .pos
+            .iter()
+            .copied()
+            .enumerate()
+            .min_by(|(_, a), (_, b)| a.distance_sq(pos).total_cmp(&b.distance_sq(pos)))
     {
-        painter.circle_stroke(plot.pos(p.benchmark, p.asset), 5.0, Stroke::new(1.5, theme::amber()));
+        let p = &r.returns[i];
+        painter.circle_stroke(point, 5.0, Stroke::new(1.5, theme::amber()));
         response.on_hover_text(format!(
             "{} → {}\nBenchmark x: {}\nAsset y: {}",
             stamp(p.start),
@@ -1119,11 +1375,15 @@ fn rho_scale() -> crate::widgets::HeatScale {
     crate::widgets::HeatScale::diverging(1.0, "ρ", two_dp)
 }
 fn matrix(ui: &mut Ui, m: &maths::Matrix) {
+    matrix_impl(ui, m, false);
+}
+/// `common`: every cell is one complete-case set (Relate common panel, id `corr.matrix.common`).
+fn matrix_impl(ui: &mut Ui, m: &maths::Matrix, common: bool) {
     use crate::widgets::{MathCard, MathCardExt};
     let hs = rho_scale();
     hs.key(ui);
-    egui::ScrollArea::horizontal().id_salt("corr-matrix").show(ui, |ui| {
-        egui::Grid::new("corr-matrix-grid").spacing(egui::vec2(3.0, 3.0)).show(ui, |ui| {
+    egui::ScrollArea::horizontal().id_salt(("corr-matrix", common)).show(ui, |ui| {
+        egui::Grid::new(("corr-matrix-grid", common)).spacing(egui::vec2(3.0, 3.0)).show(ui, |ui| {
             ui.label("");
             for name in &m.symbols {
                 ui.label(RichText::new(tr_data::security(name).ticker).font(theme::mono(10.0)).color(theme::muted()));
@@ -1147,11 +1407,15 @@ fn matrix(ui: &mut Ui, m: &maths::Matrix) {
                                 tr_data::security(&m.symbols[j]).ticker
                             );
                             let card = MathCard::new(
-                                format!("ρ {pair}"),
+                                if common { format!("ρ {pair} · corr.matrix.common") } else { format!("ρ {pair}") },
                                 "ρ = Cov(rₓ, r_y) / (σₓ σ_y)  (Pearson, log returns)",
                             )
                             .n(cell.n, "common returns")
-                            .note("Pairwise common endpoints; sample size may differ by pair.");
+                            .note(if common {
+                                "Common panel: one complete-case set, strict endpoints in every row; every cell has the same n."
+                            } else {
+                                "Pairwise common endpoints; sample size may differ by pair."
+                            });
                             match (rho, &cell.reason) {
                                 (Some(v), _) => card.value(two_dp(v)),
                                 (None, Some(why)) => card.unavailable(why.clone()),
@@ -1185,7 +1449,12 @@ mod tests {
     }
     #[test]
     fn settings_round_trip_and_old_defaults() {
-        let s = PaneSettings::StudioCorr { symbol: "AAPL US Equity".into(), spec: "QQQ 1H".into() };
+        let s = PaneSettings::StudioCorr {
+            symbol: "AAPL US Equity".into(),
+            spec: "QQQ 1H".into(),
+            horizon: 5,
+            relate: Some(RelateSpec::new("QQQ US Equity", tr_data::studio::Transform::LogReturn { h: 5 })),
+        };
         let serialized = serde_json::to_string(&s).unwrap();
         let restored = PaneKind::from_settings(serde_json::from_str(&serialized).unwrap());
         assert_eq!(serde_json::to_value(restored.settings()).unwrap(), serde_json::to_value(s).unwrap());
@@ -1193,8 +1462,15 @@ mod tests {
         assert_eq!(p.spec, "QQQ 1H");
         assert_eq!(p.generation, 0);
         assert!(p.report.is_none());
+        assert_eq!(p.horizon, 5);
+        assert!(p.relate.is_some());
         let old: PaneSettings = serde_json::from_str(r#"{"StudioCorr":{}}"#).unwrap();
-        assert_eq!(old, PaneSettings::StudioCorr { symbol: String::new(), spec: String::new() });
+        assert_eq!(
+            old,
+            PaneSettings::StudioCorr { symbol: String::new(), spec: String::new(), horizon: 1, relate: None }
+        );
+        let PaneKind::StudioCorr(p) = PaneKind::from_settings(old) else { panic!("relationship kind") };
+        assert_eq!((p.horizon, p.relate.is_none()), (1, true));
     }
     #[test]
     fn stale_and_unverified_responses_are_refused() {
@@ -1395,6 +1671,102 @@ mod tests {
             output.textures_delta.clear();
         }
     }
+    fn big_meshes(out: &egui::FullOutput) -> Vec<std::sync::Arc<egui::epaint::Mesh>> {
+        out.shapes
+            .iter()
+            .filter_map(|s| match &s.shape {
+                egui::Shape::Mesh(m) if m.vertices.len() > 500 => Some(m.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+    fn corr_text(out: &mut egui::FullOutput) -> String {
+        out.textures_delta.clear();
+        out.shapes
+            .iter()
+            .filter_map(|s| if let egui::Shape::Text(t) = &s.shape { Some(t.galley.job.text.clone()) } else { None })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+    #[test]
+    fn corr_paint_reuses_prepared_meshes() {
+        let (a, b) = tr_perf::fixtures::relationship(400);
+        let r = maths::compute("AAPL", "QQQ", &a, &b, 252., &[], "fixture").unwrap();
+        let ctx = egui::Context::default();
+        let frame = |ctx: &egui::Context, r: &CorrReport, width: f32, se: usize| {
+            let mut out = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(Pos2::ZERO, egui::vec2(width, 3000.0))),
+                    ..Default::default()
+                },
+                |ui| {
+                    ui.ctx().data_mut(|d| d.insert_temp(ui.id().with("corr-se-method"), se));
+                    render(ui, r)
+                },
+            );
+            out.textures_delta.clear();
+            big_meshes(&out)
+        };
+        for _ in 0..3 {
+            frame(&ctx, &r, 1200., 2);
+        }
+        let (one, two) = (frame(&ctx, &r, 1200., 2), frame(&ctx, &r, 1200., 2));
+        // cloud, rolling band + stroke, 3 rolling lines × 2 charts, ratio, z60, residual
+        assert!(one.len() >= 8, "expected cached meshes, got {}", one.len());
+        assert_eq!(one.len(), two.len());
+        assert!(one.iter().zip(&two).all(|(a, b)| std::sync::Arc::ptr_eq(a, b)), "identical frames must reuse meshes");
+        // A different selected SE rebuilds the SE-dependent meshes (cloud / rolling band).
+        let sel = frame(&ctx, &r, 1200., 1);
+        assert!(sel.iter().zip(&two).any(|(a, b)| !std::sync::Arc::ptr_eq(a, b)), "SE change must rebuild");
+        // A different width rebuilds every rect-dependent mesh.
+        let ctx2 = egui::Context::default();
+        for _ in 0..3 {
+            frame(&ctx2, &r, 1200., 2);
+        }
+        let before = frame(&ctx2, &r, 1200., 2);
+        let wide = frame(&ctx2, &r, 900., 2);
+        assert_eq!(before.len(), wide.len());
+        assert!(before.iter().zip(&wide).all(|(a, b)| !std::sync::Arc::ptr_eq(a, b)), "width change must rebuild");
+        // A different report (new address and content) never reuses meshes.
+        let other = maths::compute("AAPL", "QQQ", &b, &a, 252., &[], "fixture").unwrap();
+        let rebuilt = frame(&ctx2, &other, 900., 2);
+        assert!(rebuilt.iter().zip(&wide).all(|(a, b)| !std::sync::Arc::ptr_eq(a, b)));
+    }
+    #[test]
+    fn corr_residual_path_unavailable_for_overlapping_h() {
+        let (a, b) = tr_perf::fixtures::relationship(300);
+        let (named_a, named_b) = (
+            NamedBars { symbol: "A".into(), bars: a, ..Default::default() },
+            NamedBars { symbol: "B".into(), bars: b, ..Default::default() },
+        );
+        let opts = maths::Options { annual_periods: 252., daily: true };
+        for h in [5, 20] {
+            let r = maths::compute_series_at_horizon(&named_a, &named_b, &[], opts, "fixture", h).unwrap();
+            assert!(r.path.iter().all(|p| p.residual_return.is_none()), "h={h}");
+            let ctx = egui::Context::default();
+            let mut out = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(Pos2::ZERO, egui::vec2(1200., 3000.))),
+                    ..Default::default()
+                },
+                |ui| render(ui, &r),
+            );
+            let text = corr_text(&mut out);
+            assert!(text.contains("overlapping returns cannot be cumulated"), "h={h}: {text}");
+            assert!(!text.contains("exp(Σ OLS residual)"));
+        }
+        let r = maths::compute_series_at_horizon(&named_a, &named_b, &[], opts, "fixture", 1).unwrap();
+        assert!(r.path.iter().skip(1).any(|p| p.residual_return.is_some()), "h=1 path unchanged");
+        let ctx = egui::Context::default();
+        let mut out = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, egui::vec2(1200., 3000.))),
+                ..Default::default()
+            },
+            |ui| render(ui, &r),
+        );
+        assert!(corr_text(&mut out).contains("exp(Σ OLS residual)"));
+    }
     #[test]
     fn corr_matrix_paints_rho_key_and_keyed_fills() {
         let cell =
@@ -1442,7 +1814,7 @@ mod cache_v2_tests {
         let b = NamedBars { symbol: "B".into(), bars: b, source: "verified fixture".into(), ..Default::default() };
         let options = maths::Options { annual_periods: 252., daily: true };
         let call = |a: &NamedBars, b: &NamedBars, rows: &[NamedBars], h, observed| {
-            compute_cached(&reports, a, b, rows, options, Timeframe::D1, "test", h, observed).unwrap()
+            compute_cached(&reports, a, b, rows, options, Timeframe::D1, "test", h, observed, None).unwrap()
         };
         let first = call(&a, &b, &[], 1, Some(100));
         let same = call(&a, &b, &[], 1, Some(100));
@@ -1460,7 +1832,7 @@ mod cache_v2_tests {
         assert!(!std::sync::Arc::ptr_eq(&first, &with_peer));
         let mut bad = a.clone();
         bad.bars.last_mut().unwrap().provenance = tr_core::Provenance::Sample;
-        assert!(compute_cached(&reports, &bad, &b, &[], options, Timeframe::D1, "test", 1, Some(100)).is_err());
+        assert!(compute_cached(&reports, &bad, &b, &[], options, Timeframe::D1, "test", 1, Some(100), None).is_err());
     }
 }
 

@@ -446,6 +446,10 @@ pub enum Function {
     },
     StudioRoute(tr_data::studio::StudioRoute),
     StudioQuick {spec:String},
+    /// `RELATE [transform= h= beta= bands= matrix=]`: updates the focused Studio or opens a Relate lens.
+    StudioRelate {
+        spec: String,
+    },
     StudioWhen {
         spec: String,
     },
@@ -925,6 +929,16 @@ fn parse_function(head: &str, rest: &[&str]) -> Option<Function> {
         // the command; anything else falls through to the ticker (see parse()).
         "STUDIO" => {
             let spec = joined();
+            // LAB / RESID / ATTR are listed tickers, so their unavailable routes live behind STUDIO.
+            let route = match spec.to_ascii_lowercase().as_str() {
+                "lab" => Some(tr_data::studio::StudioRoute::Lab),
+                "resid" => Some(tr_data::studio::StudioRoute::Resid),
+                "attr" => Some(tr_data::studio::StudioRoute::Attr),
+                _ => None,
+            };
+            if let Some(route) = route {
+                return Some(Function::StudioRoute(route));
+            }
             crate::app::studio_hub::parse_studio(&spec).ok()?;
             Function::Studio { spec }
         }
@@ -933,11 +947,14 @@ fn parse_function(head: &str, rest: &[&str]) -> Option<Function> {
             tr_data::studio_when::parse_command(&spec).ok()?;
             Function::StudioWhen { spec }
         }
+        // Bare RELATE or key=value words only; anything else (e.g. `RELATE US Equity`) is the ticker.
+        "RELATE" => {
+            let spec = joined();
+            tr_data::studio_corr::RelateArgs::parse(&rest.iter().copied().collect::<Vec<_>>()).ok()?;
+            Function::StudioRelate { spec }
+        }
         "QUICK" => {let spec=joined();tr_data::studio_canvas::parse_spec(&spec).ok()?;Function::StudioQuick {spec}},
         "DSTRIP" if rest.is_empty()=>Function::DistributionStrip,
-        "LAB" if rest.is_empty() => Function::StudioRoute(tr_data::studio::StudioRoute::Lab),
-        "RESID" if rest.is_empty() => Function::StudioRoute(tr_data::studio::StudioRoute::Resid),
-        "ATTR" if rest.is_empty() => Function::StudioRoute(tr_data::studio::StudioRoute::Attr),
         "CORR" | "RBETA" => {
             let spec = joined();
             crate::app::studio_corr::parse_spec(&spec).ok()?;
@@ -1274,6 +1291,9 @@ fn describe(f: &Function) -> String {
         Function::Journal(q) => format!("Trade journal: {q}"),
         Function::Studio { spec } => format!("Studio · native canvas and named lenses · {spec}"),
         Function::StudioWhen { spec } => format!("When · fixed-family within-clock rule evidence · {spec}"),
+        Function::StudioRelate { spec } => {
+            format!("Relate · transforms, β and frozen-fit fair-value bands · {spec}")
+        }
         Function::StudioQuick {spec} => format!("Quick canvas · level/index100/change/z/vol · {spec}"),
         Function::DistributionStrip => "Toggle the closed-value distribution strip".into(),
         Function::StudioRoute(route) => route.reason().into(),
@@ -1569,6 +1589,34 @@ mod tests {
                 Some(Command::SymbolFunction(key.clone(), Function::Timeframe(Timeframe::W1))),
                 "{word} 1W"
             );
+        }
+        // LAB / RESID / ATTR are listed tickers; their routes live behind STUDIO.
+        for word in ["LAB", "RESID", "ATTR"] {
+            assert_eq!(parse(word), Some(Command::Symbol(format!("{word} US Equity"))), "{word}");
+            assert_eq!(parse(&format!("{word} US Equity")), Some(Command::Symbol(format!("{word} US Equity"))));
+        }
+        for (arg, route) in [
+            ("lab", tr_data::studio::StudioRoute::Lab),
+            ("resid", tr_data::studio::StudioRoute::Resid),
+            ("ATTR", tr_data::studio::StudioRoute::Attr),
+        ] {
+            assert_eq!(
+                parse(&format!("STUDIO {arg}")),
+                Some(Command::Function(Function::StudioRoute(route))),
+                "STUDIO {arg}"
+            );
+        }
+        // QUICK and WHEN follow the same shadow rules, including a weekly interval.
+        for word in ["QUICK", "WHEN"] {
+            let key = format!("{word} US Equity");
+            assert!(matches!(parse(word), Some(Command::Function(_))), "{word}");
+            assert_eq!(parse(&key), Some(Command::Symbol(key.clone())), "{word}");
+            assert_eq!(
+                parse(&format!("{word} 1W")),
+                Some(Command::SymbolFunction(key.clone(), Function::Timeframe(Timeframe::W1))),
+                "{word} 1W"
+            );
+            assert_eq!(parse(&format!("{} us equity <GO>", word.to_lowercase())), Some(Command::Symbol(key)));
         }
         assert_eq!(parse("CORR QQQ 1H"), Some(Command::Function(Function::StudioCorr { spec: "QQQ 1H".into() })));
         assert_eq!(parse("SSN 1h"), Some(Command::Function(Function::StudioSeason { spec: "1h".into() })));

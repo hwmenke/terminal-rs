@@ -676,6 +676,11 @@ cancels Brush before closing Inspector, and Ctrl+Z undoes Studio parameters outs
 lenses are retained without recomputing. `AAPL QUICK QQQ 5m mode=index100` opens
 five comparison modes, pinned Base UTC, the 44 px Distribution strip, dated lanes
 and a release-committed Brush. `DSTRIP` toggles the strip. See [Quick canvas](docs/STUDIO_CANVAS.md).
-LAB, RESID and ATTR remain unavailable. Legacy standalone research commands stay
+`RELATE` (or `STUDIO lens=relate benchmark=QQQ transform=logreturn h=5`) adds Relate
+transforms (level, change, log return, log level; h = 1, 5 or 20), a rolling or
+expanding β, a common-panel correlation matrix and a frozen-training fair-value overlay
+with residual ±σ bands drawn on the native chart; `RELATE transform=level bands=off`
+adjusts the focused Studio. See [Relate](docs/STUDIO_CORR.md).
+`STUDIO LAB`, `STUDIO RESID` and `STUDIO ATTR` remain unavailable routes (bare `LAB` etc. load their tickers). Legacy standalone research commands stay
 available. See [Studio shell](docs/STUDIO.md) for selection, data and persistence
 limits.

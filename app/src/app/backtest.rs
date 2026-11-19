@@ -256,6 +256,23 @@ pub(super) fn show(
     let sample_offline = sample;
     let mut reload = false;
     let mut export = false;
+    if sample {
+        // Refuse locally, with no worker request: nothing from a real-mode run (including an
+        // in-flight one) may stay visible while the display mode is sample / offline.
+        if pane.report.is_some() || pane.intraday_report.is_some() || pane.loading {
+            pane.generation = crate::worker::studio_token();
+        }
+        pane.report = None;
+        pane.intraday_report = None;
+        pane.receipt.clear();
+        pane.snapshot = None;
+        pane.loading = false;
+        // A worker refusal that already names sample mode stays; any other (real-mode) error is replaced.
+        if !pane.error.as_deref().is_some_and(|e| e.to_ascii_lowercase().contains("sample")) {
+            pane.error =
+                Some("Backtest refused: sample / offline display mode. Backtests never use sample bars.".into());
+        }
+    }
     {
         let intraday = pane.intraday;
         if !sample
@@ -962,6 +979,50 @@ mod tests {
         assert!(texts.contains("SAMPLE refused"));
         assert!(!texts.contains("OOS EQUITY"));
         assert!(!texts.contains("COMMON COMPARISON"));
+    }
+    #[test]
+    fn backtest_sample_mode_refuses_locally_without_requests() {
+        let mut app = test_app();
+        app.open_backtest(Some("AAPL"), "ALL");
+        app.provider = "verified fixture".into();
+        let id = app.focus;
+        let i = app.idx(id).unwrap();
+        let (worker, mut requests) = crate::worker::Worker::test_channel();
+        app.worker = worker;
+        let PaneKind::Backtest(p) = &mut app.panes[i].kind else { panic!("backtest") };
+        p.report = Some(honest_report());
+        p.receipt = "OLD RECEIPT real-mode run".into();
+        p.error = Some("earlier real-mode error".into());
+        p.loading = true;
+        let ctx = egui::Context::default();
+        let paint = |app: &mut crate::app::TerminalApp| {
+            let mut output = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(900., 1800.))),
+                    ..Default::default()
+                },
+                |ui| {
+                    app.backtest_pane(ui, id);
+                },
+            );
+            output.textures_delta.clear();
+            output
+                .shapes
+                .iter()
+                .filter_map(|s| if let egui::Shape::Text(t) = &s.shape { Some(t.galley.job.text.clone()) } else { None })
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        app.provider = "sample".into();
+        let text = paint(&mut app);
+        assert!(text.contains("Backtest refused"), "{text}");
+        assert!(!text.contains("OOS EQUITY") && !text.contains("OLD RECEIPT") && !text.contains("earlier real-mode"));
+        // Reload / RUN and repeated frames stay local.
+        let text = paint(&mut app);
+        assert!(text.contains("Backtest refused"));
+        assert!(requests.try_recv().is_err(), "sample mode must not send backtest requests");
+        let PaneKind::Backtest(p) = &app.panes[i].kind else { panic!() };
+        assert!(p.report.is_none() && p.receipt.is_empty() && !p.loading);
     }
     #[test]
     fn honest_backtest_revisions_and_generations_cannot_restore_stale_confidence() {

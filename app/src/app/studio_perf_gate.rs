@@ -169,6 +169,8 @@ fn perf_gate_paint_studios() {
     best.extend(shell_sample());
     best.extend(quick_sample());
     best.extend(when_sample());
+    best.extend(relate_sample());
+    best.extend(fair_value_sample());
     let ids: BTreeSet<_> = budgets.cases.keys().filter(|id| id.starts_with("paint.studio_")).cloned().collect();
     assert_eq!(best.keys().cloned().collect::<BTreeSet<_>>(), ids, "stale/missing studio budgets");
     for _ in 0..2 {
@@ -187,6 +189,8 @@ fn perf_gate_paint_studios() {
             .chain(shell_sample())
             .chain(quick_sample())
             .chain(when_sample())
+            .chain(relate_sample())
+            .chain(fair_value_sample())
         {
             if s.median_us < best[&id].median_us {
                 best.insert(id, s);
@@ -1357,4 +1361,408 @@ fn when_shaded_native_chart_paints_accepted_mask_only() {
     let out = shell_frame(&ctx, &mut pane, &worker, 1440., false, 30);
     assert!(!text(&out.shapes).contains("RULE · "), "refused report must not shade");
     assert_eq!(when_washes(&out), 0);
+}
+
+// ---- Relate (slice 4): panel paint + fair-value overlay on the native chart -------------------
+
+fn relate_report() -> tr_data::studio_corr::CorrReport {
+    use tr_data::studio::{BetaMode, MatrixMode, Transform};
+    let (a, b) = tr_perf::fixtures::related(5000, 0.8, 91);
+    let peers: Vec<_> = (0..5)
+        .map(|i| tr_data::studio_corr::NamedBars {
+            symbol: format!("PEER{i} US Equity"),
+            bars: tr_perf::fixtures::daily(5001, 200 + i),
+            source: "benchmark fixture only".into(),
+            ..Default::default()
+        })
+        .collect();
+    let mut spec = tr_data::studio_corr::RelateSpec::new("QQQ US Equity", Transform::LogReturn { h: 5 });
+    spec.beta_mode = BetaMode::Expanding;
+    spec.matrix = MatrixMode::Common;
+    let r = super::studio_corr::relate_fixture_report("AAPL US Equity", &spec, &a, &b, &peers);
+    let rel = r.relate.as_ref().unwrap();
+    assert!(rel.fit.is_some() && rel.expanding.len() == 1000 && rel.matrix_common.is_some());
+    r
+}
+fn relate_frame(
+    ctx: &egui::Context,
+    r: &tr_data::studio_corr::CorrReport,
+    width: f32,
+    hover: bool,
+    index: usize,
+) -> egui::FullOutput {
+    let pointer = if hover {
+        ctx.data(|d| d.get_temp::<Rect>(egui::Id::new("relate-probe"))).unwrap_or(Rect::NOTHING).center()
+            + vec2(if index >= 160 { (index % 2) as f32 } else { 0. }, 0.)
+    } else {
+        pos2(15., 15.)
+    };
+    let events = if ctx.input(|i| i.pointer.hover_pos()) == Some(pointer) {
+        vec![]
+    } else {
+        vec![egui::Event::PointerMoved(pointer)]
+    };
+    let mut out = ctx.run_ui(
+        egui::RawInput {
+            time: Some(1. + index as f64 * 0.2),
+            screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(width, 1200.))),
+            events,
+            ..Default::default()
+        },
+        |ui| super::studio_corr::relate_panel(ui, 17, r),
+    );
+    out.textures_delta.clear();
+    out
+}
+fn relate_guard(out: &egui::FullOutput) {
+    let txt = text(&out.shapes);
+    for word in [
+        "RELATE · TRANSFORM + FROZEN-FIT FAIR VALUE",
+        "log-return",
+        "in-sample descriptive",
+        "EXPANDING β · descriptive",
+        "CORRELATION · COMMON PANEL",
+        "same n=",
+        "CLOSED THRU",
+    ] {
+        assert!(txt.contains(word), "missing {word}: {txt}");
+    }
+    assert!(out.shapes.len() > 40, "empty relate panel");
+}
+fn relate_sample() -> BTreeMap<String, Summary> {
+    let ctx = egui::Context::default();
+    let r = relate_report();
+    for i in 0..20 {
+        finite(&ctx, relate_frame(&ctx, &r, 1440., false, i));
+    }
+    let mut result = BTreeMap::new();
+    for hover in [false, true] {
+        let mode = if hover { "hover" } else { "steady" };
+        if hover {
+            for i in 140..160 {
+                finite(&ctx, relate_frame(&ctx, &r, 1440., true, i));
+            }
+        }
+        let mut times: BTreeMap<String, Vec<f64>> = BTreeMap::new();
+        for i in 0..120 {
+            let start = Instant::now();
+            let mut out = relate_frame(&ctx, &r, 1440., hover, i + if hover { 160 } else { 20 });
+            let ui_us = start.elapsed().as_secs_f64() * 1e6;
+            if i == 60 {
+                relate_guard(&out);
+                if hover {
+                    assert!(
+                        text(&out.shapes).contains("relate.beta.expanding"),
+                        "hover did not paint the expanding-β MathCard"
+                    );
+                }
+            }
+            let start = Instant::now();
+            let primitives = ctx.tessellate(std::mem::take(&mut out.shapes), out.pixels_per_point);
+            let tess_us = start.elapsed().as_secs_f64() * 1e6;
+            assert!(!primitives.is_empty());
+            std::hint::black_box(primitives);
+            for (metric, v) in [("ui", ui_us), ("tess", tess_us), ("total", ui_us + tess_us)] {
+                times.entry(format!("paint.studio_relate.{mode}.{metric}")).or_default().push(v);
+            }
+        }
+        for (id, mut samples) in times {
+            result.insert(id, tr_perf::summarize(&mut samples));
+        }
+    }
+    result
+}
+#[test]
+fn relate_panel_geometry_and_actual_hover_320_1440() {
+    let r = relate_report();
+    for width in [320., 1440.] {
+        let ctx = egui::Context::default();
+        ctx.all_styles_mut(|s| s.interaction.tooltip_delay = 0.);
+        let out = relate_frame(&ctx, &r, width, false, 0);
+        if width == 1440. {
+            relate_guard(&out);
+        }
+        finite(&ctx, out);
+        let mut last = None;
+        for i in 140..160 {
+            last = Some(relate_frame(&ctx, &r, width, true, i));
+        }
+        let out = last.unwrap();
+        if width == 1440. {
+            let txt = text(&out.shapes);
+            assert!(txt.contains("relate.beta.expanding") && txt.contains("descriptive"), "{txt}");
+        }
+        finite(&ctx, out);
+    }
+}
+#[test]
+fn relate_fit_cards_and_unavailable_reason() {
+    let r = relate_report();
+    let rel = r.relate.as_ref().unwrap();
+    let fit = rel.fit.as_ref().unwrap();
+    // The cards carry the stable ids, the training receipt and the withheld-inference caveat.
+    for (c, id) in [(0, "relate.fit.alpha"), (1, "relate.fit.beta")] {
+        let card = super::studio_corr::fit_card(&r, rel, fit, c);
+        let ctx = egui::Context::default();
+        let mut out = ctx.run_ui(Default::default(), |ui| card.show(ui));
+        out.textures_delta.clear();
+        let txt = text(&out.shapes);
+        assert!(txt.contains(id) && txt.contains("CLOSED THRU") && txt.contains("p and q are withheld"), "{txt}");
+    }
+    // An unavailable fit prints its reason instead of numbers and paints no overlay inputs.
+    let mut bad = r.clone();
+    let rel = bad.relate.as_mut().unwrap();
+    rel.fit = None;
+    rel.points.clear();
+    rel.unavailable = Some("Fair value needs ≥30 training pairs; have 3 of 8 valid transformed pairs.".into());
+    let ctx = egui::Context::default();
+    let out = relate_frame(&ctx, &bad, 1440., false, 0);
+    assert!(text(&out.shapes).contains("Fair value unavailable: Fair value needs ≥30 training pairs"));
+}
+
+/// Pointer for the fair-value frames: the chart plot centre when hovering; the time-axis row when not.
+fn fv_frame(
+    ctx: &egui::Context,
+    pane: &mut super::studio_hub::StudioPane,
+    worker: &crate::worker::Worker,
+    width: f32,
+    hover: bool,
+    index: usize,
+) -> egui::FullOutput {
+    let pointer = if hover {
+        pos2(width * 0.6 + if index >= 160 { (index % 2) as f32 } else { 0. }, 350.)
+    } else {
+        pos2(width * 0.5 + (index % 2) as f32, 897.)
+    };
+    let events = if ctx.input(|i| i.pointer.hover_pos()) == Some(pointer) {
+        vec![]
+    } else {
+        vec![egui::Event::PointerMoved(pointer)]
+    };
+    let mut out = ctx.run_ui(
+        egui::RawInput {
+            time: Some(1. + index as f64 * 0.2),
+            screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(width, 900.))),
+            events,
+            ..Default::default()
+        },
+        |ui| {
+            pane.show(ui, 201, worker, false, true);
+        },
+    );
+    out.textures_delta.clear();
+    out
+}
+/// Meshes carrying the overlay's band fills (accent at 0.10 / 0.18, halved in-sample).
+fn fv_band_meshes(out: &egui::FullOutput) -> Vec<std::sync::Arc<egui::epaint::Mesh>> {
+    let accent = crate::theme::series(0);
+    let colours = [0.10f32, 0.18, 0.05, 0.09].map(|a| accent.gamma_multiply(a));
+    out.shapes
+        .iter()
+        .filter_map(|s| match &s.shape {
+            egui::Shape::Mesh(m)
+                if !m.vertices.is_empty() && m.vertices.iter().all(|v| colours.contains(&v.color)) =>
+            {
+                Some(m.clone())
+            }
+            _ => None,
+        })
+        .collect()
+}
+fn fv_strips(out: &egui::FullOutput) -> usize {
+    // Each strip is two quads (±2σ, ±1σ) of four vertices.
+    fv_band_meshes(out).iter().map(|m| m.vertices.len() / 8).sum()
+}
+fn fv_guard(pane: &super::studio_hub::StudioPane, out: &egui::FullOutput, hover: bool) {
+    let txt = text(&out.shapes);
+    // The default viewport shows the latest bars, which are all out of sample; the in-sample note is
+    // printed only when an in-sample region is on screen.
+    for word in ["FAIR VALUE · logret h=5", "frozen fit thru", "residual ±σ bands (target space)"] {
+        assert!(txt.contains(word), "fair-value overlay missing {word}: {txt}");
+    }
+    assert!(fv_strips(out) > 20, "band fills missing: {}", fv_strips(out));
+    crate::chart_view::perf_gate::studio_assert_canvas(&pane.chart, out, false);
+    if hover {
+        for word in ["relate.fair_value", "residual band", "mean CI", "prediction", "CLOSED THRU"] {
+            assert!(txt.contains(word), "fair-value hover missing {word}: {txt}");
+        }
+    }
+}
+fn fair_value_sample() -> BTreeMap<String, Summary> {
+    let mut result = BTreeMap::new();
+    for hover in [false, true] {
+        let mode = if hover { "hover" } else { "steady" };
+        let ctx = egui::Context::default();
+        let (worker, mut requests) = crate::worker::Worker::test_channel();
+        let mut pane = super::studio_hub::prepared_relate(&worker, &mut requests);
+        for i in 0..20 {
+            finite(&ctx, fv_frame(&ctx, &mut pane, &worker, 1440., false, i));
+        }
+        if hover {
+            for i in 140..160 {
+                finite(&ctx, fv_frame(&ctx, &mut pane, &worker, 1440., true, i));
+            }
+        }
+        while requests.try_recv().is_ok() {}
+        let mut times: BTreeMap<String, Vec<f64>> = BTreeMap::new();
+        for i in 0..120 {
+            let start = Instant::now();
+            let mut out = fv_frame(&ctx, &mut pane, &worker, 1440., hover, i + if hover { 160 } else { 20 });
+            let ui_us = start.elapsed().as_secs_f64() * 1e6;
+            if i == 60 {
+                fv_guard(&pane, &out, hover);
+            }
+            let start = Instant::now();
+            let primitives = ctx.tessellate(std::mem::take(&mut out.shapes), out.pixels_per_point);
+            let tess_us = start.elapsed().as_secs_f64() * 1e6;
+            assert!(!primitives.is_empty());
+            std::hint::black_box(primitives);
+            for (metric, v) in [("ui", ui_us), ("tess", tess_us), ("total", ui_us + tess_us)] {
+                times.entry(format!("paint.studio_fair_value.{mode}.{metric}")).or_default().push(v);
+            }
+        }
+        // A steady accepted overlay never dispatches research.
+        while let Ok(r) = requests.try_recv() {
+            assert!(!matches!(r, crate::worker::Request::StudioCorr { .. }), "steady fair value dispatched CORR work");
+        }
+        for (id, mut samples) in times {
+            result.insert(id, tr_perf::summarize(&mut samples));
+        }
+    }
+    result
+}
+#[test]
+fn fair_value_overlay_paints_bands_and_actual_hover() {
+    let ctx = egui::Context::default();
+    let (worker, mut requests) = crate::worker::Worker::test_channel();
+    let mut pane = super::studio_hub::prepared_relate(&worker, &mut requests);
+    let mut out = None;
+    for i in 0..21 {
+        out = Some(fv_frame(&ctx, &mut pane, &worker, 1440., false, i));
+    }
+    let out = out.unwrap();
+    fv_guard(&pane, &out, false);
+    assert!(!text(&out.shapes).contains("relate.fair_value"), "no hover card without hover");
+    finite(&ctx, out);
+    ctx.all_styles_mut(|s| s.interaction.tooltip_delay = 0.);
+    let mut last = None;
+    for i in 140..160 {
+        last = Some(fv_frame(&ctx, &mut pane, &worker, 1440., true, i));
+    }
+    let out = last.unwrap();
+    fv_guard(&pane, &out, true);
+    finite(&ctx, out);
+    // The bands toggle hides the fills but keeps the centre line, caption and hover.
+    pane.corr_mut().unwrap().relate.as_mut().unwrap().bands = false;
+    let out = fv_frame(&ctx, &mut pane, &worker, 1440., false, 200);
+    assert_eq!(fv_strips(&out), 0);
+    assert!(text(&out.shapes).contains("FAIR VALUE · "));
+}
+#[test]
+fn fair_value_gap_breaks_split_band_polygons() {
+    let ctx = egui::Context::default();
+    let (worker, mut requests) = crate::worker::Worker::test_channel();
+    let mut pane = super::studio_hub::prepared_relate(&worker, &mut requests);
+    let base = fv_frame(&ctx, &mut pane, &worker, 1440., false, 0);
+    let strips = fv_strips(&fv_frame(&ctx, &mut pane, &worker, 1440., false, 1));
+    assert!(strips > 20 && fv_strips(&base) > 0);
+    // Break before a visible point: the strip into it disappears and no polygon spans its x.
+    let c = pane.corr_mut().unwrap();
+    let mut report = (**c.report.as_ref().unwrap()).clone();
+    let rel = report.relate.as_mut().unwrap();
+    let k = rel.points.len() - 30;
+    let gap_ts = rel.points[k].ts;
+    rel.points[k].break_before = true;
+    c.report = Some(std::sync::Arc::new(report));
+    let out = fv_frame(&ctx, &mut pane, &worker, 1440., false, 2);
+    assert_eq!(fv_strips(&out), strips - 1, "one strip is removed at the break");
+    let x = pane.chart.studio_test_x_of(gap_ts).expect("break point is on a chart bar");
+    let spanning = fv_band_meshes(&out).iter().any(|m| {
+        m.vertices.chunks(4).any(|q| {
+            let (lo, hi) = q.iter().fold((f32::MAX, f32::MIN), |a, v| (a.0.min(v.pos.x), a.1.max(v.pos.x)));
+            lo < x - 0.01 && hi > x + 0.01
+        })
+    });
+    assert!(!spanning, "a band polygon crosses the break at x={x}");
+}
+#[test]
+fn fair_value_clears_on_context_change() {
+    let ctx = egui::Context::default();
+    let (worker, mut requests) = crate::worker::Worker::test_channel();
+    let mut pane = super::studio_hub::prepared_relate(&worker, &mut requests);
+    let out = fv_frame(&ctx, &mut pane, &worker, 1440., false, 0);
+    assert!(text(&out.shapes).contains("FAIR VALUE · "));
+    let old = pane.corr_mut().unwrap().generation;
+    let report = pane.corr_mut().unwrap().report.clone().unwrap();
+    pane.set_context_symbol("MSFT US Equity");
+    let out = fv_frame(&ctx, &mut pane, &worker, 1440., false, 1);
+    assert!(!text(&out.shapes).contains("FAIR VALUE"), "overlay must clear on the same frame");
+    assert!(fv_band_meshes(&out).is_empty());
+    // A late response carrying the old token is ignored by the replacement child.
+    pane.ensure_child();
+    let c = pane.corr_mut().unwrap();
+    c.accept_shared(old, Ok(report));
+    assert!(c.report.is_none() && c.fair_value_overlay("AAPL US Equity").is_none());
+    assert!(c.fair_value_overlay("MSFT US Equity").is_none());
+}
+#[test]
+fn fair_value_not_painted_in_quick_canvas_mode_or_for_other_inputs() {
+    let ctx = egui::Context::default();
+    let (worker, mut requests) = crate::worker::Worker::test_channel();
+    let mut pane = super::studio_hub::prepared_relate(&worker, &mut requests);
+    // Changed inputs: the accepted report no longer matches, so nothing is painted.
+    pane.corr_mut().unwrap().relate.as_mut().unwrap().transform = tr_data::studio::Transform::Change { h: 5 };
+    let out = fv_frame(&ctx, &mut pane, &worker, 1440., false, 0);
+    assert!(!text(&out.shapes).contains("FAIR VALUE"));
+    pane.corr_mut().unwrap().relate.as_mut().unwrap().transform = tr_data::studio::Transform::LogReturn { h: 5 };
+    assert!(text(&fv_frame(&ctx, &mut pane, &worker, 1440., false, 1).shapes).contains("FAIR VALUE"));
+    // Quick canvas: the y axis is not price, so the overlay must not paint.
+    let mut view = pane.chart.canvas_view();
+    view.enabled = true;
+    pane.chart.set_canvas_view(view);
+    let out = fv_frame(&ctx, &mut pane, &worker, 1440., false, 2);
+    assert!(!text(&out.shapes).contains("FAIR VALUE"));
+}
+#[test]
+fn relate_bands_hover_text_distinguishes_residual_band_from_mean_ci() {
+    // n=2,000 on the related fixture: ±1σ band half-width is exactly σ; the mean CI is far narrower.
+    use tr_data::studio::Transform;
+    use tr_data::studio_corr as sc;
+    let (a, b) = tr_perf::fixtures::related(2000, 1.1, 11);
+    let named = |s: &str, bars: Vec<tr_core::Bar>| sc::NamedBars {
+        symbol: s.into(),
+        bars,
+        source: "benchmark fixture only".into(),
+        ..Default::default()
+    };
+    let (a, b) = (named("AAPL US Equity", a), named("QQQ US Equity", b));
+    let opt = sc::Options { annual_periods: 252., daily: true };
+    let p = sc::prepare(&a, &b, opt, tr_core::Timeframe::D1, Transform::Change { h: 1 }, "u", 0, None).unwrap();
+    let fit = sc::training_fit(&p, 1, tr_data::studio_inference::CovarianceMethod::HacFixed5).unwrap();
+    let pts = sc::fair_value(&p, &fit);
+    let q = pts.last().unwrap();
+    let band = q.bands[2] - q.centre;
+    assert!((band - fit.sigma).abs() <= 1e-12 * fit.sigma.abs().max(1.), "{band} vs σ {}", fit.sigma);
+    let h = sc::hover_stats(&fit, q).unwrap();
+    let half = (h.mean_ci[1] - q.centre).abs();
+    assert!((half - 1.96 * h.se_mean).abs() <= 1e-9 * half.max(1e-12));
+    assert!(half < fit.sigma / 5., "mean CI {half} vs σ {}", fit.sigma);
+    assert!(h.se_prediction > fit.sigma && h.se_prediction < fit.sigma * 1.01);
+    // The hover card text names all three quantities.
+    let report = super::studio_corr::relate_fixture_report(
+        "AAPL US Equity",
+        &sc::RelateSpec::new("QQQ US Equity", Transform::Change { h: 1 }),
+        &a.bars,
+        &b.bars,
+        &[],
+    );
+    let rel = report.relate.as_ref().unwrap();
+    let card = crate::app::studio_corr::fair_value_card(&report, rel, rel.fit.as_ref().unwrap(), rel.points.last().unwrap());
+    let ctx = egui::Context::default();
+    let mut out = ctx.run_ui(Default::default(), |ui| card.show(ui));
+    out.textures_delta.clear();
+    let txt = text(&out.shapes);
+    for word in ["residual band", "mean CI", "prediction", "CLOSED THRU", "relate.fair_value"] {
+        assert!(txt.contains(word), "card missing {word}: {txt}");
+    }
 }

@@ -231,7 +231,7 @@ fn robust_report(pairs: &[PairReturn], ols: &Ols, annual_periods: f64) -> Robust
     robust_report_horizon(pairs, ols, annual_periods, 1)
 }
 fn robust_report_horizon(pairs: &[PairReturn], ols: &Ols, annual_periods: f64, horizon: usize) -> RobustReport {
-    let breaks: Vec<_> = pairs.iter().enumerate().map(|(i, p)| i > 0 && pairs[i - 1].end < p.start).collect();
+    let breaks = pair_breaks(pairs);
     let effective = |method| {
         if horizon > 1 && matches!(method, CovarianceMethod::HacFixed5 | CovarianceMethod::HacAutomatic) {
             CovarianceMethod::Overlap(horizon)
@@ -241,22 +241,42 @@ fn robust_report_horizon(pairs: &[PairReturn], ols: &Ols, annual_periods: f64, h
     };
     let fits = SE_METHODS.iter().map(|&method| fit_inference(pairs, ols, &breaks, effective(method))).collect();
     let mut rolling = vec![Vec::new(); SE_METHODS.len()];
+    // Lean rolling refits: one residual buffer, no per-window `Ols`/Family/design allocations.
+    // Arithmetic matches `regress` + `fit_inference` operation for operation (bit-identical).
+    let mut residual = Vec::with_capacity(60);
+    let mut labels: Vec<(CovarianceMethod, usize, bool, String)> = Vec::new();
     for end in 60.max(pairs.len().saturating_sub(999))..=pairs.len() {
         let start = end - 60;
         let w = &pairs[start..end];
         let crosses = breaks[start + 1..end].iter().any(|b| *b);
-        let m = regress(w, annual_periods).expect("admitted returns");
+        let core = (!crosses).then(|| core_fit(w));
+        if let Some(core) = &core {
+            residual.clear();
+            residual.extend(
+                w.iter().map(|p| p.asset - core.alpha.unwrap_or(0.) - core.beta.unwrap_or(0.) * p.benchmark),
+            );
+        }
+        let magnitude = w.iter().map(|p| p.asset.abs()).fold(0., f64::max);
         for (i, &method) in SE_METHODS.iter().enumerate() {
-            let fit = (!crosses).then(|| fit_inference(w, &m, &breaks[start..end], effective(method)));
+            let (interval, label) = match &core {
+                Some(core) => {
+                    let (interval, method, lag, fallback) =
+                        rolling_beta_interval(w, &breaks[start..end], &residual, magnitude, core, effective(method));
+                    let at = labels.iter().position(|l| l.0 == method && l.1 == lag && l.2 == fallback);
+                    let at = at.unwrap_or_else(|| {
+                        labels.push((method, lag, fallback, method.label(lag, fallback)));
+                        labels.len() - 1
+                    });
+                    (interval, labels[at].3.clone())
+                }
+                None => (None, "window crosses a vault join".to_string()),
+            };
             rolling[i].push(BetaBandPoint {
                 ts: w[59].end,
                 start: w[0].start,
-                beta: (!crosses).then_some(m.beta).flatten(),
-                covariance_label: fit
-                    .as_ref()
-                    .map(|f| f.covariance.label())
-                    .unwrap_or_else(|| "window crosses a vault join".into()),
-                interval: fit.and_then(|f| f.intervals[1]),
+                beta: core.as_ref().and_then(|c| c.beta),
+                covariance_label: label,
+                interval,
                 break_before: breaks[end - 1] || crosses,
             });
         }
@@ -267,6 +287,94 @@ fn robust_report_horizon(pairs: &[PairReturn], ols: &Ols, annual_periods: f64, h
         holdout: Some(chronological_holdout(pairs, annual_periods)),
         theil_sen: Some(theil_sen(pairs)),
     }
+}
+
+fn pair_breaks(pairs: &[PairReturn]) -> Vec<bool> {
+    pairs.iter().enumerate().map(|(i, p)| i > 0 && pairs[i - 1].end < p.start).collect()
+}
+
+/// Same expressions and summation order as the head of [`regress`].
+fn moments(w: &[PairReturn]) -> (f64, f64, f64, f64, f64) {
+    let n = w.len();
+    let mx = w.iter().map(|p| p.benchmark).sum::<f64>() / n as f64;
+    let my = w.iter().map(|p| p.asset).sum::<f64>() / n as f64;
+    let xx = w.iter().map(|p| (p.benchmark - mx).powi(2)).sum::<f64>();
+    let yy = w.iter().map(|p| (p.asset - my).powi(2)).sum::<f64>();
+    let xy = w.iter().map(|p| (p.benchmark - mx) * (p.asset - my)).sum::<f64>();
+    (mx, my, xx, yy, xy)
+}
+
+/// β and Pearson ρ of one window exactly as `regress` computes them, without the
+/// up/down-capture subsets. Windows are ≥ 3 admitted (finite) returns.
+fn beta_corr(w: &[PairReturn]) -> (Option<f64>, Option<f64>) {
+    let n = w.len();
+    if n < 3 {
+        return (None, None);
+    }
+    let (_, _, xx, yy, xy) = moments(w);
+    let tolerance = n as f64 * (16.0 * f64::EPSILON).powi(2);
+    if xx > tolerance {
+        let correlation = if yy > tolerance {
+            finite((xy / xx.sqrt() / yy.sqrt()).clamp(-1.0, 1.0))
+        } else {
+            None
+        };
+        (finite(xy / xx), correlation)
+    } else {
+        (None, None)
+    }
+}
+
+struct CoreFit {
+    alpha: Option<f64>,
+    beta: Option<f64>,
+    sigma: Option<f64>,
+}
+
+/// α, β and regression σ of one window, as `regress` computes them.
+fn core_fit(w: &[PairReturn]) -> CoreFit {
+    let n = w.len();
+    let mut out = CoreFit { alpha: None, beta: None, sigma: None };
+    if n < 3 {
+        return out;
+    }
+    let (mx, my, xx, _, xy) = moments(w);
+    let tolerance = n as f64 * (16.0 * f64::EPSILON).powi(2);
+    if xx > tolerance {
+        let beta = xy / xx;
+        let alpha = my - beta * mx;
+        let variance = w.iter().map(|p| (p.asset - alpha - beta * p.benchmark).powi(2)).sum::<f64>() / (n - 2) as f64;
+        out.alpha = finite(alpha);
+        out.beta = finite(beta);
+        out.sigma = finite(variance.sqrt());
+    }
+    out
+}
+
+/// The 95% β interval `fit_inference` would report for this window, plus the effective
+/// method, lag and fallback flag that label it. No testing-family work: rolling points
+/// never use p or q.
+fn rolling_beta_interval(
+    w: &[PairReturn],
+    breaks: &[bool],
+    residual: &[f64],
+    magnitude: f64,
+    core: &CoreFit,
+    method: CovarianceMethod,
+) -> (Option<(f64, f64)>, CovarianceMethod, usize, bool) {
+    let mut covariance = inference::regression_covariance_two(w.len(), |t| [1., w[t].benchmark], residual, breaks, method);
+    if core.alpha.is_none()
+        || core.beta.is_none()
+        || core.sigma.is_none_or(|s| s <= 64. * f64::EPSILON * magnitude)
+    {
+        covariance.covariance = None;
+    }
+    if covariance.covariance.as_ref().is_some_and(|v| v[0][0] <= 0. || v[1][1] <= 0.) {
+        covariance.covariance = None;
+    }
+    let se = covariance.mean_se(&[0., 1.]);
+    let interval = core.beta.zip(se).filter(|(_, s)| *s > 0.).map(|(v, s)| (v - 1.96 * s, v + 1.96 * s));
+    (interval, covariance.method, covariance.lag, covariance.fallback)
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -295,6 +403,10 @@ pub struct CorrReport {
     pub matrix: Matrix,
     /// Vault gaps (asset or benchmark) inside the common range; no return spans one.
     pub gaps: Vec<(i64, i64)>,
+    /// Relate transforms, expanding β, common panel and fair value. Absent for legacy CORR/RBETA,
+    /// and omitted from serialization when absent so legacy exports are unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relate: Option<Box<RelateReport>>,
 }
 
 /// Both entire input series must pass admission, even rows outside the intersection.
@@ -556,24 +668,30 @@ pub fn compute_series_at_horizon(
     let gaps: Vec<_> = all_gaps.iter().copied().filter(|g| g.1 > first && g.0 < last).collect();
     let ols = regress(&pairs, annual_periods)?;
     let robust = robust_report_horizon(&pairs, &ols, annual_periods, horizon);
+    // `pairs` already passed `regress`, so every window is finite. A window is broken when any
+    // adjacent pair inside it is non-contiguous: an O(1) prefix-count check per window.
+    let breaks = pair_breaks(&pairs);
+    let mut prefix = Vec::with_capacity(breaks.len() + 1);
+    prefix.push(0usize);
+    prefix.extend(breaks.iter().scan(0usize, |c, b| {
+        *c += usize::from(*b);
+        Some(*c)
+    }));
     let rolling = ROLLING_WINDOWS
         .iter()
         .map(|&window| {
             let points = pairs
                 .windows(window)
-                .map(|w| {
-                    let broken = w.windows(2).any(|p| p[0].end < p[1].start);
-                    let m = regress(w, annual_periods)?;
-                    Ok((
-                        w[window - 1].end,
-                        if broken { None } else { m.beta },
-                        if broken { None } else { m.correlation },
-                    ))
+                .enumerate()
+                .map(|(s, w)| {
+                    let broken = prefix[s + window] - prefix[s + 1] > 0;
+                    let (beta, correlation) = beta_corr(w);
+                    (w[window - 1].end, if broken { None } else { beta }, if broken { None } else { correlation })
                 })
-                .collect::<Result<Vec<_>, String>>()?;
-            Ok(Rolling { window, points })
+                .collect();
+            Rolling { window, points }
         })
-        .collect::<Result<Vec<_>, String>>()?;
+        .collect::<Vec<_>>();
     let mut cumulative = 0.0;
     let mut next_pair = 0;
     let path = prices
@@ -591,8 +709,10 @@ pub fn compute_series_at_horizon(
             } else {
                 None
             };
+            // At h>1 the pairs are overlapping h-bar returns; summing their residuals would
+            // count each one-bar residual about h times, so the path is unavailable.
             let residual_return = match (ols.alpha, ols.beta) {
-                (Some(alpha), Some(beta)) => {
+                (Some(alpha), Some(beta)) if horizon == 1 => {
                     // Pairs are a gap-filtered subsequence; match by end timestamp.
                     if pairs.get(next_pair).is_some_and(|p| p.end == ts) {
                         let p = &pairs[next_pair];
@@ -626,6 +746,7 @@ pub fn compute_series_at_horizon(
         path,
         matrix: matrix(rows, daily),
         gaps,
+        relate: None,
     })
 }
 
@@ -811,6 +932,17 @@ mod tests {
         assert_eq!(m.cells[2][2].correlation, None);
     }
 }
+
+#[path = "studio_relate.rs"]
+mod relate;
+pub use relate::*;
+
+#[cfg(test)]
+#[path = "studio_corr_fast_tests.rs"]
+mod fast_path_tests;
+#[cfg(test)]
+#[path = "studio_relate_tests.rs"]
+mod relate_tests;
 
 #[cfg(test)]
 mod robust_tests {

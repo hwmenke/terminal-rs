@@ -223,38 +223,44 @@ fn sample_stats(v: &[f64]) -> Option<(f64, f64)> {
     (mean.is_finite() && sd.is_finite()).then_some((mean, sd))
 }
 pub(crate) fn expected_breaks(input: &CanvasInput, bars: &[Bar]) -> Vec<bool> {
-    let class = crate::security(&input.symbol).class;
+    let gaps = input.stitch.as_ref().map_or(&[][..], |s| s.gaps.as_slice());
+    expected_breaks_for(&input.symbol, input.tf, bars, gaps)
+}
+/// `breaks[i]` is true when bar `i` does not follow bar `i-1` on the instrument's expected grid
+/// (supported cash calendar, or an explicit UTC grid for other classes) or a vault gap lies
+/// between them. `breaks[0]` is always true.
+pub(crate) fn expected_breaks_for(symbol: &str, tf: Timeframe, bars: &[Bar], gaps: &[(i64, i64)]) -> Vec<bool> {
+    let class = crate::security(symbol).class;
     let cash = crate::time_link::cash_class(class);
     let mut grid = BTreeMap::new();
-    if cash && input.tf.is_intraday() {
+    if cash && tf.is_intraday() {
         for b in bars {
             grid.entry(tr_core::ny::civil(b.ts).date())
-                .or_insert_with(|| crate::intraday::regular_opens(tr_core::ny::civil(b.ts).date(), input.tf));
+                .or_insert_with(|| crate::intraday::regular_opens(tr_core::ny::civil(b.ts).date(), tf));
         }
     }
-    let gaps = input.stitch.as_ref().map_or(&[][..], |s| s.gaps.as_slice());
     (0..bars.len())
         .map(|i| {
             if i == 0 {
                 return true;
             }
             let (a, b) = (bars[i - 1].ts, bars[i].ts);
-            let adjacent = if cash && input.tf == Timeframe::D1 {
+            let adjacent = if cash && tf == Timeframe::D1 {
                 let ad = chrono::DateTime::from_timestamp(a, 0).unwrap().date_naive();
                 let bd = chrono::DateTime::from_timestamp(b, 0).unwrap().date_naive();
                 crate::history::calendar::next_session(ad) == bd
-            } else if cash && input.tf.is_intraday() {
+            } else if cash && tf.is_intraday() {
                 let date = tr_core::ny::civil(a).date();
                 let opens = &grid[&date];
                 opens.binary_search(&a).ok().and_then(|k| {
                     opens.get(k + 1).copied().or_else(|| {
-                        crate::intraday::regular_opens(crate::history::calendar::next_session(date), input.tf)
+                        crate::intraday::regular_opens(crate::history::calendar::next_session(date), tf)
                             .first()
                             .copied()
                     })
                 }) == Some(b)
             } else {
-                b - a == input.tf.seconds()
+                b - a == tf.seconds()
             };
             !adjacent || crate::studio_dist::spans_gap(gaps, a, b)
         })

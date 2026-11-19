@@ -149,14 +149,60 @@ mod tests {
 }
 
 /// Shared signed analytical values. These never masquerade as positive-price bars.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum Transform {
     Level,
     Change { h: usize },
     LogReturn { h: usize },
     LogLevel,
 }
-#[derive(Debug, Clone, PartialEq, Eq)]
+impl Transform {
+    /// Return horizon in bars (1 for the level transforms).
+    pub fn horizon(self) -> usize {
+        match self {
+            Self::Change { h } | Self::LogReturn { h } => h,
+            Self::Level | Self::LogLevel => 1,
+        }
+    }
+    pub fn is_level(self) -> bool {
+        matches!(self, Self::Level | Self::LogLevel)
+    }
+    pub fn short(self) -> String {
+        match self {
+            Self::Level => "level".into(),
+            Self::LogLevel => "loglevel".into(),
+            Self::Change { h } => format!("change h={h}"),
+            Self::LogReturn { h } => format!("logret h={h}"),
+        }
+    }
+    /// Parses `level|change|logreturn|loglevel`; `h` must be 1, 5 or 20 for the h transforms.
+    pub fn parse(name: &str, h: usize) -> Result<Self, String> {
+        if ![1, 5, 20].contains(&h) {
+            return Err("Relate h must be 1, 5 or 20".into());
+        }
+        match name.to_ascii_lowercase().as_str() {
+            "level" => Ok(Self::Level),
+            "loglevel" => Ok(Self::LogLevel),
+            "change" => Ok(Self::Change { h }),
+            "logreturn" | "logret" => Ok(Self::LogReturn { h }),
+            _ => Err("transform must be level, change, logreturn or loglevel".into()),
+        }
+    }
+}
+/// Rolling β is the legacy windowed fit; expanding β is descriptive only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
+pub enum BetaMode {
+    #[default]
+    Rolling,
+    Expanding,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
+pub enum MatrixMode {
+    #[default]
+    Pairwise,
+    Common,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SeriesUnit {
     Native(String),
     Index100,
@@ -173,7 +219,7 @@ impl SeriesUnit {
         }
     }
 }
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SeriesReceipt {
     pub source: String,
     pub provenance: tr_core::Provenance,
@@ -182,7 +228,7 @@ pub struct SeriesReceipt {
     pub input_digest: u64,
     pub gaps: Vec<(i64, i64)>,
 }
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ScalarSeries {
     pub ts: Vec<i64>,
     pub values: Vec<Option<f64>>,

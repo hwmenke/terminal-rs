@@ -17,6 +17,9 @@ use crate::congress_view::FeedFilter;
 use crate::dock::{Node, PaneId};
 use crate::layout::Layout;
 
+fn one_bar() -> usize {
+    1
+}
 fn rotation_tail() -> u8 {
     10
 }
@@ -233,6 +236,12 @@ pub enum PaneSettings {
         symbol: String,
         #[serde(default)]
         spec: String,
+        /// Return horizon in bars (1, 5 or 20); old layouts restore h=1.
+        #[serde(default = "one_bar")]
+        horizon: usize,
+        /// Relate transform inputs; absent is the legacy CORR / RBETA behaviour.
+        #[serde(default)]
+        relate: Option<tr_data::studio_corr::RelateSpec>,
     },
     /// Statistics / conditional returns for one research symbol.
     Stats {

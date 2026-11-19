@@ -64,11 +64,78 @@ fn studio_legacy_commands_preserved() {
         tr_data::studio::StudioRoute::Resid,
         tr_data::studio::StudioRoute::Attr,
     ] {
-        assert_eq!(command::parse(r.code()), Some(Command::Function(Function::StudioRoute(r))));
+        assert_eq!(command::parse(&format!("STUDIO {}", r.code())), Some(Command::Function(Function::StudioRoute(r))));
         assert!(r.reason().contains("unavailable"));
     }
     assert!(matches!(command::parse("AAPL QUICK QQQ 5m mode=index100"),Some(Command::SymbolFunction(_,Function::StudioQuick {..}))));
     assert!(command::parse("STUDIO lens=typo").is_none());
+}
+#[test]
+fn studio_relate_parse_routes_h_to_relate() {
+    use tr_data::studio::{BetaMode, MatrixMode, Transform};
+    let (lens, _, benchmark, inputs) =
+        parse_studio("lens=relate benchmark=QQQ transform=logreturn h=5 beta=expanding matrix=common bands=off").unwrap();
+    assert_eq!(lens, StudioLens::Relate);
+    assert_eq!(benchmark, "QQQ");
+    assert_eq!(inputs.relate_transform, Some(Transform::LogReturn { h: 5 }));
+    assert_eq!((inputs.relate_beta, inputs.relate_matrix, inputs.relate_bands), (BetaMode::Expanding, MatrixMode::Common, false));
+    // Level transforms take no horizon; every h outside {1, 5, 20} is refused.
+    assert_eq!(parse_studio("lens=relate transform=loglevel").unwrap().3.relate_transform, Some(Transform::LogLevel));
+    assert!(parse_studio("lens=relate transform=logreturn h=7").is_err());
+    assert!(parse_studio("lens=relate transform=nope").is_err());
+    assert!(parse_studio("lens=dist transform=level").is_err(), "relate words require lens=relate");
+    // h= still routes to When for lens=when, and stays an error elsewhere.
+    let when = parse_studio("lens=when h=6").unwrap();
+    assert_eq!((when.0, when.3.when_horizon), (StudioLens::When, 6));
+    assert!(parse_studio("lens=dist h=5").is_err());
+    assert!(matches!(
+        command::parse("STUDIO lens=relate benchmark=QQQ transform=logreturn h=5"),
+        Some(Command::Function(Function::Studio { .. }))
+    ));
+    assert!(command::parse("STUDIO lens=relate h=7").is_none());
+    // RELATE words: bare opens a Relate Studio; invalid arguments fall through to the ticker.
+    assert_eq!(command::parse("RELATE"), Some(Command::Function(Function::StudioRelate { spec: String::new() })));
+    assert_eq!(
+        command::parse("RELATE transform=level bands=off"),
+        Some(Command::Function(Function::StudioRelate { spec: "transform=level bands=off".into() }))
+    );
+    assert_eq!(command::parse("RELATE US Equity"), Some(Command::Symbol("RELATE US Equity".into())));
+    assert!(!matches!(command::parse("RELATE h=7"), Some(Command::Function(Function::StudioRelate { .. }))));
+}
+#[test]
+fn relate_inputs_serde_old_layout_defaults() {
+    use tr_data::studio::{BetaMode, MatrixMode};
+    // An old saved view has none of the Relate fields: defaults apply (bands on, rolling, pairwise).
+    let old: StudioViewSpec = serde_json::from_str(r#"{"lens":"Relate","inputs":{"corr_horizon":5}}"#).unwrap();
+    assert_eq!(old.inputs.corr_horizon, 5);
+    assert_eq!(old.inputs.relate_transform, None);
+    assert_eq!((old.inputs.relate_beta, old.inputs.relate_matrix, old.inputs.relate_bands), (BetaMode::Rolling, MatrixMode::Pairwise, true));
+    // The default Relate transform follows the legacy horizon.
+    assert_eq!(old.inputs.relate_spec("QQQ US Equity").transform, tr_data::studio::Transform::LogReturn { h: 5 });
+    let mut v = StudioViewSpec::default();
+    v.inputs.relate_transform = Some(tr_data::studio::Transform::Change { h: 20 });
+    v.inputs.relate_matrix = MatrixMode::Common;
+    assert_eq!(serde_json::from_str::<StudioViewSpec>(&serde_json::to_string(&v).unwrap()).unwrap(), v);
+}
+#[test]
+fn relate_command_updates_the_focused_studio_without_opening_a_pane() {
+    use tr_data::studio::{BetaMode, Transform};
+    let mut app = test_app();
+    app.open_studio(Some("AAPL"), "lens=relate benchmark=QQQ");
+    let before = app.panes.len();
+    let focus = app.focus;
+    app.open_relate(None, "transform=change h=20 beta=expanding");
+    assert_eq!(app.panes.len(), before, "RELATE with arguments adjusts the focused Studio");
+    let i = app.idx(focus).unwrap();
+    let PaneKind::Studio(s) = &mut app.panes[i].kind else { panic!("studio") };
+    assert_eq!(s.lens, StudioLens::Relate);
+    let spec = s.corr_mut().unwrap().relate.clone().unwrap();
+    assert_eq!((spec.transform, spec.beta_mode), (Transform::Change { h: 20 }, BetaMode::Expanding));
+    assert_eq!(s.corr_mut().unwrap().horizon, 20);
+    // Bare RELATE opens a Relate Studio (a status line names it).
+    app.open_relate(None, "");
+    assert!(app.status.starts_with("Relate"), "{}", app.status);
+    assert!(app.panes.iter().any(|p| matches!(&p.kind, PaneKind::Studio(s) if s.lens == StudioLens::Relate)));
 }
 #[test]
 fn when_commands_route_and_persist_backward_compatibly() {

@@ -143,6 +143,21 @@
       "relative": true,
       "class": "interactive"
     },
+    "studio.relate_transforms_5k": {
+      "budget_us": 10000,
+      "relative": true,
+      "class": "interactive"
+    },
+    "studio.relate_expanding_5k": {
+      "budget_us": 40000,
+      "relative": true,
+      "class": "interactive"
+    },
+    "studio.fair_value_5k": {
+      "budget_us": 5000,
+      "relative": true,
+      "class": "interactive"
+    },
     "inference.stationary_bootstrap_5k_x500": {
       "budget_us": 120000,
       "relative": true,

@@ -31,6 +31,11 @@ pub struct StudioInputs {
     pub slippage: String,
     pub allow_short: bool,
     pub honesty: tr_data::backtest_honesty::HonestySettings,
+    /// Relate lens inputs. `None` transform means the default (log return at `corr_horizon`).
+    pub relate_transform: Option<tr_data::studio::Transform>,
+    pub relate_beta: tr_data::studio::BetaMode,
+    pub relate_bands: bool,
+    pub relate_matrix: tr_data::studio::MatrixMode,
 }
 impl Default for StudioInputs {
     fn default() -> Self {
@@ -50,7 +55,22 @@ impl Default for StudioInputs {
             slippage: format!("{:.0}", tr_data::backtest::DEFAULT_SLIPPAGE_BPS),
             allow_short: false,
             honesty: Default::default(),
+            relate_transform: None,
+            relate_beta: Default::default(),
+            relate_bands: true,
+            relate_matrix: Default::default(),
         }
+    }
+}
+impl StudioInputs {
+    /// The Relate spec these inputs describe for a benchmark key.
+    pub fn relate_spec(&self, benchmark: &str) -> tr_data::studio_corr::RelateSpec {
+        let transform = self.relate_transform.unwrap_or(tr_data::studio::Transform::LogReturn { h: self.corr_horizon });
+        let mut spec = tr_data::studio_corr::RelateSpec::new(benchmark, transform);
+        spec.beta_mode = self.relate_beta;
+        spec.bands = self.relate_bands;
+        spec.matrix = self.relate_matrix;
+        spec
     }
 }
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -202,7 +222,15 @@ impl StudioPane {
                     inputs.overlap = p.overlap;
                     inputs.thresholds = p.thresholds;
                 }
-                StudioLensState::Relate(p) => inputs.corr_horizon = p.horizon,
+                StudioLensState::Relate(p) => {
+                    inputs.corr_horizon = p.horizon;
+                    if let Some(r) = &p.relate {
+                        inputs.relate_transform = Some(r.transform);
+                        inputs.relate_beta = r.beta_mode;
+                        inputs.relate_bands = r.bands;
+                        inputs.relate_matrix = r.matrix;
+                    }
+                }
                 StudioLensState::When(p) => {
                     inputs.condition = p.condition.clone();
                     inputs.when_threshold = p.threshold;
@@ -325,7 +353,7 @@ impl StudioPane {
             self.children.clear();
         }
     }
-    fn ensure_child(&mut self) {
+    pub(super) fn ensure_child(&mut self) {
         if self.children.iter().any(|c| c.kind() == self.lens) {
             return;
         }
@@ -343,6 +371,7 @@ impl StudioPane {
             StudioLens::Relate => {
                 let mut c = studio_corr::CorrPane::new(s, format!("{} {}", self.benchmark, tf.label()));
                 c.horizon = p.corr_horizon;
+                c.relate = Some(p.relate_spec(&tr_data::security(&self.benchmark).key()));
                 StudioLensState::Relate(Box::new(c))
             }
             StudioLens::When => {
@@ -371,6 +400,33 @@ impl StudioPane {
     }
     pub fn dist_mut(&mut self) -> Option<&mut studio_dist::DistPane> {
         self.children.iter_mut().find_map(|c| if let StudioLensState::Dist(p) = c { Some(&mut **p) } else { None })
+    }
+    /// Applies `RELATE` words: select the Relate lens and update (then recompute) its inputs.
+    pub fn apply_relate_args(&mut self, args: &tr_data::studio_corr::RelateArgs) {
+        let before = self.view();
+        self.select_lens(StudioLens::Relate);
+        self.ensure_child();
+        let benchmark = tr_data::security(&self.benchmark).key();
+        if let Some(p) = self.corr_mut() {
+            let mut spec = p.relate.clone().unwrap_or_else(|| tr_data::studio_corr::RelateSpec::new(benchmark, tr_data::studio::Transform::LogReturn { h: p.horizon }));
+            let old = spec.clone();
+            args.apply(&mut spec);
+            if spec != old {
+                if !spec.transform.is_level() {
+                    p.horizon = spec.transform.horizon();
+                }
+                p.relate = Some(spec);
+                p.report = None;
+                p.error = None;
+                p.generation = studio_token();
+                p.loading = false;
+            }
+        }
+        let after = self.view();
+        if before.inputs != after.inputs {
+            self.remember(before);
+        }
+        self.inputs = after.inputs;
     }
     pub fn corr_mut(&mut self) -> Option<&mut studio_corr::CorrPane> {
         self.children.iter_mut().find_map(|c| if let StudioLensState::Relate(p) = c { Some(&mut **p) } else { None })
@@ -635,7 +691,7 @@ impl StudioPane {
             egui::Frame::group(ui.style()).show(ui,|ui|{ui.label("Studio connects the native time canvas to existing verified-data research. Each lens retains its original methods, MathCards and receipt. Quick adds descriptive canvas arithmetic. Copy command saves inputs, not historical data revisions.");});
         }
         if self.build_open {
-            egui::Frame::group(ui.style()).show(ui,|ui|{ui.label("BUILD · derived series unavailable");ui.label("Derived operations and model persistence have not been implemented; Quick uses signed scalar series for its descriptive canvas. Open LAB, RESID or ATTR for their route status.");});
+            egui::Frame::group(ui.style()).show(ui,|ui|{ui.label("BUILD · derived series unavailable");ui.label("Derived operations and model persistence have not been implemented; Quick uses signed scalar series for its descriptive canvas. Open STUDIO LAB, STUDIO RESID or STUDIO ATTR for their route status.");});
         }
         let content = ui.available_rect_before_wrap();
         let mut body = content;
@@ -746,6 +802,14 @@ impl StudioPane {
             && let Some((runs, rule)) = p.shading()
         {
             self.chart.studio_rule_shading(ui, rect, runs, rule);
+        }
+        // Frozen-fit fair-value bands: only for the accepted report of this exact context and
+        // inputs; the chart itself skips Quick-canvas mode. A context change drops the child.
+        if self.lens == StudioLens::Relate
+            && let Some(StudioLensState::Relate(p)) = self.children.iter().find(|c| c.kind() == StudioLens::Relate)
+            && let Some((corr, rel, bands)) = p.fair_value_overlay(&self.context.symbol)
+        {
+            self.chart.studio_fair_value(ui, corr, rel, bands);
         }
     }
     fn analysis(&mut self, ui: &mut Ui, id: PaneId, worker: &Worker, sample: bool) -> Vec<Action> {
@@ -877,6 +941,41 @@ impl TerminalApp {
             },Err(e)=>self.status=e,
         }
     }
+    /// `RELATE transform= h= beta= bands= matrix=` adjusts the focused Studio's Relate inputs;
+    /// bare `RELATE` (or no focused Studio) opens `STUDIO lens=relate`.
+    pub(super) fn open_relate(&mut self, symbol: Option<&str>, spec: &str) {
+        let words: Vec<&str> = spec.split_whitespace().collect();
+        let args = match tr_data::studio_corr::RelateArgs::parse(&words) {
+            Ok(a) => a,
+            Err(e) => {
+                self.status = e;
+                return;
+            }
+        };
+        if symbol.is_none() && !args.is_empty() {
+            let focus = self.focus;
+            if let Some(PaneKind::Studio(s)) = self.panes.iter_mut().find(|p| p.id == focus).map(|p| &mut p.kind) {
+                s.apply_relate_args(&args);
+                return;
+            }
+        }
+        let mut inputs = StudioInputs::default();
+        let mut relate_spec = inputs.relate_spec("SPY");
+        args.apply(&mut relate_spec);
+        inputs.relate_transform = Some(relate_spec.transform);
+        inputs.relate_beta = relate_spec.beta_mode;
+        inputs.relate_bands = relate_spec.bands;
+        inputs.relate_matrix = relate_spec.matrix;
+        inputs.corr_horizon = relate_spec.transform.horizon();
+        let symbol = symbol.map(|s| tr_data::security(s).key()).or_else(|| self.focused_symbol()).unwrap_or_default();
+        self.open_panel(PaneKind::Studio(Box::new(StudioPane::new(StudioViewSpec {
+            context: StudioContext { symbol, tf: Timeframe::D1, ..Default::default() },
+            lens: StudioLens::Relate,
+            inputs,
+            ..Default::default()
+        }))));
+        self.status = "Relate · transforms and frozen-fit fair-value bands · verified data".into();
+    }
     pub(super) fn open_studio(&mut self, symbol: Option<&str>, spec: &str) {
         match parse_studio(spec) {
             Ok((lens, tf, benchmark, inputs)) => {
@@ -964,6 +1063,43 @@ pub(super) fn prepared_when(
     pane
 }
 
+/// Native 5,000-bar AAPL daily canvas with an accepted Relate report (log return h=5, frozen fit)
+/// on the same bars (dev-only fixture). `quick` keeps the body to the chart so the fair-value
+/// overlay is measured against the native-chart ceilings.
+#[cfg(test)]
+pub(super) fn prepared_relate(
+    worker: &Worker,
+    requests: &mut tokio::sync::mpsc::UnboundedReceiver<crate::worker::Request>,
+) -> StudioPane {
+    let (chart, bars) = crate::chart_view::perf_gate::studio_canvas(worker, requests, false);
+    let mut pane = StudioPane::new(StudioViewSpec {
+        context: StudioContext { symbol: chart.symbol.clone(), tf: Timeframe::D1, ..Default::default() },
+        lens: StudioLens::Relate,
+        benchmark: "QQQ".into(),
+        inputs: StudioInputs {
+            relate_transform: Some(tr_data::studio::Transform::LogReturn { h: 5 }),
+            corr_horizon: 5,
+            ..Default::default()
+        },
+        quick: true,
+        ..Default::default()
+    });
+    pane.chart = Box::new(chart);
+    pane.chart_started = true;
+    pane.ensure_child();
+    let symbol = pane.context.symbol.clone();
+    let c = pane.corr_mut().unwrap();
+    let spec = c.relate.clone().unwrap();
+    let bench = tr_perf::fixtures::benchmark_for(&bars, 0.8, 91);
+    let report = studio_corr::relate_fixture_report(&symbol, &spec, &bars, &bench, &[]);
+    c.generation = studio_token();
+    c.loading = true;
+    c.accept(c.generation, Ok(report));
+    assert!(c.fair_value_overlay(&symbol).is_some());
+    while requests.try_recv().is_ok() {}
+    pane
+}
+
 #[cfg(test)]
 mod tests;
 
@@ -979,14 +1115,21 @@ pub(super) fn prepared_quick(worker:&Worker)->StudioPane {
 pub(crate) fn parse_studio(spec: &str) -> Result<(StudioLens, Timeframe, String, StudioInputs), String> {
     let mut shell = vec![];
     let mut suffix = vec![];
+    let mut relate = vec![];
     let mut in_rule = false;
+    // `h=` belongs to Relate only when the same command selects `lens=relate`.
+    let relate_lens = spec.split_whitespace().any(|w| w.eq_ignore_ascii_case("lens=relate"));
     for word in spec.split_whitespace() {
         let lower = word.to_ascii_lowercase();
         if lower.starts_with("rule=") {
             in_rule = true;
         }
+        let relate_word = ["transform=", "beta=", "bands=", "matrix="].iter().any(|k| lower.starts_with(k))
+            || (relate_lens && lower.starts_with("h="));
         if lower.starts_with("lens=") || lower.starts_with("benchmark=") {
             shell.push(word);
+        } else if relate_lens && relate_word {
+            relate.push(word);
         } else if in_rule || lower.starts_with("h=") || lower.starts_with("threshold=") {
             suffix.push(word);
         } else {
@@ -995,6 +1138,16 @@ pub(crate) fn parse_studio(spec: &str) -> Result<(StudioLens, Timeframe, String,
     }
     let (lens, tf, benchmark) = tr_data::studio::parse_spec(&shell.join(" "))?;
     let mut inputs = StudioInputs::default();
+    if !relate.is_empty() {
+        let args = tr_data::studio_corr::RelateArgs::parse(&relate)?;
+        let mut relate_spec = inputs.relate_spec(&benchmark);
+        args.apply(&mut relate_spec);
+        inputs.relate_transform = Some(relate_spec.transform);
+        inputs.relate_beta = relate_spec.beta_mode;
+        inputs.relate_bands = relate_spec.bands;
+        inputs.relate_matrix = relate_spec.matrix;
+        inputs.corr_horizon = relate_spec.transform.horizon();
+    }
     if !suffix.is_empty() {
         if lens != StudioLens::When {
             return Err("rule/h/threshold inputs require lens=when".into());

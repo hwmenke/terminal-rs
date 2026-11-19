@@ -18,8 +18,9 @@ AAPL WHEN 5m RSI(14)<30
 Legacy DIST/RDIST (including Shape), CORR/RBETA, SEASON/SSN, STATS/COND and
 BACKTEST/IBT commands keep their standalone panes and numerical conventions.
 QUICK opens the full [time canvas](STUDIO_CANVAS.md), with five comparison modes,
-an exact base, strip, dated lanes and a release-committed brush. LAB, RESID and
-ATTR remain named unavailable routes. Build explains that derived operations are
+an exact base, strip, dated lanes and a release-committed brush. `STUDIO LAB`,
+`STUDIO RESID` and `STUDIO ATTR` remain named unavailable routes (the bare words are
+listed tickers and load them). Build explains that derived operations are
 unavailable; About describes the composition and snapshot limits.
 
 Alt+Left / Alt+Right cycles the supported lenses in the focused Studio; the rail
@@ -63,6 +64,12 @@ requests, source admission, full-source validation, closure clocks, caches and
 second-stage report keys remain the original implementations. See
 [Distribution](STUDIO_DIST.md), [Relate](STUDIO_CORR.md) and
 [Season](STUDIO_SEASON.md) for exact methods and data limitations.
+
+Relate (slice 4) adds strict fixed-bar transforms, expanding β, a common-panel matrix and a
+frozen-training fair-value overlay with residual ±σ bands on the native chart (`RELATE`,
+`STUDIO lens=relate transform=logreturn h=5`; never in Quick-canvas mode). Bare `LAB`,
+`RESID` and `ATTR` load their tickers; their unavailable routes are `STUDIO lab|resid|attr`.
+See [Relate](STUDIO_CORR.md).
 
 When (slice 3) is a dedicated lens: rule mask shading on the native chart,
 fixed-family within-clock HAC/BY evidence at h=1,3,6,12, shared-bin
