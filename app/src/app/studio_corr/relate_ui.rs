@@ -152,8 +152,11 @@ pub(crate) fn fair_value_card(r: &CorrReport, rel: &RelateReport, fit: &FairValu
         );
     match tr_data::studio_corr::hover_stats(fit, p) {
         Some(h) => {
+            card = match (h.mean_ci, h.mean_ci_withheld) {
+                (Some(ci), _) => card.input("mean CI (95%, ŷ ± 1.96·se_m)", format!("{:.4} … {:.4}", ci[0], ci[1])),
+                (None, why) => card.input("mean CI", format!("withheld: {}", why.unwrap_or("unavailable"))),
+            };
             card = card
-                .input("mean CI (95%, ŷ ± 1.96·se_m)", format!("{:.4} … {:.4}", h.mean_ci[0], h.mean_ci[1]))
                 .input("se_m (mean response)", format!("{:.6e}", h.se_mean))
                 .input("prediction SE √(σ²+se_m²)", format!("{:.6e}", h.se_prediction))
                 .input("prediction band (±1 SE)", format!("{:.4} … {:.4}", h.prediction_band[0], h.prediction_band[1]))

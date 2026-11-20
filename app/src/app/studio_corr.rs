@@ -350,9 +350,11 @@ fn compute_cached(
         r.observed_at = observed_at;
         r.closed_thru = closed_thru(tf, tr_data::security(&a.symbol).class, r.as_of);
         if let Some(spec) = relate {
-            r.relate = Some(Box::new(maths::compute_relate(
-                a, b, rows, options, tf, spec, source, r.closed_thru, observed_at, digest,
-            )?));
+            // A Relate failure must not take the legacy CORR report down with it.
+            r.relate = Some(Box::new(
+                maths::compute_relate(a, b, rows, options, tf, spec, source, r.closed_thru, observed_at, digest)
+                    .unwrap_or_else(|e| maths::RelateReport::failed(spec, digest, e, a, b)),
+            ));
         }
         Ok(r)
     })
@@ -1473,6 +1475,50 @@ mod tests {
         assert_eq!((p.horizon, p.relate.is_none()), (1, true));
     }
     #[test]
+    fn restore_normalises_a_hand_edited_relate_horizon_and_old_specs_load() {
+        let edited = r#"{"StudioCorr":{"symbol":"AAPL US Equity","horizon":7,"relate":{"benchmark":"QQQ US Equity","transform":{"LogReturn":{"h":7}}}}}"#;
+        let PaneKind::StudioCorr(p) = PaneKind::from_settings(serde_json::from_str(edited).unwrap()) else {
+            panic!("relationship kind")
+        };
+        assert_eq!(p.horizon, 1);
+        let spec = p.relate.unwrap();
+        assert_eq!(spec.transform, tr_data::studio::Transform::LogReturn { h: 1 });
+        assert!(spec.bands);
+        let kept = r#"{"StudioCorr":{"relate":{"benchmark":"QQQ US Equity","transform":{"Change":{"h":20}}}}}"#;
+        let PaneKind::StudioCorr(p) = PaneKind::from_settings(serde_json::from_str(kept).unwrap()) else { panic!() };
+        assert_eq!(p.relate.unwrap().transform, tr_data::studio::Transform::Change { h: 20 });
+    }
+    #[test]
+    fn relate_words_bands_off_keeps_report_and_h_on_level_explains() {
+        let mut app = crate::app::tests::test_app();
+        app.open_relate(Some("AAPL"), "");
+        app.open_relate(None, "transform=logreturn h=5");
+        let focus = app.focus;
+        let report = |app: &mut crate::app::TerminalApp| {
+            let PaneKind::Studio(s) = &mut app.panes.iter_mut().find(|p| p.id == focus).unwrap().kind else { panic!() };
+            s.corr_mut().map(|p| (p.report.is_some(), p.relate.clone()))
+        };
+        let bars: Vec<_> = (0..5)
+            .map(|i| {
+                let p = 100.0 + i as f64;
+                Bar::new(i * 86400, p, p, p, p, 1.0).with_provenance(tr_core::Provenance::Real)
+            })
+            .collect();
+        {
+            let PaneKind::Studio(s) = &mut app.panes.iter_mut().find(|p| p.id == focus).unwrap().kind else { panic!() };
+            let p = s.corr_mut().unwrap();
+            p.report = Some(std::sync::Arc::new(maths::compute("A", "B", &bars, &bars, 252.0, &[], "unit").unwrap()));
+        }
+        app.open_relate(None, "bands=off");
+        let (kept, spec) = report(&mut app).unwrap();
+        assert!(kept, "bands=off must not clear the report");
+        assert!(!spec.unwrap().bands);
+        app.open_relate(None, "transform=level");
+        assert!(!report(&mut app).unwrap().0, "a transform change recomputes");
+        app.open_relate(None, "h=5");
+        assert!(app.status.contains("only to Δ"), "{}", app.status);
+    }
+    #[test]
     fn stale_and_unverified_responses_are_refused() {
         let mut pane = CorrPane::new("AAPL", "");
         pane.generation = 2;
@@ -1833,6 +1879,23 @@ mod cache_v2_tests {
         let mut bad = a.clone();
         bad.bars.last_mut().unwrap().provenance = tr_core::Provenance::Sample;
         assert!(compute_cached(&reports, &bad, &b, &[], options, Timeframe::D1, "test", 1, Some(100), None).is_err());
+    }
+
+    #[test]
+    fn relate_failure_keeps_the_legacy_corr_report_with_the_reason() {
+        let reports = tr_data::report_cache::ReportCache::new(16);
+        let (a, b) = tr_perf::fixtures::relationship(80);
+        let a = NamedBars { symbol: "A".into(), bars: a, source: "verified fixture".into(), ..Default::default() };
+        let b = NamedBars { symbol: "B".into(), bars: b, source: "verified fixture".into(), ..Default::default() };
+        let options = maths::Options { annual_periods: 252., daily: true };
+        // h=7 is unsupported, so compute_relate itself errors.
+        let spec = RelateSpec::new("B", tr_data::studio::Transform::LogReturn { h: 7 });
+        let r = compute_cached(&reports, &a, &b, &[], options, Timeframe::D1, "test", 1, Some(100), Some(&spec))
+            .expect("a Relate error must not fail the CORR report");
+        assert!(!r.returns.is_empty() || r.as_of > 0);
+        let rel = r.relate.as_deref().expect("relate section present");
+        assert!(rel.fit.is_none() && rel.points.is_empty());
+        assert!(rel.unavailable.as_deref().is_some_and(|e| e.contains("h must be")), "{:?}", rel.unavailable);
     }
 }
 

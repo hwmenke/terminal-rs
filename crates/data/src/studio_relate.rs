@@ -21,6 +21,7 @@ pub const MIN_TRAIN: usize = 30;
 pub const METHOD_SCHEMA: &str = "relate.v1";
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct RelateSpec {
     /// Benchmark security key.
     pub benchmark: String,
@@ -31,6 +32,11 @@ pub struct RelateSpec {
     pub covariance: CovarianceMethod,
     pub matrix: MatrixMode,
     pub bands: bool,
+}
+impl Default for RelateSpec {
+    fn default() -> Self {
+        Self::new("", Transform::LogReturn { h: 1 })
+    }
 }
 impl RelateSpec {
     pub fn new(benchmark: impl Into<String>, transform: Transform) -> Self {
@@ -102,6 +108,40 @@ pub struct RelateReport {
     /// Source of each side: asset, benchmark.
     pub sources: [String; 2],
     pub benchmark_gaps: Vec<(i64, i64)>,
+}
+
+impl RelateReport {
+    /// An empty Relate section carrying only why it could not be computed, so the legacy CORR
+    /// report next to it stays available.
+    pub fn failed(spec: &RelateSpec, key: u64, reason: String, asset: &NamedBars, benchmark: &NamedBars) -> Self {
+        let series = ScalarSeries {
+            ts: Vec::new(),
+            values: Vec::new(),
+            break_before: Vec::new(),
+            unit: unit_for(spec.transform),
+            receipt: SeriesReceipt {
+                source: asset.source.clone(),
+                provenance: tr_core::Provenance::default(),
+                observed_at: None,
+                closed_thru: 0,
+                input_digest: 0,
+                gaps: Vec::new(),
+            },
+        };
+        Self {
+            spec: spec.clone(),
+            key,
+            y: series.clone(),
+            x: series,
+            expanding: Vec::new(),
+            fit: None,
+            points: Vec::new(),
+            matrix_common: None,
+            unavailable: Some(reason),
+            sources: [asset.source.clone(), benchmark.source.clone()],
+            benchmark_gaps: benchmark.gaps.clone(),
+        }
+    }
 }
 
 /// Which rows of the aligned grid carry a transformed value.
@@ -392,7 +432,10 @@ pub fn fair_value(p: &Prepared, fit: &FairValueFit) -> Vec<FairValuePoint> {
 pub struct HoverStats {
     pub se_mean: f64,
     pub se_prediction: f64,
-    pub mean_ci: [f64; 2],
+    /// `None` when withheld; see `mean_ci_withheld`.
+    pub mean_ci: Option<[f64; 2]>,
+    /// Why the mean CI is withheld (level transforms: persistent residuals, HAC lag 5 too short).
+    pub mean_ci_withheld: Option<&'static str>,
     pub prediction_band: [f64; 2],
 }
 pub fn hover_stats(fit: &FairValueFit, p: &FairValuePoint) -> Option<HoverStats> {
@@ -400,7 +443,12 @@ pub fn hover_stats(fit: &FairValueFit, p: &FairValuePoint) -> Option<HoverStats>
     let se_prediction = (fit.sigma * fit.sigma + se_mean * se_mean).sqrt();
     let (_, mean) = project(fit.transform, fit.alpha, fit.beta, p.x, p.anchor, 1.96 * se_mean)?;
     let (_, pred) = project(fit.transform, fit.alpha, fit.beta, p.x, p.anchor, se_prediction)?;
-    Some(HoverStats { se_mean, se_prediction, mean_ci: [mean[1], mean[2]], prediction_band: [pred[1], pred[2]] })
+    let (mean_ci, mean_ci_withheld) = if fit.transform.is_level() {
+        (None, Some("levels nonstationary"))
+    } else {
+        (Some([mean[1], mean[2]]), None)
+    };
+    Some(HoverStats { se_mean, se_prediction, mean_ci, mean_ci_withheld, prediction_band: [pred[1], pred[2]] })
 }
 
 /// Expanding β by Welford co-moments over `(ts, y, x, break_before)`; a break resets the

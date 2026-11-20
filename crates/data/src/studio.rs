@@ -164,6 +164,15 @@ impl Transform {
             Self::Level | Self::LogLevel => 1,
         }
     }
+    /// Replaces an unsupported `h` (hand-edited layout) with 1; supported values are 1, 5, 20.
+    pub fn with_valid_horizon(self) -> Self {
+        let ok = |h: usize| if [1, 5, 20].contains(&h) { h } else { 1 };
+        match self {
+            Self::Change { h } => Self::Change { h: ok(h) },
+            Self::LogReturn { h } => Self::LogReturn { h: ok(h) },
+            other => other,
+        }
+    }
     pub fn is_level(self) -> bool {
         matches!(self, Self::Level | Self::LogLevel)
     }

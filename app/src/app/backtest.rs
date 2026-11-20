@@ -243,6 +243,9 @@ impl TerminalApp {
     }
 }
 
+/// Local refusal shown while the display mode is sample / offline; cleared when it no longer applies.
+const SAMPLE_REFUSAL: &str = "Backtest refused: sample / offline display mode. Backtests never use sample bars.";
+
 /// Shared renderer/action adapter for the standalone pane and Studio shell.
 pub(super) fn show(
     ui: &mut Ui,
@@ -269,9 +272,11 @@ pub(super) fn show(
         pane.loading = false;
         // A worker refusal that already names sample mode stays; any other (real-mode) error is replaced.
         if !pane.error.as_deref().is_some_and(|e| e.to_ascii_lowercase().contains("sample")) {
-            pane.error =
-                Some("Backtest refused: sample / offline display mode. Backtests never use sample bars.".into());
+            pane.error = Some(SAMPLE_REFUSAL.into());
         }
+    } else if pane.error.as_deref() == Some(SAMPLE_REFUSAL) {
+        // The local refusal no longer applies; clearing it lets the auto-request resume.
+        pane.error = None;
     }
     {
         let intraday = pane.intraday;
@@ -1023,6 +1028,13 @@ mod tests {
         assert!(requests.try_recv().is_err(), "sample mode must not send backtest requests");
         let PaneKind::Backtest(p) = &app.panes[i].kind else { panic!() };
         assert!(p.report.is_none() && p.receipt.is_empty() && !p.loading);
+        // Leaving sample mode clears the local refusal and the auto-request resumes.
+        assert_eq!(p.error.as_deref(), Some(SAMPLE_REFUSAL));
+        app.provider = "verified fixture".into();
+        paint(&mut app);
+        let PaneKind::Backtest(p) = &app.panes[i].kind else { panic!() };
+        assert!(p.error.as_deref() != Some(SAMPLE_REFUSAL), "{:?}", p.error);
+        assert!(requests.try_recv().is_ok(), "auto-request must resume outside sample mode");
     }
     #[test]
     fn honest_backtest_revisions_and_generations_cannot_restore_stale_confidence() {

@@ -1744,7 +1744,7 @@ fn relate_bands_hover_text_distinguishes_residual_band_from_mean_ci() {
     let band = q.bands[2] - q.centre;
     assert!((band - fit.sigma).abs() <= 1e-12 * fit.sigma.abs().max(1.), "{band} vs σ {}", fit.sigma);
     let h = sc::hover_stats(&fit, q).unwrap();
-    let half = (h.mean_ci[1] - q.centre).abs();
+    let half = (h.mean_ci.unwrap()[1] - q.centre).abs();
     assert!((half - 1.96 * h.se_mean).abs() <= 1e-9 * half.max(1e-12));
     assert!(half < fit.sigma / 5., "mean CI {half} vs σ {}", fit.sigma);
     assert!(h.se_prediction > fit.sigma && h.se_prediction < fit.sigma * 1.01);

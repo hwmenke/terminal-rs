@@ -402,7 +402,9 @@ impl StudioPane {
         self.children.iter_mut().find_map(|c| if let StudioLensState::Dist(p) = c { Some(&mut **p) } else { None })
     }
     /// Applies `RELATE` words: select the Relate lens and update (then recompute) its inputs.
-    pub fn apply_relate_args(&mut self, args: &tr_data::studio_corr::RelateArgs) {
+    /// Returns a status notice when a word was accepted but has no effect.
+    pub fn apply_relate_args(&mut self, args: &tr_data::studio_corr::RelateArgs) -> Option<String> {
+        let mut notice = None;
         let before = self.view();
         self.select_lens(StudioLens::Relate);
         self.ensure_child();
@@ -411,7 +413,13 @@ impl StudioPane {
             let mut spec = p.relate.clone().unwrap_or_else(|| tr_data::studio_corr::RelateSpec::new(benchmark, tr_data::studio::Transform::LogReturn { h: p.horizon }));
             let old = spec.clone();
             args.apply(&mut spec);
-            if spec != old {
+            if args.h.is_some() && spec.transform.is_level() {
+                notice = Some("Relate h applies only to Δ / log-return transforms; levels use h=1".to_string());
+            }
+            // The band toggle only shows or hides the overlay, so it never recomputes the report.
+            let mut changed = spec.clone();
+            changed.bands = old.bands;
+            if changed != old {
                 if !spec.transform.is_level() {
                     p.horizon = spec.transform.horizon();
                 }
@@ -420,6 +428,8 @@ impl StudioPane {
                 p.error = None;
                 p.generation = studio_token();
                 p.loading = false;
+            } else if spec.bands != old.bands {
+                p.relate = Some(spec);
             }
         }
         let after = self.view();
@@ -427,6 +437,7 @@ impl StudioPane {
             self.remember(before);
         }
         self.inputs = after.inputs;
+        notice
     }
     pub fn corr_mut(&mut self) -> Option<&mut studio_corr::CorrPane> {
         self.children.iter_mut().find_map(|c| if let StudioLensState::Relate(p) = c { Some(&mut **p) } else { None })
@@ -955,7 +966,9 @@ impl TerminalApp {
         if symbol.is_none() && !args.is_empty() {
             let focus = self.focus;
             if let Some(PaneKind::Studio(s)) = self.panes.iter_mut().find(|p| p.id == focus).map(|p| &mut p.kind) {
-                s.apply_relate_args(&args);
+                if let Some(notice) = s.apply_relate_args(&args) {
+                    self.status = notice;
+                }
                 return;
             }
         }

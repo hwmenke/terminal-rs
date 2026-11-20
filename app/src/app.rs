@@ -896,7 +896,10 @@ impl PaneKind {
             PaneSettings::StudioCorr { symbol, spec, horizon, relate } => {
                 let mut pane = studio_corr::CorrPane::new(symbol, spec);
                 pane.horizon = if [1, 5, 20].contains(&horizon) { horizon } else { 1 };
-                pane.relate = relate;
+                pane.relate = relate.map(|mut r| {
+                    r.transform = r.transform.with_valid_horizon();
+                    r
+                });
                 PaneKind::StudioCorr(Box::new(pane))
             }
             PaneSettings::StudioSeason { symbol, spec } => {

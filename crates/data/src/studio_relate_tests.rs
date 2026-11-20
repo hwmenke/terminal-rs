@@ -232,16 +232,20 @@ fn relate_bands_are_not_mean_ci() {
         assert_eq!((centre, bands), (q.centre, q.bands));
         let h = hover_stats(&fit, q).unwrap();
         if matches!(t, Transform::Level | Transform::Change { .. }) {
-            near(h.mean_ci[1] - q.centre, 1.96 * h.se_mean);
+            if t == Transform::Level {
+                assert!(h.mean_ci.is_none() && h.mean_ci_withheld == Some("levels nonstationary"));
+            } else {
+                near(h.mean_ci.unwrap()[1] - q.centre, 1.96 * h.se_mean);
+            }
         } else {
             // Target-space ±1.96·se_m, inverted: P_{t−h}·exp(a + b r + 1.96 se_m).
-            near(h.mean_ci[1], q.anchor.unwrap() * (fit.alpha + fit.beta * q.x + 1.96 * h.se_mean).exp());
+            near(h.mean_ci.unwrap()[1], q.anchor.unwrap() * (fit.alpha + fit.beta * q.x + 1.96 * h.se_mean).exp());
         }
         assert!(h.se_prediction > fit.sigma && h.se_prediction > h.se_mean);
         if t == (Transform::LogReturn { h: 1 }) {
             assert!(1.96 * h.se_mean < fit.sigma / 5., "{} vs {}", 1.96 * h.se_mean, fit.sigma);
             // Not the mean CI: the residual band is much wider.
-            assert!(bands[2] - centre > 5. * (h.mean_ci[1] - centre));
+            assert!(bands[2] - centre > 5. * (h.mean_ci.unwrap()[1] - centre));
         }
     }
 }
@@ -341,4 +345,31 @@ fn corr_pairwise_legacy_unchanged() {
         // F3: the residual path is only cumulated at h=1.
         assert_eq!(r.path.iter().all(|p| p.residual_return.is_none()), h > 1, "h={h}");
     }
+}
+
+#[test]
+fn level_hover_withholds_mean_ci_but_change_keeps_it() {
+    let (a, b) = related(600, 1.1, 5);
+    for (t, withheld) in [
+        (Transform::Level, true),
+        (Transform::LogLevel, true),
+        (Transform::Change { h: 1 }, false),
+        (Transform::LogReturn { h: 5 }, false),
+    ] {
+        let p = prep(&a, &b, t);
+        let fit = training_fit(&p, 3, CovarianceMethod::HacFixed5).unwrap();
+        let q = fair_value(&p, &fit).pop().unwrap();
+        let h = hover_stats(&fit, &q).unwrap();
+        assert_eq!(h.mean_ci.is_none(), withheld, "{t:?}");
+        assert_eq!(h.mean_ci_withheld.is_some(), withheld);
+    }
+}
+
+#[test]
+fn relate_spec_old_layout_without_new_fields_loads() {
+    let spec: RelateSpec =
+        serde_json::from_str("{\"benchmark\":\"QQQ US Equity\",\"transform\":{\"LogReturn\":{\"h\":5}}}").unwrap();
+    assert_eq!(spec.benchmark, "QQQ US Equity");
+    assert!(spec.bands);
+    assert_eq!(spec.transform, Transform::LogReturn { h: 5 });
 }
