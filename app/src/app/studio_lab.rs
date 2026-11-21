@@ -65,6 +65,14 @@ fn cov_index(m: CovarianceMethod) -> usize {
 }
 
 impl LabPane {
+    fn save_disabled_reason(&self, sample: bool) -> Option<&'static str> {
+        if sample { Some("Save requires verified real data; sample mode cannot save a residual model.") }
+        else if self.save.pending.is_some() { Some("Saving this residual model; wait for the save to finish.") }
+        else if !self.report.as_ref().is_some_and(|r| r.fit.is_some()) {
+            Some("Save requires a successful verified-data fit. Reload to retry the data sources, then fit the model in Regression Lab.")
+        } else { None }
+    }
+
     pub fn new(symbol: impl Into<String>, tf: Timeframe, spec: LabSpec) -> Self {
         let symbol = symbol.into();
         let mut spec = spec;
@@ -406,9 +414,11 @@ pub(super) fn show(ui: &mut Ui, id: PaneId, pane: &mut LabPane, worker: &crate::
             ui.ctx().copy_text(format!("STUDIO lab {} {}", pane.tf.label(), pane.spec.command()));
         }
         reload = ui.small_button("Reload").on_hover_text("Re-read every series, bypassing the short bar cache").clicked();
-        let can_save = !sample && pane.save.pending.is_none() && pane.report.as_ref().is_some_and(|r| r.fit.is_some());
+        let disabled_reason = pane.save_disabled_reason(sample);
+        let can_save = disabled_reason.is_none();
         if ui
             .add_enabled(can_save, egui::Button::new("Save residual").small())
+            .on_disabled_hover_text(disabled_reason.unwrap_or_default())
             .on_hover_text("Freeze this fit into an immutable residual model (STUDIO resid open <id>)")
             .clicked()
             && let Some(r) = pane.report.clone()

@@ -19,6 +19,7 @@ mod theme;
 mod themes;
 mod widgets;
 mod worker;
+mod daily_research;
 
 use std::time::Instant;
 

@@ -168,6 +168,12 @@ pub struct ResearchSnapshot {
     pub conditional: ConditionalReport,
 }
 
+/// Archive calendar computations support four-digit positive years, away from Chrono's boundaries.
+pub(crate) fn supported_archive_timestamp(ts: i64) -> bool {
+    chrono::DateTime::from_timestamp(ts, 0)
+        .is_some_and(|date| (1..=9999).contains(&chrono::Datelike::year(&date)))
+}
+
 /// Shared gate for statistics and conditional returns. Sample/demo bars never compute.
 pub fn require_research_bars(bars: &[Bar], operation: &str) -> Result<(), String> {
     if bars.is_empty() {
@@ -176,6 +182,9 @@ pub fn require_research_bars(bars: &[Bar], operation: &str) -> Result<(), String
         ));
     }
     Bar::require_verified(bars, operation)?;
+    if bars.iter().any(|b| !supported_archive_timestamp(b.ts)) {
+        return Err(format!("{operation} refused: invalid archive timestamp; supported calendar years are 0001–9999"));
+    }
     if bars.windows(2).any(|w| w[0].ts >= w[1].ts) {
         return Err(format!("{operation} refused: history bars must have unique ascending timestamps"));
     }

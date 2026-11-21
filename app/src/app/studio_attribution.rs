@@ -1016,7 +1016,7 @@ fn list_view(ui: &mut Ui, pane: &AttrPane) -> Option<String> {
             ui.label(ui_text("Loading saved models…", 11., theme::muted()));
         }
         Some(l) if l.is_empty() => {
-            ui.label(ui_text("No saved residual models yet. Fit a model in the Lab, then Save residual · STUDIO attr model=<id>", 11., theme::muted()));
+            ui.label(ui_text("No saved residual models yet. Open Regression Lab (STUDIO lab), fit a model, then Save residual · STUDIO attr model=<id>", 11., theme::muted()));
         }
         Some(l) => {
             ui.label(ui_text("SAVED MODELS", 10., theme::muted()));
@@ -1046,9 +1046,13 @@ fn list_view(ui: &mut Ui, pane: &AttrPane) -> Option<String> {
 }
 
 pub(super) fn show(ui: &mut Ui, id: PaneId, pane: &mut AttrPane, worker: &crate::worker::Worker, sample: bool) -> Vec<Action> {
+    let mut actions = Vec::new();
     let mut reload = false;
     let mut new_window: Option<AttrWindow> = None;
     ui.horizontal_wrapped(|ui| {
+        if pane.listing.as_ref().is_some_and(|l| l.is_empty()) && ui.small_button("Open Regression Lab").clicked() {
+            actions.push(Action::Command("STUDIO lab".into()));
+        }
         studio_title(ui, "ATTRIBUTION");
         if let Some(m) = &pane.model {
             ui.label(mono_text(
@@ -1138,7 +1142,7 @@ pub(super) fn show(ui: &mut Ui, id: PaneId, pane: &mut AttrPane, worker: &crate:
     if let Some(id) = open {
         pane.open(id);
     }
-    vec![]
+    actions
 }
 
 // ---- fixtures (tests and the paint gate only) ------------------------------------------------------

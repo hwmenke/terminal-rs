@@ -183,3 +183,16 @@ fn lab_edit_words_reach_a_focused_lab() {
     assert_eq!(pane.spec.key_string(), next.key_string());
     assert!(pane.report.is_none() && pane.previous.is_some());
 }
+
+#[test]
+fn save_residual_explains_each_disabled_state() {
+    let (mut pane, _) = pane_with_report();
+    assert!(pane.save_disabled_reason(false).is_none());
+    assert!(pane.save_disabled_reason(true).unwrap().contains("sample mode"));
+    pane.save.pending = Some(42);
+    assert!(pane.save_disabled_reason(false).unwrap().contains("wait"));
+    pane.save.pending = None;
+    pane.report = None;
+    let reason = pane.save_disabled_reason(false).unwrap();
+    assert!(reason.contains("successful verified-data fit") && reason.contains("Reload"));
+}

@@ -141,6 +141,7 @@ struct Loaded {
 #[derive(Default)]
 pub(crate) struct CorrCache {
     reports: std::sync::Arc<tr_data::report_cache::ReportCache>,
+    generation: std::sync::atomic::AtomicU64,
     entries: std::sync::Mutex<std::collections::HashMap<(String, Timeframe), (std::time::Instant, Loaded)>>,
 }
 pub(crate) static CORR_CACHE: std::sync::LazyLock<CorrCache> = std::sync::LazyLock::new(CorrCache::default);
@@ -152,6 +153,12 @@ pub(crate) fn cache_ttl(tf: Timeframe) -> std::time::Duration {
 }
 
 impl CorrCache {
+    pub(crate) fn invalidate(&self) {
+        let mut entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
+        self.generation.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        entries.clear();
+    }
+
     fn get(&self, key: &str, tf: Timeframe) -> Option<Loaded> {
         let entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
         entries
@@ -159,8 +166,9 @@ impl CorrCache {
             .filter(|(at, _)| at.elapsed() < cache_ttl(tf))
             .map(|(_, loaded)| loaded.clone())
     }
-    fn put(&self, key: String, tf: Timeframe, loaded: Loaded) {
+    fn put(&self, key: String, tf: Timeframe, loaded: Loaded, generation: u64) {
         let mut entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
+        if generation != self.generation.load(std::sync::atomic::Ordering::SeqCst) { return; }
         entries.retain(|(_, tf), (at, _)| at.elapsed() < cache_ttl(*tf));
         if entries.len() >= CACHE_CAPACITY
             && let Some(oldest) = entries.iter().min_by_key(|(_, (at, _))| *at).map(|(k, _)| k.clone())
@@ -178,8 +186,8 @@ impl CorrCache {
 pub(crate) async fn load_rows<F, Fut>(
     cache: &CorrCache,
     fresh: bool,
-    history: &tr_data::history::Service,
-    bridge: &tr_data::whats_news::Bridge,
+    _history: &tr_data::history::Service,
+    _bridge: &tr_data::whats_news::Bridge,
     names: Vec<String>,
     tf: Timeframe,
     load_intraday: F,
@@ -192,27 +200,18 @@ where
     let load = |key: String| {
         let load_intraday = &load_intraday;
         async move {
+            let generation = cache.generation.load(std::sync::atomic::Ordering::SeqCst);
             if !fresh && let Some(hit) = cache.get(&key, tf) {
                 return (key, Ok(hit));
             }
-            let result = if tf == Timeframe::D1 {
-                daily(history, bridge, &key).await.map(|(bars, source)| Loaded {
-                    bars,
-                    source,
-                    gaps: Vec::new(),
-                    observed_at: Some(chrono::Utc::now().timestamp()),
-                })
-            } else {
-                load_intraday(key.clone(), tf).await.and_then(|(mut bars, info)| {
-                    tr_data::stats::require_research_bars(&bars, "Relationship intraday")
-                        .map_err(anyhow::Error::msg)?;
-                    let n = tr_data::closed::closed_len(tf, &bars, tr_data::security(&key).class, info.fetched_at);
-                    bars.truncate(n);
-                    Ok(Loaded { bars, source: info.label(), gaps: info.gaps, observed_at: info.fetched_at })
-                })
-            };
+            let result = load_intraday(key.clone(), tf).await.and_then(|(mut bars, info)| {
+                tr_data::stats::require_research_bars(&bars, "Relationship research").map_err(anyhow::Error::msg)?;
+                let n = tr_data::closed::closed_len(tf, &bars, tr_data::security(&key).class, info.fetched_at);
+                bars.truncate(n);
+                Ok(Loaded { bars, source: if tf == Timeframe::D1 { info.source.clone() } else { info.label() }, gaps: info.gaps, observed_at: info.fetched_at })
+            });
             if let Ok(loaded) = &result {
-                cache.put(key.clone(), tf, loaded.clone());
+                cache.put(key.clone(), tf, loaded.clone(), generation);
             }
             (key, result)
         }
@@ -360,7 +359,7 @@ fn compute_cached(
         h.write_str(&format!("{spec:?} train_frac=0.8 strict_grid=true {}", maths::METHOD_SCHEMA));
     }
     let mut key = tr_data::report_cache::ReportKey::new(
-        if relate.is_some() { "studio_corr_v3" } else { "studio_corr_v2" },
+        if relate.is_some() { "studio_corr_v4" } else { "studio_corr_v2" },
         &a.symbol,
         tf,
         source,
@@ -416,40 +415,6 @@ pub(crate) fn closed_thru(tf: Timeframe, class: tr_core::AssetClass, ts: i64) ->
     end.min(cash)
 }
 
-async fn daily(
-    history: &tr_data::history::Service,
-    bridge: &tr_data::whats_news::Bridge,
-    key: &str,
-) -> anyhow::Result<(Vec<Bar>, String)> {
-    let ticker = tr_data::whats_news::archive_ticker(key);
-    let wanted = ticker.clone();
-    let mut bars = history.db(move |db| db.daily(&wanted)).await?;
-    let mut source = "Local Yahoo daily research archive".to_string();
-    if bars.is_empty() && bridge.enabled {
-        let external = bridge.histories_for(std::slice::from_ref(&ticker)).await?;
-        external.provenance.require_verified("Relationship archive").map_err(anyhow::Error::msg)?;
-        if let Some(skip) = external.data.skipped.iter().find(|s| s.symbol.eq_ignore_ascii_case(&ticker)) {
-            anyhow::bail!("{}: {}", skip.symbol, skip.reason);
-        }
-        source = external.source;
-        bars = external
-            .data
-            .bars
-            .into_iter()
-            .find(|(s, _)| s.eq_ignore_ascii_case(&ticker))
-            .map(|(_, b)| b)
-            .unwrap_or_default();
-    }
-    tr_data::stats::require_research_bars(&bars, "Relationship daily archive").map_err(anyhow::Error::msg)?;
-    let n = tr_data::closed::closed_len(
-        Timeframe::D1,
-        &bars,
-        tr_data::security(key).class,
-        Some(chrono::Utc::now().timestamp()),
-    );
-    bars.truncate(n);
-    Ok((bars, source))
-}
 
 impl TerminalApp {
     pub(super) fn open_studio_corr(&mut self, symbol: Option<&str>, spec: &str) {
@@ -1627,7 +1592,7 @@ mod tests {
             .collect()
     }
     #[tokio::test]
-    async fn daily_archive_only_and_sample_empty_state() {
+    async fn daily_uses_worker_resolver_and_sample_empty_state() {
         let start = 1_735_862_400; // 2025-01-03 00:00 UTC
         let mut archive = tr_data::history::Archive::memory().unwrap();
         for ticker in ["AAPL", "SPY"] {
@@ -1636,13 +1601,19 @@ mod tests {
         let history = history(archive);
         let bridge = tr_data::whats_news::Config { enabled: false, ..Default::default() }.bridge();
         let cache = CorrCache::default();
-        let r = research(&cache, false, &history, &bridge, false, "AAPL", "", |_, _| async {
-            panic!("daily must use archive")
+        let r = research(&cache, false, &history, &bridge, false, "AAPL", "", |key, tf| {
+            let history = &history;
+            async move {
+                assert_eq!(tf, Timeframe::D1);
+                let ticker = tr_data::whats_news::archive_ticker(&key);
+                let bars = history.db(move |db| db.daily(&ticker)).await?;
+                Ok((bars, tr_data::vault::StitchInfo { source: "Local research archive".into(), fetched_at: Some(chrono::Utc::now().timestamp()), ..Default::default() }))
+            }
         })
         .await
         .unwrap();
         assert_eq!(r.ols.n, 5);
-        assert!(r.source.contains("Local Yahoo daily research archive"));
+        assert!(r.source.contains("Local research archive"));
         assert_eq!(r.matrix.unavailable.len(), 6);
         assert!(r.provenance.is_verified());
         let err = research(&cache, false, &history, &bridge, true, "AAPL", "", |_, _| async {
@@ -1653,7 +1624,7 @@ mod tests {
         assert!(err.to_string().contains("no real data"));
         let empty = self::history(tr_data::history::Archive::memory().unwrap());
         let err = research(&CorrCache::default(), false, &empty, &bridge, false, "AAPL", "", |_, _| async {
-            panic!("daily must not fetch intraday")
+            anyhow::bail!("no history: worker resolver exhausted sources")
         })
         .await
         .unwrap_err();
@@ -1915,6 +1886,20 @@ mod tests {
 
 #[cfg(test)]
 mod cache_v2_tests {
+    #[test]
+    fn archive_invalidation_rejects_inflight_old_generation() {
+        let cache = super::CorrCache::default();
+        let row = super::Loaded { bars: vec![], source: "archive".into(), gaps: vec![], observed_at: None };
+        cache.put("AAPL".into(), Timeframe::D1, row.clone(), 0);
+        assert!(cache.get("AAPL", Timeframe::D1).is_some());
+        cache.invalidate();
+        assert!(cache.get("AAPL", Timeframe::D1).is_none());
+        cache.put("AAPL".into(), Timeframe::D1, row.clone(), 0);
+        assert!(cache.get("AAPL", Timeframe::D1).is_none());
+        cache.put("AAPL".into(), Timeframe::D1, row, 1);
+        assert!(cache.get("AAPL", Timeframe::D1).is_some());
+    }
+
     use super::*;
     #[test]
     fn report_cache_identity_corrections_peer_failures_clocks_gaps_horizons() {

@@ -457,7 +457,7 @@ fn archive_add(p: &RotationPane) -> Option<String> {
         .as_ref()?
         .skipped
         .iter()
-        .filter(|s| s.reason == "not in archive")
+        .filter(|s| s.reason == "not in archive" || s.reason.starts_with("Daily research unavailable"))
         .map(|s| s.symbol.clone())
         .collect::<Vec<_>>();
     if names.is_empty() { None } else { Some(format!("HIST ADD {}", names.join(" "))) }
@@ -1170,11 +1170,12 @@ mod tests {
         assert_eq!(current(&r.tracks[0], 258.5).unwrap().at, 257);
         r.skipped = vec![
             rotation::Skipped { symbol: "XLC".into(), reason: "not in archive".into() },
+            rotation::Skipped { symbol: "XLE".into(), reason: "Daily research unavailable: all sources failed".into() },
             rotation::Skipped { symbol: "SPY".into(), reason: "unverified".into() },
         ];
         let mut p = RotationPane::new("");
         p.accept(0, Ok(r));
-        assert_eq!(archive_add(&p).as_deref(), Some("HIST ADD XLC"));
+        assert_eq!(archive_add(&p).as_deref(), Some("HIST ADD XLC XLE"));
     }
     #[test]
     fn rotation_tail_mesh_splits_colours_at_axis_crossings() {

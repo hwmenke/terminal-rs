@@ -679,7 +679,12 @@ pub fn compute_relate(
             res.iter().sum::<f64>() / res.len() as f64,
             [asset, benchmark]
                 .iter()
-                .map(|r| crate::studio_residual::span_digest(&r.bars, &r.symbol, first, thru))
+                .map(|r| {
+                    let lookback = if spec.transform.is_level() { 0 } else { spec.transform.horizon() };
+                    let start = prepared.ts[train[0].saturating_sub(lookback)];
+                    let (first, thru) = crate::studio_residual::dependency_bounds(&r.bars, start, thru, options.daily);
+                    crate::studio_residual::span_digest(&r.bars, &r.symbol, first, thru)
+                })
                 .collect(),
             first,
         );

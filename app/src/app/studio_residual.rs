@@ -541,6 +541,7 @@ pub(super) fn badges(ui: &mut Ui, r: &ResidualReport) {
         let ticker = tr_data::security(symbol).ticker;
         let text = match check {
             InputCheck::Unchanged => continue,
+            InputCheck::PartialCoverage => format!("PARTIAL REVISION COVERAGE · {ticker} · legacy training span"),
             InputCheck::Revised { .. } => format!("INPUT REVISED · {ticker}"),
             InputCheck::SourceChanged { saved, live } => format!("SOURCE CHANGED · {ticker} · was {saved} · now {live}"),
             InputCheck::NotCovered { live_first_ts } => format!(
@@ -1144,7 +1145,7 @@ fn list_view(ui: &mut Ui, pane: &mut ResidPane) -> Option<String> {
             ui.label(ui_text("Loading saved models…", 11., theme::muted()));
         }
         Some(l) if l.is_empty() => {
-            ui.label(ui_text("No saved residual models yet. Fit a model in the Lab, then Save residual · STUDIO resid open <id>", 11., theme::muted()));
+            ui.label(ui_text("No saved residual models yet. Open Regression Lab (STUDIO lab), fit a model, then Save residual · STUDIO resid open <id>", 11., theme::muted()));
         }
         Some(l) => {
             ui.label(ui_text("SAVED MODELS", 10., theme::muted()));
@@ -1174,8 +1175,12 @@ fn list_view(ui: &mut Ui, pane: &mut ResidPane) -> Option<String> {
 }
 
 pub(super) fn show(ui: &mut Ui, id: PaneId, pane: &mut ResidPane, worker: &crate::worker::Worker, sample: bool) -> Vec<Action> {
+    let mut actions = Vec::new();
     let mut reload = false;
     ui.horizontal_wrapped(|ui| {
+        if pane.listing.as_ref().is_some_and(|l| l.is_empty()) && ui.small_button("Open Regression Lab").clicked() {
+            actions.push(Action::Command("STUDIO lab".into()));
+        }
         studio_title(ui, "RESIDUAL");
         if let Some(m) = &pane.model {
             ui.label(mono_text(
@@ -1271,7 +1276,7 @@ pub(super) fn show(ui: &mut Ui, id: PaneId, pane: &mut ResidPane, worker: &crate
     if let Some(id) = open {
         pane.open(id);
     }
-    vec![]
+    actions
 }
 
 // ---- fixtures (tests and the paint gate only) ------------------------------------------------------

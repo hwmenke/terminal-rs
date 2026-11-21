@@ -554,3 +554,22 @@ fn studio_history_change_and_queued_sample_responses_cannot_restore_reports() {
     let s = app_pane(&mut app, 201);
     assert!(s.children.is_empty() && s.chart.is_empty());
 }
+
+#[tokio::test]
+async fn accepted_native_daily_report_populates_header_receipt() {
+    let mut pane = pane();
+    pane.lens = StudioLens::Dist;
+    let bars = tr_perf::fixtures::regime_walk(400);
+    let report = studio_dist::build_report(
+        "AAPL US Equity".into(), bars, Timeframe::D1, tr_data::studio_dist::Window::All,
+        "Yahoo (native provider) · fallback: Whats-News disabled".into(),
+        Some(chrono::Utc::now().timestamp()), Vec::new(),
+    ).await.unwrap();
+    let mut dist = studio_dist::DistPane::new("AAPL US Equity", Timeframe::D1, tr_data::studio_dist::Window::All);
+    dist.report = Some(Arc::new(report));
+    pane.children = vec![StudioLensState::Dist(Box::new(dist))];
+    let receipt = pane.receipt();
+    assert!(receipt.contains("Yahoo (native provider)"));
+    assert!(receipt.contains("CLOSED THRU") && receipt.contains("Whats-News disabled"));
+    assert!(!receipt.contains("awaiting"));
+}

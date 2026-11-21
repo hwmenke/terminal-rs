@@ -2072,6 +2072,7 @@ impl TerminalApp {
                     }
                 }
                 Response::HistoryChanged => {
+                    studio_corr::CORR_CACHE.invalidate();
                     self.reload_rotation_panes();
                     self.command_catalogue = Default::default();
                     let desk: Vec<(crate::dock::PaneId, String)> = self

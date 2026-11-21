@@ -219,3 +219,20 @@ fn resid_panel_paints_without_requests_and_selection_is_free() {
     frame(&ctx, &mut pane, &worker, false);
     assert!(requests.try_recv().is_err(), "chart selection dispatched work");
 }
+
+#[test]
+fn empty_library_offers_regression_lab() {
+    let mut pane = ResidPane::new("");
+    pane.listing = Some(Vec::new());
+    let (worker, _requests) = Worker::test_channel();
+    let mut out = egui::Context::default().run_ui(
+        egui::RawInput { screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(1000., 800.))), ..Default::default() },
+        |ui| { show(ui, 6, &mut pane, &worker, false); },
+    );
+    out.textures_delta.clear();
+    let text = out.shapes.iter().filter_map(|s| match &s.shape {
+        egui::Shape::Text(t) => Some(t.galley.job.text.as_str()), _ => None,
+    }).collect::<Vec<_>>().join("\n");
+    assert!(text.contains("Open Regression Lab"), "{text}");
+    assert!(text.contains("STUDIO lab"), "{text}");
+}
