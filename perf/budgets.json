@@ -168,6 +168,21 @@
       "relative": true,
       "class": "interactive"
     },
+    "studio.residual_score_7x5000": {
+      "budget_us": 12000,
+      "relative": true,
+      "class": "interactive"
+    },
+    "studio.residual_adf_2000": {
+      "budget_us": 20000,
+      "relative": true,
+      "class": "interactive"
+    },
+    "studio.residual_monitor_250x499": {
+      "budget_us": 150000,
+      "relative": true,
+      "class": "command"
+    },
     "inference.stationary_bootstrap_5k_x500": {
       "budget_us": 120000,
       "relative": true,

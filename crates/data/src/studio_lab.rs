@@ -718,6 +718,19 @@ pub struct LabReport {
     pub factor_errors: Vec<(String, String)>,
     /// First and last design timestamps (the descriptive span).
     pub span: Option<(i64, i64)>,
+    /// Latest ≤ `MAX_TRAIN_RESIDUALS` in-sample residuals (chronological), for saving a frozen fit.
+    /// Functions of keyed content; not part of any cache key. Empty on reports from older builds.
+    #[serde(default)]
+    pub train_residuals: Vec<f64>,
+    /// Same length as `train_residuals`; the first entry is forced `true`.
+    #[serde(default)]
+    pub train_breaks: Vec<bool>,
+    /// Mean over **all** `n_train` training residuals (≈ 0 with an intercept).
+    #[serde(default)]
+    pub train_residual_mean: f64,
+    /// One per input (target first): digest of each input's bars over the training span.
+    #[serde(default)]
+    pub train_span_digests: Vec<crate::studio_residual::SpanDigest>,
 }
 
 impl LabReport {
@@ -762,6 +775,10 @@ fn blank(
         unavailable: Some(reason),
         factor_errors: vec![],
         span: None,
+        train_residuals: vec![],
+        train_breaks: vec![],
+        train_residual_mean: 0.,
+        train_span_digests: vec![],
     }
 }
 
@@ -918,6 +935,15 @@ pub fn compute(
         input_identity: key,
         model_id: hs.finish(),
     });
+    // Bounded training residuals and span digests, for freezing this fit (RESID). No refit later.
+    let cut = n_train.saturating_sub(crate::studio_residual::MAX_TRAIN_RESIDUALS);
+    report.train_residuals = fit.residuals[cut..].to_vec();
+    report.train_breaks = (cut..n_train).map(|i| i == cut || design.break_before[i]).collect();
+    report.train_residual_mean = fit.residuals.iter().sum::<f64>() / n_train as f64;
+    report.train_span_digests = std::iter::once(target)
+        .chain(factors)
+        .map(|r| crate::studio_residual::span_digest(&r.bars, &r.symbol, design.ts[0], design.ts[n_train - 1]))
+        .collect();
     // Frozen scoring of every row, in target space.
     let predict = |i: usize| beta[0] + (0..beta.len() - 1).map(|j| beta[j + 1] * design.x[j][i]).sum::<f64>();
     let yhat_test: Vec<f64> = test.iter().map(|&i| predict(i)).collect();

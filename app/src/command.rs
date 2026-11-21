@@ -77,8 +77,10 @@ impl TradeArgs {
     /// a typo never fills the ticket with something unintended.
     fn parse(buy: Option<bool>, rest: &[&str]) -> Option<TradeArgs> {
         let mut t = TradeArgs { buy, ..Default::default() };
-        let price =
-            |s: &str| s.trim_start_matches(['@', '$']).replace(',', "").parse::<f64>().ok().filter(|x| *x > 0.0);
+        // Finite and positive: `1e999`, `inf` and `NaN` must never reach the ticket.
+        let price = |s: &str| {
+            s.trim_start_matches(['@', '$']).replace(',', "").parse::<f64>().ok().filter(|x| x.is_finite() && *x > 0.0)
+        };
         let mut words = Vec::new();
         let mut i = 0;
         while i < rest.len() {
@@ -261,6 +263,15 @@ pub enum VaultCmd {
     Drop { symbol: String, tf: Option<Timeframe> },
 }
 const VAULT_VERBS: [&str; 3] = ["DROP", "VERIFY", "PRUNE"];
+
+/// True when the words after `RESID` start with a residual verb (`SAVE`, `OPEN`, `CHECK`) or a
+/// `name=` save argument. Exact matches only: `RESID 1h`, `RESID DIST` and `RESID US Equity` stay tickers.
+fn resid_verb(rest: &[&str]) -> bool {
+    rest.first().is_some_and(|w| {
+        ["SAVE", "OPEN", "CHECK"].iter().any(|v| w.eq_ignore_ascii_case(v))
+            || w.get(..5).is_some_and(|p| p.eq_ignore_ascii_case("name="))
+    })
+}
 fn parse_vault(rest: &[&str]) -> Option<VaultCmd> {
     if rest.first().is_some_and(|s| s.eq_ignore_ascii_case("DROP")) {
         let (sec, used) = Security::resolve_tokens(&rest[1..])?;
@@ -455,6 +466,10 @@ pub enum Function {
     },
     /// Regression Lab: the words after `STUDIO lab` (interval and model edits).
     StudioLab {
+        spec: String,
+    },
+    /// Frozen residual tickers: the words after `STUDIO resid` / `RESID` (`save`, `open`, `check`).
+    StudioResid {
         spec: String,
     },
     DistributionStrip,
@@ -941,6 +956,12 @@ fn parse_function(head: &str, rest: &[&str]) -> Option<Function> {
                 tr_data::studio_lab::LabArgs::parse(&tail).ok()?;
                 return Some(Function::StudioLab { spec: tail });
             }
+            // `resid` words (save / open / check) likewise precede `parse_studio`.
+            if rest.first().is_some_and(|w| w.eq_ignore_ascii_case("resid")) && rest.len() > 1 {
+                let tail = rest[1..].join(" ");
+                tr_data::studio_residual::ResidArgs::parse(&tail).ok()?;
+                return Some(Function::StudioResid { spec: tail });
+            }
             let spec = joined();
             // LAB / RESID / ATTR are listed tickers, so their unavailable routes live behind STUDIO.
             let route = match spec.to_ascii_lowercase().as_str() {
@@ -954,6 +975,13 @@ fn parse_function(head: &str, rest: &[&str]) -> Option<Function> {
             }
             crate::app::studio_hub::parse_studio(&spec).ok()?;
             Function::Studio { spec }
+        }
+        // RESID is a listed ticker: only the exact verbs `SAVE|OPEN|CHECK` and a leading `name=`
+        // make a command; every other `RESID …` form loads the ticker (see parse()).
+        "RESID" if resid_verb(rest) => {
+            let spec = joined();
+            tr_data::studio_residual::ResidArgs::parse(&spec).ok()?;
+            Function::StudioResid { spec }
         }
         "WHEN" => {
             let spec = joined();
@@ -1096,6 +1124,10 @@ pub fn parse(input: &str) -> Option<Command> {
         if ["VAULT", "VLT"].iter().any(|word| head.eq_ignore_ascii_case(word))
             && rest.first().is_some_and(|verb| VAULT_VERBS.iter().any(|v| verb.eq_ignore_ascii_case(v)))
         {
+            return None;
+        }
+        // A RESID verb with bad arguments is an error, never the ticker.
+        if head.eq_ignore_ascii_case("RESID") && resid_verb(rest) {
             return None;
         }
     }
@@ -1304,6 +1336,7 @@ fn describe(f: &Function) -> String {
         Function::Journal(q) => format!("Trade journal: {q}"),
         Function::Studio { spec } => format!("Studio · native canvas and named lenses · {spec}"),
         Function::StudioLab { spec } => format!("Regression Lab · multi-factor OLS, purged holdout, HAC · {spec}"),
+        Function::StudioResid { spec } => format!("Residual tickers · frozen fit scored on live data, never refit · {spec}"),
         Function::StudioWhen { spec } => format!("When · fixed-family within-clock rule evidence · {spec}"),
         Function::StudioRelate { spec } => {
             format!("Relate · transforms, β and frozen-fit fair-value bands · {spec}")
@@ -2380,6 +2413,95 @@ mod tests {
         for v in PortView::ALL {
             assert_eq!(parse(v.code()), f(v, ""), "{} round-trips", v.code());
         }
+    }
+
+    #[test]
+    fn resid_command_grammar_keeps_ticker() {
+        let tick = |s: &str| Command::Symbol("RESID US Equity".into()) == parse(s).unwrap_or(Command::Symbol(String::new()));
+        // Every non-verb form still loads the RESID ticker (or its interval).
+        assert!(tick("RESID") && tick("RESID US Equity"));
+        assert_eq!(
+            parse("RESID 1h"),
+            Some(Command::SymbolFunction("RESID US Equity".into(), Function::Timeframe(Timeframe::H1)))
+        );
+        assert_eq!(
+            parse("RESID 1W"),
+            Some(Command::SymbolFunction("RESID US Equity".into(), Function::Timeframe(Timeframe::W1)))
+        );
+        assert!(!matches!(parse("RESID DIST"), Some(Command::Function(Function::StudioResid { .. }))));
+        assert!(!matches!(parse("RESID 1h"), Some(Command::Function(Function::StudioResid { .. }))));
+        // The canonical forms.
+        assert_eq!(
+            parse("STUDIO resid"),
+            Some(Command::Function(Function::StudioRoute(tr_data::studio::StudioRoute::Resid)))
+        );
+        assert_eq!(
+            parse("STUDIO resid open AAPL-v-SPY-v1"),
+            Some(Command::Function(Function::StudioResid { spec: "open AAPL-v-SPY-v1".into() }))
+        );
+        assert!(matches!(
+            parse("STUDIO resid save name=AAPL-v-SPY monitor=250"),
+            Some(Command::Function(Function::StudioResid { .. }))
+        ));
+        assert!(matches!(parse("STUDIO resid check"), Some(Command::Function(Function::StudioResid { .. }))));
+        // The aliases.
+        for ok in ["RESID OPEN AAPL-v-SPY-v1", "RESID CHECK", "RESID check x-v2", "RESID SAVE", "RESID name=AAPL-v-SPY", "resid save name=a_b monitor=20"] {
+            assert!(matches!(parse(ok), Some(Command::Function(Function::StudioResid { .. }))), "{ok}");
+        }
+        // A verb with bad arguments is an error, never the ticker.
+        for bad in [
+            "RESID OPEN",
+            "RESID OPEN ../x",
+            "RESID SAVE monitor=5",
+            "RESID name=a b",
+            "STUDIO resid open ../x",
+            "STUDIO resid open",
+            "STUDIO resid save monitor=5",
+            "STUDIO resid frob",
+        ] {
+            assert_eq!(parse(bad), None, "{bad}");
+        }
+    }
+
+    #[test]
+    fn order_ticket_rejects_non_finite_price() {
+        let t = |s: &str| match parse(s) {
+            Some(Command::Function(Function::Trade(t))) => Some(t),
+            Some(Command::SymbolFunction(k, Function::Trade(mut t))) => {
+                t.symbol = Some(k);
+                Some(t)
+            }
+            _ => None,
+        };
+        for bad in ["inf", "-inf", "NaN", "1e999", "0", "-5", "0.0", "-0.5"] {
+            // limit, stop, `@` shorthand, notional and quantity: none may accept the value.
+            for form in [
+                format!("BUY AAPL 1 LMT {bad}"),
+                format!("BUY AAPL 1 LIMIT {bad}"),
+                format!("SELL AAPL 1 STP {bad}"),
+                format!("SELL AAPL 1 STOP {bad}"),
+                format!("BUY AAPL 1 @{bad}"),
+                format!("BUY AAPL ${bad}"),
+                format!("BUY AAPL {bad}"),
+            ] {
+                assert_eq!(t(&form), None, "{form}");
+            }
+        }
+        for bad in [
+            "BUY AAPL 1e999",
+            "BUY AAPL 1 LMT inf",
+            "BUY AAPL 1 @inf",
+            "SELL AAPL 1 STP 1e309",
+            "BUY NVDA $1e999",
+            "BUY AAPL 1 LMT infinity",
+            "BUY AAPL 1 LMT NaN",
+        ] {
+            assert_eq!(t(bad), None, "{bad}");
+        }
+        let ok = t("BUY AAPL 10 LMT 150").expect("finite positive price still parses");
+        assert_eq!((ok.units, ok.limit), (Some(10.0), Some(150.0)));
+        assert_eq!(t("SELL AAPL 1 STP 99.5").and_then(|a| a.stop), Some(99.5));
+        assert_eq!(t("BUY AAPL $1000").and_then(|a| a.notional), Some(1000.0));
     }
 
     #[test]

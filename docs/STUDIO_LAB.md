@@ -91,7 +91,7 @@ the symbol and the interval match, and provenance is verified. Reports are keyed
 by every row's symbol, source, gaps, error, provenance and bar digest in spec order, the ordered factor
 triples, the holdout, the target transform, `daily`, `observed_at`, `closed_thru` and `lab.v1`. A correction inside an
 old bar, or a factor reorder, changes the key; the pane identity and covariance chip do not. Frozen models stay
-in the report; persistence is deferred to RESID.
+in the report; persistence is the Save residual button / `STUDIO resid save` (see STUDIO_RESIDUAL.md).
 
 Size bounds: ≤ 5,000 plotted points, 41 histogram bins, 1,152 grid cells, ≤ 8 coefficients, 4 inference blocks.
 
@@ -114,4 +114,4 @@ A legacy `StudioRoute{Lab}` layout restores as a default Lab pane.
 ## Limits
 
 No leverage plots, skew/Jarque–Bera, bootstrap, or retained point clouds. No categorical factor colours on
-the plots. RESID and ATTR stay unavailable routes.
+the plots. RESID is available (STUDIO_RESIDUAL.md); ATTR stays an unavailable route.

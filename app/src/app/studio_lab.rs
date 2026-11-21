@@ -54,6 +54,8 @@ pub struct LabPane {
     /// The last accepted report while a changed-spec request is in flight.
     pub previous: Option<Arc<LabReport>>,
     pub ui: LabUi,
+    /// Save residual: the pending request token and the last message.
+    pub save: super::studio_residual::SaveState,
     add_text: String,
     fresh: bool,
 }
@@ -88,6 +90,7 @@ impl LabPane {
             report: None,
             previous: None,
             ui,
+            save: Default::default(),
             add_text: String::new(),
             fresh: false,
         };
@@ -391,6 +394,7 @@ fn editor(ui: &mut Ui, id: PaneId, pane: &mut LabPane) -> bool {
 
 pub(super) fn show(ui: &mut Ui, id: PaneId, pane: &mut LabPane, worker: &crate::worker::Worker, sample: bool) -> Vec<Action> {
     let mut reload = false;
+    let mut save: Option<(u64, Arc<LabReport>)> = None;
     ui.horizontal_wrapped(|ui| {
         super::studio_dist::studio_title(ui, "REGRESSION LAB");
         ui.label(mono_text(
@@ -402,6 +406,20 @@ pub(super) fn show(ui: &mut Ui, id: PaneId, pane: &mut LabPane, worker: &crate::
             ui.ctx().copy_text(format!("STUDIO lab {} {}", pane.tf.label(), pane.spec.command()));
         }
         reload = ui.small_button("Reload").on_hover_text("Re-read every series, bypassing the short bar cache").clicked();
+        let can_save = !sample && pane.save.pending.is_none() && pane.report.as_ref().is_some_and(|r| r.fit.is_some());
+        if ui
+            .add_enabled(can_save, egui::Button::new("Save residual").small())
+            .on_hover_text("Freeze this fit into an immutable residual model (STUDIO resid open <id>)")
+            .clicked()
+            && let Some(r) = pane.report.clone()
+        {
+            let token = crate::worker::studio_token();
+            pane.save = super::studio_residual::SaveState { pending: Some(token), msg: None };
+            save = Some((token, r));
+        }
+        if let Some(m) = &pane.save.msg {
+            ui.label(ui_text(m, 10., theme::muted()));
+        }
     });
     if sample {
         pane.clear_for_sample();
@@ -469,6 +487,15 @@ pub(super) fn show(ui: &mut Ui, id: PaneId, pane: &mut LabPane, worker: &crate::
             pane.report = None;
             pane.previous = None;
         }
+    }
+    if let Some((token, r)) = save {
+        worker.send(Request::SaveStudioFit {
+            pane: id,
+            token,
+            name: None,
+            monitor: None,
+            source: tr_data::studio_residual::FitSource::Lab(r),
+        });
     }
     vec![]
 }

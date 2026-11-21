@@ -17,6 +17,8 @@ pub struct CorrPane {
     pub relate: Option<RelateSpec>,
     /// Next request bypasses the bar cache (set by the Reload button).
     fresh: bool,
+    /// Save residual: the pending request token and the last message.
+    pub save: super::studio_residual::SaveState,
 }
 
 impl CorrPane {
@@ -31,6 +33,7 @@ impl CorrPane {
             report: None,
             relate: None,
             fresh: false,
+            save: Default::default(),
         }
     }
     pub fn request(&mut self, pane: PaneId, worker: &crate::worker::Worker) {
@@ -471,13 +474,42 @@ pub(super) fn show(
     embedded: bool,
 ) -> Vec<Action> {
     let mut reload = false;
+    let mut save: Option<(u64, std::sync::Arc<CorrReport>, Timeframe)> = None;
     ui.horizontal_wrapped(|ui| {
         super::studio_dist::studio_title(ui, "RELATIONSHIP STUDIO");
         if ui.small_button("Reload").on_hover_text("Re-read every series, bypassing the short bar cache").clicked() {
             reload = true;
             pane.fresh = true;
         }
+        // Freezing needs the Relate fit; the embedded Studio shell has its own saved-model entry (STUDIO resid save).
+        if !embedded {
+            let fit = pane.report.as_ref().filter(|r| r.relate.as_ref().is_some_and(|x| x.fit.is_some())).cloned();
+            let tf = parse_spec(&pane.spec).map(|(_, tf)| tf).ok();
+            let can = !sample && pane.save.pending.is_none() && fit.is_some() && tf.is_some();
+            if ui
+                .add_enabled(can, egui::Button::new("Save residual").small())
+                .on_hover_text("Freeze the Relate fit into an immutable residual model (STUDIO resid open <id>)")
+                .clicked()
+                && let (Some(r), Some(tf)) = (fit, tf)
+            {
+                let token = crate::worker::studio_token();
+                pane.save = super::studio_residual::SaveState { pending: Some(token), msg: None };
+                save = Some((token, r, tf));
+            }
+            if let Some(m) = &pane.save.msg {
+                ui.label(RichText::new(m).font(theme::ui_font(10.0)).color(theme::muted()));
+            }
+        }
     });
+    if let Some((token, report, tf)) = save {
+        worker.send(crate::worker::Request::SaveStudioFit {
+            pane: id,
+            token,
+            name: None,
+            monitor: None,
+            source: tr_data::studio_residual::FitSource::Relate { report, tf },
+        });
+    }
     if !embedded {
         ui.horizontal_wrapped(|ui| {
             ui.label("Asset");

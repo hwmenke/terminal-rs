@@ -114,6 +114,25 @@ pub struct RelateReport {
     /// Source of each side: asset, benchmark.
     pub sources: [String; 2],
     pub benchmark_gaps: Vec<(i64, i64)>,
+    /// Latest ≤ `MAX_TRAIN_RESIDUALS` residuals `y − α − βx` of the training prefix, for freezing a
+    /// fit (RESID). Functions of keyed content; empty on reports from older builds or without a fit.
+    #[serde(default)]
+    pub train_residuals: Vec<f64>,
+    #[serde(default)]
+    pub train_breaks: Vec<bool>,
+    /// Mean over all `fit.n` training residuals.
+    #[serde(default)]
+    pub train_residual_mean: f64,
+    /// Asset then benchmark: digest of each input's bars from the first training row to `train_end`.
+    #[serde(default)]
+    pub train_span_digests: Vec<crate::studio_residual::SpanDigest>,
+    /// Timestamp of the first training row.
+    #[serde(default)]
+    pub train_start: i64,
+    /// Timeframe this report was computed at (frozen into a saved model; never read from the editable
+    /// spec text). `None` on reports from older builds.
+    #[serde(default)]
+    pub tf: Option<Timeframe>,
 }
 
 impl RelateReport {
@@ -146,6 +165,12 @@ impl RelateReport {
             unavailable: Some(reason),
             sources: [asset.source.clone(), benchmark.source.clone()],
             benchmark_gaps: benchmark.gaps.clone(),
+            train_residuals: Vec::new(),
+            train_breaks: Vec::new(),
+            train_residual_mean: 0.,
+            train_span_digests: Vec::new(),
+            train_start: 0,
+            tf: None,
         }
     }
 }
@@ -223,7 +248,7 @@ pub fn prepare(
     options: Options,
     tf: Timeframe,
     transform: Transform,
-    source: &str,
+    _source: &str, // receipts now carry each symbol's own source (asset.source / benchmark.source)
     closed_thru: i64,
     observed_at: Option<i64>,
 ) -> Result<Prepared, String> {
@@ -282,8 +307,10 @@ pub fn prepare(
         }
     }
     let provenance = Bar::provenance(&asset.bars).combine(Bar::provenance(&benchmark.bars));
-    let receipt = |bars: &[Bar]| SeriesReceipt {
-        source: source.into(),
+    // Each side carries its own symbol's source label (not the joined CORR string) so a saved model's
+    // per-input source check compares like with like.
+    let receipt = |bars: &[Bar], side_source: &str| SeriesReceipt {
+        source: side_source.into(),
         provenance,
         observed_at,
         closed_thru,
@@ -299,9 +326,9 @@ pub fn prepare(
             values: y,
             break_before: brk.clone(),
             unit: unit.clone(),
-            receipt: receipt(&asset.bars),
+            receipt: receipt(&asset.bars, &asset.source),
         },
-        x: ScalarSeries { ts: ts.clone(), values: x, break_before: brk, unit, receipt: receipt(&benchmark.bars) },
+        x: ScalarSeries { ts: ts.clone(), values: x, break_before: brk, unit, receipt: receipt(&benchmark.bars, &benchmark.source) },
         ts,
         price: rows.iter().map(|r| r.a).collect(),
         anchor,
@@ -631,7 +658,39 @@ pub fn compute_relate(
         Vec::new()
     };
     let matrix_common = (spec.matrix == MatrixMode::Common).then(|| common_panel_matrix(rows, options.daily));
+    // Bounded training residuals and span digests, for freezing this fit (RESID).
+    let mut frozen = (Vec::new(), Vec::new(), 0., Vec::new(), 0);
+    if let Some(f) = &fit {
+        let train: Vec<usize> = prepared.valid_rows().into_iter().take(f.n).collect();
+        let res: Vec<f64> = train
+            .iter()
+            .map(|&t| prepared.y.values[t].unwrap() - f.alpha - f.beta * prepared.x.values[t].unwrap())
+            .collect();
+        let brk: Vec<bool> = (0..train.len())
+            .map(|i| i == 0 || prepared.y.break_before[train[i]] || train[i] != train[i - 1] + 1)
+            .collect();
+        let cut = res.len().saturating_sub(crate::studio_residual::MAX_TRAIN_RESIDUALS);
+        let mut tb = brk[cut..].to_vec();
+        tb[0] = true;
+        let (first, thru) = (prepared.ts[train[0]], f.train_end);
+        frozen = (
+            res[cut..].to_vec(),
+            tb,
+            res.iter().sum::<f64>() / res.len() as f64,
+            [asset, benchmark]
+                .iter()
+                .map(|r| crate::studio_residual::span_digest(&r.bars, &r.symbol, first, thru))
+                .collect(),
+            first,
+        );
+    }
     Ok(RelateReport {
+        train_residuals: frozen.0,
+        train_breaks: frozen.1,
+        train_residual_mean: frozen.2,
+        train_span_digests: frozen.3,
+        train_start: frozen.4,
+        tf: Some(tf),
         spec: spec.clone(),
         key,
         y: tail_series(&prepared.y, MAX_POINTS),

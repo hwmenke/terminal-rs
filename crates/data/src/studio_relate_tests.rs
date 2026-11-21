@@ -380,3 +380,28 @@ fn relate_spec_old_layout_without_new_fields_loads() {
     assert!(spec.bands);
     assert_eq!(spec.transform, Transform::LogReturn { h: 5 });
 }
+
+#[test]
+fn relate_report_carries_bounded_training_residuals() {
+    let (a, b) = related(6_600, 0.9, 41);
+    let spec = RelateSpec::new("QQQ US Equity", Transform::LogReturn { h: 1 });
+    let r = compute_relate(&a, &b, &[], OPT, Timeframe::D1, &spec, "unit", 0, None, 1).unwrap();
+    let fit = r.fit.as_ref().unwrap();
+    assert!(fit.n > crate::studio_residual::MAX_TRAIN_RESIDUALS);
+    assert_eq!(r.train_residuals.len(), crate::studio_residual::MAX_TRAIN_RESIDUALS);
+    assert!(r.train_breaks[0] && r.train_breaks.len() == r.train_residuals.len());
+    let p = prep(&a, &b, Transform::LogReturn { h: 1 });
+    let train: Vec<usize> = p.valid_rows().into_iter().take(fit.n).collect();
+    let all: Vec<f64> =
+        train.iter().map(|&t| p.y.values[t].unwrap() - fit.alpha - fit.beta * p.x.values[t].unwrap()).collect();
+    for (x, y) in r.train_residuals.iter().zip(&all[all.len() - r.train_residuals.len()..]) {
+        assert!((x - y).abs() <= 1e-12);
+    }
+    assert!((r.train_residual_mean - all.iter().sum::<f64>() / all.len() as f64).abs() <= 1e-15);
+    assert_eq!(r.train_span_digests.len(), 2);
+    assert_eq!(r.train_span_digests[1].thru_ts, fit.train_end);
+    // A report without a fit carries nothing to freeze.
+    let (a2, b2) = related(30, 1.0, 1);
+    let none = compute_relate(&a2, &b2, &[], OPT, Timeframe::D1, &spec, "unit", 0, None, 1).unwrap();
+    assert!(none.train_residuals.is_empty() && none.train_span_digests.is_empty());
+}

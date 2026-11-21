@@ -508,3 +508,36 @@ fn lab_end_to_end_recovers_slope_with_inference() {
     let lagged = compute(&target, &[factor], &spec1(spec.target, spec.factors[0].transform, 1), Timeframe::D1, true, "unit", 99, Some(5), 7);
     assert!(lagged.holdout.unwrap().forecast_style);
 }
+
+#[test]
+fn lab_and_relate_reports_carry_bounded_training_residuals() {
+    // Lab: the stored tail equals the fit_ols residuals; bounded at 5,000; mean over all n_train.
+    let n = 6_600;
+    let (target, factor) = rel_rows(n, 0.8, 77);
+    let spec = spec1(Transform::LogReturn { h: 1 }, Transform::LogReturn { h: 1 }, 0);
+    let r = compute(&target, &[factor.clone()], &spec, Timeframe::D1, true, "unit", 0, None, 1);
+    let fit = r.fit.as_ref().unwrap();
+    assert!(fit.n_train > crate::studio_residual::MAX_TRAIN_RESIDUALS);
+    assert_eq!(r.train_residuals.len(), crate::studio_residual::MAX_TRAIN_RESIDUALS);
+    assert_eq!(r.train_breaks.len(), r.train_residuals.len());
+    assert!(r.train_breaks[0]);
+    let d = design(&target, &[factor], &spec);
+    let cols: Vec<&[f64]> = d.x.iter().map(|c| &c[..fit.n_train]).collect();
+    let ols = linalg::fit_ols(&cols, &d.y[..fit.n_train]).unwrap();
+    let tail = &ols.residuals[fit.n_train - r.train_residuals.len()..];
+    for (a, b) in r.train_residuals.iter().zip(tail) {
+        assert!((a - b).abs() <= 1e-12, "{a} vs {b}");
+    }
+    let mean = ols.residuals.iter().sum::<f64>() / fit.n_train as f64;
+    assert!((r.train_residual_mean - mean).abs() <= 1e-15);
+    assert_eq!(r.train_span_digests.len(), fit.k);
+    assert_eq!(r.train_span_digests[0].symbol, TGT);
+    assert_eq!(r.train_span_digests[0].thru_ts, fit.train_end);
+    // Old exports without the new fields still deserialize (empty, so a freeze refuses them).
+    let mut json: serde_json::Value = serde_json::to_value(&r).unwrap();
+    for k in ["train_residuals", "train_breaks", "train_residual_mean", "train_span_digests"] {
+        json.as_object_mut().unwrap().remove(k);
+    }
+    let old: LabReport = serde_json::from_value(json).unwrap();
+    assert!(old.train_residuals.is_empty() && old.train_span_digests.is_empty());
+}

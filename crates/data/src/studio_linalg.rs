@@ -87,8 +87,119 @@ fn upper_inverse(r: &[f64], k: usize) -> Option<Vec<f64>> {
     inv.iter().all(|v| v.is_finite()).then_some(inv)
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Number of `fit_ols` calls on this thread; lets tests prove frozen scoring never refits.
+    pub static FIT_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Unpivoted Householder QR of `[columns…]` against `y`, in fixed column order, so every leading
+/// prefix of columns is a nested model: `sse(k)` and the last coefficient of the k-column model come
+/// from one factorisation. `fit_ols` pivots and standardises, so it cannot give nested SSEs.
+#[derive(Debug, Clone)]
+pub struct NestedQr {
+    /// `R[j][j]`.
+    pub r_diag: Vec<f64>,
+    /// Qᵀy (length n).
+    pub qty: Vec<f64>,
+    pub yty: f64,
+    pub n: usize,
+    /// Upper-triangular R, column-major k×k.
+    r: Vec<f64>,
+    /// `tail[i] = Σ_{m≥i} qty[m]²` (length n+1).
+    tail: Vec<f64>,
+}
+
+pub fn nested_qr(columns: &[&[f64]], y: &[f64]) -> Result<NestedQr, LinalgError> {
+    let (n, k) = (y.len(), columns.len());
+    if n <= k {
+        return Err(LinalgError::TooFewRows { n, k });
+    }
+    if y.iter().any(|v| !v.is_finite()) || columns.iter().any(|c| c.len() != n || c.iter().any(|v| !v.is_finite())) {
+        return Err(LinalgError::NonFinite);
+    }
+    let mut a = Vec::with_capacity(n * k);
+    for c in columns {
+        a.extend_from_slice(c);
+    }
+    let col_norm: Vec<f64> = columns.iter().map(|c| c.iter().map(|v| v * v).sum::<f64>().sqrt()).collect();
+    let mut qty = y.to_vec();
+    let yty = y.iter().map(|v| v * v).sum::<f64>();
+    let mut r_diag = vec![0.; k];
+    for i in 0..k {
+        let norm = a[i * n + i..(i + 1) * n].iter().map(|v| v * v).sum::<f64>().sqrt();
+        if norm == 0. {
+            continue;
+        }
+        let alpha = if a[i * n + i] >= 0. { -norm } else { norm };
+        let mut v: Vec<f64> = a[i * n + i..(i + 1) * n].to_vec();
+        v[0] -= alpha;
+        let vnorm2 = v.iter().map(|x| x * x).sum::<f64>();
+        if vnorm2 > 0. {
+            for c in i + 1..k {
+                let dot = a[c * n + i..(c + 1) * n].iter().zip(&v).map(|(x, w)| x * w).sum::<f64>();
+                let f = 2. * dot / vnorm2;
+                for (x, w) in a[c * n + i..(c + 1) * n].iter_mut().zip(&v) {
+                    *x -= f * w;
+                }
+            }
+            let dot = qty[i..].iter().zip(&v).map(|(x, w)| x * w).sum::<f64>();
+            let f = 2. * dot / vnorm2;
+            for (x, w) in qty[i..].iter_mut().zip(&v) {
+                *x -= f * w;
+            }
+        }
+        r_diag[i] = alpha;
+    }
+    // Rank guard against each column's own scale.
+    if let Some(j) = (0..k).find(|&j| !(r_diag[j].abs() > RANK_TOL * col_norm[j])) {
+        return Err(LinalgError::RankDeficient { rank: j, k, column: j });
+    }
+    let mut r = vec![0.; k * k];
+    for c in 0..k {
+        for i in 0..c {
+            r[c * k + i] = a[c * n + i];
+        }
+        r[c * k + c] = r_diag[c];
+    }
+    let mut tail = vec![0.; n + 1];
+    for i in (0..n).rev() {
+        tail[i] = tail[i + 1] + qty[i] * qty[i];
+    }
+    Ok(NestedQr { r_diag, qty, yty, n, r, tail })
+}
+
+impl NestedQr {
+    /// SSE of the model on the first `k` columns: ‖Qᵀy‖² beyond the first k rows.
+    pub fn sse(&self, k: usize) -> f64 {
+        self.tail[k.min(self.n)]
+    }
+    /// `(coefficient, t)` of column `k−1` in the k-column model; `se = s/|R[k−1][k−1]|`,
+    /// `s² = SSE_k/(n−k)`. `t` is infinite-free: a zero SSE gives `t = ±∞` only if the coefficient is non-zero.
+    pub fn last_coef_t(&self, k: usize) -> (f64, f64) {
+        let coef = self.qty[k - 1] / self.r_diag[k - 1];
+        let s = (self.sse(k) / (self.n - k) as f64).sqrt();
+        (coef, coef / (s / self.r_diag[k - 1].abs()))
+    }
+    /// All coefficients of the k-column model by back-substitution.
+    pub fn coefficients(&self, k: usize) -> Vec<f64> {
+        let kk = self.r_diag.len();
+        let mut b = vec![0.; k];
+        for i in (0..k).rev() {
+            let mut s = self.qty[i];
+            for m in i + 1..k {
+                s -= self.r[m * kk + i] * b[m];
+            }
+            b[i] = s / self.r[i * kk + i];
+        }
+        b
+    }
+}
+
 /// OLS with an intercept on `factors` (columns) and `y`, via pivoted QR on standardised columns.
 pub fn fit_ols(factors: &[&[f64]], y: &[f64]) -> Result<OlsFit, LinalgError> {
+    #[cfg(test)]
+    FIT_CALLS.with(|c| c.set(c.get() + 1));
     let (n, p) = (y.len(), factors.len());
     let k = p + 1;
     if n <= k {
@@ -358,6 +469,29 @@ mod tests {
         // n ≤ k: three rows for an intercept and two factors.
         assert!(matches!(fit_ols(&[&a[..3], &w[..3]], &y[..3]), Err(LinalgError::TooFewRows { n: 3, k: 3 })));
         assert!(matches!(fit_ols(&[&[f64::NAN; 8][..]], &y), Err(LinalgError::NonFinite)));
+    }
+
+    #[test]
+    fn nested_qr_matches_fit_ols_sse() {
+        let n = 60;
+        let col = |a: f64, b: f64| -> Vec<f64> { (0..n).map(|i| (i as f64 * a + b).sin() + 0.1 * (i as f64 * b).cos()).collect() };
+        let cols = [col(0.7, 0.3), col(1.3, 1.1), col(2.1, 0.2)];
+        let y: Vec<f64> = (0..n).map(|i| 0.5 + 2. * cols[0][i] - cols[1][i] + 0.3 * (i as f64 * 3.7).sin()).collect();
+        let ones = vec![1.; n];
+        let refs: Vec<&[f64]> = std::iter::once(ones.as_slice()).chain(cols.iter().map(|c| c.as_slice())).collect();
+        let nq = nested_qr(&refs, &y).unwrap();
+        for p in 0..=3 {
+            let fit = fit_ols(&cols[..p].iter().map(|c| c.as_slice()).collect::<Vec<_>>(), &y).unwrap();
+            let got = nq.sse(p + 1);
+            assert!((got - fit.sse).abs() <= 1e-9 * fit.sse.max(1e-12), "p={p}: {got} vs {}", fit.sse);
+            let b = nq.coefficients(p + 1);
+            for (x, w) in b.iter().zip(&fit.coefficients) {
+                close(*x, *w, 1e-9);
+            }
+        }
+        // Rank guard: a duplicated column.
+        let dup: Vec<&[f64]> = vec![ones.as_slice(), cols[0].as_slice(), cols[0].as_slice()];
+        assert!(matches!(nested_qr(&dup, &y), Err(LinalgError::RankDeficient { .. })));
     }
 
     #[test]

@@ -63,6 +63,8 @@ pub mod studio_season;
 pub mod studio_inference;
 pub mod studio_lab;
 pub mod studio_linalg;
+pub mod studio_residual;
+pub mod studio_stationarity;
 pub mod time_link;
 pub mod trade_plans;
 pub mod treasury;

@@ -253,6 +253,12 @@ pub enum PaneSettings {
         #[serde(default)]
         spec: tr_data::studio_lab::LabSpec,
     },
+    /// Frozen residual ticker: the saved model id only. Models live on disk (immutable); reports and
+    /// checks are never saved. A legacy `StudioRoute{Resid}` restores as an empty pane.
+    StudioResid {
+        #[serde(default)]
+        model_id: String,
+    },
     /// Statistics / conditional returns for one research symbol.
     Stats {
         #[serde(default)]

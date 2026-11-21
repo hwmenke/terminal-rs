@@ -477,6 +477,50 @@ pub fn all(scale: Scale) -> Vec<Case> {
             r.points.len() + fit.n_train
         });
     }
+    // Frozen residual tickers (slice 6): scoring a frozen 7-factor model (design + dot products +
+    // series), the ADF lag search on 2,000 AR(1) residuals, and the fixed-horizon CUSUM monitor.
+    {
+        use tr_data::studio_residual as sr;
+        let (fit, target, factors) = fixtures::resid_model(n);
+        let closed = target.bars.last().unwrap().ts + 86_400;
+        let (f1, t1, r1) = (fit.clone(), target.clone(), factors.clone());
+        add!("studio.residual_score_7x5000", move || {
+            let r = bb(sr::score(bb(&f1), bb(&t1), bb(&r1), true, "benchmark fixture only", closed, None, 1));
+            assert!(r.unavailable.is_none(), "{:?}", r.unavailable);
+            assert!(!full || r.scored.len() > 900 && r.residual.ts.len() == tr_data::studio_corr::MAX_POINTS.min(n));
+            assert!(!r.scored.is_empty() && r.scored.len() == r.scored_ts.len());
+            assert!(r.z.values.iter().flatten().any(|z| *z != 0.));
+            r.scored.len() + r.residual.ts.len()
+        });
+        let e = fixtures::resid_ar1(if full { 2000 } else { 200 }, 0.9);
+        add!("studio.residual_adf_2000", move || {
+            let a = bb(tr_data::studio_stationarity::adf(bb(&e))).expect("adf ready");
+            assert!(a.max_lag >= if full { 25 } else { 14 } && a.n_eff + a.max_lag + 1 == e.len());
+            a.n_eff + a.lag
+        });
+        let mut mfit = fit.clone();
+        let stored = if full { 2000 } else { 400 };
+        mfit.train_residuals = fixtures::resid_ar1(stored, 0.3);
+        mfit.train_breaks = vec![false; stored];
+        mfit.train_breaks[0] = true;
+        (mfit.monitoring_horizon, mfit.bootstrap_block) = (250, 13);
+        mfit.train_residuals_dropped = 0;
+        mfit.content_digest = mfit.compute_digest();
+        let mut rep = sr::score(&fit, &target, &factors, true, "benchmark fixture only", closed, None, 1);
+        rep.scored = fixtures::resid_ar1(400, 0.3);
+        rep.scored_ts = (0..400).collect();
+        rep.scored_breaks = vec![false; 400];
+        rep.scored_breaks[0] = true;
+        add!("studio.residual_monitor_250x499", move || {
+            match bb(sr::monitor_check(bb(&mfit), bb(&rep))) {
+                sr::CheckState::Ready(m) => {
+                    assert!(m.p.is_some() && m.k == 250 && m.draws == 499 && m.envelope.len() == 250);
+                    m.k + m.envelope.len()
+                }
+                other => panic!("monitor not ready: {other:?}"),
+            }
+        });
+    }
     let bars = fixtures::daily(if full { 5000 } else { 200 }, 83);
     let seed = stable_hash::bars_digest(&bars);
     let values: Vec<_> = bars.iter().map(|b| b.close / b.open - 1.).collect();

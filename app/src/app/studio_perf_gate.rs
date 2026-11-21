@@ -172,6 +172,7 @@ fn perf_gate_paint_studios() {
     best.extend(relate_sample());
     best.extend(fair_value_sample());
     best.extend(lab_sample());
+    best.extend(resid_sample());
     let ids: BTreeSet<_> = budgets.cases.keys().filter(|id| id.starts_with("paint.studio_")).cloned().collect();
     assert_eq!(best.keys().cloned().collect::<BTreeSet<_>>(), ids, "stale/missing studio budgets");
     for _ in 0..2 {
@@ -193,6 +194,7 @@ fn perf_gate_paint_studios() {
             .chain(relate_sample())
             .chain(fair_value_sample())
             .chain(lab_sample())
+            .chain(resid_sample())
         {
             if s.median_us < best[&id].median_us {
                 best.insert(id, s);
@@ -1955,5 +1957,210 @@ fn lab_low_n_and_unavailable_states_paint() {
     let txt = text(&out.shapes);
     assert!(txt.contains("REGRESSION LAB UNAVAILABLE") && txt.contains("rank-deficient"), "{txt}");
     assert!(!txt.contains("FITTED vs ACTUAL") && !txt.contains("R²_OOS"), "fitted content painted: {txt}");
+    finite(&ctx, out);
+}
+
+// ---- Frozen residual tickers (slice 6): panel paint, actual hover, pending / unavailable states ----
+
+type ResidState = (
+    std::sync::Arc<tr_data::studio_residual::FrozenFit>,
+    std::sync::Arc<tr_data::studio_residual::ResidualReport>,
+    std::sync::Arc<tr_data::studio_residual::ResidualChecks>,
+);
+fn resid_state() -> ResidState {
+    let (fit, rep, chk) = super::studio_residual::fixture(5000);
+    assert!(rep.unavailable.is_none() && rep.scored.len() > 900, "{:?}", rep.unavailable);
+    assert!(rep.residual.ts.len() > 4900 && rep.residual.values.iter().flatten().any(|e| *e < 0.));
+    assert!(matches!(chk.adf, tr_data::studio_residual::CheckState::Ready(_)), "{:?}", chk.adf);
+    assert!(matches!(&chk.monitor, tr_data::studio_residual::CheckState::Ready(m) if m.p.is_some()), "{:?}", chk.monitor);
+    (fit, rep, chk)
+}
+fn resid_frame(
+    ctx: &egui::Context,
+    s: &ResidState,
+    st: &mut super::studio_residual::ResidUi,
+    width: f32,
+    hover: bool,
+    index: usize,
+) -> egui::FullOutput {
+    let pointer = if hover {
+        ctx.data(|d| d.get_temp::<Rect>(egui::Id::new("resid-probe"))).unwrap_or(Rect::NOTHING).center()
+            + vec2(if index >= 160 { (index % 2) as f32 } else { 0. }, 0.)
+    } else {
+        pos2(15., 15.)
+    };
+    let events = if ctx.input(|i| i.pointer.hover_pos()) == Some(pointer) {
+        vec![]
+    } else {
+        vec![egui::Event::PointerMoved(pointer)]
+    };
+    let mut out = ctx.run_ui(
+        egui::RawInput {
+            time: Some(1. + index as f64 * 0.2),
+            screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(width, 1400.))),
+            events,
+            ..Default::default()
+        },
+        |ui| super::studio_residual::panel(ui, 24, &s.0, &s.1, Some(&s.2), false, st),
+    );
+    out.textures_delta.clear();
+    out
+}
+fn resid_guard(out: &egui::FullOutput) {
+    let txt = text(&out.shapes);
+    for word in [
+        "FROZEN FIT · scored, not refit",
+        "TRAIN | SCORED",
+        "TRAIN · in-sample",
+        "−2σ saved",
+        "Stationarity check · ADF",
+        "H0 unit root",
+        "Change check",
+        "SAVED COEFFICIENTS",
+        "CLOSED THRU",
+    ] {
+        assert!(txt.contains(word), "missing {word}: {txt}");
+    }
+    assert!(out.shapes.len() > 60, "empty residual panel");
+}
+fn resid_sample() -> BTreeMap<String, Summary> {
+    let ctx = egui::Context::default();
+    let s = resid_state();
+    let mut st = super::studio_residual::ResidUi::default();
+    for i in 0..20 {
+        finite(&ctx, resid_frame(&ctx, &s, &mut st, 1440., false, i));
+    }
+    let mut result = BTreeMap::new();
+    for hover in [false, true] {
+        let mode = if hover { "hover" } else { "steady" };
+        if hover {
+            for i in 140..160 {
+                finite(&ctx, resid_frame(&ctx, &s, &mut st, 1440., true, i));
+            }
+        }
+        let mut times: BTreeMap<String, Vec<f64>> = BTreeMap::new();
+        for i in 0..120 {
+            let start = Instant::now();
+            let mut out = resid_frame(&ctx, &s, &mut st, 1440., hover, i + if hover { 160 } else { 20 });
+            let ui_us = start.elapsed().as_secs_f64() * 1e6;
+            if i == 60 {
+                resid_guard(&out);
+                if hover {
+                    let txt = text(&out.shapes);
+                    assert!(
+                        txt.contains("resid.score") && txt.contains("CLOSED THRU"),
+                        "hover did not paint the residual MathCard"
+                    );
+                }
+            }
+            let start = Instant::now();
+            let primitives = ctx.tessellate(std::mem::take(&mut out.shapes), out.pixels_per_point);
+            let tess_us = start.elapsed().as_secs_f64() * 1e6;
+            assert!(!primitives.is_empty());
+            std::hint::black_box(primitives);
+            for (metric, v) in [("ui", ui_us), ("tess", tess_us), ("total", ui_us + tess_us)] {
+                times.entry(format!("paint.studio_residual.{mode}.{metric}")).or_default().push(v);
+            }
+        }
+        for (id, mut samples) in times {
+            result.insert(id, tr_perf::summarize(&mut samples));
+        }
+    }
+    result
+}
+#[test]
+fn resid_panel_geometry_and_actual_hover_320_1440() {
+    let s = resid_state();
+    for width in [320., 1440.] {
+        let ctx = egui::Context::default();
+        ctx.all_styles_mut(|st| st.interaction.tooltip_delay = 0.);
+        let mut st = super::studio_residual::ResidUi::default();
+        let out = resid_frame(&ctx, &s, &mut st, width, false, 0);
+        resid_guard(&out);
+        for clipped in &out.shapes {
+            assert!(clipped.clip_rect.is_finite());
+        }
+        finite(&ctx, out);
+        let mut last = None;
+        for i in 140..160 {
+            last = Some(resid_frame(&ctx, &s, &mut st, width, true, i));
+        }
+        let out = last.unwrap();
+        let txt = text(&out.shapes);
+        for word in ["resid.score", "CLOSED THRU", "FROZEN FIT · scored, not refit", "TRAIN | SCORED"] {
+            assert!(txt.contains(word), "{width}: hover missing {word}: {txt}");
+        }
+        let probe = ctx.data(|d| d.get_temp::<Rect>(egui::Id::new("resid-probe"))).unwrap();
+        assert!(probe.width() <= width + 1. && probe.height() == 220. && probe.is_finite(), "chart overflows {width}px: {probe:?}");
+        finite(&ctx, out);
+        // The z toggle paints from the same report.
+        st.show_z = true;
+        finite(&ctx, resid_frame(&ctx, &s, &mut st, width, false, 200));
+    }
+}
+#[test]
+fn resid_pending_and_unavailable_states_paint() {
+    use tr_data::studio_residual::{CheckState, InputCheck};
+    let ctx = egui::Context::default();
+    let (fit, rep, _) = resid_state();
+    // 23 scored bars: the ADF check is pending, never "stationary"; a revised input shows its badge.
+    let mut r = (*rep).clone();
+    let keep = 23;
+    r.scored.truncate(keep);
+    r.scored_ts.truncate(keep);
+    r.scored_breaks.truncate(keep);
+    r.revision[1].1 = InputCheck::Revised { live: 1, saved: 2 };
+    let c = tr_data::studio_residual::checks(&fit, &r);
+    assert!(matches!(c.adf, CheckState::Pending { have: 23, need: 60, .. }), "{:?}", c.adf);
+    let mut st = super::studio_residual::ResidUi::default();
+    let mut out = ctx.run_ui(
+        egui::RawInput { screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(1440., 1400.))), ..Default::default() },
+        |ui| super::studio_residual::panel(ui, 25, &fit, &r, Some(&c), false, &mut st),
+    );
+    out.textures_delta.clear();
+    let txt = text(&out.shapes);
+    for word in ["Stationarity check pending: 23/60 scored bars", "INPUT REVISED", "the saved model is unchanged"] {
+        assert!(txt.contains(word), "missing {word}: {txt}");
+    }
+    assert!(!txt.contains("stationary ·") && !txt.contains("ADF τ"), "a pending check painted a verdict: {txt}");
+    let tick = |s: &egui::Shape| {
+        matches!(s, egui::Shape::LineSegment { stroke, .. } if stroke.color == crate::theme::caution())
+    };
+    assert!(any_shape(&out.shapes, &tick), "revision badge corner tick missing");
+    finite(&ctx, out);
+    // Checks still computing: the tiles keep their reserved space.
+    let mut out = ctx.run_ui(
+        egui::RawInput { screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(1440., 1400.))), ..Default::default() },
+        |ui| super::studio_residual::panel(ui, 25, &fit, &rep, None, true, &mut st),
+    );
+    out.textures_delta.clear();
+    assert!(text(&out.shapes).contains("computing…"));
+    finite(&ctx, out);
+    // A missing model paints a recoverable card and no numbers.
+    let u = crate::studio_models::ModelUnavailable {
+        kind: crate::studio_models::UnavailableKind::Missing,
+        id: "gone-v1".into(),
+        message: "no such saved model".into(),
+    };
+    let mut out = ctx.run_ui(
+        egui::RawInput { screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(1440., 800.))), ..Default::default() },
+        |ui| super::studio_residual::model_unavailable(ui, &u),
+    );
+    out.textures_delta.clear();
+    let txt = text(&out.shapes);
+    assert!(txt.contains("Model `gone-v1` unavailable: missing"), "{txt}");
+    assert!(!txt.contains("σ_saved") && !txt.contains("FROZEN FIT") && !txt.contains("τ"), "numbers painted: {txt}");
+    finite(&ctx, out);
+    // An unavailable score paints the reason card and no chart.
+    let mut bad = (*rep).clone();
+    bad.unavailable = Some("Residual scoring needs every saved input; unavailable: F3 (no archive).".into());
+    bad.factor_errors = vec![("F3 US Equity".into(), "no archive".into())];
+    let mut out = ctx.run_ui(
+        egui::RawInput { screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(1440., 1400.))), ..Default::default() },
+        |ui| super::studio_residual::panel(ui, 25, &fit, &bad, None, false, &mut st),
+    );
+    out.textures_delta.clear();
+    let txt = text(&out.shapes);
+    assert!(txt.contains("RESIDUAL UNAVAILABLE") && txt.contains("no archive") && !txt.contains("TRAIN | SCORED"), "{txt}");
     finite(&ctx, out);
 }

@@ -83,10 +83,10 @@ impl StudioRoute {
                 "QUICK / Answers is unavailable: the evidence-bearing answer screen has not been implemented."
             }
             Self::Lab => {
-                "Regression Lab · multi-factor OLS with a purged holdout and HAC inference · STUDIO lab factors=SPY,TLT (frozen model persistence arrives with RESID)"
+                "Regression Lab · multi-factor OLS with a purged holdout and HAC inference · STUDIO lab factors=SPY,TLT (Save residual freezes a fit for RESID)"
             }
             Self::Resid => {
-                "RESID is unavailable: frozen residual scoring and its signed scalar-series canvas have not been implemented."
+                "Residual tickers · frozen fit scored on live data, never refit · STUDIO resid open <id>"
             }
             Self::Attr => {
                 "ATTR is unavailable: move attribution and actual = intercept + factors + residual reconciliation have not been implemented."
@@ -218,6 +218,8 @@ pub enum SeriesUnit {
     Index100,
     Z,
     BpPerBar,
+    /// Residual in units of the *saved training* σ of a frozen fit (RESID).
+    ZFrozen,
 }
 impl SeriesUnit {
     pub fn label(&self) -> &str {
@@ -225,6 +227,7 @@ impl SeriesUnit {
             Self::Native(s) => s,
             Self::Index100 => "index (base=100)",
             Self::Z => "z (prior sample σ)",
+            Self::ZFrozen => "z (saved training σ)",
             Self::BpPerBar => "bp/bar",
         }
     }

@@ -318,6 +318,9 @@ pub fn compute_report(
         }
     }
 
+    // Outcomes may only use closes known at the as-of date: a neighbour whose horizon ends after
+    // `query_idx` is incomplete for this query, however much later history the archive holds.
+    let visible = &bars[..=query_idx];
     let neighbors: Vec<Neighbor> = selected
         .iter()
         .map(|&(i, distance)| Neighbor {
@@ -326,7 +329,7 @@ pub fn compute_report(
             index: i,
             distance,
             features: features[i].clone(),
-            outcomes: query.horizons.iter().map(|&h| horizon_outcome(bars, i, h)).collect(),
+            outcomes: query.horizons.iter().map(|&h| horizon_outcome(visible, i, h)).collect(),
         })
         .collect();
 
@@ -682,6 +685,49 @@ mod tests {
         assert!(report.neighbors.iter().all(|n| n.index < 100));
         assert!(report.neighbors.iter().all(|n| n.ts < report.query.ts));
         assert!(!report.neighbors.iter().any(|n| n.index == 100));
+    }
+
+    #[test]
+    fn lookalike_historical_as_of_never_sees_future_outcomes() {
+        let bars = uptrend(220);
+        let q = |as_of_idx: usize| LookalikeQuery {
+            k: 20,
+            horizons: vec![21],
+            as_of: Some(bar_date(bars[as_of_idx].ts)),
+            gap: 5,
+        };
+        let base = compute_report("X", "X", &bars[..=150], &q(150), "t").unwrap();
+        let full = compute_report("X", "X", &bars, &q(150), "t").unwrap();
+        assert!(
+            full.neighbors.iter().any(|n| n.index + 21 > 150),
+            "fixture must include neighbours whose horizon passes the as-of"
+        );
+        for n in &full.neighbors {
+            let o = n.outcomes.iter().find(|o| o.horizon == 21).unwrap();
+            assert_eq!(o.completed, n.index + 21 <= 150, "neighbour {}", n.index);
+            if o.completed {
+                let want = bars[n.index + 21].close / bars[n.index].close - 1.0;
+                assert!((o.ret.unwrap() - want).abs() < 1e-12);
+            } else {
+                assert!(o.ret.is_none());
+                assert!(o.reason.as_ref().unwrap().starts_with("incomplete:"));
+            }
+        }
+        // Append-invariance: later bars never change the report at a fixed as-of.
+        for end in [152, 220] {
+            let r = compute_report("X", "X", &bars[..end], &q(150), "t").unwrap();
+            assert_eq!(r.eligible_n, base.eligible_n);
+            assert_eq!(r.by_horizon.len(), base.by_horizon.len());
+            for (a, b) in r.by_horizon.iter().zip(&base.by_horizon) {
+                assert_eq!(format!("{a:?}"), format!("{b:?}"));
+            }
+            assert_eq!(r.neighbors.len(), base.neighbors.len());
+            for (a, b) in r.neighbors.iter().zip(&base.neighbors) {
+                assert_eq!((a.index, a.distance.to_bits()), (b.index, b.distance.to_bits()));
+                assert_eq!(format!("{:?}", a.outcomes), format!("{:?}", b.outcomes));
+            }
+            assert_eq!(format!("{:?}", r.query), format!("{:?}", base.query));
+        }
     }
 
     #[test]

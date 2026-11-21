@@ -36,7 +36,10 @@ const COMMANDS: &[(&str, &str, &str, Option<Action>)] = &[
     ("QUICK mode=index100", "Compare from a pinned base", "studio normalize", None),
     ("DSTRIP", "Toggle distribution margin strip", "chart histogram", None),
     ("STUDIO lab factors=SPY,TLT", "Regression Lab · multi-factor OLS, purged holdout", "regression factors ols hac vif", None),
-    ("STUDIO RESID", "Residual route · unavailable", "studio residual", None),
+    ("STUDIO resid", "Residual tickers · saved models scored on live data, never refit", "studio residual frozen", None),
+    ("STUDIO resid open AAPL-v-SPY-v1", "Open a saved residual model (alias RESID OPEN <id>)", "residual open model", None),
+    ("STUDIO resid save name=AAPL-v-SPY monitor=250", "Freeze the focused Lab / Relate fit (alias RESID SAVE)", "residual save freeze", None),
+    ("STUDIO resid check", "Fresh reload, rescore and checks (alias RESID CHECK)", "residual adf cusum check", None),
     ("STUDIO ATTR", "Attribution route · unavailable", "studio attribution", None),
     (
         "STOPS",

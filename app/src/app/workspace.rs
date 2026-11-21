@@ -30,7 +30,7 @@ pub const PANELS: [(&str, &str); 37] = [
     ("When", "WHEN"),
     ("Quick canvas", "QUICK"),
     ("Factor Lab (unavailable)", "LAB"),
-    ("Residual (unavailable)", "RESID"),
+    ("Residual tickers", "RESID"),
     ("Attribution (unavailable)", "ATTR"),
     ("Watchlist", "WL"),
     ("News", "NEWS"),
@@ -1109,7 +1109,7 @@ impl TerminalApp {
                 };
                 PaneKind::StudioLab(Box::new(super::studio_lab::LabPane::new(symbol, tr_core::Timeframe::D1, spec)))
             }
-            "RESID" => PaneKind::StudioRoute(tr_data::studio::StudioRoute::Resid),
+            "RESID" => PaneKind::StudioResid(Box::new(super::studio_residual::ResidPane::new(String::new()))),
             "ATTR" => PaneKind::StudioRoute(tr_data::studio::StudioRoute::Attr),
             "DIST" | "RDIST" => {
                 let symbol =

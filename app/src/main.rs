@@ -14,6 +14,7 @@ mod palette;
 mod perf;
 mod portable;
 mod prefs;
+mod studio_models;
 mod theme;
 mod themes;
 mod widgets;

@@ -239,6 +239,37 @@ pub enum Request {
         spec: tr_data::studio_lab::LabSpec,
         fresh: bool,
     },
+    /// Freeze the displayed Lab / Relate fit into an immutable model file. No new fit, no new load.
+    SaveStudioFit {
+        pane: PaneId,
+        token: u64,
+        name: Option<String>,
+        monitor: Option<usize>,
+        source: tr_data::studio_residual::FitSource,
+    },
+    /// List saved residual models (disk read only).
+    ListStudioFits {
+        pane: PaneId,
+        token: u64,
+    },
+    LoadStudioFit {
+        pane: PaneId,
+        token: u64,
+        id: String,
+    },
+    /// Score a frozen model on freshly re-admitted live data. Never refits.
+    ScoreStudioResidual {
+        pane: PaneId,
+        token: u64,
+        model: Arc<tr_data::studio_residual::FrozenFit>,
+        fresh: bool,
+    },
+    CheckStudioResidual {
+        pane: PaneId,
+        token: u64,
+        model: Arc<tr_data::studio_residual::FrozenFit>,
+        report: Arc<tr_data::studio_residual::ResidualReport>,
+    },
     StudioSeason {
         pane: PaneId,
         generation: u64,
@@ -617,6 +648,11 @@ impl Request {
             Self::TstackTune { .. } => "TstackTune",
             Self::StudioCorr { .. } => "StudioCorr",
             Self::StudioLab { .. } => "StudioLab",
+            Self::SaveStudioFit { .. } => "SaveStudioFit",
+            Self::ListStudioFits { .. } => "ListStudioFits",
+            Self::LoadStudioFit { .. } => "LoadStudioFit",
+            Self::ScoreStudioResidual { .. } => "ScoreStudioResidual",
+            Self::CheckStudioResidual { .. } => "CheckStudioResidual",
             Self::StudioSeason { .. } => "StudioSeason",
             Self::StudioShape { .. } => "StudioShape",
             Self::StudioShapeBootstrap { .. } => "StudioShapeBootstrap",
@@ -928,6 +964,35 @@ pub enum Response {
         token: u64,
         spec: tr_data::studio_lab::LabSpec,
         result: Result<Arc<tr_data::studio_lab::LabReport>, String>,
+    },
+    StudioFitSaved {
+        pane: PaneId,
+        token: u64,
+        result: Result<crate::studio_models::SavedFit, String>,
+    },
+    StudioFitList {
+        pane: PaneId,
+        token: u64,
+        result: Result<Vec<crate::studio_models::ModelListing>, String>,
+    },
+    StudioFitLoaded {
+        pane: PaneId,
+        token: u64,
+        id: String,
+        result: Result<Arc<tr_data::studio_residual::FrozenFit>, crate::studio_models::ModelUnavailable>,
+    },
+    StudioResidualScored {
+        pane: PaneId,
+        token: u64,
+        model_digest: u64,
+        result: Result<Arc<tr_data::studio_residual::ResidualReport>, String>,
+    },
+    StudioResidualChecked {
+        pane: PaneId,
+        token: u64,
+        model_digest: u64,
+        score_key: u64,
+        result: Result<Arc<tr_data::studio_residual::ResidualChecks>, String>,
     },
     StudioSeason {
         pane: PaneId,
@@ -4762,6 +4827,74 @@ async fn handle_inner(s: &Arc<Shared>, req: Request, force: bool) {
             .await
             .map_err(|e| format!("{e:#}"));
             send(Response::StudioLab { pane, token, spec, result });
+        }
+        Request::SaveStudioFit { pane, token, name, monitor, source } => {
+            let result = if s.sample_mode() {
+                Err("Residual save refused: sample / offline display mode. Sample prices are never frozen.".to_string())
+            } else {
+                let (root, jobs) = (data_dir(), s.jobs.clone());
+                tokio::task::spawn_blocking(move || {
+                    let _job = crate::perf::JobTimer::new(&jobs, "StudioResidSave");
+                    crate::app::studio_residual::save_blocking(&root, source, name, monitor)
+                })
+                .await
+                .map_err(|e| format!("save task failed: {e}"))
+                .and_then(|r| r)
+            };
+            send(Response::StudioFitSaved { pane, token, result });
+        }
+        Request::ListStudioFits { pane, token } => {
+            let root = data_dir();
+            let result = tokio::task::spawn_blocking(move || crate::studio_models::list(&root))
+                .await
+                .map_err(|e| format!("list task failed: {e}"))
+                .and_then(|r| r);
+            send(Response::StudioFitList { pane, token, result });
+        }
+        Request::LoadStudioFit { pane, token, id } => {
+            let root = data_dir();
+            let key = id.clone();
+            let result = match tokio::task::spawn_blocking(move || crate::studio_models::load(&root, &key)).await {
+                Ok(r) => r.map(Arc::new),
+                Err(e) => Err(crate::studio_models::ModelUnavailable {
+                    kind: crate::studio_models::UnavailableKind::Corrupt,
+                    id: id.clone(),
+                    message: format!("load task failed: {e}"),
+                }),
+            };
+            send(Response::StudioFitLoaded { pane, token, id, result });
+        }
+        Request::ScoreStudioResidual { pane, token, model, fresh } => {
+            let model_digest = model.content_digest;
+            let result = crate::app::studio_residual::score_research(
+                &crate::app::studio_corr::CORR_CACHE,
+                fresh,
+                Some(s.jobs.clone()),
+                &s.history,
+                &config.bridge(),
+                s.sample_mode(),
+                &model,
+                |key, tf| async move { analysis_bars(s, &key, tf, default_limit(tf), "Residual ticker").await },
+            )
+            .await
+            .map_err(|e| format!("{e:#}"));
+            send(Response::StudioResidualScored { pane, token, model_digest, result });
+        }
+        Request::CheckStudioResidual { pane, token, model, report } => {
+            let (model_digest, score_key) = (model.content_digest, report.key);
+            let result = if s.sample_mode() {
+                Err("Residual checks refused: sample / offline display mode.".to_string())
+            } else {
+                let jobs = s.jobs.clone();
+                tokio::task::spawn_blocking(move || {
+                    let _job = crate::perf::JobTimer::new(&jobs, "StudioResidCheck");
+                    crate::app::studio_residual::check_blocking(&model, &report)
+                })
+                .await
+                .map_err(|e| format!("check task failed: {e}"))
+                .and_then(|r| r)
+            };
+            send(Response::StudioResidualChecked { pane, token, model_digest, score_key, result });
         }
         Request::StudioSeason { pane, generation, symbol, tf } => {
             let result = async {

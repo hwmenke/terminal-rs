@@ -435,6 +435,36 @@
       "budget_us": 2500,
       "relative": false,
       "class": "frame"
+    },
+    "paint.studio_residual.steady.ui": {
+      "budget_us": 1200,
+      "relative": false,
+      "class": "frame"
+    },
+    "paint.studio_residual.steady.tess": {
+      "budget_us": 800,
+      "relative": false,
+      "class": "frame"
+    },
+    "paint.studio_residual.steady.total": {
+      "budget_us": 2000,
+      "relative": false,
+      "class": "frame"
+    },
+    "paint.studio_residual.hover.ui": {
+      "budget_us": 1200,
+      "relative": false,
+      "class": "frame"
+    },
+    "paint.studio_residual.hover.tess": {
+      "budget_us": 800,
+      "relative": false,
+      "class": "frame"
+    },
+    "paint.studio_residual.hover.total": {
+      "budget_us": 2000,
+      "relative": false,
+      "class": "frame"
     }
   }
 }

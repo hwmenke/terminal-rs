@@ -65,8 +65,13 @@ fn studio_legacy_commands_preserved() {
         tr_data::studio::StudioRoute::Attr,
     ] {
         assert_eq!(command::parse(&format!("STUDIO {}", r.code())), Some(Command::Function(Function::StudioRoute(r))));
-        // LAB is built (slice 5); RESID / ATTR still explain why they are unavailable.
-        assert!(r.reason().contains(if r == tr_data::studio::StudioRoute::Lab { "Regression Lab" } else { "unavailable" }));
+        // LAB (slice 5) and RESID (slice 6) are built; ATTR still explains why it is unavailable.
+        let want = match r {
+            tr_data::studio::StudioRoute::Lab => "Regression Lab",
+            tr_data::studio::StudioRoute::Resid => "Residual",
+            _ => "unavailable",
+        };
+        assert!(r.reason().contains(want), "{r:?}");
     }
     assert!(matches!(command::parse("AAPL QUICK QQQ 5m mode=index100"),Some(Command::SymbolFunction(_,Function::StudioQuick {..}))));
     assert!(command::parse("STUDIO lens=typo").is_none());

@@ -709,7 +709,7 @@ impl StudioPane {
             egui::Frame::group(ui.style()).show(ui,|ui|{ui.label("Studio connects the native time canvas to existing verified-data research. Each lens retains its original methods, MathCards and receipt. Quick adds descriptive canvas arithmetic. Copy command saves inputs, not historical data revisions.");});
         }
         if self.build_open {
-            egui::Frame::group(ui.style()).show(ui,|ui|{ui.label("BUILD · Regression Lab available; derived series persistence unavailable");ui.label("Regression Lab (STUDIO lab factors=SPY,TLT) fits multi-factor OLS with a purged frozen holdout. Frozen model persistence, residual scoring and attribution have not been implemented; open STUDIO RESID or STUDIO ATTR for their route status.");});
+            egui::Frame::group(ui.style()).show(ui,|ui|{ui.label("BUILD · Residual tickers available (STUDIO resid); attribution unavailable");ui.label("Regression Lab (STUDIO lab factors=SPY,TLT) fits multi-factor OLS with a purged frozen holdout. Save residual freezes a fit into an immutable model; STUDIO resid open <id> scores it on live data and never refits. Attribution has not been implemented; open STUDIO ATTR for its route status.");});
         }
         let content = ui.available_rect_before_wrap();
         let mut body = content;

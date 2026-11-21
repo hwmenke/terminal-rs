@@ -221,6 +221,30 @@ pub fn lab_model(
     (spec, named("AAPL US Equity", asset), rows)
 }
 
+/// Dev-only frozen residual model: `lab_model(n)` → `studio_lab::compute` → `freeze_lab`, with the
+/// live rows to score it on. Setup only; never used outside tests and the perf gates.
+pub fn resid_model(
+    n: usize,
+) -> (tr_data::studio_residual::FrozenFit, tr_data::studio_corr::NamedBars, Vec<tr_data::studio_corr::NamedBars>) {
+    let (spec, target, rows) = lab_model(n);
+    let closed = target.bars.last().unwrap().ts + 86_400;
+    let r = tr_data::studio_lab::compute(&target, &rows, &spec, Timeframe::D1, true, "benchmark fixture only", closed, None, 1);
+    let fit = tr_data::studio_residual::freeze_lab(&r, Some("bench"), None, 0).expect("fixture lab fit freezes");
+    (fit, target, rows)
+}
+
+/// Deterministic AR(1) residual vector `e_t = φ e_{t−1} + u_t`, `u` uniform on ±0.5·1e-2.
+pub fn resid_ar1(n: usize, phi: f64) -> Vec<f64> {
+    let mut rng = Rng(515);
+    let mut e = 0.;
+    (0..n)
+        .map(|_| {
+            e = phi * e + 1e-2 * (rng.next() - 0.5);
+            e
+        })
+        .collect()
+}
+
 /// A rectangular 78-clock session grid with nondegenerate common-row variation.
 pub fn inference_clocks(sessions: usize) -> Vec<Vec<Option<f64>>> {
     let mut rng = Rng(311);
