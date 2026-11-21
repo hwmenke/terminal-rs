@@ -158,6 +158,16 @@
       "relative": true,
       "class": "interactive"
     },
+    "studio.lab_design_7x5000": {
+      "budget_us": 10000,
+      "relative": true,
+      "class": "interactive"
+    },
+    "studio.lab_7x5000": {
+      "budget_us": 40000,
+      "relative": true,
+      "class": "interactive"
+    },
     "inference.stationary_bootstrap_5k_x500": {
       "budget_us": 120000,
       "relative": true,

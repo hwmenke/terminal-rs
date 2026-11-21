@@ -171,6 +171,7 @@ fn perf_gate_paint_studios() {
     best.extend(when_sample());
     best.extend(relate_sample());
     best.extend(fair_value_sample());
+    best.extend(lab_sample());
     let ids: BTreeSet<_> = budgets.cases.keys().filter(|id| id.starts_with("paint.studio_")).cloned().collect();
     assert_eq!(best.keys().cloned().collect::<BTreeSet<_>>(), ids, "stale/missing studio budgets");
     for _ in 0..2 {
@@ -191,6 +192,7 @@ fn perf_gate_paint_studios() {
             .chain(when_sample())
             .chain(relate_sample())
             .chain(fair_value_sample())
+            .chain(lab_sample())
         {
             if s.median_us < best[&id].median_us {
                 best.insert(id, s);
@@ -1765,4 +1767,193 @@ fn relate_bands_hover_text_distinguishes_residual_band_from_mean_ci() {
     for word in ["residual band", "mean CI", "prediction", "CLOSED THRU", "relate.fair_value"] {
         assert!(txt.contains(word), "card missing {word}: {txt}");
     }
+}
+
+// ---- Regression Lab (slice 5): panel paint, actual hover, LOW N and unavailable states ----------
+
+fn lab_report() -> tr_data::studio_lab::LabReport {
+    let (spec, target, rows) = tr_perf::fixtures::lab_model(5000);
+    let r = super::studio_lab::fixture_compute(&spec, &target, &rows);
+    let fit = r.fit.as_ref().expect("lab fit available");
+    assert!(fit.k == 8 && r.low_n.is_none() && r.inference.len() == 4, "{:?}", r.unavailable);
+    // Lags (≤5) and horizons (≤5) cost a handful of the 5,000 bars; every complete row is plotted.
+    assert!(r.design_rows > 4900 && r.points.len() == r.design_rows && r.diagnostics.is_some() && fit.vif.len() == 7);
+    assert!(r.inference.iter().all(|i| i.covariance.covariance.is_some()));
+    r
+}
+fn lab_frame(
+    ctx: &egui::Context,
+    r: &tr_data::studio_lab::LabReport,
+    st: &mut super::studio_lab::LabUi,
+    width: f32,
+    hover: bool,
+    index: usize,
+) -> egui::FullOutput {
+    let pointer = if hover {
+        ctx.data(|d| d.get_temp::<Rect>(egui::Id::new("lab-probe"))).unwrap_or(Rect::NOTHING).center()
+            + vec2(if index >= 160 { (index % 2) as f32 } else { 0. }, 0.)
+    } else {
+        pos2(15., 15.)
+    };
+    let events = if ctx.input(|i| i.pointer.hover_pos()) == Some(pointer) {
+        vec![]
+    } else {
+        vec![egui::Event::PointerMoved(pointer)]
+    };
+    let mut out = ctx.run_ui(
+        egui::RawInput {
+            time: Some(1. + index as f64 * 0.2),
+            screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(width, 1400.))),
+            events,
+            ..Default::default()
+        },
+        |ui| super::studio_lab::panel(ui, 23, r, st),
+    );
+    out.textures_delta.clear();
+    out
+}
+fn lab_guard(out: &egui::FullOutput) {
+    let txt = text(&out.shapes);
+    for word in [
+        "COEFFICIENTS",
+        "FITTED vs ACTUAL",
+        "R²_OOS vs training mean",
+        "in-sample, descriptive",
+        "count per cell",
+        "VIF",
+        "HAC auto",
+        "TRAIN",
+        "TEST",
+        "purged 0",
+    ] {
+        assert!(txt.contains(word), "missing {word}: {txt}");
+    }
+    assert!(out.shapes.len() > 60, "empty lab panel");
+}
+fn lab_sample() -> BTreeMap<String, Summary> {
+    let ctx = egui::Context::default();
+    let r = lab_report();
+    let mut st = super::studio_lab::LabUi::default();
+    st.shown_cov = 3;
+    for i in 0..20 {
+        finite(&ctx, lab_frame(&ctx, &r, &mut st, 1440., false, i));
+    }
+    let mut result = BTreeMap::new();
+    for hover in [false, true] {
+        let mode = if hover { "hover" } else { "steady" };
+        if hover {
+            for i in 140..160 {
+                finite(&ctx, lab_frame(&ctx, &r, &mut st, 1440., true, i));
+            }
+        }
+        let mut times: BTreeMap<String, Vec<f64>> = BTreeMap::new();
+        for i in 0..120 {
+            let start = Instant::now();
+            let mut out = lab_frame(&ctx, &r, &mut st, 1440., hover, i + if hover { 160 } else { 20 });
+            let ui_us = start.elapsed().as_secs_f64() * 1e6;
+            if i == 60 {
+                lab_guard(&out);
+                if hover {
+                    let txt = text(&out.shapes);
+                    assert!(
+                        txt.contains("lab.fit.coef") && txt.contains("CLOSED THRU"),
+                        "hover did not paint the coefficient MathCard"
+                    );
+                }
+            }
+            let start = Instant::now();
+            let primitives = ctx.tessellate(std::mem::take(&mut out.shapes), out.pixels_per_point);
+            let tess_us = start.elapsed().as_secs_f64() * 1e6;
+            assert!(!primitives.is_empty());
+            std::hint::black_box(primitives);
+            for (metric, v) in [("ui", ui_us), ("tess", tess_us), ("total", ui_us + tess_us)] {
+                times.entry(format!("paint.studio_lab.{mode}.{metric}")).or_default().push(v);
+            }
+        }
+        for (id, mut samples) in times {
+            result.insert(id, tr_perf::summarize(&mut samples));
+        }
+    }
+    result
+}
+#[test]
+fn lab_panel_geometry_and_actual_hover_320_1440() {
+    let r = lab_report();
+    for width in [320., 1440.] {
+        let ctx = egui::Context::default();
+        ctx.all_styles_mut(|s| s.interaction.tooltip_delay = 0.);
+        let mut st = super::studio_lab::LabUi::default();
+        let out = lab_frame(&ctx, &r, &mut st, width, false, 0);
+        lab_guard(&out);
+        for clipped in &out.shapes {
+            assert!(clipped.clip_rect.is_finite());
+        }
+        finite(&ctx, out);
+        let mut last = None;
+        for i in 140..160 {
+            last = Some(lab_frame(&ctx, &r, &mut st, width, true, i));
+        }
+        let out = last.unwrap();
+        let txt = text(&out.shapes);
+        assert!(txt.contains("lab.fit.coef") && txt.contains("CLOSED THRU"), "{width}: {txt}");
+        assert!(txt.contains("levels may be nonstationary"), "level caveat missing: {txt}");
+        let probe = ctx.data(|d| d.get_temp::<Rect>(egui::Id::new("lab-probe"))).unwrap();
+        assert!(probe.width() <= width + 1. && probe.is_finite(), "table row overflows {width}px: {probe:?}");
+        finite(&ctx, out);
+        // Selecting a diagnostic tab or covariance paints from the same report.
+        for (tab, cov) in [(1, 0), (2, 1)] {
+            st.diag_tab = tab;
+            st.shown_cov = cov;
+            finite(&ctx, lab_frame(&ctx, &r, &mut st, width, false, 200 + tab));
+        }
+    }
+}
+fn any_shape(shapes: &[egui::epaint::ClippedShape], f: &dyn Fn(&egui::Shape) -> bool) -> bool {
+    fn walk(s: &egui::Shape, f: &dyn Fn(&egui::Shape) -> bool) -> bool {
+        match s {
+            egui::Shape::Vec(v) => v.iter().any(|s| walk(s, f)),
+            s => f(s),
+        }
+    }
+    shapes.iter().any(|c| walk(&c.shape, f))
+}
+#[test]
+fn lab_low_n_and_unavailable_states_paint() {
+    use tr_data::studio::Transform as T;
+    use tr_data::studio_lab::FactorSpec;
+    let ctx = egui::Context::default();
+    // LOW N: 100 bars leave < max(60, 10·k) = 80 training rows for k = 8; β stays, inference is withheld.
+    let (spec, target, rows) = tr_perf::fixtures::lab_model(100);
+    let r = super::studio_lab::fixture_compute(&spec, &target, &rows);
+    assert!(r.fit.is_some() && r.inference.is_empty() && r.low_n.is_some(), "{:?}", r.unavailable);
+    let mut st = super::studio_lab::LabUi::default();
+    let out = lab_frame(&ctx, &r, &mut st, 1440., false, 0);
+    let txt = text(&out.shapes);
+    assert!(txt.contains("LOW N: training rows"), "{txt}");
+    assert!(txt.contains("COEFFICIENTS") && txt.contains("withheld"), "{txt}");
+    let tick = |s: &egui::Shape| {
+        matches!(s, egui::Shape::LineSegment { stroke, .. } if stroke.color == crate::theme::caution())
+    };
+    assert!(any_shape(&out.shapes, &tick), "LOW N corner tick missing");
+    finite(&ctx, out);
+    // Unavailable: an exact duplicate factor makes the design rank-deficient. A reason card replaces
+    // every fitted plot and the table; no numbers are painted.
+    let (mut spec, target, mut rows) = tr_perf::fixtures::lab_model(5000);
+    let mut twin = rows[0].clone();
+    twin.symbol = "F0B US Equity".into();
+    spec.factors[1] = FactorSpec { symbol: twin.symbol.clone(), transform: T::LogReturn { h: 1 }, lag: 0 };
+    spec.factors[0].transform = T::LogReturn { h: 1 };
+    spec.factors[0].lag = 0;
+    rows[1] = twin;
+    let r = super::studio_lab::fixture_compute(&spec, &target, &rows);
+    assert!(
+        r.fit.is_none() && r.unavailable.as_deref().is_some_and(|m| m.contains("rank-deficient")),
+        "{:?}",
+        r.unavailable
+    );
+    let out = lab_frame(&ctx, &r, &mut st, 1440., false, 1);
+    let txt = text(&out.shapes);
+    assert!(txt.contains("REGRESSION LAB UNAVAILABLE") && txt.contains("rank-deficient"), "{txt}");
+    assert!(!txt.contains("FITTED vs ACTUAL") && !txt.contains("R²_OOS"), "fitted content painted: {txt}");
+    finite(&ctx, out);
 }

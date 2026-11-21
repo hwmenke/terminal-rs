@@ -83,7 +83,7 @@ fn clock(r: &CorrReport) -> String {
     r.observed_at.map(stamp).unwrap_or_else(|| "closed input receipt; clock unavailable".into())
 }
 
-fn signed(v: f64, digits: usize) -> String {
+pub(crate) fn signed(v: f64, digits: usize) -> String {
     let s = format!("{v:+.digits$}");
     s.replacen('-', "\u{2212}", 1)
 }
@@ -143,7 +143,16 @@ pub(crate) fn fair_value_card(r: &CorrReport, rel: &RelateReport, fit: &FairValu
             p.bands.iter().map(|v| format!("{v:.4}")).collect::<Vec<_>>().join("  "),
         )
         .input("observation clock", clock(r))
-        .input("sample", if p.in_sample { "in-sample descriptive" } else { "out of sample (after the training prefix)" })
+        .input(
+            "sample",
+            if p.in_sample {
+                "in-sample descriptive (fitted training prefix)"
+            } else if p.embargo {
+                "embargo: within h−1 bars of the training prefix, not fitted"
+            } else {
+                "out of sample (after the embargo)"
+            },
+        )
         .input("descriptive z=(y−ŷ)/σ", signed(p.z, 2))
         .note(format!("residual band: ±kσ in target space, then inverted · frozen fit thru {}", stamp(fit.train_end)))
         .caveat(

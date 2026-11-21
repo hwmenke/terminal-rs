@@ -83,7 +83,7 @@ impl StudioRoute {
                 "QUICK / Answers is unavailable: the evidence-bearing answer screen has not been implemented."
             }
             Self::Lab => {
-                "LAB is unavailable: multi-factor fitting and frozen model persistence have not been implemented."
+                "Regression Lab · multi-factor OLS with a purged holdout and HAC inference · STUDIO lab factors=SPY,TLT (frozen model persistence arrives with RESID)"
             }
             Self::Resid => {
                 "RESID is unavailable: frozen residual scoring and its signed scalar-series canvas have not been implemented."
@@ -187,7 +187,8 @@ impl Transform {
     /// Parses `level|change|logreturn|loglevel`; `h` must be 1, 5 or 20 for the h transforms.
     pub fn parse(name: &str, h: usize) -> Result<Self, String> {
         if ![1, 5, 20].contains(&h) {
-            return Err("Relate h must be 1, 5 or 20".into());
+            // Caller-neutral; Relate and the Lab prefix their own name.
+            return Err("h must be 1, 5 or 20".into());
         }
         match name.to_ascii_lowercase().as_str() {
             "level" => Ok(Self::Level),

@@ -221,6 +221,13 @@ fn relate_bands_are_not_mean_ci() {
         let points = fair_value(&p, &fit);
         assert_eq!(points.len(), MAX_POINTS.min(p.valid_rows().len()));
         assert!(points.iter().any(|q| !q.in_sample) && points.iter().any(|q| q.in_sample));
+        // The h−1 rows after the training prefix are a third state: not fitted, not in-sample.
+        let h = if t.is_level() { 1 } else { t.horizon() };
+        let embargo = points.iter().filter(|q| q.embargo).count();
+        assert_eq!(embargo, h - 1, "{t:?}");
+        assert!(points.iter().all(|q| !(q.in_sample && q.embargo)));
+        let first_oos = points.iter().position(|q| !q.in_sample && !q.embargo).unwrap();
+        assert!(points[..first_oos].iter().all(|q| q.in_sample || q.embargo));
         let q = points.last().unwrap();
         let (centre, bands) = project(t, fit.alpha, fit.beta, q.x, q.anchor, fit.sigma).unwrap();
         if matches!(t, Transform::Level | Transform::Change { .. }) {

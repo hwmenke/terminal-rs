@@ -182,6 +182,45 @@ pub fn benchmark_for(asset: &[Bar], beta: f64, seed: u64) -> Vec<Bar> {
         .collect()
 }
 
+/// Dev-only Regression Lab model: a `related` target (log-return β≈0.8 on its first benchmark) and
+/// seven factors from `benchmark_for(asset, β_i, 300+i)`, each with its own transform and lag.
+/// Factors: logret h1 ℓ0, logret h5 ℓ1, change h1 ℓ0, logret h1 ℓ2, logret h5 ℓ5, loglevel ℓ0,
+/// logret h1 ℓ1, so the overlap horizon is H = 5. Never used outside tests and the perf gates.
+pub fn lab_model(
+    n: usize,
+) -> (tr_data::studio_lab::LabSpec, tr_data::studio_corr::NamedBars, Vec<tr_data::studio_corr::NamedBars>) {
+    use tr_data::{studio::Transform as T, studio_corr::NamedBars, studio_lab::{FactorSpec, LabSpec}};
+    let (asset, _) = related(n, 0.8, 91);
+    let named = |symbol: &str, bars: Vec<Bar>| NamedBars {
+        symbol: symbol.into(),
+        bars,
+        source: "benchmark fixture only".into(),
+        ..Default::default()
+    };
+    let betas = [0.8, 1.1, 0.6, 1.4, 0.9, 1.2, 0.7];
+    let defs = [
+        (T::LogReturn { h: 1 }, 0usize),
+        (T::LogReturn { h: 5 }, 1),
+        (T::Change { h: 1 }, 0),
+        (T::LogReturn { h: 1 }, 2),
+        (T::LogReturn { h: 5 }, 5),
+        (T::LogLevel, 0),
+        (T::LogReturn { h: 1 }, 1),
+    ];
+    let rows: Vec<NamedBars> = (0..7)
+        .map(|i| named(&format!("F{i} US Equity"), benchmark_for(&asset, betas[i], 300 + i as u64)))
+        .collect();
+    let spec = LabSpec {
+        factors: rows
+            .iter()
+            .zip(defs)
+            .map(|(r, (transform, lag))| FactorSpec { symbol: r.symbol.clone(), transform, lag })
+            .collect(),
+        ..Default::default()
+    };
+    (spec, named("AAPL US Equity", asset), rows)
+}
+
 /// A rectangular 78-clock session grid with nondegenerate common-row variation.
 pub fn inference_clocks(sessions: usize) -> Vec<Vec<Option<f64>>> {
     let mut rng = Rng(311);

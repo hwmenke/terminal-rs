@@ -168,41 +168,24 @@ impl CorrCache {
     }
 }
 
-/// Kept here so the shared worker only registers a request/response arm. The supplied
-/// loader is the existing vault-aware analysis_bars path (history_sourced underneath).
-/// Symbols load concurrently (bounded by [`CORR_CONCURRENCY`]) through `cache`.
-#[allow(clippy::too_many_arguments)]
-pub(crate) async fn research_horizon<F, Fut>(
+/// Bounded concurrent loader shared by CORR and the Regression Lab: each name is read through the
+/// shared (symbol, interval) bar cache (or fresh), admitted with `require_research_bars` on the
+/// **full** supplied series, and only then trimmed to closed bars. A failed name stays a row with
+/// its error; it is never substituted. Returns each row with its observation clock.
+pub(crate) async fn load_rows<F, Fut>(
     cache: &CorrCache,
     fresh: bool,
-    horizon: usize,
-    relate: Option<RelateSpec>,
-    jobs: Option<std::sync::Arc<crate::perf::JobLog>>,
     history: &tr_data::history::Service,
     bridge: &tr_data::whats_news::Bridge,
-    sample: bool,
-    symbol: &str,
-    spec: &str,
+    names: Vec<String>,
+    tf: Timeframe,
     load_intraday: F,
-) -> anyhow::Result<std::sync::Arc<CorrReport>>
+) -> Vec<(NamedBars, Option<i64>)>
 where
     F: Fn(String, Timeframe) -> Fut,
     Fut: std::future::Future<Output = anyhow::Result<(Vec<Bar>, tr_data::vault::StitchInfo)>>,
 {
     use futures::StreamExt;
-    if sample {
-        anyhow::bail!("Relationship Studio: no real data in sample / demo display mode. Sample prices are never used.");
-    }
-    let (benchmark, tf) = parse_spec(spec).map_err(anyhow::Error::msg)?;
-    let symbol = tr_data::security(symbol).key();
-    let mut names = vec![symbol.clone(), benchmark.clone()];
-    for ticker in maths::DEFAULT_SET {
-        let key = tr_data::security(ticker).key();
-        if !names.contains(&key) {
-            names.push(key);
-        }
-    }
-    names.dedup();
     let load = |key: String| {
         let load_intraday = &load_intraday;
         async move {
@@ -233,15 +216,55 @@ where
     };
     let loaded: Vec<(String, anyhow::Result<Loaded>)> =
         futures::stream::iter(names.into_iter().map(load)).buffered(CORR_CONCURRENCY).collect().await;
-    let observed_at = loaded.iter().filter_map(|(_, r)| r.as_ref().ok().and_then(|r| r.observed_at)).min();
-    let rows: Vec<NamedBars> = loaded
+    loaded
         .into_iter()
         .map(|(key, result)| match result {
-            Ok(Loaded { bars, source, gaps, .. }) => NamedBars { symbol: key, bars, source, error: None, gaps },
+            Ok(Loaded { bars, source, gaps, observed_at }) => {
+                (NamedBars { symbol: key, bars, source, error: None, gaps }, observed_at)
+            }
             // A failed ticker is listed as unavailable; never substituted.
-            Err(e) => NamedBars { symbol: key, error: Some(format!("{e:#}")), ..Default::default() },
+            Err(e) => (NamedBars { symbol: key, error: Some(format!("{e:#}")), ..Default::default() }, None),
         })
-        .collect();
+        .collect()
+}
+
+/// Kept here so the shared worker only registers a request/response arm. The supplied
+/// loader is the existing vault-aware analysis_bars path (history_sourced underneath).
+/// Symbols load concurrently (bounded by [`CORR_CONCURRENCY`]) through `cache`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn research_horizon<F, Fut>(
+    cache: &CorrCache,
+    fresh: bool,
+    horizon: usize,
+    relate: Option<RelateSpec>,
+    jobs: Option<std::sync::Arc<crate::perf::JobLog>>,
+    history: &tr_data::history::Service,
+    bridge: &tr_data::whats_news::Bridge,
+    sample: bool,
+    symbol: &str,
+    spec: &str,
+    load_intraday: F,
+) -> anyhow::Result<std::sync::Arc<CorrReport>>
+where
+    F: Fn(String, Timeframe) -> Fut,
+    Fut: std::future::Future<Output = anyhow::Result<(Vec<Bar>, tr_data::vault::StitchInfo)>>,
+{
+    if sample {
+        anyhow::bail!("Relationship Studio: no real data in sample / demo display mode. Sample prices are never used.");
+    }
+    let (benchmark, tf) = parse_spec(spec).map_err(anyhow::Error::msg)?;
+    let symbol = tr_data::security(symbol).key();
+    let mut names = vec![symbol.clone(), benchmark.clone()];
+    for ticker in maths::DEFAULT_SET {
+        let key = tr_data::security(ticker).key();
+        if !names.contains(&key) {
+            names.push(key);
+        }
+    }
+    names.dedup();
+    let loaded = load_rows(cache, fresh, history, bridge, names, tf, load_intraday).await;
+    let observed_at = loaded.iter().filter_map(|(_, at)| *at).min();
+    let rows: Vec<NamedBars> = loaded.into_iter().map(|(row, _)| row).collect();
     let asset = rows.iter().find(|r| r.symbol == symbol).unwrap();
     let other = rows.iter().find(|r| r.symbol == benchmark).unwrap();
     for row in [asset, other] {
@@ -325,7 +348,9 @@ fn compute_cached(
     h.write_str(&b.source);
     h.write_str(&format!("{:?} {:?}", Bar::provenance(&a.bars), Bar::provenance(&b.bars)));
     h.write_u64(tr_data::stable_hash::bars_digest(&b.bars));
-    h.write_str(&format!("{:?} {:?} {:?} horizon={horizon} observed={observed_at:?}", options, a.gaps, b.gaps));
+    // The observation clock is deliberately not keyed: for daily data it is the wall-clock load time,
+    // which would make every reload a cache miss. Bar content, gaps and provenance are keyed.
+    h.write_str(&format!("{:?} {:?} {:?} horizon={horizon}", options, a.gaps, b.gaps));
     // Relate keys everything above plus the full spec, the split, the grid convention and the
     // method schema, in a separate namespace so legacy keys and reports are untouched.
     if let Some(spec) = relate {
@@ -361,7 +386,7 @@ fn compute_cached(
 }
 
 /// Match the existing closed_len end convention, including short cash buckets.
-fn closed_thru(tf: Timeframe, class: tr_core::AssetClass, ts: i64) -> i64 {
+pub(crate) fn closed_thru(tf: Timeframe, class: tr_core::AssetClass, ts: i64) -> i64 {
     let equity = matches!(class, tr_core::AssetClass::Equity | tr_core::AssetClass::Etf | tr_core::AssetClass::Index);
     if !equity {
         return ts + tf.seconds();
@@ -511,7 +536,7 @@ pub(super) fn show(
     vec![]
 }
 
-mod relate_ui;
+pub(crate) mod relate_ui;
 pub(crate) use relate_ui::fair_value_card;
 #[cfg(test)]
 pub(crate) use relate_ui::fit_card;
@@ -836,7 +861,7 @@ fn se_controls(ui: &mut Ui, r: &CorrReport) -> usize {
         r.horizon
     ));
     if r.horizon > 1 {
-        ui.label("Overlapping outcomes: default uniform h−1 kernel with labelled Bartlett fallback. Classical/HC3 omit serial overlap; holdout shares up to h−1 boundary prices.");
+        ui.label("Overlapping outcomes: default uniform h−1 kernel with labelled Bartlett fallback. Classical/HC3 omit serial overlap; the holdout purges the last h−1 training pairs that overlap the first test pair.");
     }
     if let Some(sen) = &r.robust.theil_sen {
         coloured_label(ui,[("Theil–Sen slope ".into(),theme::text()),(sen.slope.map(|v|format!("{v:+.4}")).unwrap_or_else(||"—".into()),sen.slope.map_or_else(theme::muted,theme::sign)),(format!(" · latest n={} · descriptive cross-check",sen.n),theme::text())]).math_card(|| {
@@ -899,7 +924,7 @@ fn se_controls(ui: &mut Ui, r: &CorrReport) -> usize {
                 .n(h.test_n,"test returns, frozen training coefficients")
                 .span(stamp(r.returns.first().unwrap().start),stamp(r.as_of)).closed_thru(stamp(r.closed_thru))
                 .source(&r.source).provenance(r.provenance)
-                .input("train / test",format!("{} / {}; split {}",h.train_n,h.test_n,stamp(h.split_ts)))
+                .input("train / purged / test",format!("{} / {} / {}; split {}",h.train_n,h.purged,h.test_n,stamp(h.split_ts)))
                 .input("alpha / beta / train mean",format!("{} / {} / {}",number(h.alpha),number(h.beta),number(h.train_mean)))
                 .caveat("Chronological first 80% fit, last 20% scored without refitting; negative R²_oos reads no skill. One split is descriptive, not a strategy test.");
             match h.r_squared_oos {
@@ -910,7 +935,14 @@ fn se_controls(ui: &mut Ui, r: &CorrReport) -> usize {
         coloured_label(
             ui,
             [
-                (format!("HOLDOUT · train {} | test {} · R²_oos ", h.train_n, h.test_n), theme::text()),
+                (
+                    if h.purged > 0 {
+                        format!("HOLDOUT · train {} | purged {} | test {} · R²_oos ", h.train_n, h.purged, h.test_n)
+                    } else {
+                        format!("HOLDOUT · train {} | test {} · R²_oos ", h.train_n, h.test_n)
+                    },
+                    theme::text(),
+                ),
                 (
                     h.r_squared_oos.map(|v| format!("{v:+.4}")).unwrap_or_else(|| "—".into()),
                     h.r_squared_oos.map_or_else(theme::muted, theme::sign),
@@ -923,7 +955,7 @@ fn se_controls(ui: &mut Ui, r: &CorrReport) -> usize {
         )
         .math_card(card);
         let (rect, response) = ui.allocate_exact_size(egui::vec2(ui.available_width().max(120.), 24.), Sense::hover());
-        let split = rect.left() + rect.width() * h.train_n as f32 / (h.train_n + h.test_n).max(1) as f32;
+        let split = rect.left() + rect.width() * (h.train_n + h.purged) as f32 / (h.train_n + h.purged + h.test_n).max(1) as f32;
         ui.painter().rect_filled(
             Rect::from_min_max(rect.min, egui::pos2(split, rect.bottom())),
             0.,
@@ -1872,7 +1904,9 @@ mod cache_v2_tests {
         gap.gaps.push((a.bars[20].ts, a.bars[21].ts));
         assert!(!std::sync::Arc::ptr_eq(&first, &call(&gap, &b, &[], 1, Some(100))));
         assert!(!std::sync::Arc::ptr_eq(&first, &call(&a, &b, &[], 5, Some(100))));
-        assert!(!std::sync::Arc::ptr_eq(&first, &call(&a, &b, &[], 1, Some(101))));
+        // Slice-5 correction: the wall-clock observation time is not part of the key, so a reload
+        // with identical bars reuses the report (the original assertion expected a miss).
+        assert!(std::sync::Arc::ptr_eq(&first, &call(&a, &b, &[], 1, Some(101))));
         let peer = NamedBars { symbol: "SPY".into(), error: Some("missing".into()), ..Default::default() };
         let with_peer = call(&a, &b, &[peer], 1, Some(100));
         assert!(!std::sync::Arc::ptr_eq(&first, &with_peer));

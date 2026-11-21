@@ -659,8 +659,10 @@ impl TerminalApp {
             if nav_row(ui, Icon::Chart, "When", Some("WHEN"), false).clicked() {
                 out.push(SidebarCmd::Function(Function::StudioWhen { spec: String::new() }));
             }
+            if nav_row(ui, Icon::Chart, "Regression Lab", Some("STUDIO lab"), false).clicked() {
+                out.push(SidebarCmd::Function(Function::StudioRoute(tr_data::studio::StudioRoute::Lab)));
+            }
             for route in [
-                tr_data::studio::StudioRoute::Lab,
                 tr_data::studio::StudioRoute::Resid,
                 tr_data::studio::StudioRoute::Attr,
             ] {

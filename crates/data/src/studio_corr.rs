@@ -110,8 +110,13 @@ pub struct BetaBandPoint {
 }
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Holdout {
+    /// Training pairs actually fitted (after the purge).
     pub train_n: usize,
     pub test_n: usize,
+    /// Nominal training pairs dropped because their h-bar support overlaps the first test pair
+    /// (h−1; 0 at h=1). Older saved reports restore 0.
+    #[serde(default)]
+    pub purged: usize,
     pub split_ts: i64,
     pub alpha: Option<f64>,
     pub beta: Option<f64>,
@@ -194,12 +199,22 @@ fn fit_inference(pairs: &[PairReturn], ols: &Ols, breaks: &[bool], method: Covar
 }
 
 pub fn chronological_holdout(pairs: &[PairReturn], annual_periods: f64) -> Holdout {
-    let train_n = pairs.len() * 4 / 5;
-    let test_n = pairs.len() - train_n;
+    chronological_holdout_h(pairs, annual_periods, 1)
+}
+
+/// 80/20 chronological holdout for h-bar overlapping pairs. The last h−1 nominal training pairs
+/// share bars with the first test pair, so they are purged from the fit and the baseline mean
+/// (slice-5 correction; at h=1 nothing is purged and results are unchanged).
+pub fn chronological_holdout_h(pairs: &[PairReturn], annual_periods: f64, horizon: usize) -> Holdout {
+    let nominal = pairs.len() * 4 / 5;
+    let test_n = pairs.len() - nominal;
+    let purged = horizon.saturating_sub(1).min(nominal);
+    let train_n = nominal - purged;
     let mut out = Holdout {
         train_n,
         test_n,
-        split_ts: pairs.get(train_n).map_or(0, |p| p.end),
+        purged,
+        split_ts: pairs.get(nominal).map_or(0, |p| p.end),
         alpha: None,
         beta: None,
         train_mean: None,
@@ -207,7 +222,7 @@ pub fn chronological_holdout(pairs: &[PairReturn], annual_periods: f64) -> Holdo
         unavailable: None,
     };
     if train_n < 30 || test_n < 10 {
-        out.unavailable = Some("holdout needs ≥30 training and ≥10 test returns".into());
+        out.unavailable = Some("holdout needs ≥30 training (after purge) and ≥10 test returns".into());
         return out;
     }
     let fit = regress(&pairs[..train_n], annual_periods).expect("admitted finite returns");
@@ -216,8 +231,8 @@ pub fn chronological_holdout(pairs: &[PairReturn], annual_periods: f64) -> Holdo
     let mean = pairs[..train_n].iter().map(|p| p.asset).sum::<f64>() / train_n as f64;
     out.train_mean = Some(mean);
     if let (Some(a), Some(b)) = (fit.alpha, fit.beta) {
-        let sse = pairs[train_n..].iter().map(|p| (p.asset - a - b * p.benchmark).powi(2)).sum();
-        let baseline = pairs[train_n..].iter().map(|p| (p.asset - mean).powi(2)).sum::<f64>();
+        let sse = pairs[nominal..].iter().map(|p| (p.asset - a - b * p.benchmark).powi(2)).sum();
+        let baseline = pairs[nominal..].iter().map(|p| (p.asset - mean).powi(2)).sum::<f64>();
         out.r_squared_oos = divide(sse, baseline).and_then(|r| finite(1. - r));
     }
     if out.r_squared_oos.is_none() {
@@ -284,7 +299,7 @@ fn robust_report_horizon(pairs: &[PairReturn], ols: &Ols, annual_periods: f64, h
     RobustReport {
         fits,
         rolling,
-        holdout: Some(chronological_holdout(pairs, annual_periods)),
+        holdout: Some(chronological_holdout_h(pairs, annual_periods, horizon)),
         theil_sen: Some(theil_sen(pairs)),
     }
 }
@@ -934,7 +949,7 @@ mod tests {
 }
 
 #[path = "studio_relate.rs"]
-mod relate;
+pub(crate) mod relate;
 pub use relate::*;
 
 #[cfg(test)]
@@ -992,6 +1007,26 @@ mod robust_tests {
                 / p[80..].iter().map(|p| (p.asset - mean).powi(2)).sum::<f64>();
         assert_eq!(held.r_squared_oos, Some(reference));
         assert!(chronological_holdout(&p[..35], 252.).r_squared_oos.is_none());
+    }
+    #[test]
+    fn holdout_purges_last_h_minus_1_training_pairs() {
+        let p = pairs(100);
+        let h1 = chronological_holdout_h(&p, 252., 1);
+        assert_eq!((h1.train_n, h1.purged, h1.test_n), (80, 0, 20));
+        assert_eq!(h1, chronological_holdout(&p, 252.));
+        for (h, purged) in [(5usize, 4usize), (20, 19)] {
+            let held = chronological_holdout_h(&p, 252., h);
+            assert_eq!((held.train_n, held.purged, held.test_n), (80 - purged, purged, 20));
+            // The test block and the split stamp stay at the nominal boundary.
+            assert_eq!(held.split_ts, h1.split_ts);
+            // Frozen fit uses exactly the surviving training pairs.
+            let fit = regress(&p[..80 - purged], 252.).unwrap();
+            assert_eq!((held.alpha, held.beta), (fit.alpha, fit.beta));
+            let mean = p[..80 - purged].iter().map(|q| q.asset).sum::<f64>() / (80 - purged) as f64;
+            assert_eq!(held.train_mean, Some(mean));
+        }
+        // Too few surviving training pairs is refused, never silently relabelled.
+        assert!(chronological_holdout_h(&p[..38], 252., 20).unavailable.is_some());
     }
     #[test]
     fn appending_bars_keeps_earlier_rolling_estimates() {

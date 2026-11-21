@@ -1098,7 +1098,17 @@ impl TerminalApp {
                 let mut canvas=crate::chart_view::studio_canvas::CanvasView {enabled:true,peers,..Default::default()};canvas.spec.mode=mode;
                 PaneKind::Studio(Box::new(super::studio_hub::StudioPane::new(super::studio_hub::StudioViewSpec {context:tr_data::studio::StudioContext {symbol,tf,..Default::default()},quick:true,canvas,..Default::default()})))
             },
-            "LAB" => PaneKind::StudioRoute(tr_data::studio::StudioRoute::Lab),
+            // `NEW LAB` opens the Lab for the current symbol (typed `LAB` alone stays the LAB ticker).
+            "LAB" => {
+                let symbol =
+                    symbol.map(|s| tr_data::security(s).key()).or_else(|| self.focused_symbol()).unwrap_or_default();
+                let spec = if symbol.is_empty() {
+                    tr_data::studio_lab::LabSpec::default()
+                } else {
+                    tr_data::studio_lab::LabSpec::default_for(&symbol)
+                };
+                PaneKind::StudioLab(Box::new(super::studio_lab::LabPane::new(symbol, tr_core::Timeframe::D1, spec)))
+            }
             "RESID" => PaneKind::StudioRoute(tr_data::studio::StudioRoute::Resid),
             "ATTR" => PaneKind::StudioRoute(tr_data::studio::StudioRoute::Attr),
             "DIST" | "RDIST" => {

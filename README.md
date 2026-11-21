@@ -681,6 +681,10 @@ transforms (level, change, log return, log level; h = 1, 5 or 20), a rolling or
 expanding β, a common-panel correlation matrix and a frozen-training fair-value overlay
 with residual ±σ bands drawn on the native chart; `RELATE transform=level bands=off`
 adjusts the focused Studio. See [Relate](docs/STUDIO_CORR.md).
-`STUDIO LAB`, `STUDIO RESID` and `STUDIO ATTR` remain unavailable routes (bare `LAB` etc. load their tickers). Legacy standalone research commands stay
+`STUDIO lab` (`AAPL STUDIO lab 5m factors=SPY,TLT`, `STUDIO lab factor=TLT transform=change h=5 lag=1`,
+`NEW LAB`) opens the Regression Lab: up to seven factors with per-factor transform and lag, pivoted-QR OLS with
+rank/κ guards, Classical/HC3/HAC covariances, a purged frozen holdout (R²_OOS), VIF and residual diagnostics on
+verified data only; bare `LAB` is still the LAB ticker. See [Regression Lab](docs/STUDIO_LAB.md).
+`STUDIO RESID` and `STUDIO ATTR` remain unavailable routes (bare `RESID` / `ATTR` load their tickers). Legacy standalone research commands stay
 available. See [Studio shell](docs/STUDIO.md) for selection, data and persistence
 limits.

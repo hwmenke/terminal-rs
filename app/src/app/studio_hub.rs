@@ -63,9 +63,16 @@ impl Default for StudioInputs {
     }
 }
 impl StudioInputs {
+    /// `corr_horizon` restricted to the supported {1, 5, 20} (hand-edited layouts restore 1).
+    pub fn valid_corr_horizon(&self) -> usize {
+        if [1, 5, 20].contains(&self.corr_horizon) { self.corr_horizon } else { 1 }
+    }
     /// The Relate spec these inputs describe for a benchmark key.
     pub fn relate_spec(&self, benchmark: &str) -> tr_data::studio_corr::RelateSpec {
-        let transform = self.relate_transform.unwrap_or(tr_data::studio::Transform::LogReturn { h: self.corr_horizon });
+        let transform = self
+            .relate_transform
+            .unwrap_or(tr_data::studio::Transform::LogReturn { h: self.valid_corr_horizon() })
+            .with_valid_horizon();
         let mut spec = tr_data::studio_corr::RelateSpec::new(benchmark, transform);
         spec.beta_mode = self.relate_beta;
         spec.bands = self.relate_bands;
@@ -370,7 +377,7 @@ impl StudioPane {
             }
             StudioLens::Relate => {
                 let mut c = studio_corr::CorrPane::new(s, format!("{} {}", self.benchmark, tf.label()));
-                c.horizon = p.corr_horizon;
+                c.horizon = p.valid_corr_horizon();
                 c.relate = Some(p.relate_spec(&tr_data::security(&self.benchmark).key()));
                 StudioLensState::Relate(Box::new(c))
             }
@@ -702,7 +709,7 @@ impl StudioPane {
             egui::Frame::group(ui.style()).show(ui,|ui|{ui.label("Studio connects the native time canvas to existing verified-data research. Each lens retains its original methods, MathCards and receipt. Quick adds descriptive canvas arithmetic. Copy command saves inputs, not historical data revisions.");});
         }
         if self.build_open {
-            egui::Frame::group(ui.style()).show(ui,|ui|{ui.label("BUILD · derived series unavailable");ui.label("Derived operations and model persistence have not been implemented; Quick uses signed scalar series for its descriptive canvas. Open STUDIO LAB, STUDIO RESID or STUDIO ATTR for their route status.");});
+            egui::Frame::group(ui.style()).show(ui,|ui|{ui.label("BUILD · Regression Lab available; derived series persistence unavailable");ui.label("Regression Lab (STUDIO lab factors=SPY,TLT) fits multi-factor OLS with a purged frozen holdout. Frozen model persistence, residual scoring and attribution have not been implemented; open STUDIO RESID or STUDIO ATTR for their route status.");});
         }
         let content = ui.available_rect_before_wrap();
         let mut body = content;

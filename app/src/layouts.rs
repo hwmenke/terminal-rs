@@ -243,6 +243,16 @@ pub enum PaneSettings {
         #[serde(default)]
         relate: Option<tr_data::studio_corr::RelateSpec>,
     },
+    /// Regression Lab: target symbol, interval and model. Fits and reports are never saved;
+    /// every field defaults so older layouts and partial JSON load.
+    StudioLab {
+        #[serde(default)]
+        symbol: String,
+        #[serde(default)]
+        tf: Timeframe,
+        #[serde(default)]
+        spec: tr_data::studio_lab::LabSpec,
+    },
     /// Statistics / conditional returns for one research symbol.
     Stats {
         #[serde(default)]

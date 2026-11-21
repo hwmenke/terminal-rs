@@ -430,6 +430,53 @@ pub fn all(scale: Scale) -> Vec<Case> {
             points.len()
         });
     }
+    // Regression Lab (slice 5): seven factors, H = 5. `build_design` alone, then the whole `compute`
+    // (design, pivoted QR, four covariances, holdout, diagnostics).
+    {
+        let (spec, target, factors) = fixtures::lab_model(n);
+        let daily = true;
+        let closed = target.bars.last().unwrap().ts + 86_400;
+        let (t, f, s) = (target.clone(), factors.clone(), spec.clone());
+        add!("studio.lab_design_7x5000", move || {
+            let d = bb(tr_data::studio_lab::build_design(
+                bb(&t),
+                bb(&f),
+                bb(&s),
+                tr_core::Timeframe::D1,
+                daily,
+                "benchmark fixture only",
+                closed,
+                None,
+            ))
+            .unwrap();
+            // Daily bars: target h=1 needs one prior bar; the deepest lag + h window drops a few more.
+            assert!(d.y.len() >= n - 12 && d.x.len() == 7 && d.x.iter().all(|c| c.len() == d.y.len()));
+            d.y.len()
+        });
+        add!("studio.lab_7x5000", move || {
+            let r = bb(tr_data::studio_lab::compute(
+                bb(&target),
+                bb(&factors),
+                bb(&spec),
+                tr_core::Timeframe::D1,
+                daily,
+                "benchmark fixture only",
+                closed,
+                None,
+                1,
+            ));
+            let fit = r.fit.as_ref().expect("lab fit available");
+            assert_eq!(fit.k, 8);
+            // Real inference work at both scales: 200 bars still leave ≥ 80 training and ≥ 20 test rows.
+            assert_eq!(r.inference.len(), 4);
+            assert!(r.low_n.is_none(), "{:?}", r.low_n);
+            assert!(r.inference.iter().all(|i| i.covariance.covariance.is_some()));
+            assert!(r.holdout.as_ref().unwrap().r2_oos.is_some());
+            assert!(!full || r.points.len() == r.design_rows && r.design_rows > 4900 && fit.n_train > 3900);
+            assert!(r.diagnostics.is_some() && r.points.len() <= tr_data::studio_corr::MAX_POINTS);
+            r.points.len() + fit.n_train
+        });
+    }
     let bars = fixtures::daily(if full { 5000 } else { 200 }, 83);
     let seed = stable_hash::bars_digest(&bars);
     let values: Vec<_> = bars.iter().map(|b| b.close / b.open - 1.).collect();

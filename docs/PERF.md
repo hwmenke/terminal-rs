@@ -983,6 +983,35 @@ open `relate.fair_value` card with “residual band”, “mean CI” and “pre
 
 The overlay decimates to one point per pixel for display only; hover reads the exact point.
 
+## Studio Slice 5 — Regression Lab
+
+New compute cases (`relative:true`, class `interactive`) on the dev-only `fixtures::lab_model(5000)`
+(a `related` target plus seven `benchmark_for` factors; logret h1 ℓ0, logret h5 ℓ1, change h1 ℓ0, logret
+h1 ℓ2, logret h5 ℓ5, loglevel ℓ0, logret h1 ℓ1, so H = 5). `studio.lab_design_7x5000` times `build_design`
+only; `studio.lab_7x5000` times the full `compute` (design, pivoted QR, four covariances, holdout,
+diagnostics). Both assert k = 8, every complete row plotted (> 4,900), no LOW N, four available covariance
+blocks and an available R²_OOS. The first run of the design case failed its 10 ms budget (12.5 ms): per-row
+`security()` lookups and a binary search per cell dominated. They were hoisted/replaced by a merge pass
+(budget unchanged).
+
+| Case | Median ms | p95 ms | Budget ms |
+| --- | ---: | ---: | ---: |
+| `studio.lab_design_7x5000` | 7.011 | 7.615 | 10 |
+| `studio.lab_7x5000` | 13.658 | 14.205 | 40 |
+
+Paint (`paint.studio_lab.{steady,hover}`, 1,440 px, 5,000 bars, diagnostics open on Residual vs fitted;
+hover drives a real pointer onto the coefficient-row probe and asserts the open `lab.fit.coef` card with
+CLOSED THRU):
+
+| Metric (µs, median) | steady | hover | Ceiling |
+| --- | ---: | ---: | ---: |
+| `paint.studio_lab.*.ui` | 159.7 | 199.3 | 1200 |
+| `paint.studio_lab.*.tess` | 444.4 | 460.6 | 800 |
+| `paint.studio_lab.*.total` | 609.5 | 662.7 | 2000 |
+
+Gate status: compute **46 passed / 0 failed / 0 harness errors**; studio paint test passed. No existing
+budget, workload or `perf/baseline.json` entry was changed; the new cases report as New.
+
 ### Fold-ins and their measured effect
 
 | Metric | Before (slice 3 tip) | After |

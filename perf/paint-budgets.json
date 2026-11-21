@@ -376,6 +376,36 @@
       "relative": false,
       "class": "frame"
     },
+    "paint.studio_lab.steady.ui": {
+      "budget_us": 1200,
+      "relative": false,
+      "class": "frame"
+    },
+    "paint.studio_lab.steady.tess": {
+      "budget_us": 800,
+      "relative": false,
+      "class": "frame"
+    },
+    "paint.studio_lab.steady.total": {
+      "budget_us": 2000,
+      "relative": false,
+      "class": "frame"
+    },
+    "paint.studio_lab.hover.ui": {
+      "budget_us": 1200,
+      "relative": false,
+      "class": "frame"
+    },
+    "paint.studio_lab.hover.tess": {
+      "budget_us": 800,
+      "relative": false,
+      "class": "frame"
+    },
+    "paint.studio_lab.hover.total": {
+      "budget_us": 2000,
+      "relative": false,
+      "class": "frame"
+    },
     "paint.studio_fair_value.steady.ui": {
       "budget_us": 1500,
       "relative": false,

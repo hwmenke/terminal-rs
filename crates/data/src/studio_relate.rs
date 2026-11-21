@@ -59,7 +59,13 @@ pub struct FairValuePoint {
     /// −2σ, −1σ, +1σ, +2σ residual bands, added in target space then inverted.
     pub bands: [f64; 4],
     pub break_before: bool,
+    /// Row is inside the training prefix (its endpoint is a fitted pair).
     pub in_sample: bool,
+    /// Rows `h−1` bars after the last training endpoint: their h-bar support overlaps the training
+    /// prefix, but they were not fitted. Neither in-sample nor out-of-sample (slice-5 correction;
+    /// they used to be labelled in-sample). Old saved reports restore `false`.
+    #[serde(default)]
+    pub embargo: bool,
     /// Regressor in target space: X, ln X, ΔX or r^X.
     #[serde(default)]
     pub x: f64,
@@ -186,7 +192,7 @@ fn aligned_indexed(asset: &[Bar], benchmark: &[Bar], daily: bool) -> Result<Vec<
     Ok(out)
 }
 
-fn prefix(breaks: &[bool]) -> Vec<usize> {
+pub(crate) fn prefix(breaks: &[bool]) -> Vec<usize> {
     let mut out = Vec::with_capacity(breaks.len() + 1);
     out.push(0);
     let mut c = 0;
@@ -197,7 +203,7 @@ fn prefix(breaks: &[bool]) -> Vec<usize> {
     out
 }
 
-fn unit_for(transform: Transform) -> SeriesUnit {
+pub(crate) fn unit_for(transform: Transform) -> SeriesUnit {
     SeriesUnit::Native(
         match transform {
             Transform::Level => "price (native)",
@@ -309,7 +315,7 @@ impl Prepared {
     }
 }
 
-fn effective_method(method: CovarianceMethod, h: usize) -> CovarianceMethod {
+pub(crate) fn effective_method(method: CovarianceMethod, h: usize) -> CovarianceMethod {
     if h > 1 && matches!(method, CovarianceMethod::HacFixed5 | CovarianceMethod::HacAutomatic) {
         CovarianceMethod::Overlap(h)
     } else {
@@ -409,7 +415,8 @@ pub fn fair_value(p: &Prepared, fit: &FairValueFit) -> Vec<FairValuePoint> {
             centre,
             bands,
             break_before: p.y.break_before[t] || last != Some(t.wrapping_sub(1)),
-            in_sample: t <= train_row + h - 1,
+            in_sample: t <= train_row,
+            embargo: t > train_row && t <= train_row + h - 1,
             x,
             y,
             price: p.price[t],
@@ -474,6 +481,20 @@ pub fn expanding_beta(points: &[(i64, f64, f64, bool)]) -> Vec<(i64, Option<f64>
     out
 }
 
+/// Sorted, deduplicated union of every row's vault gaps; day-widened for daily data (a stamp for
+/// one date may be later or earlier than another series' stamp for the same date).
+pub(crate) fn union_gaps(rows: &[&NamedBars], daily: bool) -> Vec<(i64, i64)> {
+    let mut gaps: Vec<(i64, i64)> = rows.iter().flat_map(|r| r.gaps.iter().copied()).collect();
+    if daily {
+        for g in &mut gaps {
+            *g = (g.0.div_euclid(86_400) * 86_400 + 86_399, g.1.div_euclid(86_400) * 86_400);
+        }
+    }
+    gaps.sort_unstable();
+    gaps.dedup();
+    gaps
+}
+
 /// One complete-case set: timestamps present in every admitted row, where each return's
 /// endpoints are consecutive in every row's own bars and no vault gap is spanned. Every cell uses
 /// the same returns, so the same n. Pairwise `matrix()` stays the legacy conventions.
@@ -492,14 +513,7 @@ pub fn common_panel_matrix(rows: &[NamedBars], daily: bool) -> Matrix {
         })
         .collect();
     let ok: Vec<usize> = (0..rows.len()).filter(|&i| errors[i].is_none()).collect();
-    let mut gaps: Vec<(i64, i64)> = ok.iter().flat_map(|&i| rows[i].gaps.iter().copied()).collect();
-    if daily {
-        for g in &mut gaps {
-            *g = (g.0.div_euclid(86_400) * 86_400 + 86_399, g.1.div_euclid(86_400) * 86_400);
-        }
-    }
-    gaps.sort_unstable();
-    gaps.dedup();
+    let gaps = union_gaps(&ok.iter().map(|&i| &rows[i]).collect::<Vec<_>>(), daily);
     // Common positions with each row's bar index.
     let keys: Vec<Vec<i64>> = ok.iter().map(|&i| rows[i].bars.iter().map(|b| key(b.ts)).collect()).collect();
     let mut at: Vec<Vec<usize>> = vec![Vec::new(); ok.len()];
@@ -650,7 +664,7 @@ impl RelateArgs {
             let value = value.to_ascii_lowercase();
             match key.to_ascii_lowercase().as_str() {
                 "transform" => {
-                    Transform::parse(&value, 1)?;
+                    Transform::parse(&value, 1).map_err(|e| format!("Relate {e}"))?;
                     out.transform = Some(value);
                 }
                 "h" => {

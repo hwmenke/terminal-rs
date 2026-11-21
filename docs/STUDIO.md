@@ -68,8 +68,19 @@ second-stage report keys remain the original implementations. See
 Relate (slice 4) adds strict fixed-bar transforms, expanding β, a common-panel matrix and a
 frozen-training fair-value overlay with residual ±σ bands on the native chart (`RELATE`,
 `STUDIO lens=relate transform=logreturn h=5`; never in Quick-canvas mode). Bare `LAB`,
-`RESID` and `ATTR` load their tickers; their unavailable routes are `STUDIO lab|resid|attr`.
+`RESID` and `ATTR` load their tickers; `STUDIO resid|attr` are unavailable routes.
 See [Relate](STUDIO_CORR.md).
+
+The Regression Lab (slice 5) is a standalone pane reached with `STUDIO lab …` (it is not a sixth
+lens; `StudioLens::ALL` stays five): up to seven factors with per-factor transform and lag on the
+target's strict grid, a pivoted-QR fit with rank and κ guards, four covariances, a purged frozen
+holdout and two diagnostic plots. Bare `LAB` is still the LAB ticker. See [Regression Lab](STUDIO_LAB.md).
+
+Slice-5 corrections to slice-4 numbers: the CORR/Relate chronological holdout now purges the last
+h−1 training pairs at h > 1 (OOS R² at h = 5 and 20 moves; h = 1 unchanged), fair-value embargo rows
+are a third state instead of "in-sample", `Transform::parse` errors no longer say "Relate" for every
+caller, and the CORR report cache key no longer includes the wall-clock observation time.
+Restored Studio layouts normalise the Relate transform horizon and `corr_horizon` to {1, 5, 20}.
 
 When (slice 3) is a dedicated lens: rule mask shading on the native chart,
 fixed-family within-clock HAC/BY evidence at h=1,3,6,12, shared-bin

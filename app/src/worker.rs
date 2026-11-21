@@ -230,6 +230,15 @@ pub enum Request {
         /// Relate transforms / fair value. Legacy CORR and RBETA always send `None`.
         relate: Option<tr_data::studio_corr::RelateSpec>,
     },
+    /// Regression Lab. `token` comes from `studio_token()`; the response must echo the spec.
+    StudioLab {
+        pane: PaneId,
+        token: u64,
+        symbol: String,
+        tf: Timeframe,
+        spec: tr_data::studio_lab::LabSpec,
+        fresh: bool,
+    },
     StudioSeason {
         pane: PaneId,
         generation: u64,
@@ -607,6 +616,7 @@ impl Request {
             Self::StudioDist { .. } => "StudioDist",
             Self::TstackTune { .. } => "TstackTune",
             Self::StudioCorr { .. } => "StudioCorr",
+            Self::StudioLab { .. } => "StudioLab",
             Self::StudioSeason { .. } => "StudioSeason",
             Self::StudioShape { .. } => "StudioShape",
             Self::StudioShapeBootstrap { .. } => "StudioShapeBootstrap",
@@ -912,6 +922,12 @@ pub enum Response {
         pane: PaneId,
         generation: u64,
         result: Result<Arc<tr_data::studio_corr::CorrReport>, String>,
+    },
+    StudioLab {
+        pane: PaneId,
+        token: u64,
+        spec: tr_data::studio_lab::LabSpec,
+        result: Result<Arc<tr_data::studio_lab::LabReport>, String>,
     },
     StudioSeason {
         pane: PaneId,
@@ -4729,6 +4745,23 @@ async fn handle_inner(s: &Arc<Shared>, req: Request, force: bool) {
             .await
             .map_err(|e| format!("{e:#}"));
             send(Response::StudioCorr { pane, generation, result });
+        }
+        Request::StudioLab { pane, token, symbol, tf, spec, fresh } => {
+            let result = crate::app::studio_lab::research(
+                &crate::app::studio_corr::CORR_CACHE,
+                fresh,
+                Some(s.jobs.clone()),
+                &s.history,
+                &config.bridge(),
+                s.sample_mode(),
+                &symbol,
+                tf,
+                &spec,
+                |key, tf| async move { analysis_bars(s, &key, tf, default_limit(tf), "Regression Lab").await },
+            )
+            .await
+            .map_err(|e| format!("{e:#}"));
+            send(Response::StudioLab { pane, token, spec, result });
         }
         Request::StudioSeason { pane, generation, symbol, tf } => {
             let result = async {

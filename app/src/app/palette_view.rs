@@ -35,7 +35,7 @@ const COMMANDS: &[(&str, &str, &str, Option<Action>)] = &[
     ("QUICK", "Quick time canvas · five comparison modes", "studio chart base brush", None),
     ("QUICK mode=index100", "Compare from a pinned base", "studio normalize", None),
     ("DSTRIP", "Toggle distribution margin strip", "chart histogram", None),
-    ("STUDIO LAB", "Factor Lab route · unavailable", "studio factors", None),
+    ("STUDIO lab factors=SPY,TLT", "Regression Lab · multi-factor OLS, purged holdout", "regression factors ols hac vif", None),
     ("STUDIO RESID", "Residual route · unavailable", "studio residual", None),
     ("STUDIO ATTR", "Attribution route · unavailable", "studio attribution", None),
     (

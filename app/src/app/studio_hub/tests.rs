@@ -65,7 +65,8 @@ fn studio_legacy_commands_preserved() {
         tr_data::studio::StudioRoute::Attr,
     ] {
         assert_eq!(command::parse(&format!("STUDIO {}", r.code())), Some(Command::Function(Function::StudioRoute(r))));
-        assert!(r.reason().contains("unavailable"));
+        // LAB is built (slice 5); RESID / ATTR still explain why they are unavailable.
+        assert!(r.reason().contains(if r == tr_data::studio::StudioRoute::Lab { "Regression Lab" } else { "unavailable" }));
     }
     assert!(matches!(command::parse("AAPL QUICK QQQ 5m mode=index100"),Some(Command::SymbolFunction(_,Function::StudioQuick {..}))));
     assert!(command::parse("STUDIO lens=typo").is_none());
@@ -192,6 +193,19 @@ fn studio_layout_defaults_load() {
     assert!(!json.contains("report") && !json.contains("generation") && !json.contains("children"));
     let round: PaneSettings = serde_json::from_str(&json).unwrap();
     assert_eq!(round, settings);
+    // Restored Relate inputs are normalised: unsupported h → 1, corr_horizon ∈ {1,5,20}.
+    let bad = StudioInputs {
+        corr_horizon: 7,
+        relate_transform: Some(tr_data::studio::Transform::Change { h: 3 }),
+        ..Default::default()
+    };
+    assert_eq!(bad.valid_corr_horizon(), 1);
+    assert_eq!(bad.relate_spec("SPY").transform, tr_data::studio::Transform::Change { h: 1 });
+    let bad = StudioInputs { corr_horizon: 9, ..Default::default() };
+    assert_eq!(bad.relate_spec("SPY").transform, tr_data::studio::Transform::LogReturn { h: 1 });
+    let ok = StudioInputs { corr_horizon: 20, ..Default::default() };
+    assert_eq!(ok.valid_corr_horizon(), 20);
+    assert_eq!(ok.relate_spec("SPY").transform, tr_data::studio::Transform::LogReturn { h: 20 });
     for legacy in [r#"{"StudioDist":{}}"#, r#"{"StudioCorr":{}}"#, r#"{"StudioSeason":{}}"#] {
         assert!(serde_json::from_str::<PaneSettings>(legacy).is_ok());
     }

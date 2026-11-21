@@ -453,6 +453,10 @@ pub enum Function {
     StudioWhen {
         spec: String,
     },
+    /// Regression Lab: the words after `STUDIO lab` (interval and model edits).
+    StudioLab {
+        spec: String,
+    },
     DistributionStrip,
     StudioDist {
         timeframe: Timeframe,
@@ -928,6 +932,15 @@ fn parse_function(head: &str, rest: &[&str]) -> Option<Function> {
         // Studio words are also listed tickers: only valid Studio arguments make
         // the command; anything else falls through to the ticker (see parse()).
         "STUDIO" => {
+            // `lab` is checked before `parse_studio`, which would reject it as an unknown interval.
+            if rest.first().is_some_and(|w| w.eq_ignore_ascii_case("lab")) {
+                let tail = rest[1..].join(" ");
+                if tail.is_empty() {
+                    return Some(Function::StudioRoute(tr_data::studio::StudioRoute::Lab));
+                }
+                tr_data::studio_lab::LabArgs::parse(&tail).ok()?;
+                return Some(Function::StudioLab { spec: tail });
+            }
             let spec = joined();
             // LAB / RESID / ATTR are listed tickers, so their unavailable routes live behind STUDIO.
             let route = match spec.to_ascii_lowercase().as_str() {
@@ -1290,6 +1303,7 @@ fn describe(f: &Function) -> String {
         }
         Function::Journal(q) => format!("Trade journal: {q}"),
         Function::Studio { spec } => format!("Studio · native canvas and named lenses · {spec}"),
+        Function::StudioLab { spec } => format!("Regression Lab · multi-factor OLS, purged holdout, HAC · {spec}"),
         Function::StudioWhen { spec } => format!("When · fixed-family within-clock rule evidence · {spec}"),
         Function::StudioRelate { spec } => {
             format!("Relate · transforms, β and frozen-fit fair-value bands · {spec}")
@@ -2571,6 +2585,35 @@ mod auction_tests {
         assert!(matches!(parse("ZZZQ"), Some(Command::Symbol(_))));
         assert!(tr_core::catalog::lookup("AUCTION", None).is_none());
         assert!(tr_core::catalog::lookup("AMAP", None).is_none());
+    }
+    #[test]
+    fn lab_command_does_not_shadow_ticker() {
+        // LAB is a listed ticker, with or without its key; the Lab is reached through STUDIO lab.
+        assert_eq!(parse("LAB"), Some(Command::Symbol("LAB US Equity".into())));
+        assert_eq!(parse("LAB US Equity"), Some(Command::Symbol("LAB US Equity".into())));
+        assert!(!matches!(
+            parse("LAB factors=SPY"),
+            Some(Command::Function(Function::StudioLab { .. }) | Command::SymbolFunction(_, Function::StudioLab { .. }))
+        ));
+        assert_eq!(
+            parse("STUDIO lab"),
+            Some(Command::Function(Function::StudioRoute(tr_data::studio::StudioRoute::Lab)))
+        );
+        assert_eq!(
+            parse("STUDIO lab 5m factors=SPY,TLT"),
+            Some(Command::Function(Function::StudioLab { spec: "5m factors=SPY,TLT".into() }))
+        );
+        assert_eq!(
+            parse("AAPL STUDIO lab factors=SPY"),
+            Some(Command::SymbolFunction("AAPL US Equity".into(), Function::StudioLab { spec: "factors=SPY".into() }))
+        );
+        assert!(matches!(
+            parse("STUDIO LAB factor=TLT transform=change h=5 lag=1"),
+            Some(Command::Function(Function::StudioLab { .. }))
+        ));
+        assert_eq!(parse("STUDIO lab factors="), None);
+        assert_eq!(parse("STUDIO lab h=3"), None);
+        assert_eq!(parse("STUDIO lab transform=change"), None);
     }
     #[test]
     fn honest_backtest_words_remain_explicit_tickers() {

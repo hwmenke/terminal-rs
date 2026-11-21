@@ -12,7 +12,8 @@ use tr_data::studio_corr::{CorrReport, FairValuePoint, RelateReport};
 /// One drawable run: consecutive overlay points that map to consecutive chart bars with the same
 /// in-sample state and no break.
 struct Run {
-    in_sample: bool,
+    /// 0 in-sample (training prefix), 1 embargo (h−1 rows after it, not fitted), 2 out-of-sample.
+    state: u8,
     /// (screen x, centre y, [−2σ, −1σ, +1σ, +2σ] y)
     pts: Vec<(f32, f32, [f32; 4])>,
 }
@@ -85,8 +86,9 @@ impl ChartState {
             }
             let x = to_x(idx);
             let point = (x, to_y(p.centre), [to_y(p.bands[0]), to_y(p.bands[1]), to_y(p.bands[2]), to_y(p.bands[3])]);
+            let state: u8 = if p.in_sample { 0 } else if p.embargo { 1 } else { 2 };
             match runs.last_mut() {
-                Some(run) if contiguous && run.in_sample == p.in_sample => {
+                Some(run) if contiguous && run.state == state => {
                     // Display decimation only: keep one point per pixel; hover uses exact points.
                     if x - last_x >= 1.0 {
                         run.pts.push(point);
@@ -96,13 +98,13 @@ impl ChartState {
                 Some(run) if contiguous => {
                     // The sample state changes: share the boundary point so the line has no gap.
                     let shared = run.pts.last().copied();
-                    let mut next = Run { in_sample: p.in_sample, pts: shared.into_iter().collect() };
+                    let mut next = Run { state, pts: shared.into_iter().collect() };
                     next.pts.push(point);
                     runs.push(next);
                     last_x = x;
                 }
                 _ => {
-                    runs.push(Run { in_sample: p.in_sample, pts: vec![point] });
+                    runs.push(Run { state, pts: vec![point] });
                     last_x = x;
                 }
             }
@@ -113,7 +115,7 @@ impl ChartState {
         if bands {
             let mut mesh = Mesh::default();
             for run in &runs {
-                let dim = if run.in_sample { 0.5 } else { 1.0 };
+                let dim = [0.5, 0.75, 1.0][run.state as usize];
                 for w in run.pts.windows(2) {
                     // Outer ±2σ band first (0.10), then the inner ±1σ band (0.18).
                     for (a, b, alpha) in [(0usize, 3usize, 0.10f32), (1, 2, 0.18)] {
@@ -137,7 +139,8 @@ impl ChartState {
                 continue;
             }
             let line: Vec<egui::Pos2> = run.pts.iter().map(|p| egui::pos2(p.0, p.1)).collect();
-            let stroke = Stroke::new(1.5, if run.in_sample { accent.gamma_multiply(0.55) } else { accent });
+            let stroke =
+                Stroke::new(1.5, [accent.gamma_multiply(0.55), accent.gamma_multiply(0.78), accent][run.state as usize]);
             painter.extend(egui::Shape::dashed_line(&line, stroke, 6.0, 4.0));
         }
         let caption = format!(
@@ -152,11 +155,11 @@ impl ChartState {
             corr.source
         );
         painter.text(rect.left_top() + vec2(8., 24.), egui::Align2::LEFT_TOP, caption, theme::ui_font(10.), theme::muted());
-        if runs.iter().any(|r| r.in_sample) {
+        if runs.iter().any(|r| r.state < 2) {
             painter.text(
                 rect.left_top() + vec2(8., 38.),
                 egui::Align2::LEFT_TOP,
-                "dimmed = in-sample descriptive (training prefix)",
+                "dimmed = in-sample descriptive (training prefix); lighter dim = embargo (h−1 rows, not fitted)",
                 theme::ui_font(10.),
                 theme::muted(),
             );

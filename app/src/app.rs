@@ -42,6 +42,7 @@ pub(crate) mod studio_corr;
 pub(crate) mod studio_dist;
 pub(crate) mod studio_frame;
 pub(crate) mod studio_hub;
+pub(crate) mod studio_lab;
 pub(crate) mod studio_when;
 #[cfg(test)]
 mod studio_perf_gate;
@@ -125,6 +126,8 @@ pub enum PaneKind {
     StudioRoute(tr_data::studio::StudioRoute),
     StudioDist(Box<studio_dist::DistPane>),
     StudioCorr(Box<studio_corr::CorrPane>),
+    /// Regression Lab (`STUDIO lab`, `NEW LAB`); bare `LAB` stays a ticker.
+    StudioLab(Box<studio_lab::LabPane>),
     TstackTune(Box<tstack_tune::TunePane>),
     StudioSeason(Box<studio_season::SeasonPane>),
     /// Strategy vs buy-and-hold paper backtest (`BACKTEST` / `BT`).
@@ -403,6 +406,7 @@ impl PaneKind {
             PaneKind::StudioDist(s) => format!("{} Distribution", tr_data::security(&s.symbol).ticker),
             PaneKind::TstackTune(s) => format!("{} TSTACK Tune", tr_data::security(&s.symbol).ticker),
             PaneKind::StudioCorr(s) => format!("{} CORR", tr_data::security(&s.symbol).ticker),
+            PaneKind::StudioLab(s) => format!("{} Lab", tr_data::security(&s.symbol).ticker),
             PaneKind::StudioSeason(s) => {
                 if s.symbol.trim().is_empty() {
                     "Seasonality".into()
@@ -543,6 +547,7 @@ impl PaneKind {
             PaneKind::StudioRoute(route) => route.code(),
             PaneKind::StudioDist(_) => "DIST",
             PaneKind::StudioCorr(_) => "CORR",
+            PaneKind::StudioLab(_) => "LAB",
             PaneKind::TstackTune(_) => "TUNE",
             PaneKind::StudioSeason(_) => "SEASON",
             PaneKind::Backtest(b) if b.intraday => "IBT",
@@ -699,6 +704,12 @@ impl PaneKind {
                 horizon: s.horizon,
                 relate: s.relate.clone(),
             },
+            PaneKind::StudioLab(s) => {
+                // The editor's covariance chip is the persisted display default.
+                let mut spec = s.spec.clone();
+                spec.covariance = tr_data::studio_corr::SE_METHODS[s.ui.shown_cov.min(3)];
+                PaneSettings::StudioLab { symbol: s.symbol.clone(), tf: s.tf, spec }
+            }
             PaneKind::StudioSeason(s) => PaneSettings::StudioSeason { symbol: s.symbol.clone(), spec: s.spec.clone() },
             PaneKind::Stats(s) => PaneSettings::Stats {
                 symbol: s.symbol.clone(),
@@ -886,7 +897,14 @@ impl PaneKind {
             PaneSettings::Journal { filter } => PaneKind::Journal(Box::new(journal::JournalPane::new(filter))),
             PaneSettings::Studio { view } => PaneKind::Studio(Box::new(studio_hub::StudioPane::new(view))),
             PaneSettings::StudioRoute { route:tr_data::studio::StudioRoute::Quick } => PaneKind::Studio(Box::new(studio_hub::StudioPane::new(studio_hub::StudioViewSpec {quick:true,..Default::default()}))),
+            // A saved LAB route restores as a default Lab pane.
+            PaneSettings::StudioRoute { route: tr_data::studio::StudioRoute::Lab } => PaneKind::StudioLab(Box::new(
+                studio_lab::LabPane::new(String::new(), tr_core::Timeframe::D1, tr_data::studio_lab::LabSpec::default()),
+            )),
             PaneSettings::StudioRoute { route } => PaneKind::StudioRoute(route),
+            PaneSettings::StudioLab { symbol, tf, spec } => {
+                PaneKind::StudioLab(Box::new(studio_lab::LabPane::new(symbol, tf, spec)))
+            }
             PaneSettings::StudioDist { symbol, timeframe, window } => {
                 PaneKind::StudioDist(Box::new(studio_dist::DistPane::new(symbol, timeframe, window)))
             }
@@ -1593,6 +1611,8 @@ impl TerminalApp {
             Command::SymbolFunction(s, Function::StudioRelate { spec }) => self.open_relate(Some(&s), &spec),
             Command::SymbolFunction(s, Function::Studio { spec }) => self.open_studio(Some(&s), &spec),
             Command::SymbolFunction(s, Function::StudioRoute(tr_data::studio::StudioRoute::Quick)) => self.open_quick(Some(&s),""),
+            Command::SymbolFunction(s, Function::StudioRoute(tr_data::studio::StudioRoute::Lab)) => self.open_lab(Some(&s), ""),
+            Command::SymbolFunction(s, Function::StudioLab { spec }) => self.open_lab(Some(&s), &spec),
             Command::SymbolFunction(_, Function::StudioRoute(route)) => self.open_panel(PaneKind::StudioRoute(route)),
             Command::SymbolFunction(s, Function::StudioDistHorizon(h)) => self.set_shape_horizon(Some(&s), h),
             Command::SymbolFunction(s, Function::StudioDist { timeframe }) => {
@@ -1876,6 +1896,8 @@ impl TerminalApp {
             Function::DistributionStrip => self.with_chart(|c,_|c.toggle_canvas_strip()),
             Function::Studio { spec } => self.open_studio(symbol.as_deref(), &spec),
             Function::StudioRoute(tr_data::studio::StudioRoute::Quick) => self.open_quick(symbol.as_deref(),""),
+            Function::StudioRoute(tr_data::studio::StudioRoute::Lab) => self.open_lab(symbol.as_deref(), ""),
+            Function::StudioLab { spec } => self.open_lab(symbol.as_deref(), &spec),
             Function::StudioRoute(route) => self.open_panel(PaneKind::StudioRoute(route)),
             Function::StudioCorr { spec } => self.open_studio_corr(symbol.as_deref(), &spec),
             Function::StudioSeason { spec } => self.open_studio_season(symbol.as_deref(), &spec),
@@ -2023,6 +2045,10 @@ impl TerminalApp {
                             PaneKind::StudioDist(s) => s.request(pane.id, &self.worker),
                             PaneKind::TstackTune(s) => s.request(pane.id, &self.worker),
                             PaneKind::StudioCorr(s) => s.request(pane.id, &self.worker),
+                            PaneKind::StudioLab(s) => {
+                                s.invalidate(false);
+                                s.request(pane.id, &self.worker)
+                            }
                             PaneKind::StudioSeason(s) => s.request(pane.id, &self.worker),
                             PaneKind::Backtest(b) => b.request(pane.id, &self.worker),
                             PaneKind::Lookalike(l) => l.request(pane.id, &self.worker),
@@ -2124,6 +2150,11 @@ impl TerminalApp {
                 Response::StudioCorr { pane, generation, result } => {
                     if let Some(s) = self.panes.iter_mut().find(|p| p.id == pane).and_then(|p| p.kind.corr_mut()) {
                         s.accept_shared(generation, result);
+                    }
+                }
+                Response::StudioLab { pane, token, spec, result } => {
+                    if let Some(PaneKind::StudioLab(s)) = self.panes.iter_mut().find(|p| p.id == pane).map(|p| &mut p.kind) {
+                        s.accept(token, &spec, result);
                     }
                 }
                 Response::StudioShape { pane, generation, result } => {

@@ -147,9 +147,17 @@ windows withheld. Ratio z60 also withholds windows crossing a join.
 The **holdout** fits the first floor(0.8n) observations, freezes alpha, beta and
 training mean, then scores the remaining observations. `R²_oos = 1 − SSE_test /
 Σtest(y−mean_train)²`; negative values read **no skill**. It needs at least 30
-training and 10 test observations and a nonzero test baseline. No refitting or
-parameter selection uses the test set. Overlapping horizons share up to h−1
-boundary prices across this simple split; the UI discloses this limitation.
+training (after the purge) and 10 test observations and a nonzero test baseline. No
+refitting or parameter selection uses the test set.
+
+**Purge (correction, slice 5).** At h > 1 consecutive pairs overlap by h−1 bars. The
+last h−1 of the nominal 80% training pairs share bars with the first test pair, so they
+are now **purged** from the fit and from the training mean (`Holdout::purged`, shown as
+"train | purged | test"). The test block and `split_ts` stay at the nominal boundary.
+At h = 1 nothing is purged and results are unchanged. Published h = 5 and h = 20 OOS R²
+values from earlier builds were computed without the purge and will move (the earlier
+split let training pairs share bars with the first test pair); h = 1 values, all in-sample statistics and all rolling
+bands are bit-identical.
 The train/test strip is descriptive, not an execution or strategy backtest.
 
 The **Theil–Sen** slope is the exact median of finite pairwise slopes on at most
@@ -211,7 +219,12 @@ convention applies; unavailable stays unavailable (no interpolation or carry).
 **Frozen training fit.** OLS on the chronological first 80% of valid pairs
 (`train_n = 4n/5`), σ = √(SSE/(n−2)) in target space; refused when n_train < 30, the
 benchmark has no variance, or σ ≤ 64·ε·max|y|. Points after `train_end` are out of
-sample; earlier points are drawn dimmed and labelled *in-sample descriptive*. Bands add
+sample; earlier points are drawn dimmed and labelled *in-sample descriptive*. The h−1
+rows right after `train_end` (their h-bar support overlaps the fitted prefix but they
+were not fitted) are a third **embargo** state (`FairValuePoint::embargo`; lighter dim,
+card text "embargo … not fitted"). **Correction (slice 5):** they were previously
+labelled in-sample; numbers and bands are unchanged, only the label and dimming moved.
+Bands add
 `kσ` (k = ±1, ±2) **in target space and then invert**: level `ŷ+kσ`; log level
 `exp(a+b ln X+kσ)` (a conditional **median**, no σ²/2 term); change `P_{t−h}+a+bΔX+kσ`;
 log return `P_{t−h}·exp(a+b r^X+kσ)`. Residuals are never cumulated. Change and
