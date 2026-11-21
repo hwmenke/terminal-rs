@@ -206,7 +206,7 @@ impl Bridge {
         }
         Ok(())
     }
-    async fn get<T: serde::de::DeserializeOwned>(&self, path: &str) -> Result<T> {
+    fn request_url(&self, path: &str) -> Result<reqwest::Url> {
         let base = self.url.as_deref().context("HTTP disabled")?;
         let mut url = reqwest::Url::parse(base).context("Whats-News URL is invalid. Use http://127.0.0.1:8050 (main app) or http://127.0.0.1:8051 (data service) in Settings › Whats-News")?;
         let local = url.host_str().is_some_and(|h| {
@@ -218,15 +218,24 @@ impl Bridge {
                 "Whats-News URL must be a local HTTP URL. Use http://127.0.0.1:8050 or http://127.0.0.1:8051 in Settings › Whats-News"
             );
         }
-        url.set_path(path.split('?').next().unwrap_or(path));
+        url.path_segments_mut().map_err(|_| anyhow::anyhow!("Whats-News URL cannot contain path segments"))?
+            .clear().extend(path.split('?').next().unwrap_or(path).trim_start_matches('/').split('/'));
+        // url's path-segment encoder leaves carets literal; archive index tickers need %5E.
+        let encoded = url.path().replace('^', "%5E");
+        url.set_path(&encoded);
         url.set_query(path.split_once('?').map(|(_, q)| q));
+        Ok(url)
+    }
+    async fn get<T: serde::de::DeserializeOwned>(&self, path: &str) -> Result<T> {
+        let url = self.request_url(path)?;
+        let base = self.url.as_deref().context("HTTP disabled")?;
         let response = self.client.get(url).send().await.map_err(|e| {
-            if e.is_timeout() { anyhow::anyhow!("Whats-News timed out at {base}. Check that it is responding, or switch to the archive file in Settings › Whats-News.") }
-            else { anyhow::anyhow!("Whats-News isn't running or cannot be reached at {base}. Start it or switch to the archive file in Settings › Whats-News. ({e})") }
+            if e.is_timeout() { anyhow::Error::new(e).context(format!("Whats-News timed out at {base}. Check that it is responding, or switch to the archive file in Settings › Whats-News.")) }
+            else { anyhow::Error::new(e).context(format!("Whats-News isn't running or cannot be reached at {base}. Start it or switch to the archive file in Settings › Whats-News.")) }
         })?.error_for_status()?;
         response.json().await.map_err(|e| {
-            if e.is_timeout() { anyhow::anyhow!("Whats-News timed out reading a response from {base}. Check the app or switch to the archive file in Settings › Whats-News.") }
-            else { anyhow::anyhow!("Whats-News returned an invalid response at {base}. Check the URL in Settings › Whats-News (main app port 8050, data service port 8051). ({e})") }
+            if e.is_timeout() { anyhow::Error::new(e).context(format!("Whats-News timed out reading a response from {base}. Check the app or switch to the archive file in Settings › Whats-News.")) }
+            else { anyhow::Error::new(e).context(format!("Whats-News returned an invalid response at {base}. Check the URL in Settings › Whats-News (main app port 8050, data service port 8051).")) }
         })
     }
     async fn sql<T: Send + 'static>(
@@ -466,11 +475,13 @@ impl Bridge {
             .await
             .unwrap_or_else(|_| Err(anyhow::anyhow!("Whats-News timed out reading watchlist histories")));
         match http {
-            Ok(data) => Ok(Snapshot {
+            Ok((data, used_sql)) => Ok(Snapshot {
                 failures: vec![],
                 data,
-                provenance: Provenance::Real,
-                source: format!("Whats-News HTTP archive: {}", self.url.as_deref().unwrap_or_default()),
+                provenance: if used_sql { Provenance::Cached } else { Provenance::Real },
+                source: if used_sql {
+                    format!("Whats-News HTTP / SQLite archive: {}", self.db.display())
+                } else { format!("Whats-News HTTP archive: {}", self.url.as_deref().unwrap_or_default()) },
             }),
             Err(e) if e.is::<Unverified>() => Err(e),
             Err(http) => {
@@ -481,26 +492,51 @@ impl Bridge {
             }
         }
     }
-    async fn http_histories_for(&self, tickers: &[String]) -> Result<Histories> {
+    async fn http_histories_for(&self, tickers: &[String]) -> Result<(Histories, bool)> {
         let rows: Vec<_> = stream::iter(tickers.iter().cloned().map(|symbol| async move {
-            match self.http_bars(&symbol, 1_000_000).await {
-                Ok(bars) => Ok((symbol, Ok(bars))),
-                Err(e) if e.is::<Unverified>() || e.downcast_ref::<reqwest::Error>().is_some() => Err(e),
-                Err(e) => Ok((symbol, Err(format!("invalid archived history: {e}")))),
-            }
+            let mut used_sql = false;
+            let result = match self.http_bars(&symbol, 1_000_000).await {
+                Err(e) if e.downcast_ref::<reqwest::Error>().is_some() => {
+                    let ticker = symbol.clone();
+                    match self.sql(move |c| bars_sql(&c, &ticker, None, 1_000_000)).await {
+                        Ok(snapshot) if !snapshot.data.is_empty() => { used_sql = true; Ok(snapshot.data) },
+                        Err(db) if db.is::<Unverified>() => Err(db),
+                        _ => Err(e),
+                    }
+                }
+                Ok(bars) if bars.is_empty() => {
+                    let ticker = symbol.clone();
+                    match self.sql(move |c| bars_sql(&c, &ticker, None, 1_000_000)).await {
+                        Ok(snapshot) if !snapshot.data.is_empty() => { used_sql = true; Ok(snapshot.data) },
+                        Err(db) if db.is::<Unverified>() => Err(db),
+                        _ => Ok(bars),
+                    }
+                }
+                result => result,
+            };
+            (symbol, result, used_sql)
         }))
         .buffered(12)
-        .try_collect::<Vec<_>>()
-        .await?;
+        .collect::<Vec<_>>()
+        .await;
         let mut histories = Histories { bars: vec![], skipped: vec![] };
-        for (symbol, bars) in rows {
+        let mut transport = None;
+        let mut used_sql = false;
+        for (symbol, bars, from_sql) in rows {
+            used_sql |= from_sql;
             match bars {
                 Ok(bars) if !bars.is_empty() => histories.bars.push((symbol, bars)),
                 Ok(_) => histories.skipped.push(Skipped { symbol, reason: "no daily history".into() }),
-                Err(reason) => histories.skipped.push(Skipped { symbol, reason }),
+                Err(e) if e.is::<Unverified>() => return Err(e),
+                Err(e) if e.downcast_ref::<reqwest::Error>().is_some() => {
+                    histories.skipped.push(Skipped { symbol, reason: format!("Whats-News transport failure: {e}") });
+                    transport = Some(e);
+                }
+                Err(e) => histories.skipped.push(Skipped { symbol, reason: format!("invalid archived history: {e}") }),
             }
         }
-        Ok(histories)
+        if histories.bars.is_empty() && let Some(e) = transport { return Err(e); }
+        Ok((histories, used_sql))
     }
     /// Original service fields are supplementary. Setup membership and all user
     /// filters use the shared Rust calculation contract over verified history.
@@ -611,7 +647,11 @@ fn convert(rows: Vec<StoredBar>) -> Result<Vec<Bar>> {
     let mut bars = Vec::with_capacity(rows.len());
     for r in rows {
         verify(r.provenance, "Whats-News research/archive")?;
-        let ts = NaiveDate::parse_from_str(&r.date, "%Y-%m-%d")?.and_hms_opt(0, 0, 0).unwrap().and_utc().timestamp();
+        let ts = NaiveDate::parse_from_str(&r.date, "%Y-%m-%d")?.and_hms_opt(0, 0, 0)
+            .context("invalid archive date")?.and_utc().timestamp();
+        if !crate::stats::supported_archive_timestamp(ts) {
+            bail!("invalid archive date {}; supported calendar years are 0001–9999", r.date);
+        }
         if ![r.open, r.high, r.low, r.close, r.volume].iter().all(|n| n.is_finite())
             || r.low <= 0.0
             || r.open <= 0.0
@@ -1170,13 +1210,52 @@ mod tests {
         assert!(b.bars("BREAK").await.is_err());
         assert!(!missing.exists());
     }
+    #[tokio::test]
+    async fn selected_histories_transport_fallback_and_error_cause() {
+        let url = "http://127.0.0.1:0".to_string();
+        let fixture = Fixture::new();
+        let bridge = Bridge::new(fixture.0.clone(), Some(url.clone()), true);
+        let error = bridge.http_bars("BREAK", 100).await.unwrap_err();
+        assert!(error.downcast_ref::<reqwest::Error>().is_some());
+        assert!(!error.to_string().contains("invalid archived history"));
+        let result = bridge.histories_for(&["BREAK".into(), "SHORT".into()]).await.unwrap();
+        assert_eq!(result.data.bars.len(), 2);
+        let missing = Bridge::new(fixture.0.with_extension("missing"), Some(url), true);
+        let error = missing.histories_for(&["BREAK".into()]).await.unwrap_err();
+        assert!(error.to_string().contains("cannot be reached"));
+        assert!(!error.to_string().contains("invalid archived history"));
+    }
+
+    #[tokio::test]
+    async fn selected_histories_keep_http_success_on_symbol_failure() {
+        let fixture = Fixture::new();
+        let (url, server) = http_fixture(vec![
+            ("/api/ohlcv/HTTP?freq=daily&limit=1000000", 200, scan_bar_json()),
+            ("/api/ohlcv/SHORT?freq=daily&limit=1000000", 503, "{}".into()),
+        ]);
+        let bridge = Bridge::new(fixture.0.clone(), Some(url), true);
+        let result = bridge.histories_for(&["HTTP".into(), "SHORT".into()]).await.unwrap();
+        assert_eq!(result.data.bars.iter().map(|(s, _)| s.as_str()).collect::<Vec<_>>(), ["HTTP", "SHORT"]);
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn mapped_archive_symbols_are_encoded_as_path_segments() {
+        let bridge = Bridge::new(PathBuf::new(), Some("http://127.0.0.1:8050".into()), true);
+        for (key, path) in [("SPX Index", "%5EGSPC"), ("AAPL US Equity", "AAPL"), ("BRK-B US Equity", "BRK-B")] {
+            let url = bridge.request_url(&format!("/api/ohlcv/{}?freq=daily&limit=100", archive_ticker(key))).unwrap();
+            assert_eq!(url.path(), format!("/api/ohlcv/{path}"));
+            assert_eq!(url.query(), Some("freq=daily&limit=100"));
+        }
+    }
+
     // Minimal HTTP fixture also enforces GET-only requests; no service or real DB needed.
     fn http_fixture(routes: Vec<(&'static str, u16, impl Into<String>)>) -> (String, std::thread::JoinHandle<()>) {
-        let routes: Vec<_> = routes.into_iter().map(|(path, status, body)| (path, status, body.into())).collect();
+        let mut routes: Vec<_> = routes.into_iter().map(|(path, status, body)| (path, status, body.into())).collect();
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
         let handle = std::thread::spawn(move || {
-            for (path, status, body) in routes {
+            while !routes.is_empty() {
                 let (mut socket, _) = listener.accept().unwrap();
                 socket.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
                 let mut request = Vec::new();
@@ -1186,7 +1265,10 @@ mod tests {
                     request.push(byte[0]);
                 }
                 let request = String::from_utf8(request).unwrap();
-                assert!(request.starts_with(&format!("GET {path} HTTP/1.1\r\n")), "{request}");
+                // Concurrent per-symbol reads may arrive in either order.
+                let at = routes.iter().position(|(path, _, _)| request.starts_with(&format!("GET {path} HTTP/1.1\r\n")))
+                    .unwrap_or_else(|| panic!("unexpected request: {request}"));
+                let (_, status, body) = routes.remove(at);
                 write!(socket, "HTTP/1.1 {status} Test\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len()).unwrap();
             }
         });

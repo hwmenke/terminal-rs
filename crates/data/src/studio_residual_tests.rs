@@ -682,3 +682,77 @@ fn residual_covariance_saved_and_digest_compatible() {
     .contains("count"));
     assert!(bad(&|x| x.model.origin = FitOrigin::Relate).contains("count"));
 }
+
+#[test]
+fn raw_dependency_revisions_and_legacy_coverage() {
+    let (t, f) = related(500, 0.8, 5);
+    for (target, predictor, lag, revised_input) in [
+        (Transform::LogReturn { h: 1 }, Transform::Level, 0, 0),
+        (Transform::Level, Transform::LogReturn { h: 1 }, 0, 1),
+        (Transform::Level, Transform::Level, 3, 1),
+        (Transform::LogReturn { h: 5 }, Transform::LogReturn { h: 5 }, 3, 1),
+    ] {
+        let spec = LabSpec { target, factors: vec![FactorSpec::new(F1, predictor, lag)], ..Default::default() };
+        let report = studio_lab::compute(&t, &[f.clone()], &spec, Timeframe::D1, true, "unit", 0, None, 7);
+        let fit = freeze_lab(&report, None, None, 0).unwrap();
+        let first = fit.span_digests[revised_input].first_ts;
+        assert!(first < fit.model.train_start);
+        let (mut revised_t, mut revised_f) = (t.clone(), f.clone());
+        let row = if revised_input == 0 { &mut revised_t } else { &mut revised_f };
+        let raw = row.bars.iter_mut().find(|b| b.ts == first).unwrap();
+        *raw = bar(raw.ts, raw.close + 0.01);
+        let scored = run(&fit, &revised_t, &[revised_f]);
+        assert!(matches!(scored.revision[revised_input].1, InputCheck::Revised { .. }));
+        let mut legacy = fit.clone();
+        for span in &mut legacy.span_digests { span.version = 0; }
+        legacy.content_digest = legacy.compute_digest();
+        let mut json = serde_json::to_value(&legacy).unwrap();
+        for span in json["span_digests"].as_array_mut().unwrap() { span.as_object_mut().unwrap().remove("version"); }
+        let loaded: FrozenFit = serde_json::from_value(json).unwrap();
+        loaded.validate().unwrap();
+        assert!(run(&loaded, &t, &[f.clone()]).revision.iter().all(|(_, c)| *c == InputCheck::PartialCoverage));
+    }
+}
+
+#[test]
+fn relate_raw_lookback_revision() {
+    let (t, f) = related(500, 0.9, 13);
+    let opts = Options { annual_periods: 252., daily: true };
+    let spec = RelateSpec::new(F1, Transform::LogReturn { h: 5 });
+    let report = compute_relate(&t, &f, &[], opts, Timeframe::D1, &spec, "unit", 0, None, 1).unwrap();
+    let mut corr = compute_series_at_horizon(&t, &f, &[], opts, "unit", 5).unwrap();
+    corr.relate = Some(Box::new(report));
+    let fit = freeze_relate(&corr, Timeframe::D1, None, None, 0).unwrap();
+    for input in 0..2 {
+        let (mut a, mut b) = (t.clone(), f.clone());
+        let row = if input == 0 { &mut a } else { &mut b };
+        let first = fit.span_digests[input].first_ts;
+        assert!(first < fit.model.train_start);
+        let raw = row.bars.iter_mut().find(|b| b.ts == first).unwrap();
+        *raw = bar(raw.ts, raw.close + 0.01);
+        assert!(matches!(run(&fit, &a, &[b]).revision[input].1, InputCheck::Revised { .. }));
+    }
+}
+
+#[test]
+fn residual_daily_receipt_changes_do_not_change_provider_identity() {
+    let (t, mut f) = level_pair(160, 51);
+    f.source = "Yahoo (native provider) · CLOSED THRU 2026-01-02 · 1000 bars · observed 2026-01-03 · fallback: archive empty".into();
+    let fit = manual_fit(&[&t, &f], &[1., 2.], 0., 1., 99, 20);
+    f.source = "Yahoo (native provider) · CLOSED THRU 2026-01-05 · 1001 bars · observed 2026-01-06 · fallback: archive unavailable".into();
+    assert_eq!(run(&fit, &t, &[f.clone()]).revision[1].1, InputCheck::Unchanged);
+    f.source = f.source.replace("Yahoo", "Alpaca");
+    assert!(matches!(run(&fit, &t, &[f]).revision[1].1, InputCheck::SourceChanged { .. }));
+}
+
+#[test]
+fn dependency_bounds_tolerate_gaps_without_panicking() {
+    use tr_core::Bar;
+    let day = 86_400;
+    let bars: Vec<Bar> = [0, 1, 3, 4].iter().map(|d| Bar::new(d * day, 1., 1., 1., 1., 1.)).collect();
+    // Start falls on a missing day: the as-of bar before it is included.
+    assert_eq!(super::dependency_bounds(&bars, 2 * day, 4 * day, true), (day, 4 * day));
+    // Start before the series: clamps to the first bar.
+    assert_eq!(super::dependency_bounds(&bars, -day, 3 * day, true), (0, 3 * day));
+    assert_eq!(super::dependency_bounds(&[], 5, 9, true), (5, 9));
+}

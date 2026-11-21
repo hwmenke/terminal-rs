@@ -1998,6 +1998,60 @@ async fn native_fetch_with_clock(
     result.map_err(|e| anyhow::Error::new(NativeError(e)))
 }
 
+/// Whole-series daily admission; no display-cache reads or provider splicing.
+async fn research_daily(s: &Shared, bridge: &tr_data::whats_news::Bridge, key: &str) -> anyhow::Result<(Vec<Bar>, String)> {
+    let ticker = tr_data::whats_news::archive_ticker(key);
+    let receipt = crate::daily_research::resolve(key, chrono::Utc::now().timestamp(), |stage| {
+        let ticker = ticker.clone();
+        async move {
+            match stage {
+                0 => Ok((s.history.db(move |db| db.daily(&ticker)).await?, "Local research archive".into())),
+                1 => {
+                    anyhow::ensure!(bridge.enabled, "disabled");
+                    let external = bridge.histories_for(std::slice::from_ref(&ticker)).await?;
+                    external.provenance.require_verified("Daily research").map_err(anyhow::Error::msg)?;
+                    if let Some(skip) = external.data.skipped.iter().find(|v| v.symbol.eq_ignore_ascii_case(&ticker)) {
+                        anyhow::bail!("{}", skip.reason);
+                    }
+                    let bars = external.data.bars.into_iter().find(|(k, _)| k.eq_ignore_ascii_case(&ticker)).map(|(_, b)| b).unwrap_or_default();
+                    Ok((bars, format!("Whats-News ({})", external.source)))
+                }
+                _ => {
+                    anyhow::ensure!(!s.sample_mode(), "Native daily research refused: sample / offline display mode");
+                    let (bars, source, _) = native_fetch(s, key, Timeframe::D1, None, 100_000).await?;
+                    Bar::require_verified(&bars, "Native daily research").map_err(anyhow::Error::msg)?;
+                    Ok((bars, format!("{source} (native provider)")))
+                }
+            }
+        }
+    }).await?;
+    let label = receipt.label();
+    Ok((receipt.bars, label))
+}
+
+/// Research reads: daily goes through the archive-first verified source chain
+/// (archive → Whats-News → native provider); intraday is `analysis_bars`.
+/// Chart-facing callers (comparison overlays, Wall Edge, Trend Stack, Tune) keep
+/// using `analysis_bars` so their daily data stays live, like the chart.
+async fn research_history(
+    s: &Shared,
+    symbol: &str,
+    tf: Timeframe,
+    limit: usize,
+    operation: &str,
+) -> anyhow::Result<(Vec<Bar>, tr_data::vault::StitchInfo)> {
+    if tf != Timeframe::D1 {
+        return analysis_bars(s, symbol, tf, limit, operation).await;
+    }
+    if s.sample_mode() {
+        anyhow::bail!("{operation} refused: sample / offline display mode");
+    }
+    let bridge = s.whats_news.borrow().1.bridge();
+    let (bars, source) = research_daily(s, &bridge, symbol).await?;
+    let info = tr_data::vault::StitchInfo { source, fetched_at: Some(chrono::Utc::now().timestamp()), live_ok: true, live_bars: bars.len(), ..Default::default() };
+    Ok((bars, info))
+}
+
 /// Fetch only the provider's ordinary depth, then read a larger local window.
 /// A failed fresh fetch cannot advance the observation clock.
 async fn analysis_bars(
@@ -2326,14 +2380,10 @@ async fn fetch_stack_lane(
     let result = if let Some(bars) = cached_base {
         Ok(bars)
     } else if archive {
-        let ticker = tr_data::whats_news::archive_ticker(symbol);
-        s.history.db(move |db| db.daily(&ticker)).await.map_err(|e| format!("{e:#}")).and_then(|bars| {
-            if bars.is_empty() {
-                return Err("No daily history in the local research archive".into());
-            }
-            Bar::require_verified(&bars, "Trend Stack archive")?;
-            Ok(if tf == Timeframe::D1 { bars } else { tf.resample(&bars) })
-        })
+        let bridge = s.whats_news.borrow().1.bridge();
+        research_daily(s, &bridge, symbol).await.map(|(bars, _)| {
+            if tf == Timeframe::D1 { bars } else { tf.resample(&bars) }
+        }).map_err(|e| format!("{e:#}"))
     } else {
         analysis_bars(s, symbol, tf, 400, "Trend Stack").await.map(|(bars, _)| bars).map_err(|e| format!("{e:#}"))
     };
@@ -2364,8 +2414,7 @@ async fn stack_wall_lane_bars(
     stack_lane_bars(s, symbol, tf, archive, now).await
 }
 
-/// Preserve the chart's pre-existing verified bridge fallback without putting bridge
-/// data into the wall's local-archive cache namespace.
+/// Chart archive lanes use the same accepted daily source chain as the wall.
 async fn stack_chart_lane_bars(
     s: &Shared,
     symbol: &str,
@@ -2373,14 +2422,7 @@ async fn stack_chart_lane_bars(
     archive: bool,
     now: i64,
 ) -> Result<Arc<Vec<Bar>>, String> {
-    let result = stack_lane_bars(s, symbol, tf, archive, now).await;
-    if archive && result.is_err() {
-        let config = s.whats_news.borrow().1.clone();
-        let bars = desk_daily(s, &config.bridge(), symbol).await.map_err(|e| format!("{e:#}"))?;
-        Ok(Arc::new(if tf == Timeframe::D1 { bars } else { tf.resample(&bars) }))
-    } else {
-        result
-    }
+    stack_lane_bars(s, symbol, tf, archive, now).await
 }
 
 type WallEdgeResult = Result<Arc<tr_data::wall_edge::WallEdge>, tr_data::wall_edge::Miss>;
@@ -2882,39 +2924,27 @@ async fn research_scan(
     })
 }
 
-/// Rotation deliberately has no bridge, provider or display-cache path.
+/// Rotation uses the shared verified daily source chain.
 async fn research_rotation(
     s: &Shared,
     query: &tr_data::rotation::RotationQuery,
 ) -> anyhow::Result<tr_data::rotation::RotationReport> {
     let query = query.clone();
-    let limit = tr_data::rotation::fetch_limit(query.cadence);
-    let bench = query.benchmark.clone();
-    let symbols = query.symbols.clone();
-    // Service::db runs SQLite on spawn_blocking; compute stays off the UI thread too.
-    let (benchmark, named) = s
-        .history
-        .db(move |db| {
-            let benchmark = db.daily_window(&bench, None, limit)?;
-            let named = symbols
-                .into_iter()
-                .map(|symbol| {
-                    let bars = db.daily_window(&symbol, None, limit).map_err(|e| format!("{e:#}"));
-                    (symbol, bars)
-                })
-                .collect::<Vec<_>>();
-            Ok((benchmark, named))
-        })
-        .await?;
-    if benchmark.is_empty() {
-        anyhow::bail!(
-            "Rotation refused: no daily history for {} in the local research archive. Sample/display prices are never used.",
-            query.benchmark
-        );
+    let bridge = s.whats_news.borrow().1.bridge();
+    let (benchmark, source) = research_daily(s, &bridge, &query.benchmark).await?;
+    let mut named = Vec::new();
+    let mut sources = vec![format!("{}: {}", query.benchmark, source)];
+    for symbol in &query.symbols {
+        let result = research_daily(s, &bridge, symbol).await.map(|(bars, source)| {
+            sources.push(format!("{symbol}: {source}"));
+            bars
+        }).map_err(|e| format!("{e:#}"));
+        named.push((symbol.clone(), result));
     }
+    let source = sources.join("; ");
     let expected = tr_data::history::calendar::last_expected_session(chrono::Utc::now());
     tokio::task::spawn_blocking(move || {
-        tr_data::rotation::build_report(&benchmark, named, &query, "Local Yahoo daily research archive", expected)
+        tr_data::rotation::build_report(&benchmark, named, &query, &source, expected)
     })
     .await?
     .map_err(anyhow::Error::msg)
@@ -2933,40 +2963,7 @@ async fn research_stats(
     if ticker.is_empty() {
         anyhow::bail!("Statistics refused: invalid security");
     }
-    let wanted = ticker.clone();
-    let local = s.history.db(move |db| db.daily(&wanted)).await?;
-    let mut source = "Local Yahoo daily research archive".to_string();
-    let bars = if !local.is_empty() {
-        tr_data::stats::require_research_bars(&local, "Statistics").map_err(anyhow::Error::msg)?;
-        local
-    } else if bridge.enabled {
-        match bridge.histories_for(std::slice::from_ref(&ticker)).await {
-            Ok(external) => {
-                external.provenance.require_verified("Statistics archive").map_err(anyhow::Error::msg)?;
-                source = format!("{} + {}", source, external.source);
-                if let Some(skip) = external.data.skipped.iter().find(|s| s.symbol.eq_ignore_ascii_case(&ticker)) {
-                    anyhow::bail!("Statistics refused: {}: {}", skip.symbol, skip.reason);
-                }
-                let bars = external
-                    .data
-                    .bars
-                    .into_iter()
-                    .find(|(s, _)| s.eq_ignore_ascii_case(&ticker))
-                    .map(|(_, b)| b)
-                    .unwrap_or_default();
-                tr_data::stats::require_research_bars(&bars, "Statistics").map_err(anyhow::Error::msg)?;
-                bars
-            }
-            Err(e) if tr_data::whats_news::is_unverified(&e) => return Err(e),
-            Err(e) => anyhow::bail!(
-                "Statistics refused: no daily history in the local research archive, and Whats-News is unavailable ({e:#}). Sample/display prices are never used."
-            ),
-        }
-    } else {
-        anyhow::bail!(
-            "Statistics refused: no daily history for {ticker} in the local research archive. Sample/display prices are never used."
-        );
-    };
+    let (bars, source) = research_daily(s, bridge, key).await?;
     let key = tr_data::security(key).key();
     let snapshot = tokio::task::spawn_blocking({
         let condition = condition.to_string();
@@ -3138,40 +3135,7 @@ async fn research_backtest(
     if ticker.is_empty() {
         anyhow::bail!("Backtest refused: invalid security");
     }
-    let wanted = ticker.clone();
-    let local = s.history.db(move |db| db.daily(&wanted)).await?;
-    let mut source = "Local Yahoo daily research archive".to_string();
-    let bars = if !local.is_empty() {
-        Bar::require_verified(&local, "Backtest").map_err(anyhow::Error::msg)?;
-        local
-    } else if bridge.enabled {
-        match bridge.histories_for(std::slice::from_ref(&ticker)).await {
-            Ok(external) => {
-                external.provenance.require_verified("Backtest archive").map_err(anyhow::Error::msg)?;
-                source = format!("{} + {}", source, external.source);
-                if let Some(skip) = external.data.skipped.iter().find(|s| s.symbol.eq_ignore_ascii_case(&ticker)) {
-                    anyhow::bail!("Backtest refused: {}: {}", skip.symbol, skip.reason);
-                }
-                let bars = external
-                    .data
-                    .bars
-                    .into_iter()
-                    .find(|(s, _)| s.eq_ignore_ascii_case(&ticker))
-                    .map(|(_, b)| b)
-                    .unwrap_or_default();
-                Bar::require_verified(&bars, "Backtest").map_err(anyhow::Error::msg)?;
-                bars
-            }
-            Err(e) if tr_data::whats_news::is_unverified(&e) => return Err(e),
-            Err(e) => anyhow::bail!(
-                "Backtest refused: no daily history in the local research archive, and Whats-News is unavailable ({e:#}). Sample/display prices are never used."
-            ),
-        }
-    } else {
-        anyhow::bail!(
-            "Backtest refused: no daily history for {ticker} in the local research archive. Sample/display prices are never used."
-        );
-    };
+    let (bars, source) = research_daily(s, bridge, key).await?;
     let strategies = tr_data::backtest::parse_strategies(spec, allow_short).map_err(anyhow::Error::msg)?;
     let settings = tr_data::backtest::RunSettings {
         holdout_frac: tr_data::backtest::parse_holdout(holdout),
@@ -3184,7 +3148,7 @@ async fn research_backtest(
     let key = tr_data::security(key).key();
     let current = tr_data::backtest_trials::daily_experiments(&settings, honesty);
     let basis = source.clone();
-    let receipt = format!("{} · verified daily archive · observation {}", source, observed);
+    let receipt = format!("{} · verified daily research · observation {}", source, observed);
     let report = honest_cached(
         s,
         key,
@@ -3835,40 +3799,7 @@ async fn research_lookalike(
     if ticker.is_empty() {
         anyhow::bail!("Lookalikes refused: invalid security");
     }
-    let wanted = ticker.clone();
-    let local = s.history.db(move |db| db.daily(&wanted)).await?;
-    let mut source = "Local Yahoo daily research archive".to_string();
-    let bars = if !local.is_empty() {
-        tr_data::lookalike::require_lookalike_bars(&local, "Lookalikes").map_err(anyhow::Error::msg)?;
-        local
-    } else if bridge.enabled {
-        match bridge.histories_for(std::slice::from_ref(&ticker)).await {
-            Ok(external) => {
-                external.provenance.require_verified("Lookalike archive").map_err(anyhow::Error::msg)?;
-                source = format!("{} + {}", source, external.source);
-                if let Some(skip) = external.data.skipped.iter().find(|s| s.symbol.eq_ignore_ascii_case(&ticker)) {
-                    anyhow::bail!("Lookalikes refused: {}: {}", skip.symbol, skip.reason);
-                }
-                let bars = external
-                    .data
-                    .bars
-                    .into_iter()
-                    .find(|(s, _)| s.eq_ignore_ascii_case(&ticker))
-                    .map(|(_, b)| b)
-                    .unwrap_or_default();
-                tr_data::lookalike::require_lookalike_bars(&bars, "Lookalikes").map_err(anyhow::Error::msg)?;
-                bars
-            }
-            Err(e) if tr_data::whats_news::is_unverified(&e) => return Err(e),
-            Err(e) => anyhow::bail!(
-                "Lookalikes refused: no daily history in the local research archive, and Whats-News is unavailable ({e:#}). Sample/display prices are never used."
-            ),
-        }
-    } else {
-        anyhow::bail!(
-            "Lookalikes refused: no daily history for {ticker} in the local research archive. Sample/display prices are never used."
-        );
-    };
+    let (bars, source) = research_daily(s, bridge, key).await?;
     let key = tr_data::security(key).key();
     let report = tokio::task::spawn_blocking({
         let source = source.clone();
@@ -3898,54 +3829,17 @@ async fn research_desk(
         }
         wanted.push((key.clone(), ticker));
     }
-    let tickers: Vec<String> = wanted.iter().map(|(_, t)| t.clone()).collect();
-    let mut local = if tickers.is_empty() {
-        Default::default()
-    } else {
-        s.history.db(move |db| db.histories_for(&tickers)).await?
-    };
-    let mut source = "Local Yahoo daily research archive (watchlist only)".to_string();
-    let mut wn_skipped = vec![];
-    if bridge.enabled && !wanted.is_empty() {
-        let missing: Vec<String> = wanted
-            .iter()
-            .filter(|(_, t)| !local.get(t).is_some_and(|b| !b.is_empty()))
-            .map(|(_, t)| t.clone())
-            .collect();
-        if !missing.is_empty() {
-            match bridge.histories_for(&missing).await {
-                Ok(external) => {
-                    external.provenance.require_verified("PM Desk archive").map_err(anyhow::Error::msg)?;
-                    source.push_str(&format!(" + {}", external.source));
-                    wn_skipped = external.data.skipped;
-                    for (symbol, bars) in external.data.bars {
-                        if !local.get(&symbol).is_some_and(|b| !b.is_empty()) {
-                            local.insert(symbol, bars);
-                        }
-                    }
-                }
-                Err(e) if tr_data::whats_news::is_unverified(&e) => return Err(e),
-                Err(e) => source.push_str(&format!(" · Whats-News unavailable: {e}")),
-            }
-        }
-    } else if !bridge.enabled {
-        source.push_str(" · Whats-News disabled");
-    }
+    let mut sources = Vec::new();
     for (key, ticker) in wanted {
-        if let Some(bars) = local.remove(&ticker) {
-            match MemberRow::from_bars(&key, &ticker, &bars) {
-                Ok(row) => rows.push(row),
-                Err(e) => return Err(anyhow::anyhow!(e)),
+        match research_daily(s, bridge, &key).await {
+            Ok((bars, source)) => {
+                sources.push(format!("{ticker}: {source}"));
+                rows.push(MemberRow::from_bars(&key, &ticker, &bars).map_err(anyhow::Error::msg)?);
             }
-        } else {
-            let reason = wn_skipped
-                .iter()
-                .find(|s| s.symbol == ticker)
-                .map(|s| s.reason.clone())
-                .unwrap_or_else(|| "no daily history in the watchlist-scoped archive read".into());
-            rows.push(MemberRow::skipped(&key, &ticker, tr_core::Provenance::Missing, reason));
+            Err(e) => rows.push(MemberRow::skipped(&key, &ticker, tr_core::Provenance::Missing, format!("{e:#}"))),
         }
     }
+    let source = sources.join("; ");
     tr_data::whats_news::rank_watchlist(&mut rows);
     for row in &rows {
         if row.skip.is_none() {
@@ -4320,7 +4214,13 @@ async fn handle_inner(s: &Arc<Shared>, req: Request, force: bool) {
                             tr_data::cash_session::exchange_zone(&symbol).as_deref(),
                         )?;
                     }
-                    let base = stack_wall_lane_bars(s, &symbol, tf, daily, now).await?;
+                    let (base, receipt) = if daily {
+                        let bridge = s.whats_news.borrow().1.bridge();
+                        let (bars, source) = research_daily(s, &bridge, &symbol).await.map_err(|e| format!("{e:#}"))?;
+                        (Arc::new(bars), Some(source))
+                    } else {
+                        (stack_wall_lane_bars(s, &symbol, tf, false, now).await?, None)
+                    };
                     // Validate before filtering, so a discarded off-session bar cannot hide taint.
                     Bar::require_verified(&base, "Trend Wall")?;
                     let base = if daily { base } else { tr_data::intraday::regular_only(base.as_ref().clone()).into() };
@@ -4331,14 +4231,16 @@ async fn handle_inner(s: &Arc<Shared>, req: Request, force: bool) {
                     for lane_tf in ladder(tf, daily).into_iter().filter(|t| *t != tf) {
                         lanes.push((
                             lane_tf,
-                            stack_wall_lane_bars(s, &symbol, lane_tf, daily, now).await.map(|b| b.as_ref().clone()),
+                            if daily { Ok(lane_tf.resample(&base)) } else { stack_wall_lane_bars(s, &symbol, lane_tf, false, now).await.map(|b| b.as_ref().clone()) },
                         ));
                     }
                     let symbol = symbol.clone();
                     tokio::task::spawn_blocking(move || {
                         let mut stack = trend_stack(&base, tf, lanes, Default::default())?;
                         mark_stack_freshness(&mut stack, tr_data::security(&symbol).class, daily, now);
-                        Ok(tr_data::stack_wall::build_row(&symbol, &stack, &base, now))
+                        let mut row = tr_data::stack_wall::build_row(&symbol, &stack, &base, now);
+                        if let Some(receipt) = receipt { row.note = Some(receipt); }
+                        Ok(row)
                     })
                     .await
                     .map_err(|e| e.to_string())?
@@ -4635,14 +4537,14 @@ async fn handle_inner(s: &Arc<Shared>, req: Request, force: bool) {
                 tr_data::studio_when::WhenSpec::parse(&rule, threshold).map_err(anyhow::Error::msg)?;
                 let (bars, source, observed_at, stitch) = if tf == Timeframe::D1 {
                     let (bars, source) =
-                        crate::app::studio_dist::daily_bars(&s.history, &config.bridge(), &symbol).await?;
+                        research_daily(s, &config.bridge(), &symbol).await?;
                     (bars, source, Some(chrono::Utc::now().timestamp()), None)
                 } else {
                     if !tr_data::cash_session::cash_bar_size(tf) {
                         anyhow::bail!("When: unsupported session interval");
                     }
                     let (bars, info) =
-                        analysis_bars(s, &symbol, tf, tr_data::cash_session::research_fetch_limit(tf), "When").await?;
+                        research_history(s, &symbol, tf, tr_data::cash_session::research_fetch_limit(tf), "When").await?;
                     (bars, info.label(), info.fetched_at, Some(Arc::new(info)))
                 };
                 let input =
@@ -4719,7 +4621,7 @@ async fn handle_inner(s: &Arc<Shared>, req: Request, force: bool) {
                             }
                             if input.tf == Timeframe::D1 {
                                 let (bars, source) =
-                                    crate::app::studio_dist::daily_bars(&s.history, &config.bridge(), &symbol).await?;
+                                    research_daily(s, &config.bridge(), &symbol).await?;
                                 Ok::<_, anyhow::Error>(tr_data::studio_canvas::CanvasInput {
                                     symbol: symbol.clone(),
                                     tf: input.tf,
@@ -4730,7 +4632,7 @@ async fn handle_inner(s: &Arc<Shared>, req: Request, force: bool) {
                                 })
                             } else {
                                 let (bars, info) =
-                                    analysis_bars(s, &symbol, input.tf, default_limit(input.tf), "Quick comparison")
+                                    research_history(s, &symbol, input.tf, default_limit(input.tf), "Quick comparison")
                                         .await?;
                                 let observed_at = info.fetched_at;
                                 Ok(tr_data::studio_canvas::CanvasInput {
@@ -4821,11 +4723,11 @@ async fn handle_inner(s: &Arc<Shared>, req: Request, force: bool) {
                 }
                 let (bars, source, observed_at, gaps) = if timeframe == Timeframe::D1 {
                     let (bars, source) =
-                        crate::app::studio_dist::daily_bars(&s.history, &config.bridge(), &symbol).await?;
+                        research_daily(s, &config.bridge(), &symbol).await?;
                     (bars, source, Some(chrono::Utc::now().timestamp()), Vec::new())
                 } else {
                     let (bars, stitch) =
-                        analysis_bars(s, &symbol, timeframe, default_limit(timeframe), "Distribution Studio").await?;
+                        research_history(s, &symbol, timeframe, default_limit(timeframe), "Distribution Studio").await?;
                     let stale = s.provider.health().is_some_and(|h| {
                         matches!(
                             h.snapshot()[Feed::Bars as usize].state,
@@ -4853,7 +4755,7 @@ async fn handle_inner(s: &Arc<Shared>, req: Request, force: bool) {
                     (bars, info.label(), observed, Some(info))
                 } else {
                     let (bars, source) =
-                        crate::app::studio_dist::daily_bars(&s.history, &config.bridge(), &symbol).await?;
+                        research_daily(s, &config.bridge(), &symbol).await?;
                     (tf.resample(&bars), source, Some(chrono::Utc::now().timestamp()), None)
                 };
                 let reports = s.reports.clone();
@@ -4880,7 +4782,7 @@ async fn handle_inner(s: &Arc<Shared>, req: Request, force: bool) {
                 s.sample_mode(),
                 &symbol,
                 &spec,
-                |key, tf| async move { analysis_bars(s, &key, tf, default_limit(tf), "Relationship Studio").await },
+                |key, tf| async move { research_history(s, &key, tf, default_limit(tf), "Relationship Studio").await },
             )
             .await
             .map_err(|e| format!("{e:#}"));
@@ -4897,7 +4799,7 @@ async fn handle_inner(s: &Arc<Shared>, req: Request, force: bool) {
                 &symbol,
                 tf,
                 &spec,
-                |key, tf| async move { analysis_bars(s, &key, tf, default_limit(tf), "Regression Lab").await },
+                |key, tf| async move { research_history(s, &key, tf, default_limit(tf), "Regression Lab").await },
             )
             .await
             .map_err(|e| format!("{e:#}"));
@@ -4949,7 +4851,7 @@ async fn handle_inner(s: &Arc<Shared>, req: Request, force: bool) {
                 &config.bridge(),
                 s.sample_mode(),
                 &model,
-                |key, tf| async move { analysis_bars(s, &key, tf, default_limit(tf), "Residual ticker").await },
+                |key, tf| async move { research_history(s, &key, tf, default_limit(tf), "Residual ticker").await },
             )
             .await
             .map_err(|e| format!("{e:#}"));
@@ -4995,17 +4897,10 @@ async fn handle_inner(s: &Arc<Shared>, req: Request, force: bool) {
                     anyhow::bail!("SEASON currently requires a US cash-session equity, ETF or index");
                 }
                 let (bars, source, observed, gaps) = if tf == Timeframe::D1 {
-                    let ticker = tr_data::whats_news::archive_ticker(&symbol);
-                    let bars = s.history.db(move |db| db.daily(&ticker)).await?;
-                    let (bars, source) = if bars.is_empty() {
-                        if !config.enabled { anyhow::bail!("Seasonality refused: no daily history in the research archive; sample/display prices are never used"); }
-                        let snapshot = config.bridge().bars(&symbol).await?;
-                        snapshot.provenance.require_verified("Seasonality archive").map_err(anyhow::Error::msg)?;
-                        (snapshot.data, snapshot.source)
-                    } else { (bars, "Local Yahoo daily research archive".into()) };
+                    let (bars, source) = research_daily(s, &config.bridge(), &symbol).await?;
                     (bars, source, chrono::Utc::now().timestamp(), Vec::new())
                 } else {
-                    let (bars, info) = analysis_bars(s, &symbol, tf, tr_data::cash_session::research_fetch_limit(tf), "Seasonality").await?;
+                    let (bars, info) = research_history(s, &symbol, tf, tr_data::cash_session::research_fetch_limit(tf), "Seasonality").await?;
                     // Normalise mixed verified cache/live tags only with the original vault witness.
                     let bars = tr_data::vault::research_bars(&bars, Some(&info)).map_err(anyhow::Error::msg)?.into_owned();
                     // A stale vault must not use wall time to close an observed pending bar.
@@ -7978,7 +7873,7 @@ mod tests {
         assert_eq!(provider.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
     #[tokio::test]
-    async fn trend_wall_daily_never_calls_the_market_provider() {
+    async fn trend_wall_daily_falls_back_to_native_and_prefers_local() {
         let provider =
             Arc::new(StackPrices { calls: Default::default(), name: "fixture", provenance: tr_core::Provenance::Real });
         let (mut s, rx) = shared(provider.clone(), None);
@@ -7987,13 +7882,17 @@ mod tests {
             Arc::new(ArchivePrices),
             tr_data::history::Policy { spacing: Duration::ZERO, ..Default::default() },
         ));
-        // A missing archive must not fall through to a bridge or market provider.
+        s.whats_news.send_replace((0, tr_data::whats_news::Config { enabled: false, ..Default::default() }));
+        // Missing archives recover through the verified native provider.
         let request = wall_request(1, true);
         assert!(begin_request(&s, &request));
         handle(&s, request).await;
         assert!(wall_responses(&rx).iter().any(
-            |r| matches!(r, Response::TrendWallRow { row, .. } if matches!(row.status, LaneStatus::Unavailable(_)))
+            |r| matches!(r, Response::TrendWallRow { row, .. } if row.provenance.is_verified() && row.note.as_ref().is_some_and(|n| n.contains("native provider")))
         ));
+        let native_calls = provider.calls.load(std::sync::atomic::Ordering::SeqCst);
+        assert!(native_calls > 0);
+        s.stack_lanes.lock().unwrap().clear();
         // Seed only through the in-memory DailyHistory fixture; no HTTP in this test.
         s.history.run("ADD", tr_data::history::universe::resolve("AAPL").unwrap(), |_| {}).await.unwrap();
         s.history.run("REFRESH", vec![], |_| {}).await.unwrap();
@@ -8011,7 +7910,7 @@ mod tests {
             row.lanes.iter().map(|l| l.tf).collect::<Vec<_>>(),
             vec![Timeframe::D1, Timeframe::W1, Timeframe::MN1]
         );
-        assert_eq!(provider.calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert_eq!(provider.calls.load(std::sync::atomic::Ordering::SeqCst), native_calls);
     }
     #[tokio::test]
     async fn trend_wall_reuses_stack_lane_cache_with_chart() {
@@ -8647,8 +8546,70 @@ mod tests {
         .await;
         let Response::WhatsNews { response, .. } = rx.try_recv().unwrap() else { panic!("expected envelope") };
         let Response::StudioSeason { result, .. } = *response else { panic!("expected seasonality") };
-        assert!(result.unwrap().source.contains("Local Yahoo"));
+        assert!(result.unwrap().source.contains("Local research archive"));
         assert_eq!(provider.calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn daily_native_keeps_provider_depth_and_canonical_security() {
+        struct DeepDaily;
+        #[async_trait::async_trait]
+        impl tr_data::MarketData for DeepDaily {
+            fn mode(&self) -> DataMode { DataMode::Live }
+            fn name(&self) -> &str { "mock native" }
+            async fn history(&self, symbol: &str, tf: Timeframe, end: Option<i64>, limit: usize) -> anyhow::Result<Vec<Bar>> {
+                assert_eq!(symbol, "SPX Index");
+                assert_eq!(tf, Timeframe::D1);
+                assert!(end.is_none() && limit >= 1200);
+                Ok(stack_fixture(1200, tf, tr_core::Provenance::Real))
+            }
+        }
+        let (s, _) = shared(Arc::new(DeepDaily), None);
+        let bridge = tr_data::whats_news::Config { enabled: false, ..Default::default() }.bridge();
+        let (bars, source) = research_daily(&s, &bridge, "SPX Index").await.unwrap();
+        assert!(bars.len() >= 1199, "provider depth was clipped");
+        assert!(source.contains("mock native (native provider)"));
+    }
+
+    #[tokio::test]
+    async fn daily_native_recovery_reaches_research_reports_without_display_data() {
+        let provider = Arc::new(StackPrices { calls: Default::default(), name: "fixture", provenance: tr_core::Provenance::Real });
+        let (s, _) = shared(provider.clone(), Some(BarCache::open_in_memory().unwrap()));
+        let config = tr_data::whats_news::Config { enabled: false, ..Default::default() };
+        s.whats_news.send_replace((0, config.clone()));
+        let bridge = config.bridge();
+        let (bars, source) = research_daily(&s, &bridge, "SPX Index").await.unwrap();
+        assert!(bars.len() >= 399);
+        assert!(source.contains("native provider") && source.contains("CLOSED THRU"));
+        assert!(source.contains("Local research archive") && source.contains("Whats-News"));
+        let stats = research_stats(&s, &bridge, "SPX Index", "", &[5]).await.unwrap();
+        assert!(stats.stats.source.contains("native provider"));
+        let query = tr_data::rotation::parse_query("AAPL MSFT", &[]).unwrap();
+        let rotation = research_rotation(&s, &query).await.unwrap();
+        assert!(rotation.source.contains("native provider"));
+        assert_eq!(rotation.tracks.len(), 2);
+        let desk = research_desk(&s, &bridge, &["AAPL US Equity".into()]).await.unwrap();
+        assert!(desk.data[0].skip.is_none());
+        assert!(desk.source.contains("CLOSED THRU"));
+        let rows = crate::app::studio_corr::load_rows(
+            &Default::default(), true, &s.history, &bridge, vec!["SPX Index".into()], Timeframe::D1,
+            |key, tf| { let s = &s; async move { research_history(s, &key, tf, 400, "test").await } },
+        ).await;
+        assert!(rows[0].0.error.is_none());
+        assert!(rows[0].0.source.contains("native provider"));
+        assert!(!rows[0].0.source.contains("VAULT"));
+    }
+
+    #[tokio::test]
+    async fn daily_native_rejects_tainted_provider_and_ignores_display_cache() {
+        let provider = Arc::new(StackPrices { calls: Default::default(), name: "fixture", provenance: tr_core::Provenance::Sample });
+        let (s, _) = shared(provider, Some(BarCache::open_in_memory().unwrap()));
+        store_verified_history(&s, "SPX Index", Timeframe::D1, &stack_fixture(400, Timeframe::D1, tr_core::Provenance::Real)).await;
+        let config = tr_data::whats_news::Config { enabled: false, ..Default::default() };
+        let error = research_daily(&s, &config.bridge(), "SPX Index").await.unwrap_err().to_string();
+        for text in ["Local research archive", "Whats-News", "Native provider", "Retry", "Settings > Whats-News"] {
+            assert!(error.contains(text), "{error}");
+        }
     }
 
     #[tokio::test]
@@ -8673,7 +8634,7 @@ mod tests {
         let snap = research_stats(&s, &config.bridge(), "AAPL US Equity", "", &[5]).await.unwrap();
         assert!(snap.stats.provenance.is_verified());
         assert!(snap.conditional.provenance.is_verified());
-        assert!(snap.stats.source.contains("Local Yahoo"));
+        assert!(snap.stats.source.contains("Local research archive"));
         assert_eq!(snap.stats.ticker, "AAPL");
         assert_eq!(snap.conditional.by_horizon[0].baseline.count, snap.stats.bars.saturating_sub(5));
     }
@@ -8730,7 +8691,7 @@ mod tests {
         s.history.run("REFRESH", vec![], |_| {}).await.unwrap();
         let report = research_rotation(&s, &query).await.unwrap();
         assert!(report.provenance.is_verified());
-        assert!(report.source.contains("Local Yahoo"));
+        assert!(report.source.contains("Local research archive"));
         assert_eq!(report.tracks.len(), 2);
         assert_eq!(report.dates.len(), 260);
     }
@@ -8777,7 +8738,7 @@ mod tests {
         s.history.run("REFRESH", vec![], |_| {}).await.unwrap();
         let report = research_lookalike(&s, &config.bridge(), "AAPL US Equity", &query).await.unwrap();
         assert!(report.provenance.is_verified());
-        assert!(report.source.contains("Local Yahoo"));
+        assert!(report.source.contains("Local research archive"));
         assert_eq!(report.ticker, "AAPL");
         assert_eq!(report.by_horizon[0].completed_n + report.by_horizon[0].incomplete_n, report.selected_n);
     }

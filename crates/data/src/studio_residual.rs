@@ -44,6 +44,8 @@ pub enum FitOrigin {
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct SpanDigest {
+    /// 0: legacy response-only span; 1: complete raw dependency span.
+    pub version: u32,
     pub symbol: String,
     pub first_ts: i64,
     pub thru_ts: i64,
@@ -61,7 +63,7 @@ pub fn span_digest(bars: &[Bar], symbol: &str, first_ts: i64, thru_ts: i64) -> S
         n += 1;
     }
     h.write_u64(n as u64);
-    SpanDigest { symbol: symbol.into(), first_ts, thru_ts, n_bars: n, digest: h.finish() }
+    SpanDigest { version: 1, symbol: symbol.into(), first_ts, thru_ts, n_bars: n, digest: h.finish() }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -306,6 +308,10 @@ impl FrozenFit {
             write_receipt(&mut h, r);
         }
         for s in &self.span_digests {
+            if s.version != 0 {
+                h.write_str("raw-span-version");
+                h.write_u64(s.version as u64);
+            }
             h.write_str(&s.symbol);
             h.write_i64(s.first_ts);
             h.write_i64(s.thru_ts);
@@ -432,7 +438,7 @@ impl FrozenFit {
 /// `"{source} · VAULT n + LIVE m bars · … holes · … missing · {note}"`, whose counts and notes change
 /// whenever a bar arrives; only the leading provider name is identity.
 pub fn source_identity(label: &str) -> &str {
-    label.split(" · VAULT ").next().unwrap_or(label).trim()
+    label.split(" · VAULT ").next().unwrap_or(label).split(" · CLOSED THRU ").next().unwrap_or(label).trim()
 }
 
 fn valid_slug(s: &str) -> bool {
@@ -738,9 +744,20 @@ impl ResidSegment {
     }
 }
 
+/// Raw-bar bounds of one input's training dependencies, never panicking on gaps.
+/// `first` is the last bar at or before `start` (as-of alignment reads it), so a
+/// revision to any bar a design row could depend on stays inside the digest.
+pub fn dependency_bounds(bars: &[Bar], start: i64, end: i64, daily: bool) -> (i64, i64) {
+    let key = |ts: i64| if daily { ts.div_euclid(86_400) } else { ts };
+    let first = bars.iter().take_while(|b| key(b.ts) <= key(start)).last().or(bars.first()).map_or(start, |b| b.ts);
+    let thru = bars.iter().take_while(|b| key(b.ts) <= key(end)).last().map_or(end, |b| b.ts).max(first);
+    (first, thru)
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum InputCheck {
     Unchanged,
+    PartialCoverage,
     Revised { live: u64, saved: u64 },
     NotCovered { live_first_ts: i64 },
     SourceChanged { saved: String, live: String },
@@ -881,7 +898,7 @@ pub fn score_key(
     }
     h.write_str(source);
     h.write_str(&format!("daily={daily} closed_thru={closed_thru} {METHOD} max_points={MAX_POINTS}"));
-    let mut key = ReportKey::new("studio_resid_v1", &target.symbol, fit.model.tf, source, &target.bars, METHOD);
+    let mut key = ReportKey::new("studio_resid_v2", &target.symbol, fit.model.tf, source, &target.bars, METHOD);
     key.params = h.finish();
     key
 }
@@ -1016,6 +1033,8 @@ pub fn score(
                 InputCheck::Revised { live: live.digest, saved: saved.digest }
             } else if source_identity(&row.source) != source_identity(&receipt.source) {
                 InputCheck::SourceChanged { saved: receipt.source.clone(), live: row.source.clone() }
+            } else if saved.version != 1 {
+                InputCheck::PartialCoverage
             } else {
                 InputCheck::Unchanged
             };

@@ -353,6 +353,10 @@ fn validate(bars: &[Bar]) -> Result<(), Failure> {
         if b.provenance != Provenance::Real {
             return Err(Failure::new(FailureKind::Rejected, "sample, cached or unverified downloads are refused"));
         }
+        if !crate::stats::supported_archive_timestamp(b.ts) {
+            return Err(Failure::new(FailureKind::Rejected,
+                "invalid archive date; supported calendar years are 0001–9999. Repair or reimport this history"));
+        }
         if ![b.open, b.high, b.low, b.close, b.volume].iter().all(|v| v.is_finite())
             || b.open <= 0.0
             || b.close <= 0.0
@@ -511,9 +515,11 @@ impl Service {
             }
         };
         let start = old.last().map(|b| {
-            chrono::DateTime::from_timestamp(b.ts, 0).unwrap().date_naive()
-                - chrono::Duration::days(self.policy.overlap_days.max(1))
-        });
+            chrono::DateTime::from_timestamp(b.ts, 0)
+                .and_then(|dt| chrono::Duration::try_days(self.policy.overlap_days.max(1))
+                    .and_then(|overlap| dt.date_naive().checked_sub_signed(overlap)))
+                .ok_or_else(|| anyhow::anyhow!("Invalid archive date or refresh overlap for {symbol}; repair the archive or reduce overlap days"))
+        }).transpose()?;
         let result = async {
             let mut bars = self.fetch(&symbol, start, &cancel).await?;
             let mut replace = start.is_none();
@@ -807,11 +813,28 @@ mod tests {
         }
         let mut archive = Archive::memory().unwrap();
         archive.add(&symbols("AAPL")).unwrap();
+        let invalid_date = Bar { ts: (i64::MAX / 86_400) * 86_400, ..b("2026-09-08", 10.0) };
+        assert!(archive.store("AAPL", &[invalid_date.clone()], true).unwrap_err().to_string().contains("date"));
+        assert!(crate::stats::require_research_bars(&[invalid_date], "test").unwrap_err().contains("timestamp"));
         let invalid = Bar { volume: f64::NAN, ..b("2026-09-08", 10.0) };
         assert!(archive.store("AAPL", &[invalid], true).is_err());
         assert!(archive.store("AAPL", &[], true).is_err());
         assert!(archive.daily("AAPL").unwrap().is_empty());
     }
+    #[tokio::test]
+    async fn corrupt_archived_timestamp_is_rejected_before_refresh() {
+        let mut archive = Archive::memory().unwrap();
+        archive.add(&symbols("AAPL")).unwrap();
+        let ts = (i64::MAX / 86_400) * 86_400;
+        archive.conn.execute("INSERT INTO history_daily VALUES('AAPL',?,10,12,9,11,10,'yahoo','Real')", [ts]).unwrap();
+        assert!(archive.daily("AAPL").unwrap_err().to_string().contains("date"));
+        let provider = Mock::new(vec![]);
+        let service = Service::new(archive, provider.clone(), policy());
+        service.run("REFRESH", vec![], |_| {}).await.unwrap();
+        assert!(provider.calls.lock().unwrap().is_empty());
+        assert!(service.status().await.unwrap().entries[0].error.as_ref().unwrap().contains("Rejected archived data"));
+    }
+
     struct Blocking {
         started: tokio::sync::Notify,
         calls: std::sync::atomic::AtomicUsize,

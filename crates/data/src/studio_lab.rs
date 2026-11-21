@@ -942,7 +942,17 @@ pub fn compute(
     report.train_residual_mean = fit.residuals.iter().sum::<f64>() / n_train as f64;
     report.train_span_digests = std::iter::once(target)
         .chain(factors)
-        .map(|r| crate::studio_residual::span_digest(&r.bars, &r.symbol, design.ts[0], design.ts[n_train - 1]))
+        .enumerate()
+        .map(|(i, r)| {
+            let (transform, lag) = if i == 0 { (spec.target, 0) } else {
+                (spec.factors[i - 1].transform, spec.factors[i - 1].lag)
+            };
+            let lookback = if transform.is_level() { 0 } else { transform.horizon() };
+            let start = target.bars[design.bar[0].saturating_sub(lag + lookback)].ts;
+            let end = target.bars[design.bar[n_train - 1].saturating_sub(lag)].ts;
+            let (first, thru) = crate::studio_residual::dependency_bounds(&r.bars, start, end, daily);
+            crate::studio_residual::span_digest(&r.bars, &r.symbol, first, thru)
+        })
         .collect();
     // Frozen scoring of every row, in target space.
     let predict = |i: usize| beta[0] + (0..beta.len() - 1).map(|j| beta[j + 1] * design.x[j][i]).sum::<f64>();
@@ -1017,7 +1027,7 @@ pub fn cache_key(
     h.write_str(&spec.key_string());
     h.write_str(&format!("daily={daily} observed={observed_at:?} closed_thru={closed_thru} {METHOD_SCHEMA}"));
     let mut key =
-        crate::report_cache::ReportKey::new("studio_lab_v1", &target.symbol, tf, source, &target.bars, MODEL_NOTE);
+        crate::report_cache::ReportKey::new("studio_lab_v2", &target.symbol, tf, source, &target.bars, MODEL_NOTE);
     key.params = h.finish();
     key
 }

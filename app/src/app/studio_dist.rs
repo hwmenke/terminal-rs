@@ -194,43 +194,6 @@ impl DistPane {
     }
 }
 
-/// Same archive-first policy as STATS. Called only by the background worker.
-pub(crate) async fn daily_bars(
-    history: &tr_data::history::Service,
-    bridge: &tr_data::whats_news::Bridge,
-    key: &str,
-) -> anyhow::Result<(Vec<Bar>, String)> {
-    let ticker = tr_data::whats_news::archive_ticker(key);
-    if ticker.is_empty() {
-        anyhow::bail!("Distribution Studio refused: invalid security");
-    }
-    let wanted = ticker.clone();
-    let local = history.db(move |db| db.daily(&wanted)).await?;
-    if !local.is_empty() {
-        tr_data::stats::require_research_bars(&local, "Distribution Studio").map_err(anyhow::Error::msg)?;
-        return Ok((local, "Local Yahoo daily research archive".into()));
-    }
-    if !bridge.enabled {
-        anyhow::bail!(
-            "Distribution Studio: no verified daily history for {ticker} in the research archive. Sample/display prices are never used."
-        );
-    }
-    let external = bridge.histories_for(std::slice::from_ref(&ticker)).await?;
-    external.provenance.require_verified("Distribution Studio archive").map_err(anyhow::Error::msg)?;
-    if let Some(skip) = external.data.skipped.iter().find(|s| s.symbol.eq_ignore_ascii_case(&ticker)) {
-        anyhow::bail!("Distribution Studio refused: {}: {}", skip.symbol, skip.reason);
-    }
-    let bars = external
-        .data
-        .bars
-        .into_iter()
-        .find(|(s, _)| s.eq_ignore_ascii_case(&ticker))
-        .map(|(_, b)| b)
-        .unwrap_or_default();
-    tr_data::stats::require_research_bars(&bars, "Distribution Studio").map_err(anyhow::Error::msg)?;
-    Ok((bars, external.source))
-}
-
 pub(crate) async fn build_report(
     symbol: String,
     bars: Vec<Bar>,
