@@ -623,3 +623,62 @@ fn residual_validate_rejects_inconsistent_bookkeeping() {
         "stored > MAX",
     );
 }
+
+#[test]
+fn residual_covariance_saved_and_digest_compatible() {
+    // Lab: four entries, equal to the Lab's own covariances.
+    let (r, _, _) = lab_report(500);
+    let fit = freeze_lab(&r, None, None, 1).unwrap();
+    assert_eq!(fit.coef_covariance.len(), 4);
+    for (c, i) in fit.coef_covariance.iter().zip(&r.inference) {
+        assert_eq!(c, &i.covariance);
+    }
+    assert!(fit.coef_covariance.iter().any(|c| c.covariance.is_some()));
+    // Relate: the fit's single covariance.
+    let (a, b) = related(500, 0.9, 13);
+    let opts = Options { annual_periods: 252., daily: true };
+    let rows = [a.clone(), b.clone()];
+    let mut corr = compute_series_at_horizon(&a, &b, &rows, opts, "src", 1).unwrap();
+    let spec = RelateSpec::new(F1, Transform::LogReturn { h: 1 });
+    corr.relate = Some(Box::new(compute_relate(&a, &b, &rows, opts, Timeframe::D1, &spec, "src", 0, None, 1).unwrap()));
+    let rf = freeze_relate(&corr, Timeframe::D1, None, Some(40), 1).unwrap();
+    assert_eq!(rf.coef_covariance.len(), 1);
+    assert_eq!(rf.coef_covariance[0], corr.relate.as_ref().unwrap().fit.as_ref().unwrap().covariance);
+    // A model saved before slice 7 (no `coef_covariance` key) keeps exactly its digest.
+    let mut old = fit.clone();
+    old.coef_covariance.clear();
+    old.content_digest = old.compute_digest();
+    let mut v = serde_json::to_value(&old).unwrap();
+    v.as_object_mut().unwrap().remove("coef_covariance").expect("key serialised");
+    let back: FrozenFit = serde_json::from_value(v).unwrap();
+    assert!(back.coef_covariance.is_empty());
+    back.validate().unwrap();
+    assert_eq!(back.content_digest, old.content_digest);
+    assert_ne!(old.content_digest, fit.content_digest, "stored covariance enters the digest");
+    // One ULP in a stored matrix changes the digest.
+    let mut edited = fit.clone();
+    let m = edited.coef_covariance[0].covariance.as_mut().unwrap();
+    m[1][1] = f64::from_bits(m[1][1].to_bits() + 1);
+    assert_ne!(edited.compute_digest(), fit.content_digest);
+    assert!(edited.validate().unwrap_err().contains("digest"));
+    // validate rejects bad shapes, asymmetry, non-finite values and the wrong count.
+    let bad = |f: &dyn Fn(&mut FrozenFit)| {
+        let mut x = fit.clone();
+        f(&mut x);
+        x.content_digest = x.compute_digest();
+        x.validate().unwrap_err()
+    };
+    assert!(bad(&|x| {
+        x.coef_covariance[0].covariance.as_mut().unwrap().pop();
+    })
+    .contains("k×k"));
+    assert!(bad(&|x| x.coef_covariance[1].covariance.as_mut().unwrap()[0].push(0.)).contains("k×k"));
+    assert!(bad(&|x| x.coef_covariance[2].covariance.as_mut().unwrap()[0][1] = f64::NAN).contains("k×k"));
+    assert!(bad(&|x| x.coef_covariance[2].covariance.as_mut().unwrap()[0][1] = 1e3).contains("symmetric"));
+    assert!(bad(&|x| x.coef_covariance[3].covariance.as_mut().unwrap()[1][1] = -1.).contains("negative"));
+    assert!(bad(&|x| {
+        x.coef_covariance.pop();
+    })
+    .contains("count"));
+    assert!(bad(&|x| x.model.origin = FitOrigin::Relate).contains("count"));
+}

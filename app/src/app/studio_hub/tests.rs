@@ -65,11 +65,11 @@ fn studio_legacy_commands_preserved() {
         tr_data::studio::StudioRoute::Attr,
     ] {
         assert_eq!(command::parse(&format!("STUDIO {}", r.code())), Some(Command::Function(Function::StudioRoute(r))));
-        // LAB (slice 5) and RESID (slice 6) are built; ATTR still explains why it is unavailable.
+        // LAB (slice 5), RESID (slice 6) and ATTR (slice 7) are built.
         let want = match r {
             tr_data::studio::StudioRoute::Lab => "Regression Lab",
             tr_data::studio::StudioRoute::Resid => "Residual",
-            _ => "unavailable",
+            _ => "Attribution",
         };
         assert!(r.reason().contains(want), "{r:?}");
     }

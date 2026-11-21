@@ -89,7 +89,7 @@ impl StudioRoute {
                 "Residual tickers · frozen fit scored on live data, never refit · STUDIO resid open <id>"
             }
             Self::Attr => {
-                "ATTR is unavailable: move attribution and actual = intercept + factors + residual reconciliation have not been implemented."
+                "Attribution · actual = drift + factor contributions + residual from a saved frozen model, never refit · STUDIO attr model=<id> obs=20"
             }
         }
     }

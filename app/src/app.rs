@@ -43,6 +43,7 @@ pub(crate) mod studio_dist;
 pub(crate) mod studio_frame;
 pub(crate) mod studio_hub;
 pub(crate) mod studio_lab;
+pub(crate) mod studio_attribution;
 pub(crate) mod studio_residual;
 pub(crate) mod studio_when;
 #[cfg(test)]
@@ -124,6 +125,8 @@ pub enum PaneKind {
     /// Historical risk/return and conditional forward returns (`STATS` / `COND`).
     Stats(Box<stats::StatsPane>),
     Studio(Box<studio_hub::StudioPane>),
+    /// Legacy route placeholder; every route (QUICK, LAB, RESID, ATTR) now opens a real pane.
+    #[allow(dead_code)]
     StudioRoute(tr_data::studio::StudioRoute),
     StudioDist(Box<studio_dist::DistPane>),
     StudioCorr(Box<studio_corr::CorrPane>),
@@ -131,6 +134,8 @@ pub enum PaneKind {
     StudioLab(Box<studio_lab::LabPane>),
     /// Frozen residual ticker (`STUDIO resid open <id>`, `NEW RESID`); bare `RESID` stays a ticker.
     StudioResid(Box<studio_residual::ResidPane>),
+    /// Factor attribution of a saved model (`STUDIO attr`, `NEW ATTR`); bare `ATTR` stays a ticker.
+    StudioAttr(Box<studio_attribution::AttrPane>),
     TstackTune(Box<tstack_tune::TunePane>),
     StudioSeason(Box<studio_season::SeasonPane>),
     /// Strategy vs buy-and-hold paper backtest (`BACKTEST` / `BT`).
@@ -413,6 +418,9 @@ impl PaneKind {
             PaneKind::StudioResid(s) => {
                 if s.model_id.is_empty() { "Residual".into() } else { format!("{} Residual", s.model_id) }
             }
+            PaneKind::StudioAttr(s) => {
+                if s.model_id.is_empty() { "Attribution".into() } else { format!("{} Attribution", s.model_id) }
+            }
             PaneKind::StudioSeason(s) => {
                 if s.symbol.trim().is_empty() {
                     "Seasonality".into()
@@ -555,6 +563,7 @@ impl PaneKind {
             PaneKind::StudioCorr(_) => "CORR",
             PaneKind::StudioLab(_) => "LAB",
             PaneKind::StudioResid(_) => "RESID",
+            PaneKind::StudioAttr(_) => "ATTR",
             PaneKind::TstackTune(_) => "TUNE",
             PaneKind::StudioSeason(_) => "SEASON",
             PaneKind::Backtest(b) if b.intraday => "IBT",
@@ -718,6 +727,10 @@ impl PaneKind {
                 PaneSettings::StudioLab { symbol: s.symbol.clone(), tf: s.tf, spec }
             }
             PaneKind::StudioResid(s) => PaneSettings::StudioResid { model_id: s.model_id.clone() },
+            PaneKind::StudioAttr(s) => PaneSettings::StudioAttr {
+                model_id: s.model_id.clone(),
+                window: s.window.words(s.is_daily()),
+            },
             PaneKind::StudioSeason(s) => PaneSettings::StudioSeason { symbol: s.symbol.clone(), spec: s.spec.clone() },
             PaneKind::Stats(s) => PaneSettings::Stats {
                 symbol: s.symbol.clone(),
@@ -913,7 +926,14 @@ impl PaneKind {
             PaneSettings::StudioRoute { route: tr_data::studio::StudioRoute::Resid } => {
                 PaneKind::StudioResid(Box::new(studio_residual::ResidPane::new(String::new())))
             }
-            PaneSettings::StudioRoute { route } => PaneKind::StudioRoute(route),
+            // A saved ATTR route restores as an empty attribution pane (the model list).
+            PaneSettings::StudioRoute { route: tr_data::studio::StudioRoute::Attr } => {
+                PaneKind::StudioAttr(Box::new(studio_attribution::AttrPane::new(String::new())))
+            }
+            // Invalid id or window words restore as an empty pane / the default window.
+            PaneSettings::StudioAttr { model_id, window } => {
+                PaneKind::StudioAttr(Box::new(studio_attribution::AttrPane::restore(&model_id, &window)))
+            }
             // Only the id is saved; an invalid id restores as an empty pane rather than a bad path.
             PaneSettings::StudioResid { model_id } => PaneKind::StudioResid(Box::new(studio_residual::ResidPane::new(
                 if tr_data::studio_residual::valid_id(&model_id) { model_id } else { String::new() },
@@ -1631,7 +1651,8 @@ impl TerminalApp {
             Command::SymbolFunction(s, Function::StudioLab { spec }) => self.open_lab(Some(&s), &spec),
             Command::SymbolFunction(_, Function::StudioRoute(tr_data::studio::StudioRoute::Resid)) => self.open_resid(""),
             Command::SymbolFunction(_, Function::StudioResid { spec }) => self.open_resid(&spec),
-            Command::SymbolFunction(_, Function::StudioRoute(route)) => self.open_panel(PaneKind::StudioRoute(route)),
+            Command::SymbolFunction(_, Function::StudioRoute(tr_data::studio::StudioRoute::Attr)) => self.open_attr(""),
+            Command::SymbolFunction(_, Function::StudioAttr { spec }) => self.open_attr(&spec),
             Command::SymbolFunction(s, Function::StudioDistHorizon(h)) => self.set_shape_horizon(Some(&s), h),
             Command::SymbolFunction(s, Function::StudioDist { timeframe }) => {
                 self.open_studio_dist(Some(&s), timeframe)
@@ -1918,7 +1939,8 @@ impl TerminalApp {
             Function::StudioLab { spec } => self.open_lab(symbol.as_deref(), &spec),
             Function::StudioRoute(tr_data::studio::StudioRoute::Resid) => self.open_resid(""),
             Function::StudioResid { spec } => self.open_resid(&spec),
-            Function::StudioRoute(route) => self.open_panel(PaneKind::StudioRoute(route)),
+            Function::StudioRoute(tr_data::studio::StudioRoute::Attr) => self.open_attr(""),
+            Function::StudioAttr { spec } => self.open_attr(&spec),
             Function::StudioCorr { spec } => self.open_studio_corr(symbol.as_deref(), &spec),
             Function::StudioSeason { spec } => self.open_studio_season(symbol.as_deref(), &spec),
             Function::Stats { condition, conditional } => self.open_stats(symbol.as_deref(), &condition, conditional),
@@ -2070,6 +2092,7 @@ impl TerminalApp {
                                 s.request(pane.id, &self.worker)
                             }
                             PaneKind::StudioResid(s) if s.model.is_some() => s.reload(),
+                            PaneKind::StudioAttr(s) if s.model.is_some() => s.reload(),
                             PaneKind::StudioSeason(s) => s.request(pane.id, &self.worker),
                             PaneKind::Backtest(b) => b.request(pane.id, &self.worker),
                             PaneKind::Lookalike(l) => l.request(pane.id, &self.worker),
@@ -2180,18 +2203,29 @@ impl TerminalApp {
                 }
                 Response::StudioFitSaved { pane, token, result } => self.on_fit_saved(pane, token, result),
                 Response::StudioFitList { pane, token, result } => {
-                    if let Some(PaneKind::StudioResid(s)) = self.panes.iter_mut().find(|p| p.id == pane).map(|p| &mut p.kind) {
-                        s.accept_list(token, result);
+                    match self.panes.iter_mut().find(|p| p.id == pane).map(|p| &mut p.kind) {
+                        Some(PaneKind::StudioResid(s)) => s.accept_list(token, result),
+                        Some(PaneKind::StudioAttr(s)) => s.accept_list(token, result),
+                        _ => {}
                     }
                 }
                 Response::StudioFitLoaded { pane, token, id, result } => {
-                    if let Some(PaneKind::StudioResid(s)) = self.panes.iter_mut().find(|p| p.id == pane).map(|p| &mut p.kind) {
-                        s.accept_loaded(token, &id, result);
+                    match self.panes.iter_mut().find(|p| p.id == pane).map(|p| &mut p.kind) {
+                        Some(PaneKind::StudioResid(s)) => s.accept_loaded(token, &id, result),
+                        Some(PaneKind::StudioAttr(s)) => s.accept_loaded(token, &id, result),
+                        _ => {}
                     }
                 }
                 Response::StudioResidualScored { pane, token, model_digest, result } => {
-                    if let Some(PaneKind::StudioResid(s)) = self.panes.iter_mut().find(|p| p.id == pane).map(|p| &mut p.kind) {
-                        s.accept_scored(token, model_digest, result);
+                    match self.panes.iter_mut().find(|p| p.id == pane).map(|p| &mut p.kind) {
+                        Some(PaneKind::StudioResid(s)) => s.accept_scored(token, model_digest, result),
+                        Some(PaneKind::StudioAttr(s)) => s.accept_scored(token, model_digest, result),
+                        _ => {}
+                    }
+                }
+                Response::StudioAttributed { pane, token, model_digest, score_key, window, result } => {
+                    if let Some(PaneKind::StudioAttr(s)) = self.panes.iter_mut().find(|p| p.id == pane).map(|p| &mut p.kind) {
+                        s.accept_attributed(token, model_digest, score_key, &window, result);
                     }
                 }
                 Response::StudioResidualChecked { pane, token, model_digest, score_key, result } => {

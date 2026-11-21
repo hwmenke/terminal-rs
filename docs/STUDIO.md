@@ -19,8 +19,8 @@ Legacy DIST/RDIST (including Shape), CORR/RBETA, SEASON/SSN, STATS/COND and
 BACKTEST/IBT commands keep their standalone panes and numerical conventions.
 QUICK opens the full [time canvas](STUDIO_CANVAS.md), with five comparison modes,
 an exact base, strip, dated lanes and a release-committed brush. `STUDIO LAB` and `STUDIO resid` (see [STUDIO_RESIDUAL.md](STUDIO_RESIDUAL.md)) are available;
-`STUDIO ATTR` remains a named unavailable route (the bare words are
-listed tickers and load them). Build explains that derived operations are
+`STUDIO attr` opens factor attribution ([STUDIO_ATTRIBUTION.md](STUDIO_ATTRIBUTION.md); the bare words
+`LAB`, `RESID` and `ATTR` are listed tickers and load them). Build explains that derived operations are
 unavailable; About describes the composition and snapshot limits.
 
 Alt+Left / Alt+Right cycles the supported lenses in the focused Studio; the rail
@@ -68,7 +68,7 @@ second-stage report keys remain the original implementations. See
 Relate (slice 4) adds strict fixed-bar transforms, expanding β, a common-panel matrix and a
 frozen-training fair-value overlay with residual ±σ bands on the native chart (`RELATE`,
 `STUDIO lens=relate transform=logreturn h=5`; never in Quick-canvas mode). Bare `LAB`,
-`RESID` and `ATTR` load their tickers; `STUDIO resid` opens residual tickers, `STUDIO attr` is an unavailable route.
+`RESID` and `ATTR` load their tickers; `STUDIO resid` opens residual tickers, `STUDIO attr [model=<id> obs=N]` opens factor attribution.
 See [Relate](STUDIO_CORR.md).
 
 The Regression Lab (slice 5) is a standalone pane reached with `STUDIO lab …` (it is not a sixth

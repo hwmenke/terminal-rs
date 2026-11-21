@@ -685,6 +685,6 @@ adjusts the focused Studio. See [Relate](docs/STUDIO_CORR.md).
 `NEW LAB`) opens the Regression Lab: up to seven factors with per-factor transform and lag, pivoted-QR OLS with
 rank/κ guards, Classical/HC3/HAC covariances, a purged frozen holdout (R²_OOS), VIF and residual diagnostics on
 verified data only; bare `LAB` is still the LAB ticker. See [Regression Lab](docs/STUDIO_LAB.md).
-`STUDIO resid` opens frozen residual tickers (`docs/STUDIO_RESIDUAL.md`); `STUDIO ATTR` remains an unavailable route (bare `RESID` / `ATTR` load their tickers). Legacy standalone research commands stay
+`STUDIO resid` opens frozen residual tickers (`docs/STUDIO_RESIDUAL.md`); `STUDIO attr model=<id> obs=20` splits a window's move into drift + factor contributions + residual from a saved model (`docs/STUDIO_ATTRIBUTION.md`; bare `RESID` / `ATTR` load their tickers). Legacy standalone research commands stay
 available. See [Studio shell](docs/STUDIO.md) for selection, data and persistence
 limits.

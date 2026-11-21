@@ -272,6 +272,14 @@ fn resid_verb(rest: &[&str]) -> bool {
             || w.get(..5).is_some_and(|p| p.eq_ignore_ascii_case("name="))
     })
 }
+/// True when the words after `ATTR` start with `model=`, `obs=`, `from=` or `to=`. `ATTR 1h`,
+/// `ATTR DIST` and `ATTR US Equity` stay tickers.
+fn attr_key_word(rest: &[&str]) -> bool {
+    rest.first().is_some_and(|w| {
+        let w = w.to_ascii_lowercase();
+        ["model=", "obs=", "from=", "to="].iter().any(|k| w.starts_with(k))
+    })
+}
 fn parse_vault(rest: &[&str]) -> Option<VaultCmd> {
     if rest.first().is_some_and(|s| s.eq_ignore_ascii_case("DROP")) {
         let (sec, used) = Security::resolve_tokens(&rest[1..])?;
@@ -470,6 +478,10 @@ pub enum Function {
     },
     /// Frozen residual tickers: the words after `STUDIO resid` / `RESID` (`save`, `open`, `check`).
     StudioResid {
+        spec: String,
+    },
+    /// Factor attribution of a saved model: the words after `STUDIO attr` (`model=`, `obs=`, `from=`, `to=`).
+    StudioAttr {
         spec: String,
     },
     DistributionStrip,
@@ -962,8 +974,22 @@ fn parse_function(head: &str, rest: &[&str]) -> Option<Function> {
                 tr_data::studio_residual::ResidArgs::parse(&tail).ok()?;
                 return Some(Function::StudioResid { spec: tail });
             }
+            // `attr <words>` and the `screen=attribution` alias (exact first word) also precede `parse_studio`.
+            if rest.first().is_some_and(|w| w.eq_ignore_ascii_case("attr")) && rest.len() > 1 {
+                let tail = rest[1..].join(" ");
+                tr_data::studio_attribution::AttrArgs::parse(&tail).ok()?;
+                return Some(Function::StudioAttr { spec: tail });
+            }
+            if rest.first().is_some_and(|w| w.eq_ignore_ascii_case("screen=attribution")) {
+                let tail = rest[1..].join(" ");
+                if tail.is_empty() {
+                    return Some(Function::StudioRoute(tr_data::studio::StudioRoute::Attr));
+                }
+                tr_data::studio_attribution::AttrArgs::parse(&tail).ok()?;
+                return Some(Function::StudioAttr { spec: tail });
+            }
             let spec = joined();
-            // LAB / RESID / ATTR are listed tickers, so their unavailable routes live behind STUDIO.
+            // LAB / RESID / ATTR are listed tickers, so their routes live behind STUDIO.
             let route = match spec.to_ascii_lowercase().as_str() {
                 "lab" => Some(tr_data::studio::StudioRoute::Lab),
                 "resid" => Some(tr_data::studio::StudioRoute::Resid),
@@ -982,6 +1008,12 @@ fn parse_function(head: &str, rest: &[&str]) -> Option<Function> {
             let spec = joined();
             tr_data::studio_residual::ResidArgs::parse(&spec).ok()?;
             Function::StudioResid { spec }
+        }
+        // ATTR is a listed ticker: only a leading `model=|obs=|from=|to=` word makes a command.
+        "ATTR" if attr_key_word(rest) => {
+            let spec = joined();
+            tr_data::studio_attribution::AttrArgs::parse(&spec).ok()?;
+            Function::StudioAttr { spec }
         }
         "WHEN" => {
             let spec = joined();
@@ -1128,6 +1160,10 @@ pub fn parse(input: &str) -> Option<Command> {
         }
         // A RESID verb with bad arguments is an error, never the ticker.
         if head.eq_ignore_ascii_case("RESID") && resid_verb(rest) {
+            return None;
+        }
+        // Likewise an ATTR key word with bad arguments.
+        if head.eq_ignore_ascii_case("ATTR") && attr_key_word(rest) {
             return None;
         }
     }
@@ -1337,6 +1373,7 @@ fn describe(f: &Function) -> String {
         Function::Studio { spec } => format!("Studio · native canvas and named lenses · {spec}"),
         Function::StudioLab { spec } => format!("Regression Lab · multi-factor OLS, purged holdout, HAC · {spec}"),
         Function::StudioResid { spec } => format!("Residual tickers · frozen fit scored on live data, never refit · {spec}"),
+        Function::StudioAttr { spec } => format!("Attribution · actual = drift + factors + residual, frozen fit never refit · {spec}"),
         Function::StudioWhen { spec } => format!("When · fixed-family within-clock rule evidence · {spec}"),
         Function::StudioRelate { spec } => {
             format!("Relate · transforms, β and frozen-fit fair-value bands · {spec}")
@@ -2459,6 +2496,40 @@ mod tests {
             "STUDIO resid save monitor=5",
             "STUDIO resid frob",
         ] {
+            assert_eq!(parse(bad), None, "{bad}");
+        }
+    }
+
+    #[test]
+    fn attr_command_grammar_keeps_ticker() {
+        use tr_data::studio::StudioRoute;
+        // The bare word and every non-key form still load the ticker.
+        assert_eq!(parse("ATTR"), Some(Command::Symbol("ATTR US Equity".into())));
+        assert_eq!(parse("ATTR US Equity"), Some(Command::Symbol("ATTR US Equity".into())));
+        assert_eq!(
+            parse("ATTR 1h"),
+            Some(Command::SymbolFunction("ATTR US Equity".into(), Function::Timeframe(Timeframe::H1)))
+        );
+        assert!(!matches!(parse("ATTR DIST"), Some(Command::Function(Function::StudioAttr { .. }))));
+        // Canonical and routes.
+        for s in ["STUDIO attr", "STUDIO ATTR", "STUDIO screen=attribution"] {
+            assert_eq!(parse(s), Some(Command::Function(Function::StudioRoute(StudioRoute::Attr))), "{s}");
+        }
+        assert_eq!(
+            parse("STUDIO attr model=AAPL-v-SPY-v1 obs=20"),
+            Some(Command::Function(Function::StudioAttr { spec: "model=AAPL-v-SPY-v1 obs=20".into() }))
+        );
+        for ok in [
+            "STUDIO screen=attribution obs=5",
+            "ATTR model=AAPL-v-SPY-v1",
+            "attr obs=5",
+            "ATTR from=2026-03-02 to=2026-03-20",
+            "STUDIO attr to=2026-03-02T14:30",
+        ] {
+            assert!(matches!(parse(ok), Some(Command::Function(Function::StudioAttr { .. }))), "{ok}");
+        }
+        // A key word with bad arguments is an error, never the ticker.
+        for bad in ["ATTR model=../x", "ATTR obs=0", "ATTR obs=5 from=2026-03-02", "STUDIO attr bogus", "STUDIO attr obs=1001"] {
             assert_eq!(parse(bad), None, "{bad}");
         }
     }

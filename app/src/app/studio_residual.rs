@@ -151,6 +151,8 @@ pub struct ResidPane {
     pub ui: ResidUi,
     /// Set by "Refit in Lab"; the app opens the Lab on the next frame.
     pub want_refit: bool,
+    /// Set by "Attribute move"; the app opens ATTR with this model and report on the next frame.
+    pub want_attr: bool,
     fresh: bool,
 }
 
@@ -435,6 +437,19 @@ impl TerminalApp {
         let sample = self.provider.eq_ignore_ascii_case("sample");
         let PaneKind::StudioResid(pane) = &mut self.panes[i].kind else { return vec![] };
         let actions = show(ui, id, pane, &self.worker, sample);
+        if std::mem::take(&mut pane.want_attr)
+            && let Some(m) = pane.model.clone()
+        {
+            let r = pane.report.clone();
+            self.status = format!("Attribution of {} · latest complete move, scored report reused, not refit", m.id);
+            self.open_panel(PaneKind::StudioAttr(Box::new(super::studio_attribution::AttrPane::from_resid(
+                m,
+                r,
+                Default::default(),
+            ))));
+            return actions;
+        }
+        let PaneKind::StudioResid(pane) = &mut self.panes[i].kind else { return actions };
         if std::mem::take(&mut pane.want_refit)
             && let Some(m) = pane.model.clone()
         {
@@ -457,10 +472,10 @@ impl TerminalApp {
 
 // ---- UI helpers ----------------------------------------------------------------------------------
 
-fn ui_text(s: impl Into<String>, size: f32, ink: Color32) -> RichText {
+pub(super) fn ui_text(s: impl Into<String>, size: f32, ink: Color32) -> RichText {
     RichText::new(s).font(theme::ui_font(size)).color(ink)
 }
-fn mono_text(s: impl Into<String>, size: f32, ink: Color32) -> RichText {
+pub(super) fn mono_text(s: impl Into<String>, size: f32, ink: Color32) -> RichText {
     RichText::new(s).font(theme::mono(size)).color(ink)
 }
 /// Scientific notation with an explicit sign and a true minus.
@@ -470,7 +485,7 @@ fn sci(v: f64) -> String {
 fn fixed(v: f64, digits: usize) -> String {
     format!("{v:+.digits$}").replacen('-', "\u{2212}", 1)
 }
-fn date(ts: i64) -> String {
+pub(super) fn date(ts: i64) -> String {
     chrono::DateTime::from_timestamp(ts, 0).map_or_else(|| "—".into(), |d| d.format("%Y-%m-%d").to_string())
 }
 
@@ -490,7 +505,7 @@ fn receipt(ui: &mut Ui, r: &ResidualReport, tf: Timeframe) {
     ));
 }
 
-fn caution_corner(ui: &Ui, rect: Rect) {
+pub(super) fn caution_corner(ui: &Ui, rect: Rect) {
     ui.painter().line_segment([rect.right_top(), rect.right_top() + vec2(-5., 5.)], Stroke::new(1., theme::caution()));
 }
 
@@ -521,7 +536,7 @@ fn ribbon(ui: &mut Ui, fit: &FrozenFit) {
     });
 }
 
-fn badges(ui: &mut Ui, r: &ResidualReport) {
+pub(super) fn badges(ui: &mut Ui, r: &ResidualReport) {
     for (symbol, check) in &r.revision {
         let ticker = tr_data::security(symbol).ticker;
         let text = match check {
@@ -1183,6 +1198,13 @@ pub(super) fn show(ui: &mut Ui, id: PaneId, pane: &mut ResidPane, worker: &crate
                 .clicked()
             {
                 pane.want_refit = true;
+            }
+            if ui
+                .small_button("Attribute move")
+                .on_hover_text("Opens ATTR with this model and its scored report: actual = drift + factors + residual")
+                .clicked()
+            {
+                pane.want_attr = true;
             }
         }
     });

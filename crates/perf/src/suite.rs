@@ -520,6 +520,31 @@ pub fn all(scale: Scale) -> Vec<Case> {
                 other => panic!("monitor not ready: {other:?}"),
             }
         });
+        // Factor attribution (slice 7): a pure function of the frozen fit and its scored report;
+        // the window is the latest complete stride-1 run, so the sum mode does real work.
+        {
+            use tr_data::studio_attribution as sa;
+            let rep = sr::score(&fit, &target, &factors, true, "benchmark fixture only", closed, None, 1);
+            let obs = rep.residual.values.iter().rev().take_while(|v| v.is_some()).count().saturating_sub(1).max(1);
+            assert!(!full || obs >= 4000, "attribution window too short: {obs}");
+            let w = sa::AttrWindow::Obs { obs, to: None };
+            let fit = fit.clone();
+            add!("studio.attribution_7x5000", move || {
+                let a = bb(sa::attribute(bb(&fit), bb(&rep), bb(&w)));
+                assert!(a.unavailable.is_none(), "{:?}", a.unavailable);
+                assert!(a.m == obs && a.covariances.len() == 4, "m {} covs {}", a.m, a.covariances.len());
+                let sum: f64 = a.intercept + a.factors.iter().map(|f| f.contribution).sum::<f64>();
+                assert!((a.actual - sum - a.residual).abs() <= 1e-9 * a.actual.abs().max(1.));
+                let not_moves = a.factors.iter().filter(|f| matches!(f.kind, sa::ExposureKind::NotAMove { .. })).count();
+                let level = a
+                    .factors
+                    .iter()
+                    .filter(|f| matches!(&f.kind, sa::ExposureKind::NotAMove { why } if why.contains("levels")))
+                    .count();
+                assert!(not_moves == 3 && level == 1, "NotAMove {not_moves}, level {level}");
+                a.m + a.path.len()
+            });
+        }
     }
     let bars = fixtures::daily(if full { 5000 } else { 200 }, 83);
     let seed = stable_hash::bars_digest(&bars);

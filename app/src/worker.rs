@@ -270,6 +270,14 @@ pub enum Request {
         model: Arc<tr_data::studio_residual::FrozenFit>,
         report: Arc<tr_data::studio_residual::ResidualReport>,
     },
+    /// Pure attribution of a scored frozen model over one window. No load, no fit.
+    StudioAttribution {
+        pane: PaneId,
+        token: u64,
+        model: Arc<tr_data::studio_residual::FrozenFit>,
+        report: Arc<tr_data::studio_residual::ResidualReport>,
+        window: tr_data::studio_attribution::AttrWindow,
+    },
     StudioSeason {
         pane: PaneId,
         generation: u64,
@@ -653,6 +661,7 @@ impl Request {
             Self::LoadStudioFit { .. } => "LoadStudioFit",
             Self::ScoreStudioResidual { .. } => "ScoreStudioResidual",
             Self::CheckStudioResidual { .. } => "CheckStudioResidual",
+            Self::StudioAttribution { .. } => "StudioAttribution",
             Self::StudioSeason { .. } => "StudioSeason",
             Self::StudioShape { .. } => "StudioShape",
             Self::StudioShapeBootstrap { .. } => "StudioShapeBootstrap",
@@ -993,6 +1002,14 @@ pub enum Response {
         model_digest: u64,
         score_key: u64,
         result: Result<Arc<tr_data::studio_residual::ResidualChecks>, String>,
+    },
+    StudioAttributed {
+        pane: PaneId,
+        token: u64,
+        model_digest: u64,
+        score_key: u64,
+        window: tr_data::studio_attribution::AttrWindow,
+        result: Result<Arc<tr_data::studio_attribution::AttributionReport>, String>,
     },
     StudioSeason {
         pane: PaneId,
@@ -4895,6 +4912,23 @@ async fn handle_inner(s: &Arc<Shared>, req: Request, force: bool) {
                 .and_then(|r| r)
             };
             send(Response::StudioResidualChecked { pane, token, model_digest, score_key, result });
+        }
+        Request::StudioAttribution { pane, token, model, report, window } => {
+            let (model_digest, score_key) = (model.content_digest, report.key);
+            let result = if s.sample_mode() {
+                Err("Attribution refused: sample / offline display mode.".to_string())
+            } else {
+                let jobs = s.jobs.clone();
+                let w = window.clone();
+                tokio::task::spawn_blocking(move || {
+                    let _job = crate::perf::JobTimer::new(&jobs, "StudioAttribution");
+                    crate::app::studio_attribution::attribute_blocking(&model, &report, &w)
+                })
+                .await
+                .map_err(|e| format!("attribution task failed: {e}"))
+                .and_then(|r| r)
+            };
+            send(Response::StudioAttributed { pane, token, model_digest, score_key, window, result });
         }
         Request::StudioSeason { pane, generation, symbol, tf } => {
             let result = async {

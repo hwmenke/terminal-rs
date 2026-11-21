@@ -40,7 +40,9 @@ const COMMANDS: &[(&str, &str, &str, Option<Action>)] = &[
     ("STUDIO resid open AAPL-v-SPY-v1", "Open a saved residual model (alias RESID OPEN <id>)", "residual open model", None),
     ("STUDIO resid save name=AAPL-v-SPY monitor=250", "Freeze the focused Lab / Relate fit (alias RESID SAVE)", "residual save freeze", None),
     ("STUDIO resid check", "Fresh reload, rescore and checks (alias RESID CHECK)", "residual adf cusum check", None),
-    ("STUDIO ATTR", "Attribution route · unavailable", "studio attribution", None),
+    ("STUDIO attr", "Attribution · drift + factor contributions + residual of a saved model", "studio attribution factor", None),
+    ("STUDIO attr model=AAPL-v-SPY-v1 obs=20", "Attribute the last 20 observations of a saved model", "attribution model obs", None),
+    ("STUDIO attr model=AAPL-v-SPY-v1 from=2026-03-02 to=2026-03-20", "Attribute a dated window (on-or-before bars, UTC)", "attribution range from to", None),
     (
         "STOPS",
         "ATR Stop Cloud and empirical Stop Odds",

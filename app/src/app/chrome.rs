@@ -665,10 +665,8 @@ impl TerminalApp {
             if nav_row(ui, Icon::Chart, "Residual tickers", Some("STUDIO resid"), false).clicked() {
                 out.push(SidebarCmd::Function(Function::StudioRoute(tr_data::studio::StudioRoute::Resid)));
             }
-            for route in [tr_data::studio::StudioRoute::Attr] {
-                if nav_row(ui, Icon::Chart, route.code(), Some("Unavailable"), false).clicked() {
-                    out.push(SidebarCmd::Function(Function::StudioRoute(route)));
-                }
+            if nav_row(ui, Icon::Chart, "Attribution", Some("STUDIO attr"), false).clicked() {
+                out.push(SidebarCmd::Function(Function::StudioRoute(tr_data::studio::StudioRoute::Attr)));
             }
             if nav_row(
                 ui,

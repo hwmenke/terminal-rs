@@ -83,3 +83,10 @@ change once).
 ## Cut list
 
 Cut: half-life bootstrap / non-reversion mass. Nothing else from the spec's cut order was cut.
+
+## Attribution (slice 7)
+
+Saved models also store the coefficient covariances in original units (`coef_covariance`: four for a
+Lab fit, one for a Relate fit). They enter the digest only when present, so slice-6 model files keep
+valid digests. `STUDIO attr` and the RESID **Attribute move** button attribute a window of the scored
+report: see [STUDIO_ATTRIBUTION.md](STUDIO_ATTRIBUTION.md).

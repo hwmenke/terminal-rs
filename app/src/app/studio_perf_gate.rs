@@ -173,6 +173,7 @@ fn perf_gate_paint_studios() {
     best.extend(fair_value_sample());
     best.extend(lab_sample());
     best.extend(resid_sample());
+    best.extend(attr_sample());
     let ids: BTreeSet<_> = budgets.cases.keys().filter(|id| id.starts_with("paint.studio_")).cloned().collect();
     assert_eq!(best.keys().cloned().collect::<BTreeSet<_>>(), ids, "stale/missing studio budgets");
     for _ in 0..2 {
@@ -195,6 +196,7 @@ fn perf_gate_paint_studios() {
             .chain(fair_value_sample())
             .chain(lab_sample())
             .chain(resid_sample())
+            .chain(attr_sample())
         {
             if s.median_us < best[&id].median_us {
                 best.insert(id, s);
@@ -2162,5 +2164,190 @@ fn resid_pending_and_unavailable_states_paint() {
     out.textures_delta.clear();
     let txt = text(&out.shapes);
     assert!(txt.contains("RESIDUAL UNAVAILABLE") && txt.contains("no archive") && !txt.contains("TRAIN | SCORED"), "{txt}");
+    finite(&ctx, out);
+}
+
+// ---- Factor attribution (slice 7): panel paint, actual hover, unavailable / LOW N / IN-SAMPLE states ----
+
+type AttrState = (
+    std::sync::Arc<tr_data::studio_residual::FrozenFit>,
+    std::sync::Arc<tr_data::studio_attribution::AttributionReport>,
+);
+fn attr_state() -> AttrState {
+    let (fit, rep) = super::studio_attribution::fixture(5000);
+    let a = tr_data::studio_attribution::attribute(
+        &fit,
+        &rep,
+        &tr_data::studio_attribution::AttrWindow::Obs { obs: 20, to: None },
+    );
+    assert!(a.unavailable.is_none(), "{:?}", a.unavailable);
+    assert!(a.m == 20 && a.factors.len() == 7 && a.covariances.len() == 4 && a.path.len() == 20);
+    (fit, std::sync::Arc::new(a))
+}
+fn attr_frame(
+    ctx: &egui::Context,
+    fit: &tr_data::studio_residual::FrozenFit,
+    a: &tr_data::studio_attribution::AttributionReport,
+    st: &mut super::studio_attribution::AttrUi,
+    width: f32,
+    hover: bool,
+    index: usize,
+) -> egui::FullOutput {
+    let pointer = if hover {
+        ctx.data(|d| d.get_temp::<Rect>(egui::Id::new("attr-bar0"))).unwrap_or(Rect::NOTHING).center()
+            + vec2(if index >= 160 { (index % 2) as f32 } else { 0. }, 0.)
+    } else {
+        pos2(15., 15.)
+    };
+    let events = if ctx.input(|i| i.pointer.hover_pos()) == Some(pointer) {
+        vec![]
+    } else {
+        vec![egui::Event::PointerMoved(pointer)]
+    };
+    let mut out = ctx.run_ui(
+        egui::RawInput {
+            time: Some(1. + index as f64 * 0.2),
+            screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(width, 1400.))),
+            events,
+            ..Default::default()
+        },
+        |ui| super::studio_attribution::panel(ui, 26, fit, a, st),
+    );
+    out.textures_delta.clear();
+    out
+}
+fn attr_guard(out: &egui::FullOutput) {
+    let txt = text(&out.shapes);
+    for word in ["FROZEN FIT · attributed, not refit", "Actual", "Drift", "Residual", "WATERFALL", "Predicted", "CLOSED THRU"] {
+        assert!(txt.contains(word), "missing {word}: {txt}");
+    }
+    assert!(out.shapes.len() > 60, "empty attribution panel");
+}
+fn attr_sample() -> BTreeMap<String, Summary> {
+    let ctx = egui::Context::default();
+    let (fit, a) = attr_state();
+    let mut st = super::studio_attribution::AttrUi::default();
+    for i in 0..20 {
+        finite(&ctx, attr_frame(&ctx, &fit, &a, &mut st, 1440., false, i));
+    }
+    let mut result = BTreeMap::new();
+    for hover in [false, true] {
+        let mode = if hover { "hover" } else { "steady" };
+        if hover {
+            for i in 140..160 {
+                finite(&ctx, attr_frame(&ctx, &fit, &a, &mut st, 1440., true, i));
+            }
+        }
+        let mut times: BTreeMap<String, Vec<f64>> = BTreeMap::new();
+        for i in 0..120 {
+            let start = Instant::now();
+            let mut out = attr_frame(&ctx, &fit, &a, &mut st, 1440., hover, i + if hover { 160 } else { 20 });
+            let ui_us = start.elapsed().as_secs_f64() * 1e6;
+            if i == 60 {
+                attr_guard(&out);
+                if hover {
+                    let txt = text(&out.shapes);
+                    assert!(
+                        txt.contains("attr.contribution") && txt.contains("CLOSED THRU"),
+                        "hover did not paint the attribution MathCard"
+                    );
+                }
+            }
+            let start = Instant::now();
+            let primitives = ctx.tessellate(std::mem::take(&mut out.shapes), out.pixels_per_point);
+            let tess_us = start.elapsed().as_secs_f64() * 1e6;
+            assert!(!primitives.is_empty());
+            std::hint::black_box(primitives);
+            for (metric, v) in [("ui", ui_us), ("tess", tess_us), ("total", ui_us + tess_us)] {
+                times.entry(format!("paint.studio_attribution.{mode}.{metric}")).or_default().push(v);
+            }
+        }
+        for (id, mut samples) in times {
+            result.insert(id, tr_perf::summarize(&mut samples));
+        }
+    }
+    result
+}
+#[test]
+fn attr_panel_geometry_and_actual_hover_320_1440() {
+    let (fit, a) = attr_state();
+    for width in [320., 1440.] {
+        let ctx = egui::Context::default();
+        ctx.all_styles_mut(|st| st.interaction.tooltip_delay = 0.);
+        let mut st = super::studio_attribution::AttrUi::default();
+        let out = attr_frame(&ctx, &fit, &a, &mut st, width, false, 0);
+        attr_guard(&out);
+        for clipped in &out.shapes {
+            assert!(clipped.clip_rect.is_finite());
+        }
+        finite(&ctx, out);
+        let mut last = None;
+        for i in 140..160 {
+            last = Some(attr_frame(&ctx, &fit, &a, &mut st, width, true, i));
+        }
+        let out = last.unwrap();
+        let txt = text(&out.shapes);
+        for word in ["attr.contribution", "CLOSED THRU", "FROZEN FIT · attributed, not refit", "Actual", "Residual"] {
+            assert!(txt.contains(word), "{width}: hover missing {word}: {txt}");
+        }
+        let probe = ctx.data(|d| d.get_temp::<Rect>(egui::Id::new("attr-probe"))).unwrap();
+        assert!(probe.width() <= width + 1. && probe.height() == 240. && probe.is_finite(), "waterfall overflows {width}px: {probe:?}");
+        finite(&ctx, out);
+        // Both SE meanings and every stored estimator paint from the same report.
+        st.se = tr_data::studio_attribution::AttributionSe::Coefficient;
+        st.cov = Some(0);
+        finite(&ctx, attr_frame(&ctx, &fit, &a, &mut st, width, false, 200));
+    }
+}
+#[test]
+fn attr_states_paint() {
+    use tr_data::studio_attribution::WindowLabel;
+    let ctx = egui::Context::default();
+    let (fit, a) = attr_state();
+    let mut st = super::studio_attribution::AttrUi::default();
+    let tick = |s: &egui::Shape| {
+        matches!(s, egui::Shape::LineSegment { stroke, .. } if stroke.color == crate::theme::caution())
+    };
+    // An unavailable window paints the reason and no numbers or bars.
+    let mut bad = (*a).clone();
+    bad.unavailable = Some("window starts before the scored grid (first bar 2026-01-02 00:00 UTC)".into());
+    let out = attr_frame(&ctx, &fit, &bad, &mut st, 1440., false, 1);
+    let txt = text(&out.shapes);
+    assert!(txt.contains("ATTRIBUTION UNAVAILABLE") && txt.contains("starts before the scored grid"), "{txt}");
+    assert!(!txt.contains("attr.contribution") && !txt.contains("WATERFALL"), "numbers painted: {txt}");
+    finite(&ctx, out);
+    // LOW N: the predictive SE is withheld with a caution tick; the coefficient SE stays.
+    let mut low = (*a).clone();
+    for c in &mut low.covariances {
+        c.predictive_se = None;
+    }
+    low.residual_var.variance = None;
+    low.residual_var.unavailable = Some("LOW N: 12 stored residual pairs at lag 20 < 30; predictive SE withheld".into());
+    let out = attr_frame(&ctx, &fit, &low, &mut st, 1440., false, 2);
+    let txt = text(&out.shapes);
+    assert!(txt.contains("withheld") && txt.contains("LOW N"), "{txt}");
+    assert!(any_shape(&out.shapes, &tick), "LOW N corner tick missing");
+    finite(&ctx, out);
+    // IN-SAMPLE is labelled, never refused.
+    let mut ins = (*a).clone();
+    ins.label = WindowLabel::InSample;
+    let out = attr_frame(&ctx, &fit, &ins, &mut st, 1440., false, 3);
+    let txt = text(&out.shapes);
+    assert!(txt.contains("IN-SAMPLE") && txt.contains("not an out-of-sample error"), "{txt}");
+    assert!(any_shape(&out.shapes, &tick), "IN-SAMPLE corner tick missing");
+    finite(&ctx, out);
+    // A missing model paints a recoverable card and no numbers.
+    let u = crate::studio_models::ModelUnavailable {
+        kind: crate::studio_models::UnavailableKind::Missing,
+        id: "gone-v1".into(),
+        message: "no such saved model".into(),
+    };
+    let mut out = ctx.run_ui(
+        egui::RawInput { screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(1440., 800.))), ..Default::default() },
+        |ui| super::studio_residual::model_unavailable(ui, &u),
+    );
+    out.textures_delta.clear();
+    let txt = text(&out.shapes);
+    assert!(txt.contains("Model `gone-v1` unavailable: missing") && !txt.contains("Actual") && !txt.contains("WATERFALL"), "{txt}");
     finite(&ctx, out);
 }

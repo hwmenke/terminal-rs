@@ -29,9 +29,9 @@ pub const PANELS: [(&str, &str); 37] = [
     ("Studio", "STUDIO"),
     ("When", "WHEN"),
     ("Quick canvas", "QUICK"),
-    ("Factor Lab (unavailable)", "LAB"),
+    ("Regression Lab", "LAB"),
     ("Residual tickers", "RESID"),
-    ("Attribution (unavailable)", "ATTR"),
+    ("Attribution", "ATTR"),
     ("Watchlist", "WL"),
     ("News", "NEWS"),
     ("Order Book", "BOOK"),
@@ -1110,7 +1110,7 @@ impl TerminalApp {
                 PaneKind::StudioLab(Box::new(super::studio_lab::LabPane::new(symbol, tr_core::Timeframe::D1, spec)))
             }
             "RESID" => PaneKind::StudioResid(Box::new(super::studio_residual::ResidPane::new(String::new()))),
-            "ATTR" => PaneKind::StudioRoute(tr_data::studio::StudioRoute::Attr),
+            "ATTR" => PaneKind::StudioAttr(Box::new(super::studio_attribution::AttrPane::new(String::new()))),
             "DIST" | "RDIST" => {
                 let symbol =
                     symbol.map(|s| tr_data::security(s).key()).or_else(|| self.focused_symbol()).unwrap_or_default();
@@ -2527,6 +2527,13 @@ fn tab_menu(ui: &mut Ui, pid: PaneId, link: Option<Link>, cmds: &mut Vec<GroupCm
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn panel_labels_have_no_unavailable_builds() {
+        assert!(PANELS.iter().all(|(label, _)| !label.contains("(unavailable)")), "stale label in PANELS");
+        assert!(PANELS.contains(&("Regression Lab", "LAB")));
+        assert!(PANELS.contains(&("Attribution", "ATTR")));
+    }
+
     #[test]
     fn new_twall_opens_default_pane() {
         let mut app = crate::app::tests::test_app();

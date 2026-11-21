@@ -137,6 +137,10 @@ pub struct FrozenFit {
     pub monitoring_horizon: usize,
     /// `max(⌈n_stored^{1/3}⌉, h_y)`.
     pub bootstrap_block: usize,
+    /// Coefficient covariances in original units, intercept first (Lab: `SE_METHODS` order, 4 entries;
+    /// Relate: the fit's one). Empty on models saved before slice 7 → coefficient SE unavailable.
+    #[serde(default)]
+    pub coef_covariance: Vec<crate::studio_inference::RegressionCovariance>,
     pub content_digest: u64,
 }
 impl Default for FrozenFit {
@@ -160,6 +164,7 @@ impl Default for FrozenFit {
             train_residuals_dropped: 0,
             monitoring_horizon: DEFAULT_MONITOR,
             bootstrap_block: 1,
+            coef_covariance: Vec::new(),
             content_digest: 0,
         }
     }
@@ -218,6 +223,42 @@ fn write_receipt(h: &mut Fnv64, r: &SeriesReceipt) {
     for (a, b) in &r.gaps {
         h.write_i64(*a);
         h.write_i64(*b);
+    }
+}
+
+/// Explicit method tags (never `Debug`).
+fn write_covariance(h: &mut Fnv64, c: &crate::studio_inference::RegressionCovariance) {
+    use crate::studio_inference::CovarianceMethod as M;
+    match c.method {
+        M::Classical => h.write_u64(1),
+        M::HC3 => h.write_u64(2),
+        M::HacFixed5 => h.write_u64(3),
+        M::HacAutomatic => h.write_u64(4),
+        M::Overlap(n) => {
+            h.write_u64(5);
+            h.write_u64(n as u64);
+        }
+    }
+    h.write_u64(c.lag as u64);
+    h.write_u64(c.n as u64);
+    h.write_u64(c.fallback as u64);
+    match &c.covariance {
+        Some(v) => {
+            h.write_u64(1);
+            for row in v {
+                for x in row {
+                    h.write_f64_bits(*x);
+                }
+            }
+        }
+        None => h.write_u64(0),
+    }
+    match &c.unavailable {
+        Some(u) => {
+            h.write_u64(1);
+            h.write_str(u);
+        }
+        None => h.write_u64(0),
     }
 }
 
@@ -281,6 +322,14 @@ impl FrozenFit {
         h.write_u64(self.train_residuals_dropped as u64);
         h.write_u64(self.monitoring_horizon as u64);
         h.write_u64(self.bootstrap_block as u64);
+        // Only when present, so every model saved before slice 7 keeps its digest.
+        if !self.coef_covariance.is_empty() {
+            h.write_str("coef_cov.v1");
+            h.write_u64(self.coef_covariance.len() as u64);
+            for c in &self.coef_covariance {
+                write_covariance(&mut h, c);
+            }
+        }
         h.finish()
     }
 
@@ -336,6 +385,30 @@ impl FrozenFit {
             return Err("dropped training residual count is inconsistent".into());
         }
         self.lab_spec().validate()?;
+        let want_len: &[usize] = match m.origin {
+            FitOrigin::Lab => &[0, 4],
+            FitOrigin::Relate => &[0, 1],
+        };
+        if !want_len.contains(&self.coef_covariance.len()) {
+            return Err("coefficient covariance count does not match the model origin".into());
+        }
+        for c in &self.coef_covariance {
+            let Some(v) = &c.covariance else { continue };
+            if v.len() != m.k || v.iter().any(|r| r.len() != m.k) || v.iter().flatten().any(|x| !x.is_finite()) {
+                return Err("coefficient covariance must be a finite k×k matrix".into());
+            }
+            let big = v.iter().flatten().fold(0f64, |a, x| a.max(x.abs()));
+            for i in 0..m.k {
+                if v[i][i] < 0. {
+                    return Err("coefficient covariance has a negative variance".into());
+                }
+                for j in 0..i {
+                    if (v[i][j] - v[j][i]).abs() > 1e-9 * big {
+                        return Err("coefficient covariance is not symmetric".into());
+                    }
+                }
+            }
+        }
         if self.compute_digest() != self.content_digest {
             return Err("content digest does not match the saved content".into());
         }
@@ -471,6 +544,7 @@ struct Parts {
     spans: Vec<SpanDigest>,
     residuals: Vec<f64>,
     breaks: Vec<bool>,
+    coef_covariance: Vec<crate::studio_inference::RegressionCovariance>,
 }
 
 /// Default name `{TARGET}-v-{F1}` with `_p{n}` for `n` further factors, sanitised to the slug alphabet.
@@ -542,6 +616,7 @@ fn assemble(p: Parts, name: &str, monitor: Option<usize>, saved_at: i64) -> Resu
         train_residuals_dropped: p.n_train.saturating_sub(stored),
         monitoring_horizon: monitor,
         bootstrap_block: cube.max(h_y).max(1),
+        coef_covariance: p.coef_covariance,
         content_digest: 0,
     };
     fit.content_digest = fit.compute_digest();
@@ -583,6 +658,7 @@ pub fn freeze_lab(r: &LabReport, name: Option<&str>, monitor: Option<usize>, sav
             spans: r.train_span_digests.clone(),
             residuals: r.train_residuals.clone(),
             breaks: r.train_breaks.clone(),
+            coef_covariance: r.inference.iter().map(|i| i.covariance.clone()).collect(),
         },
         &name,
         monitor,
@@ -638,6 +714,7 @@ pub fn freeze_relate(
             spans: rel.train_span_digests.clone(),
             residuals: rel.train_residuals.clone(),
             breaks: rel.train_breaks.clone(),
+            coef_covariance: vec![f.covariance.clone()],
         },
         &name,
         monitor,
@@ -689,10 +766,10 @@ pub struct ResidualReport {
     /// `SeriesUnit::ZFrozen`, same ts / breaks.
     pub z: ScalarSeries,
     pub segment: Vec<ResidSegment>,
-    /// Hover only, parallel to `residual.ts`.
+    /// Frozen design on the target grid (hover and ATTR), parallel to `residual.ts`.
     pub y: Vec<Option<f64>>,
     pub fitted: Vec<Option<f64>>,
-    /// Regressors `x_{j,t−ℓ_j}` per factor, parallel to `residual.ts` (hover only).
+    /// Regressors `x_{j,t−ℓ_j}` per factor, parallel to `residual.ts` (hover and ATTR).
     #[serde(default)]
     pub x: Vec<Vec<Option<f64>>>,
     pub scored: Vec<f64>,

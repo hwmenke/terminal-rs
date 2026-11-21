@@ -259,6 +259,14 @@ pub enum PaneSettings {
         #[serde(default)]
         model_id: String,
     },
+    /// Factor attribution: the saved model id and the canonical window words (`obs=20`,
+    /// `from=… to=…`). Reports are never saved; an invalid id or window restores as empty / default.
+    StudioAttr {
+        #[serde(default)]
+        model_id: String,
+        #[serde(default)]
+        window: String,
+    },
     /// Statistics / conditional returns for one research symbol.
     Stats {
         #[serde(default)]

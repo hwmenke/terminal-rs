@@ -114,4 +114,4 @@ A legacy `StudioRoute{Lab}` layout restores as a default Lab pane.
 ## Limits
 
 No leverage plots, skew/Jarque–Bera, bootstrap, or retained point clouds. No categorical factor colours on
-the plots. RESID is available (STUDIO_RESIDUAL.md); ATTR stays an unavailable route.
+the plots. RESID is available (STUDIO_RESIDUAL.md); ATTR is available (STUDIO_ATTRIBUTION.md).

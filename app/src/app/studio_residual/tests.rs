@@ -195,9 +195,9 @@ fn resid_layout_roundtrip_and_legacy_route() {
     let legacy: PaneSettings = serde_json::from_str(r#"{"StudioRoute":{"route":"Resid"}}"#).unwrap();
     let PaneKind::StudioResid(p) = PaneKind::from_settings(legacy) else { panic!("legacy route is not a RESID pane") };
     assert!(p.model_id.is_empty() && p.model.is_none());
-    // ATTR keeps its unavailable route.
+    // The legacy ATTR route restores an empty attribution pane (slice 7).
     let attr: PaneSettings = serde_json::from_str(r#"{"StudioRoute":{"route":"Attr"}}"#).unwrap();
-    assert!(matches!(PaneKind::from_settings(attr), PaneKind::StudioRoute(_)));
+    assert!(matches!(PaneKind::from_settings(attr), PaneKind::StudioAttr(_)));
     // A hand-edited path never becomes an id.
     let evil: PaneSettings = serde_json::from_str(r#"{"StudioResid":{"model_id":"../../etc/passwd"}}"#).unwrap();
     let PaneKind::StudioResid(p) = PaneKind::from_settings(evil) else { panic!() };
