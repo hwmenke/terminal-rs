@@ -25,6 +25,8 @@ pub struct StudioInputs {
     pub horizons: String,
     pub when_threshold: f64,
     pub when_horizon: usize,
+    /// When analysis period token (`period=10y` / `since=YYYY-MM-DD`); empty = default 10Y.
+    pub when_period: String,
     pub strategies: String,
     pub holdout: String,
     pub commission: String,
@@ -49,6 +51,7 @@ impl Default for StudioInputs {
             horizons: "5, 10".into(),
             when_threshold: tr_data::studio_when::DEFAULT_THRESHOLD_BP,
             when_horizon: 6,
+            when_period: String::new(),
             strategies: "ALL".into(),
             holdout: "20%".into(),
             commission: format!("{:.0}", tr_data::backtest::DEFAULT_COMMISSION_BPS),
@@ -63,6 +66,13 @@ impl Default for StudioInputs {
     }
 }
 impl StudioInputs {
+    /// Saved/typed When period; anything unparsable restores the default 10Y.
+    pub fn when_period_value(&self) -> tr_data::studio_when::WhenPeriod {
+        let t = self.when_period.trim();
+        t.split_once('=')
+            .and_then(|(_, v)| tr_data::studio_when::WhenPeriod::parse(v).ok())
+            .unwrap_or_default()
+    }
     /// `corr_horizon` restricted to the supported {1, 5, 20} (hand-edited layouts restore 1).
     pub fn valid_corr_horizon(&self) -> usize {
         if [1, 5, 20].contains(&self.corr_horizon) { self.corr_horizon } else { 1 }
@@ -242,6 +252,7 @@ impl StudioPane {
                     inputs.condition = p.condition.clone();
                     inputs.when_threshold = p.threshold;
                     inputs.when_horizon = p.horizon;
+                    inputs.when_period = p.period.token();
                 }
                 StudioLensState::Season(_) => {}
                 StudioLensState::Backtest(p) => {
@@ -382,7 +393,8 @@ impl StudioPane {
                 StudioLensState::Relate(Box::new(c))
             }
             StudioLens::When => {
-                let c = studio_when::WhenPane::new(s, tf, &p.condition, p.when_threshold, p.when_horizon);
+                let c = studio_when::WhenPane::new(s, tf, &p.condition, p.when_threshold, p.when_horizon)
+                    .with_period(p.when_period_value());
                 StudioLensState::When(Box::new(c))
             }
             StudioLens::Season => StudioLensState::Season(Box::new(studio_season::SeasonPane::new(s, tf.label()))),
@@ -522,6 +534,30 @@ impl StudioPane {
             ui.allocate_space(vec2(ui.available_width(), 130.));
         }
     }
+    /// Error text of the visible lens, if it failed (used by the status bar to decide whether an
+    /// optional-service outage actually affects the current result).
+    pub(super) fn lens_error(&self) -> Option<&str> {
+        match self.children.iter().find(|c| c.kind() == self.lens)? {
+            StudioLensState::When(p) => p.error.as_deref(),
+            StudioLensState::Relate(p) => p.error.as_deref(),
+            _ => None,
+        }
+    }
+    /// Structured receipts of the visible lens (one compact chip; full chain on hover/Inspector).
+    fn receipt_parts(&self) -> (Vec<tr_data::source_receipt::SourceReceipt>, Vec<String>) {
+        match self.children.iter().find(|c| c.kind() == self.lens) {
+            Some(StudioLensState::Relate(p)) if p.report.is_some() => {
+                let r = p.report.as_ref().unwrap();
+                let labels = [&r.symbol, &r.benchmark].map(|s| tr_data::security(s).ticker).to_vec();
+                (r.receipts.clone(), labels)
+            }
+            Some(StudioLensState::When(p)) if p.report.is_some() => {
+                let r = p.report.as_ref().unwrap();
+                (r.source_receipts.clone(), vec![tr_data::security(&r.report.symbol).ticker])
+            }
+            _ => (vec![], vec![]),
+        }
+    }
     fn receipt(&self) -> String {
         match self.children.iter().find(|c| c.kind() == self.lens) {
             Some(StudioLensState::Dist(p)) if p.report.is_some() => {
@@ -551,12 +587,17 @@ impl StudioPane {
             _ => "Source / CLOSED THRU unavailable · awaiting accepted real-data receipt".into(),
         }
     }
-    fn command(&self) -> String {
+    pub(super) fn command(&self) -> String {
         if self.quick {let c=self.chart.canvas_view();return format!("{} QUICK {} {} mode={}",self.context.symbol,c.peers.iter().map(|s|tr_data::security(s).ticker).collect::<Vec<_>>().join(" "),self.context.tf.label(),c.spec.mode.code());}
         let rule = if self.lens == StudioLens::When {
             let p = self.view().inputs;
             let condition = if p.condition.trim().is_empty() { tr_data::studio_when::DEFAULT_RULE } else { &p.condition };
-            format!(" rule=\"{condition}\" h={} threshold={}bp", p.when_horizon, p.when_threshold)
+            let period = if self.context.tf == Timeframe::D1 {
+                format!(" {}", p.when_period_value().token())
+            } else {
+                String::new()
+            };
+            format!(" rule=\"{condition}\" h={} threshold={}bp{period}", p.when_horizon, p.when_threshold)
         } else {
             String::new()
         };
@@ -570,6 +611,12 @@ impl StudioPane {
     }
     fn inspector(&mut self, ui: &mut Ui) {
         ui.label(RichText::new("STUDIO INPUTS").font(theme::ui_font(16.)).strong());
+        // Full source chain (attempts, clocks, gaps) lives here, not in the pane header.
+        let (receipts, labels) = self.receipt_parts();
+        let chain = crate::widgets::source_chip_detail(&receipts, &labels, &self.receipt());
+        egui::CollapsingHeader::new(RichText::new("Source chain").font(theme::ui_font(11.))).show(ui, |ui| {
+            ui.label(RichText::new(chain).font(theme::mono(10.)).color(theme::muted()));
+        });
         ui.horizontal_wrapped(|ui| {
             ui.label("Symbol");
             ui.add(egui::TextEdit::singleline(&mut self.symbol_edit).desired_width(160.));
@@ -685,7 +732,8 @@ impl StudioPane {
                     self.inspector_open = !self.inspector_open;
                 }
             });
-            ui.label(RichText::new(self.receipt()).font(theme::mono(10.)).color(theme::muted()));
+            let (receipts, labels) = self.receipt_parts();
+            crate::widgets::source_chip(ui, "", &receipts, &labels, &self.receipt());
         });
         let _ = header;
         ui.scope(|ui| {
@@ -1181,6 +1229,7 @@ fn when_inputs(inputs: &mut StudioInputs, cmd: tr_data::studio_when::WhenCommand
     inputs.condition = cmd.rule.unwrap_or_else(|| tr_data::studio_when::DEFAULT_RULE.into());
     inputs.when_threshold = cmd.threshold.unwrap_or(tr_data::studio_when::DEFAULT_THRESHOLD_BP);
     inputs.when_horizon = cmd.horizon.unwrap_or(6);
+    inputs.when_period = cmd.period.map(|p| p.token()).unwrap_or_default();
 }
 
 /// A Studio opened on the When lens from `WHEN` arguments (daily by default).
@@ -1214,6 +1263,9 @@ impl TerminalApp {
                 if let Some(p) = s.when_mut() {
                     if let Some(h) = cmd.horizon {
                         p.horizon = h;
+                    }
+                    if let Some(period) = cmd.period {
+                        p.set_period(period);
                     }
                     if let Some(t) = cmd.threshold
                         && p.threshold != t

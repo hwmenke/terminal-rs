@@ -115,29 +115,13 @@ impl TerminalApp {
         ui.interact(chip, Id::new("source-chip"), Sense::hover()).on_hover_text(self.provider_label());
         x = chip.right() + 8.0;
 
-        // Which account trades: DEMO (paper) or LIVE (real money, in red). Click to switch.
-        let live_mode = !self.demo_mode();
-        let (label, fill) = if live_mode { ("LIVE", theme::down()) } else { ("DEMO", theme::accent()) };
-        let badge_text = p.layout_no_wrap(label.into(), mono(11.0), Color32::WHITE);
-        let badge = Rect::from_min_size(pos2(x, cy - 10.0), vec2(badge_text.size().x + 18.0, 20.0));
-        let resp = ui.interact(badge, Id::new("account-mode-badge"), Sense::click());
-        let fill = if resp.hovered() { fill } else { fill.gamma_multiply(0.9) };
-        p.rect_filled(badge, 10.0, fill);
-        p.galley(badge.center() - badge_text.size() / 2.0, badge_text, Color32::WHITE);
-        let tip = if live_mode {
-            "LIVE: portfolio panes and orders use your real brokerage accounts. Click to switch to the demo account."
-        } else {
-            "DEMO: paper trading with virtual cash. Click to switch to your live brokerage accounts."
-        };
-        if resp.on_hover_text(tip).clicked() {
-            let next = if live_mode { crate::prefs::AccountMode::Demo } else { crate::prefs::AccountMode::Live };
-            self.set_account_mode(next, false);
-        }
-        if live_mode {
-            // A red rule along the toolbar so live mode is never mistaken for the demo.
+        // The account mode (paper trading / LIVE) is an execution setting, not a data mode: it
+        // is shown only in Portfolio and order-entry panes. Real-money mode keeps a red rule
+        // along the toolbar as a safety cue; paper trading shows nothing here.
+        if !self.demo_mode() {
             p.hline(rect.x_range(), rect.bottom() - 1.0, Stroke::new(2.0, theme::down()));
         }
-        x = badge.right() + 10.0;
+        x += 2.0;
 
         // Right-hand cluster, laid out from the right edge: one-line clock (UTC on hover).
         let now = chrono::Local::now();
@@ -1106,6 +1090,18 @@ impl TerminalApp {
         }
     }
 
+    /// True when the focused pane's own result failed because it needed Whats-News. An offline
+    /// optional service that another source covered does not affect the result.
+    fn whats_news_affects_focus(&self) -> bool {
+        let needs = |e: Option<&str>| e.is_some_and(|e| e.contains("Whats-News"));
+        match self.panes.iter().find(|p| p.id == self.focus).map(|p| &p.kind) {
+            Some(super::PaneKind::Studio(s)) => needs(s.lens_error()),
+            Some(super::PaneKind::StudioLab(p)) => needs(p.error.as_deref()),
+            Some(super::PaneKind::Stats(p)) => needs(p.error.as_deref()),
+            _ => false,
+        }
+    }
+
     pub(super) fn status_bar(&mut self, ui: &Ui, rect: Rect) {
         let strip = Rect::from_min_max(
             pos2((rect.right() - 300.0).max(rect.left()), rect.top()),
@@ -1113,6 +1109,7 @@ impl TerminalApp {
         );
         self.health_strip(ui, strip);
         let link_rect = Rect::from_min_max(rect.min, pos2(strip.left(), rect.top() + 22.0));
+        let affected = self.whats_news_affects_focus();
         let health = &self.whats_news_health;
         let label = if health.connected() {
             format!(
@@ -1124,9 +1121,10 @@ impl TerminalApp {
                 if health.message.is_empty() { String::new() } else { format!(" · {}", health.message) }
             )
         } else {
-            format!("Whats-News: {} · {}", health.label(), health.message)
+            // Optional service: a short grey label; the endpoint/start-service text is on hover.
+            "Whats-News offline".to_string()
         };
-        let color = if health.connected() && health.message.is_empty() { theme::up() } else { amber() };
+        let color = whats_news_color(health.connected(), !health.message.is_empty(), affected);
         let p = ui.painter_at(link_rect.shrink2(vec2(8.0, 0.0)));
         p.text(pos2(link_rect.left() + 10.0, link_rect.center().y), Align2::LEFT_CENTER, label, ui_font(11.5), color);
         let clicked = ui
@@ -1250,6 +1248,16 @@ impl TerminalApp {
 }
 
 /// Small grey section header, as in a macOS source list.
+/// Footer Whats-News colour: green when healthy, amber for a connected-with-warning service or
+/// when an offline service actually affects the focused result, otherwise quiet grey.
+pub(super) fn whats_news_color(connected: bool, has_message: bool, affected: bool) -> egui::Color32 {
+    match (connected, has_message, affected) {
+        (true, false, _) => theme::up(),
+        (true, true, _) | (false, _, true) => amber(),
+        (false, _, false) => muted(),
+    }
+}
+
 fn section(ui: &mut Ui, label: &str) {
     ui.add_space(10.0);
     ui.label(RichText::new(label).font(ui_font(11.0)).color(muted()));
@@ -1535,6 +1543,52 @@ mod tests {
         step(vec![Event::PointerMoved(go), click(go, true)]);
         step(vec![click(go, false)]);
         assert_eq!(app.panes[0].kind.symbol(), Some("MSFT US Equity"));
+    }
+
+    fn shape_text(shapes: &[egui::epaint::ClippedShape]) -> String {
+        fn walk(s: &egui::Shape) -> String {
+            match s {
+                egui::Shape::Text(t) => t.galley.job.text.clone(),
+                egui::Shape::Vec(v) => v.iter().map(walk).collect::<Vec<_>>().join("\n"),
+                _ => String::new(),
+            }
+        }
+        shapes.iter().map(|s| walk(&s.shape)).collect::<Vec<_>>().join("\n")
+    }
+
+    /// The research toolbar never paints the paper/live account pill, in either account mode.
+    #[test]
+    fn toolbar_has_no_account_mode_pill_and_mode_semantics_unchanged() {
+        for mode in [crate::prefs::AccountMode::Demo, crate::prefs::AccountMode::Live] {
+            let ctx = egui::Context::default();
+            let mut app = chart_app();
+            app.prefs.trading.account_mode = mode;
+            let mut out = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(1200.0, 700.0))),
+                    ..Default::default()
+                },
+                |ui| {
+                    let rect = app.toolbar_rect(ui.max_rect());
+                    app.toolbar(ui, rect, 0.0);
+                },
+            );
+            out.textures_delta.clear();
+            let text = shape_text(&out.shapes);
+            assert!(!text.contains("DEMO") && !text.contains("LIVE") && !text.contains("Paper trading"), "{text}");
+            assert_eq!(app.prefs.trading.account_mode, mode, "painting never changes the account mode");
+            assert_eq!(app.demo_mode(), mode == crate::prefs::AccountMode::Demo);
+        }
+    }
+
+    #[test]
+    fn whats_news_footer_is_grey_unless_the_result_needs_it() {
+        let grey = whats_news_color(false, true, false);
+        assert_eq!(grey, muted());
+        assert_ne!(grey, amber());
+        assert_eq!(whats_news_color(false, true, true), amber());
+        assert_eq!(whats_news_color(true, false, false), theme::up());
+        assert_eq!(whats_news_color(true, true, false), amber());
     }
 
     #[test]

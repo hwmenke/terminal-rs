@@ -1787,7 +1787,7 @@ impl TerminalApp {
                 } else {
                     "Live orders stay off until you enable them in Settings › Trading; until then you can only view."
                 },
-                "This choice is remembered. Switch back to DEMO any time from the toolbar badge.",
+                "This choice is remembered. Switch back to the paper account any time in Settings or with MODE DEMO.",
             ] {
                 ui.label(RichText::new(format!("• {line}")).font(ui_font(12.0)).color(text()));
             }
@@ -1866,7 +1866,7 @@ impl TerminalApp {
                 self.set_account_mode(AccountMode::Demo, false);
             }
         });
-        note(ui, "The toolbar badge shows which account is active; click it to switch.");
+        note(ui, "Portfolio and order panes show which account is active; switch here or with MODE DEMO / MODE LIVE.");
 
         section(ui, "Demo account");
         let b = &self.demo.book;
@@ -2141,9 +2141,9 @@ fn filled(label: &str, fill: Color32, enabled: bool) -> egui::Button<'static> {
     }
 }
 
-/// The DEMO / LIVE pill.
+/// The "Paper trading" / LIVE pill; shown in Portfolio and order-entry panes only.
 pub fn mode_badge(ui: &mut Ui, live: bool) -> egui::Response {
-    let (label, fill) = if live { ("LIVE", theme::down()) } else { ("DEMO", theme::accent()) };
+    let (label, fill) = if live { ("LIVE", theme::down()) } else { ("Paper trading", theme::accent()) };
     ui.add(
         egui::Button::new(RichText::new(label).font(mono(11.0)).strong().color(Color32::WHITE))
             .fill(fill)

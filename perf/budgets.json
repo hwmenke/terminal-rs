@@ -258,6 +258,11 @@
       "relative": true,
       "class": "command"
     },
+    "studio.when_daily_10y_of_24k": {
+      "budget_us": 100000,
+      "relative": false,
+      "class": "command"
+    },
     "studio.subset_5k": {
       "budget_us": 15000,
       "relative": true,

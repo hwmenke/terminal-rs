@@ -710,6 +710,9 @@ pub struct LabReport {
     pub diagnostics: Option<LabDiagnostics>,
     pub points: Vec<LabPoint>,
     pub source: String,
+    /// Structured source receipts, target first (display/Inspector; not part of the key).
+    #[serde(default)]
+    pub source_receipts: Vec<crate::source_receipt::SourceReceipt>,
     pub provenance: Provenance,
     pub closed_thru: i64,
     pub observed_at: Option<i64>,
@@ -768,6 +771,7 @@ fn blank(
         diagnostics: None,
         points: vec![],
         source: source.into(),
+        source_receipts: vec![],
         provenance,
         closed_thru,
         observed_at,
@@ -787,6 +791,25 @@ fn blank(
 /// never a partial fit, a substituted peer or a fallback source.
 #[allow(clippy::too_many_arguments)]
 pub fn compute(
+    target: &NamedBars,
+    factors: &[NamedBars],
+    spec: &LabSpec,
+    tf: Timeframe,
+    daily: bool,
+    source: &str,
+    closed_thru: i64,
+    observed_at: Option<i64>,
+    key: u64,
+) -> LabReport {
+    let mut report = compute_inner(target, factors, spec, tf, daily, source, closed_thru, observed_at, key);
+    // Structured receipts in the same order as the joined `source` text (target first, loaded rows only).
+    report.source_receipts =
+        std::iter::once(target).chain(factors).filter(|r| r.error.is_none()).filter_map(|r| r.receipt.clone()).collect();
+    report
+}
+
+#[allow(clippy::too_many_arguments)]
+fn compute_inner(
     target: &NamedBars,
     factors: &[NamedBars],
     spec: &LabSpec,

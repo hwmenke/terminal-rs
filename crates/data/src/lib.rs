@@ -53,6 +53,7 @@ pub mod session_brief;
 pub mod session_clock;
 pub mod session_extreme;
 pub mod session_path;
+pub mod source_receipt;
 pub mod stable_hash;
 pub mod stack_wall;
 pub mod stats;

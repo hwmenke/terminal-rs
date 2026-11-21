@@ -113,6 +113,9 @@ pub struct RelateReport {
     pub unavailable: Option<String>,
     /// Source of each side: asset, benchmark.
     pub sources: [String; 2],
+    /// Structured receipts per side; provider identity comes from here, never from `sources` text.
+    #[serde(default)]
+    pub receipts: [Option<crate::source_receipt::SourceReceipt>; 2],
     pub benchmark_gaps: Vec<(i64, i64)>,
     /// Latest ≤ `MAX_TRAIN_RESIDUALS` residuals `y − α − βx` of the training prefix, for freezing a
     /// fit (RESID). Functions of keyed content; empty on reports from older builds or without a fit.
@@ -164,6 +167,7 @@ impl RelateReport {
             matrix_common: None,
             unavailable: Some(reason),
             sources: [asset.source.clone(), benchmark.source.clone()],
+            receipts: [asset.receipt.clone(), benchmark.receipt.clone()],
             benchmark_gaps: benchmark.gaps.clone(),
             train_residuals: Vec::new(),
             train_breaks: Vec::new(),
@@ -706,6 +710,7 @@ pub fn compute_relate(
         matrix_common,
         unavailable,
         sources: [asset.source.clone(), benchmark.source.clone()],
+        receipts: [asset.receipt.clone(), benchmark.receipt.clone()],
         benchmark_gaps: benchmark.gaps.clone(),
     })
 }

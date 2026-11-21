@@ -31,6 +31,8 @@ pub struct PreparedWhen {
     /// Contiguous accepted rule slots `[start, end)` for canvas shading.
     pub runs: Vec<(i64, i64)>,
     pub receipt: String,
+    /// Structured source receipt of the analysed series (chip + Inspector); not part of the key.
+    pub source_receipts: Vec<tr_data::source_receipt::SourceReceipt>,
     /// Rule text exactly as requested (for response matching).
     pub requested_rule: String,
     /// Printed canvas label for the accepted mask.
@@ -237,22 +239,44 @@ pub fn prepare(report: WhenReport, requested_rule: String) -> PreparedWhen {
         distribution_cards,
         runs,
         receipt,
+        source_receipts: Vec::new(),
         requested_rule,
         shading_label,
     }
 }
 
-/// Single-flight cached report. Validation precedes the key and cache lookup.
+/// Single-flight cached report (default 10Y period, no receipt). Validation precedes the key and
+/// cache lookup.
+#[cfg(test)]
 pub fn cached_report(
     input: &tr_data::studio_canvas::CanvasInput,
     rule: &str,
     threshold: f64,
 ) -> Result<Arc<PreparedWhen>, String> {
-    let spec = data::WhenSpec::parse(rule, threshold)?;
+    cached_report_period(input, rule, threshold, data::WhenPeriod::default(), None)
+}
+
+/// As [`cached_report`] with an explicit analysis period (part of the report key) and the
+/// structured source receipt for display. The period changes the key, so a report for
+/// another period is never returned.
+pub fn cached_report_period(
+    input: &tr_data::studio_canvas::CanvasInput,
+    rule: &str,
+    threshold: f64,
+    period: data::WhenPeriod,
+    receipt: Option<tr_data::source_receipt::SourceReceipt>,
+) -> Result<Arc<PreparedWhen>, String> {
+    let spec = data::WhenSpec::parse(rule, threshold)?.with_period(period);
     let key = data::input_key(input, &spec)?;
     let mut cache = ReportKey::new("studio.when.v1", &input.symbol, input.tf, &input.source, &[], rule);
     cache.inputs = key;
-    REPORTS.get_or_compute(cache, || data::compute(input, &spec).map(|r| prepare(r, rule.into())))
+    REPORTS.get_or_compute(cache, || {
+        data::compute(input, &spec).map(|r| {
+            let mut p = prepare(r, rule.into());
+            p.source_receipts = receipt.into_iter().collect();
+            p
+        })
+    })
 }
 
 pub fn cached_bootstrap(input: &PreparedWhen) -> Result<Arc<WhenBootstrap>, String> {
@@ -325,6 +349,10 @@ pub struct WhenPane {
     pub threshold: f64,
     /// Selected horizon: presentation only.
     pub horizon: usize,
+    /// Applied analysis period (daily only; part of the report key and copied command).
+    pub period: data::WhenPeriod,
+    /// Custom-start text field (`YYYY-MM-DD`).
+    pub period_draft: String,
     pub draft: String,
     pub draft_threshold: f64,
     pub generation: u64,
@@ -349,6 +377,8 @@ impl WhenPane {
             condition,
             threshold,
             horizon: if data::HORIZONS.contains(&horizon) { horizon } else { 6 },
+            period: data::WhenPeriod::default(),
+            period_draft: String::new(),
             generation: studio_token(),
             report: None,
             bootstrap: None,
@@ -356,6 +386,18 @@ impl WhenPane {
             boot_loading: false,
             error: None,
             boot_error: None,
+        }
+    }
+    pub fn with_period(mut self, period: data::WhenPeriod) -> Self {
+        self.period = period;
+        self
+    }
+    /// Period change: numbers clear and the next request carries the new period; responses
+    /// for the previous period no longer match the fresh generation.
+    pub fn set_period(&mut self, period: data::WhenPeriod) {
+        if self.period != period {
+            self.period = period;
+            self.clear();
         }
     }
     /// Refusal/edit/context change: clear numbers, mask and overlays; old
@@ -379,6 +421,7 @@ impl WhenPane {
             tf: self.tf,
             rule: self.condition.clone(),
             threshold: self.threshold,
+            period: self.period,
         });
     }
     pub fn accept(&mut self, generation: u64, result: Result<Arc<PreparedWhen>, String>) {
@@ -396,6 +439,7 @@ impl WhenPane {
                     && r.report.tf == self.tf
                     && r.requested_rule == self.condition
                     && r.report.spec.threshold_bp == self.threshold
+                    && (self.tf != Timeframe::D1 || r.report.spec.period == self.period)
                     && r.report.mask.receipt.provenance.is_verified() =>
             {
                 self.error = None;
@@ -423,7 +467,9 @@ impl WhenPane {
     /// Accepted rule runs for canvas shading, only while the report matches the applied rule.
     pub fn shading(&self) -> Option<(&[(i64, i64)], &str)> {
         let r = self.report.as_ref()?;
-        (r.requested_rule == self.condition && r.report.spec.threshold_bp == self.threshold)
+        (r.requested_rule == self.condition
+            && r.report.spec.threshold_bp == self.threshold
+            && (self.tf != Timeframe::D1 || r.report.spec.period == self.period))
             .then(|| (r.runs.as_slice(), r.shading_label.as_str()))
     }
     fn apply_draft(&mut self) -> Result<(), String> {
@@ -451,6 +497,9 @@ pub(super) fn show(ui: &mut Ui, id: u64, p: &mut WhenPane, worker: &Worker) -> V
         Err(e) => format!("Rule error: {e}"),
     };
     ui.label(RichText::new(echo).font(theme::mono(10.)).color(theme::muted()));
+    if p.tf == Timeframe::D1 {
+        period_row(ui, p);
+    }
     let edited = p.draft.trim() != p.condition || p.draft_threshold != p.threshold;
     if run {
         match p.apply_draft() {
@@ -467,8 +516,29 @@ pub(super) fn show(ui: &mut Ui, id: u64, p: &mut WhenPane, worker: &Worker) -> V
                 .color(theme::caution()),
         );
     }
-    if let Some(e) = &p.error {
-        ui.colored_label(theme::alert(), format!("When unavailable: {e}"));
+    if let Some(e) = p.error.clone() {
+        if e.starts_with(data::PERIOD_LIMIT_PREFIX) {
+            // Not a failure: the period is simply too long for the analysis grid.
+            let mut pick = None;
+            ui.horizontal_wrapped(|ui| {
+                ui.label(
+                    RichText::new(format!("{} ({}). Use a shorter period:", data::PERIOD_LIMIT_PREFIX, p.period.label()))
+                        .font(theme::ui_font(11.))
+                        .color(theme::caution()),
+                );
+                for y in data::WhenPeriod::PRESETS {
+                    let candidate = data::WhenPeriod::Years(y);
+                    if candidate != p.period && ui.small_button(format!("{y}Y")).clicked() {
+                        pick = Some(candidate);
+                    }
+                }
+            });
+            if let Some(period) = pick {
+                p.set_period(period);
+            }
+        } else {
+            ui.colored_label(theme::alert(), format!("When unavailable: {e}"));
+        }
     }
     if p.loading {
         ui.allocate_ui(vec2(ui.available_width(), BODY_HEIGHT), |ui| {
@@ -488,6 +558,60 @@ pub(super) fn show(ui: &mut Ui, id: u64, p: &mut WhenPane, worker: &Worker) -> V
         });
     }
     vec![]
+}
+
+/// Disclosed analysis period: 5Y / 10Y / 20Y / Custom start date. Daily only.
+fn period_row(ui: &mut Ui, p: &mut WhenPane) {
+    ui.horizontal_wrapped(|ui| {
+        ui.label(RichText::new("PERIOD").font(theme::ui_font(10.)).color(theme::muted()));
+        let mut pick = None;
+        for y in data::WhenPeriod::PRESETS {
+            let candidate = data::WhenPeriod::Years(y);
+            if ui.selectable_label(p.period == candidate, format!("{y}Y")).clicked() {
+                pick = Some(candidate);
+            }
+        }
+        let custom = matches!(p.period, data::WhenPeriod::Since(_));
+        let edit = ui.add(
+            egui::TextEdit::singleline(&mut p.period_draft)
+                .hint_text("Custom YYYY-MM-DD")
+                .desired_width(120.)
+                .font(theme::mono(11.)),
+        );
+        if custom {
+            ui.label(RichText::new("●").font(theme::ui_font(9.)).color(theme::accent()));
+        }
+        if edit.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) && !p.period_draft.trim().is_empty() {
+            match data::WhenPeriod::parse(p.period_draft.trim()) {
+                Ok(d @ data::WhenPeriod::Since(_)) => pick = Some(d),
+                _ => p.error = Some("Custom period is a start date, YYYY-MM-DD".into()),
+            }
+        }
+        if let Some(w) = p.report.as_ref().and_then(|r| r.report.window.as_ref()) {
+            ui.label(RichText::new(window_line(w, p.report.as_ref().map_or(0, |r| r.report.sessions))).font(theme::mono(10.)).color(theme::muted()));
+        }
+        if let Some(period) = pick {
+            p.set_period(period);
+        }
+    });
+}
+
+/// `Analysis period 10Y · Nov 21, 2016 → Nov 20, 2026 · 2,517 sessions · 1,000 warm-up bars not scored`.
+pub(super) fn window_line(w: &data::WhenWindow, sessions: usize) -> String {
+    let d = |t: i64| stamp(t).split(' ').next().unwrap_or_default().to_string();
+    format!(
+        "Analysis period {} · {} → {} · {} sessions{}{}",
+        w.period.label(),
+        d(w.scored_from),
+        d(w.scored_to),
+        tr_data::source_receipt::thousands(sessions),
+        if w.warmup_bars > 0 {
+            format!(" · {} warm-up bars not scored", tr_data::source_receipt::thousands(w.warmup_bars))
+        } else {
+            String::new()
+        },
+        if w.clipped { " · history starts later than requested" } else { "" }
+    )
 }
 
 /// Two normalised shared-bin distributions with a printed legend.
@@ -552,7 +676,10 @@ pub(super) fn view(
     horizon: &mut usize,
 ) -> Rect {
     let r = &p.report;
-    ui.label(RichText::new(&p.receipt).font(theme::mono(10.)).color(theme::muted()));
+    crate::widgets::source_chip(ui, "", &p.source_receipts, &[r.symbol.clone()], &p.receipt);
+    if let Some(w) = &r.window {
+        ui.label(RichText::new(window_line(w, r.sessions)).font(theme::mono(10.)).color(theme::muted()));
+    }
     ui.label(
         RichText::new(format!(
             "RULE {} · FIXED FAMILY m=8 (mean + event × h=1,3,6,12) · BY q · within-clock HAC",
@@ -843,3 +970,6 @@ mod tests {
         assert_eq!(r.cards.len(), 4);
     }
 }
+
+#[cfg(test)]
+mod period_tests;

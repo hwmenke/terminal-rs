@@ -19,6 +19,8 @@ pub struct NamedBars {
     pub error: Option<String>,
     /// Vault UNVERIFIED JOIN gaps `(last before, first after)`; no return spans one.
     pub gaps: Vec<(i64, i64)>,
+    /// Structured source receipt (display/Inspector/provider identity); not part of any cache key.
+    pub receipt: Option<crate::source_receipt::SourceReceipt>,
 }
 
 /// How bars are joined and annualised.
@@ -402,6 +404,9 @@ pub struct CorrReport {
     pub benchmark: String,
     pub provenance: Provenance,
     pub source: String,
+    /// Structured receipts for [asset, benchmark] (display and provider identity only).
+    #[serde(default)]
+    pub receipts: Vec<crate::source_receipt::SourceReceipt>,
     pub as_of: i64,
     #[serde(default)]
     pub closed_thru: i64,
@@ -748,6 +753,7 @@ pub fn compute_series_at_horizon(
         benchmark: benchmark.symbol.clone(),
         provenance: Bar::provenance(&asset.bars).combine(Bar::provenance(other)),
         source: source.into(),
+        receipts: [asset, benchmark].into_iter().filter_map(|r| r.receipt.clone()).collect(),
         as_of: prices.last().unwrap().0,
         closed_thru: prices.last().unwrap().0,
         observed_at: None,
@@ -935,6 +941,7 @@ mod tests {
             source: "unit".into(),
             error,
             gaps: vec![],
+            receipt: None,
         };
         let rows =
             vec![row("A", a.clone(), None), row("B", b.clone(), None), row("TLT", vec![], Some("no archive".into()))];

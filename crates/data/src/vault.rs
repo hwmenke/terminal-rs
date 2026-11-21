@@ -34,6 +34,8 @@ pub struct StitchInfo {
     /// `(last bar before, first bar after)` for every join that skips at least
     /// one whole cash session. Nothing is drawn or interpolated inside a gap.
     pub gaps: Vec<(i64, i64)>,
+    /// Structured daily-research receipt (provider id, closed-thru, bar count, attempts).
+    pub receipt: Option<crate::source_receipt::SourceReceipt>,
 }
 impl StitchInfo {
     pub fn label(&self) -> String {
@@ -402,6 +404,7 @@ impl BarVault {
             fetched_at: if quarantine { None } else { at },
             note,
             digest: bars_digest(&bars[..n]),
+            receipt: None,
         };
         Ok((bars, info))
     }

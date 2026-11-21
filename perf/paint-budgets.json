@@ -525,6 +525,21 @@
       "budget_us": 2000,
       "relative": false,
       "class": "frame"
+    },
+    "paint.studio_source_chip.steady.ui": {
+      "budget_us": 1200,
+      "relative": false,
+      "class": "frame"
+    },
+    "paint.studio_source_chip.steady.tess": {
+      "budget_us": 800,
+      "relative": false,
+      "class": "frame"
+    },
+    "paint.studio_source_chip.steady.total": {
+      "budget_us": 2000,
+      "relative": false,
+      "class": "frame"
     }
   }
 }

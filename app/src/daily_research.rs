@@ -4,10 +4,24 @@ use tr_core::{Bar, Timeframe};
 pub(crate) struct Receipt {
     pub bars: Vec<Bar>,
     pub source: String,
+    /// Stable id of the accepted source: `archive`, `whats-news` or the native provider id.
+    pub provider_id: String,
     pub fallback: Vec<String>,
     pub observed_at: i64,
 }
 impl Receipt {
+    /// Structured successful-source metadata, kept apart from the failed-attempt chain.
+    pub fn summary(&self) -> tr_data::source_receipt::SourceReceipt {
+        let mut s = tr_data::source_receipt::SourceReceipt::new(
+            &self.provider_id,
+            self.bars.len(),
+            self.bars.last().map(|b| b.ts),
+        );
+        s.observed_at = Some(self.observed_at);
+        s.attempts = self.fallback.clone();
+        s.detail = self.label();
+        s
+    }
     pub fn label(&self) -> String {
         let end = self
             .bars
@@ -47,7 +61,14 @@ where
         }
         .await;
         match result {
-            Ok((bars, source)) => return Ok(Receipt { bars, source, fallback, observed_at }),
+            Ok((bars, source)) => {
+                let provider_id = match i {
+                    0 => "archive".to_string(),
+                    1 => "whats-news".to_string(),
+                    _ => source.trim_end_matches(" (native provider)").to_ascii_lowercase(),
+                };
+                return Ok(Receipt { bars, source, provider_id, fallback, observed_at });
+            }
             Err(e) => fallback.push(format!("{name}: {e:#}")),
         }
     }
@@ -126,6 +147,31 @@ mod tests {
             assert!(error.contains(text), "{error}");
         }
     }
+    #[tokio::test]
+    async fn structured_receipt_keeps_success_apart_from_attempts() {
+        let receipt = resolve("SPX Index", 1_740_000_000, |stage| async move {
+            if stage < 2 {
+                anyhow::bail!("no daily history for stage {stage}");
+            }
+            Ok((bars(Provenance::Real), "yahoo (native provider)".into()))
+        })
+        .await
+        .unwrap();
+        let s = receipt.summary();
+        assert_eq!((s.provider_id.as_str(), s.provider.as_str(), s.bars), ("yahoo", "Yahoo", 4));
+        assert_eq!(s.attempts.len(), 2);
+        let chip = s.chip();
+        assert!(chip.starts_with("Yahoo · thru Jan 6") && chip.contains("4 bars"), "{chip}");
+        assert!(!chip.contains("fallback") && !chip.contains("no daily history"), "{chip}");
+        // The complete diagnostic text is preserved for hover, the Inspector and exports.
+        assert!(s.detail.contains("fallback:") && s.full().contains("no daily history for stage 1"));
+        assert_eq!(s.detail, receipt.label());
+        let archive = resolve("AAPL", 1_740_000_000, |_| async { Ok((bars(Provenance::Real), "x".into())) })
+            .await
+            .unwrap();
+        assert_eq!(archive.summary().provider_id, "archive");
+    }
+
     #[tokio::test]
     async fn pending_bar_is_withheld() {
         let receipt =

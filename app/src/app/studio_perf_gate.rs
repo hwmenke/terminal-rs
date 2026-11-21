@@ -174,6 +174,7 @@ fn perf_gate_paint_studios() {
     best.extend(lab_sample());
     best.extend(resid_sample());
     best.extend(attr_sample());
+    best.extend(source_chip_sample());
     let ids: BTreeSet<_> = budgets.cases.keys().filter(|id| id.starts_with("paint.studio_")).cloned().collect();
     assert_eq!(best.keys().cloned().collect::<BTreeSet<_>>(), ids, "stale/missing studio budgets");
     for _ in 0..2 {
@@ -197,6 +198,7 @@ fn perf_gate_paint_studios() {
             .chain(lab_sample())
             .chain(resid_sample())
             .chain(attr_sample())
+            .chain(source_chip_sample())
         {
             if s.median_us < best[&id].median_us {
                 best.insert(id, s);
@@ -1234,6 +1236,61 @@ fn when_guard(p: &super::studio_when::WhenPane, out: &egui::FullOutput, hover: b
             assert!(txt.contains(word), "When hover missing MathCard {word}: {txt}");
         }
     }
+}
+/// UX cleanup slice 1: forty compact source chips per frame (multi-series, long failed-attempt chain
+/// hidden on hover). Structured receipts are fixtures built here; nothing synthetic reaches the app.
+fn source_chip_frame(ctx: &egui::Context, index: usize) -> egui::FullOutput {
+    use tr_data::source_receipt::SourceReceipt;
+    let mut yahoo = SourceReceipt::new("yahoo", 24_841, Some(1_763_596_800));
+    yahoo.observed_at = Some(1_763_683_200);
+    yahoo.attempts = vec![
+        "Local research archive: Daily research refused: no history".into(),
+        "Whats-News (HTTP / SQLite): no daily history".into(),
+    ];
+    yahoo.detail = format!("yahoo (native provider) · fallback: {}", yahoo.attempts.join("; "));
+    let factor = SourceReceipt::new("yahoo", 9_100, Some(1_763_596_800));
+    let receipts = [yahoo, factor];
+    let mut out = ctx.run_ui(
+        egui::RawInput {
+            time: Some(1. + index as f64 * 0.2),
+            screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(1440., 1200.))),
+            ..Default::default()
+        },
+        |ui| {
+            for _ in 0..40 {
+                crate::widgets::source_chip(ui, "REAL", &receipts, &["SPX".into(), "SPY".into()], "legacy");
+            }
+        },
+    );
+    out.textures_delta.clear();
+    out
+}
+fn source_chip_sample() -> BTreeMap<String, Summary> {
+    let ctx = egui::Context::default();
+    for i in 0..20 {
+        finite(&ctx, source_chip_frame(&ctx, i));
+    }
+    let mut times: BTreeMap<String, Vec<f64>> = BTreeMap::new();
+    for i in 0..120 {
+        let start = Instant::now();
+        let mut out = source_chip_frame(&ctx, i + 20);
+        let ui_us = start.elapsed().as_secs_f64() * 1e6;
+        if i == 60 {
+            let txt = text(&out.shapes);
+            assert_eq!(txt.matches("REAL · Yahoo · thru Nov 20 · 24,841 bars · +1 series").count(), 40, "{txt}");
+            assert!(!txt.contains("fallback") && !txt.contains("no daily history"), "no text wall in the chip");
+            assert!(out.shapes.len() >= 40, "chips painted");
+        }
+        let start = Instant::now();
+        let primitives = ctx.tessellate(std::mem::take(&mut out.shapes), out.pixels_per_point);
+        let tess_us = start.elapsed().as_secs_f64() * 1e6;
+        assert!(!primitives.is_empty());
+        std::hint::black_box(primitives);
+        for (metric, v) in [("ui", ui_us), ("tess", tess_us), ("total", ui_us + tess_us)] {
+            times.entry(format!("paint.studio_source_chip.steady.{metric}")).or_default().push(v);
+        }
+    }
+    times.into_iter().map(|(id, mut s)| (id, tr_perf::summarize(&mut s))).collect()
 }
 fn when_sample() -> BTreeMap<String, Summary> {
     let mut result = BTreeMap::new();

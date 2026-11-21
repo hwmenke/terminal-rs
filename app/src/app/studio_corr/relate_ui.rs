@@ -238,6 +238,12 @@ fn expanding_beta(ui: &mut Ui, r: &CorrReport, rel: &RelateReport) {
     });
 }
 
+/// True only when both sides carry a structured receipt and the provider ids differ.
+/// Different bar counts or closed-thru dates from one provider are coverage, not a source change.
+pub(super) fn cross_source(rel: &RelateReport) -> bool {
+    tr_data::source_receipt::providers_differ(rel.receipts[0].as_ref(), rel.receipts[1].as_ref()) == Some(true)
+}
+
 /// Fit tile, expanding β, common-panel matrix and the source receipts.
 pub(super) fn panel(ui: &mut Ui, id: PaneId, r: &CorrReport, rel: &RelateReport) {
     ui.push_id(("relate-panel", id), |ui| {
@@ -252,18 +258,27 @@ pub(super) fn panel(ui: &mut Ui, id: PaneId, r: &CorrReport, rel: &RelateReport)
             .font(theme::ui_font(11.0))
             .color(theme::muted()),
         );
-        ui.label(
-            RichText::new(format!(
-                "asset: {} · benchmark: {} · CLOSED THRU {} · benchmark gaps {}",
-                rel.sources[0],
-                rel.sources[1],
-                stamp(r.closed_thru),
-                rel.benchmark_gaps.len()
-            ))
-            .font(theme::mono(10.0))
-            .color(theme::muted()),
+        let receipts: Vec<_> = rel.receipts.iter().flatten().cloned().collect();
+        // Unstructured fallback keeps the closed-thru date first so the one-line truncation never drops it.
+        let legacy = format!(
+            "CLOSED THRU {} · benchmark gaps {} · asset: {} · benchmark: {}",
+            stamp(r.closed_thru),
+            rel.benchmark_gaps.len(),
+            rel.sources[0],
+            rel.sources[1],
         );
-        if rel.sources[0] != rel.sources[1] {
+        let labels = [&r.symbol, &r.benchmark].map(|s| tr_data::security(s).ticker).to_vec();
+        ui.horizontal(|ui| {
+            crate::widgets::source_chip(ui, "", &receipts, &labels, &legacy);
+            if !rel.benchmark_gaps.is_empty() {
+                ui.label(
+                    RichText::new(format!("· benchmark gaps {}", rel.benchmark_gaps.len()))
+                        .font(theme::mono(10.0))
+                        .color(theme::muted()),
+                );
+            }
+        });
+        if cross_source(rel) {
             ui.label(
                 RichText::new("Cross-source: asset and benchmark come from different sources; timestamps are matched, values are not reconciled.")
                     .font(theme::ui_font(11.0))
@@ -337,4 +352,55 @@ pub(super) fn panel(ui: &mut Ui, id: PaneId, r: &CorrReport, rel: &RelateReport)
             ui.push_id("common-matrix", |ui| matrix_impl(ui, m, true));
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tr_data::{
+        source_receipt::SourceReceipt,
+        studio::Transform,
+        studio_corr::NamedBars,
+    };
+
+    fn report(a: Option<SourceReceipt>, b: Option<SourceReceipt>, sa: &str, sb: &str) -> RelateReport {
+        let row = |s: &str, source: &str, receipt| NamedBars {
+            symbol: s.into(),
+            source: source.into(),
+            receipt,
+            ..Default::default()
+        };
+        RelateReport::failed(
+            &RelateSpec::new("SPY", Transform::LogReturn { h: 1 }),
+            1,
+            "fixture".into(),
+            &row("AAPL", sa, a),
+            &row("SPY", sb, b),
+        )
+    }
+    fn receipt(provider: &str, bars: usize, day: i64) -> SourceReceipt {
+        SourceReceipt::new(provider, bars, Some(1_700_000_000 + day * 86_400))
+    }
+
+    /// Same provider with different bar counts / closed-thru dates is coverage, not a source change,
+    /// even though the full receipt strings differ.
+    #[test]
+    fn same_provider_different_counts_and_dates_does_not_warn() {
+        let rel = report(
+            Some(receipt("yahoo", 24_841, 0)),
+            Some(receipt("yahoo", 9_100, 3)),
+            "yahoo (native provider) · CLOSED THRU 2026-11-20 · 24841 bars · fallback: archive: none",
+            "yahoo (native provider) · CLOSED THRU 2026-11-17 · 9100 bars",
+        );
+        assert_ne!(rel.sources[0], rel.sources[1], "the old string comparison would have warned");
+        assert!(!cross_source(&rel));
+    }
+
+    #[test]
+    fn different_providers_warn_and_missing_structure_never_guesses() {
+        let rel = report(Some(receipt("yahoo", 100, 0)), Some(receipt("whats-news", 100, 0)), "a", "b");
+        assert!(cross_source(&rel));
+        let rel = report(Some(receipt("yahoo", 100, 0)), None, "a", "b");
+        assert!(!cross_source(&rel));
+    }
 }

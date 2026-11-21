@@ -133,6 +133,27 @@ Editing a draft keeps the previous accepted snapshot visible (with a caution
 note) until Run; a refusal, sample mode or native history revision clears the
 report, mask and shading.
 
+## Analysis period (daily)
+
+Daily When analyses the **latest 10 calendar years** of closed daily bars by
+default, anchored on the last closed bar (never the wall clock). The 5Y / 10Y /
+20Y / Custom (start date) controls change the disclosed period; the window line
+shows the period, dates, session count and warm-up. The command forms are
+`period=5y|10y|20y` and `since=YYYY-MM-DD` (keyed only: bare `5Y`, `10Y`, `20Y`
+remain tickers). Up to `WARMUP_BARS` (1,000 = the maximum feature period) closed
+bars before the window are read so indicators are warm, but those slots get no
+rule value, no bucket feature and no outcome: warm-up never enters a scored row.
+Missing-bar resets, stitch joins and horizon boundaries are unchanged inside the
+window; every report array, session row and the bootstrap are sliced to the
+window. A history that starts after the requested window is clipped and said so.
+`preflight()` counts expected sessions/slots before any grid or indicator work;
+over the limit (the limits themselves are unchanged: 120,000 slots / 20,000
+sessions) the pane shows a neutral "period exceeds the analysis limit" card with
+shorter-period buttons instead of a red failure. The period is part of the report
+key, the cache entry, the copied command (`… period=10y`) and the response match
+(a late response for another period is dropped). Intraday ignores the period.
+Saved layouts add `StudioInputs::when_period` (serde default = 10Y).
+
 ## Worker, keys and cache
 
 `Request::StudioWhen {pane, generation, symbol, tf, rule, threshold}` builds one

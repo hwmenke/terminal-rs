@@ -1159,3 +1159,70 @@ pub fn seq_key(p: &egui::Painter, at: Pos2, labels: &[&str]) {
         x += 12. + label.len() as f32 * 5.5 + 8.;
     }
 }
+
+// ---- source chip ------------------------------------------------------------------------------
+
+/// Chip line for a research pane: the first series' receipt (the target's own bar
+/// count, not an aligned sample size) plus `+N series` for the others.
+pub fn source_chip_text(receipts: &[tr_data::source_receipt::SourceReceipt]) -> Option<String> {
+    receipts.first().map(|r| r.chip_with(receipts.len() - 1))
+}
+
+/// Hover/Inspector text: every series' full receipt, including failed earlier attempts.
+pub fn source_chip_detail(
+    receipts: &[tr_data::source_receipt::SourceReceipt],
+    labels: &[String],
+    legacy: &str,
+) -> String {
+    if receipts.is_empty() {
+        return legacy.to_string();
+    }
+    receipts
+        .iter()
+        .enumerate()
+        .map(|(i, r)| match labels.get(i) {
+            Some(l) if !l.is_empty() => format!("{l}: {}", r.full()),
+            _ => r.full(),
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// One compact muted source line, e.g. `Yahoo · thru Nov 20 · 24,841 bars · +1 series`.
+/// The full chain (attempts, clocks, gaps) is on hover. Receipts missing: a short
+/// truncated legacy line, never the whole text wall.
+pub fn source_chip(
+    ui: &mut Ui,
+    lead: &str,
+    receipts: &[tr_data::source_receipt::SourceReceipt],
+    labels: &[String],
+    legacy: &str,
+) -> Response {
+    let body = source_chip_text(receipts).unwrap_or_else(|| {
+        let head: String = legacy.chars().take(48).collect();
+        if head.len() < legacy.len() { format!("{head}…") } else { head }
+    });
+    let text = if lead.is_empty() { body } else { format!("{lead} · {body}") };
+    let detail = source_chip_detail(receipts, labels, legacy);
+    ui.add(egui::Label::new(egui::RichText::new(text).font(theme::mono(10.)).color(theme::muted())).truncate())
+        .on_hover_text(detail)
+}
+
+#[cfg(test)]
+mod source_chip_tests {
+    use super::*;
+    use tr_data::source_receipt::SourceReceipt;
+    #[test]
+    fn chip_is_one_line_and_hover_keeps_chain() {
+        let mut a = SourceReceipt::new("yahoo", 24_841, Some(1_763_596_800));
+        a.attempts = vec!["Local research archive: no daily history".into(), "Whats-News: offline".into()];
+        let b = SourceReceipt::new("yahoo", 9_000, Some(1_763_596_800));
+        let text = source_chip_text(&[a.clone(), b.clone()]).unwrap();
+        assert!(text.starts_with("Yahoo · thru Nov 20") && text.contains("24,841 bars") && text.ends_with("+1 series"));
+        assert!(!text.contains("archive") && !text.contains('\n'));
+        let hover = source_chip_detail(&[a, b], &["AAPL".into(), "SPY".into()], "legacy");
+        assert!(hover.contains("AAPL:") && hover.contains("SPY:") && hover.contains("Whats-News: offline"));
+        assert_eq!(source_chip_detail(&[], &[], "legacy text"), "legacy text");
+        assert!(source_chip_text(&[]).is_none());
+    }
+}

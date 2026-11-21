@@ -32,6 +32,12 @@ pub const MAX_EXCLUDED: usize = DRAWS / 20;
 pub const MIN_EDGE_HISTORY: usize = 30;
 const MAX_GRID: usize = 120_000;
 const MAX_SESSIONS: usize = 20_000;
+/// Closed daily bars read before the analysis window so indicators are warm.
+/// They are never scored (the maximum declared feature period is 1,000).
+pub const WARMUP_BARS: usize = 1_000;
+/// Stable prefix of every "period too large" refusal (UI offers a shorter period).
+pub const PERIOD_LIMIT_PREFIX: &str = "When: period exceeds the analysis limit";
+pub const DEFAULT_PERIOD_YEARS: u32 = 10;
 const METHOD: &str = "when.v1|simple R bp|FE clock contrast|scalar-score Bartlett L=h+4|BY m=8|prior quintiles|session499";
 
 /// Bartlett lag for horizon `h`: overlap `h−1` plus five bars of persistence.
@@ -39,11 +45,83 @@ pub fn hac_lag(h: usize) -> usize {
     h - 1 + 5
 }
 
+/// Disclosed analysis period for daily When, anchored on the last closed bar.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WhenPeriod {
+    /// Latest N calendar years of closed daily observations.
+    Years(u32),
+    /// Custom start date through the last closed bar.
+    Since(chrono::NaiveDate),
+}
+impl Default for WhenPeriod {
+    fn default() -> Self {
+        Self::Years(DEFAULT_PERIOD_YEARS)
+    }
+}
+impl WhenPeriod {
+    pub const PRESETS: [u32; 3] = [5, 10, 20];
+    /// `5y`, `10Y` or `2015-01-01` (the value after `period=` / `since=`).
+    pub fn parse(s: &str) -> Result<Self, String> {
+        let t = s.trim();
+        if let Some(n) = t.strip_suffix(['y', 'Y']) {
+            let n: u32 = n.parse().map_err(|_| "period is 1y..100y or since=YYYY-MM-DD")?;
+            return if (1..=100).contains(&n) { Ok(Self::Years(n)) } else { Err("period is 1y..100y".into()) };
+        }
+        chrono::NaiveDate::parse_from_str(t, "%Y-%m-%d")
+            .map(Self::Since)
+            .map_err(|_| "period is 1y..100y or since=YYYY-MM-DD".into())
+    }
+    /// Command token: `period=10y` / `since=2015-01-01`.
+    pub fn token(&self) -> String {
+        match self {
+            Self::Years(n) => format!("period={n}y"),
+            Self::Since(d) => format!("since={}", d.format("%Y-%m-%d")),
+        }
+    }
+    pub fn label(&self) -> String {
+        match self {
+            Self::Years(n) => format!("{n}Y"),
+            Self::Since(d) => format!("since {}", d.format("%Y-%m-%d")),
+        }
+    }
+    fn hash_into(&self, h: &mut Fnv64) {
+        match self {
+            Self::Years(n) => h.write_str(&format!("period=years:{n}")),
+            Self::Since(d) => h.write_str(&format!("period=since:{d}")),
+        }
+    }
+    /// First calendar date that is scored, given the last closed bar's date.
+    fn first_scored(&self, end: chrono::NaiveDate) -> chrono::NaiveDate {
+        match self {
+            Self::Years(n) => end
+                .checked_sub_months(chrono::Months::new(12 * n))
+                .and_then(|d| d.succ_opt())
+                .unwrap_or(chrono::NaiveDate::MIN),
+            Self::Since(d) => *d,
+        }
+    }
+}
+
+/// What was actually analysed (disclosed beside every daily When result).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WhenWindow {
+    pub period: WhenPeriod,
+    pub scored_from: i64,
+    pub scored_to: i64,
+    /// Closed daily bars read before `scored_from` for indicator warm-up only.
+    pub warmup_bars: usize,
+    /// The source history starts after the requested window start.
+    pub clipped: bool,
+    pub available_from: i64,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct WhenSpec {
     pub conditions: Vec<Cmp>,
     pub horizons: [usize; 4],
     pub threshold_bp: f64,
+    /// Daily only; intraday history is already bounded by its fetch depth.
+    pub period: WhenPeriod,
 }
 impl Default for WhenSpec {
     fn default() -> Self {
@@ -67,7 +145,11 @@ impl WhenSpec {
                 bounded_feature(operand, &[]).map_err(|e| e.to_string())?;
             }
         }
-        Ok(Self { conditions, horizons: HORIZONS, threshold_bp })
+        Ok(Self { conditions, horizons: HORIZONS, threshold_bp, period: WhenPeriod::default() })
+    }
+    pub fn with_period(mut self, period: WhenPeriod) -> Self {
+        self.period = period;
+        self
     }
     /// Parsed echo, in input order.
     pub fn rule(&self) -> String {
@@ -97,6 +179,7 @@ pub struct WhenCommand {
     pub rule: Option<String>,
     pub horizon: Option<usize>,
     pub threshold: Option<f64>,
+    pub period: Option<WhenPeriod>,
 }
 
 /// Parse `5m RSI(14)<30`, `rule="RSI(14)<30 AND close>SMA(50)" h=6 threshold=10bp`.
@@ -135,6 +218,10 @@ pub fn parse_command(s: &str) -> Result<WhenCommand, String> {
             let t = x.strip_suffix("bp").unwrap_or(x).parse::<f64>().map_err(|_| "threshold is in bp, e.g. 10bp")?;
             if out.threshold.replace(t).is_some() {
                 return Err("Repeated threshold".into());
+            }
+        } else if let Some(x) = lower.strip_prefix("period=").or_else(|| lower.strip_prefix("since=")) {
+            if out.period.replace(WhenPeriod::parse(x)?).is_some() {
+                return Err("Repeated period".into());
             }
         } else if lower.starts_with("rule=") {
             rule.push(w[5..].to_string());
@@ -222,6 +309,8 @@ pub struct WhenReport {
     /// Per expected session and horizon: [rule n, rule hits, rest n, rest hits].
     pub session_rows: Vec<[[usize; 4]; 4]>,
     pub session_breaks: Vec<bool>,
+    /// Daily analysis window (None for intraday).
+    pub window: Option<WhenWindow>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -267,6 +356,10 @@ pub fn input_key(input: &CanvasInput, spec: &WhenSpec) -> Result<u64, String> {
     hash.write_str("complement=all other admitted scored slots");
     hash.write_str(&canonical.canonical());
     hash.write_u64(spec.threshold_bp.to_bits());
+    if input.tf == Timeframe::D1 {
+        spec.period.hash_into(&mut hash);
+        hash.write_u64(WARMUP_BARS as u64);
+    }
     Ok(hash.finish())
 }
 
@@ -382,11 +475,55 @@ fn grid(tf: Timeframe, bars: &[Bar], gaps: &[(i64, i64)]) -> Result<Grid, String
         g.session_breaks.push(joined);
         g.sessions += 1;
         if g.ts.len() > MAX_GRID || g.sessions > MAX_SESSIONS {
-            return Err("When expected grid exceeds 120,000 slots / 20,000 sessions".into());
+            return Err(format!("{PERIOD_LIMIT_PREFIX} (expected grid over {MAX_GRID} slots / {MAX_SESSIONS} sessions)"));
         }
         day = crate::history::calendar::next_session(day);
     }
     Ok(g)
+}
+
+/// Expected `(sessions, slots)` between two timestamps, checked against the
+/// grid limits *before* any grid, indicator or bootstrap work. The limits are
+/// unchanged; callers shorten the period instead.
+pub fn preflight(tf: Timeframe, first_ts: i64, last_ts: i64) -> Result<(usize, usize), String> {
+    let mut day = date(first_ts, tf);
+    if !crate::history::calendar::is_session(day) {
+        day = crate::history::calendar::next_session(day);
+    }
+    let end_day = date(last_ts, tf);
+    let (mut sessions, mut slots) = (0usize, 0usize);
+    while day <= end_day {
+        sessions += 1;
+        slots += if tf == Timeframe::D1 { 1 } else { crate::intraday::regular_opens(day, tf).len() };
+        if sessions > MAX_SESSIONS || slots > MAX_GRID {
+            return Err(format!(
+                "{PERIOD_LIMIT_PREFIX}: more than {MAX_SESSIONS} sessions / {MAX_GRID} slots. Choose a shorter period."
+            ));
+        }
+        day = crate::history::calendar::next_session(day);
+    }
+    Ok((sessions, slots))
+}
+
+/// Trim closed daily bars to `[warm-up | scored window]`. Returns the bars to
+/// read and the number of leading warm-up bars (never scored).
+fn apply_period(bars: Vec<Bar>, period: &WhenPeriod) -> Result<(Vec<Bar>, WhenWindow), String> {
+    let end = date(bars.last().map_or(0, |b| b.ts), Timeframe::D1);
+    let from = period.first_scored(end);
+    let first = bars.partition_point(|b| date(b.ts, Timeframe::D1) < from);
+    if first >= bars.len() {
+        return Err(format!("When: no closed bars inside the analysis period ({})", period.label()));
+    }
+    let warm = first.min(WARMUP_BARS);
+    let window = WhenWindow {
+        period: *period,
+        scored_from: bars.get(first).map_or(0, |b| b.ts),
+        scored_to: bars.last().map_or(0, |b| b.ts),
+        warmup_bars: warm,
+        clipped: first == 0 && bars.first().is_some_and(|b| date(b.ts, Timeframe::D1) > from),
+        available_from: bars.first().map_or(0, |b| b.ts),
+    };
+    Ok((bars[first - warm..].to_vec(), window))
 }
 
 /// Prior-only expanding Type-7 quintile edges: slot `i` sees only finite
@@ -455,8 +592,17 @@ pub fn compute(input: &CanvasInput, spec: &WhenSpec) -> Result<WhenReport, Strin
     if bars.is_empty() {
         return Err("When: no closed regular-session bars".into());
     }
+    let (bars, window) = if input.tf == Timeframe::D1 {
+        let (b, w) = apply_period(bars, &spec.period)?;
+        (b, Some(w))
+    } else {
+        (bars, None)
+    };
+    preflight(input.tf, bars[0].ts, bars[bars.len() - 1].ts)?;
     let gaps = input.stitch.as_ref().map_or(&[][..], |s| s.gaps.as_slice());
     let g = grid(input.tf, &bars, gaps)?;
+    // Slots before the window only warm indicators; they are never scored.
+    let scored_from = window.as_ref().map_or(i64::MIN, |w| w.scored_from);
     let n = g.ts.len();
     // Indicators run over contiguous observed runs; they reset at missing
     // expected bars and stitch joins but carry normal session transitions.
@@ -485,11 +631,16 @@ pub fn compute(input: &CanvasInput, spec: &WhenSpec) -> Result<WhenReport, Strin
         }
         let f = bounded_feature(&bucket_operand, &run).map_err(|e| e.to_string())?;
         for j in 0..run.len() {
+            if g.ts[start + j] < scored_from {
+                continue;
+            }
             group[start + j] = valid[j].then_some(mask[j]);
             feature[start + j] = f[j];
         }
         start = stop;
     }
+    let w0 = g.ts.partition_point(|t| *t < scored_from);
+    let s0 = g.session.get(w0).copied().unwrap_or(0);
     let edges = prior_quintiles(&feature);
     let bucket_slots: Vec<Option<usize>> = (0..n)
         .map(|i| edges[i].zip(feature[i]).map(|(e, x)| e.iter().filter(|edge| x > **edge).count()))
@@ -587,9 +738,9 @@ pub fn compute(input: &CanvasInput, spec: &WhenSpec) -> Result<WhenReport, Strin
         c.q_hit = q[2 * i + 1];
     }
     let mask = ScalarSeries {
-        ts: g.ts,
-        values: group.into_iter().map(|g| g.map(f64::from)).collect(),
-        break_before: g.breaks,
+        ts: g.ts[w0..].to_vec(),
+        values: group.into_iter().skip(w0).map(|g| g.map(f64::from)).collect(),
+        break_before: g.breaks[w0..].to_vec(),
         unit: SeriesUnit::Native("rule (1) / complement (0)".into()),
         receipt: level.receipt,
     };
@@ -602,11 +753,12 @@ pub fn compute(input: &CanvasInput, spec: &WhenSpec) -> Result<WhenReport, Strin
         cells,
         buckets,
         bucket_feature: bucket_operand,
-        edges,
-        bucket_slots,
-        sessions: g.sessions,
-        session_rows: rows,
-        session_breaks: g.session_breaks,
+        edges: edges[w0..].to_vec(),
+        bucket_slots: bucket_slots[w0..].to_vec(),
+        sessions: g.sessions - s0,
+        session_rows: rows[s0..].to_vec(),
+        session_breaks: g.session_breaks[s0..].to_vec(),
+        window,
     })
 }
 
@@ -1223,3 +1375,6 @@ mod tests {
         assert_ne!(subset_from_dist(&r, (span.0, span.1 + 300)).unwrap().key, s.key);
     }
 }
+
+#[cfg(test)]
+mod period_tests;

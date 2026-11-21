@@ -42,6 +42,8 @@ pub enum Request {
         tf: Timeframe,
         rule: String,
         threshold: f64,
+        /// Daily analysis period (ignored for intraday).
+        period: tr_data::studio_when::WhenPeriod,
     },
     /// Second-stage session-block bootstrap for an accepted When report.
     StudioWhenBootstrap {
@@ -2000,6 +2002,16 @@ async fn native_fetch_with_clock(
 
 /// Whole-series daily admission; no display-cache reads or provider splicing.
 async fn research_daily(s: &Shared, bridge: &tr_data::whats_news::Bridge, key: &str) -> anyhow::Result<(Vec<Bar>, String)> {
+    let (bars, receipt) = research_daily_receipt(s, bridge, key).await?;
+    Ok((bars, receipt.detail))
+}
+
+/// Same admission, with the structured receipt (provider id, closed-thru, bars, attempts).
+async fn research_daily_receipt(
+    s: &Shared,
+    bridge: &tr_data::whats_news::Bridge,
+    key: &str,
+) -> anyhow::Result<(Vec<Bar>, tr_data::source_receipt::SourceReceipt)> {
     let ticker = tr_data::whats_news::archive_ticker(key);
     let receipt = crate::daily_research::resolve(key, chrono::Utc::now().timestamp(), |stage| {
         let ticker = ticker.clone();
@@ -2025,8 +2037,8 @@ async fn research_daily(s: &Shared, bridge: &tr_data::whats_news::Bridge, key: &
             }
         }
     }).await?;
-    let label = receipt.label();
-    Ok((receipt.bars, label))
+    let summary = receipt.summary();
+    Ok((receipt.bars, summary))
 }
 
 /// Research reads: daily goes through the archive-first verified source chain
@@ -2047,8 +2059,15 @@ async fn research_history(
         anyhow::bail!("{operation} refused: sample / offline display mode");
     }
     let bridge = s.whats_news.borrow().1.bridge();
-    let (bars, source) = research_daily(s, &bridge, symbol).await?;
-    let info = tr_data::vault::StitchInfo { source, fetched_at: Some(chrono::Utc::now().timestamp()), live_ok: true, live_bars: bars.len(), ..Default::default() };
+    let (bars, receipt) = research_daily_receipt(s, &bridge, symbol).await?;
+    let info = tr_data::vault::StitchInfo {
+        source: receipt.detail.clone(),
+        fetched_at: Some(chrono::Utc::now().timestamp()),
+        live_ok: true,
+        live_bars: bars.len(),
+        receipt: Some(receipt),
+        ..Default::default()
+    };
     Ok((bars, info))
 }
 
@@ -4528,31 +4547,37 @@ async fn handle_inner(s: &Arc<Shared>, req: Request, force: bool) {
                 result: research_desk(s, &bridge, &symbols).await.map_err(|e| format!("{e:#}")),
             });
         }
-        Request::StudioWhen { pane, generation, symbol, tf, rule, threshold } => {
+        Request::StudioWhen { pane, generation, symbol, tf, rule, threshold, period } => {
             let result = async {
                 if s.sample_mode() {
                     anyhow::bail!("When: sample mode has no research data");
                 }
                 // Bounded string parse before any provider call.
                 tr_data::studio_when::WhenSpec::parse(&rule, threshold).map_err(anyhow::Error::msg)?;
-                let (bars, source, observed_at, stitch) = if tf == Timeframe::D1 {
-                    let (bars, source) =
-                        research_daily(s, &config.bridge(), &symbol).await?;
-                    (bars, source, Some(chrono::Utc::now().timestamp()), None)
+                let (bars, source, observed_at, stitch, receipt) = if tf == Timeframe::D1 {
+                    let (bars, receipt) = research_daily_receipt(s, &config.bridge(), &symbol).await?;
+                    (bars, receipt.detail.clone(), Some(chrono::Utc::now().timestamp()), None, Some(receipt))
                 } else {
                     if !tr_data::cash_session::cash_bar_size(tf) {
                         anyhow::bail!("When: unsupported session interval");
                     }
                     let (bars, info) =
                         research_history(s, &symbol, tf, tr_data::cash_session::research_fetch_limit(tf), "When").await?;
-                    (bars, info.label(), info.fetched_at, Some(Arc::new(info)))
+                    let mut r = tr_data::source_receipt::SourceReceipt::new(
+                        &info.source,
+                        bars.len(),
+                        bars.last().map(|b| b.ts),
+                    );
+                    r.observed_at = info.fetched_at;
+                    r.detail = info.label();
+                    (bars, info.label(), info.fetched_at, Some(Arc::new(info)), (!r.provider_id.is_empty()).then_some(r))
                 };
                 let input =
                     tr_data::studio_canvas::CanvasInput { symbol, tf, bars: Arc::new(bars), source, observed_at, stitch };
                 let jobs = s.jobs.clone();
                 tokio::task::spawn_blocking(move || {
                     let _job = crate::perf::JobTimer::new(&jobs, "StudioWhen");
-                    crate::app::studio_when::cached_report(&input, &rule, threshold)
+                    crate::app::studio_when::cached_report_period(&input, &rule, threshold, period, receipt)
                 })
                 .await?
                 .map_err(anyhow::Error::msg)
