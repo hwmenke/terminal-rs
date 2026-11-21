@@ -141,17 +141,24 @@ fn conditions(bars: &[Bar], label: &str) -> Conditions {
         unavailable: None,
     }
 }
-fn validate(bars: &[Bar]) -> std::result::Result<(), String> {
+/// Date/OHLC (and optionally finite volume) admission. Scanner views pass
+/// `require_volume = false`: a missing (NaN) volume is a valid observation there.
+pub(super) fn validate_ohlc(bars: &[Bar], require_volume: bool) -> std::result::Result<(), String> {
     if bars.is_empty() {
         return Err("missing daily history".into());
     }
     if bars.iter().any(|b| {
+        let volume_bad = if require_volume {
+            !b.volume.is_finite() || b.volume < 0.0
+        } else {
+            !(b.volume.is_nan() || (b.volume.is_finite() && b.volume >= 0.0))
+        };
         chrono::DateTime::from_timestamp(b.ts, 0).is_none()
-            || ![b.open, b.high, b.low, b.close, b.volume].iter().all(|v| v.is_finite())
+            || ![b.open, b.high, b.low, b.close].iter().all(|v| v.is_finite())
+            || volume_bad
             || b.low <= 0.0
             || b.open <= 0.0
             || b.close <= 0.0
-            || b.volume < 0.0
             || b.high < b.open.max(b.close).max(b.low)
             || b.low > b.open.min(b.close)
     }) {
@@ -160,6 +167,10 @@ fn validate(bars: &[Bar]) -> std::result::Result<(), String> {
     if bars.windows(2).any(|b| b[0].ts >= b[1].ts) {
         return Err("daily bars must have unique ascending dates".into());
     }
+    Ok(())
+}
+fn validate(bars: &[Bar]) -> std::result::Result<(), String> {
+    validate_ohlc(bars, true)?;
     if bars.len() < 30 {
         return Err(format!("insufficient daily history: need 30 bars, have {}", bars.len()));
     }
@@ -235,27 +246,78 @@ pub fn calculate(b: &[Bar]) -> std::result::Result<Metrics, String> {
     }
     Ok(metrics)
 }
+/// 128-bit content key (FNV + independent SipHash) plus len and last_ts. Stores no bars,
+/// so a 1024-entry cache stays small; any corrected bar changes both digests.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+struct CalcKey {
+    len: usize,
+    last_ts: i64,
+    fnv: u64,
+    sip: u64,
+}
+impl CalcKey {
+    fn of(bars: &[Bar]) -> Self {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        for b in bars {
+            b.ts.hash(&mut h);
+            for v in [b.open, b.high, b.low, b.close, b.volume] {
+                v.to_bits().hash(&mut h);
+            }
+            b.provenance.is_verified().hash(&mut h);
+        }
+        Self {
+            len: bars.len(),
+            last_ts: bars.last().map_or(0, |b| b.ts),
+            fnv: crate::stable_hash::bars_digest(bars),
+            sip: h.finish(),
+        }
+    }
+}
+const CALC_CACHE_CAP: usize = 1024;
 #[derive(Default)]
 struct CalculationCache {
-    entries: Vec<(Vec<Bar>, std::result::Result<Metrics, String>)>,
+    map: std::collections::HashMap<CalcKey, (u64, std::result::Result<Metrics, String>)>,
+    tick: u64,
 }
 impl CalculationCache {
-    fn get(&mut self, bars: &[Bar]) -> std::result::Result<Metrics, String> {
-        if let Some((_, metrics)) = self.entries.iter().find(|(b, _)| b == bars) {
-            return metrics.clone();
-        }
-        let metrics = calculate(bars);
-        if self.entries.len() == 64 {
-            let _ = self.entries.remove(0);
-        }
-        self.entries.push((bars.to_vec(), metrics.clone()));
-        metrics
+    fn get(&mut self, key: &CalcKey) -> Option<std::result::Result<Metrics, String>> {
+        self.tick += 1;
+        let tick = self.tick;
+        self.map.get_mut(key).map(|e| {
+            e.0 = tick;
+            e.1.clone()
+        })
     }
+    fn insert(&mut self, key: CalcKey, value: std::result::Result<Metrics, String>) {
+        self.tick += 1;
+        if !self.map.contains_key(&key) && self.map.len() >= CALC_CACHE_CAP {
+            if let Some(oldest) = self.map.iter().min_by_key(|(_, (t, _))| *t).map(|(k, _)| *k) {
+                self.map.remove(&oldest);
+            }
+        }
+        self.map.insert(key, (self.tick, value));
+    }
+}
+/// Lock → lookup → unlock → compute without the lock → lock → insert. Returns (result, hit).
+fn cached_with(
+    cache: &Mutex<CalculationCache>,
+    bars: &[Bar],
+    compute: impl FnOnce(&[Bar]) -> std::result::Result<Metrics, String>,
+) -> (std::result::Result<Metrics, String>, bool) {
+    let key = CalcKey::of(bars);
+    let hit = cache.lock().unwrap().get(&key);
+    if let Some(hit) = hit {
+        return (hit, true);
+    }
+    let value = compute(bars);
+    cache.lock().unwrap().insert(key, value.clone());
+    (value, false)
 }
 /// Cached metrics for daily bars; callers must check provenance before using setup hits.
 pub fn cached_calculate(bars: &[Bar]) -> std::result::Result<Metrics, String> {
     static CACHE: OnceLock<Mutex<CalculationCache>> = OnceLock::new();
-    CACHE.get_or_init(|| Mutex::new(CalculationCache::default())).lock().unwrap().get(bars)
+    cached_with(CACHE.get_or_init(|| Mutex::new(CalculationCache::default())), bars, calculate).0
 }
 /// Whether `name` is active on verified daily bars. Sample / unverified history is refused.
 pub fn setup_active(name: &str, bars: &[Bar]) -> std::result::Result<bool, String> {
@@ -275,16 +337,14 @@ pub fn setup_active_with_spy(name: &str, bars: &[Bar], spy: Option<&[Bar]>) -> s
         let spy = spy.ok_or_else(|| "SPY benchmark unavailable for O'Neil setup".to_string())?;
         Bar::require_verified(spy, "SPY benchmark")
             .map_err(|e| format!("SPY benchmark unavailable: {e}"))?;
-        m.oneil_lens = super::scan_pack::measure_oneil(
-            &bars.iter().map(|b| b.close).collect::<Vec<_>>(),
-            Some(&spy.iter().map(|b| b.close).collect::<Vec<_>>()),
+        m.oneil_lens = super::scan_pack::OneilMetrics::from_relative_return(
+            tr_core::indicators::daily_relative_return(bars, spy, super::scan_pack::RS_BARS),
         );
     } else if name == "ALL" {
         if let Some(spy) = spy {
             if Bar::require_verified(spy, "SPY benchmark").is_ok() {
-                m.oneil_lens = super::scan_pack::measure_oneil(
-                    &bars.iter().map(|b| b.close).collect::<Vec<_>>(),
-                    Some(&spy.iter().map(|b| b.close).collect::<Vec<_>>()),
+                m.oneil_lens = super::scan_pack::OneilMetrics::from_relative_return(
+                    tr_core::indicators::daily_relative_return(bars, spy, super::scan_pack::RS_BARS),
                 );
             }
         }
@@ -354,14 +414,13 @@ impl ScanCache {
         let mut scan = Scan { provenance, scanned: 0, results: vec![], skipped: vec![] };
         let mut candidates = vec![];
         let spy = histories.iter().find(|(s, _)| crate::security(s).ticker == "SPY").map(|(_, b)| b);
-        let spy_close = spy.map(|bars| bars.iter().map(|b| b.close).collect::<Vec<_>>());
         for (symbol, b) in &histories {
             let m = match cached_calculate(b) {
                 Ok(mut m) => {
-                    m.oneil_lens = super::scan_pack::measure_oneil(&b.iter().map(|b| b.close).collect::<Vec<_>>(), spy_close.as_deref());
-                    if let Some(spy) = spy {
-                        m.rs_spy_63d = tr_core::indicators::daily_relative_return(b, spy, 63);
-                    }
+                    // Dated alignment on the symbol's own sessions; one pass feeds both fields.
+                    let rs = spy.and_then(|spy| tr_core::indicators::daily_relative_return(b, spy, super::scan_pack::RS_BARS));
+                    m.rs_spy_63d = rs;
+                    m.oneil_lens = super::scan_pack::OneilMetrics::from_relative_return(rs);
                     m
                 }
                 Err(reason) => {
@@ -969,15 +1028,110 @@ mod tests {
         assert!(setup_active("NEAR_HIGH", &sample).unwrap_err().contains("SAMPLE"));
         assert!(setup_active("NEAR_HIGH", &bars(30)).unwrap());
         assert!(cache.scan("TYPO", input, Provenance::Cached).is_err());
-        let mut cache = CalculationCache::default();
+        let cache = Mutex::new(CalculationCache::default());
         let mut b = bars(30);
-        let original = cache.get(&b).unwrap();
-        assert_eq!(cache.entries.len(), 1);
-        cache.get(&b).unwrap();
-        assert_eq!(cache.entries.len(), 1);
+        let original = cached_with(&cache, &b, calculate).0.unwrap();
+        assert_eq!(cache.lock().unwrap().map.len(), 1);
+        assert!(cached_with(&cache, &b, calculate).1);
+        assert_eq!(cache.lock().unwrap().map.len(), 1);
         b[29].volume = 200.0;
-        assert_ne!(cache.get(&b).unwrap().volume, original.volume);
-        assert_eq!(cache.entries.len(), 2);
+        assert_ne!(cached_with(&cache, &b, calculate).0.unwrap().volume, original.volume);
+        assert_eq!(cache.lock().unwrap().map.len(), 2);
+    }
+    fn varied(n: usize, seed: usize) -> Vec<Bar> {
+        (0..n)
+            .map(|i| bar(d("2023-01-02") + Days::days(i as i64), 100.0 + ((i * 7 + seed * 13) % 23) as f64 + seed as f64 * 0.01))
+            .collect()
+    }
+    #[test]
+    fn calc_cache_corrected_old_bar_misses() {
+        let cache = Mutex::new(CalculationCache::default());
+        let mut b = varied(300, 1);
+        let first = cached_with(&cache, &b, calculate);
+        assert!(!first.1);
+        b[5].close += 3.0;
+        b[5].high += 3.0;
+        let second = cached_with(&cache, &b, calculate);
+        assert!(!second.1, "same len and last bar but a corrected old bar must miss");
+        assert_eq!(cache.lock().unwrap().map.len(), 2);
+        assert_ne!(first.0.unwrap().daily.rsi, second.0.unwrap().daily.rsi);
+    }
+    #[test]
+    fn calc_cache_500_names_second_pass_all_hits() {
+        let cache = Mutex::new(CalculationCache::default());
+        let all: Vec<_> = (0..500).map(|i| varied(60, i)).collect();
+        assert!(all.iter().all(|b| !cached_with(&cache, b, calculate).1));
+        assert!(all.iter().all(|b| cached_with(&cache, b, calculate).1));
+        assert_eq!(cache.lock().unwrap().map.len(), 500);
+    }
+    #[test]
+    fn calc_cache_lru_evicts_least_recent_at_1024() {
+        let cache = Mutex::new(CalculationCache::default());
+        let all: Vec<_> = (0..CALC_CACHE_CAP + 1).map(|i| varied(40 + i % 3, i)).collect();
+        let dummy = |_: &[Bar]| Err::<Metrics, String>("x".into());
+        for b in &all[..CALC_CACHE_CAP] {
+            let _ = cached_with(&cache, b, dummy);
+        }
+        assert!(cached_with(&cache, &all[0], dummy).1, "touch the oldest entry");
+        let _ = cached_with(&cache, &all[CALC_CACHE_CAP], dummy);
+        assert_eq!(cache.lock().unwrap().map.len(), CALC_CACHE_CAP);
+        assert!(cached_with(&cache, &all[0], dummy).1, "recently touched survives");
+        assert!(!cached_with(&cache, &all[1], dummy).1, "least recent was evicted");
+    }
+    #[test]
+    fn calc_cache_lock_not_held_during_compute() {
+        let cache = Mutex::new(CalculationCache::default());
+        let (r, hit) = cached_with(&cache, &bars(30), |b| {
+            assert!(cache.try_lock().is_ok(), "lock must be free while computing");
+            calculate(b)
+        });
+        assert!(r.is_ok() && !hit);
+    }
+    fn dated_bars(closes: impl Iterator<Item = f64>) -> Vec<Bar> {
+        closes.enumerate().map(|(i, c)| bar(d("2024-01-02") + Days::days(i as i64), c)).collect()
+    }
+    /// Stale symbol (D0..D99, last 110) vs SPY D0..D199 close 100+i; own-dates result is -24.82.
+    #[test]
+    fn oneil_stale_symbol_uses_own_dates_not_newer_spy_window() {
+        let spy = dated_bars((0..200).map(|i| 100.0 + i as f64));
+        let sym = dated_bars((0..100).map(|i| if i == 99 { 110.0 } else { 100.0 }));
+        let expected = super::super::scan_pack::OneilMetrics { rs_spy_pct: Some(-24.82), oneil_rs: false };
+        let hist = vec![("WIN".to_string(), sym.clone()), ("SPY".to_string(), spy.clone())];
+        // Path 1: ScanCache::scan with SPY in the universe.
+        let mut all = ScanCache::default().scan("ALL", hist.clone(), Provenance::Real).unwrap().0;
+        let m = all.results.iter().find(|r| r.symbol == "WIN").unwrap().metrics.clone().unwrap();
+        assert_eq!(m.oneil_lens, expected);
+        assert!((m.rs_spy_63d.unwrap() + 24.8241).abs() < 1e-3);
+        // Path 2: apply_spy_benchmark.
+        crate::whats_news::apply_spy_benchmark(&mut all, &hist, Some(&spy)).unwrap();
+        let m = all.results.iter().find(|r| r.symbol == "WIN").unwrap().metrics.clone().unwrap();
+        assert_eq!(m.oneil_lens, expected);
+        // Path 3: setup_active_with_spy. A 140 close is positive positionally (+10.5) but negative dated.
+        let mut strong = sym.clone();
+        strong[99].close = 140.0;
+        strong[99].high = 141.0;
+        assert!(!setup_active_with_spy("ONEIL_LENS", &strong, Some(&spy)).unwrap());
+        assert!(!setup_active_with_spy("ONEIL_LENS", &sym, Some(&spy)).unwrap());
+        // The positional Python-parity function would have said -13.18 for the stale case.
+        let closes = |b: &[Bar]| b.iter().map(|b| b.close).collect::<Vec<_>>();
+        assert_eq!(
+            super::super::scan_pack::measure_oneil(&closes(&sym), Some(&closes(&spy))).rs_spy_pct,
+            Some(-13.18)
+        );
+    }
+    #[test]
+    fn oneil_missing_spy_start_date_none() {
+        let mut spy = dated_bars((0..200).map(|i| 100.0 + i as f64));
+        spy.remove(36);
+        let sym = dated_bars((0..100).map(|i| if i == 99 { 110.0 } else { 100.0 }));
+        let hist = vec![("WIN".to_string(), sym.clone()), ("SPY".to_string(), spy.clone())];
+        let mut all = ScanCache::default().scan("ALL", hist.clone(), Provenance::Real).unwrap().0;
+        let m = all.results.iter().find(|r| r.symbol == "WIN").unwrap().metrics.clone().unwrap();
+        assert_eq!((m.rs_spy_63d, m.oneil_lens.rs_spy_pct, m.oneil_lens.oneil_rs), (None, None, false));
+        crate::whats_news::apply_spy_benchmark(&mut all, &hist, Some(&spy)).unwrap();
+        let m = all.results.iter().find(|r| r.symbol == "WIN").unwrap().metrics.clone().unwrap();
+        assert_eq!((m.rs_spy_63d, m.oneil_lens.rs_spy_pct, m.oneil_lens.oneil_rs), (None, None, false));
+        assert!(!setup_active_with_spy("ONEIL_LENS", &sym, Some(&spy)).unwrap());
     }
     #[test]
     fn relative_strength_ties_same_date_cohorts_and_universe_before_filtering() {

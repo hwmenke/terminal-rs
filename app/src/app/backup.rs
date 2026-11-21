@@ -67,6 +67,10 @@ impl TerminalApp {
             self.status = "EXPORT SCAN needs an open SCAN or UNIV pane with results".into();
             return;
         };
+        if pane.view.is_some() {
+            self.status = "EXPORT SCAN does not cover SCAN VIEW boards yet".into();
+            return;
+        }
         let doc = if let Some(snapshot) = &pane.results {
             env::scan_document(pane.scan.as_deref().unwrap_or("SCAN"), snapshot, Some(&pane.filter), env::now_rfc3339())
         } else if let Some(snapshot) = &pane.universe {

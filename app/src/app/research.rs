@@ -2,7 +2,9 @@
 use super::watchlists::{Member, Origin};
 use crate::{congress_view::Action, worker::Request};
 use egui::{Key, RichText, Ui};
-use tr_data::whats_news::{Condition, Scan, ScanFilter, Snapshot, Sort, Symbol};
+use tr_data::whats_news::{Condition, Scan, ScanFilter, ScanViewSpec, Snapshot, Sort, Symbol};
+
+pub(crate) mod scan_view;
 
 /// Counts each setup once per row, in the scanner's canonical display order.
 fn setup_tag_counts(rows: &[tr_data::whats_news::ScanRow], selected: Option<&str>) -> Vec<(String, usize)> {
@@ -95,6 +97,8 @@ pub struct ResearchPane {
     selected: usize,
     scroll_selected: bool,
     page_rows: usize,
+    /// `SCAN VIEW PATTERN` / `RSI-C` board state; `scan` holds the canonical `VIEW …` string.
+    pub view: Option<scan_view::ScanViewPane>,
 }
 
 impl ResearchPane {
@@ -146,6 +150,16 @@ impl ResearchPane {
     }
 
     pub fn new(scan: Option<String>) -> Self {
+        // A leading `VIEW` word selects a scanner view; the canonical string is what persists.
+        let view = scan.as_deref().and_then(ScanViewSpec::parse).map(scan_view::ScanViewPane::new);
+        let scan = match view.as_ref().map(|v| &v.spec) {
+            Some(Ok(spec)) => Some(spec.canonical()),
+            _ => scan,
+        };
+        let error = match view.as_ref().map(|v| &v.spec) {
+            Some(Err(e)) => Some(e.clone()),
+            _ => None,
+        };
         Self {
             filter_scan: scan.clone(),
             scan,
@@ -157,13 +171,14 @@ impl ResearchPane {
             generation: 0,
             universe: None,
             results: None,
-            loading: true,
-            error: None,
+            loading: error.is_none(),
+            error,
             search: String::new(),
             filter: ScanFilter::default(),
             selected: 0,
             scroll_selected: false,
             page_rows: 10,
+            view,
         }
     }
     pub fn price_history() -> Self {
@@ -193,12 +208,31 @@ impl ResearchPane {
             self.polled = Some(std::time::Instant::now());
             return;
         }
+        if let Some(view) = &self.view {
+            // A view never goes through `Request::Research`/`research_scan`; a bad spec sends nothing.
+            match &view.spec {
+                Ok(spec) => {
+                    self.generation += 1;
+                    self.loading = true;
+                    self.error = None;
+                    worker.send(Request::ScanView { pane, generation: self.generation, spec: spec.clone() });
+                }
+                Err(e) => {
+                    self.loading = false;
+                    self.error = Some(e.clone());
+                }
+            }
+            return;
+        }
         self.generation += 1;
         self.loading = true;
         self.error = None;
         worker.send(Request::Research { pane, generation: self.generation, scan: self.scan.clone() });
     }
     pub(super) fn visible_symbols(&self) -> Vec<&str> {
+        if let Some(symbols) = self.view_symbols() {
+            return symbols;
+        }
         let query = self.search.trim().to_ascii_uppercase();
         if let Some(s) = &self.results {
             return self
@@ -237,7 +271,9 @@ impl ResearchPane {
         let key = tr_data::security(symbol).key();
         let matches = |s: &str| s.eq_ignore_ascii_case(symbol) || tr_data::security(s).key() == key;
         let mut item = Member::new(symbol);
-        let (source, provenance, date, price) = if let Some(s) = &self.results {
+        let (source, provenance, date, price) = if let Some(v) = &self.view {
+            v.origin_for(symbol)?
+        } else if let Some(s) = &self.results {
             let r = s.data.results.iter().find(|r| matches(&r.symbol))?;
             (
                 s.source.clone(),
@@ -262,6 +298,10 @@ impl ResearchPane {
     }
     /// Returns the open action separately so the app can preserve list focus.
     pub fn navigate(&mut self, key: Key) -> Option<Action> {
+        if let Some(handled) = self.view_navigate(key) {
+            self.scroll_selected = true;
+            return handled;
+        }
         let n = self.visible_symbols().len();
         if n == 0 {
             self.selected = 0;
@@ -285,6 +325,9 @@ impl ResearchPane {
         self.sync_setup_filter();
         if self.history {
             return (self.show_history(ui, worker), false);
+        }
+        if self.view.is_some() {
+            return self.show_view(ui);
         }
         let mut actions = Vec::new();
         let mut export = false;

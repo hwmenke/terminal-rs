@@ -5,6 +5,7 @@ use std::{path::PathBuf, time::Duration};
 mod desk;
 mod link;
 mod review;
+pub mod equity_engine;
 pub mod scan_pack;
 mod scanner;
 pub use desk::{
@@ -12,6 +13,7 @@ pub use desk::{
     archive_ticker, box_stop, drawing_stops, last_atr, rank_watchlist, resolve_stop, size_position,
 };
 pub use link::{Config, DEFAULT_URL, Health, LinkState, detect_archive, retry_delay};
+pub use equity_engine::{ScanView, ScanViewSpec};
 pub use review::ReviewContext;
 pub use scanner::{Condition, Conditions, Metrics, ScanCache, ScanFilter, Skipped, Sort, active_setups, cached_calculate, setup_active, setup_active_with_spy};
 
@@ -902,15 +904,16 @@ pub fn apply_spy_benchmark(scan: &mut Scan, histories: &[(String, Vec<Bar>)], sp
     if let Some(spy) = spy {
         Bar::require_verified(spy, "SCAN SPY benchmark").map_err(anyhow::Error::msg)?;
     }
-    let spy_close = spy.map(|bars| bars.iter().map(|b| b.close).collect::<Vec<_>>());
     for row in &mut scan.results {
         if let Some(metrics) = &mut row.metrics {
             metrics.rs_spy_63d = None;
             metrics.oneil_lens = scan_pack::OneilMetrics::default();
             if let Some((_, bars)) = histories.iter().find(|(symbol, _)| symbol == &row.symbol) {
                 Bar::require_verified(bars, "SCAN relative return").map_err(anyhow::Error::msg)?;
-                metrics.oneil_lens = scan_pack::measure_oneil(&bars.iter().map(|b| b.close).collect::<Vec<_>>(), spy_close.as_deref());
-                metrics.rs_spy_63d = spy.and_then(|spy| tr_core::indicators::daily_relative_return(bars, spy, 63));
+                // Dated alignment: O'Neil derives from the same relative return, never positional closes.
+                let rs = spy.and_then(|spy| tr_core::indicators::daily_relative_return(bars, spy, scan_pack::RS_BARS));
+                metrics.rs_spy_63d = rs;
+                metrics.oneil_lens = scan_pack::OneilMetrics::from_relative_return(rs);
             }
         }
     }

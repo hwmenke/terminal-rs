@@ -107,6 +107,12 @@ pub enum Request {
         generation: u64,
         scan: Option<String>,
     },
+    /// SCAN VIEW PATTERN / RSI-C board over the verified research archive. Never a setup scan.
+    ScanView {
+        pane: PaneId,
+        generation: u64,
+        spec: tr_data::whats_news::ScanViewSpec,
+    },
     /// Watchlist-scoped PM Desk snapshot. `symbols` are market keys, not the universe.
     Desk {
         pane: PaneId,
@@ -635,6 +641,7 @@ impl Request {
             Self::ConfigureWhatsNews { .. } => "ConfigureWhatsNews",
             Self::AutocompleteUniverse => "AutocompleteUniverse",
             Self::Research { .. } => "Research",
+            Self::ScanView { .. } => "ScanView",
             Self::Desk { .. } => "Desk",
             Self::WallEdge { .. } => "WallEdge",
             Self::CancelWallEdge { .. } => "CancelWallEdge",
@@ -882,6 +889,11 @@ pub enum Response {
         pane: PaneId,
         generation: u64,
         result: Result<tr_data::whats_news::ScanSnapshot, String>,
+    },
+    ScanView {
+        pane: PaneId,
+        generation: u64,
+        result: Result<Arc<crate::app::research::scan_view::ViewSnapshot>, String>,
     },
     Desk {
         pane: PaneId,
@@ -2706,6 +2718,75 @@ fn filter_enriched_scan(name: &str, mut scan: tr_data::whats_news::Scan) -> tr_d
     scan
 }
 
+/// Local archive merged with the Whats-News bridge (local wins when non-empty).
+struct MergedResearch {
+    histories: std::collections::BTreeMap<String, Vec<tr_core::Bar>>,
+    source: String,
+    skipped: Vec<tr_data::whats_news::Skipped>,
+    service: Option<tr_data::whats_news::Scan>,
+}
+
+/// The SCAN merge, shared with SCAN VIEW. `want_service` only matters for SCAN's HTTP fields.
+async fn merge_research_histories(
+    bridge: &tr_data::whats_news::Bridge,
+    local: std::collections::BTreeMap<String, Vec<tr_core::Bar>>,
+    want_service: bool,
+) -> anyhow::Result<MergedResearch> {
+    let mut histories = local;
+    let mut source = "Local Yahoo daily research archive".to_string();
+    let mut skipped = vec![];
+    let mut service = None;
+    if bridge.enabled {
+        match bridge.histories().await {
+            Ok(external) => {
+                external.provenance.require_verified("SCAN archive").map_err(anyhow::Error::msg)?;
+                source.push_str(&format!(" + {}", external.source));
+                if want_service && external.source.starts_with("Whats-News HTTP") {
+                    match bridge.service_scan().await {
+                        Ok(fields) => service = fields,
+                        Err(e) if tr_data::whats_news::is_unverified(&e) => return Err(e),
+                        Err(e) => source.push_str(&format!(" · Service fields unavailable: {e}")),
+                    }
+                }
+                skipped = external
+                    .data
+                    .skipped
+                    .into_iter()
+                    .filter(|skip| !histories.get(&skip.symbol).is_some_and(|b| !b.is_empty()))
+                    .collect();
+                for (symbol, bars) in external.data.bars {
+                    if !histories.get(&symbol).is_some_and(|b| !b.is_empty()) {
+                        histories.insert(symbol, bars);
+                    }
+                }
+            }
+            Err(e) if tr_data::whats_news::is_unverified(&e) => return Err(e),
+            Err(e) => source.push_str(&format!(" · Whats-News unavailable: {e}")),
+        }
+    }
+    Ok(MergedResearch { histories, source, skipped, service })
+}
+
+/// SCAN VIEW board: the same local+bridge merge as SCAN, never `research_scan`/`Bridge::scan`.
+async fn research_scan_view(
+    s: &Shared,
+    bridge: &tr_data::whats_news::Bridge,
+    spec: &tr_data::whats_news::ScanViewSpec,
+) -> anyhow::Result<Arc<crate::app::research::scan_view::ViewSnapshot>> {
+    let sample = s.sample_mode();
+    crate::app::research::scan_view::scan_view_research(
+        sample,
+        || async {
+            let local = s.history.db(|db| db.histories()).await?;
+            let merged = merge_research_histories(bridge, local, false).await?;
+            Ok((merged.histories.into_iter().collect(), merged.skipped, merged.source, tr_core::Provenance::Cached))
+        },
+        spec,
+    )
+    .await
+    .map(Arc::new)
+}
+
 async fn research_scan(
     s: &Shared,
     bridge: &tr_data::whats_news::Bridge,
@@ -2761,38 +2842,7 @@ async fn research_scan(
     if !tr_data::whats_news::SETUPS.contains(&name) {
         anyhow::bail!("Unknown scan {name}");
     }
-    let mut histories = local;
-    let mut source = "Local Yahoo daily research archive".to_string();
-    let mut skipped = vec![];
-    let mut service = None;
-    if bridge.enabled {
-        match bridge.histories().await {
-            Ok(external) => {
-                external.provenance.require_verified("SCAN archive").map_err(anyhow::Error::msg)?;
-                source.push_str(&format!(" + {}", external.source));
-                if external.source.starts_with("Whats-News HTTP") {
-                    match bridge.service_scan().await {
-                        Ok(fields) => service = fields,
-                        Err(e) if tr_data::whats_news::is_unverified(&e) => return Err(e),
-                        Err(e) => source.push_str(&format!(" · Service fields unavailable: {e}")),
-                    }
-                }
-                skipped = external
-                    .data
-                    .skipped
-                    .into_iter()
-                    .filter(|skip| !histories.get(&skip.symbol).is_some_and(|b| !b.is_empty()))
-                    .collect();
-                for (symbol, bars) in external.data.bars {
-                    if !histories.get(&symbol).is_some_and(|b| !b.is_empty()) {
-                        histories.insert(symbol, bars);
-                    }
-                }
-            }
-            Err(e) if tr_data::whats_news::is_unverified(&e) => return Err(e),
-            Err(e) => source.push_str(&format!(" · Whats-News unavailable: {e}")),
-        }
-    }
+    let MergedResearch { histories, mut source, skipped, service } = merge_research_histories(bridge, local, true).await?;
     let breadth = tr_data::whats_news::scan_pack::ScanBreadth::from_histories(
         &histories.iter().map(|(s, b)| (s.clone(), b.clone())).collect::<Vec<_>>(),
     );
@@ -4160,6 +4210,14 @@ async fn handle_inner(s: &Arc<Shared>, req: Request, force: bool) {
                     result: research_universe(s, &bridge).await.map_err(|e| format!("{e:#}")),
                 });
             }
+        }
+        Request::ScanView { pane, generation, spec } => {
+            let bridge = config.bridge();
+            send(Response::ScanView {
+                pane,
+                generation,
+                result: research_scan_view(s, &bridge, &spec).await.map_err(|e| format!("{e:#}")),
+            });
         }
         Request::WallEdge { pane, generation, symbols, daily, priority } => {
             if !wall_edge_current(s, pane, generation) {

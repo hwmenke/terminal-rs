@@ -28,7 +28,7 @@ mod portfolio_stops;
 mod portfolio_view;
 mod realized_vol;
 mod relative_path;
-mod research;
+pub(crate) mod research;
 mod rotation;
 mod session_breadth;
 mod session_brief;
@@ -46,6 +46,8 @@ pub(crate) mod studio_lab;
 pub(crate) mod studio_attribution;
 pub(crate) mod studio_residual;
 pub(crate) mod studio_when;
+#[cfg(test)]
+mod scan_perf_gate;
 #[cfg(test)]
 mod studio_perf_gate;
 mod studio_season;
@@ -372,6 +374,8 @@ impl PaneKind {
             PaneKind::Research(r) => {
                 if r.history {
                     "Price history".into()
+                } else if let Some(Ok(spec)) = r.view.as_ref().map(|v| &v.spec) {
+                    format!("Scan view: {}", spec.view.title())
                 } else {
                     r.scan.as_ref().map(|s| format!("Scan: {s}")).unwrap_or_else(|| "Archive universe".into())
                 }
@@ -2133,6 +2137,15 @@ impl TerminalApp {
                             scan.snapshot
                         });
                         r.accept_scan(result);
+                    }
+                }
+                Response::ScanView { pane, generation, result } => {
+                    // Deliberately no `holding_risk.scan_breadth`: only SCAN breadth feeds that.
+                    if let Some(PaneKind::Research(r)) =
+                        self.panes.iter_mut().find(|p| p.id == pane).map(|p| &mut p.kind)
+                        && r.generation == generation
+                    {
+                        r.accept_view(result);
                     }
                 }
                 Response::HoldingHistory { pane, generation, rows, spy, error } => {

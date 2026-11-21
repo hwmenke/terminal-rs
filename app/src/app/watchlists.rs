@@ -1009,6 +1009,9 @@ impl TerminalApp {
         });
         let research =
             self.idx(self.focus).is_some_and(|i| matches!(&self.panes[i].kind, PaneKind::Research(r) if !r.history));
+        let scan_view = self
+            .idx(self.focus)
+            .is_some_and(|i| matches!(&self.panes[i].kind, PaneKind::Research(r) if !r.history && r.view.is_some()));
         let mut consumed = false;
         for (key, m) in keys {
             let plain = !m.any();
@@ -1026,7 +1029,8 @@ impl TerminalApp {
                         | Key::J
                         | Key::K
                         | Key::Enter
-                );
+                )
+                || (scan_view && plain && matches!(key, Key::ArrowLeft | Key::ArrowRight));
             let step = self.focused_is_chart()
                 && self.peek_chart().is_some_and(|c| c.watch_group.is_some())
                 && ((plain && matches!(key, Key::OpenBracket | Key::CloseBracket))
@@ -1076,10 +1080,18 @@ impl TerminalApp {
                     self.show_group_picker();
                 }
             } else if list_nav {
+                let mut notice = None;
                 let action = self.idx(self.focus).and_then(|i| match &mut self.panes[i].kind {
-                    PaneKind::Research(r) => r.navigate(key),
+                    PaneKind::Research(r) => {
+                        let action = r.navigate(key);
+                        notice = r.view.as_mut().and_then(|v| v.notice.take());
+                        action
+                    }
                     _ => None,
                 });
+                if let Some(n) = notice {
+                    self.status = n;
+                }
                 if let Some(a) = action {
                     self.run_actions(vec![a]);
                 }

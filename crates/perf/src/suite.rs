@@ -546,6 +546,35 @@ pub fn all(scale: Scale) -> Vec<Case> {
             });
         }
     }
+    // SCAN VIEW engine (slice 8): 650 daily bars per name, so the weekly reads (>=120 completed
+    // weeks of context) and both RSI counters do real work for every row.
+    {
+        use tr_data::whats_news::equity_engine as ee;
+        let n = if full { 500 } else { 50 };
+        let h: Rc<Vec<(String, Vec<tr_core::Bar>)>> =
+            Rc::new((0..n).map(|i| (format!("S{i:03}"), fixtures::daily(650, 9000 + i as u64))).collect());
+        let p = ee::EngineParams::default();
+        let hc = h.clone();
+        add!("scan.engine_board_500_cold", move || {
+            let b = bb(ee::engine_board(bb(&hc), p));
+            assert_eq!(b.rows.len(), n);
+            assert!(b.short.is_empty() && b.invalid.is_empty());
+            for r in &b.rows {
+                let w = r.weekly.as_ref().expect("weekly read");
+                assert!(r.pattern_d.is_ok() && r.rsic_d.is_ok() && w.pattern.is_ok() && w.rsic.is_ok(), "{}", r.symbol);
+            }
+            assert!(b.rows.iter().all(|r| r.rsic_d.as_ref().is_ok_and(|c| c.valid == 20 && c.closes_used == 400)));
+            b.rows.len() * 4
+        });
+        let cache = ee::BoardCache::default();
+        assert!(!cache.get_or_compute(&h, p).1, "first call computes");
+        add!("scan.engine_board_500_warm", move || {
+            let (board, hit) = bb(cache.get_or_compute(bb(&h), p));
+            assert!(hit, "warm path must be a cache hit");
+            assert_eq!(board.rows.len(), n);
+            board.rows.len()
+        });
+    }
     let bars = fixtures::daily(if full { 5000 } else { 200 }, 83);
     let seed = stable_hash::bars_digest(&bars);
     let values: Vec<_> = bars.iter().map(|b| b.close / b.open - 1.).collect();

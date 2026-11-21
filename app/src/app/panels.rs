@@ -122,6 +122,9 @@ impl TerminalApp {
                 if refresh {
                     r.request(id, &self.worker);
                 }
+                if let Some(n) = r.view.as_mut().and_then(|v| v.notice.take()) {
+                    self.status = n;
+                }
             }
             PaneKind::News(n) => {
                 let offline = self.provider.eq_ignore_ascii_case("sample");

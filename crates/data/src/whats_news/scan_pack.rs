@@ -361,11 +361,19 @@ pub fn measure_qulla(close: &[f64], open: Option<&[f64]>, breakout: &BreakoutMet
     QullaMetrics { gap_pct, is_ep, qulla: is_ep || breakout.vol_surge || breakout.near_nd }
 }
 
-/// O'Neil price/RS lens, matching Python's positional (not date-aligned) inputs.
+/// O'Neil price/RS lens. `measure_oneil` is the Python positional parity fixture only;
+/// scans use dated alignment via `from_relative_return`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct OneilMetrics {
     pub rs_spy_pct: Option<f64>,
     pub oneil_rs: bool,
+}
+impl OneilMetrics {
+    /// From the date-aligned 63-session relative return (percent); `None` stays unavailable.
+    pub fn from_relative_return(rs: Option<f64>) -> Self {
+        let rs_spy_pct = rs.and_then(|v| rounded(v, 2));
+        Self { rs_spy_pct, oneil_rs: rs_spy_pct.is_some_and(|v| v > 0.0) }
+    }
 }
 pub const RS_BARS: usize = 63;
 pub fn measure_oneil(close: &[f64], spy_close: Option<&[f64]>) -> OneilMetrics {

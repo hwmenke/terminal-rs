@@ -154,6 +154,17 @@ impl TerminalApp {
                 keywords: "whats-news research".into(),
             });
         }
+        for (key, name) in [
+            ("SCAN VIEW PATTERN", "Pattern scanner: 63/21-bar daily and 52/26-week breakouts, breakdowns, thirds"),
+            ("SCAN VIEW RSI-C", "RSI Counter: RSI 2–21 shares, state, D/W alignment, pullback, acceleration"),
+        ] {
+            items.push(Suggestion {
+                key: key.into(),
+                name: name.into(),
+                class: None,
+                keywords: "whats-news research scanner view pattern rsi counter rsic".into(),
+            });
+        }
         rank(items, &self.recent_symbols, &self.cmd)
     }
 

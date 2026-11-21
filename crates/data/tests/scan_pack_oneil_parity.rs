@@ -21,7 +21,7 @@ fn python_oneil_lens_fixtures() {
 }
 
 #[test]
-fn oneil_scan_and_benchmark_use_positional_closes() {
+fn oneil_scan_and_benchmark_use_dated_closes() {
     use tr_core::{Bar, Provenance};
     use tr_data::whats_news::{SETUPS, apply_spy_benchmark, scan_histories};
     assert!(SETUPS.contains(&"ONEIL_LENS"));
@@ -30,16 +30,29 @@ fn oneil_scan_and_benchmark_use_positional_closes() {
         Bar::new(1_700_000_000 + (i + offset) * 86400, close, close, close, close, 100.)
             .with_provenance(Provenance::Real)
     }).collect::<Vec<_>>();
-    let spy = bars(110., 100);
+    // Same dates: WIN still reads {9.09, true} on both paths.
+    let spy = bars(110., 0);
     let histories = vec![("WIN".into(), bars(120., 0)), ("LOSE".into(), bars(105., 0)), ("SPY".into(), spy.clone())];
     let mut scan = scan_histories("ONEIL_LENS", histories.clone(), Provenance::Real).unwrap();
     assert_eq!(scan.results.len(), 1);
     assert_eq!(scan.results[0].symbol, "WIN");
     let expected = OneilMetrics { rs_spy_pct: Some(9.09), oneil_rs: true };
     assert_eq!(scan.results[0].metrics.as_ref().unwrap().oneil_lens, expected);
-    assert_eq!(scan.results[0].metrics.as_ref().unwrap().rs_spy_63d, None);
+    assert!(scan.results[0].metrics.as_ref().unwrap().rs_spy_63d.is_some());
     apply_spy_benchmark(&mut scan, &histories, Some(&spy)).unwrap();
     assert_eq!(scan.results[0].metrics.as_ref().unwrap().oneil_lens, expected);
     apply_spy_benchmark(&mut scan, &histories, None).unwrap();
     assert_eq!(scan.results[0].metrics.as_ref().unwrap().oneil_lens, OneilMetrics::default());
+    // SPY offset by 100 days has no date overlap: unavailable, no ONEIL_LENS hit.
+    let offset = bars(110., 100);
+    let histories = vec![("WIN".into(), bars(120., 0)), ("SPY".into(), offset.clone())];
+    let mut scan = scan_histories("ALL", histories.clone(), Provenance::Real).unwrap();
+    assert!(scan_histories("ONEIL_LENS", histories.clone(), Provenance::Real).unwrap().results.is_empty());
+    apply_spy_benchmark(&mut scan, &histories, Some(&offset)).unwrap();
+    assert!(scan.results.iter().any(|r| r.symbol == "WIN"));
+    for row in scan.results.iter().filter(|r| r.symbol == "WIN") {
+        let m = row.metrics.as_ref().unwrap();
+        assert_eq!(m.oneil_lens, OneilMetrics::default());
+        assert_eq!(m.rs_spy_63d, None);
+    }
 }

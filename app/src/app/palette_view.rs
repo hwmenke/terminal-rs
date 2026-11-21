@@ -287,6 +287,8 @@ const COMMANDS: &[(&str, &str, &str, Option<Action>)] = &[
     ("HIST ADD ALL", "Download bundled research universe", "daily yahoo history", None),
     ("UNIV", "Research archive universe", "coverage stale missing research", None),
     ("SCAN DARVAS_BREAKOUT", "Scan archived Darvas breakouts", "whats-news research setups", None),
+    ("SCAN VIEW PATTERN", "Pattern scanner: daily/weekly breakouts, breakdowns and thirds", "whats-news research scanner view", None),
+    ("SCAN VIEW RSI-C", "RSI Counter: RSI 2–21 shares, alignment, D/W agreement", "whats-news research scanner view rsic", None),
     ("SECF", "Security search", "search find", None),
     ("LAYOUTS", "", "saved layouts workspaces", None),
     ("LAYOUT NEW", "Start a new saved layout", "workspace", None),

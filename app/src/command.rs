@@ -1261,7 +1261,11 @@ fn describe(f: &Function) -> String {
         Function::Refresh => "Refresh congressional disclosures now".into(),
         Function::History(args) => format!("Price history {args}"),
         Function::Universe => "Browse Whats-News archive coverage".into(),
-        Function::Scan(name) => format!("Scan Whats-News archive: {name}"),
+        Function::Scan(name) => match tr_data::whats_news::ScanViewSpec::parse(name) {
+            Some(Ok(spec)) => spec.describe(),
+            Some(Err(e)) => e,
+            None => format!("Scan Whats-News archive: {name}"),
+        },
         Function::Watchlist => "Watchlist".into(),
         Function::Earnings => "Earnings calendar for the selected watchlist".into(),
         Function::Intraday => {
@@ -2134,6 +2138,21 @@ mod tests {
         assert_eq!(parse("UNIV <GO>"), Some(Command::Function(Function::Universe)));
         assert_eq!(parse("scan darvas_breakout"), Some(Command::Function(Function::Scan("DARVAS_BREAKOUT".into()))));
         assert_eq!(parse("SCAN"), Some(Command::Function(Function::Scan(String::new()))));
+        assert_eq!(parse("SCAN MA"), Some(Command::Function(Function::Scan("MA".into()))));
+        assert_eq!(parse("SCAN VCP_LENS"), Some(Command::Function(Function::Scan("VCP_LENS".into()))));
+        assert_eq!(parse("SCAN VIEW PATTERN"), Some(Command::Function(Function::Scan("VIEW PATTERN".into()))));
+        assert_eq!(parse("scan view rsi-c"), Some(Command::Function(Function::Scan("VIEW RSI-C".into()))));
+        let Some(Command::Function(Function::Scan(raw))) = parse("scan view rsic n=9 k=3") else { panic!("not a scan") };
+        let spec = tr_data::whats_news::ScanViewSpec::parse(&raw).unwrap().unwrap();
+        assert_eq!(spec.canonical(), "VIEW RSI-C N=9 K=3");
+        // The listed words stay tickers when typed alone.
+        for word in ["VIEW", "PATTERN", "RSIC", "COIL", "MA", "STR", "LAB", "RESID", "ATTR"] {
+            assert!(matches!(parse(word), Some(Command::Symbol(_))), "{word}");
+        }
+        assert!(hint("SCAN VIEW FOO").contains("Unknown view"));
+        assert!(hint("SCAN VIEW").contains("needs PATTERN or RSI-C"));
+        assert!(hint("SCAN VIEW PATTERN").contains("Scanner view: Pattern — 63/21-bar daily and 52/26-week extremes, thirds"));
+        assert!(hint("SCAN NEAR_HIGH").contains("Scan Whats-News archive"));
         assert_eq!(parse("REVIEW"), Some(Command::Function(Function::Review)));
         assert_eq!(parse("DESK"), Some(Command::Function(Function::Desk)));
         assert_eq!(parse("PMDESK"), Some(Command::Function(Function::Desk)));

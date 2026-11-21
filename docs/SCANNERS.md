@@ -90,4 +90,71 @@ Whats-News archive or changes its ingestion/schema.
 
 `EXPORT SCAN` writes the current results (source, last-bar dates, provenance, filters).
 Sample snapshots are named `SAMPLE` and must stay isolated. Scan JSON is not restored
-into SCAN. See [Export and recovery](EXPORT_RECOVERY.md).
+into SCAN. See [Export and recovery](EXPORT_RECOVERY.md). `EXPORT SCAN` does not cover
+SCAN VIEW boards yet (status says so).
+
+The scan calculation cache is a 1024-entry LRU keyed by a 128-bit content key
+(FNV-1a digest + an independent SipHash over every bar field and the verified bit, plus
+length and last timestamp). It stores no bars, and the lock is never held while a name
+is computed. O'Neil relative strength (`rs_spy_pct`, `oneil_rs`) is derived from the
+**dated** 63-session relative return (`daily_relative_return`: aligned on the symbol's own
+sessions, SPY required at both endpoints), so a stale symbol is never compared with a
+newer SPY window; a missing SPY endpoint date is unavailable (`None`/false).
+`measure_oneil` remains only as the Python positional parity fixture.
+
+## Views: PATTERN, RSI-C
+
+```
+SCAN VIEW PATTERN
+SCAN VIEW RSI-C [N=<2..21>] [K=<1..20>]      (alias RSIC; defaults N=14 K=5)
+```
+
+Two dense, sortable, heat-coloured boards over the same verified research universe as
+SCAN (local Yahoo archive merged with the Whats-News archive; local wins). A view never
+goes through the setup scan. `VIEW`, `PATTERN`, `RSIC` typed alone are still tickers.
+The pane's scan string is the persisted state (`VIEW RSI-C N=9 K=3`; defaults omitted),
+so saved layouts restore the view. One engine board (`whats_news::equity_engine`) carries
+the daily/weekly pattern *and* the daily/weekly RSI counter for every row; both views read
+it from one content-keyed cache (4 boards, LRU, no wall clock in the key). Compute runs on
+the worker in at most four scoped threads, merged deterministically.
+
+**Pattern.** Daily (≥64 bars): C against the *prior* 63/21-bar high/low (windows end at
+t−1). Breakout `C ≥ H`; else Breakdown `C ≤ L`; else with `p=(C−L)/(H−L)`: From Bottom
+`C ≥ H21 ∧ p ≤ 1/3`, From Top `C ≤ L21 ∧ p ≥ 2/3`. Weekly (≥28 completed weeks, window =
+last ≤52 weeks, *including* the last completed week): the same with a 0.1% tolerance
+(`C ≥ 0.999·H`, `C ≤ 1.001·L`) and 26-week short window; the row states the actual weeks
+used and amber-flags fewer than 52. A flat window is a Breakout with no position.
+
+**RSI Counter.** Reference EWM RSI (α=1/n, first-delta seed, needs ≥n+2 closes, a window
+with no loss reads 100) for n = 2…21 on the last 400 daily / 120 completed weekly
+closes (≥24 closes, ≥10 valid lengths). This is deliberately *not* the scan's Wilder
+RSI14 (SMA seed, flat = 50). Shares are count/valid; counts: <20, <10, >80, >90, 50..75
+(up), 25..50 (down; exactly 50 is in both). State = first tier hit in the order
+OS → OB → up → down: Extreme ≥90%, Strong ≥70%, Tilt ≥55% of valid lengths, decided with
+integer arithmetic; otherwise MIXED. Mean, sample sd, and alignment `1 − min(1, sd/25)`.
+D/W agreement = both trend up (or both down); PULLBACK = daily OS inside a weekly up
+state; Δn/k = RSIₙ(t) − RSIₙ(t−k) (zero counts as accelerating).
+
+Divergences from the Python reference, on purpose: weekly bars are **completed weeks
+only** (the reference resamples the partial week too), and states classify on
+**unrounded** RSI (the reference rounds 19.995 to 20.00, which is not <20; the terminal counts [19.995, 20) as <20).
+
+**Trust.** Verified bars only: a Sample bar anywhere refuses the whole board; an
+unverified (Missing) history becomes that name's invalid row with no substitution;
+sample/offline display mode refuses before any DB or bridge call. Admission is per view
+and timeframe (date/OHLC validity, NaN volume allowed, no 30-bar rule): a 24-bar name
+appears in RSI-C D; a weekly failure leaves the daily cells. Rows keep their own last
+date; counts and the default list cover the same-date cohort (tick *Include older-dated*
+to add the rest). Nothing is filled, interpolated or substituted between D and W.
+
+**Keys.** ↑/↓ j/k PgUp/PgDn Home/End as in SCAN; ←/→ choose the D or W side (W when a weekly
+bucket is selected); Enter opens the archive chart at the exact **daily** bar that
+triggered the read (a weekly read opens the last session of that completed week, never the
+Monday timestamp); clicking a D or W cell opens that side. An unavailable side leaves a
+status note and never opens the other side. Click a header to sort (nulls last, ties by
+ticker); click a chip to filter by bucket. w/W, N hand-off and the watchlist origin
+(`SCAN VIEW PATTERN`) work as in SCAN.
+
+Performance budgets: `scan.engine_board_500_cold` ≤120 ms, `scan.engine_board_500_warm`
+(content digest of 500 tails + cache hit) ≤25 ms, `paint.scan_view.{steady,hover}`
+≤2 ms/frame.

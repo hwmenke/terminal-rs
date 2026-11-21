@@ -188,6 +188,16 @@
       "relative": true,
       "class": "interactive"
     },
+    "scan.engine_board_500_cold": {
+      "budget_us": 120000,
+      "relative": true,
+      "class": "command"
+    },
+    "scan.engine_board_500_warm": {
+      "budget_us": 25000,
+      "relative": true,
+      "class": "interactive"
+    },
     "inference.stationary_bootstrap_5k_x500": {
       "budget_us": 120000,
       "relative": true,

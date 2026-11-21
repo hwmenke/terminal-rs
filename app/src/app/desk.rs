@@ -1137,11 +1137,10 @@ impl HoldingRiskState {
                 (key, stretch)
             })
             .collect();
-        let spy_close = self
+        let spy = self
             .spy
             .as_deref()
-            .filter(|bars| tr_core::Bar::require_verified(bars, "holding SPY benchmark").is_ok())
-            .map(|bars| bars.iter().map(|b| b.close).collect::<Vec<_>>());
+            .filter(|bars| tr_core::Bar::require_verified(bars, "holding SPY benchmark").is_ok());
         self.setups = pf
             .into_iter()
             .flat_map(|pf| &pf.positions)
@@ -1150,10 +1149,7 @@ impl HoldingRiskState {
                 let setups = self.history.get(&key).and_then(|bars| {
                     tr_core::Bar::require_verified(bars, "holding setups").ok()?;
                     let mut metrics = tr_data::whats_news::cached_calculate(bars).ok()?;
-                    metrics.oneil_lens = tr_data::whats_news::scan_pack::measure_oneil(
-                        &bars.iter().map(|b| b.close).collect::<Vec<_>>(),
-                        spy_close.as_deref(),
-                    );
+                    metrics.oneil_lens = holding_oneil(bars, spy);
                     Some(tr_data::whats_news::active_setups(bars, &metrics))
                 });
                 (key, setups)
@@ -1213,9 +1209,36 @@ impl TerminalApp {
     }
 }
 
+/// Date-matched O'Neil lens for a holding (never positional against SPY).
+fn holding_oneil(bars: &[tr_core::Bar], spy: Option<&[tr_core::Bar]>) -> tr_data::whats_news::scan_pack::OneilMetrics {
+    use tr_data::whats_news::scan_pack::{OneilMetrics, RS_BARS};
+    OneilMetrics::from_relative_return(
+        spy.and_then(|s| tr_core::indicators::daily_relative_return(bars, s, RS_BARS)),
+    )
+}
+
 #[cfg(test)]
 mod holding_risk_tests {
     use super::*;
+
+    /// §4.6 stale-symbol vector: own-dates -24.82/false, not the positional -13.18.
+    #[test]
+    fn holding_oneil_is_date_matched_for_stale_history() {
+        let mk = |n: usize, f: &dyn Fn(usize) -> f64| -> Vec<tr_core::Bar> {
+            (0..n)
+                .map(|i| {
+                    let c = f(i);
+                    tr_core::Bar::new(1_704_153_600 + i as i64 * 86_400, c, c + 1.0, c - 1.0, c, 100.0)
+                        .with_provenance(tr_core::Provenance::Real)
+                })
+                .collect()
+        };
+        let spy = mk(200, &|i| 100.0 + i as f64);
+        let sym = mk(100, &|i| if i == 99 { 110.0 } else { 100.0 });
+        let m = holding_oneil(&sym, Some(&spy));
+        assert_eq!((m.rs_spy_pct, m.oneil_rs), (Some(-24.82), false));
+        assert_eq!(holding_oneil(&sym, None).rs_spy_pct, None);
+    }
 
     #[test]
     fn symbol_sets_diff_and_prune_without_price_or_order_inputs() {

@@ -258,6 +258,10 @@ impl TerminalApp {
                         &["SCAN DARVAS_BREAKOUT", "SCAN NEAR_HIGH"],
                         "Scan archived bars; Enter opens the linked archive chart (REVIEW for daily+weekly)",
                     ),
+                    (
+                        &["SCAN VIEW PATTERN", "SCAN VIEW RSI-C", "SCAN VIEW RSI-C N=9 K=3"],
+                        "Scanner views: Pattern (D 63/21, W 52/26) and RSI Counter (RSI 2–21); ←/→ pick D or W, Enter opens the trigger bar",
+                    ),
                     (&["WEI"], "World markets overview"),
                     (&["STUDIO", "AAPL STUDIO 5m lens=dist", "STUDIO lens=relate benchmark=QQQ", "STUDIO lens=when", "STUDIO lens=season", "STUDIO lens=backtest"], "Native time canvas and retained research lenses; local Alt+Left/Right, Escape inspector, Ctrl+Z parameter undo"),
                     (&["WHEN", "AAPL WHEN 5m RSI(14)<30", "AAPL STUDIO 5m lens=when rule=\"RSI(14)<30\"", "WHEN h=6 threshold=10bp"], "When lens: rule mask shading, fixed m=8 within-clock HAC/BY evidence at h=1,3,6,12, session-block probability tiles; daily or 1m–1h US cash; COND has Open in When"),
