@@ -147,7 +147,17 @@ pub fn alma(values: &[f64], n: usize, offset: f64, sigma: f64) -> Vec<f64> {
 pub fn vwma(values: &[f64], volume: &[f64], n: usize) -> Vec<f64> {
     let pv = zip(values, volume, |c, v| c * v);
     let (spv, sv, sc) = (sum(&pv, n), sum(volume, n), sma(values, n));
-    (0..values.len()).map(|i| if sv[i] > 0.0 { spv[i] / sv[i] } else { sc[i] }).collect()
+    (0..values.len())
+        .map(|i| {
+            if !sv[i].is_finite() {
+                NAN
+            } else if sv[i] > 0.0 {
+                spv[i] / sv[i]
+            } else {
+                sc[i]
+            }
+        })
+        .collect()
 }
 
 /// Elastic volume-weighted moving average: each bar moves the average by its share of the

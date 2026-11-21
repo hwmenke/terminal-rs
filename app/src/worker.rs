@@ -15,8 +15,11 @@ use tr_congress::performance::{self, Performance, TradeReturn};
 use tr_congress::refresh::{self, HttpSource, NewTradeAlert, RefreshConfig};
 use tr_congress::{Db, Politician, Trade};
 use tr_core::indicators::registry::{Input, Plot, Tone};
+use tr_core::indicators::{AdaptiveTrendParams, LaneStatus, TrendStack, ladder, ladder_custom, score, trend_stack};
 use tr_core::{Bar, Security, Series, Timeframe};
-use tr_data::{BarCache, Provider, Quote, SearchHit, YieldCurves};
+#[cfg(test)]
+use tr_data::BarCache;
+use tr_data::{BarVault, Provider, Quote, SearchHit, YieldCurves};
 
 use crate::command::IndicatorSpec;
 use crate::theme;
@@ -25,10 +28,446 @@ pub type PaneId = u64;
 
 /// Minutes between Congress disclosure checks (`TR_CONGRESS_REFRESH_MIN`; 0 disables).
 pub const CONGRESS_REFRESH_MIN: u64 = 30;
+/// Seconds between price, session-VWAP, session-signal, and setup rule evaluations (`TR_PRICE_ALERT_SECS`; 0 disables).
+pub const PRICE_ALERT_EVAL_SECS: u64 = 20;
+
+use tr_data::health::{DataMode, DownKind, Feed, FeedState, Snapshot, Unavailable};
 
 pub enum Request {
+    /// One When report (mask, all fixed horizons, buckets) for an applied rule.
+    StudioWhen {
+        pane: PaneId,
+        generation: u64,
+        symbol: String,
+        tf: Timeframe,
+        rule: String,
+        threshold: f64,
+    },
+    /// Second-stage session-block bootstrap for an accepted When report.
+    StudioWhenBootstrap {
+        pane: PaneId,
+        generation: u64,
+        input: Arc<crate::app::studio_when::PreparedWhen>,
+    },
+    /// Selected `[start,end)` versus rest over an accepted Distribution report.
+    StudioSubset {
+        pane: PaneId,
+        generation: u64,
+        input: Arc<tr_data::studio_dist::Report>,
+        selection: (i64, i64),
+    },
+    StudioCanvas {
+        pane: PaneId,
+        token: u64,
+        key: crate::chart_view::studio_canvas::CanvasKey,
+        input: tr_data::studio_canvas::CanvasInput,
+        peers: Option<Arc<crate::chart_view::studio_canvas::PeerSources>>,
+        comparisons: Vec<String>,
+        spec: tr_data::studio_canvas::CanvasSpec,
+        news: Vec<tr_data::NewsItem>,
+        earnings: Option<tr_data::studio_canvas::CanvasEvent>,
+    },
+
+    StackEdge {
+        pane: PaneId,
+        key: tr_data::edge::EdgeKey,
+        bars: Arc<Vec<Bar>>,
+        state: Vec<Option<i8>>,
+        entry_long: Vec<bool>,
+        entry_short: Vec<bool>,
+        stitch: Option<Arc<tr_data::vault::StitchInfo>>,
+    },
+
+    VaultSnapshot {
+        pane: PaneId,
+        generation: u64,
+        symbol: Option<String>,
+    },
+    VaultDrop {
+        symbol: String,
+        tf: Option<Timeframe>,
+    },
+    VaultVerify,
+    VaultPrune,
+
+    Health,
+    RetryFeed {
+        feed: Feed,
+        pane: Option<PaneId>,
+    },
+    HistoryStatus,
+    HistoryTask(String),
+    ConfigureWhatsNews {
+        epoch: u64,
+        config: tr_data::whats_news::Config,
+    },
+    AutocompleteUniverse,
+    Research {
+        pane: PaneId,
+        generation: u64,
+        scan: Option<String>,
+    },
+    /// SCAN VIEW PATTERN / RSI-C board over the verified research archive. Never a setup scan.
+    ScanView {
+        pane: PaneId,
+        generation: u64,
+        spec: tr_data::whats_news::ScanViewSpec,
+    },
+    /// Watchlist-scoped PM Desk snapshot. `symbols` are market keys, not the universe.
+    Desk {
+        pane: PaneId,
+        generation: u64,
+        symbols: Vec<String>,
+    },
+    /// One Edge pass over the wall's rows. `priority` lists row indices to start first
+    /// (the rows on screen plus a margin); unlisted rows follow in row order.
+    WallEdge {
+        pane: PaneId,
+        generation: u64,
+        symbols: Vec<String>,
+        daily: bool,
+        priority: Vec<usize>,
+    },
+    CancelWallEdge {
+        pane: PaneId,
+        generation: u64,
+    },
+    /// Re-rank the not-yet-started rows of a running pass (scroll or re-sort). No fetch.
+    WallEdgeFocus {
+        pane: PaneId,
+        generation: u64,
+        priority: Vec<usize>,
+    },
+    TrendWall {
+        pane: PaneId,
+        generation: u64,
+        symbols: Vec<String>,
+        daily: bool,
+    },
+    TrendStack {
+        pane: PaneId,
+        generation: u64,
+        symbol: String,
+        tf: Timeframe,
+        archive: bool,
+        base: Arc<Vec<Bar>>,
+        params: AdaptiveTrendParams,
+        ladder: Option<Vec<Timeframe>>,
+        config_revision: u64,
+    },
+    DailyStrength {
+        pane: PaneId,
+        generation: u64,
+        archive: bool,
+        base: Arc<Vec<Bar>>,
+    },
+    ChartSessionSummary {
+        pane: PaneId,
+        key: crate::chart_view::SessionSummaryKey,
+        bars: Arc<Vec<Bar>>,
+        class: tr_core::AssetClass,
+        stitch: Option<Arc<tr_data::vault::StitchInfo>>,
+    },
+    /// Verified closed-session profiles with an optional shared fine-bar read.
+    AuctionMap {
+        pane: PaneId,
+        key: tr_data::auction::AuctionKey,
+        symbol: String,
+        class: tr_core::AssetClass,
+        bars: Arc<Vec<Bar>>,
+        as_of: Option<i64>,
+        stitch: Option<Arc<tr_data::vault::StitchInfo>>,
+    },
+    /// Closed-bar ATR guides and empirical non-overlapping stop-touch odds.
+    StopCloud {
+        pane: PaneId,
+        key: tr_data::stop_cloud::StopKey,
+        class: tr_core::AssetClass,
+        bars: Arc<Vec<Bar>>,
+        as_of: Option<i64>,
+        stitch: Option<Arc<tr_data::vault::StitchInfo>>,
+    },
+    /// Closed-bar path bootstrap and walk-forward calibration on verified bars.
+    TrendCone {
+        pane: PaneId,
+        key: tr_data::trend_cone::ConeKey,
+        class: tr_core::AssetClass,
+        bars: Arc<Vec<Bar>>,
+        as_of: Option<i64>,
+        stitch: Option<Arc<tr_data::vault::StitchInfo>>,
+    },
+    /// Anchored VWAP on the chart's own loaded bars. `key` carries the generation,
+    /// interval and anchors; `as_of` is the chart's last refresh (now for archive charts)
+    /// and decides the forming bar through `closed_len`. Never fetches prices.
+    AnchoredVwap {
+        pane: PaneId,
+        key: tr_data::anchored_vwap::AvwapKey,
+        class: tr_core::AssetClass,
+        bars: Arc<Vec<Bar>>,
+        as_of: Option<i64>,
+    },
+    HoldingHistory {
+        pane: PaneId,
+        generation: u64,
+        symbols: Vec<String>,
+    },
+    StudioDist {
+        pane: PaneId,
+        generation: u64,
+        symbol: String,
+        timeframe: Timeframe,
+        window: tr_data::studio_dist::Window,
+    },
+    /// `fresh` bypasses the per-(symbol, interval) bar cache (explicit Reload).
+    TstackTune {
+        pane: PaneId,
+        generation: u64,
+        symbol: String,
+        tf: Timeframe,
+        params: AdaptiveTrendParams,
+    },
+    StudioCorr {
+        pane: PaneId,
+        generation: u64,
+        horizon: usize,
+        symbol: String,
+        spec: String,
+        fresh: bool,
+        /// Relate transforms / fair value. Legacy CORR and RBETA always send `None`.
+        relate: Option<tr_data::studio_corr::RelateSpec>,
+    },
+    /// Regression Lab. `token` comes from `studio_token()`; the response must echo the spec.
+    StudioLab {
+        pane: PaneId,
+        token: u64,
+        symbol: String,
+        tf: Timeframe,
+        spec: tr_data::studio_lab::LabSpec,
+        fresh: bool,
+    },
+    /// Freeze the displayed Lab / Relate fit into an immutable model file. No new fit, no new load.
+    SaveStudioFit {
+        pane: PaneId,
+        token: u64,
+        name: Option<String>,
+        monitor: Option<usize>,
+        source: tr_data::studio_residual::FitSource,
+    },
+    /// List saved residual models (disk read only).
+    ListStudioFits {
+        pane: PaneId,
+        token: u64,
+    },
+    LoadStudioFit {
+        pane: PaneId,
+        token: u64,
+        id: String,
+    },
+    /// Score a frozen model on freshly re-admitted live data. Never refits.
+    ScoreStudioResidual {
+        pane: PaneId,
+        token: u64,
+        model: Arc<tr_data::studio_residual::FrozenFit>,
+        fresh: bool,
+    },
+    CheckStudioResidual {
+        pane: PaneId,
+        token: u64,
+        model: Arc<tr_data::studio_residual::FrozenFit>,
+        report: Arc<tr_data::studio_residual::ResidualReport>,
+    },
+    /// Pure attribution of a scored frozen model over one window. No load, no fit.
+    StudioAttribution {
+        pane: PaneId,
+        token: u64,
+        model: Arc<tr_data::studio_residual::FrozenFit>,
+        report: Arc<tr_data::studio_residual::ResidualReport>,
+        window: tr_data::studio_attribution::AttrWindow,
+    },
+    StudioSeason {
+        pane: PaneId,
+        generation: u64,
+        symbol: String,
+        tf: Timeframe,
+    },
+    StudioShape {
+        pane: PaneId,
+        generation: u64,
+        report: Arc<tr_data::studio_dist::Report>,
+        horizon: usize,
+        overlap: bool,
+        thresholds: [f64; 3],
+    },
+    StudioShapeBootstrap {
+        pane: PaneId,
+        generation: u64,
+        input: Arc<tr_data::studio_shape::Shape>,
+    },
+    StudioDistRotation {
+        pane: PaneId,
+        generation: u64,
+        symbol: String,
+        timeframe: Timeframe,
+        source: String,
+        input: Arc<tr_data::studio_regime::RotationInput>,
+    },
+
+    StudioSeasonBand {
+        pane: PaneId,
+        generation: u64,
+        symbol: String,
+        tf: Timeframe,
+        source: String,
+        input: Arc<tr_data::studio_season::SessionBandInput>,
+    },
+    /// Historical statistics and conditional forward returns for one archive symbol.
+    Stats {
+        pane: PaneId,
+        generation: u64,
+        symbol: String,
+        condition: String,
+        horizons: Vec<usize>,
+    },
+    /// Paper strategy backtest vs buy-and-hold for one archive symbol.
+    Backtest {
+        pane: PaneId,
+        generation: u64,
+        symbol: String,
+        spec: String,
+        holdout: String,
+        commission_bps: f64,
+        slippage_bps: f64,
+        allow_short: bool,
+        honesty: tr_data::backtest_honesty::HonestySettings,
+    },
+    /// Multi-symbol intraday compare, percent from each name's 09:30 open.
+    IntradayCompare {
+        pane: PaneId,
+        generation: u64,
+        symbol: String,
+        spec: String,
+        timeframe: String,
+    },
+    /// Today versus the typical path of prior regular sessions.
+    SessionPath {
+        pane: PaneId,
+        generation: u64,
+        symbol: String,
+        spec: String,
+        timeframe: String,
+    },
+    /// Relative rotation, using only the local daily research archive.
+    Rotation {
+        pane: PaneId,
+        generation: u64,
+        query: tr_data::rotation::RotationQuery,
+    },
+    /// Share of a list at or above the 09:30 open and session VWAP.
+    Breadth {
+        pane: PaneId,
+        generation: u64,
+        spec: String,
+        timeframe: String,
+        /// Selected watchlist, used when `spec` names no ticker.
+        symbols: Vec<String>,
+    },
+    /// Cumulative volume versus the usual pace of prior sessions.
+    VolumePace {
+        pane: PaneId,
+        generation: u64,
+        symbol: String,
+        spec: String,
+        timeframe: String,
+    },
+    RealizedVol {
+        pane: PaneId,
+        generation: u64,
+        symbol: String,
+        spec: String,
+        timeframe: String,
+    },
+    Autocorr {
+        pane: PaneId,
+        generation: u64,
+        symbol: String,
+        spec: String,
+        timeframe: String,
+    },
+    /// Today's open versus the prior cash close.
+    GapFill {
+        pane: PaneId,
+        generation: u64,
+        symbol: String,
+        spec: String,
+        timeframe: String,
+    },
+    /// When the session high and low print.
+    SessionExtreme {
+        pane: PaneId,
+        generation: u64,
+        symbol: String,
+        spec: String,
+        timeframe: String,
+    },
+    /// Weekday by cash-bucket returns.
+    SessionClock {
+        pane: PaneId,
+        generation: u64,
+        symbol: String,
+        spec: String,
+        timeframe: String,
+    },
+    /// Percent from the 09:30 open minus SPY.
+    RelativePath {
+        pane: PaneId,
+        generation: u64,
+        symbol: String,
+        spec: String,
+        timeframe: String,
+    },
+    /// Five session reads for one name. Not a chart.
+    SessionBrief {
+        pane: PaneId,
+        generation: u64,
+        symbol: String,
+    },
+    /// Prior close, open, opening range, and VWAP for the named chart.
+    CashLevels {
+        pane: PaneId,
+        symbol: String,
+    },
+    /// Paper VWAP / opening-range backtest on verified regular-session bars.
+    IntradayBacktest {
+        pane: PaneId,
+        generation: u64,
+        symbol: String,
+        spec: String,
+        timeframe: String,
+        holdout: String,
+        commission_bps: f64,
+        slippage_bps: f64,
+        allow_short: bool,
+        honesty: tr_data::backtest_honesty::HonestySettings,
+    },
+    /// Historical lookalikes / nearest neighbors for one archive symbol.
+    Lookalike {
+        pane: PaneId,
+        generation: u64,
+        symbol: String,
+        query: tr_data::lookalike::LookalikeQuery,
+    },
+    ArchiveHistory {
+        pane: PaneId,
+        generation: u64,
+        symbol: String,
+        tf: Timeframe,
+        /// Displayed candles to keep; daily rows fetched are a multiple of this.
+        limit: usize,
+        /// Page older daily history ending before this timestamp (chart left-edge paging).
+        before: Option<i64>,
+    },
     /// Load the brokerage portfolio through SnapTrade (`None` = the simulated sample).
-    Portfolio(Option<tr_broker::Credentials>),
+    Portfolio(u64, u64, Option<tr_broker::Credentials>),
     /// Register a SnapTrade user under the partner keys.
     BrokerRegister {
         creds: tr_broker::Credentials,
@@ -51,10 +490,10 @@ pub enum Request {
         symbol: String,
         expiration: Option<i64>,
     },
-    /// Headlines for a market key (`None` = general market news).
+    /// Headlines for bounded market keys (`None` = one top-market query).
     News {
         pane: PaneId,
-        symbol: Option<String>,
+        symbols: Option<Vec<String>>,
     },
     OrderBook {
         pane: PaneId,
@@ -62,6 +501,14 @@ pub enum Request {
         depth: usize,
     },
     History {
+        pane: PaneId,
+        generation: u64,
+        symbol: String,
+        tf: Timeframe,
+        limit: usize,
+    },
+    /// Pre-market and after-hours bars. Not read from or written to the regular-session cache.
+    ExtendedHistory {
         pane: PaneId,
         generation: u64,
         symbol: String,
@@ -76,6 +523,8 @@ pub enum Request {
         tf: Timeframe,
         existing: Arc<Vec<Bar>>,
         limit: usize,
+        /// Page the extended-hours read. A regular page is never spliced onto it.
+        extended: bool,
     },
     Indicators {
         pane: PaneId,
@@ -83,6 +532,9 @@ pub enum Request {
         bars: Arc<Vec<Bar>>,
         tf: Timeframe,
         specs: Vec<IndicatorSpec>,
+        class: tr_core::AssetClass,
+        observed: Option<i64>,
+        stitch: Option<Arc<tr_data::vault::StitchInfo>>,
         /// Colours are baked into overlays, so the UI passes its current palette.
         palette: theme::Palette,
     },
@@ -116,13 +568,175 @@ pub enum Request {
     },
     Alerts,
     MarkAlertsSeen,
+    /// Snapshot of persistent price/setup rules and fired events.
+    TradePlans,
+    ArmTradePlan(tr_data::trade_plans::PlanDraft),
+    UpdateTradePlan {
+        query: String,
+        change: tr_data::trade_plans::PlanChange,
+    },
+    CancelTradePlan {
+        id: String,
+    },
+    RemoveTradePlan {
+        query: String,
+    },
+    CancelTradePlansFor {
+        query: String,
+    },
+    MarkTradePlansSeen,
+    PriceAlerts,
+    AddPriceAlert {
+        symbol: String,
+        kind: tr_data::price_alerts::AlertKind,
+    },
+    RemovePriceAlert {
+        query: String,
+    },
+    SetPriceAlertEnabled {
+        id: String,
+        enabled: bool,
+    },
+    MarkPriceAlertsSeen,
+    EvaluatePriceAlerts,
+    /// Session RVOL and VWAP for the named watchlist group. Bars are read one name at a time.
+    IntradayScan {
+        group: String,
+        symbols: Vec<String>,
+        /// Bumps on each read so a slow answer cannot replace a newer one.
+        generation: u64,
+    },
     RefreshCongress,
+    /// Write archived daily bars to a portable JSON file (source + dates).
+    ExportHistory {
+        path: PathBuf,
+        symbols: Vec<String>,
+    },
+    /// Restore verified Real bars from a portable history export.
+    ImportHistory {
+        path: PathBuf,
+    },
+    /// Replace in-memory price/setup rules from a workspace restore.
+    ReplacePriceAlerts(tr_data::price_alerts::Store),
     /// A pane closed or changed: stop its live feed and drop its series.
     Forget(PaneId),
     YieldCurves,
     Search(String),
     /// Order entry (see `app::trading`); only sent once trading is enabled.
     Trade(TradeRequest),
+}
+
+impl Request {
+    fn kind(&self) -> &'static str {
+        match self {
+            Self::StackEdge { .. } => "StackEdge",
+            Self::VaultSnapshot { .. } => "VaultSnapshot",
+            Self::VaultDrop { .. } => "VaultDrop",
+            Self::VaultVerify => "VaultVerify",
+            Self::VaultPrune => "VaultPrune",
+            Self::Health => "Health",
+            Self::RetryFeed { .. } => "RetryFeed",
+            Self::HistoryStatus => "HistoryStatus",
+            Self::HistoryTask(..) => "HistoryTask",
+            Self::ConfigureWhatsNews { .. } => "ConfigureWhatsNews",
+            Self::AutocompleteUniverse => "AutocompleteUniverse",
+            Self::Research { .. } => "Research",
+            Self::ScanView { .. } => "ScanView",
+            Self::Desk { .. } => "Desk",
+            Self::WallEdge { .. } => "WallEdge",
+            Self::CancelWallEdge { .. } => "CancelWallEdge",
+            Self::WallEdgeFocus { .. } => "WallEdgeFocus",
+            Self::TrendWall { .. } => "TrendWall",
+            Self::TrendStack { .. } => "TrendStack",
+            Self::DailyStrength { .. } => "DailyStrength",
+            Self::AuctionMap { .. } => "AuctionMap",
+            Self::ChartSessionSummary { .. } => "ChartSessionSummary",
+            Self::StopCloud { .. } => "StopCloud",
+            Self::TrendCone { .. } => "TrendCone",
+            Self::AnchoredVwap { .. } => "AnchoredVwap",
+            Self::HoldingHistory { .. } => "HoldingHistory",
+            Self::StudioWhen { .. } => "StudioWhen",
+            Self::StudioWhenBootstrap { .. } => "StudioWhenBootstrap",
+            Self::StudioSubset { .. } => "StudioSubset",
+            Self::StudioCanvas { .. } => "StudioCanvas",
+            Self::StudioDist { .. } => "StudioDist",
+            Self::TstackTune { .. } => "TstackTune",
+            Self::StudioCorr { .. } => "StudioCorr",
+            Self::StudioLab { .. } => "StudioLab",
+            Self::SaveStudioFit { .. } => "SaveStudioFit",
+            Self::ListStudioFits { .. } => "ListStudioFits",
+            Self::LoadStudioFit { .. } => "LoadStudioFit",
+            Self::ScoreStudioResidual { .. } => "ScoreStudioResidual",
+            Self::CheckStudioResidual { .. } => "CheckStudioResidual",
+            Self::StudioAttribution { .. } => "StudioAttribution",
+            Self::StudioSeason { .. } => "StudioSeason",
+            Self::StudioShape { .. } => "StudioShape",
+            Self::StudioShapeBootstrap { .. } => "StudioShapeBootstrap",
+            Self::StudioDistRotation { .. } => "StudioDistRotation",
+            Self::StudioSeasonBand { .. } => "StudioSeasonBand",
+            Self::Stats { .. } => "Stats",
+            Self::Backtest { .. } => "Backtest",
+            Self::IntradayCompare { .. } => "IntradayCompare",
+            Self::SessionPath { .. } => "SessionPath",
+            Self::Rotation { .. } => "Rotation",
+            Self::Breadth { .. } => "Breadth",
+            Self::VolumePace { .. } => "VolumePace",
+            Self::RealizedVol { .. } => "RealizedVol",
+            Self::Autocorr { .. } => "Autocorr",
+            Self::GapFill { .. } => "GapFill",
+            Self::SessionExtreme { .. } => "SessionExtreme",
+            Self::SessionClock { .. } => "SessionClock",
+            Self::RelativePath { .. } => "RelativePath",
+            Self::SessionBrief { .. } => "SessionBrief",
+            Self::CashLevels { .. } => "CashLevels",
+            Self::IntradayBacktest { .. } => "IntradayBacktest",
+            Self::Lookalike { .. } => "Lookalike",
+            Self::ArchiveHistory { .. } => "ArchiveHistory",
+            Self::Portfolio(..) => "Portfolio",
+            Self::BrokerRegister { .. } => "BrokerRegister",
+            Self::BrokerPortal { .. } => "BrokerPortal",
+            Self::BrokerDisconnect { .. } => "BrokerDisconnect",
+            Self::Options { .. } => "Options",
+            Self::News { .. } => "News",
+            Self::OrderBook { .. } => "OrderBook",
+            Self::History { .. } => "History",
+            Self::ExtendedHistory { .. } => "ExtendedHistory",
+            Self::MoreHistory { .. } => "MoreHistory",
+            Self::Indicators { .. } => "Indicators",
+            Self::Compare { .. } => "Compare",
+            Self::Markers { .. } => "Markers",
+            Self::Quotes(..) => "Quotes",
+            Self::Latest { .. } => "Latest",
+            Self::TickerTrades { .. } => "TickerTrades",
+            Self::Profile { .. } => "Profile",
+            Self::SearchPoliticians(..) => "SearchPoliticians",
+            Self::Track { .. } => "Track",
+            Self::Alerts => "Alerts",
+            Self::MarkAlertsSeen => "MarkAlertsSeen",
+            Self::TradePlans => "TradePlans",
+            Self::ArmTradePlan(..) => "ArmTradePlan",
+            Self::UpdateTradePlan { .. } => "UpdateTradePlan",
+            Self::CancelTradePlan { .. } => "CancelTradePlan",
+            Self::RemoveTradePlan { .. } => "RemoveTradePlan",
+            Self::CancelTradePlansFor { .. } => "CancelTradePlansFor",
+            Self::MarkTradePlansSeen => "MarkTradePlansSeen",
+            Self::PriceAlerts => "PriceAlerts",
+            Self::AddPriceAlert { .. } => "AddPriceAlert",
+            Self::RemovePriceAlert { .. } => "RemovePriceAlert",
+            Self::SetPriceAlertEnabled { .. } => "SetPriceAlertEnabled",
+            Self::MarkPriceAlertsSeen => "MarkPriceAlertsSeen",
+            Self::EvaluatePriceAlerts => "EvaluatePriceAlerts",
+            Self::IntradayScan { .. } => "IntradayScan",
+            Self::RefreshCongress => "RefreshCongress",
+            Self::ExportHistory { .. } => "ExportHistory",
+            Self::ImportHistory { .. } => "ImportHistory",
+            Self::ReplacePriceAlerts(..) => "ReplacePriceAlerts",
+            Self::Forget(..) => "Forget",
+            Self::YieldCurves => "YieldCurves",
+            Self::Search(..) => "Search",
+            Self::Trade(..) => "Trade",
+        }
+    }
 }
 
 /// A trading call through SnapTrade. Previews never place anything; placing takes a preview
@@ -187,9 +801,17 @@ pub struct CapsError {
 pub struct BuiltIndicator {
     pub spec: IndicatorSpec,
     pub overlays: Vec<(String, Overlay)>,
+    /// Set when a research overlay refused sample / unverified bars.
+    pub refused: Option<String>,
+    /// Last-bar HUD for research overlays (regimes and trailing stops).
+    pub note: Option<String>,
+    /// Preserve double precision for z readouts; price geometry uses f32.
+    pub z_readout: Option<Arc<Vec<f64>>>,
+    pub honest_z: Option<Arc<tr_data::honest_z::Report>>,
 }
 
 pub struct Profile {
+    pub price_warnings: Vec<String>,
     pub politician: Politician,
     pub trades: Vec<Trade>,
     pub perf: Performance,
@@ -198,7 +820,332 @@ pub struct Profile {
 }
 
 pub enum Response {
-    Portfolio(Result<Box<tr_broker::Portfolio>, String>),
+    StudioWhen {
+        pane: PaneId,
+        generation: u64,
+        result: Result<Arc<crate::app::studio_when::PreparedWhen>, String>,
+    },
+    StudioWhenBootstrap {
+        pane: PaneId,
+        generation: u64,
+        key: u64,
+        result: Result<Arc<tr_data::studio_when::WhenBootstrap>, String>,
+    },
+    StudioSubset {
+        pane: PaneId,
+        generation: u64,
+        key: u64,
+        selection: (i64, i64),
+        result: Result<Arc<crate::app::studio_when::PreparedSubset>, String>,
+    },
+    StudioCanvas {
+        pane: PaneId,
+        token: u64,
+        key: crate::chart_view::studio_canvas::CanvasKey,
+        result: Result<Arc<crate::chart_view::studio_canvas::PreparedCanvas>, String>,
+    },
+    StackEdge {
+        pane: PaneId,
+        key: tr_data::edge::EdgeKey,
+        result: Result<Arc<tr_data::edge::EdgeReport>, String>,
+    },
+
+    VaultStitch {
+        pane: PaneId,
+        generation: u64,
+        info: Arc<tr_data::vault::StitchInfo>,
+    },
+    VaultSnapshot {
+        pane: PaneId,
+        generation: u64,
+        result: Result<Arc<tr_data::vault::VaultSnapshot>, String>,
+    },
+
+    Feed {
+        feed: Feed,
+        pane: Option<PaneId>,
+        symbol: Option<String>,
+        generation: Option<u64>,
+        state: FeedState,
+    },
+    Health(Snapshot),
+    HistoryStatus(Result<tr_data::history::Status, String>),
+    HistoryChanged,
+    WhatsNews {
+        epoch: u64,
+        response: Box<Response>,
+    },
+    WhatsNewsHealth {
+        epoch: u64,
+        health: tr_data::whats_news::Health,
+    },
+    AutocompleteUniverse(Result<tr_data::whats_news::Snapshot<Vec<tr_data::whats_news::Symbol>>, String>),
+    Universe {
+        pane: PaneId,
+        generation: u64,
+        result: Result<tr_data::whats_news::Snapshot<Vec<tr_data::whats_news::Symbol>>, String>,
+    },
+    Scan {
+        pane: PaneId,
+        generation: u64,
+        result: Result<tr_data::whats_news::ScanSnapshot, String>,
+    },
+    ScanView {
+        pane: PaneId,
+        generation: u64,
+        result: Result<Arc<crate::app::research::scan_view::ViewSnapshot>, String>,
+    },
+    Desk {
+        pane: PaneId,
+        generation: u64,
+        result: Result<tr_data::whats_news::Snapshot<Vec<tr_data::whats_news::MemberRow>>, String>,
+    },
+    WallEdgeRow {
+        pane: PaneId,
+        generation: u64,
+        index: usize,
+        symbol: String,
+        result: WallEdgeResult,
+    },
+    WallEdgeDone {
+        pane: PaneId,
+        generation: u64,
+        error: Option<String>,
+    },
+    TrendWallRow {
+        pane: PaneId,
+        generation: u64,
+        index: usize,
+        row: tr_data::stack_wall::Row,
+    },
+    TrendWallDone {
+        pane: PaneId,
+        generation: u64,
+        error: Option<String>,
+    },
+    TrendStack {
+        pane: PaneId,
+        generation: u64,
+        base_len: usize,
+        result: Result<TrendStack, String>,
+        config_revision: u64,
+    },
+    DailyStrength {
+        pane: PaneId,
+        generation: u64,
+        base_len: usize,
+        result: Result<LineRef, String>,
+    },
+    ChartSessionSummary {
+        pane: PaneId,
+        key: crate::chart_view::SessionSummaryKey,
+        result: Result<Arc<tr_data::chart_session::SessionSummary>, String>,
+    },
+    /// Timestamp-anchored profiles for exactly the keyed chart input.
+    AuctionMap {
+        pane: PaneId,
+        key: tr_data::auction::AuctionKey,
+        result: Result<Arc<tr_data::auction::AuctionReport>, String>,
+    },
+    StopCloud {
+        pane: PaneId,
+        key: tr_data::stop_cloud::StopKey,
+        result: Result<Arc<tr_data::stop_cloud::StopReport>, String>,
+    },
+    TrendCone {
+        pane: PaneId,
+        key: tr_data::trend_cone::ConeKey,
+        result: Result<Arc<tr_data::trend_cone::ConeReport>, String>,
+    },
+    /// Anchored VWAP for the chart state described by `key` (generation, anchors, bars).
+    AnchoredVwap {
+        pane: PaneId,
+        key: tr_data::anchored_vwap::AvwapKey,
+        result: Result<Arc<tr_data::anchored_vwap::AvwapReport>, String>,
+    },
+    HoldingHistory {
+        pane: PaneId,
+        generation: u64,
+        rows: Vec<(String, Vec<Bar>)>,
+        spy: Option<Vec<Bar>>,
+        error: Option<String>,
+    },
+    TstackTune {
+        pane: PaneId,
+        generation: u64,
+        result: Result<Arc<tr_data::tstack_tune::TuneReport>, String>,
+    },
+    StudioCorr {
+        pane: PaneId,
+        generation: u64,
+        result: Result<Arc<tr_data::studio_corr::CorrReport>, String>,
+    },
+    StudioLab {
+        pane: PaneId,
+        token: u64,
+        spec: tr_data::studio_lab::LabSpec,
+        result: Result<Arc<tr_data::studio_lab::LabReport>, String>,
+    },
+    StudioFitSaved {
+        pane: PaneId,
+        token: u64,
+        result: Result<crate::studio_models::SavedFit, String>,
+    },
+    StudioFitList {
+        pane: PaneId,
+        token: u64,
+        result: Result<Vec<crate::studio_models::ModelListing>, String>,
+    },
+    StudioFitLoaded {
+        pane: PaneId,
+        token: u64,
+        id: String,
+        result: Result<Arc<tr_data::studio_residual::FrozenFit>, crate::studio_models::ModelUnavailable>,
+    },
+    StudioResidualScored {
+        pane: PaneId,
+        token: u64,
+        model_digest: u64,
+        result: Result<Arc<tr_data::studio_residual::ResidualReport>, String>,
+    },
+    StudioResidualChecked {
+        pane: PaneId,
+        token: u64,
+        model_digest: u64,
+        score_key: u64,
+        result: Result<Arc<tr_data::studio_residual::ResidualChecks>, String>,
+    },
+    StudioAttributed {
+        pane: PaneId,
+        token: u64,
+        model_digest: u64,
+        score_key: u64,
+        window: tr_data::studio_attribution::AttrWindow,
+        result: Result<Arc<tr_data::studio_attribution::AttributionReport>, String>,
+    },
+    StudioSeason {
+        pane: PaneId,
+        generation: u64,
+        result: Result<Arc<tr_data::studio_season::SeasonReport>, String>,
+    },
+    StudioShape {
+        pane: PaneId,
+        generation: u64,
+        result: Result<Arc<tr_data::studio_shape::Shape>, String>,
+    },
+    StudioShapeBootstrap {
+        pane: PaneId,
+        generation: u64,
+        key: u64,
+        result: Result<Arc<tr_data::studio_shape::Intervals>, String>,
+    },
+    StudioDistRotation {
+        pane: PaneId,
+        generation: u64,
+        key: u64,
+        result: Result<Arc<tr_data::studio_regime::RegimeRotation>, String>,
+    },
+
+    StudioSeasonBand {
+        pane: PaneId,
+        generation: u64,
+        key: u64,
+        result: Result<Arc<tr_data::studio_inference::MaxTBand>, String>,
+    },
+    Stats {
+        pane: PaneId,
+        generation: u64,
+        result: Result<tr_data::stats::ResearchSnapshot, String>,
+    },
+    StudioDist {
+        pane: PaneId,
+        generation: u64,
+        result: Result<tr_data::studio_dist::Report, String>,
+    },
+    BacktestTrialRevision {
+        scope: String,
+        revision: u64,
+    },
+    Backtest {
+        pane: PaneId,
+        generation: u64,
+        result: Result<(Arc<tr_data::backtest::BacktestReport>, String), String>,
+    },
+    IntradayBacktest {
+        pane: PaneId,
+        generation: u64,
+        result: Result<(Arc<tr_data::intraday_backtest::IntradayReport>, String), String>,
+    },
+    IntradayCompare {
+        pane: PaneId,
+        generation: u64,
+        result: Result<tr_data::intraday_compare::CompareChart, String>,
+    },
+    SessionPath {
+        pane: PaneId,
+        generation: u64,
+        result: Result<tr_data::session_path::SessionPath, String>,
+    },
+    Rotation {
+        pane: PaneId,
+        generation: u64,
+        result: Result<tr_data::rotation::RotationReport, String>,
+    },
+    Breadth {
+        pane: PaneId,
+        generation: u64,
+        result: Result<tr_data::session_breadth::Breadth, String>,
+    },
+    VolumePace {
+        pane: PaneId,
+        generation: u64,
+        result: Result<tr_data::volume_pace::VolumePace, String>,
+    },
+    RealizedVol {
+        pane: PaneId,
+        generation: u64,
+        result: Result<tr_data::realized_vol::RealizedVol, String>,
+    },
+    Autocorr {
+        pane: PaneId,
+        generation: u64,
+        result: Result<tr_data::autocorr::Autocorr, String>,
+    },
+    GapFill {
+        pane: PaneId,
+        generation: u64,
+        result: Result<tr_data::gap_fill::GapFill, String>,
+    },
+    SessionExtreme {
+        pane: PaneId,
+        generation: u64,
+        result: Result<tr_data::session_extreme::SessionExtreme, String>,
+    },
+    SessionClock {
+        pane: PaneId,
+        generation: u64,
+        result: Result<tr_data::session_clock::SessionClock, String>,
+    },
+    RelativePath {
+        pane: PaneId,
+        generation: u64,
+        result: Result<tr_data::relative_path::RelativePath, String>,
+    },
+    SessionBrief {
+        pane: PaneId,
+        generation: u64,
+        result: Result<tr_data::session_brief::SessionBrief, String>,
+    },
+    CashLevels {
+        pane: PaneId,
+        result: Result<tr_data::cash_levels::CashLevels, String>,
+    },
+    Lookalike {
+        pane: PaneId,
+        generation: u64,
+        result: Result<tr_data::lookalike::LookalikeReport, String>,
+    },
+    Portfolio(u64, u64, Result<Box<tr_broker::Portfolio>, String>),
     /// `(userId, userSecret)` for a newly registered SnapTrade user.
     BrokerRegistered(Result<(String, String), String>),
     BrokerPortal(Result<String, String>),
@@ -211,8 +1158,8 @@ pub enum Response {
     },
     News {
         pane: PaneId,
-        symbol: Option<String>,
-        items: Result<Vec<tr_data::NewsItem>, String>,
+        symbols: Option<Vec<String>>,
+        batch: tr_data::news::NewsBatch,
     },
     OrderBook {
         pane: PaneId,
@@ -269,6 +1216,17 @@ pub enum Response {
     Politicians(Vec<PoliticianSummary>),
     Alerts(Vec<Alert>),
     NewAlerts(Vec<NewTradeAlert>),
+    TradePlanFeed(tr_data::trade_plans::PlanBatch),
+    NewTradePlanEvents(Vec<tr_data::trade_plans::PlanEvent>),
+    PriceAlertFeed(tr_data::price_alerts::AlertBatch),
+    NewPriceAlerts(Vec<tr_data::price_alerts::FiredAlert>),
+    IntradayScan {
+        group: String,
+        board: tr_data::iscan::Board,
+        generation: u64,
+    },
+    /// Result of EXPORT HIST / RESTORE history / price-alert replace.
+    Portable(Result<String, String>),
     Status(String),
     CongressRefreshed(String),
     Curves(Box<YieldCurves>),
@@ -280,6 +1238,9 @@ pub enum Response {
 }
 
 pub struct Worker {
+    jobs: Arc<crate::perf::JobLog>,
+    data_mode: DataMode,
+    health_board: Option<Arc<tr_data::HealthBoard>>,
     tx: tokio::sync::mpsc::UnboundedSender<Request>,
     pub rx: mpsc::Receiver<Response>,
     _rt: tokio::runtime::Runtime,
@@ -288,21 +1249,194 @@ pub struct Worker {
 /// Bars per pane tagged with the load generation they belong to.
 type SeriesMap = HashMap<PaneId, (u64, Arc<Vec<Bar>>)>;
 
+type LaneKey = (String, Timeframe, bool);
+#[derive(Default)]
+struct LaneSlot {
+    value: tokio::sync::OnceCell<Result<Arc<Vec<Bar>>, String>>,
+    completed: std::sync::atomic::AtomicI64,
+}
+
+type FineBars = (Vec<Bar>, tr_data::vault::StitchInfo);
+#[derive(Default)]
+struct FineSlot {
+    value: tokio::sync::OnceCell<Option<Arc<FineBars>>>,
+    completed: std::sync::atomic::AtomicI64,
+}
+type NativeKey = (String, Timeframe, Option<i64>, usize);
+#[derive(Clone, Copy)]
+struct VaultObservation {
+    at: i64,
+    admitted: bool,
+}
+type NativeResult = Result<(Vec<Bar>, String, VaultObservation), Arc<anyhow::Error>>;
+type NativeSlot = tokio::sync::OnceCell<NativeResult>;
+#[derive(Debug)]
+struct NativeError(Arc<anyhow::Error>);
+impl std::fmt::Display for NativeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{:#}", self.0)
+    }
+}
+impl std::error::Error for NativeError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.0.as_ref().as_ref())
+    }
+}
+
 struct Shared {
+    jobs: Arc<crate::perf::JobLog>,
+    history: Arc<tr_data::history::Service>,
+    whats_news: tokio::sync::watch::Sender<(u64, tr_data::whats_news::Config)>,
     provider: Provider,
     /// Authoritative bars per chart pane (history, paging and live ticks all merge here),
     /// tagged with the pane's load generation.
     series: std::sync::Mutex<SeriesMap>,
-    cache: std::sync::Mutex<Option<BarCache>>,
+    feed_requests: std::sync::Mutex<HashMap<(Feed, Option<PaneId>), FeedRequest>>,
+    followers: std::sync::Mutex<std::collections::HashSet<(PaneId, u64, bool)>>,
+    /// Daily source rows for archive panes so weekly/monthly paging can resample the
+    /// combined window instead of stitching broken week boundaries.
+    archive_daily: std::sync::Mutex<SeriesMap>,
+    wall_generations: std::sync::Mutex<HashMap<PaneId, u64>>,
+    wall_edge_generations: std::sync::Mutex<HashMap<PaneId, u64>>,
+    /// Latest on-screen priority per pane, tagged with the Edge generation it ranks.
+    wall_edge_focus: std::sync::Mutex<HashMap<PaneId, (u64, Vec<usize>)>>,
+    wall_edge: std::sync::Mutex<HashMap<(String, bool), Arc<EdgeSlot>>>,
+    wall_edge_compute: Arc<tokio::sync::Semaphore>,
+    stack_lanes: std::sync::Mutex<HashMap<LaneKey, Arc<LaneSlot>>>,
+    auction_fine: std::sync::Mutex<HashMap<String, Arc<FineSlot>>>,
+    wall_fetches: tokio::sync::Semaphore,
+    cache: Arc<std::sync::Mutex<Option<BarVault>>>,
+    reports: Arc<tr_data::report_cache::ReportCache>,
+    native: std::sync::Mutex<HashMap<NativeKey, Arc<NativeSlot>>>,
+    chart_sources: std::sync::Mutex<HashMap<PaneId, (u64, String)>>,
+    news: std::sync::Mutex<tr_data::news::NewsCache>,
+    price_alerts: std::sync::Mutex<tr_data::price_alerts::Store>,
+    price_alerts_path: PathBuf,
+    trade_plans: std::sync::Mutex<tr_data::trade_plans::Store>,
+    trade_plans_path: PathBuf,
     db: Mutex<Db>,
     out: mpsc::Sender<Response>,
     ctx: egui::Context,
 }
 
+#[derive(Clone)]
+enum FeedRequest {
+    Bars { pane: PaneId, generation: u64, symbol: String, tf: Timeframe, limit: usize, extended: bool },
+    Quotes(Vec<String>),
+    Options { pane: PaneId, symbol: String, expiration: Option<i64> },
+    Book { pane: PaneId, symbol: String, depth: usize },
+    Curve,
+}
+impl FeedRequest {
+    fn capture(req: &Request) -> Option<(Feed, Option<PaneId>, Self)> {
+        Some(match req {
+            Request::History { pane, generation, symbol, tf, limit }
+            | Request::ExtendedHistory { pane, generation, symbol, tf, limit } => (
+                Feed::Bars,
+                Some(*pane),
+                Self::Bars {
+                    pane: *pane,
+                    generation: *generation,
+                    symbol: symbol.clone(),
+                    tf: *tf,
+                    limit: *limit,
+                    extended: matches!(req, Request::ExtendedHistory { .. }),
+                },
+            ),
+            Request::Quotes(symbols) => (Feed::Quotes, None, Self::Quotes(symbols.clone())),
+            Request::Options { pane, symbol, expiration } => (
+                Feed::Options,
+                Some(*pane),
+                Self::Options { pane: *pane, symbol: symbol.clone(), expiration: *expiration },
+            ),
+            Request::OrderBook { pane, symbol, depth } => {
+                (Feed::Book, Some(*pane), Self::Book { pane: *pane, symbol: symbol.clone(), depth: *depth })
+            }
+            Request::YieldCurves => (Feed::Curve, None, Self::Curve),
+            _ => return None,
+        })
+    }
+    fn request(self) -> Request {
+        match self {
+            Self::Bars { pane, generation, symbol, tf, limit, extended: false } => {
+                Request::History { pane, generation, symbol, tf, limit }
+            }
+            Self::Bars { pane, generation, symbol, tf, limit, extended: true } => {
+                Request::ExtendedHistory { pane, generation, symbol, tf, limit }
+            }
+            Self::Quotes(s) => Request::Quotes(s),
+            Self::Options { pane, symbol, expiration } => Request::Options { pane, symbol, expiration },
+            Self::Book { pane, symbol, depth } => Request::OrderBook { pane, symbol, depth },
+            Self::Curve => Request::YieldCurves,
+        }
+    }
+}
 impl Shared {
+    fn sample_mode(&self) -> bool {
+        self.provider.mode() == DataMode::ExplicitSample
+    }
+    fn feed(
+        &self,
+        feed: Feed,
+        pane: Option<PaneId>,
+        symbol: Option<String>,
+        generation: Option<u64>,
+        state: FeedState,
+    ) {
+        self.send(Response::Feed { feed, pane, symbol, generation, state });
+    }
+    fn result_state<T>(&self, feed: Feed, result: &anyhow::Result<T>) -> FeedState {
+        match result {
+            Ok(_) => FeedState::Live { last_ok: chrono::Utc::now().timestamp() },
+            Err(e) => {
+                let down = e.downcast_ref::<Unavailable>().cloned().unwrap_or_else(|| Unavailable {
+                    feed,
+                    kind: DownKind::Offline,
+                    reason: format!("{e:#}"),
+                    since: chrono::Utc::now().timestamp(),
+                    retry_at: Some(chrono::Utc::now().timestamp() + 15),
+                });
+                if down.kind == DownKind::Unsupported {
+                    FeedState::Unsupported { reason: down.reason }
+                } else {
+                    FeedState::Unavailable(down)
+                }
+            }
+        }
+    }
+    async fn bars_failed(&self, pane: PaneId, generation: u64, symbol: &str, tf: Timeframe, error: anyhow::Error) {
+        let Some(bars) = current_series(self, pane, generation) else { return };
+        let result: anyhow::Result<()> = Err(error);
+        let mut state = self.result_state(Feed::Bars, &result);
+        if !bars.is_empty() && bars.iter().all(|b| b.provenance.is_verified()) {
+            let fetched = display_cached(self, symbol, tf, 1)
+                .await
+                .and_then(|(_, at)| at)
+                .unwrap_or_else(|| bars.last().unwrap().ts);
+            state = state.stale(fetched, self.provider.name(), chrono::Utc::now().timestamp());
+        }
+        self.feed(Feed::Bars, Some(pane), Some(symbol.into()), Some(generation), state);
+    }
+
     fn send(&self, r: Response) {
         let _ = self.out.send(r);
         self.ctx.request_repaint();
+    }
+
+    fn persist_trade_plans(&self) {
+        self.trade_plans.lock().expect("trade plans").save(&self.trade_plans_path);
+    }
+
+    fn trade_plan_snapshot(&self, now: i64) -> tr_data::trade_plans::PlanBatch {
+        self.trade_plans.lock().expect("trade plans").snapshot(now, false, self.sample_mode(), Vec::new())
+    }
+
+    fn persist_price_alerts(&self) {
+        self.price_alerts.lock().expect("price alerts").save(&self.price_alerts_path);
+    }
+
+    fn price_alert_snapshot(&self, now: i64) -> tr_data::price_alerts::AlertBatch {
+        self.price_alerts.lock().expect("price alerts").snapshot(now, false, self.sample_mode(), Vec::new())
     }
 }
 
@@ -323,14 +1457,14 @@ pub fn data_dir() -> PathBuf {
 
 impl Worker {
     pub fn spawn(ctx: egui::Context, provider: Provider) -> anyhow::Result<Self> {
+        let data_mode = provider.mode();
+        let health_board = provider.health();
         let dir = data_dir();
         std::fs::create_dir_all(&dir)?;
         let db = Db::open(dir.join("congress.sqlite3")).or_else(|e| {
             tracing::warn!("congress db unavailable ({e:#}); using in-memory store");
             Db::open_in_memory()
         })?;
-        let cache =
-            BarCache::open(dir.join("bars.sqlite3")).map_err(|e| tracing::warn!("bar cache unavailable: {e:#}")).ok();
         let rt = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(4)
             .enable_all()
@@ -338,10 +1472,40 @@ impl Worker {
             .build()?;
         let (tx, mut req_rx) = tokio::sync::mpsc::unbounded_channel::<Request>();
         let (out, rx) = mpsc::channel();
+        let (whats_news, _) =
+            tokio::sync::watch::channel((0, crate::prefs::Prefs::load(&dir.join("prefs.json")).whats_news));
         let shared = Arc::new(Shared {
+            jobs: Default::default(),
+            history: Arc::new(tr_data::history::Service::new(
+                tr_data::history::Archive::open(dir.join("history.sqlite3"))?,
+                Arc::new(tr_data::yahoo::YahooProvider::new()?),
+                Default::default(),
+            )),
+            whats_news,
             provider,
             series: Default::default(),
-            cache: std::sync::Mutex::new(cache),
+            feed_requests: Default::default(),
+            followers: Default::default(),
+            archive_daily: Default::default(),
+            stack_lanes: Default::default(),
+            auction_fine: Default::default(),
+            wall_fetches: tokio::sync::Semaphore::new(4),
+            wall_generations: Default::default(),
+            wall_edge_generations: Default::default(),
+            wall_edge_focus: Default::default(),
+            wall_edge: Default::default(),
+            wall_edge_compute: Arc::new(tokio::sync::Semaphore::new(4)),
+            cache: Default::default(),
+            reports: Default::default(),
+            native: Default::default(),
+            chart_sources: Default::default(),
+            news: Default::default(),
+            price_alerts: std::sync::Mutex::new(tr_data::price_alerts::Store::load(&dir.join("price_alerts.json"))),
+            price_alerts_path: dir.join("price_alerts.json"),
+            trade_plans: std::sync::Mutex::new(tr_data::trade_plans::Store::load(&tr_data::trade_plans::store_path(
+                &dir,
+            ))),
+            trade_plans_path: tr_data::trade_plans::store_path(&dir),
             db: Mutex::new(db),
             out,
             ctx,
@@ -350,9 +1514,93 @@ impl Worker {
         // Request dispatcher: every request runs as its own task.
         let s = shared.clone();
         rt.spawn(async move {
+            if !s.sample_mode() {
+                let path = dir.join("bars.sqlite3");
+                let opened = tokio::task::spawn_blocking(move || BarVault::open(path)).await;
+                match opened {
+                    Ok(Ok(vault)) => *s.cache.lock().expect("vault lock") = Some(vault),
+                    Ok(Err(error)) => tracing::warn!("bar vault unavailable: {error:#}"),
+                    Err(error) => tracing::warn!("bar vault open task failed: {error}"),
+                }
+            }
             while let Some(req) = req_rx.recv().await {
+                // Reserve generations and retire panes in channel order, before
+                // asynchronous tasks can finish (or even start) out of order.
+                if !begin_request(&s, &req) {
+                    continue;
+                }
                 let s = s.clone();
                 tokio::spawn(async move { handle(&s, req).await });
+            }
+        });
+
+        let s = shared.clone();
+        rt.spawn(async move {
+            let mut previous = None;
+            let mut interval = tokio::time::interval(Duration::from_secs(1));
+            loop {
+                interval.tick().await;
+                if let Some(board) = s.provider.health() {
+                    let snapshot = board.snapshot();
+                    if previous.as_ref() != Some(&snapshot) {
+                        previous = Some(snapshot.clone());
+                        s.send(Response::Health(snapshot));
+                    }
+                }
+            }
+        });
+
+        let s = shared.clone();
+        rt.spawn(async move {
+            tokio::time::sleep(Duration::from_secs(30)).await;
+            loop {
+                cache_op(&s, |v| v.prune(chrono::Utc::now().timestamp())).await;
+                tokio::time::sleep(Duration::from_secs(24 * 60 * 60)).await;
+            }
+        });
+
+        // Independent health task: config changes cancel an obsolete probe/backoff.
+        let s = shared.clone();
+        rt.spawn(async move {
+            let mut config = s.whats_news.subscribe();
+            let mut failures = 0;
+            loop {
+                let (epoch, settings) = config.borrow_and_update().clone();
+                let bridge = settings.bridge();
+                let health = tokio::select! {
+                    health = bridge.health() => health,
+                    changed = config.changed() => {
+                        if changed.is_err() { break; }
+                        failures = 0;
+                        continue;
+                    }
+                };
+                failures = if health.connected() { 0 } else { failures + 1 };
+                s.send(Response::WhatsNewsHealth { epoch, health });
+                tokio::select! {
+                    _ = tokio::time::sleep(tr_data::whats_news::retry_delay(failures)) => {},
+                    changed = config.changed() => {
+                        if changed.is_err() { break; }
+                        failures = 0;
+                    }
+                }
+            }
+        });
+
+        // Price / setup rules: evaluate on a short interval so a crossing is not missed.
+        let s = shared.clone();
+        rt.spawn(async move {
+            let secs: u64 =
+                std::env::var("TR_PRICE_ALERT_SECS").ok().and_then(|v| v.parse().ok()).unwrap_or(PRICE_ALERT_EVAL_SECS);
+            if secs == 0 {
+                return;
+            }
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            let mut tick = tokio::time::interval(Duration::from_secs(secs));
+            loop {
+                tick.tick().await;
+                evaluate_price_alerts(&s).await;
+                evaluate_trade_plans(&s).await;
             }
         });
 
@@ -373,7 +1621,44 @@ impl Worker {
                 congress_refresh(&s).await;
             }
         });
-        Ok(Self { tx, rx, _rt: rt })
+        Ok(Self { jobs: shared.jobs.clone(), data_mode, health_board, tx, rx, _rt: rt })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_channel() -> (Self, tokio::sync::mpsc::UnboundedReceiver<Request>) {
+        let (worker, requests, _) = Self::test_channel_with_responses();
+        (worker, requests)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_channel_with_responses()
+    -> (Self, tokio::sync::mpsc::UnboundedReceiver<Request>, mpsc::Sender<Response>) {
+        let (tx, requests) = tokio::sync::mpsc::unbounded_channel();
+        let (out, rx) = mpsc::channel();
+        let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
+        (
+            Self { jobs: Default::default(), data_mode: DataMode::ExplicitSample, health_board: None, tx, rx, _rt: rt },
+            requests,
+            out,
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_live_channel() -> (Self, tokio::sync::mpsc::UnboundedReceiver<Request>) {
+        let (mut worker, rx) = Self::test_channel();
+        worker.data_mode = DataMode::Live;
+        (worker, rx)
+    }
+
+    pub fn jobs(&self) -> &crate::perf::JobLog {
+        &self.jobs
+    }
+
+    pub fn mode(&self) -> DataMode {
+        self.data_mode
+    }
+    pub fn health(&self) -> Option<Snapshot> {
+        self.health_board.as_ref().map(|b| b.snapshot())
     }
 
     pub fn send(&self, req: Request) {
@@ -406,11 +1691,21 @@ fn overlay(values: &[f64], color: egui::Color32, kind: LineKind) -> Overlay {
 
 /// Compute every indicator on `bars`. The `i`-th indicator takes the `i`-th series colour;
 /// its signal lines, outer bands and up/down lines take theme roles.
+#[cfg(test)]
 pub fn build_indicators(
     bars: &[Bar],
     tf: Timeframe,
     specs: &[IndicatorSpec],
     palette: &theme::Palette,
+) -> Vec<BuiltIndicator> {
+    build_indicators_impl(bars, tf, specs, palette, false)
+}
+fn build_indicators_impl(
+    bars: &[Bar],
+    tf: Timeframe,
+    specs: &[IndicatorSpec],
+    palette: &theme::Palette,
+    skip_zband: bool,
 ) -> Vec<BuiltIndicator> {
     let input = Input::new(bars, tf);
     let colors = palette.series.len();
@@ -418,6 +1713,28 @@ pub fn build_indicators(
         .iter()
         .enumerate()
         .map(|(i, spec)| {
+            if skip_zband && spec.code == "ZBAND" {
+                return BuiltIndicator {
+                    spec: spec.clone(),
+                    overlays: Vec::new(),
+                    refused: None,
+                    note: None,
+                    z_readout: None,
+                    honest_z: None,
+                };
+            }
+            if spec.def().is_some_and(|d| d.research)
+                && let Err(error) = tr_core::indicators::require_adaptive_bars(bars, spec.name())
+            {
+                return BuiltIndicator {
+                    spec: spec.clone(),
+                    overlays: Vec::new(),
+                    refused: Some(error),
+                    note: None,
+                    z_readout: None,
+                    honest_z: None,
+                };
+            }
             let main = palette.series[i % colors];
             let mut outputs = spec.compute(&input);
             // Columns first, so lines and markers draw over them.
@@ -443,9 +1760,89 @@ pub fn build_indicators(
                     (o.name.to_string(), overlay(&o.values, color, kind))
                 })
                 .collect();
-            BuiltIndicator { spec: spec.clone(), overlays }
+            let note = (spec.code == "ADTREND").then(|| {
+                let mut params = AdaptiveTrendParams::from_registry(&spec.params);
+                params.session_atr = tf.is_intraday();
+                let starts = tf.is_intraday().then(|| tr_core::indicators::session_starts(&input.d.ts));
+                let mut note = tr_core::indicators::adaptive_trend_with(&input.d, params, starts.as_deref()).hud();
+                if params.session_atr {
+                    note.push_str(" · session ATR");
+                }
+                note
+            });
+            let z_readout = (spec.code == "ZBAND")
+                .then(|| Arc::new(tr_core::indicators::registry::zband(&input.d.close, spec.params[0] as usize).z));
+            BuiltIndicator { spec: spec.clone(), overlays, refused: None, note, z_readout, honest_z: None }
         })
         .collect()
+}
+
+/// Keep the values whose drawn segment belongs to the `grey` half: bar t is kept
+/// when its own flag or the next bar's flag matches, so adjacent halves join.
+fn zband_split(values: &[f64], muted: &[bool], grey: bool) -> Vec<f64> {
+    let at = |t: usize| muted.get(t).copied().unwrap_or(true) == grey;
+    values.iter().enumerate().map(|(t, v)| if at(t) || at(t + 1) { *v } else { f64::NAN }).collect()
+}
+
+/// Chart-only closed-clock enrichment. Existing indicator calculations stay on
+/// the worker; ZBAND is rebuilt exclusively from admitted closed inputs.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn build_chart_indicators(
+    bars: &[Bar],
+    tf: Timeframe,
+    specs: &[IndicatorSpec],
+    palette: &theme::Palette,
+    class: tr_core::AssetClass,
+    observed: Option<i64>,
+    stitch: Option<&tr_data::vault::StitchInfo>,
+) -> Vec<BuiltIndicator> {
+    let mut built = build_indicators_impl(bars, tf, specs, palette, true);
+    for (i, indicator) in built.iter_mut().enumerate().filter(|(_, b)| b.spec.code == "ZBAND") {
+        let result = tr_data::vault::research_bars(bars, stitch).and_then(|bars| {
+            tr_data::honest_z::compute(
+                &bars,
+                tf,
+                class,
+                observed,
+                indicator.spec.params[0] as usize,
+                stitch.map_or(&[][..], |s| s.gaps.as_slice()),
+            )
+        });
+        // Never retain raw forming/unverified geometry from the generic builder.
+        indicator.overlays.clear();
+        indicator.z_readout = None;
+        indicator.note = None;
+        match result {
+            Err(e) => {
+                indicator.refused = Some(e);
+            }
+            Ok((band, report)) => {
+                indicator.refused = None;
+                let main = palette.series[i % palette.series.len()];
+                let lines = [
+                    ("+2σ", band.upper_two),
+                    ("+1σ", band.upper_one),
+                    ("Basis", band.mean),
+                    ("−1σ", band.lower_one),
+                    ("−2σ", band.lower_two),
+                ];
+                // Point-in-time styling: overlays 0..5 are the trusted (coloured)
+                // segments, 5..10 the grey ones. The segment ending at bar t takes
+                // bar t's flag, so each half keeps the joining bar t−1 as well.
+                let mut overlays = Vec::with_capacity(10);
+                for (grey, color) in [(false, main), (true, palette.muted)] {
+                    for (name, values) in &lines {
+                        let split = zband_split(values, &report.muted_at, grey);
+                        overlays.push(((*name).into(), overlay(&split, color, LineKind::Line)));
+                    }
+                }
+                indicator.overlays = overlays;
+                indicator.z_readout = Some(Arc::new(band.z));
+                indicator.honest_z = Some(Arc::new(report));
+            }
+        }
+    }
+    built
 }
 
 /// Align `other`'s closes to `base` timestamps (last close at or before each bar). The
@@ -479,17 +1876,3537 @@ pub fn initial_limit(tf: Timeframe) -> usize {
     std::env::var("TR_HISTORY_LIMIT").ok().and_then(|v| v.parse().ok()).unwrap_or_else(|| default_limit(tf))
 }
 
+/// Displayed archive candles requested per load/page. Daily rows fetched are
+/// `archive_daily_needed` of this. `TR_ARCHIVE_LIMIT` overrides the candle count.
+pub fn archive_page(tf: Timeframe) -> usize {
+    std::env::var("TR_ARCHIVE_LIMIT").ok().and_then(|v| v.parse().ok()).unwrap_or_else(|| match tf {
+        Timeframe::D1 => 800,
+        Timeframe::W1 => 400,
+        Timeframe::MN1 => 240,
+        _ => 800,
+    })
+}
+
+/// Daily rows needed to form `candles` of `tf` without inventing missing weeks/months.
+pub fn archive_daily_needed(tf: Timeframe, candles: usize) -> usize {
+    match tf {
+        Timeframe::W1 => candles.saturating_mul(5).saturating_add(10),
+        Timeframe::MN1 => candles.saturating_mul(23).saturating_add(10),
+        _ => candles,
+    }
+}
+
+/// Only verified native fetches reach the persistent bar cache.
+async fn cache_op<T: Send + 'static>(
+    s: &Shared,
+    f: impl FnOnce(&mut BarVault) -> anyhow::Result<T> + Send + 'static,
+) -> Option<T> {
+    if s.sample_mode() {
+        return None;
+    }
+    let cache = s.cache.clone();
+    tokio::task::spawn_blocking(move || {
+        let mut guard = cache.lock().ok()?;
+        let vault = guard.as_mut()?;
+        f(vault).map_err(|e| tracing::warn!("vault operation failed: {e:#}")).ok()
+    })
+    .await
+    .ok()
+    .flatten()
+}
+async fn display_cached(s: &Shared, symbol: &str, tf: Timeframe, limit: usize) -> Option<(Vec<Bar>, Option<i64>)> {
+    let symbol = symbol.to_owned();
+    cache_op(s, move |v| Ok((v.load(&symbol, tf, limit)?, v.fetched_at(&symbol, tf)?))).await
+}
+async fn store_verified_history(s: &Shared, symbol: &str, tf: Timeframe, bars: &[Bar]) {
+    if bars.is_empty() || !Bar::provenance(bars).is_verified() {
+        return;
+    }
+    let symbol = symbol.to_owned();
+    let bars = bars.to_vec();
+    cache_op(s, move |v| {
+        if !v.enabled() {
+            return Ok(());
+        }
+        v.store(&symbol, tf, &bars)?;
+        v.note_fetch(&symbol, tf, chrono::Utc::now().timestamp())
+    })
+    .await;
+}
+/// Share one provider response and one admission transaction across simultaneous
+/// identical native requests. Neither a pane closing nor paint accesses SQLite.
+async fn native_fetch(
+    s: &Shared,
+    symbol: &str,
+    tf: Timeframe,
+    end: Option<i64>,
+    limit: usize,
+) -> anyhow::Result<(Vec<Bar>, String, VaultObservation)> {
+    native_fetch_with_clock(s, symbol, tf, end, limit, || chrono::Utc::now().timestamp()).await
+}
+
+async fn native_fetch_with_clock(
+    s: &Shared,
+    symbol: &str,
+    tf: Timeframe,
+    end: Option<i64>,
+    limit: usize,
+    clock: impl FnOnce() -> i64,
+) -> anyhow::Result<(Vec<Bar>, String, VaultObservation)> {
+    let key = (tr_data::security(symbol).key(), tf, end, limit);
+    let slot = {
+        let mut pending = s.native.lock().expect("native fetches");
+        pending.entry(key.clone()).or_default().clone()
+    };
+    let result = slot
+        .get_or_init(|| async {
+            let response = s.provider.history_sourced(symbol, tf, end, limit).await;
+            let at = clock();
+            let (bars, source) = match response {
+                Ok(response) => response,
+                Err(error) => {
+                    let symbol = key.0.clone();
+                    let detail = format!("{error:#}");
+                    cache_op(s, move |v| {
+                        let id = v.sole_series(&symbol, tf)?.unwrap_or(tr_data::vault::SeriesId {
+                            symbol,
+                            tf,
+                            source: "unresolved".into(),
+                        });
+                        v.fetch_failed(&id, at, &detail)
+                    })
+                    .await;
+                    return Err(Arc::new(error));
+                }
+            };
+            let mut ready = false;
+            if !s.sample_mode() && tr_data::vault::eligible(symbol, tf, &source) {
+                let id = tr_data::vault::SeriesId { symbol: key.0.clone(), tf, source: source.clone() };
+                let fresh = bars.clone();
+                ready = cache_op(s, move |v| v.ingest(&id, &fresh, DataMode::Live, at))
+                    .await
+                    .is_some_and(|out| out.quarantined || out.inserted + out.confirmed + out.corrected > 0);
+            }
+            Ok((bars, source, VaultObservation { at, admitted: ready }))
+        })
+        .await
+        .clone();
+    let mut pending = s.native.lock().expect("native fetches");
+    if pending.get(&key).is_some_and(|v| Arc::ptr_eq(v, &slot)) {
+        pending.remove(&key);
+    }
+    result.map_err(|e| anyhow::Error::new(NativeError(e)))
+}
+
+/// Fetch only the provider's ordinary depth, then read a larger local window.
+/// A failed fresh fetch cannot advance the observation clock.
+async fn analysis_bars(
+    s: &Shared,
+    symbol: &str,
+    tf: Timeframe,
+    limit: usize,
+    operation: &str,
+) -> anyhow::Result<(Vec<Bar>, tr_data::vault::StitchInfo)> {
+    if s.sample_mode() {
+        anyhow::bail!("{operation} refused: sample / offline display mode");
+    }
+    let result = native_fetch(s, symbol, tf, None, limit).await;
+    match result {
+        Ok((bars, source, observation)) => {
+            Bar::require_verified(&bars, operation).map_err(anyhow::Error::msg)?;
+            let (bars, info) =
+                stitch_native(s, symbol, tf, bars, source, limit.max(tr_data::vault::vault_limit(tf)), observation)
+                    .await;
+            Bar::require_verified(&bars, operation).map_err(anyhow::Error::msg)?;
+            Ok((bars, info))
+        }
+        Err(error) => {
+            if error.chain().any(|e| e.downcast_ref::<Unavailable>().is_some_and(|u| u.kind == DownKind::Rejected)) {
+                return Err(error);
+            }
+            let symbol = tr_data::security(symbol).key();
+            let fallback = cache_op(s, move |v| {
+                let Some(id) = v.sole_series(&symbol, tf)? else { return Ok(None) };
+                let (bars, info) = v.stitch(&id, &[], limit.max(tr_data::vault::vault_limit(tf)), None)?;
+                Ok((!bars.is_empty()).then_some((bars, info)))
+            })
+            .await
+            .flatten();
+            fallback.ok_or(error)
+        }
+    }
+}
+async fn stitch_native(
+    s: &Shared,
+    symbol: &str,
+    tf: Timeframe,
+    bars: Vec<Bar>,
+    source: String,
+    limit: usize,
+    observation: VaultObservation,
+) -> (Vec<Bar>, tr_data::vault::StitchInfo) {
+    let VaultObservation { at, admitted: ready } = observation;
+    let observed = !bars.is_empty() && bars.iter().all(|b| b.provenance == tr_core::Provenance::Real);
+    let fallback = tr_data::vault::StitchInfo {
+        source: source.clone(),
+        live_bars: bars.len(),
+        oldest_ts: bars.first().map(|b| b.ts),
+        live_ok: observed,
+        fetched_at: observed.then_some(at),
+        note: Some("vault unavailable or ineligible".into()),
+        ..Default::default()
+    };
+    if !ready || s.sample_mode() || !tr_data::vault::eligible(symbol, tf, &source) {
+        return (bars, fallback);
+    }
+    let id = tr_data::vault::SeriesId { symbol: tr_data::security(symbol).key(), tf, source };
+    let fresh = bars.clone();
+    cache_op(s, move |v| v.stitch(&id, &fresh, limit, Some(at))).await.unwrap_or((bars, fallback))
+}
+/// Admission and cache lookup both run in spawn_blocking, including input hashing.
+#[allow(clippy::too_many_arguments)]
+fn tune_cached(
+    jobs: &crate::perf::JobLog,
+    reports: &tr_data::report_cache::ReportCache,
+    symbol: &str,
+    tf: Timeframe,
+    params: AdaptiveTrendParams,
+    bars: &[Bar],
+    source: &str,
+    observed: Option<i64>,
+    stitch: Option<&tr_data::vault::StitchInfo>,
+) -> Result<Arc<tr_data::tstack_tune::TuneReport>, String> {
+    tr_data::stats::require_research_bars(bars, "TSTACK Tune")?;
+    let bars = tr_data::vault::research_bars(bars, stitch)?;
+    let class = tr_data::security(symbol).class;
+    let n = tr_data::closed::closed_len(tf, &bars, class, observed);
+    let input = &bars[n.saturating_sub(tr_data::tstack_tune::MAX_BARS)..n];
+    let gaps = stitch.map_or(&[][..], |s| s.gaps.as_slice());
+    let mut key = tr_data::report_cache::ReportKey::new(
+        "tstack_tune",
+        symbol,
+        tf,
+        source,
+        input,
+        &format!("{params:?} {class:?} {gaps:?}"),
+    );
+    key.epoch = stitch.map_or(0, |s| s.epoch);
+    reports.get_or_compute(key, || {
+        jobs.time("TstackTune", || tr_data::tstack_tune::compute(&bars, tf, class, observed, params, source, gaps))
+    })
+}
+
+async fn cached_study<T: Clone + Send + Sync + 'static>(
+    s: &Shared,
+    key: tr_data::report_cache::ReportKey,
+    compute: impl FnOnce() -> Result<T, String> + Send + 'static,
+) -> anyhow::Result<T> {
+    if let Some(hit) = s.reports.get::<T>(&key) {
+        return Ok((*hit).clone());
+    }
+    let reports = s.reports.clone();
+    let jobs = s.jobs.clone();
+    let kind = match key.kind.as_str() {
+        "stack" => "TrendStack",
+        "clock" => "SessionClock",
+        "session_path" => "SessionPath",
+        "intraday_compare" => "IntradayCompare",
+        "volume_pace" => "VolumePace",
+        "realized_vol" => "RealizedVol",
+        "autocorr" => "Autocorr",
+        "gap_fill" => "GapFill",
+        "session_extreme" => "SessionExtreme",
+        "relative_path" => "RelativePath",
+        "breadth" => "Breadth",
+        _ => "cached study",
+    };
+    tokio::task::spawn_blocking(move || reports.get_or_compute(key, || jobs.time(kind, compute)).map(|v| (*v).clone()))
+        .await?
+        .map_err(anyhow::Error::msg)
+}
+
+const AUCTION_FINE_LIMIT: usize = 9_000;
+/// Pane-free fine fetch: does not change chart sources, observation clocks or feeds.
+async fn auction_fine_bars(s: &Shared, symbol: &str) -> Option<Arc<FineBars>> {
+    use std::sync::atomic::Ordering;
+    let symbol = tr_data::security(symbol).key();
+    let now = chrono::Utc::now().timestamp();
+    let slot = {
+        let mut slots = s.auction_fine.lock().unwrap();
+        slots.retain(|_, v| v.value.get().is_none() || now.saturating_sub(v.completed.load(Ordering::Acquire)) < 45);
+        if slots.len() >= 160 && !slots.contains_key(&symbol) {
+            let oldest = slots
+                .iter()
+                .filter(|(_, v)| v.value.get().is_some())
+                .min_by_key(|(_, v)| v.completed.load(Ordering::Acquire))
+                .map(|(k, _)| k.clone());
+            if let Some(k) = oldest {
+                slots.remove(&k);
+            }
+        }
+        slots.entry(symbol.clone()).or_default().clone()
+    };
+    slot.value
+        .get_or_init(|| async {
+            let fetched = match native_fetch(s, &symbol, Timeframe::M1, None, default_limit(Timeframe::M1)).await {
+                Ok((bars, source, observation)) => {
+                    Some(stitch_native(s, &symbol, Timeframe::M1, bars, source, AUCTION_FINE_LIMIT, observation).await)
+                }
+                Err(_) => {
+                    let symbol = symbol.clone();
+                    cache_op(s, move |v| {
+                        let Some(id) = v.sole_series(&symbol, Timeframe::M1)? else { return Ok(None) };
+                        Ok(Some(v.stitch(&id, &[], AUCTION_FINE_LIMIT, None)?))
+                    })
+                    .await
+                    .flatten()
+                }
+            };
+            let result = fetched.filter(|(bars, info)| {
+                !bars.is_empty()
+                    && Bar::require_verified(bars, "Auction Map").is_ok()
+                    && !info.note.as_ref().is_some_and(|n| n.contains("QUARANTINED"))
+            });
+            slot.completed.store(chrono::Utc::now().timestamp(), Ordering::Release);
+            result.map(Arc::new)
+        })
+        .await
+        .clone()
+}
+#[allow(clippy::too_many_arguments)]
+async fn auction_map(
+    s: &Shared,
+    symbol: &str,
+    class: tr_core::AssetClass,
+    bars: Arc<Vec<Bar>>,
+    key: &tr_data::auction::AuctionKey,
+    as_of: Option<i64>,
+    stitch: Option<Arc<tr_data::vault::StitchInfo>>,
+) -> Result<Arc<tr_data::auction::AuctionReport>, String> {
+    if s.sample_mode() {
+        return Err("Auction Map refused: sample / offline display mode".into());
+    }
+    if !key.tf.is_intraday() || key.tf.seconds() > 3600 {
+        return Err("Auction Map needs a live intraday chart (1m–1h)".into());
+    }
+    // Refuse before fetching any fine data. Admission itself runs off the UI thread.
+    Bar::require_verified(&bars, "Auction Map")?;
+    if !tr_data::time_link::cash_class(class) || tr_data::cash_session::require_us_session(symbol, None).is_err() {
+        return Err("Auction Map needs a US cash session".into());
+    }
+    let fine = if key.tf == Timeframe::M1 { None } else { auction_fine_bars(s, symbol).await };
+    let jobs = s.jobs.clone();
+    let reports = s.reports.clone();
+    let key = key.clone();
+    let symbol = symbol.to_owned();
+    tokio::task::spawn_blocking(move || {
+        let chart = tr_data::vault::research_bars(&bars, stitch.as_deref())?;
+        let n = tr_data::closed::closed_len(key.tf, &chart, class, as_of).min(key.closed);
+        let chart = &chart[..n];
+        let cut = chart
+            .last()
+            .map(|b| tr_data::time_link::bar_end(key.tf, b.ts, true))
+            .ok_or("Auction Map needs closed verified bars")?;
+        let mut gaps = stitch.as_ref().map_or_else(Vec::new, |s| s.gaps.clone());
+        if let Some(f) = &fine {
+            gaps.extend_from_slice(&f.1.gaps);
+        }
+        gaps.sort_unstable();
+        gaps.dedup();
+        let fine_bars = fine.as_ref().map(|f| f.0.as_slice());
+        let fine_closed = fine_bars.map(|b| &b[..b.partition_point(|b| b.ts + 60 <= cut)]);
+        let price = chart.last().unwrap().close;
+        let tick = if price >= 1. { 0.01 } else { 0.0001 };
+        let source = stitch.as_ref().map_or("verified chart bars".into(), |s| s.label());
+        let fine_id = fine.as_ref().map(|f| (&f.1.source, f.1.epoch, &f.1.note));
+        let mut cache_key = tr_data::report_cache::ReportKey::new(
+            "auction",
+            &symbol,
+            key.tf,
+            &source,
+            chart,
+            &format!(
+                "{:?} {class:?} cut={cut} gaps={gaps:?} tick={tick} fine={fine_id:?} digest={}",
+                key.params,
+                tr_data::stable_hash::bars_digest(fine_closed.unwrap_or(&[]))
+            ),
+        );
+        cache_key.epoch = stitch.as_ref().map_or(0, |s| s.epoch);
+        reports.get_or_compute(cache_key, || {
+            let _job = crate::perf::JobTimer::new(&jobs, "AuctionMap");
+            let mut r = tr_data::auction::build(chart, key.tf, fine_closed, class, cut, &gaps, key.params, tick)?;
+            r.source = fine.as_ref().map_or(source.clone(), |f| format!("{source} · fine {}", f.1.label()));
+            Ok(r)
+        })
+    })
+    .await
+    .unwrap_or_else(|e| Err(format!("Auction Map task failed: {e}")))
+}
+
+/// Coalesce only the same native key. Never hold the map lock across an await.
+async fn stack_lane_bars(
+    s: &Shared,
+    symbol: &str,
+    tf: Timeframe,
+    archive: bool,
+    now: i64,
+) -> Result<Arc<Vec<Bar>>, String> {
+    use std::sync::atomic::Ordering;
+    let now = now.max(chrono::Utc::now().timestamp());
+    let key = (symbol.to_string(), tf, archive);
+    let ttl = tr_data::intraday::refresh_ttl_secs(tf).unwrap_or(900);
+    let slot = {
+        let mut cache = s.stack_lanes.lock().expect("native lanes");
+        if let Some(slot) = cache.get(&key) {
+            let at = slot.completed.load(Ordering::Acquire);
+            if slot.value.get().is_some() && (at > now || now - at >= ttl) {
+                cache.remove(&key);
+            }
+        }
+        while cache.len() >= 256 && !cache.contains_key(&key) {
+            let oldest = cache
+                .iter()
+                .filter(|(_, slot)| slot.value.get().is_some())
+                .min_by_key(|(_, slot)| slot.completed.load(Ordering::Acquire))
+                .map(|(k, _)| k.clone());
+            if let Some(oldest) = oldest {
+                cache.remove(&oldest);
+            } else {
+                break;
+            }
+        }
+        cache.entry(key.clone()).or_default().clone()
+    };
+    let result = slot
+        .value
+        .get_or_init(|| async {
+            let result = fetch_stack_lane(s, symbol, tf, archive, now).await;
+            // Completion time, rather than request start, controls the TTL.
+            slot.completed.store(chrono::Utc::now().timestamp(), Ordering::Release);
+            result.map(Arc::new)
+        })
+        .await
+        .clone();
+    let mut cache = s.stack_lanes.lock().expect("native lanes");
+    if result.is_err() && cache.get(&key).is_some_and(|current| Arc::ptr_eq(current, &slot)) {
+        cache.remove(&key);
+    }
+    // A burst may temporarily contain more than 256 in-flight slots. Prune only completed ones.
+    while cache.len() > 256 {
+        let oldest = cache
+            .iter()
+            .filter(|(_, slot)| slot.value.get().is_some())
+            .min_by_key(|(_, slot)| slot.completed.load(Ordering::Acquire))
+            .map(|(key, _)| key.clone());
+        if let Some(oldest) = oldest {
+            cache.remove(&oldest);
+        } else {
+            break;
+        }
+    }
+    result
+}
+
+async fn fetch_stack_lane(
+    s: &Shared,
+    symbol: &str,
+    tf: Timeframe,
+    archive: bool,
+    now: i64,
+) -> Result<Vec<Bar>, String> {
+    let ttl = tr_data::intraday::refresh_ttl_secs(tf).unwrap_or(900);
+    let cached_base = if !archive && tf == Timeframe::M5 {
+        display_cached(s, symbol, tf, 400).await.and_then(|(bars, at)| {
+            at.filter(|at| *at <= now && now - *at < ttl)
+                .and_then(|_| (!bars.is_empty() && Bar::provenance(&bars).is_verified()).then_some(bars))
+        })
+    } else {
+        None
+    };
+    let result = if let Some(bars) = cached_base {
+        Ok(bars)
+    } else if archive {
+        let ticker = tr_data::whats_news::archive_ticker(symbol);
+        s.history.db(move |db| db.daily(&ticker)).await.map_err(|e| format!("{e:#}")).and_then(|bars| {
+            if bars.is_empty() {
+                return Err("No daily history in the local research archive".into());
+            }
+            Bar::require_verified(&bars, "Trend Stack archive")?;
+            Ok(if tf == Timeframe::D1 { bars } else { tf.resample(&bars) })
+        })
+    } else {
+        analysis_bars(s, symbol, tf, 400, "Trend Stack").await.map(|(bars, _)| bars).map_err(|e| format!("{e:#}"))
+    };
+    let mut bars = result?;
+    Bar::require_verified(&bars, "Trend Stack")?;
+    bars.sort_by_key(|b| b.ts);
+    bars.reverse();
+    bars.dedup_by_key(|b| b.ts);
+    bars.reverse();
+    if archive && bars.len() > 400 {
+        bars.drain(..bars.len() - 400);
+    }
+    if !archive {
+        store_verified_history(s, symbol, tf, &bars).await;
+    }
+    Ok(bars)
+}
+
+/// Wall acquisition is bounded independently of chart requests.
+async fn stack_wall_lane_bars(
+    s: &Shared,
+    symbol: &str,
+    tf: Timeframe,
+    archive: bool,
+    now: i64,
+) -> Result<Arc<Vec<Bar>>, String> {
+    let _permit = s.wall_fetches.acquire().await.map_err(|e| e.to_string())?;
+    stack_lane_bars(s, symbol, tf, archive, now).await
+}
+
+/// Preserve the chart's pre-existing verified bridge fallback without putting bridge
+/// data into the wall's local-archive cache namespace.
+async fn stack_chart_lane_bars(
+    s: &Shared,
+    symbol: &str,
+    tf: Timeframe,
+    archive: bool,
+    now: i64,
+) -> Result<Arc<Vec<Bar>>, String> {
+    let result = stack_lane_bars(s, symbol, tf, archive, now).await;
+    if archive && result.is_err() {
+        let config = s.whats_news.borrow().1.clone();
+        let bars = desk_daily(s, &config.bridge(), symbol).await.map_err(|e| format!("{e:#}"))?;
+        Ok(Arc::new(if tf == Timeframe::D1 { bars } else { tf.resample(&bars) }))
+    } else {
+        result
+    }
+}
+
+type WallEdgeResult = Result<Arc<tr_data::wall_edge::WallEdge>, tr_data::wall_edge::Miss>;
+/// Rows of one Edge pass in flight at once: the four wall fetch permits plus two
+/// computing, so fetch and compute overlap without queueing all fifty names at once.
+const WALL_EDGE_IN_FLIGHT: usize = 6;
+/// Next row to start: latest on-screen focus, then the request's priority, then row order.
+fn wall_edge_next(focus: &[usize], priority: &[usize], started: &mut [bool]) -> Option<usize> {
+    let i =
+        focus.iter().chain(priority).copied().chain(0..started.len()).find(|&i| started.get(i).is_some_and(|s| !s))?;
+    started[i] = true;
+    Some(i)
+}
+struct EdgeSlot {
+    value: tokio::sync::OnceCell<Arc<tr_data::wall_edge::WallEdge>>,
+    day: chrono::NaiveDate,
+    completed: std::sync::atomic::AtomicI64,
+}
+fn claim_wall_edge(s: &Shared, pane: PaneId, generation: u64) -> bool {
+    let mut generations = s.wall_edge_generations.lock().unwrap();
+    if generations.get(&pane).is_some_and(|g| *g > generation) {
+        return false;
+    }
+    generations.insert(pane, generation);
+    true
+}
+fn wall_edge_current(s: &Shared, pane: PaneId, generation: u64) -> bool {
+    s.wall_edge_generations.lock().unwrap().get(&pane) == Some(&generation)
+}
+#[allow(clippy::too_many_arguments)]
+fn wall_edge_cached(
+    reports: &tr_data::report_cache::ReportCache,
+    symbol: &str,
+    tf: Timeframe,
+    params: AdaptiveTrendParams,
+    bars: &[Bar],
+    source: &str,
+    observed: Option<i64>,
+    stitch: Option<&tr_data::vault::StitchInfo>,
+) -> WallEdgeResult {
+    use tr_data::wall_edge::{self, Miss};
+    let class = tr_data::security(symbol).class;
+    let input = wall_edge::prepare(bars, tf, class, observed, stitch)?;
+    let mut key = tr_data::report_cache::ReportKey::new(
+        "wall_edge",
+        symbol,
+        tf,
+        source,
+        &input.bars,
+        &format!("{params:?} h=5 {class:?} v1"),
+    );
+    key.epoch = stitch.map_or(0, |s| s.epoch);
+    key.day = input.bars.last().and_then(|b| {
+        if tf.is_intraday() {
+            Some(tr_core::ny::civil(b.ts).date())
+        } else {
+            chrono::DateTime::from_timestamp(b.ts, 0).map(|t| t.date_naive())
+        }
+    });
+    // Vault/live split of the input window itself (research_bars re-tags a mixed stitch).
+    let (lo, hi) = (input.bars.first().map_or(0, |b| b.ts), input.bars.last().map_or(0, |b| b.ts));
+    let window = bars.iter().filter(|b| (lo..=hi).contains(&b.ts));
+    let vault_bars = window.clone().filter(|b| b.provenance == tr_core::Provenance::Cached).count();
+    let live_bars = window.filter(|b| b.provenance == tr_core::Provenance::Real).count();
+    reports.get_or_compute(key, || {
+        let mut report = wall_edge::compute(&input.bars, tf, params).map_err(Miss::unverified)?;
+        report.source = source.into();
+        report.trimmed_gap = input.trimmed_gap;
+        report.vault_bars = if stitch.is_some() { vault_bars } else { 0 };
+        report.live_bars = if stitch.is_some() { live_bars } else { input.bars.len() };
+        report.vault_only = tf.is_intraday() && observed.is_none();
+        Ok(report)
+    })
+}
+async fn wall_edge_one(s: &Arc<Shared>, symbol: &str, daily: bool, pane: PaneId, generation: u64) -> WallEdgeResult {
+    use std::sync::atomic::Ordering;
+    use tr_data::wall_edge::{self, Miss};
+    let now = chrono::Utc::now().timestamp();
+    let day = wall_edge::completed_session(now);
+    let symbol = tr_data::security(symbol).key();
+    let key = (symbol.clone(), daily);
+    let slot = {
+        let mut cache = s.wall_edge.lock().unwrap();
+        cache.retain(|_, v| v.day == day);
+        while cache.len() >= 128 && !cache.contains_key(&key) {
+            let oldest = cache
+                .iter()
+                .filter(|(_, v)| v.value.get().is_some())
+                .min_by_key(|(_, v)| v.completed.load(Ordering::Acquire))
+                .map(|(k, _)| k.clone());
+            if let Some(k) = oldest {
+                cache.remove(&k);
+            } else {
+                break;
+            }
+        }
+        cache
+            .entry(key.clone())
+            .or_insert_with(|| Arc::new(EdgeSlot { value: Default::default(), day, completed: Default::default() }))
+            .clone()
+    };
+    let result = slot
+        .value
+        .get_or_try_init(|| async {
+            if s.sample_mode() {
+                return Err(Miss::unverified("SAMPLE DATA · offline display mode"));
+            }
+            if !daily
+                && (!tr_data::cash_session::is_cash(&tr_data::security(&symbol))
+                    || tr_data::cash_session::require_us_session(
+                        &symbol,
+                        tr_data::cash_session::exchange_zone(&symbol).as_deref(),
+                    )
+                    .is_err())
+            {
+                return Err(Miss::new("NOT US CASH", "Requires a verified US cash-session symbol", false));
+            }
+            let tf = if daily { Timeframe::D1 } else { Timeframe::M5 };
+            // The wall's own ribbon refresh has usually just admitted today's 5m bars. When
+            // the vault alone already holds a full contiguous window, a deep provider fetch
+            // could only re-confirm bars the window contains: skip it.
+            let reused = if daily { None } else { wall_edge_vault_window(s, &symbol, day).await };
+            let permit = if reused.is_some() {
+                None
+            } else {
+                Some(s.wall_fetches.acquire().await.map_err(|e| Miss::new("NO DATA", e.to_string(), false))?)
+            };
+            if !wall_edge_current(s, pane, generation) {
+                return Err(Miss::new("NO DATA", "Cancelled", false));
+            }
+            let (bars, stitch, observed, source) = if let Some((bars, info, at)) = reused {
+                let source = info.source.clone();
+                (bars, Some(info), Some(at), source)
+            } else if daily {
+                let ticker = tr_data::whats_news::archive_ticker(&symbol);
+                let bars = s
+                    .history
+                    .db(move |db| db.daily(&ticker))
+                    .await
+                    .map_err(|e| Miss::new("NO DATA", format!("{e:#}"), false))?;
+                (bars, None, Some(now), "research archive".to_string())
+            } else {
+                let (bars, info) =
+                    analysis_bars(s, &symbol, tf, wall_edge::MAX_BARS, "Wall Edge").await.map_err(|e| {
+                        let detail = format!("{e:#}");
+                        let upper = detail.to_uppercase();
+                        if upper.contains("UNVERIFIED") || upper.contains("SAMPLE") || upper.contains("MIXED") {
+                            Miss::unverified(detail)
+                        } else {
+                            Miss::new("NO DATA", detail, false)
+                        }
+                    })?;
+                let observed = info.live_ok.then_some(info.fetched_at).flatten();
+                let source = info.source.clone();
+                (bars, Some(info), observed, source)
+            };
+            drop(permit);
+            let compute = s
+                .wall_edge_compute
+                .clone()
+                .acquire_owned()
+                .await
+                .map_err(|e| Miss::new("NO DATA", e.to_string(), false))?;
+            if !wall_edge_current(s, pane, generation) {
+                return Err(Miss::new("NO DATA", "Cancelled", false));
+            }
+            let reports = s.reports.clone();
+            let symbol = symbol.clone();
+            let result = tokio::task::spawn_blocking(move || {
+                let _permit = compute;
+                wall_edge_cached(&reports, &symbol, tf, Default::default(), &bars, &source, observed, stitch.as_ref())
+            })
+            .await
+            .map_err(|e| Miss::new("NO DATA", e.to_string(), false))?;
+            slot.completed.store(chrono::Utc::now().timestamp(), Ordering::Release);
+            result
+        })
+        .await
+        .cloned();
+    let mut cache = s.wall_edge.lock().unwrap();
+    if result.is_err() && slot.value.get().is_none() && cache.get(&key).is_some_and(|v| Arc::ptr_eq(v, &slot)) {
+        cache.remove(&key);
+    }
+    while cache.len() > 128 {
+        let oldest = cache
+            .iter()
+            .filter(|(_, v)| v.value.get().is_some())
+            .min_by_key(|(_, v)| v.completed.load(Ordering::Acquire))
+            .map(|(k, _)| k.clone());
+        if let Some(k) = oldest {
+            cache.remove(&k);
+        } else {
+            break;
+        }
+    }
+    result
+}
+/// Vault rows read for the reuse check: the Edge window plus room for the session cut.
+const WALL_EDGE_VAULT_READ: usize = tr_data::wall_edge::MAX_BARS + 400;
+/// A vault-only 5m window for Wall Edge, or `None` when a provider fetch is still needed.
+/// Reuse requires (a) exactly one vault source, (b) an admitted fetch at or after the
+/// close of the last completed session, so that session is complete in the vault, and
+/// (c) a full `MAX_BARS` contiguous closed window after the session cut and gap trim.
+/// The input is the last `MAX_BARS` contiguous closed bars either way; a deep fetch could
+/// only re-confirm (or, rarely, correct) bars older than the ribbon's own fetch.
+async fn wall_edge_vault_window(
+    s: &Shared,
+    symbol: &str,
+    day: chrono::NaiveDate,
+) -> Option<(Vec<Bar>, tr_data::vault::StitchInfo, i64)> {
+    use tr_data::wall_edge;
+    let close = tr_data::intraday::close_minute(day);
+    let close = tr_core::ny::to_utc(day.and_hms_opt(close / 60, close % 60, 0)?);
+    let symbol = tr_data::security(symbol).key();
+    cache_op(s, move |v| {
+        let Some(id) = v.sole_series(&symbol, Timeframe::M5)? else { return Ok(None) };
+        let Some(at) = v.last_ingest(&id)?.filter(|at| *at >= close) else { return Ok(None) };
+        let (bars, info) = v.stitch(&id, &[], WALL_EDGE_VAULT_READ, Some(at))?;
+        let class = tr_data::security(&symbol).class;
+        let full = wall_edge::prepare(&bars, Timeframe::M5, class, Some(at), Some(&info))
+            .is_ok_and(|p| p.bars.len() == wall_edge::MAX_BARS);
+        Ok(full.then_some((bars, info, at)))
+    })
+    .await
+    .flatten()
+}
+
+fn claim_wall(s: &Shared, pane: PaneId, generation: u64) -> bool {
+    let mut generations = s.wall_generations.lock().expect("wall generations");
+    if generations.get(&pane).is_some_and(|g| *g > generation) {
+        return false;
+    }
+    generations.insert(pane, generation);
+    true
+}
+fn wall_current(s: &Shared, pane: PaneId, generation: u64) -> bool {
+    s.wall_generations.lock().expect("wall generations").get(&pane) == Some(&generation)
+}
+
+fn mark_stack_freshness(stack: &mut TrendStack, class: tr_core::AssetClass, archive: bool, now: i64) {
+    if !archive {
+        for lane in &mut stack.lanes {
+            if lane.status == LaneStatus::Ready
+                && let Some(ts) = lane.last_bar_ts
+                && let Some(tr_data::intraday::Freshness::Stale { lag_secs }) =
+                    tr_data::intraday::freshness(tr_data::intraday::MarketClock::for_class(class), lane.tf, ts, now)
+            {
+                lane.status = LaneStatus::Stale { lag_secs };
+            }
+        }
+        stack.score = score(&stack.lanes);
+    }
+}
+
+async fn desk_daily(s: &Shared, bridge: &tr_data::whats_news::Bridge, symbol: &str) -> anyhow::Result<Vec<Bar>> {
+    let ticker = tr_data::whats_news::archive_ticker(symbol);
+    let wanted = ticker.clone();
+    let local = s.history.db(move |db| db.daily(&wanted)).await?;
+    let bars = if local.is_empty() {
+        let snapshot = bridge.bars(&ticker).await?;
+        snapshot.provenance.require_verified("Daily desk metrics").map_err(anyhow::Error::msg)?;
+        snapshot.data
+    } else {
+        local
+    };
+    Bar::require_verified(&bars, "Daily desk metrics").map_err(anyhow::Error::msg)?;
+    Ok(bars)
+}
+
+async fn research_universe(
+    s: &Shared,
+    bridge: &tr_data::whats_news::Bridge,
+) -> anyhow::Result<tr_data::whats_news::Snapshot<Vec<tr_data::whats_news::Symbol>>> {
+    let local = s.history.db(|db| db.universe()).await?;
+    let external = bridge.universe().await;
+    if local.data.is_empty() {
+        return external;
+    }
+    let mut rows = std::collections::BTreeMap::new();
+    let mut source = local.source.clone();
+    let mut failures = local.failures.clone();
+    match external {
+        Ok(wn) => {
+            failures.extend(wn.failures);
+            source.push_str(&format!(" + {}", wn.source));
+            for row in wn.data {
+                rows.insert(row.symbol.clone(), row);
+            }
+        }
+        Err(e) if bridge.enabled => source.push_str(&format!(" · Whats-News unavailable: {e}")),
+        _ => {}
+    }
+    for row in local.data {
+        if row.last_date.is_some() || !rows.contains_key(&row.symbol) {
+            rows.insert(row.symbol.clone(), row);
+        }
+    }
+    Ok(tr_data::whats_news::Snapshot {
+        failures,
+        data: rows.into_values().collect(),
+        source,
+        provenance: tr_core::Provenance::Cached,
+    })
+}
+// Temporarily include verified SPY bars when O'Neil RS is needed (ONEIL_LENS or ALL tags).
+fn with_spy_for_oneil(
+    name: &str,
+    mut bars: Vec<(String, Vec<tr_core::Bar>)>,
+    spy: Option<&[tr_core::Bar]>,
+) -> (Vec<(String, Vec<tr_core::Bar>)>, bool) {
+    let needs_spy = name == "ONEIL_LENS" || name == "ALL";
+    let added_spy =
+        needs_spy && !bars.iter().any(|(symbol, _)| tr_data::security(symbol).ticker == "SPY") && spy.is_some();
+    if added_spy {
+        bars.push(("SPY".into(), spy.unwrap().to_vec()));
+    }
+    (bars, added_spy)
+}
+
+fn strip_spy_from_scan(scan: &mut tr_data::whats_news::Scan, added_spy: bool) {
+    if added_spy {
+        scan.results.retain(|row| row.symbol != "SPY");
+        if !scan.skipped.iter().any(|row| row.symbol == "SPY") {
+            scan.scanned = scan.scanned.saturating_sub(1);
+        }
+        scan.skipped.retain(|row| row.symbol != "SPY");
+    }
+}
+
+/// Apply lens selection only after separately verified benchmark enrichment.
+fn filter_enriched_scan(name: &str, mut scan: tr_data::whats_news::Scan) -> tr_data::whats_news::Scan {
+    if name == "ONEIL_LENS" {
+        scan.results.retain(|row| row.metrics.as_ref().is_some_and(|metrics| metrics.oneil_lens.oneil_rs));
+    }
+    scan
+}
+
+/// Local archive merged with the Whats-News bridge (local wins when non-empty).
+struct MergedResearch {
+    histories: std::collections::BTreeMap<String, Vec<tr_core::Bar>>,
+    source: String,
+    skipped: Vec<tr_data::whats_news::Skipped>,
+    service: Option<tr_data::whats_news::Scan>,
+}
+
+/// The SCAN merge, shared with SCAN VIEW. `want_service` only matters for SCAN's HTTP fields.
+async fn merge_research_histories(
+    bridge: &tr_data::whats_news::Bridge,
+    local: std::collections::BTreeMap<String, Vec<tr_core::Bar>>,
+    want_service: bool,
+) -> anyhow::Result<MergedResearch> {
+    let mut histories = local;
+    let mut source = "Local Yahoo daily research archive".to_string();
+    let mut skipped = vec![];
+    let mut service = None;
+    if bridge.enabled {
+        match bridge.histories().await {
+            Ok(external) => {
+                external.provenance.require_verified("SCAN archive").map_err(anyhow::Error::msg)?;
+                source.push_str(&format!(" + {}", external.source));
+                if want_service && external.source.starts_with("Whats-News HTTP") {
+                    match bridge.service_scan().await {
+                        Ok(fields) => service = fields,
+                        Err(e) if tr_data::whats_news::is_unverified(&e) => return Err(e),
+                        Err(e) => source.push_str(&format!(" · Service fields unavailable: {e}")),
+                    }
+                }
+                skipped = external
+                    .data
+                    .skipped
+                    .into_iter()
+                    .filter(|skip| !histories.get(&skip.symbol).is_some_and(|b| !b.is_empty()))
+                    .collect();
+                for (symbol, bars) in external.data.bars {
+                    if !histories.get(&symbol).is_some_and(|b| !b.is_empty()) {
+                        histories.insert(symbol, bars);
+                    }
+                }
+            }
+            Err(e) if tr_data::whats_news::is_unverified(&e) => return Err(e),
+            Err(e) => source.push_str(&format!(" · Whats-News unavailable: {e}")),
+        }
+    }
+    Ok(MergedResearch { histories, source, skipped, service })
+}
+
+/// SCAN VIEW board: the same local+bridge merge as SCAN, never `research_scan`/`Bridge::scan`.
+async fn research_scan_view(
+    s: &Shared,
+    bridge: &tr_data::whats_news::Bridge,
+    spec: &tr_data::whats_news::ScanViewSpec,
+) -> anyhow::Result<Arc<crate::app::research::scan_view::ViewSnapshot>> {
+    let sample = s.sample_mode();
+    crate::app::research::scan_view::scan_view_research(
+        sample,
+        || async {
+            let local = s.history.db(|db| db.histories()).await?;
+            let merged = merge_research_histories(bridge, local, false).await?;
+            Ok((merged.histories.into_iter().collect(), merged.skipped, merged.source, tr_core::Provenance::Cached))
+        },
+        spec,
+    )
+    .await
+    .map(Arc::new)
+}
+
+async fn research_scan(
+    s: &Shared,
+    bridge: &tr_data::whats_news::Bridge,
+    name: &str,
+) -> anyhow::Result<tr_data::whats_news::ScanSnapshot> {
+    let spy = desk_daily(s, bridge, "SPY").await.ok();
+    let local = s.history.db(|db| db.histories()).await?;
+    if local.is_empty() {
+        let mut snapshot = bridge.scan(name).await?;
+        // Rebuild O'Neil candidates with the separately verified benchmark before
+        // the scanner's initial selection; enrichment alone cannot recover rows.
+        let mut benchmark_available = false;
+        if let Ok(histories) = bridge.histories().await {
+            if histories.provenance.require_verified("SCAN archive").is_ok() {
+                let (bars, added_spy) = with_spy_for_oneil(name, histories.data.bars, spy.as_deref());
+                if name == "ONEIL_LENS" || name == "ALL" {
+                    let mut scan = tr_data::whats_news::scan_histories(name, bars.clone(), snapshot.provenance)?;
+                    scan.skipped.extend(histories.data.skipped);
+                    strip_spy_from_scan(&mut scan, added_spy);
+                    for row in &mut scan.results {
+                        if let Some(original) =
+                            snapshot.data.results.iter().find(|original| original.symbol == row.symbol)
+                        {
+                            // Keep Rust setup tags for ALL; HTTP service fields still attach below for other scans.
+                            let setups = std::mem::take(&mut row.service.setups);
+                            let setup_count = row.service.setup_count;
+                            row.service = original.service.clone();
+                            if name == "ALL" {
+                                row.service.setups = setups;
+                                row.service.setup_count = setup_count;
+                            }
+                            row.from_service = original.from_service;
+                        }
+                    }
+                    snapshot.data = scan;
+                }
+                benchmark_available = spy.is_some()
+                    && tr_data::whats_news::apply_spy_benchmark(&mut snapshot.data, &bars, spy.as_deref()).is_ok();
+            }
+        }
+        if !benchmark_available {
+            let _ = tr_data::whats_news::apply_spy_benchmark(&mut snapshot.data, &[], None);
+        }
+        if name == "ALL" {
+            tr_data::whats_news::refresh_setup_tags(&mut snapshot.data);
+        }
+        snapshot.snapshot.data = filter_enriched_scan(name, snapshot.snapshot.data);
+        if name == "ONEIL_LENS" && !benchmark_available {
+            snapshot.source.push_str(" · SPY unavailable — O'Neil RS not computed");
+        }
+        return Ok(snapshot);
+    }
+    if !tr_data::whats_news::SETUPS.contains(&name) {
+        anyhow::bail!("Unknown scan {name}");
+    }
+    let MergedResearch { histories, mut source, skipped, service } = merge_research_histories(bridge, local, true).await?;
+    let breadth = tr_data::whats_news::scan_pack::ScanBreadth::from_histories(
+        &histories.iter().map(|(s, b)| (s.clone(), b.clone())).collect::<Vec<_>>(),
+    );
+    source.push_str(&format!("\n{}", breadth.breadth.summary()));
+    let scan_name = name.to_string();
+    let (mut data, benchmark_available) = tokio::task::spawn_blocking(move || {
+        let name = scan_name;
+        let (histories, added_spy) = with_spy_for_oneil(&name, histories.into_iter().collect(), spy.as_deref());
+        let mut scan = tr_data::whats_news::scan_histories(&name, histories.clone(), tr_core::Provenance::Cached)?;
+        let benchmark_available =
+            spy.is_some() && tr_data::whats_news::apply_spy_benchmark(&mut scan, &histories, spy.as_deref()).is_ok();
+        if !benchmark_available {
+            let _ = tr_data::whats_news::apply_spy_benchmark(&mut scan, &[], None);
+        }
+        strip_spy_from_scan(&mut scan, added_spy);
+        if name == "ALL" {
+            tr_data::whats_news::refresh_setup_tags(&mut scan);
+        }
+        Ok::<_, anyhow::Error>((filter_enriched_scan(&name, scan), benchmark_available))
+    })
+    .await??;
+    if name == "ONEIL_LENS" && !benchmark_available {
+        source.push_str(" · SPY unavailable — O'Neil RS not computed");
+    }
+    data.skipped.extend(skipped);
+    if let Some(service) = service {
+        tr_data::whats_news::attach_service(&mut data, service)?;
+    }
+    Ok(tr_data::whats_news::ScanSnapshot {
+        breadth,
+        snapshot: tr_data::whats_news::Snapshot {
+            failures: vec![],
+            data,
+            provenance: tr_core::Provenance::Cached,
+            source,
+        },
+    })
+}
+
+/// Rotation deliberately has no bridge, provider or display-cache path.
+async fn research_rotation(
+    s: &Shared,
+    query: &tr_data::rotation::RotationQuery,
+) -> anyhow::Result<tr_data::rotation::RotationReport> {
+    let query = query.clone();
+    let limit = tr_data::rotation::fetch_limit(query.cadence);
+    let bench = query.benchmark.clone();
+    let symbols = query.symbols.clone();
+    // Service::db runs SQLite on spawn_blocking; compute stays off the UI thread too.
+    let (benchmark, named) = s
+        .history
+        .db(move |db| {
+            let benchmark = db.daily_window(&bench, None, limit)?;
+            let named = symbols
+                .into_iter()
+                .map(|symbol| {
+                    let bars = db.daily_window(&symbol, None, limit).map_err(|e| format!("{e:#}"));
+                    (symbol, bars)
+                })
+                .collect::<Vec<_>>();
+            Ok((benchmark, named))
+        })
+        .await?;
+    if benchmark.is_empty() {
+        anyhow::bail!(
+            "Rotation refused: no daily history for {} in the local research archive. Sample/display prices are never used.",
+            query.benchmark
+        );
+    }
+    let expected = tr_data::history::calendar::last_expected_session(chrono::Utc::now());
+    tokio::task::spawn_blocking(move || {
+        tr_data::rotation::build_report(&benchmark, named, &query, "Local Yahoo daily research archive", expected)
+    })
+    .await?
+    .map_err(anyhow::Error::msg)
+}
+
+/// Load one name from the local archive, then Whats-News. Sample/display bars never enter.
+async fn research_stats(
+    s: &Shared,
+    bridge: &tr_data::whats_news::Bridge,
+    key: &str,
+    condition: &str,
+    horizons: &[usize],
+) -> anyhow::Result<tr_data::stats::ResearchSnapshot> {
+    use tr_data::whats_news::archive_ticker;
+    let ticker = archive_ticker(key);
+    if ticker.is_empty() {
+        anyhow::bail!("Statistics refused: invalid security");
+    }
+    let wanted = ticker.clone();
+    let local = s.history.db(move |db| db.daily(&wanted)).await?;
+    let mut source = "Local Yahoo daily research archive".to_string();
+    let bars = if !local.is_empty() {
+        tr_data::stats::require_research_bars(&local, "Statistics").map_err(anyhow::Error::msg)?;
+        local
+    } else if bridge.enabled {
+        match bridge.histories_for(std::slice::from_ref(&ticker)).await {
+            Ok(external) => {
+                external.provenance.require_verified("Statistics archive").map_err(anyhow::Error::msg)?;
+                source = format!("{} + {}", source, external.source);
+                if let Some(skip) = external.data.skipped.iter().find(|s| s.symbol.eq_ignore_ascii_case(&ticker)) {
+                    anyhow::bail!("Statistics refused: {}: {}", skip.symbol, skip.reason);
+                }
+                let bars = external
+                    .data
+                    .bars
+                    .into_iter()
+                    .find(|(s, _)| s.eq_ignore_ascii_case(&ticker))
+                    .map(|(_, b)| b)
+                    .unwrap_or_default();
+                tr_data::stats::require_research_bars(&bars, "Statistics").map_err(anyhow::Error::msg)?;
+                bars
+            }
+            Err(e) if tr_data::whats_news::is_unverified(&e) => return Err(e),
+            Err(e) => anyhow::bail!(
+                "Statistics refused: no daily history in the local research archive, and Whats-News is unavailable ({e:#}). Sample/display prices are never used."
+            ),
+        }
+    } else {
+        anyhow::bail!(
+            "Statistics refused: no daily history for {ticker} in the local research archive. Sample/display prices are never used."
+        );
+    };
+    let key = tr_data::security(key).key();
+    let snapshot = tokio::task::spawn_blocking({
+        let condition = condition.to_string();
+        let horizons = horizons.to_vec();
+        let source = source.clone();
+        let ticker = ticker.clone();
+        move || tr_data::stats::compute_snapshot(&key, &ticker, &bars, &condition, &horizons, &source)
+    })
+    .await?
+    .map_err(anyhow::Error::msg)?;
+    Ok(snapshot)
+}
+
+/// Science cache contains immutable admitted inputs, never refresh receipts. All
+/// hashing, DB work and inference happen on the blocking worker.
+#[allow(clippy::too_many_arguments)]
+async fn honest_cached<T: Send + Sync + 'static>(
+    s: &Shared,
+    symbol: String,
+    tf: Timeframe,
+    bars: Vec<Bar>,
+    basis: String,
+    observed: Option<i64>,
+    stitch: Option<tr_data::vault::StitchInfo>,
+    settings: tr_data::backtest_honesty::HonestySettings,
+    current: Vec<tr_data::backtest_trials::Experiment>,
+    compute: impl Fn(&[Bar], tr_data::backtest_honesty::HonestReport) -> Result<T, String> + Send + 'static,
+) -> anyhow::Result<Arc<T>> {
+    if s.sample_mode() {
+        anyhow::bail!("Backtest refused: sample / offline display mode");
+    }
+    let cache = s.cache.clone();
+    let jobs = s.jobs.clone();
+    let reports = s.reports.clone();
+    let out = s.out.clone();
+    let ctx = s.ctx.clone();
+    tokio::task::spawn_blocking(move || -> Result<Arc<T>, String> {
+        use tr_data::backtest_honesty::{Estimate, Reason};
+        // Gate even before a science-cache hit. A mixed series needs its witness.
+        let normalized = tr_data::vault::research_bars(&bars, stitch.as_ref())?;
+        if normalized.windows(2).any(|w| w[0].ts > w[1].ts) {
+            return Err("Backtest refused: input timestamps are not ascending".into());
+        }
+        let mut closed = tr_data::closed::closed_len(tf, &normalized, tr_data::security(&symbol).class, observed);
+        // Equal timestamps are not successors. Keep the entire pending bucket
+        // out; interior duplicates are counted by the intraday session gate.
+        if closed < normalized.len() {
+            while closed > 0 && normalized[closed - 1].ts >= normalized[closed].ts {
+                closed -= 1;
+            }
+        }
+        let bars = &normalized[..closed];
+        if bars.is_empty() {
+            return Err("Backtest refused: no closed bars".into());
+        }
+        if !tf.is_intraday() {
+            tr_data::backtest::require_backtest_bars(bars, "Honest backtest")?;
+            tr_data::backtest_honesty::validate_daily(bars).map_err(|r| r.to_string())?;
+        }
+        for e in &current {
+            e.validate().map_err(|r| r.to_string())?;
+        }
+        let scope = tr_data::backtest_trials::scope(&symbol, tf.is_intraday(), tf, &basis);
+        for _ in 0..3 {
+            let family = cache.lock().ok().and_then(|mut guard| {
+                let v = guard.as_mut()?;
+                if !v.enabled() {
+                    return None;
+                }
+                v.backtest_register(&scope, &current, bars, chrono::Utc::now().timestamp())
+                    .map_err(|e| tracing::warn!("backtest trial register: {e:#}"))
+                    .ok()
+            });
+            let family = match family {
+                Some((f, changed)) => {
+                    if changed {
+                        let _ =
+                            out.send(Response::BacktestTrialRevision { scope: f.scope.clone(), revision: f.revision });
+                        ctx.request_repaint();
+                    }
+                    Estimate::Available(f)
+                }
+                None => Estimate::Unavailable(Reason::RegisterUnavailable),
+            };
+            let revision = family.value().map(|f| f.revision);
+            let params = serde_json::to_string(&(
+                settings,
+                &current,
+                family.value().map(|f| (&f.scope, f.revision, &f.digest)),
+                stitch.as_ref().map(|s| (&s.gaps, s.holes, s.missing_sessions)),
+            ))
+            .map_err(|e| e.to_string())?;
+            let mut key = tr_data::report_cache::ReportKey::new(
+                if tf.is_intraday() { "backtest_honest_intraday_v1" } else { "backtest_honest_daily_v1" },
+                &symbol,
+                tf,
+                &basis,
+                bars,
+                &params,
+            );
+            key.epoch = stitch.as_ref().map_or(0, |s| s.epoch);
+            let result = reports.get_or_compute(key, || {
+                let _job = crate::perf::JobTimer::new(&jobs, "HonestBacktest");
+                let honest = tr_data::backtest_trials::compute(
+                    bars,
+                    tf,
+                    settings,
+                    &current,
+                    family.clone(),
+                    format!(
+                        "Verified closed prefix: {} native bars; complete cash sessions only; source {}",
+                        bars.len(),
+                        basis
+                    ),
+                );
+                // Persist failed attempts too, without changing experiment identity.
+                if let Ok(mut guard) = cache.lock()
+                    && let Some(v) = guard.as_mut().filter(|v| v.enabled())
+                {
+                    for (id, status) in &honest.replay_statuses {
+                        let _ = v.backtest_status(&scope, id, status);
+                    }
+                }
+                let result = compute(bars, honest);
+                if let Err(e) = &result
+                    && let Ok(mut guard) = cache.lock()
+                    && let Some(v) = guard.as_mut().filter(|v| v.enabled())
+                {
+                    for experiment in &current {
+                        let _ = v.backtest_status(&scope, &experiment.canonical(), &format!("failed: {e}"));
+                    }
+                }
+                result
+            })?;
+            let latest = cache
+                .lock()
+                .ok()
+                .and_then(|guard| guard.as_ref().filter(|v| v.enabled()).and_then(|v| v.backtest_family(&scope).ok()))
+                .map(|f| f.revision);
+            if latest == revision {
+                return Ok(result);
+            }
+        }
+        Err("Backtest trial family changed during replay; reload to obtain current confidence".into())
+    })
+    .await?
+    .map_err(anyhow::Error::msg)
+}
+
+/// Load one name from the local archive, then Whats-News. Sample/display bars never enter.
+#[allow(clippy::too_many_arguments)] // mirrors the typed pane request
+async fn research_backtest(
+    s: &Shared,
+    bridge: &tr_data::whats_news::Bridge,
+    key: &str,
+    spec: &str,
+    holdout: &str,
+    commission_bps: f64,
+    slippage_bps: f64,
+    allow_short: bool,
+    honesty: tr_data::backtest_honesty::HonestySettings,
+) -> anyhow::Result<(Arc<tr_data::backtest::BacktestReport>, String)> {
+    if s.sample_mode() {
+        anyhow::bail!("Backtest refused: sample / offline display mode does not feed this pane");
+    }
+    let observed = chrono::Utc::now().timestamp();
+    use tr_data::whats_news::archive_ticker;
+    let ticker = archive_ticker(key);
+    if ticker.is_empty() {
+        anyhow::bail!("Backtest refused: invalid security");
+    }
+    let wanted = ticker.clone();
+    let local = s.history.db(move |db| db.daily(&wanted)).await?;
+    let mut source = "Local Yahoo daily research archive".to_string();
+    let bars = if !local.is_empty() {
+        Bar::require_verified(&local, "Backtest").map_err(anyhow::Error::msg)?;
+        local
+    } else if bridge.enabled {
+        match bridge.histories_for(std::slice::from_ref(&ticker)).await {
+            Ok(external) => {
+                external.provenance.require_verified("Backtest archive").map_err(anyhow::Error::msg)?;
+                source = format!("{} + {}", source, external.source);
+                if let Some(skip) = external.data.skipped.iter().find(|s| s.symbol.eq_ignore_ascii_case(&ticker)) {
+                    anyhow::bail!("Backtest refused: {}: {}", skip.symbol, skip.reason);
+                }
+                let bars = external
+                    .data
+                    .bars
+                    .into_iter()
+                    .find(|(s, _)| s.eq_ignore_ascii_case(&ticker))
+                    .map(|(_, b)| b)
+                    .unwrap_or_default();
+                Bar::require_verified(&bars, "Backtest").map_err(anyhow::Error::msg)?;
+                bars
+            }
+            Err(e) if tr_data::whats_news::is_unverified(&e) => return Err(e),
+            Err(e) => anyhow::bail!(
+                "Backtest refused: no daily history in the local research archive, and Whats-News is unavailable ({e:#}). Sample/display prices are never used."
+            ),
+        }
+    } else {
+        anyhow::bail!(
+            "Backtest refused: no daily history for {ticker} in the local research archive. Sample/display prices are never used."
+        );
+    };
+    let strategies = tr_data::backtest::parse_strategies(spec, allow_short).map_err(anyhow::Error::msg)?;
+    let settings = tr_data::backtest::RunSettings {
+        holdout_frac: tr_data::backtest::parse_holdout(holdout),
+        costs: tr_data::backtest::CostModel { commission_bps, slippage_bps },
+        fill: tr_data::backtest::FillRule::NextOpen,
+        seed: tr_data::backtest::DEFAULT_SEED,
+        allow_short,
+        strategies,
+    };
+    let key = tr_data::security(key).key();
+    let current = tr_data::backtest_trials::daily_experiments(&settings, honesty);
+    let basis = source.clone();
+    let receipt = format!("{} · verified daily archive · observation {}", source, observed);
+    let report = honest_cached(
+        s,
+        key,
+        Timeframe::D1,
+        bars,
+        basis,
+        Some(observed),
+        None,
+        honesty,
+        current,
+        move |bars, honest| {
+            let mut report = tr_data::backtest::compute_report(
+                &tr_data::security(&ticker).key(),
+                &ticker,
+                bars,
+                &settings,
+                &source,
+            )?;
+            report.honesty = Some(honest);
+            Ok(report)
+        },
+    )
+    .await?;
+    Ok((report, receipt))
+}
+
+/// Verified regular-session bars only. Sample substitution is refused before a setup is scored.
+#[allow(clippy::too_many_arguments)] // mirrors the typed pane request
+async fn research_intraday_backtest(
+    s: &Shared,
+    key: &str,
+    spec: &str,
+    timeframe: &str,
+    holdout: &str,
+    commission_bps: f64,
+    slippage_bps: f64,
+    allow_short: bool,
+    honesty: tr_data::backtest_honesty::HonestySettings,
+) -> anyhow::Result<(Arc<tr_data::intraday_backtest::IntradayReport>, String)> {
+    let sec = tr_data::security(key);
+    tr_data::cash_session::require_us_session(&sec.ticker, None).map_err(anyhow::Error::msg)?;
+    if !matches!(sec.class, tr_core::AssetClass::Equity | tr_core::AssetClass::Etf | tr_core::AssetClass::Index) {
+        anyhow::bail!(
+            "Intraday backtest refused: {} has no US cash session. Sample prices are never used.",
+            sec.ticker
+        );
+    }
+    if s.sample_mode() {
+        anyhow::bail!(
+            "Intraday backtest refused: sample / offline display mode does not feed this pane. Sample prices are never used."
+        );
+    }
+    let (setups, tf) = tr_data::intraday_backtest::parse_request(spec, timeframe).map_err(anyhow::Error::msg)?;
+    let limit = tr_data::intraday_backtest::fetch_limit(tf);
+    let symbol = sec.key();
+    let (bars, stitch) = analysis_bars(s, &symbol, tf, limit, "Intraday backtest").await?;
+    tr_data::cash_session::require_us_session(&sec.ticker, None).map_err(anyhow::Error::msg)?;
+    if bars.is_empty() {
+        anyhow::bail!(
+            "Intraday backtest refused: no regular-session bars were returned. Sample prices are never used."
+        );
+    }
+    let settings = tr_data::intraday_backtest::RunSettings {
+        holdout_frac: tr_data::backtest::parse_holdout(holdout),
+        costs: tr_data::backtest::CostModel { commission_bps, slippage_bps },
+        seed: tr_data::backtest::DEFAULT_SEED,
+        allow_short,
+        timeframe: tf,
+        setups,
+    };
+    let source = stitch.source.clone();
+    let receipt = stitch.label();
+    let current = tr_data::backtest_trials::intraday_experiments(&settings, honesty);
+    let report = honest_cached(
+        s,
+        symbol.clone(),
+        tf,
+        bars,
+        source.clone(),
+        stitch.fetched_at,
+        Some(stitch),
+        honesty,
+        current,
+        move |bars, honest| {
+            let mut report = tr_data::intraday_backtest::compute_report(&symbol, bars, &settings, &source)?;
+            let mut honest = honest;
+            honest.admission.push_str(&format!(" · {}", report.skip_note));
+            report.honesty = Some(honest);
+            Ok(report)
+        },
+    )
+    .await?;
+    Ok((report, receipt))
+}
+
+/// Verified regular-session bars for several cash names. Sample substitution is refused.
+async fn research_intraday_compare(
+    s: &Shared,
+    symbol: &str,
+    spec: &str,
+    timeframe: &str,
+) -> anyhow::Result<tr_data::intraday_compare::CompareChart> {
+    if s.sample_mode() {
+        anyhow::bail!(
+            "Intraday compare refused: sample / offline display mode does not feed this pane. Sample prices are never used."
+        );
+    }
+    let query = tr_data::intraday_compare::parse_query(symbol, spec, timeframe).map_err(anyhow::Error::msg)?;
+    let limit = tr_data::intraday_compare::fetch_limit(query.timeframe);
+    let mut rows = Vec::with_capacity(query.symbols.len());
+    let mut sources = Vec::new();
+    for sym in &query.symbols {
+        let sec = tr_data::security(sym);
+        tr_data::cash_session::require_us_session(&sec.ticker, None).map_err(anyhow::Error::msg)?;
+        if !matches!(sec.class, tr_core::AssetClass::Equity | tr_core::AssetClass::Etf | tr_core::AssetClass::Index) {
+            rows.push(tr_data::intraday_compare::NamedBars {
+                symbol: sec.key(),
+                bars: Vec::new(),
+                error: Some(format!("{} has no US cash session.", sec.ticker)),
+            });
+            continue;
+        }
+        let fetched =
+            analysis_bars(s, &sec.key(), query.timeframe, limit, "Intraday study").await.map(|(bars, info)| {
+                sources.push(format!("{} {}", sec.ticker, info.label()));
+                bars
+            });
+        tr_data::cash_session::require_us_session(&sec.ticker, None).map_err(anyhow::Error::msg)?;
+        match fetched {
+            Ok(bars) if bars.is_empty() => rows.push(tr_data::intraday_compare::NamedBars {
+                symbol: sec.key(),
+                bars,
+                error: Some(format!("{} returned no regular-session bars. Sample prices are never used.", sec.ticker)),
+            }),
+            Ok(bars) => rows.push(tr_data::intraday_compare::NamedBars { symbol: sec.key(), bars, error: None }),
+            Err(e) => rows.push(tr_data::intraday_compare::NamedBars {
+                symbol: sec.key(),
+                bars: Vec::new(),
+                error: Some(format!("{e:#}")),
+            }),
+        }
+    }
+    let source = sources.join(" · ");
+    if rows.iter().any(|r| r.error.is_some()) {
+        return tokio::task::spawn_blocking(move || {
+            tr_data::intraday_compare::build_chart(&query.anchor, query.timeframe, &rows, &source)
+        })
+        .await?
+        .map_err(anyhow::Error::msg);
+    }
+    let combined: Vec<_> = rows.iter().flat_map(|r| r.bars.iter().copied()).collect();
+    let key = tr_data::report_cache::ReportKey::new(
+        "compare",
+        &query.anchor,
+        query.timeframe,
+        &source,
+        &combined,
+        &format!("{query:?}"),
+    );
+    cached_study(s, key, move || tr_data::intraday_compare::build_chart(&query.anchor, query.timeframe, &rows, &source))
+        .await
+}
+
+/// Verified regular-session bars for one cash name. Sample substitution is refused.
+async fn research_session_path(
+    s: &Shared,
+    symbol: &str,
+    spec: &str,
+    timeframe: &str,
+) -> anyhow::Result<tr_data::session_path::SessionPath> {
+    if s.sample_mode() {
+        anyhow::bail!(
+            "Session path refused: sample / offline display mode does not feed this pane. Sample prices are never used."
+        );
+    }
+    let sec = tr_data::security(symbol);
+    tr_data::cash_session::require_us_session(&sec.ticker, None).map_err(anyhow::Error::msg)?;
+    if !matches!(sec.class, tr_core::AssetClass::Equity | tr_core::AssetClass::Etf | tr_core::AssetClass::Index) {
+        anyhow::bail!("{} has no US cash session. The path is the regular session from 09:30.", sec.ticker);
+    }
+    let query = tr_data::session_path::parse_query(spec, timeframe).map_err(anyhow::Error::msg)?;
+    let limit = tr_data::session_path::fetch_limit(query.timeframe);
+    let (bars, stitch) = analysis_bars(s, &sec.key(), query.timeframe, limit, "Intraday study").await?;
+    tr_data::cash_session::require_us_session(&sec.ticker, None).map_err(anyhow::Error::msg)?;
+    if bars.is_empty() {
+        anyhow::bail!("Session path refused: no regular-session bars were returned. Sample prices are never used.");
+    }
+    Bar::require_verified(&bars, "Session path").map_err(anyhow::Error::msg)?;
+    let source = format!("{} {} regular session", stitch.label(), query.timeframe.label());
+    let mut cache_key = tr_data::report_cache::ReportKey::new(
+        "session_path",
+        &sec.key(),
+        query.timeframe,
+        &source,
+        &bars,
+        &format!("{query:?}"),
+    );
+    cache_key.epoch = stitch.epoch;
+    cache_key.day = Some(tr_core::ny::civil(chrono::Utc::now().timestamp()).date());
+    cached_study(s, cache_key, move || tr_data::session_path::build_path(&sec.key(), &bars, &query, &source)).await
+}
+
+/// Verified regular-session bars for one cash name. Sample substitution is refused.
+async fn research_volume_pace(
+    s: &Shared,
+    symbol: &str,
+    spec: &str,
+    timeframe: &str,
+) -> anyhow::Result<tr_data::volume_pace::VolumePace> {
+    if s.sample_mode() {
+        anyhow::bail!(
+            "Volume pace refused: sample / offline display mode does not feed this pane. Sample prices are never used."
+        );
+    }
+    let sec = tr_data::security(symbol);
+    tr_data::cash_session::require_us_session(&sec.ticker, None).map_err(anyhow::Error::msg)?;
+    if !matches!(sec.class, tr_core::AssetClass::Equity | tr_core::AssetClass::Etf | tr_core::AssetClass::Index) {
+        anyhow::bail!("{} has no US cash session. The pace is the regular session from 09:30.", sec.ticker);
+    }
+    let query = tr_data::volume_pace::parse_query(spec, timeframe).map_err(anyhow::Error::msg)?;
+    let limit = tr_data::volume_pace::fetch_limit(query.timeframe);
+    let (bars, stitch) = analysis_bars(s, &sec.key(), query.timeframe, limit, "Intraday study").await?;
+    tr_data::cash_session::require_us_session(&sec.ticker, None).map_err(anyhow::Error::msg)?;
+    if bars.is_empty() {
+        anyhow::bail!("Volume pace refused: no regular-session bars were returned. Sample prices are never used.");
+    }
+    Bar::require_verified(&bars, "Volume pace").map_err(anyhow::Error::msg)?;
+    let source = format!("{} {} regular session", stitch.label(), query.timeframe.label());
+    let mut cache_key = tr_data::report_cache::ReportKey::new(
+        "volume_pace",
+        &sec.key(),
+        query.timeframe,
+        &source,
+        &bars,
+        &format!("{query:?}"),
+    );
+    cache_key.epoch = stitch.epoch;
+    cache_key.day = Some(tr_core::ny::civil(chrono::Utc::now().timestamp()).date());
+    cached_study(s, cache_key, move || tr_data::volume_pace::build_pace(&sec.key(), &bars, &query, &source)).await
+}
+
+async fn research_realized_vol(
+    s: &Shared,
+    symbol: &str,
+    spec: &str,
+    timeframe: &str,
+) -> anyhow::Result<tr_data::realized_vol::RealizedVol> {
+    if s.sample_mode() {
+        anyhow::bail!(
+            "Realized volatility refused: sample / offline display mode does not feed this pane. Sample prices are never used."
+        );
+    }
+    let sec = tr_data::security(symbol);
+    tr_data::cash_session::require_us_session(&sec.ticker, None).map_err(anyhow::Error::msg)?;
+    if !matches!(sec.class, tr_core::AssetClass::Equity | tr_core::AssetClass::Etf | tr_core::AssetClass::Index) {
+        anyhow::bail!(
+            "{} has no US cash session. Realized volatility uses the regular session from 09:30.",
+            sec.ticker
+        );
+    }
+    let query = tr_data::realized_vol::parse_query(spec, timeframe).map_err(anyhow::Error::msg)?;
+    let limit = tr_data::realized_vol::fetch_limit(query.timeframe);
+    let (bars, stitch) = analysis_bars(s, &sec.key(), query.timeframe, limit, "Intraday study").await?;
+    tr_data::cash_session::require_us_session(&sec.ticker, None).map_err(anyhow::Error::msg)?;
+    if bars.is_empty() {
+        anyhow::bail!(
+            "Realized volatility refused: no regular-session bars were returned. Sample prices are never used."
+        );
+    }
+    Bar::require_verified(&bars, "Realized volatility").map_err(anyhow::Error::msg)?;
+    let source = format!("{} {} regular session", stitch.label(), query.timeframe.label());
+    let mut cache_key = tr_data::report_cache::ReportKey::new(
+        "realized_vol",
+        &sec.key(),
+        query.timeframe,
+        &source,
+        &bars,
+        &format!("{query:?}"),
+    );
+    cache_key.epoch = stitch.epoch;
+    cache_key.day = Some(tr_core::ny::civil(chrono::Utc::now().timestamp()).date());
+    cached_study(s, cache_key, move || tr_data::realized_vol::build_vol(&sec.key(), &bars, &query, &source)).await
+}
+async fn research_autocorr(
+    s: &Shared,
+    symbol: &str,
+    spec: &str,
+    timeframe: &str,
+) -> anyhow::Result<tr_data::autocorr::Autocorr> {
+    if s.sample_mode() {
+        anyhow::bail!(
+            "Return autocorrelation refused: sample / offline display mode does not feed this pane. Sample prices are never used."
+        );
+    }
+    let sec = tr_data::security(symbol);
+    tr_data::cash_session::require_us_session(&sec.ticker, None).map_err(anyhow::Error::msg)?;
+    if !matches!(sec.class, tr_core::AssetClass::Equity | tr_core::AssetClass::Etf | tr_core::AssetClass::Index) {
+        anyhow::bail!(
+            "{} has no US cash session. Return autocorrelation uses the regular session from 09:30.",
+            sec.ticker
+        );
+    }
+    let query = tr_data::autocorr::parse_query(spec, timeframe).map_err(anyhow::Error::msg)?;
+    let limit = tr_data::autocorr::fetch_limit(query.timeframe);
+    let (bars, stitch) = analysis_bars(s, &sec.key(), query.timeframe, limit, "Intraday study").await?;
+    tr_data::cash_session::require_us_session(&sec.ticker, None).map_err(anyhow::Error::msg)?;
+    if bars.is_empty() {
+        anyhow::bail!(
+            "Return autocorrelation refused: no regular-session bars were returned. Sample prices are never used."
+        );
+    }
+    Bar::require_verified(&bars, "Return autocorrelation").map_err(anyhow::Error::msg)?;
+    let source = format!("{} {} regular session", stitch.label(), query.timeframe.label());
+    let mut cache_key = tr_data::report_cache::ReportKey::new(
+        "autocorr",
+        &sec.key(),
+        query.timeframe,
+        &source,
+        &bars,
+        &format!("{query:?}"),
+    );
+    cache_key.epoch = stitch.epoch;
+    cache_key.day = Some(tr_core::ny::civil(chrono::Utc::now().timestamp()).date());
+    cached_study(s, cache_key, move || tr_data::autocorr::build_autocorr(&sec.key(), &bars, &query, &source)).await
+}
+
+/// Verified regular-session bars for one cash name. Sample substitution is refused.
+async fn research_gap_fill(
+    s: &Shared,
+    symbol: &str,
+    spec: &str,
+    timeframe: &str,
+) -> anyhow::Result<tr_data::gap_fill::GapFill> {
+    if s.sample_mode() {
+        anyhow::bail!(
+            "Gap fill refused: sample / offline display mode does not feed this pane. Sample prices are never used."
+        );
+    }
+    let sec = tr_data::security(symbol);
+    tr_data::cash_session::require_us_session(&sec.ticker, None).map_err(anyhow::Error::msg)?;
+    if !matches!(sec.class, tr_core::AssetClass::Equity | tr_core::AssetClass::Etf | tr_core::AssetClass::Index) {
+        anyhow::bail!("{} has no US cash session. The gap is the regular session from 09:30.", sec.ticker);
+    }
+    let query = tr_data::gap_fill::parse_query(spec, timeframe).map_err(anyhow::Error::msg)?;
+    let limit = tr_data::gap_fill::fetch_limit(query.timeframe);
+    let (bars, stitch) = analysis_bars(s, &sec.key(), query.timeframe, limit, "Intraday study").await?;
+    tr_data::cash_session::require_us_session(&sec.ticker, None).map_err(anyhow::Error::msg)?;
+    if bars.is_empty() {
+        anyhow::bail!("Gap fill refused: no regular-session bars were returned. Sample prices are never used.");
+    }
+    Bar::require_verified(&bars, "Gap fill").map_err(anyhow::Error::msg)?;
+    let source = format!("{} {} regular session", stitch.label(), query.timeframe.label());
+    let mut cache_key = tr_data::report_cache::ReportKey::new(
+        "gap_fill",
+        &sec.key(),
+        query.timeframe,
+        &source,
+        &bars,
+        &format!("{query:?}"),
+    );
+    cache_key.epoch = stitch.epoch;
+    cache_key.day = Some(tr_core::ny::civil(chrono::Utc::now().timestamp()).date());
+    cached_study(s, cache_key, move || tr_data::gap_fill::build_gap(&sec.key(), &bars, &query, &source)).await
+}
+
+/// Verified regular-session bars for one cash name. Sample substitution is refused.
+async fn research_session_extreme(
+    s: &Shared,
+    symbol: &str,
+    spec: &str,
+    timeframe: &str,
+) -> anyhow::Result<tr_data::session_extreme::SessionExtreme> {
+    if s.sample_mode() {
+        anyhow::bail!(
+            "Session extreme refused: sample / offline display mode does not feed this pane. Sample prices are never used."
+        );
+    }
+    let sec = tr_data::security(symbol);
+    tr_data::cash_session::require_us_session(&sec.ticker, None).map_err(anyhow::Error::msg)?;
+    if !matches!(sec.class, tr_core::AssetClass::Equity | tr_core::AssetClass::Etf | tr_core::AssetClass::Index) {
+        anyhow::bail!("{} has no US cash session. The extreme is the regular session from 09:30.", sec.ticker);
+    }
+    let query = tr_data::session_extreme::parse_query(spec, timeframe).map_err(anyhow::Error::msg)?;
+    let limit = tr_data::session_extreme::fetch_limit(query.timeframe);
+    let (bars, stitch) = analysis_bars(s, &sec.key(), query.timeframe, limit, "Intraday study").await?;
+    tr_data::cash_session::require_us_session(&sec.ticker, None).map_err(anyhow::Error::msg)?;
+    if bars.is_empty() {
+        anyhow::bail!("Session extreme refused: no regular-session bars were returned. Sample prices are never used.");
+    }
+    Bar::require_verified(&bars, "Session extreme").map_err(anyhow::Error::msg)?;
+    let source = format!("{} {} regular session", stitch.label(), query.timeframe.label());
+    let mut cache_key = tr_data::report_cache::ReportKey::new(
+        "session_extreme",
+        &sec.key(),
+        query.timeframe,
+        &source,
+        &bars,
+        &format!("{query:?}"),
+    );
+    cache_key.epoch = stitch.epoch;
+    cache_key.day = Some(tr_core::ny::civil(chrono::Utc::now().timestamp()).date());
+    cached_study(s, cache_key, move || tr_data::session_extreme::build_extreme(&sec.key(), &bars, &query, &source))
+        .await
+}
+
+/// CLOCK uses only the research gate; its complete report is built off the UI thread.
+async fn research_session_clock(
+    s: &Shared,
+    symbol: &str,
+    spec: &str,
+    timeframe: &str,
+) -> anyhow::Result<tr_data::session_clock::SessionClock> {
+    if s.sample_mode() {
+        anyhow::bail!("Session Clock refused: sample / offline display mode. Verified real data is required.");
+    }
+    let sec = tr_data::security(symbol);
+    tr_data::cash_session::require_us_session(&sec.ticker, None).map_err(anyhow::Error::msg)?;
+    if !tr_data::cash_session::is_cash(&sec) {
+        anyhow::bail!("Session Clock supports US cash sessions only.");
+    }
+    let query = tr_data::session_clock::parse_query(spec, timeframe).map_err(anyhow::Error::msg)?;
+    let (bars, stitch) = analysis_bars(
+        s,
+        &sec.key(),
+        query.timeframe,
+        tr_data::cash_session::research_fetch_limit(query.timeframe),
+        "Session Clock",
+    )
+    .await?;
+    tr_data::cash_session::require_us_session(&sec.ticker, None).map_err(anyhow::Error::msg)?;
+    Bar::require_verified(&bars, "Session Clock").map_err(anyhow::Error::msg)?;
+    let now = chrono::Utc::now().timestamp();
+    let health_stale = s.provider.health().is_some_and(|h| {
+        matches!(h.snapshot()[Feed::Bars as usize].state, FeedState::Stale { .. } | FeedState::Unavailable(_))
+    });
+    // Cached data has no fresh observation clock. In particular its last print
+    // must not become closed just because the wall clock has advanced.
+    let observed_at = (!health_stale && stitch.live_ok).then_some(stitch.fetched_at).flatten();
+    let source = stitch.label();
+    let closed = tr_data::closed::closed_len(query.timeframe, &bars, sec.class, observed_at);
+    let mut cache_key = tr_data::report_cache::ReportKey::new(
+        "clock",
+        &sec.key(),
+        query.timeframe,
+        &source,
+        &bars[..closed],
+        &format!("{query:?} {} {}", now / query.timeframe.seconds(), observed_at.is_some()),
+    );
+    cache_key.epoch = stitch.epoch;
+    cache_key.day = Some(tr_core::ny::civil(now).date());
+    cached_study(s, cache_key, move || {
+        tr_data::session_clock::build_clock(&sec.key(), &bars, &query, &source, now, observed_at)
+    })
+    .await
+}
+
+/// Verified regular-session bars for one cash name and for SPY. Sample substitution is refused.
+async fn research_relative_path(
+    s: &Shared,
+    symbol: &str,
+    spec: &str,
+    timeframe: &str,
+) -> anyhow::Result<tr_data::relative_path::RelativePath> {
+    if s.sample_mode() {
+        anyhow::bail!(
+            "Relative path refused: sample / offline display mode does not feed this pane. Sample prices are never used."
+        );
+    }
+    let sec = tr_data::security(symbol);
+    tr_data::cash_session::require_us_session(&sec.ticker, None).map_err(anyhow::Error::msg)?;
+    if sec.key() == tr_data::relative_path::benchmark_key() {
+        anyhow::bail!("SPY is the benchmark. RPATH needs another cash name.");
+    }
+    if !matches!(sec.class, tr_core::AssetClass::Equity | tr_core::AssetClass::Etf | tr_core::AssetClass::Index) {
+        anyhow::bail!("{} has no US cash session. The spread is the regular session from 09:30.", sec.ticker);
+    }
+    let query = tr_data::relative_path::parse_query(spec, timeframe).map_err(anyhow::Error::msg)?;
+    let limit = tr_data::relative_path::fetch_limit(query.timeframe);
+    let (bars, stitch) = analysis_bars(s, &sec.key(), query.timeframe, limit, "Intraday study").await?;
+    tr_data::cash_session::require_us_session(&sec.ticker, None).map_err(anyhow::Error::msg)?;
+    if bars.is_empty() {
+        anyhow::bail!("Relative path refused: no regular-session bars were returned. Sample prices are never used.");
+    }
+    Bar::require_verified(&bars, "Relative path").map_err(anyhow::Error::msg)?;
+    let spy_key = tr_data::relative_path::benchmark_key();
+    let (spy, spy_stitch) = analysis_bars(s, &spy_key, query.timeframe, limit, "Relative path").await?;
+    if spy.is_empty() {
+        anyhow::bail!("Relative path refused: SPY returned no regular-session bars. Sample prices are never used.");
+    }
+    Bar::require_verified(&spy, "Relative path").map_err(anyhow::Error::msg)?;
+    let source =
+        format!("{} · SPY {} · {} regular session", stitch.label(), spy_stitch.label(), query.timeframe.label());
+    let mut cache_key = tr_data::report_cache::ReportKey::new(
+        "relative_path",
+        &sec.key(),
+        query.timeframe,
+        &source,
+        &bars,
+        &format!("{query:?} {} {}", tr_data::stable_hash::bars_digest(&spy), spy_stitch.epoch),
+    );
+    cache_key.epoch = stitch.epoch;
+    cache_key.day = Some(tr_core::ny::civil(chrono::Utc::now().timestamp()).date());
+    cached_study(s, cache_key, move || tr_data::relative_path::build_relative(&sec.key(), &bars, &spy, &query, &source))
+        .await
+}
+
+/// Five session reads from one verified 5-minute history. Sample substitution is refused.
+/// A missing SPY history blanks only the versus-SPY line.
+async fn research_session_brief(s: &Shared, symbol: &str) -> anyhow::Result<tr_data::session_brief::SessionBrief> {
+    if s.sample_mode() {
+        anyhow::bail!(
+            "Session brief refused: sample / offline display mode does not feed this pane. Sample prices are never used."
+        );
+    }
+    let sec = tr_data::security(symbol);
+    tr_data::cash_session::require_us_session(&sec.ticker, None).map_err(anyhow::Error::msg)?;
+    if !matches!(sec.class, tr_core::AssetClass::Equity | tr_core::AssetClass::Etf | tr_core::AssetClass::Index) {
+        anyhow::bail!("{} has no US cash session.", sec.ticker);
+    }
+    let limit = tr_data::session_alerts::fetch_limit();
+    let (bars, stitch) = analysis_bars(s, &sec.key(), Timeframe::M5, limit, "Session brief").await?;
+    tr_data::cash_session::require_us_session(&sec.ticker, None).map_err(anyhow::Error::msg)?;
+    if bars.is_empty() {
+        anyhow::bail!("Session brief refused: no regular-session bars were returned. Sample prices are never used.");
+    }
+    Bar::require_verified(&bars, "Session brief").map_err(anyhow::Error::msg)?;
+    let spy_key = tr_data::relative_path::benchmark_key();
+    let spy = if sec.key() == spy_key {
+        Some(bars.clone())
+    } else {
+        match analysis_bars(s, &spy_key, Timeframe::M5, limit, "Session brief").await.map(|(bars, _)| bars) {
+            Ok(spy) if !spy.is_empty() => Some(spy),
+            _ => None,
+        }
+    };
+    let now = chrono::Utc::now().timestamp();
+    tokio::task::spawn_blocking(move || {
+        let mut report = tr_data::session_brief::build(&sec.key(), Timeframe::M5, &bars, spy.as_deref(), now)?;
+        report.source = stitch.label();
+        Ok::<_, String>(report)
+    })
+    .await?
+    .map_err(anyhow::Error::msg)
+}
+
+/// Verified 5-minute bars for the chart's cash levels. Sample substitution is refused.
+async fn research_cash_levels(s: &Shared, symbol: &str) -> anyhow::Result<tr_data::cash_levels::CashLevels> {
+    if s.sample_mode() {
+        anyhow::bail!(
+            "Cash levels refused: sample / offline display mode does not feed this chart. Sample prices are never used."
+        );
+    }
+    let sec = tr_data::security(symbol);
+    tr_data::cash_session::require_us_session(&sec.ticker, None).map_err(anyhow::Error::msg)?;
+    if !matches!(sec.class, tr_core::AssetClass::Equity | tr_core::AssetClass::Etf | tr_core::AssetClass::Index) {
+        anyhow::bail!("{} has no US cash session.", sec.ticker);
+    }
+    let (bars, stitch) =
+        analysis_bars(s, &sec.key(), Timeframe::M5, tr_data::cash_levels::fetch_limit(), "Cash levels").await?;
+    tr_data::cash_session::require_us_session(&sec.ticker, None).map_err(anyhow::Error::msg)?;
+    if bars.is_empty() {
+        anyhow::bail!("{} has no regular-session bars. A premarket print is not the open.", sec.ticker);
+    }
+    Bar::require_verified(&bars, "Cash levels").map_err(anyhow::Error::msg)?;
+    tokio::task::spawn_blocking(move || {
+        let mut report = tr_data::cash_levels::build(&sec.key(), Timeframe::M5, &bars)?;
+        report.notes.push(stitch.label());
+        Ok::<_, String>(report)
+    })
+    .await?
+    .map_err(anyhow::Error::msg)
+}
+
+/// Verified regular-session bars for a list of cash names. Sample substitution is refused.
+async fn research_breadth(
+    s: &Shared,
+    spec: &str,
+    timeframe: &str,
+    watchlist: &[String],
+) -> anyhow::Result<tr_data::session_breadth::Breadth> {
+    if s.sample_mode() {
+        anyhow::bail!(
+            "Session breadth refused: sample / offline display mode does not feed this pane. Sample prices are never used."
+        );
+    }
+    let query = tr_data::session_breadth::parse_query(spec, timeframe, watchlist).map_err(anyhow::Error::msg)?;
+    let limit = tr_data::session_breadth::fetch_limit(query.timeframe);
+    let mut rows = Vec::with_capacity(query.symbols.len());
+    let mut sources = Vec::new();
+    for symbol in &query.symbols {
+        let sec = tr_data::security(symbol);
+        tr_data::cash_session::require_us_session(&sec.ticker, None).map_err(anyhow::Error::msg)?;
+        if !matches!(sec.class, tr_core::AssetClass::Equity | tr_core::AssetClass::Etf | tr_core::AssetClass::Index) {
+            rows.push(tr_data::session_breadth::NamedBars {
+                symbol: sec.key(),
+                bars: Vec::new(),
+                error: Some(format!("{} has no US cash session.", sec.ticker)),
+            });
+            continue;
+        }
+        let fetched =
+            analysis_bars(s, &sec.key(), query.timeframe, limit, "Intraday study").await.map(|(bars, info)| {
+                sources.push(format!("{} {}", sec.ticker, info.label()));
+                bars
+            });
+        tr_data::cash_session::require_us_session(&sec.ticker, None).map_err(anyhow::Error::msg)?;
+        match fetched {
+            Ok(bars) if bars.is_empty() => rows.push(tr_data::session_breadth::NamedBars {
+                symbol: sec.key(),
+                bars,
+                error: Some(format!("{} returned no regular-session bars. Sample prices are never used.", sec.ticker)),
+            }),
+            Ok(bars) => rows.push(tr_data::session_breadth::NamedBars { symbol: sec.key(), bars, error: None }),
+            Err(e) => rows.push(tr_data::session_breadth::NamedBars {
+                symbol: sec.key(),
+                bars: Vec::new(),
+                error: Some(format!("{e:#}")),
+            }),
+        }
+    }
+    let source = sources.join(" · ");
+    if rows.iter().any(|r| r.error.is_some()) {
+        return tokio::task::spawn_blocking(move || tr_data::session_breadth::build_breadth(&rows, &query, &source))
+            .await?
+            .map_err(anyhow::Error::msg);
+    }
+    let combined: Vec<_> = rows.iter().flat_map(|r| r.bars.iter().copied()).collect();
+    let key = tr_data::report_cache::ReportKey::new(
+        "breadth",
+        "",
+        query.timeframe,
+        &source,
+        &combined,
+        &format!("{query:?}"),
+    );
+    cached_study(s, key, move || tr_data::session_breadth::build_breadth(&rows, &query, &source)).await
+}
+
+/// Load one name from the local archive, then Whats-News. Sample/display bars never enter.
+async fn research_lookalike(
+    s: &Shared,
+    bridge: &tr_data::whats_news::Bridge,
+    key: &str,
+    query: &tr_data::lookalike::LookalikeQuery,
+) -> anyhow::Result<tr_data::lookalike::LookalikeReport> {
+    use tr_data::whats_news::archive_ticker;
+    let ticker = archive_ticker(key);
+    if ticker.is_empty() {
+        anyhow::bail!("Lookalikes refused: invalid security");
+    }
+    let wanted = ticker.clone();
+    let local = s.history.db(move |db| db.daily(&wanted)).await?;
+    let mut source = "Local Yahoo daily research archive".to_string();
+    let bars = if !local.is_empty() {
+        tr_data::lookalike::require_lookalike_bars(&local, "Lookalikes").map_err(anyhow::Error::msg)?;
+        local
+    } else if bridge.enabled {
+        match bridge.histories_for(std::slice::from_ref(&ticker)).await {
+            Ok(external) => {
+                external.provenance.require_verified("Lookalike archive").map_err(anyhow::Error::msg)?;
+                source = format!("{} + {}", source, external.source);
+                if let Some(skip) = external.data.skipped.iter().find(|s| s.symbol.eq_ignore_ascii_case(&ticker)) {
+                    anyhow::bail!("Lookalikes refused: {}: {}", skip.symbol, skip.reason);
+                }
+                let bars = external
+                    .data
+                    .bars
+                    .into_iter()
+                    .find(|(s, _)| s.eq_ignore_ascii_case(&ticker))
+                    .map(|(_, b)| b)
+                    .unwrap_or_default();
+                tr_data::lookalike::require_lookalike_bars(&bars, "Lookalikes").map_err(anyhow::Error::msg)?;
+                bars
+            }
+            Err(e) if tr_data::whats_news::is_unverified(&e) => return Err(e),
+            Err(e) => anyhow::bail!(
+                "Lookalikes refused: no daily history in the local research archive, and Whats-News is unavailable ({e:#}). Sample/display prices are never used."
+            ),
+        }
+    } else {
+        anyhow::bail!(
+            "Lookalikes refused: no daily history for {ticker} in the local research archive. Sample/display prices are never used."
+        );
+    };
+    let key = tr_data::security(key).key();
+    let report = tokio::task::spawn_blocking({
+        let source = source.clone();
+        let ticker = ticker.clone();
+        let query = query.clone();
+        move || tr_data::lookalike::compute_report(&key, &ticker, &bars, &query, &source)
+    })
+    .await?
+    .map_err(anyhow::Error::msg)?;
+    Ok(report)
+}
+
+/// Load only the requested watchlist tickers. Sample/unverified history is refused.
+async fn research_desk(
+    s: &Shared,
+    bridge: &tr_data::whats_news::Bridge,
+    keys: &[String],
+) -> anyhow::Result<tr_data::whats_news::Snapshot<Vec<tr_data::whats_news::MemberRow>>> {
+    use tr_data::whats_news::{MemberRow, archive_ticker};
+    let mut wanted = Vec::new();
+    let mut rows = Vec::new();
+    for key in keys {
+        let ticker = archive_ticker(key);
+        if ticker.is_empty() {
+            rows.push(MemberRow::skipped(key, key, tr_core::Provenance::Missing, "invalid security"));
+            continue;
+        }
+        wanted.push((key.clone(), ticker));
+    }
+    let tickers: Vec<String> = wanted.iter().map(|(_, t)| t.clone()).collect();
+    let mut local = if tickers.is_empty() {
+        Default::default()
+    } else {
+        s.history.db(move |db| db.histories_for(&tickers)).await?
+    };
+    let mut source = "Local Yahoo daily research archive (watchlist only)".to_string();
+    let mut wn_skipped = vec![];
+    if bridge.enabled && !wanted.is_empty() {
+        let missing: Vec<String> = wanted
+            .iter()
+            .filter(|(_, t)| !local.get(t).is_some_and(|b| !b.is_empty()))
+            .map(|(_, t)| t.clone())
+            .collect();
+        if !missing.is_empty() {
+            match bridge.histories_for(&missing).await {
+                Ok(external) => {
+                    external.provenance.require_verified("PM Desk archive").map_err(anyhow::Error::msg)?;
+                    source.push_str(&format!(" + {}", external.source));
+                    wn_skipped = external.data.skipped;
+                    for (symbol, bars) in external.data.bars {
+                        if !local.get(&symbol).is_some_and(|b| !b.is_empty()) {
+                            local.insert(symbol, bars);
+                        }
+                    }
+                }
+                Err(e) if tr_data::whats_news::is_unverified(&e) => return Err(e),
+                Err(e) => source.push_str(&format!(" · Whats-News unavailable: {e}")),
+            }
+        }
+    } else if !bridge.enabled {
+        source.push_str(" · Whats-News disabled");
+    }
+    for (key, ticker) in wanted {
+        if let Some(bars) = local.remove(&ticker) {
+            match MemberRow::from_bars(&key, &ticker, &bars) {
+                Ok(row) => rows.push(row),
+                Err(e) => return Err(anyhow::anyhow!(e)),
+            }
+        } else {
+            let reason = wn_skipped
+                .iter()
+                .find(|s| s.symbol == ticker)
+                .map(|s| s.reason.clone())
+                .unwrap_or_else(|| "no daily history in the watchlist-scoped archive read".into());
+            rows.push(MemberRow::skipped(&key, &ticker, tr_core::Provenance::Missing, reason));
+        }
+    }
+    tr_data::whats_news::rank_watchlist(&mut rows);
+    for row in &rows {
+        if row.skip.is_none() {
+            row.provenance.require_verified("PM Desk").map_err(anyhow::Error::msg)?;
+        }
+    }
+    let provenance = rows
+        .iter()
+        .filter(|r| r.skip.is_none())
+        .map(|r| r.provenance)
+        .reduce(tr_core::Provenance::combine)
+        .unwrap_or(tr_core::Provenance::Cached);
+    Ok(tr_data::whats_news::Snapshot { failures: vec![], data: rows, provenance, source })
+}
+
+/// Verified gate first, then `closed_len` on the feed's clock, then the sums off the async
+/// runtime. Sample or unverified bars return the shared refusal and no numbers.
+async fn anchored_vwap(
+    jobs: Arc<crate::perf::JobLog>,
+    class: tr_core::AssetClass,
+    bars: Arc<Vec<Bar>>,
+    key: &tr_data::anchored_vwap::AvwapKey,
+    as_of: Option<i64>,
+) -> Result<Arc<tr_data::anchored_vwap::AvwapReport>, String> {
+    Bar::require_verified(&bars, "Anchored VWAP")?;
+    let closed = tr_data::closed::closed_len(key.tf, &bars, class, as_of);
+    let anchors = key.anchors.clone();
+    tokio::task::spawn_blocking(move || {
+        jobs.time("AnchoredVwap", || tr_data::anchored_vwap::report(&bars, &anchors, closed).map(Arc::new))
+    })
+    .await
+    .map_err(|e| format!("Anchored VWAP task failed: {e}"))?
+}
+
+/// Complete-input admission always precedes the cache key and lookup.
+fn cached_season_report(
+    reports: &tr_data::report_cache::ReportCache,
+    jobs: &crate::perf::JobLog,
+    symbol: &str, tf: Timeframe, bars: &[Bar], source: &str,
+    observed: i64, now: i64, gaps: &[(i64,i64)],
+) -> Result<Arc<tr_data::studio_season::SeasonReport>,String> {
+    tr_data::studio_season::validate_input(tf,bars)?;
+    chrono::DateTime::<chrono::Utc>::from_timestamp(now, 0).ok_or("SEASON refused: invalid calendar clock")?;
+    chrono::DateTime::<chrono::Utc>::from_timestamp(observed, 0).ok_or("SEASON refused: invalid observation clock")?;
+    let mut key = tr_data::report_cache::ReportKey::new(
+        "studio.season", symbol, tf, source, bars,
+        &format!("evidence-v2-two-families;provenance={:?};observed={observed};gaps={gaps:?}", Bar::provenance(bars)),
+    );
+    // Calendar/OR classifications depend on the NY date, not the paint/reload second.
+    key.day = Some(tr_core::ny::civil(now).date());
+    reports.get_or_compute(key, || {
+        let _job=crate::perf::JobTimer::new(jobs,"StudioSeason");
+        tr_data::studio_season::compute_with_gaps(symbol,tf,bars,source,observed,now,gaps)
+    })
+}
+
 async fn handle(s: &Arc<Shared>, req: Request) {
+    let kind = req.kind();
+    let started = std::time::Instant::now();
+    handle_inner(s, req, false).await;
+    s.jobs.record(kind, crate::perf::Phase::Wall, started.elapsed());
+}
+async fn handle_inner(s: &Arc<Shared>, req: Request, force: bool) {
+    if let Request::RetryFeed { feed, pane } = req {
+        let requests: Vec<_> = s
+            .feed_requests
+            .lock()
+            .expect("feed requests")
+            .iter()
+            .filter(|((f, p), _)| {
+                (*f == feed || (feed == Feed::Ticks && *f == Feed::Bars)) && (pane.is_none() || *p == pane)
+            })
+            .map(|(_, r)| r.clone())
+            .collect();
+        for request in requests {
+            Box::pin(handle_inner(s, request.request(), true)).await;
+        }
+        return;
+    }
+    let (epoch, config) = s.whats_news.borrow().clone();
+    let send = |response| s.send(Response::WhatsNews { epoch, response: Box::new(response) });
     match req {
+        Request::StackEdge { pane, key, bars, state, entry_long, entry_short, stitch } => {
+            let jobs = s.jobs.clone();
+            let k = key.clone();
+            let reports = s.reports.clone();
+            let result = tokio::task::spawn_blocking(move || {
+                let bars = tr_data::vault::research_bars(&bars, stitch.as_deref())?;
+                if k.n > bars.len() || tr_data::stable_hash::bars_digest(&bars[..k.n]) != k.digest {
+                    return Err("TSTACK Edge input changed".into());
+                }
+                let mut causal = tr_data::stable_hash::Fnv64::default();
+                for state in &state {
+                    causal.write_i64(state.map_or(2, i64::from));
+                }
+                for value in entry_long.iter().chain(&entry_short) {
+                    causal.write_u64(u64::from(*value));
+                }
+                let mut cache_key = tr_data::report_cache::ReportKey::new(
+                    "edge",
+                    "",
+                    k.tf,
+                    "chart",
+                    &bars[..k.n],
+                    &format!("{:?} {:?} {}", k.params, k.horizons, causal.finish()),
+                );
+                if let Some(s) = &stitch {
+                    cache_key.source = s.source.clone();
+                    cache_key.epoch = s.epoch;
+                }
+                reports.get_or_compute(cache_key, || {
+                    jobs.time("StackEdge", || {
+                        tr_data::edge::regime_edge(&bars[..k.n], &state, &entry_long, &entry_short, &k.horizons)
+                    })
+                })
+            })
+            .await
+            .unwrap_or_else(|e| Err(format!("Edge task failed: {e}")));
+            s.send(Response::StackEdge { pane, key, result });
+        }
+
+        Request::VaultSnapshot { pane, generation, symbol } => {
+            let result = if s.sample_mode() {
+                Err("VAULT OFF · sample mode never reads or writes the vault".into())
+            } else {
+                cache_op(s, move |v| v.snapshot(symbol.as_deref(), chrono::Utc::now().timestamp()))
+                    .await
+                    .map(Arc::new)
+                    .ok_or_else(|| "vault unavailable".into())
+            };
+            s.send(Response::VaultSnapshot { pane, generation, result });
+        }
+        Request::VaultDrop { symbol, tf } => {
+            let n = cache_op(s, move |v| v.drop_series(&symbol, tf, chrono::Utc::now().timestamp())).await;
+            s.send(Response::Status(
+                n.map(|n| format!("VAULT DROP · {n} bars removed"))
+                    .unwrap_or_else(|| "VAULT unavailable or disabled".into()),
+            ));
+        }
+        Request::VaultVerify => {
+            let result = cache_op(s, |v| v.verify(chrono::Utc::now().timestamp())).await;
+            s.send(Response::Status(result.unwrap_or_else(|| "VAULT unavailable or disabled".into())));
+        }
+        Request::VaultPrune => {
+            let n = cache_op(s, |v| v.prune(chrono::Utc::now().timestamp())).await;
+            s.send(Response::Status(
+                n.map(|n| format!("VAULT PRUNE · {n} bars removed"))
+                    .unwrap_or_else(|| "VAULT unavailable or disabled".into()),
+            ));
+        }
+
+        Request::ConfigureWhatsNews { .. } => unreachable!("configured in dispatcher"),
+        Request::RetryFeed { .. } => unreachable!("handled above"),
+        Request::Health => {
+            if let Some(board) = s.provider.health() {
+                s.send(Response::Health(board.snapshot()));
+            }
+        }
+        Request::HistoryStatus => {
+            s.send(Response::HistoryStatus(s.history.status().await.map_err(|e| format!("{e:#}"))))
+        }
+        Request::ExportHistory { path, symbols } => {
+            let result = s
+                .history
+                .db({
+                    let path = path.clone();
+                    let symbols = symbols.clone();
+                    move |db| {
+                        let doc = tr_data::portable::history_document(
+                            db,
+                            (!symbols.is_empty()).then_some(symbols.as_slice()),
+                            tr_data::portable::now_rfc3339(),
+                        )
+                        .map_err(|e| anyhow::anyhow!(e))?;
+                        tr_data::portable::write_json(&path, &doc).map_err(|e| anyhow::anyhow!(e))?;
+                        let label = if doc.sample { "SAMPLE price history" } else { "price history" };
+                        Ok(format!("Exported {label} to {}", path.display()))
+                    }
+                })
+                .await;
+            s.send(Response::Portable(result.map_err(|e| format!("{e:#}"))));
+        }
+        Request::ImportHistory { path } => {
+            let result = s
+                .history
+                .db({
+                    let path = path.clone();
+                    move |db| {
+                        let doc = tr_data::portable::Document::read(&path).map_err(|e| anyhow::anyhow!(e))?;
+                        let n = tr_data::portable::import_history(db, &doc).map_err(|e| anyhow::anyhow!(e))?;
+                        Ok(format!("Restored {n} price-history series from {}", path.display()))
+                    }
+                })
+                .await;
+            s.send(Response::Portable(result.map_err(|e| format!("{e:#}"))));
+            s.send(Response::HistoryChanged);
+        }
+        Request::ReplacePriceAlerts(mut store) => {
+            store.repair_ids();
+            {
+                let mut lock = s.price_alerts.lock().expect("price alerts");
+                *lock = store;
+            }
+            s.persist_price_alerts();
+            s.send(Response::PriceAlertFeed(s.price_alert_snapshot(chrono::Utc::now().timestamp())));
+            s.send(Response::Portable(Ok("Restored price/setup alerts".into())));
+        }
+        Request::HistoryTask(command) => {
+            let (action, args) = command.trim().split_once(' ').unwrap_or((command.trim(), ""));
+            let action = action.to_ascii_uppercase();
+            if action == "CANCEL" {
+                s.history.cancel();
+                return;
+            }
+            let result = async {
+                if !["ADD", "REFRESH", "RETRY", "RESUME"].contains(&action.as_str()) {
+                    anyhow::bail!(
+                        "Use HIST ADD <US|NASDAQ|ETFS|ALL|WHATS-NEWS|symbols>, REFRESH, CANCEL, RESUME or RETRY"
+                    );
+                }
+                let added = if action == "ADD" {
+                    let mut symbols = Vec::new();
+                    for token in args.split(|c: char| c.is_whitespace() || c == ',').filter(|t| !t.is_empty()) {
+                        if token.eq_ignore_ascii_case("WHATS-NEWS") || token.eq_ignore_ascii_case("WN") {
+                            symbols.extend(config.bridge().universe().await?.data);
+                        } else {
+                            symbols.extend(tr_data::history::universe::resolve(token)?);
+                        }
+                    }
+                    if symbols.is_empty() {
+                        anyhow::bail!("HIST ADD needs a list or ticker symbols");
+                    }
+                    symbols
+                } else {
+                    Vec::new()
+                };
+                s.history.run(&action, added, |status| s.send(Response::HistoryStatus(Ok(status)))).await
+            }
+            .await;
+            if let Err(e) = result {
+                s.send(Response::HistoryStatus(Err(format!("{e:#}"))));
+            }
+            s.send(Response::HistoryChanged);
+        }
+        Request::AutocompleteUniverse => {
+            let bridge = config.bridge();
+            let result = research_universe(s, &bridge).await.map_err(|e| format!("{e:#}"));
+            send(Response::AutocompleteUniverse(result));
+        }
+        Request::Research { pane, generation, scan } => {
+            let bridge = config.bridge();
+            if let Some(name) = scan {
+                send(Response::Scan {
+                    pane,
+                    generation,
+                    result: research_scan(s, &bridge, &name).await.map_err(|e| format!("{e:#}")),
+                });
+            } else {
+                send(Response::Universe {
+                    pane,
+                    generation,
+                    result: research_universe(s, &bridge).await.map_err(|e| format!("{e:#}")),
+                });
+            }
+        }
+        Request::ScanView { pane, generation, spec } => {
+            let bridge = config.bridge();
+            send(Response::ScanView {
+                pane,
+                generation,
+                result: research_scan_view(s, &bridge, &spec).await.map_err(|e| format!("{e:#}")),
+            });
+        }
+        Request::WallEdge { pane, generation, symbols, daily, priority } => {
+            if !wall_edge_current(s, pane, generation) {
+                return;
+            }
+            if s.sample_mode() {
+                send(Response::WallEdgeDone {
+                    pane,
+                    generation,
+                    error: Some("EDGE REFUSED · WARNING: SAMPLE DATA".into()),
+                });
+                return;
+            }
+            let symbols: Vec<_> = symbols.into_iter().take(tr_data::stack_wall::MAX_SYMBOLS).collect();
+            let mut started = vec![false; symbols.len()];
+            // Pull rows one at a time in on-screen order, re-reading the pane's latest
+            // focus so a scroll during the pass re-ranks the rows not yet started.
+            let mut next = || {
+                let focus = s
+                    .wall_edge_focus
+                    .lock()
+                    .unwrap()
+                    .get(&pane)
+                    .filter(|(g, _)| *g == generation)
+                    .map(|(_, p)| p.clone())
+                    .unwrap_or_default();
+                let i = wall_edge_next(&focus, &priority, &mut started)?;
+                Some((i, symbols[i].clone()))
+            };
+            let mut tasks = tokio::task::JoinSet::new();
+            let mut tick = tokio::time::interval(Duration::from_millis(20));
+            loop {
+                while tasks.len() < WALL_EDGE_IN_FLIGHT {
+                    let Some((index, symbol)) = next() else { break };
+                    let shared = s.clone();
+                    tasks.spawn(async move {
+                        let result = wall_edge_one(&shared, &symbol, daily, pane, generation).await;
+                        (index, symbol, result)
+                    });
+                }
+                if tasks.is_empty() {
+                    break;
+                }
+                if !wall_edge_current(s, pane, generation) {
+                    tasks.abort_all();
+                    return;
+                }
+                tokio::select! {
+                    _ = tick.tick() => {}
+                    result = tasks.join_next() => {
+                        if !wall_edge_current(s, pane, generation) {
+                            tasks.abort_all();
+                            return;
+                        }
+                        match result {
+                            Some(Ok((index, symbol, result))) => {
+                                send(Response::WallEdgeRow { pane, generation, index, symbol, result })
+                            }
+                            Some(Err(e)) => {
+                                tasks.abort_all();
+                                send(Response::WallEdgeDone { pane, generation, error: Some(e.to_string()) });
+                                return;
+                            }
+                            None => break,
+                        }
+                    }
+                }
+            }
+            if wall_edge_current(s, pane, generation) {
+                s.wall_edge_focus.lock().unwrap().remove(&pane);
+                send(Response::WallEdgeDone { pane, generation, error: None });
+            }
+        }
+        Request::CancelWallEdge { .. } | Request::WallEdgeFocus { .. } => {}
+        Request::TrendWall { pane, generation, symbols, daily } => {
+            if !wall_current(s, pane, generation) {
+                return;
+            }
+            if s.sample_mode() {
+                send(Response::TrendWallDone {
+                    pane,
+                    generation,
+                    error: Some("TREND WALL REFUSED · WARNING: SAMPLE DATA".into()),
+                });
+                return;
+            }
+            let tf = if daily { Timeframe::D1 } else { Timeframe::M5 };
+            for (index, symbol) in symbols.into_iter().take(tr_data::stack_wall::MAX_SYMBOLS).enumerate() {
+                if !wall_current(s, pane, generation) {
+                    return;
+                }
+                let now = chrono::Utc::now().timestamp();
+                let result = async {
+                    if !daily {
+                        if !tr_data::cash_session::is_cash(&tr_data::security(&symbol)) {
+                            return Err("Trend Wall refused: requires US cash-session symbols".into());
+                        }
+                        tr_data::cash_session::require_us_session(
+                            &symbol,
+                            tr_data::cash_session::exchange_zone(&symbol).as_deref(),
+                        )?;
+                    }
+                    let base = stack_wall_lane_bars(s, &symbol, tf, daily, now).await?;
+                    // Validate before filtering, so a discarded off-session bar cannot hide taint.
+                    Bar::require_verified(&base, "Trend Wall")?;
+                    let base = if daily { base } else { tr_data::intraday::regular_only(base.as_ref().clone()).into() };
+                    if base.is_empty() {
+                        return Err("No regular-session native bars".to_string());
+                    }
+                    let mut lanes = Vec::new();
+                    for lane_tf in ladder(tf, daily).into_iter().filter(|t| *t != tf) {
+                        lanes.push((
+                            lane_tf,
+                            stack_wall_lane_bars(s, &symbol, lane_tf, daily, now).await.map(|b| b.as_ref().clone()),
+                        ));
+                    }
+                    let symbol = symbol.clone();
+                    tokio::task::spawn_blocking(move || {
+                        let mut stack = trend_stack(&base, tf, lanes, Default::default())?;
+                        mark_stack_freshness(&mut stack, tr_data::security(&symbol).class, daily, now);
+                        Ok(tr_data::stack_wall::build_row(&symbol, &stack, &base, now))
+                    })
+                    .await
+                    .map_err(|e| e.to_string())?
+                }
+                .await;
+                if !wall_current(s, pane, generation) {
+                    return;
+                }
+                let row = result.unwrap_or_else(|error| {
+                    let status = if error.to_ascii_lowercase().contains("refus")
+                        || error.contains("UNVERIFIED")
+                        || error.contains("SAMPLE")
+                    {
+                        LaneStatus::Refused(error)
+                    } else {
+                        LaneStatus::Unavailable(error)
+                    };
+                    tr_data::stack_wall::Row::failure(symbol, status, daily)
+                });
+                send(Response::TrendWallRow { pane, generation, index, row });
+            }
+            if wall_current(s, pane, generation) {
+                send(Response::TrendWallDone { pane, generation, error: None });
+            }
+        }
+        Request::TrendStack {
+            pane,
+            generation,
+            symbol,
+            tf,
+            archive,
+            base,
+            params,
+            ladder: custom,
+            config_revision,
+        } => {
+            if s.sample_mode() {
+                send(Response::TrendStack {
+                    config_revision,
+                    pane,
+                    generation,
+                    base_len: base.len(),
+                    result: Err("TREND STACK REFUSED · WARNING: SAMPLE DATA".into()),
+                });
+                return;
+            }
+            if let Err(error) = tr_core::indicators::require_adaptive_bars(&base, "Trend Stack") {
+                send(Response::TrendStack {
+                    config_revision,
+                    pane,
+                    generation,
+                    base_len: base.len(),
+                    result: Err(error),
+                });
+                return;
+            }
+            let frames = match custom
+                .as_deref()
+                .map(|frames| ladder_custom(tf, frames, archive))
+                .unwrap_or_else(|| Ok(ladder(tf, archive)))
+            {
+                Ok(frames) => frames,
+                Err(error) => {
+                    send(Response::TrendStack {
+                        config_revision,
+                        pane,
+                        generation,
+                        base_len: base.len(),
+                        result: Err(error),
+                    });
+                    return;
+                }
+            };
+            // Base/cloud first: no network or main-thread maths. Higher lanes fill later.
+            let initial = frames.iter().copied().filter(|t| *t != tf).map(|t| (t, Err("Loading…".into()))).collect();
+            let b = base.clone();
+            let jobs = s.jobs.clone();
+            if let Ok(result) =
+                tokio::task::spawn_blocking(move || jobs.time("TrendStack", || trend_stack(&b, tf, initial, params)))
+                    .await
+            {
+                send(Response::TrendStack { config_revision, pane, generation, base_len: base.len(), result });
+            }
+            let now = chrono::Utc::now().timestamp();
+            let mut lanes = Vec::new();
+            // The chart's verified base also seeds the persistent native cache for a wall.
+            if !archive
+                && tf == Timeframe::M5
+                && (!tr_data::cash_session::is_cash(&tr_data::security(&symbol))
+                    || base.iter().all(|b| tr_data::intraday::in_regular_session(b.ts)))
+            {
+                store_verified_history(s, &symbol, tf, &base).await;
+            }
+            for lane_tf in frames.into_iter().filter(|t| *t != tf) {
+                lanes.push((
+                    lane_tf,
+                    stack_chart_lane_bars(s, &symbol, lane_tf, archive, now).await.map(|b| b.as_ref().clone()),
+                ));
+            }
+            let base_len = base.len();
+            let class = tr_data::security(&symbol).class;
+            let lane_identity: Vec<_> = lanes
+                .iter()
+                .map(|(tf, bars)| {
+                    (tf.label(), bars.as_ref().map(|b| tr_data::stable_hash::bars_digest(b)).map_err(Clone::clone))
+                })
+                .collect();
+            let key = tr_data::report_cache::ReportKey::new(
+                "stack",
+                &symbol,
+                tf,
+                if archive { "archive" } else { "native" },
+                &base,
+                &format!("{params:?} {lane_identity:?}"),
+            );
+            let mut result = if lanes.iter().any(|(_, b)| b.is_err()) {
+                let jobs = s.jobs.clone();
+                tokio::task::spawn_blocking(move || jobs.time("TrendStack", || trend_stack(&base, tf, lanes, params)))
+                    .await
+                    .unwrap_or_else(|e| Err(e.to_string()))
+            } else {
+                cached_study(s, key, move || trend_stack(&base, tf, lanes, params)).await.map_err(|e| format!("{e:#}"))
+            };
+            if let Ok(stack) = &mut result {
+                mark_stack_freshness(stack, class, archive, now);
+            }
+            send(Response::TrendStack { config_revision, pane, generation, base_len, result });
+        }
+        Request::DailyStrength { pane, generation, archive, base } => {
+            let result = async {
+                Bar::require_verified(&base, "Daily SPY strength").map_err(anyhow::Error::msg)?;
+                let spy = if archive {
+                    desk_daily(s, &config.bridge(), "SPY").await?
+                } else {
+                    s.provider
+                        .history_for_analysis(
+                            "SPY US Equity",
+                            Timeframe::D1,
+                            None,
+                            base.len().max(100),
+                            "Daily SPY strength",
+                        )
+                        .await?
+                };
+                Bar::require_verified(&spy, "Daily SPY strength").map_err(anyhow::Error::msg)?;
+                let values = tr_core::indicators::daily_relative_strength(&base, &spy);
+                if !values.iter().any(|v| v.is_finite()) {
+                    anyhow::bail!("No common daily SPY dates");
+                }
+                Ok(line_ref(&values))
+            }
+            .await;
+            send(Response::DailyStrength {
+                pane,
+                generation,
+                base_len: base.len(),
+                result: result.map_err(|e: anyhow::Error| format!("{e:#}")),
+            });
+        }
+        Request::ChartSessionSummary { pane, key, bars, class, stitch } => {
+            let sample = s.sample_mode();
+            let jobs = s.jobs.clone();
+            let result = tokio::task::spawn_blocking(move || {
+                let _job = crate::perf::JobTimer::new(&jobs, "ChartSessionSummary");
+                if sample { return Err("Session summary refused: sample / offline display mode".into()); }
+                tr_data::chart_session::build(&bars, key.tf, class, key.extended, key.as_of, stitch.as_deref()).map(Arc::new)
+            }).await.unwrap_or_else(|e| Err(format!("Session summary task failed: {e}")));
+            s.send(Response::ChartSessionSummary { pane, key, result });
+        }
+        Request::AuctionMap { pane, key, symbol, class, bars, as_of, stitch } => {
+            let result = auction_map(s, &symbol, class, bars, &key, as_of, stitch).await;
+            s.send(Response::AuctionMap { pane, key, result });
+        }
+        Request::StopCloud { pane, key, class, bars, as_of, stitch } => {
+            let jobs = s.jobs.clone();
+            let config = key.clone();
+            let reports = s.reports.clone();
+            let result = tokio::task::spawn_blocking(move || {
+                let bars = tr_data::vault::research_bars(&bars, stitch.as_deref())?;
+                let mut cache_key = tr_data::report_cache::ReportKey::new(
+                    "stops",
+                    "",
+                    config.tf,
+                    "chart",
+                    &bars[..config.closed.min(bars.len())],
+                    &format!("{:?} {:?} {:?}", config.params, config.trend, class),
+                );
+                if let Some(s) = &stitch {
+                    cache_key.source = s.source.clone();
+                    cache_key.epoch = s.epoch;
+                }
+                reports.get_or_compute(cache_key, || {
+                    jobs.time("StopCloud", || {
+                        tr_data::stop_cloud::report(&bars, config.tf, class, as_of, config.params, config.trend)
+                    })
+                })
+            })
+            .await
+            .unwrap_or_else(|e| Err(format!("Stop Cloud task failed: {e}")));
+            s.send(Response::StopCloud { pane, key, result });
+        }
+        Request::TrendCone { pane, key, class, bars, as_of, stitch } => {
+            let jobs = s.jobs.clone();
+            let config = key.clone();
+            let reports = s.reports.clone();
+            let result = tokio::task::spawn_blocking(move || {
+                let bars = tr_data::vault::research_bars(&bars, stitch.as_deref())?;
+                let mut cache_key = tr_data::report_cache::ReportKey::new(
+                    "cone",
+                    "",
+                    config.tf,
+                    "chart",
+                    &bars[..config.closed.min(bars.len())],
+                    &format!("{:?} {:?} {:?}", config.params, config.trend, class),
+                );
+                if let Some(s) = &stitch {
+                    cache_key.source = s.source.clone();
+                    cache_key.epoch = s.epoch;
+                }
+                reports.get_or_compute(cache_key, || {
+                    jobs.time("TrendCone", || {
+                        tr_data::trend_cone::report(&bars, config.tf, class, as_of, config.params, config.trend)
+                    })
+                })
+            })
+            .await
+            .unwrap_or_else(|e| Err(format!("Trend Cone task failed: {e}")));
+            s.send(Response::TrendCone { pane, key, result });
+        }
+        Request::AnchoredVwap { pane, key, class, bars, as_of } => {
+            s.send(Response::AnchoredVwap {
+                pane,
+                result: anchored_vwap(s.jobs.clone(), class, bars, &key, as_of).await,
+                key,
+            });
+        }
+        Request::HoldingHistory { pane, generation, symbols } => {
+            let bridge = config.bridge();
+            let mut rows = Vec::new();
+            let mut errors = Vec::new();
+            // Include the benchmark once, reusing its fetch if SPY is itself held.
+            let held_symbols = symbols;
+            let mut symbols = held_symbols.clone();
+            if !symbols.iter().any(|s| tr_data::whats_news::archive_ticker(s) == "SPY") {
+                symbols.push("SPY".into());
+            }
+            let mut spy = None;
+            use futures::StreamExt;
+            let results = futures::stream::iter(symbols.into_iter().map(|symbol| {
+                let bridge = &bridge;
+                async move {
+                    let result = desk_daily(s, bridge, &symbol).await;
+                    (symbol, result)
+                }
+            }))
+            .buffered(tr_data::news::FETCH_CONCURRENCY)
+            .collect::<Vec<_>>()
+            .await;
+            for (symbol, result) in results {
+                match result {
+                    Ok(bars) => {
+                        if tr_data::whats_news::archive_ticker(&symbol) == "SPY" {
+                            spy = Some(bars.clone());
+                        }
+                        if held_symbols.contains(&symbol) {
+                            rows.push((symbol, bars));
+                        }
+                    }
+                    Err(e) => errors.push(format!("{symbol}: {e}")),
+                }
+            }
+            send(Response::HoldingHistory {
+                pane,
+                generation,
+                rows,
+                spy,
+                error: (!errors.is_empty()).then(|| errors.join("; ")),
+            });
+        }
+        Request::Desk { pane, generation, symbols } => {
+            let bridge = config.bridge();
+            send(Response::Desk {
+                pane,
+                generation,
+                result: research_desk(s, &bridge, &symbols).await.map_err(|e| format!("{e:#}")),
+            });
+        }
+        Request::StudioWhen { pane, generation, symbol, tf, rule, threshold } => {
+            let result = async {
+                if s.sample_mode() {
+                    anyhow::bail!("When: sample mode has no research data");
+                }
+                // Bounded string parse before any provider call.
+                tr_data::studio_when::WhenSpec::parse(&rule, threshold).map_err(anyhow::Error::msg)?;
+                let (bars, source, observed_at, stitch) = if tf == Timeframe::D1 {
+                    let (bars, source) =
+                        crate::app::studio_dist::daily_bars(&s.history, &config.bridge(), &symbol).await?;
+                    (bars, source, Some(chrono::Utc::now().timestamp()), None)
+                } else {
+                    if !tr_data::cash_session::cash_bar_size(tf) {
+                        anyhow::bail!("When: unsupported session interval");
+                    }
+                    let (bars, info) =
+                        analysis_bars(s, &symbol, tf, tr_data::cash_session::research_fetch_limit(tf), "When").await?;
+                    (bars, info.label(), info.fetched_at, Some(Arc::new(info)))
+                };
+                let input =
+                    tr_data::studio_canvas::CanvasInput { symbol, tf, bars: Arc::new(bars), source, observed_at, stitch };
+                let jobs = s.jobs.clone();
+                tokio::task::spawn_blocking(move || {
+                    let _job = crate::perf::JobTimer::new(&jobs, "StudioWhen");
+                    crate::app::studio_when::cached_report(&input, &rule, threshold)
+                })
+                .await?
+                .map_err(anyhow::Error::msg)
+            }
+            .await
+            .map_err(|e| format!("{e:#}"));
+            send(Response::StudioWhen { pane, generation, result });
+        }
+        Request::StudioWhenBootstrap { pane, generation, input } => {
+            let key = input.report.key;
+            let jobs = s.jobs.clone();
+            let result = if s.sample_mode() {
+                Err("When: sample mode clears bootstrap".into())
+            } else {
+                tokio::task::spawn_blocking(move || {
+                    let _job = crate::perf::JobTimer::new(&jobs, "StudioWhenBootstrap");
+                    crate::app::studio_when::cached_bootstrap(&input)
+                })
+                .await
+                .unwrap_or_else(|e| Err(e.to_string()))
+            };
+            send(Response::StudioWhenBootstrap { pane, generation, key, result });
+        }
+        Request::StudioSubset { pane, generation, input, selection } => {
+            let key = input.bars_seed;
+            let jobs = s.jobs.clone();
+            let result = if s.sample_mode() {
+                Err("Subset: sample mode clears comparison".into())
+            } else {
+                tokio::task::spawn_blocking(move || {
+                    let _job = crate::perf::JobTimer::new(&jobs, "StudioSubset");
+                    crate::app::studio_when::cached_subset(&input, selection)
+                })
+                .await
+                .unwrap_or_else(|e| Err(e.to_string()))
+            };
+            send(Response::StudioSubset { pane, generation, key, selection, result });
+        }
+        Request::StudioCanvas { pane, token, key, input, peers, comparisons, spec, news, earnings } => {
+            let result = async {
+                if s.sample_mode() {
+                    anyhow::bail!("Quick canvas: no real data in sample mode");
+                }
+                if comparisons.len() > 4 {
+                    anyhow::bail!("Quick canvas: at most four comparisons");
+                }
+                // Validate native source before any comparison I/O, trimming or cache lookup.
+                let native = input.clone();
+                tokio::task::spawn_blocking(move || tr_data::studio_canvas::validate(&native))
+                    .await?
+                    .map_err(anyhow::Error::msg)?;
+                let peers = if let Some(p) = peers {
+                    if p.requested != comparisons {
+                        anyhow::bail!("Canvas comparison receipt mismatch");
+                    }
+                    p
+                } else {
+                    let mut p = crate::chart_view::studio_canvas::PeerSources {
+                        requested: comparisons.clone(),
+                        ..Default::default()
+                    };
+                    for symbol in comparisons {
+                        let load = async {
+                            if s.sample_mode() {
+                                anyhow::bail!("Sample mode: no comparison provider calls");
+                            }
+                            if input.tf == Timeframe::D1 {
+                                let (bars, source) =
+                                    crate::app::studio_dist::daily_bars(&s.history, &config.bridge(), &symbol).await?;
+                                Ok::<_, anyhow::Error>(tr_data::studio_canvas::CanvasInput {
+                                    symbol: symbol.clone(),
+                                    tf: input.tf,
+                                    bars: Arc::new(bars),
+                                    source,
+                                    observed_at: Some(chrono::Utc::now().timestamp()),
+                                    stitch: None,
+                                })
+                            } else {
+                                let (bars, info) =
+                                    analysis_bars(s, &symbol, input.tf, default_limit(input.tf), "Quick comparison")
+                                        .await?;
+                                let observed_at = info.fetched_at;
+                                Ok(tr_data::studio_canvas::CanvasInput {
+                                    symbol: symbol.clone(),
+                                    tf: input.tf,
+                                    bars: Arc::new(bars),
+                                    source: info.source.clone(),
+                                    observed_at,
+                                    stitch: Some(Arc::new(info)),
+                                })
+                            }
+                        }
+                        .await;
+                        match load {
+                            Ok(i) => p.inputs.push(i),
+                            Err(e) => p.failures.push(format!("{symbol}: unavailable · {e:#}")),
+                        }
+                    }
+                    Arc::new(p)
+                };
+                let jobs = s.jobs.clone();
+                tokio::task::spawn_blocking(move || {
+                    use tr_data::{
+                        report_cache::{ReportCache, ReportKey},
+                        studio_canvas as canvas,
+                    };
+                    static CACHE: std::sync::LazyLock<ReportCache> = std::sync::LazyLock::new(|| ReportCache::new(4));
+                    let mut inputs = vec![input];
+                    let mut failures = peers.failures.clone();
+                    for peer in &peers.inputs {
+                        match canvas::validate(peer) {
+                            Ok(()) => inputs.push(peer.clone()),
+                            Err(e) => failures.push(format!("{}: {e}", peer.symbol)),
+                        }
+                    }
+                    let peers = if inputs.len() == peers.inputs.len() + 1 && failures == peers.failures {
+                        peers
+                    } else {
+                        Arc::new(crate::chart_view::studio_canvas::PeerSources {
+                            inputs: inputs[1..].to_vec(),
+                            failures,
+                            requested: peers.requested.clone(),
+                        })
+                    };
+                    let mut events: Vec<_> = news
+                        .into_iter()
+                        .filter(|n| n.ts > 0)
+                        .take(canvas::MAX_EVENTS - 1)
+                        .map(|n| canvas::CanvasEvent {
+                            kind: canvas::EventKind::News,
+                            time: canvas::EventTime::Instant(n.ts),
+                            source: n.publisher,
+                            headline: n.title,
+                        })
+                        .collect();
+                    if let Some(e) = earnings {
+                        events.push(e);
+                    }
+                    let digest = canvas::input_key(&inputs, &spec, key.visible, key.selected, &events)?;
+                    let mut cache_key = ReportKey::new(
+                        "studio.canvas.v1",
+                        &inputs[0].symbol,
+                        inputs[0].tf,
+                        &inputs[0].source,
+                        &[],
+                        &format!("{:?}", peers.failures),
+                    );
+                    cache_key.inputs = digest;
+                    CACHE.get_or_compute(cache_key, || {
+                        let _job = crate::perf::JobTimer::new(&jobs, "StudioCanvas");
+                        let report = canvas::compute(&inputs, &spec, key.visible, key.selected, &events)?;
+                        Ok::<_, String>(crate::chart_view::studio_canvas::prepare(report, &inputs, peers))
+                    })
+                })
+                .await?
+                .map_err(anyhow::Error::msg)
+            }
+            .await
+            .map_err(|e| format!("{e:#}"));
+            send(Response::StudioCanvas { pane, token, key, result });
+        }
+        Request::StudioDist { pane, generation, symbol, timeframe, window } => {
+            let result = async {
+                if s.sample_mode() {
+                    anyhow::bail!(
+                        "Distribution Studio: sample / demo mode has no real data. Verified bars are required."
+                    );
+                }
+                let (bars, source, observed_at, gaps) = if timeframe == Timeframe::D1 {
+                    let (bars, source) =
+                        crate::app::studio_dist::daily_bars(&s.history, &config.bridge(), &symbol).await?;
+                    (bars, source, Some(chrono::Utc::now().timestamp()), Vec::new())
+                } else {
+                    let (bars, stitch) =
+                        analysis_bars(s, &symbol, timeframe, default_limit(timeframe), "Distribution Studio").await?;
+                    let stale = s.provider.health().is_some_and(|h| {
+                        matches!(
+                            h.snapshot()[Feed::Bars as usize].state,
+                            FeedState::Stale { .. } | FeedState::Unavailable(_)
+                        )
+                    });
+                    let observed_at = (!stale && stitch.live_ok).then_some(stitch.fetched_at).flatten();
+                    (bars, stitch.label(), observed_at, stitch.gaps)
+                };
+                crate::app::studio_dist::build_report(symbol, bars, timeframe, window, source, observed_at, gaps)
+                    .await
+                    .map_err(anyhow::Error::msg)
+            }
+            .await;
+            send(Response::StudioDist { pane, generation, result: result.map_err(|e| format!("{e:#}")) });
+        }
+        Request::TstackTune { pane, generation, symbol, tf, params } => {
+            let result = async {
+                if s.sample_mode() {
+                    anyhow::bail!("TSTACK Tune refused: sample / offline display mode");
+                }
+                let (bars, source, observed, stitch) = if tf.is_intraday() {
+                    let (bars, info) = analysis_bars(s, &symbol, tf, 5_000, "TSTACK Tune").await?;
+                    let observed = info.live_ok.then_some(info.fetched_at).flatten();
+                    (bars, info.label(), observed, Some(info))
+                } else {
+                    let (bars, source) =
+                        crate::app::studio_dist::daily_bars(&s.history, &config.bridge(), &symbol).await?;
+                    (tf.resample(&bars), source, Some(chrono::Utc::now().timestamp()), None)
+                };
+                let reports = s.reports.clone();
+                let jobs = s.jobs.clone();
+                tokio::task::spawn_blocking(move || {
+                    tune_cached(&jobs, &reports, &symbol, tf, params, &bars, &source, observed, stitch.as_ref())
+                })
+                .await?
+                .map_err(anyhow::Error::msg)
+            }
+            .await;
+            send(Response::TstackTune { pane, generation, result: result.map_err(|e| format!("{e:#}")) });
+        }
+        Request::StudioCorr { pane, generation, symbol, spec, fresh, horizon, relate } => {
+            let bridge = config.bridge();
+            let result = crate::app::studio_corr::research_horizon(
+                &crate::app::studio_corr::CORR_CACHE,
+                fresh,
+                horizon,
+                relate,
+                Some(s.jobs.clone()),
+                &s.history,
+                &bridge,
+                s.sample_mode(),
+                &symbol,
+                &spec,
+                |key, tf| async move { analysis_bars(s, &key, tf, default_limit(tf), "Relationship Studio").await },
+            )
+            .await
+            .map_err(|e| format!("{e:#}"));
+            send(Response::StudioCorr { pane, generation, result });
+        }
+        Request::StudioLab { pane, token, symbol, tf, spec, fresh } => {
+            let result = crate::app::studio_lab::research(
+                &crate::app::studio_corr::CORR_CACHE,
+                fresh,
+                Some(s.jobs.clone()),
+                &s.history,
+                &config.bridge(),
+                s.sample_mode(),
+                &symbol,
+                tf,
+                &spec,
+                |key, tf| async move { analysis_bars(s, &key, tf, default_limit(tf), "Regression Lab").await },
+            )
+            .await
+            .map_err(|e| format!("{e:#}"));
+            send(Response::StudioLab { pane, token, spec, result });
+        }
+        Request::SaveStudioFit { pane, token, name, monitor, source } => {
+            let result = if s.sample_mode() {
+                Err("Residual save refused: sample / offline display mode. Sample prices are never frozen.".to_string())
+            } else {
+                let (root, jobs) = (data_dir(), s.jobs.clone());
+                tokio::task::spawn_blocking(move || {
+                    let _job = crate::perf::JobTimer::new(&jobs, "StudioResidSave");
+                    crate::app::studio_residual::save_blocking(&root, source, name, monitor)
+                })
+                .await
+                .map_err(|e| format!("save task failed: {e}"))
+                .and_then(|r| r)
+            };
+            send(Response::StudioFitSaved { pane, token, result });
+        }
+        Request::ListStudioFits { pane, token } => {
+            let root = data_dir();
+            let result = tokio::task::spawn_blocking(move || crate::studio_models::list(&root))
+                .await
+                .map_err(|e| format!("list task failed: {e}"))
+                .and_then(|r| r);
+            send(Response::StudioFitList { pane, token, result });
+        }
+        Request::LoadStudioFit { pane, token, id } => {
+            let root = data_dir();
+            let key = id.clone();
+            let result = match tokio::task::spawn_blocking(move || crate::studio_models::load(&root, &key)).await {
+                Ok(r) => r.map(Arc::new),
+                Err(e) => Err(crate::studio_models::ModelUnavailable {
+                    kind: crate::studio_models::UnavailableKind::Corrupt,
+                    id: id.clone(),
+                    message: format!("load task failed: {e}"),
+                }),
+            };
+            send(Response::StudioFitLoaded { pane, token, id, result });
+        }
+        Request::ScoreStudioResidual { pane, token, model, fresh } => {
+            let model_digest = model.content_digest;
+            let result = crate::app::studio_residual::score_research(
+                &crate::app::studio_corr::CORR_CACHE,
+                fresh,
+                Some(s.jobs.clone()),
+                &s.history,
+                &config.bridge(),
+                s.sample_mode(),
+                &model,
+                |key, tf| async move { analysis_bars(s, &key, tf, default_limit(tf), "Residual ticker").await },
+            )
+            .await
+            .map_err(|e| format!("{e:#}"));
+            send(Response::StudioResidualScored { pane, token, model_digest, result });
+        }
+        Request::CheckStudioResidual { pane, token, model, report } => {
+            let (model_digest, score_key) = (model.content_digest, report.key);
+            let result = if s.sample_mode() {
+                Err("Residual checks refused: sample / offline display mode.".to_string())
+            } else {
+                let jobs = s.jobs.clone();
+                tokio::task::spawn_blocking(move || {
+                    let _job = crate::perf::JobTimer::new(&jobs, "StudioResidCheck");
+                    crate::app::studio_residual::check_blocking(&model, &report)
+                })
+                .await
+                .map_err(|e| format!("check task failed: {e}"))
+                .and_then(|r| r)
+            };
+            send(Response::StudioResidualChecked { pane, token, model_digest, score_key, result });
+        }
+        Request::StudioAttribution { pane, token, model, report, window } => {
+            let (model_digest, score_key) = (model.content_digest, report.key);
+            let result = if s.sample_mode() {
+                Err("Attribution refused: sample / offline display mode.".to_string())
+            } else {
+                let jobs = s.jobs.clone();
+                let w = window.clone();
+                tokio::task::spawn_blocking(move || {
+                    let _job = crate::perf::JobTimer::new(&jobs, "StudioAttribution");
+                    crate::app::studio_attribution::attribute_blocking(&model, &report, &w)
+                })
+                .await
+                .map_err(|e| format!("attribution task failed: {e}"))
+                .and_then(|r| r)
+            };
+            send(Response::StudioAttributed { pane, token, model_digest, score_key, window, result });
+        }
+        Request::StudioSeason { pane, generation, symbol, tf } => {
+            let result = async {
+                if s.sample_mode() { anyhow::bail!("SEASON: no real data in sample / offline display mode"); }
+                if !tr_data::cash_session::is_cash(&tr_data::security(&symbol)) {
+                    anyhow::bail!("SEASON currently requires a US cash-session equity, ETF or index");
+                }
+                let (bars, source, observed, gaps) = if tf == Timeframe::D1 {
+                    let ticker = tr_data::whats_news::archive_ticker(&symbol);
+                    let bars = s.history.db(move |db| db.daily(&ticker)).await?;
+                    let (bars, source) = if bars.is_empty() {
+                        if !config.enabled { anyhow::bail!("Seasonality refused: no daily history in the research archive; sample/display prices are never used"); }
+                        let snapshot = config.bridge().bars(&symbol).await?;
+                        snapshot.provenance.require_verified("Seasonality archive").map_err(anyhow::Error::msg)?;
+                        (snapshot.data, snapshot.source)
+                    } else { (bars, "Local Yahoo daily research archive".into()) };
+                    (bars, source, chrono::Utc::now().timestamp(), Vec::new())
+                } else {
+                    let (bars, info) = analysis_bars(s, &symbol, tf, tr_data::cash_session::research_fetch_limit(tf), "Seasonality").await?;
+                    // Normalise mixed verified cache/live tags only with the original vault witness.
+                    let bars = tr_data::vault::research_bars(&bars, Some(&info)).map_err(anyhow::Error::msg)?.into_owned();
+                    // A stale vault must not use wall time to close an observed pending bar.
+                    let observed = info.fetched_at.unwrap_or_else(|| bars.last().map(|b| b.ts).unwrap_or(0));
+                    (bars, info.source, observed, info.gaps)
+                };
+                let now = chrono::Utc::now().timestamp();
+                let jobs = s.jobs.clone();
+                let reports = s.reports.clone();
+                tokio::task::spawn_blocking(move || {
+                    cached_season_report(&reports, &jobs, &symbol, tf, &bars, &source, observed.min(now), now, &gaps)
+                }).await?.map_err(anyhow::Error::msg)
+            }.await.map_err(|e| format!("{e:#}"));
+            send(Response::StudioSeason { pane, generation, result });
+        }
+        Request::StudioShape { pane, generation, report, horizon, overlap, thresholds } => {
+            let reports = s.reports.clone();
+            let jobs = s.jobs.clone();
+            let result = if s.sample_mode() {
+                Err("DIST Shape: no real data in sample mode".into())
+            } else {
+                tokio::task::spawn_blocking(move || {
+                    report.provenance.require_verified("DIST Shape")?;
+                    let seed = tr_data::studio_shape::key_with_thresholds(&report, horizon, overlap, &thresholds);
+                    let mut cache_key = tr_data::report_cache::ReportKey::new(
+                        "dist.shape.v1",
+                        &report.symbol,
+                        report.timeframe,
+                        &report.source,
+                        &[],
+                        "FD KDE horizon closed returns",
+                    );
+                    cache_key.inputs = seed;
+                    reports.get_or_compute(cache_key, || {
+                        let _job = crate::perf::JobTimer::new(&jobs, "StudioShape");
+                        tr_data::studio_shape::compute_with_thresholds(&report, horizon, overlap, &thresholds)
+                    })
+                })
+                .await
+                .unwrap_or_else(|e| Err(format!("Shape task: {e}")))
+            };
+            send(Response::StudioShape { pane, generation, result });
+        }
+        Request::StudioShapeBootstrap { pane, generation, input } => {
+            let key = input.seed;
+            let reports = s.reports.clone();
+            let jobs = s.jobs.clone();
+            let result = if s.sample_mode() {
+                Err("DIST Shape bootstrap: no real data in sample mode".into())
+            } else {
+                tokio::task::spawn_blocking(move || {
+                    let mut cache_key = tr_data::report_cache::ReportKey::new(
+                        "dist.shape.bootstrap.v1",
+                        "",
+                        tr_core::Timeframe::D1,
+                        "",
+                        &[],
+                        "500 stationary draws 90% percentile",
+                    );
+                    cache_key.inputs = key;
+                    reports.get_or_compute(cache_key, || {
+                        let _job = crate::perf::JobTimer::new(&jobs, "StudioShapeBootstrap");
+                        Ok::<_, String>(input.bootstrap())
+                    })
+                })
+                .await
+                .unwrap_or_else(|e| Err(format!("Shape bootstrap task: {e}")))
+            };
+            send(Response::StudioShapeBootstrap { pane, generation, key, result });
+        }
+        Request::StudioDistRotation { pane, generation, symbol, timeframe, source, input } => {
+            let key = input.seed;
+            let reports = s.reports.clone();
+            let jobs = s.jobs.clone();
+            let result = if s.sample_mode() {
+                Err("DIST rotation: no real data in sample mode".into())
+            } else {
+                tokio::task::spawn_blocking(move || {
+                    let mut cache_key = tr_data::report_cache::ReportKey::new(
+                        "dist.regime.rotation.v1",
+                        &symbol,
+                        timeframe,
+                        &source,
+                        &[],
+                        "499 circular label rotations; min shift 40; BY m=3",
+                    );
+                    cache_key.inputs = key;
+                    reports.get_or_compute(cache_key, || {
+                        let _job = crate::perf::JobTimer::new(&jobs, "StudioDistRotation");
+                        Ok::<_, String>(input.compute())
+                    })
+                })
+                .await
+                .unwrap_or_else(|e| Err(format!("DIST rotation task: {e}")))
+            };
+            send(Response::StudioDistRotation { pane, generation, key, result });
+        }
+        Request::StudioSeasonBand {pane,generation,symbol,tf,source,input} => {
+            let key=input.seed;
+            let reports=s.reports.clone();let jobs=s.jobs.clone();
+            let result=if s.sample_mode() {Err("SEASON band: no real data in sample mode".into())} else {
+                tokio::task::spawn_blocking(move || {
+                    let mut cache_key=tr_data::report_cache::ReportKey::new("season.maxt.v2",&symbol,tf,&source,&[],"500 stationary draws; fixed HAC studentizers; simultaneous ALL clocks");
+                    cache_key.inputs=key;
+                    reports.get_or_compute(cache_key,|| {
+                        let _job=crate::perf::JobTimer::new(&jobs,"StudioSeasonBand");
+                        Ok::<_,String>(input.compute())
+                    })
+                }).await.unwrap_or_else(|e|Err(format!("SEASON band task: {e}")))
+            };
+            send(Response::StudioSeasonBand {pane,generation,key,result});
+        }
+        Request::Stats { pane, generation, symbol, condition, horizons } => {
+            let bridge = config.bridge();
+            send(Response::Stats {
+                pane,
+                generation,
+                result: research_stats(s, &bridge, &symbol, &condition, &horizons).await.map_err(|e| format!("{e:#}")),
+            });
+        }
+        Request::Backtest {
+            pane,
+            generation,
+            symbol,
+            spec,
+            holdout,
+            commission_bps,
+            slippage_bps,
+            allow_short,
+            honesty,
+        } => {
+            let bridge = config.bridge();
+            send(Response::Backtest {
+                pane,
+                generation,
+                result: research_backtest(
+                    s,
+                    &bridge,
+                    &symbol,
+                    &spec,
+                    &holdout,
+                    commission_bps,
+                    slippage_bps,
+                    allow_short,
+                    honesty,
+                )
+                .await
+                .map_err(|e| format!("{e:#}")),
+            });
+        }
+        Request::IntradayCompare { pane, generation, symbol, spec, timeframe } => {
+            send(Response::IntradayCompare {
+                pane,
+                generation,
+                result: research_intraday_compare(s, &symbol, &spec, &timeframe).await.map_err(|e| format!("{e:#}")),
+            });
+        }
+        Request::SessionPath { pane, generation, symbol, spec, timeframe } => {
+            send(Response::SessionPath {
+                pane,
+                generation,
+                result: research_session_path(s, &symbol, &spec, &timeframe).await.map_err(|e| format!("{e:#}")),
+            });
+        }
+        Request::VolumePace { pane, generation, symbol, spec, timeframe } => {
+            send(Response::VolumePace {
+                pane,
+                generation,
+                result: research_volume_pace(s, &symbol, &spec, &timeframe).await.map_err(|e| format!("{e:#}")),
+            });
+        }
+        Request::RealizedVol { pane, generation, symbol, spec, timeframe } => {
+            send(Response::RealizedVol {
+                pane,
+                generation,
+                result: research_realized_vol(s, &symbol, &spec, &timeframe).await.map_err(|e| format!("{e:#}")),
+            });
+        }
+        Request::Autocorr { pane, generation, symbol, spec, timeframe } => {
+            send(Response::Autocorr {
+                pane,
+                generation,
+                result: research_autocorr(s, &symbol, &spec, &timeframe).await.map_err(|e| format!("{e:#}")),
+            });
+        }
+        Request::GapFill { pane, generation, symbol, spec, timeframe } => {
+            send(Response::GapFill {
+                pane,
+                generation,
+                result: research_gap_fill(s, &symbol, &spec, &timeframe).await.map_err(|e| format!("{e:#}")),
+            });
+        }
+        Request::SessionExtreme { pane, generation, symbol, spec, timeframe } => {
+            send(Response::SessionExtreme {
+                pane,
+                generation,
+                result: research_session_extreme(s, &symbol, &spec, &timeframe).await.map_err(|e| format!("{e:#}")),
+            });
+        }
+        Request::SessionClock { pane, generation, symbol, spec, timeframe } => {
+            send(Response::SessionClock {
+                pane,
+                generation,
+                result: research_session_clock(s, &symbol, &spec, &timeframe).await.map_err(|e| format!("{e:#}")),
+            });
+        }
+        Request::RelativePath { pane, generation, symbol, spec, timeframe } => {
+            send(Response::RelativePath {
+                pane,
+                generation,
+                result: research_relative_path(s, &symbol, &spec, &timeframe).await.map_err(|e| format!("{e:#}")),
+            });
+        }
+        Request::SessionBrief { pane, generation, symbol } => {
+            send(Response::SessionBrief {
+                pane,
+                generation,
+                result: research_session_brief(s, &symbol).await.map_err(|e| format!("{e:#}")),
+            });
+        }
+        Request::CashLevels { pane, symbol } => {
+            send(Response::CashLevels {
+                pane,
+                result: research_cash_levels(s, &symbol).await.map_err(|e| format!("{e:#}")),
+            });
+        }
+        Request::Rotation { pane, generation, query } => {
+            let result = research_rotation(s, &query).await.map_err(|e| format!("{e:#}"));
+            send(Response::Rotation { pane, generation, result });
+        }
+        Request::Breadth { pane, generation, spec, timeframe, symbols } => {
+            send(Response::Breadth {
+                pane,
+                generation,
+                result: research_breadth(s, &spec, &timeframe, &symbols).await.map_err(|e| format!("{e:#}")),
+            });
+        }
+        Request::IntradayBacktest {
+            pane,
+            generation,
+            symbol,
+            spec,
+            timeframe,
+            holdout,
+            commission_bps,
+            slippage_bps,
+            allow_short,
+            honesty,
+        } => {
+            send(Response::IntradayBacktest {
+                pane,
+                generation,
+                result: research_intraday_backtest(
+                    s,
+                    &symbol,
+                    &spec,
+                    &timeframe,
+                    &holdout,
+                    commission_bps,
+                    slippage_bps,
+                    allow_short,
+                    honesty,
+                )
+                .await
+                .map_err(|e| format!("{e:#}")),
+            });
+        }
+        Request::Lookalike { pane, generation, symbol, query } => {
+            let bridge = config.bridge();
+            send(Response::Lookalike {
+                pane,
+                generation,
+                result: research_lookalike(s, &bridge, &symbol, &query).await.map_err(|e| format!("{e:#}")),
+            });
+        }
+        Request::ArchiveHistory { pane, generation, symbol, tf, limit, before } => {
+            let bridge = config.bridge();
+            if current_series(s, pane, generation).is_none() {
+                return;
+            }
+            let page = limit.max(1);
+            let daily_page = archive_daily_needed(tf, page);
+            let have = current_daily(s, pane, generation).map(|d| d.len()).unwrap_or(0);
+            let fetch = if before.is_some() { have.saturating_add(daily_page).max(daily_page) } else { daily_page };
+            let ticker = tr_data::yahoo::yahoo_symbol(&tr_data::security(&symbol));
+            let remote = ticker.clone();
+            let before_local = before;
+            let local = s.history.db(move |db| db.daily_window(&ticker, before_local, daily_page)).await;
+            let result = match local {
+                Ok(data) if !data.is_empty() => Ok(tr_data::whats_news::Snapshot {
+                    failures: vec![],
+                    data,
+                    provenance: tr_core::Provenance::Cached,
+                    source: "Local Yahoo archive".into(),
+                }),
+                Ok(_) => bridge.bars_window(&remote, before, fetch).await,
+                Err(e) => Err(e),
+            };
+            match result {
+                Ok(snapshot) => {
+                    if let Err(error) = Bar::require_verified(&snapshot.data, "Archive chart") {
+                        send(Response::HistoryError { pane, generation, error });
+                        return;
+                    }
+                    let older = match before {
+                        Some(ts) => snapshot.data.into_iter().filter(|b| b.ts < ts).collect::<Vec<_>>(),
+                        None => snapshot.data,
+                    };
+                    let fetched = older.len();
+                    let daily = if let Some(ts) = before {
+                        let mut merged = older;
+                        if let Some(have) = current_daily(s, pane, generation) {
+                            merged.extend(have.iter().copied().filter(|b| b.ts >= ts));
+                        }
+                        merged.sort_by_key(|b| b.ts);
+                        merged.dedup_by_key(|b| b.ts);
+                        merged
+                    } else {
+                        older
+                    };
+                    let daily = Arc::new(daily);
+                    store_daily(s, pane, generation, daily.clone());
+                    let old_len = current_series(s, pane, generation).map(|b| b.len()).unwrap_or(0);
+                    let bars = Arc::new(tf.resample(&daily));
+                    let prepended = if before.is_some() { bars.len().saturating_sub(old_len) } else { 0 };
+                    if !store_series(s, pane, generation, bars.clone()) {
+                        return;
+                    }
+                    let gpu = build_gpu(s.jobs.clone(), bars.clone()).await;
+                    send(Response::History {
+                        pane,
+                        generation,
+                        symbol: tr_data::security(&symbol).key(),
+                        tf,
+                        bars,
+                        gpu,
+                        prepended,
+                        from_cache: false,
+                        exhausted: fetched < daily_page,
+                        live: false,
+                    });
+                }
+                Err(e) => send(Response::HistoryError { pane, generation, error: format!("{e:#}") }),
+            }
+        }
         Request::History { pane, generation, symbol, tf, limit } => {
-            if !claim_series(s, pane, generation) {
+            if current_series(s, pane, generation).is_none() {
                 return; // a newer load for this pane is already running
             }
-            // Paint from the disk cache immediately, then refresh from the network.
-            let cached = s.cache.lock().ok().and_then(|c| c.as_ref().and_then(|c| c.load(&symbol, tf, limit).ok()));
-            if let Some(bars) = cached.filter(|b| !b.is_empty()) {
+            // A fresh intraday series is painted from disk and not fetched again.
+            // Daily and higher always refresh: the cold-start path depends on that.
+            let disk = display_cached(s, &symbol, tf, limit).await;
+            let fresh = if force {
+                None
+            } else {
+                disk.as_ref().and_then(|(bars, at)| {
+                    (tr_data::intraday::fetched_recently(
+                        *at,
+                        chrono::Utc::now().timestamp(),
+                        tr_data::intraday::refresh_ttl_secs(tf),
+                    ) && !bars.is_empty()
+                        && Bar::provenance(bars).is_verified())
+                    .then(|| bars.clone())
+                })
+            };
+            if let Some(bars) = fresh {
                 let bars = Arc::new(bars);
-                let gpu = build_gpu(bars.clone()).await;
+                if !store_series(s, pane, generation, bars.clone()) {
+                    return;
+                }
+                if !store_series(s, pane, generation, bars.clone()) {
+                    return;
+                }
+                let gpu = build_gpu(s.jobs.clone(), bars.clone()).await;
+                s.send(Response::History {
+                    pane,
+                    generation,
+                    symbol: symbol.clone(),
+                    tf,
+                    bars,
+                    gpu,
+                    prepended: 0,
+                    from_cache: true,
+                    exhausted: false,
+                    live: false,
+                });
+                let last_ok = disk.as_ref().and_then(|(_, at)| *at).unwrap_or(chrono::Utc::now().timestamp());
+                s.feed(Feed::Bars, Some(pane), Some(symbol.clone()), Some(generation), FeedState::Live { last_ok });
+                follow_quotes(s.clone(), pane, generation, symbol, tf, false);
+                return;
+            }
+            // Paint from the disk cache immediately, then refresh from the network.
+            let cached = disk.map(|(bars, _)| bars);
+            if let Some(bars) =
+                cached.filter(|b| !s.sample_mode() && !b.is_empty() && b.iter().all(|b| b.provenance.is_verified()))
+            {
+                let bars = Arc::new(bars);
+                if !store_series(s, pane, generation, bars.clone()) {
+                    return;
+                }
+                let gpu = build_gpu(s.jobs.clone(), bars.clone()).await;
                 s.send(Response::History {
                     pane,
                     generation,
@@ -503,19 +5420,43 @@ async fn handle(s: &Arc<Shared>, req: Request) {
                     live: false,
                 });
             }
-            match s.provider.history(&symbol, tf, None, limit).await {
+            let fetched = native_fetch(s, &symbol, tf, None, limit).await;
+            let fetched = match fetched {
+                Ok((bars, source, observation)) => {
+                    let (bars, info) = stitch_native(s, &symbol, tf, bars, source, limit, observation).await;
+                    record_chart_source(s, pane, generation, &info.source);
+                    s.send(Response::VaultStitch { pane, generation, info: Arc::new(info) });
+                    Ok(bars)
+                }
+                Err(e) => Err(e),
+            };
+            match fetched {
+                Ok(bars) if !s.sample_mode() && bars.iter().any(|b| !b.provenance.is_verified()) => {
+                    s.bars_failed(
+                        pane,
+                        generation,
+                        &symbol,
+                        tf,
+                        Unavailable {
+                            feed: Feed::Bars,
+                            kind: DownKind::Rejected,
+                            reason: "Rejected SAMPLE or UNVERIFIED bars in live mode".into(),
+                            since: chrono::Utc::now().timestamp(),
+                            retry_at: Some(chrono::Utc::now().timestamp() + 15),
+                        }
+                        .into(),
+                    )
+                    .await;
+                    retry_intraday(s.clone(), pane, generation, symbol, tf, false);
+                }
                 Ok(bars) if !bars.is_empty() => {
-                    if let Ok(mut c) = s.cache.lock()
-                        && let Some(c) = c.as_mut()
-                    {
-                        let _ = c.store(&symbol, tf, &bars);
-                    }
+                    store_verified_history(s, &symbol, tf, &bars).await;
                     let exhausted = bars.len() < limit / 2;
                     let bars = Arc::new(bars);
                     if !store_series(s, pane, generation, bars.clone()) {
                         return; // superseded while loading
                     }
-                    let gpu = build_gpu(bars.clone()).await;
+                    let gpu = build_gpu(s.jobs.clone(), bars.clone()).await;
                     s.send(Response::History {
                         pane,
                         generation,
@@ -528,18 +5469,88 @@ async fn handle(s: &Arc<Shared>, req: Request) {
                         exhausted,
                         live: false,
                     });
-                    start_live(s.clone(), pane, generation, symbol, tf);
+                    follow_quotes(s.clone(), pane, generation, symbol, tf, false);
                 }
-                Ok(_) => s.send(Response::HistoryError { pane, generation, error: format!("no data for {symbol}") }),
-                Err(e) => s.send(Response::HistoryError { pane, generation, error: format!("{e:#}") }),
+                Ok(_) => {
+                    s.bars_failed(
+                        pane,
+                        generation,
+                        &symbol,
+                        tf,
+                        Unavailable {
+                            feed: Feed::Bars,
+                            kind: DownKind::Empty,
+                            reason: format!("No real bars for {symbol}"),
+                            since: chrono::Utc::now().timestamp(),
+                            retry_at: Some(chrono::Utc::now().timestamp() + 15),
+                        }
+                        .into(),
+                    )
+                    .await;
+                    s.send(Response::HistoryError { pane, generation, error: format!("no data for {symbol}") });
+                    retry_intraday(s.clone(), pane, generation, symbol, tf, false);
+                }
+                Err(e) => {
+                    let message = format!("{e:#}");
+                    s.bars_failed(pane, generation, &symbol, tf, e).await;
+                    s.send(Response::HistoryError { pane, generation, error: message });
+                    retry_intraday(s.clone(), pane, generation, symbol, tf, false);
+                }
             }
         }
-        Request::MoreHistory { pane, generation, symbol, tf, existing, limit } => {
+        Request::ExtendedHistory { pane, generation, symbol, tf, limit } => {
+            load_extended(s, pane, generation, symbol, tf, limit).await;
+        }
+        Request::MoreHistory { pane, generation, symbol, tf, existing, limit, extended } => {
             // Page from the worker's copy (it may hold newer live bars than the UI's).
             let base = current_series(s, pane, generation).filter(|b| !b.is_empty()).unwrap_or(existing);
             let Some(first) = base.first().copied() else { return };
-            match s.provider.history(&symbol, tf, Some(first.ts), limit).await {
+            let older = if extended {
+                s.provider.extended_history(&symbol, tf, Some(first.ts), limit).await
+            } else {
+                match native_fetch(s, &symbol, tf, Some(first.ts), limit).await {
+                    Ok((bars, source, observation)) => {
+                        let changed = s
+                            .chart_sources
+                            .lock()
+                            .expect("chart sources")
+                            .get(&pane)
+                            .is_some_and(|(g, old)| *g == generation && old != &source);
+                        if changed {
+                            s.send(Response::HistoryError {
+                                pane,
+                                generation,
+                                error: "History source changed; refresh chart before paging".into(),
+                            });
+                            return;
+                        }
+                        if !s.sample_mode()
+                            && let Err(error) = Bar::require_verified(&bars, "History paging")
+                        {
+                            s.send(Response::HistoryError { pane, generation, error });
+                            return;
+                        }
+                        let (bars, info) = stitch_native(s, &symbol, tf, bars, source, limit, observation).await;
+                        // A session gap is shown with its marker (never filled); only a
+                        // disputed or re-scaled series refuses to page.
+                        if info.note.as_ref().is_some_and(|s| s.contains("QUARANTINED") || s.contains("REBASED")) {
+                            s.send(Response::HistoryError { pane, generation, error: info.note.unwrap() });
+                            return;
+                        }
+                        Ok(bars)
+                    }
+                    Err(e) => Err(e),
+                }
+            };
+            match older {
                 Ok(older) => {
+                    if extended
+                        && !older.is_empty()
+                        && let Err(error) = tr_core::Bar::require_verified(&older, "extended hours")
+                    {
+                        s.send(Response::HistoryError { pane, generation, error });
+                        return;
+                    }
                     let older: Vec<Bar> = older.into_iter().filter(|b| b.ts < first.ts).collect();
                     let prepended = older.len();
                     let bars = {
@@ -551,7 +5562,7 @@ async fn handle(s: &Arc<Shared>, req: Request) {
                         *cur = Arc::new(merged);
                         cur.clone()
                     };
-                    let gpu = build_gpu(bars.clone()).await;
+                    let gpu = build_gpu(s.jobs.clone(), bars.clone()).await;
                     s.send(Response::History {
                         pane,
                         generation,
@@ -568,15 +5579,29 @@ async fn handle(s: &Arc<Shared>, req: Request) {
                 Err(e) => s.send(Response::HistoryError { pane, generation, error: format!("{e:#}") }),
             }
         }
-        Request::Indicators { pane, generation, bars, tf, specs, palette } => {
-            let built = tokio::task::spawn_blocking(move || build_indicators(&bars, tf, &specs, &palette))
-                .await
-                .unwrap_or_default();
+        Request::Indicators { pane, generation, bars, tf, specs, palette, class, observed, stitch } => {
+            let jobs = s.jobs.clone();
+            let built = tokio::task::spawn_blocking(move || {
+                jobs.time("Indicators", || {
+                    build_chart_indicators(&bars, tf, &specs, &palette, class, observed, stitch.as_deref())
+                })
+            })
+            .await
+            .unwrap_or_default();
             s.send(Response::Indicators { pane, generation, built });
         }
         Request::Compare { pane, generation, symbol, tf, base } => {
+            if let Err(error) = Bar::require_verified(&base, "Comparison") {
+                s.send(Response::Status(error));
+                return;
+            }
             let limit = base.len().max(100);
-            match s.provider.history(&symbol, tf, None, limit).await {
+            let fetched = if tf.is_intraday() {
+                analysis_bars(s, &symbol, tf, limit, "Comparison").await.map(|(bars, _)| bars)
+            } else {
+                s.provider.history_for_analysis(&symbol, tf, None, limit, "Comparison").await
+            };
+            match fetched {
                 Ok(other) => {
                     let line = tokio::task::spawn_blocking(move || line_ref(&align_compare(&base, &other))).await;
                     if let Ok(line) = line {
@@ -595,10 +5620,26 @@ async fn handle(s: &Arc<Shared>, req: Request) {
             };
             s.send(Response::Markers { pane, symbol, trades });
         }
-        Request::Quotes(symbols) => match s.provider.quotes(&symbols).await {
-            Ok(q) => s.send(Response::Quotes(q)),
-            Err(e) => s.send(Response::Status(format!("quotes: {e:#}"))),
-        },
+        Request::Quotes(symbols) => {
+            let result = s.provider.quotes(&symbols).await;
+            for symbol in &symbols {
+                let state = if result.as_ref().is_ok_and(|q| !q.iter().any(|q| &q.symbol == symbol)) {
+                    FeedState::Unavailable(Unavailable {
+                        feed: Feed::Quotes,
+                        kind: DownKind::Empty,
+                        reason: format!("No real quote for {symbol}"),
+                        since: chrono::Utc::now().timestamp(),
+                        retry_at: Some(chrono::Utc::now().timestamp() + 15),
+                    })
+                } else {
+                    s.result_state(Feed::Quotes, &result)
+                };
+                s.feed(Feed::Quotes, None, Some(symbol.clone()), None, state);
+            }
+            if let Ok(quotes) = result {
+                s.send(Response::Quotes(quotes));
+            }
+        }
         Request::Latest { limit } => {
             let t = s.db.lock().await.latest_trades(limit).unwrap_or_default();
             s.send(Response::Latest(t));
@@ -639,15 +5680,134 @@ async fn handle(s: &Arc<Shared>, req: Request) {
             let _ = db.mark_alerts_seen();
             s.send(Response::Alerts(db.alerts(false, 200).unwrap_or_default()));
         }
+        Request::TradePlans => {
+            s.send(Response::TradePlanFeed(s.trade_plan_snapshot(chrono::Utc::now().timestamp())));
+        }
+        Request::ArmTradePlan(draft) => {
+            let result = s.trade_plans.lock().expect("trade plans").arm(draft, chrono::Utc::now().timestamp());
+            match result {
+                Ok(_) => {
+                    s.persist_trade_plans();
+                    evaluate_trade_plans(s).await;
+                }
+                Err(error) => s.send(Response::Status(error)),
+            }
+        }
+        Request::UpdateTradePlan { query, change } => {
+            // A sample provider cannot authorize a manual move using a previously saved quote.
+            let manual = matches!(change, tr_data::trade_plans::PlanChange::MoveStop(_));
+            let result = if s.sample_mode() && manual {
+                Err("moving a stop needs a fresh verified observed quote; sample provider cannot move stops".into())
+            } else {
+                s.trade_plans.lock().expect("trade plans").update(&query, change, chrono::Utc::now().timestamp())
+            };
+            match result {
+                Ok(plan) => {
+                    s.persist_trade_plans();
+                    if manual {
+                        s.send(Response::Status(format!(
+                            "{} {} {:.2} — observed quote, no order was changed",
+                            tr_data::security(&plan.symbol).ticker,
+                            tr_data::trade_plans::stop_label(&plan),
+                            plan.stop
+                        )));
+                    }
+                    evaluate_trade_plans(s).await;
+                }
+                Err(error) => s.send(Response::Status(error)),
+            }
+        }
+        Request::CancelTradePlan { id } => {
+            s.trade_plans.lock().expect("trade plans").cancel(&id);
+            s.persist_trade_plans();
+            s.send(Response::TradePlanFeed(s.trade_plan_snapshot(chrono::Utc::now().timestamp())));
+        }
+        Request::RemoveTradePlan { query } => {
+            s.trade_plans.lock().expect("trade plans").remove(&query);
+            s.persist_trade_plans();
+            s.send(Response::TradePlanFeed(s.trade_plan_snapshot(chrono::Utc::now().timestamp())));
+        }
+        Request::CancelTradePlansFor { query } => {
+            s.trade_plans.lock().expect("trade plans").cancel_symbol(&query);
+            s.persist_trade_plans();
+            s.send(Response::TradePlanFeed(s.trade_plan_snapshot(chrono::Utc::now().timestamp())));
+        }
+        Request::MarkTradePlansSeen => {
+            s.trade_plans.lock().expect("trade plans").mark_seen();
+            s.persist_trade_plans();
+            s.send(Response::TradePlanFeed(s.trade_plan_snapshot(chrono::Utc::now().timestamp())));
+        }
+        Request::PriceAlerts => {
+            s.send(Response::PriceAlertFeed(s.price_alert_snapshot(chrono::Utc::now().timestamp())));
+        }
+        Request::AddPriceAlert { symbol, kind } => {
+            let now = chrono::Utc::now().timestamp();
+            let result = s.price_alerts.lock().expect("price alerts").add_rule(&symbol, kind, now);
+            s.persist_price_alerts();
+            match result {
+                Ok(rule) => {
+                    s.send(Response::Status(format!(
+                        "Watching {} {}",
+                        tr_data::security(&rule.symbol).ticker,
+                        rule.kind.label()
+                    )));
+                    evaluate_price_alerts(s).await;
+                }
+                Err(e) => {
+                    s.send(Response::Status(format!("Alert not added: {e}")));
+                    s.send(Response::PriceAlertFeed(s.price_alert_snapshot(now)));
+                }
+            }
+        }
+        Request::RemovePriceAlert { query } => {
+            let n = s.price_alerts.lock().expect("price alerts").remove(&query);
+            s.persist_price_alerts();
+            s.send(Response::Status(if n == 0 {
+                format!("No price/setup alert matches {query}")
+            } else {
+                format!("Removed {n} price/setup alert{}", if n == 1 { "" } else { "s" })
+            }));
+            s.send(Response::PriceAlertFeed(s.price_alert_snapshot(chrono::Utc::now().timestamp())));
+        }
+        Request::SetPriceAlertEnabled { id, enabled } => {
+            let ok = s.price_alerts.lock().expect("price alerts").set_enabled(&id, enabled);
+            s.persist_price_alerts();
+            if ok {
+                evaluate_price_alerts(s).await;
+            } else {
+                s.send(Response::PriceAlertFeed(s.price_alert_snapshot(chrono::Utc::now().timestamp())));
+            }
+        }
+        Request::MarkPriceAlertsSeen => {
+            s.price_alerts.lock().expect("price alerts").mark_seen();
+            s.persist_price_alerts();
+            s.send(Response::PriceAlertFeed(s.price_alert_snapshot(chrono::Utc::now().timestamp())));
+        }
+        Request::EvaluatePriceAlerts => {
+            evaluate_price_alerts(s).await;
+            evaluate_trade_plans(s).await;
+        }
+        Request::IntradayScan { group, symbols, generation } => {
+            let board = intraday_scan(s, &symbols).await;
+            s.send(Response::IntradayScan { group, board, generation });
+        }
         Request::RefreshCongress => congress_refresh(s).await,
         Request::Forget(pane) => {
+            s.feed_requests.lock().expect("feed requests").retain(|(_, id), _| *id != Some(pane));
+            s.wall_generations.lock().expect("wall generations").remove(&pane);
+            s.wall_edge_generations.lock().unwrap().remove(&pane);
             s.series.lock().expect("series lock").remove(&pane);
+            s.archive_daily.lock().expect("archive daily lock").remove(&pane);
+            s.chart_sources.lock().expect("chart sources").remove(&pane);
         }
-        Request::YieldCurves => match s.provider.yield_curves().await {
-            Ok(c) => s.send(Response::Curves(Box::new(c))),
-            Err(e) => s.send(Response::Status(format!("yield curve: {e:#}"))),
-        },
-        Request::Portfolio(creds) => {
+        Request::YieldCurves => {
+            let result = s.provider.yield_curves().await;
+            s.feed(Feed::Curve, None, None, None, s.result_state(Feed::Curve, &result));
+            if let Ok(curves) = result {
+                s.send(Response::Curves(Box::new(curves)));
+            }
+        }
+        Request::Portfolio(generation, request_id, creds) => {
             let result = match creds {
                 None => Ok(tr_broker::sample::portfolio()),
                 Some(c) => match tr_broker::SnapTrade::new(c) {
@@ -655,7 +5815,7 @@ async fn handle(s: &Arc<Shared>, req: Request) {
                     Err(e) => Err(e),
                 },
             };
-            s.send(Response::Portfolio(result.map(Box::new).map_err(|e| format!("{e:#}"))));
+            s.send(Response::Portfolio(generation, request_id, result.map(Box::new).map_err(|e| format!("{e:#}"))));
         }
         Request::BrokerRegister { creds, user_id } => {
             let result = match tr_broker::SnapTrade::new(creds) {
@@ -679,15 +5839,19 @@ async fn handle(s: &Arc<Shared>, req: Request) {
             s.send(Response::BrokerDisconnected(result.map(|()| id).map_err(|e| format!("{e:#}"))));
         }
         Request::Options { pane, symbol, expiration } => {
-            let chain = s.provider.options(&symbol, expiration).await.map(Box::new).map_err(|e| format!("{e:#}"));
+            let result = s.provider.options(&symbol, expiration).await;
+            s.feed(Feed::Options, Some(pane), Some(symbol.clone()), None, s.result_state(Feed::Options, &result));
+            let chain = result.map(Box::new).map_err(|e| format!("{e:#}"));
             s.send(Response::Options { pane, symbol, chain });
         }
-        Request::News { pane, symbol } => {
-            let items = s.provider.news(symbol.as_deref()).await.map_err(|e| format!("{e:#}"));
-            s.send(Response::News { pane, symbol, items });
+        Request::News { pane, symbols } => {
+            let batch = fetch_news(s, symbols.clone()).await;
+            s.send(Response::News { pane, symbols, batch });
         }
         Request::OrderBook { pane, symbol, depth } => {
-            let book = s.provider.order_book(&symbol, depth).await.map_err(|e| format!("{e:#}"));
+            let result = s.provider.order_book(&symbol, depth).await;
+            s.feed(Feed::Book, Some(pane), Some(symbol.clone()), None, s.result_state(Feed::Book, &result));
+            let book = result.map_err(|e| format!("{e:#}"));
             s.send(Response::OrderBook { pane, symbol, book });
         }
         Request::Search(query) => {
@@ -737,6 +5901,56 @@ async fn trade(t: TradeRequest) -> TradeResponse {
     }
 }
 
+/// Run lifecycle changes synchronously in dispatcher order. A closed pane cannot
+/// be resurrected by an older history task that happens to start or finish later.
+fn begin_request(s: &Shared, req: &Request) -> bool {
+    let accepted = match req {
+        Request::ConfigureWhatsNews { epoch, config } => {
+            s.whats_news.send_replace((*epoch, config.clone()));
+            false
+        }
+        Request::History { pane, generation, .. }
+        | Request::ExtendedHistory { pane, generation, .. }
+        | Request::ArchiveHistory { pane, generation, .. } => claim_series(s, *pane, *generation),
+        Request::TrendWall { pane, generation, .. } => claim_wall(s, *pane, *generation),
+        Request::WallEdge { pane, generation, .. } => claim_wall_edge(s, *pane, *generation),
+        Request::WallEdgeFocus { pane, generation, priority } => {
+            if wall_edge_current(s, *pane, *generation) {
+                s.wall_edge_focus.lock().unwrap().insert(*pane, (*generation, priority.clone()));
+            }
+            false
+        }
+        Request::CancelWallEdge { pane, generation } => {
+            claim_wall_edge(s, *pane, *generation);
+            s.wall_edge_focus.lock().unwrap().remove(pane);
+            false
+        }
+        Request::Forget(pane) => {
+            s.feed_requests.lock().expect("feed requests").retain(|(_, id), _| *id != Some(*pane));
+            s.wall_generations.lock().expect("wall generations").remove(pane);
+            s.wall_edge_generations.lock().unwrap().remove(pane);
+            s.wall_edge_focus.lock().unwrap().remove(pane);
+            s.series.lock().expect("series lock").remove(pane);
+            s.archive_daily.lock().expect("archive daily lock").remove(pane);
+            s.chart_sources.lock().expect("chart sources").remove(pane);
+            false
+        }
+        _ => true,
+    };
+    if accepted && let Some((feed, pane, mut request)) = FeedRequest::capture(req) {
+        let mut requests = s.feed_requests.lock().expect("feed requests");
+        if let FeedRequest::Quotes(symbols) = &mut request
+            && let Some(FeedRequest::Quotes(previous)) = requests.get(&(feed, pane))
+        {
+            symbols.extend(previous.iter().cloned());
+            symbols.sort();
+            symbols.dedup();
+        }
+        requests.insert((feed, pane), request);
+    }
+    accepted
+}
+
 /// Register a load for `generation`; generations only move forward, since request
 /// tasks run concurrently and may start out of order.
 fn claim_series(s: &Shared, pane: PaneId, generation: u64) -> bool {
@@ -754,23 +5968,253 @@ fn claim_series(s: &Shared, pane: PaneId, generation: u64) -> bool {
 /// Store freshly loaded bars for a pane if `generation` is still the newest.
 fn store_series(s: &Shared, pane: PaneId, generation: u64, bars: Arc<Vec<Bar>>) -> bool {
     let mut map = s.series.lock().expect("series lock");
-    match map.get(&pane) {
-        Some((g, _)) if *g > generation => false,
-        _ => {
-            map.insert(pane, (generation, bars));
-            true
-        }
+    if let Some((g, current)) = map.get_mut(&pane)
+        && *g == generation
+    {
+        *current = bars;
+        return true;
     }
+    false
+}
+
+fn record_chart_source(s: &Shared, pane: PaneId, generation: u64, source: &str) -> Option<(u64, String)> {
+    let series = s.series.lock().expect("series lock");
+    if !series.get(&pane).is_some_and(|(g, _)| *g == generation) {
+        return None;
+    }
+    s.chart_sources.lock().expect("chart sources").insert(pane, (generation, source.to_owned()))
 }
 
 fn current_series(s: &Shared, pane: PaneId, generation: u64) -> Option<Arc<Vec<Bar>>> {
     s.series.lock().expect("series lock").get(&pane).filter(|(g, _)| *g == generation).map(|(_, b)| b.clone())
 }
 
+fn store_daily(s: &Shared, pane: PaneId, generation: u64, bars: Arc<Vec<Bar>>) {
+    let mut map = s.archive_daily.lock().expect("archive daily lock");
+    if map.get(&pane).is_none_or(|(g, _)| *g <= generation) {
+        map.insert(pane, (generation, bars));
+    }
+}
+
+fn current_daily(s: &Shared, pane: PaneId, generation: u64) -> Option<Arc<Vec<Bar>>> {
+    s.archive_daily
+        .lock()
+        .expect("archive daily lock")
+        .get(&pane)
+        .filter(|(g, _)| *g == generation)
+        .map(|(_, b)| b.clone())
+}
+
+/// Keep an intraday chart moving. A real stream wins; otherwise wait out the cache TTL
+/// and pull again. The wait happens before any provider call, so a test that handles
+/// one history request does not see a second fetch before it returns.
+fn follow_quotes(s: Arc<Shared>, pane: PaneId, generation: u64, symbol: String, tf: Timeframe, extended: bool) {
+    if tf.is_intraday() && !s.provider.has_live_feed(&symbol, tf) {
+        schedule_intraday_refresh(s, pane, generation, symbol, tf, extended);
+    } else if !extended {
+        start_live(s, pane, generation, symbol, tf);
+    }
+}
+
+fn retry_intraday(s: Arc<Shared>, pane: PaneId, generation: u64, symbol: String, tf: Timeframe, extended: bool) {
+    poll_intraday(s, pane, generation, symbol, tf, extended, true);
+}
+fn schedule_intraday_refresh(
+    s: Arc<Shared>,
+    pane: PaneId,
+    generation: u64,
+    symbol: String,
+    tf: Timeframe,
+    extended: bool,
+) {
+    poll_intraday(s, pane, generation, symbol, tf, extended, false);
+}
+fn poll_intraday(
+    s: Arc<Shared>,
+    pane: PaneId,
+    generation: u64,
+    symbol: String,
+    tf: Timeframe,
+    extended: bool,
+    mut failed: bool,
+) {
+    let Some(ttl) = tr_data::intraday::refresh_ttl_secs(tf).filter(|ttl| *ttl > 0) else { return };
+    if !s.followers.lock().expect("followers").insert((pane, generation, false)) {
+        return;
+    }
+    tokio::spawn(async move {
+        loop {
+            let down = s.provider.health().is_some_and(|h| h.snapshot()[Feed::Bars as usize].state.is_down());
+            tokio::time::sleep(Duration::from_secs(if failed || down { 15 } else { ttl as u64 })).await;
+            if current_series(&s, pane, generation).is_none() {
+                break;
+            }
+            let before = s.provider.health().map(|h| h.snapshot()[Feed::Bars as usize].failed);
+            refresh_intraday(&s, pane, generation, &symbol, tf, extended).await;
+            failed = s.provider.health().is_some_and(|h| Some(h.snapshot()[Feed::Bars as usize].failed) != before)
+                || current_series(&s, pane, generation).is_some_and(|b| b.is_empty());
+            if !failed && !extended && s.provider.has_live_feed(&symbol, tf) {
+                start_live(s.clone(), pane, generation, symbol.clone(), tf);
+                break;
+            }
+        }
+        s.followers.lock().expect("followers").remove(&(pane, generation, false));
+    });
+}
+
+/// Extended-hours read. Sample and unverified bars are refused, and the regular cache is left alone.
+async fn load_extended(s: &Arc<Shared>, pane: PaneId, generation: u64, symbol: String, tf: Timeframe, limit: usize) {
+    if current_series(s, pane, generation).is_none() {
+        return;
+    }
+    match s.provider.extended_history(&symbol, tf, None, limit).await {
+        Ok(bars) if bars.is_empty() => {
+            s.send(Response::HistoryError { pane, generation, error: format!("no extended-hours bars for {symbol}") });
+        }
+        Ok(bars) => match tr_core::Bar::require_verified(&bars, "extended hours") {
+            Ok(()) => {
+                let bars = Arc::new(bars);
+                if !store_series(s, pane, generation, bars.clone()) {
+                    return;
+                }
+                let gpu = build_gpu(s.jobs.clone(), bars.clone()).await;
+                s.send(Response::History {
+                    pane,
+                    generation,
+                    symbol: symbol.clone(),
+                    tf,
+                    bars,
+                    gpu,
+                    prepended: 0,
+                    from_cache: false,
+                    exhausted: false,
+                    live: false,
+                });
+                follow_quotes(s.clone(), pane, generation, symbol, tf, true);
+            }
+            Err(error) => s.send(Response::HistoryError { pane, generation, error }),
+        },
+        Err(e) => {
+            s.send(Response::HistoryError { pane, generation, error: format!("{e:#}") });
+            if !s.sample_mode() {
+                retry_intraday(s.clone(), pane, generation, symbol, tf, true);
+            }
+        }
+    }
+}
+
+/// Pull the latest intraday bars into the pane's series. A fresh cache skips the network.
+/// Sample, missing, empty, and failed responses leave the bars already on screen.
+async fn refresh_intraday(s: &Shared, pane: PaneId, generation: u64, symbol: &str, tf: Timeframe, extended: bool) {
+    if !tf.is_intraday() || current_series(s, pane, generation).is_none() {
+        return;
+    }
+    let now = chrono::Utc::now().timestamp();
+    // The regular cache is not an extended-hours read, so it cannot skip that fetch.
+    let fresh = !extended
+        && display_cached(s, symbol, tf, 1).await.is_some_and(|(_, at)| {
+            tr_data::intraday::fetched_recently(at, now, tr_data::intraday::refresh_ttl_secs(tf))
+        });
+    if fresh {
+        return;
+    }
+    let limit = current_series(s, pane, generation).map(|bars| bars.len().clamp(300, 5_000)).unwrap_or(300);
+    let mut replace_regular = false;
+    let fetched = if extended {
+        s.provider.extended_history(symbol, tf, None, limit).await
+    } else {
+        match native_fetch(s, symbol, tf, None, limit).await {
+            Ok((bars, source, observation)) => {
+                let (bars, info) = stitch_native(
+                    s,
+                    symbol,
+                    tf,
+                    bars,
+                    source,
+                    current_series(s, pane, generation).map_or(limit, |b| b.len().max(limit)),
+                    observation,
+                )
+                .await;
+                let previous = record_chart_source(s, pane, generation, &info.source);
+                replace_regular =
+                    info.epoch > 0 || previous.is_some_and(|(g, old)| g == generation && old != info.source);
+                s.send(Response::VaultStitch { pane, generation, info: Arc::new(info) });
+                Ok(bars)
+            }
+            Err(e) => Err(e),
+        }
+    };
+    let bars = match fetched {
+        Ok(bars) => bars,
+        Err(error) => {
+            let message = format!("{error:#}");
+            s.bars_failed(pane, generation, symbol, tf, error).await;
+            if current_series(s, pane, generation).is_some() {
+                s.send(Response::HistoryError {
+                    pane,
+                    generation,
+                    error: format!("Refresh failed; retry on next poll: {message}"),
+                });
+            }
+            return;
+        }
+    };
+    if bars.is_empty() || !bars.iter().all(|b| b.provenance.is_verified()) {
+        s.bars_failed(pane, generation, symbol, tf, anyhow::anyhow!("Refresh returned no verified bars")).await;
+        if current_series(s, pane, generation).is_some() {
+            s.send(Response::HistoryError {
+                pane,
+                generation,
+                error: "Refresh returned no verified bars; retry on next poll".into(),
+            });
+        }
+        return;
+    }
+    let merged = {
+        let mut map = s.series.lock().expect("series lock");
+        let Some((_, cur)) = map.get_mut(&pane).filter(|(g, _)| *g == generation) else { return };
+        let next = if !replace_regular && cur.iter().all(|b| b.provenance.is_verified()) {
+            let mut series = Series { symbol: symbol.to_string(), timeframe: tf, bars: cur.iter().copied().collect() };
+            series.merge(bars);
+            series.bars
+        } else {
+            bars
+        };
+        let next = Arc::new(next);
+        *cur = next.clone();
+        next
+    };
+    if !extended {
+        store_verified_history(s, symbol, tf, &merged).await;
+    }
+    let gpu = build_gpu(s.jobs.clone(), merged.clone()).await;
+    if current_series(s, pane, generation).is_none() {
+        return;
+    }
+    s.send(Response::History {
+        pane,
+        generation,
+        symbol: symbol.to_string(),
+        tf,
+        bars: merged,
+        gpu,
+        prepended: 0,
+        from_cache: false,
+        exhausted: false,
+        live: false,
+    });
+}
+
 /// Merge the provider's live feed (if any) into the pane's series, publishing at most
 /// four updates a second. Stops when the pane reloads, closes or the feed ends.
 fn start_live(s: Arc<Shared>, pane: PaneId, generation: u64, symbol: String, tf: Timeframe) {
-    let Some(mut feed) = s.provider.live(&symbol, tf) else { return };
+    if !s.followers.lock().expect("followers").insert((pane, generation, true)) {
+        return;
+    }
+    let Some(mut feed) = s.provider.live(&symbol, tf) else {
+        s.followers.lock().expect("followers").remove(&(pane, generation, true));
+        return;
+    };
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(Duration::from_millis(250));
         let mut dirty = false;
@@ -793,7 +6237,7 @@ fn start_live(s: Arc<Shared>, pane: PaneId, generation: u64, symbol: String, tf:
                     }
                     dirty = false;
                     let Some(bars) = current_series(&s, pane, generation) else { break };
-                    let gpu = build_gpu(bars.clone()).await;
+                    let gpu = build_gpu(s.jobs.clone(), bars.clone()).await;
                     s.send(Response::History {
                         pane,
                         generation,
@@ -809,12 +6253,18 @@ fn start_live(s: Arc<Shared>, pane: PaneId, generation: u64, symbol: String, tf:
                 }
             }
         }
+        s.followers.lock().expect("followers").remove(&(pane, generation, true));
+        if current_series(&s, pane, generation).is_some() {
+            retry_intraday(s.clone(), pane, generation, symbol.clone(), tf, false);
+        }
         tracing::debug!("live feed for pane {pane} ({symbol}) stopped");
     });
 }
 
-async fn build_gpu(bars: Arc<Vec<Bar>>) -> SeriesGpu {
-    tokio::task::spawn_blocking(move || SeriesGpu::build(&bars)).await.expect("pyramid build task")
+async fn build_gpu(jobs: Arc<crate::perf::JobLog>, bars: Arc<Vec<Bar>>) -> SeriesGpu {
+    tokio::task::spawn_blocking(move || jobs.time("SeriesGpu", || SeriesGpu::build(&bars)))
+        .await
+        .expect("pyramid build task")
 }
 
 fn resolve_politician(db: &Db, query: &str) -> Option<Politician> {
@@ -850,13 +6300,25 @@ async fn profile(s: &Shared, query: &str) -> Option<Profile> {
     let fetches = tickers.into_iter().map(|t| {
         let provider = provider.clone();
         async move {
-            let r = provider.history(&format!("{t} US Equity"), Timeframe::D1, None, days.min(4000)).await;
+            let r = provider
+                .history_for_analysis(
+                    &format!("{t} US Equity"),
+                    Timeframe::D1,
+                    None,
+                    days.min(4000),
+                    "Historical performance/backtest",
+                )
+                .await;
             (t, r)
         }
     });
+    let mut price_warnings = Vec::new();
     for (t, r) in futures_join(fetches).await {
-        if let Ok(b) = r {
-            prices.insert(t, b);
+        match r {
+            Ok(b) => {
+                prices.insert(t, b);
+            }
+            Err(e) => price_warnings.push(format!("{t}: excluded from performance: {e:#}")),
         }
     }
     let (perf, returns) = performance::estimate(
@@ -869,7 +6331,505 @@ async fn profile(s: &Shared, query: &str) -> Option<Profile> {
         },
         |tk| prices.get(tk).and_then(|b| b.last()).map(|b| b.close),
     );
-    Some(Profile { politician, trades, perf, returns, tracked })
+    Some(Profile { politician, trades, perf, returns, tracked, price_warnings })
+}
+
+async fn intraday_scan(s: &Shared, symbols: &[String]) -> tr_data::iscan::Board {
+    let now = chrono::Utc::now().timestamp();
+    let sample = s.sample_mode();
+    let spy_key = tr_data::security(tr_data::iscan::BENCHMARK).key();
+    let spy = if sample {
+        Err("sample bars are not ranked".into())
+    } else {
+        analysis_bars(s, &spy_key, Timeframe::M5, tr_data::iscan::BARS, "Intraday scan")
+            .await
+            .map(|(b, _)| b)
+            .map_err(|e| format!("{e:#}"))
+    };
+    let bench = spy.as_ref().ok().and_then(|bars| tr_data::iscan::benchmark_span(bars));
+    let mut seen = Vec::new();
+    let mut items = Vec::new();
+    for symbol in symbols {
+        let key = tr_data::security(symbol).key();
+        if seen.iter().any(|s| s == &key) {
+            continue;
+        }
+        seen.push(key.clone());
+        let reason = tr_data::iscan::sample_reason(&key);
+        if sample || reason == "no US cash session" {
+            items.push((key, Err(reason)));
+            continue;
+        }
+        let read = if key == spy_key {
+            match &spy {
+                Ok(bars) => tr_data::iscan::read_against(&key, bars, now, bench),
+                Err(e) => Err(e.clone()),
+            }
+        } else {
+            match analysis_bars(s, &key, Timeframe::M5, tr_data::iscan::BARS, "Intraday scan").await.map(|(b, _)| b) {
+                Ok(bars) => tr_data::iscan::read_against(&key, &bars, now, bench),
+                Err(e) => Err(format!("{e:#}")),
+            }
+        };
+        items.push((key, read));
+    }
+    tr_data::iscan::build(items, sample)
+}
+
+/// One daily/M5 pair per enabled symbol, with each requested setup evaluated once.
+fn combo_acquisition_plan(
+    rules: &[tr_data::price_alerts::AlertRule],
+) -> std::collections::BTreeMap<String, Vec<String>> {
+    let mut plan: std::collections::BTreeMap<String, Vec<String>> = Default::default();
+    for rule in rules.iter().filter(|r| r.enabled) {
+        if let tr_data::price_alerts::AlertKind::SetupPriceRvol { setup, .. } = &rule.kind {
+            let names = plan.entry(rule.symbol.clone()).or_default();
+            if !names.contains(setup) {
+                names.push(setup.clone());
+            }
+        }
+    }
+    plan
+}
+
+#[cfg(test)]
+mod combo_acquisition_tests {
+    use super::*;
+    #[test]
+    fn combo_plan_deduplicates_enabled_symbols_and_setups() {
+        use tr_data::price_alerts::{AlertKind, PriceSide, Store};
+        let mut store = Store::default();
+        for (setup, level) in [("NEAR_HIGH", 100.0), ("NEAR_HIGH", 110.0), ("VOL_SURGE", 120.0)] {
+            store
+                .add_rule(
+                    "AAPL",
+                    AlertKind::SetupPriceRvol { setup: setup.into(), side: PriceSide::Above, level, multiple: 2.0 },
+                    1,
+                )
+                .unwrap();
+        }
+        let mut disabled = store.rules[0].clone();
+        disabled.symbol = "MSFT US Equity".into();
+        disabled.enabled = false;
+        store.rules.push(disabled);
+        let plan = combo_acquisition_plan(&store.rules);
+        assert_eq!(plan.len(), 1);
+        assert_eq!(plan["AAPL US Equity"].len(), 2);
+    }
+}
+
+async fn evaluate_trade_plans(s: &Shared) {
+    use tr_data::price_alerts::{AlertFailure, PriceTick};
+    use tr_data::trade_plans::{EvalInput, evaluate};
+    let now = chrono::Utc::now().timestamp();
+    if s.sample_mode() {
+        let outcome = evaluate(
+            &mut s.trade_plans.lock().expect("trade plans"),
+            EvalInput { now, sample_provider: true, prices: Vec::new(), failures: Vec::new() },
+        );
+        s.send(Response::TradePlanFeed(outcome.batch));
+        return;
+    }
+    let symbols = s.trade_plans.lock().expect("trade plans").active_symbols();
+    if symbols.is_empty() {
+        s.send(Response::TradePlanFeed(s.trade_plan_snapshot(now)));
+        return;
+    }
+    let mut prices = Vec::new();
+    let mut failures = Vec::new();
+    let mut fetch_failed = false;
+    match s.provider.quotes(&symbols).await {
+        Ok(quotes) => {
+            for key in &symbols {
+                if let Some(q) = quotes.iter().find(|q| q.symbol == *key || tr_data::security(&q.symbol).key() == *key)
+                {
+                    prices.push(PriceTick { symbol: key.clone(), price: q.last, ts: q.ts, provenance: q.provenance });
+                }
+            }
+        }
+        Err(error) => {
+            fetch_failed = true;
+            for symbol in symbols {
+                failures.push(AlertFailure { symbol, error: format!("{error:#}") });
+            }
+        }
+    }
+    let mut outcome = evaluate(
+        &mut s.trade_plans.lock().expect("trade plans"),
+        EvalInput { now, sample_provider: false, prices, failures },
+    );
+    outcome.batch.stale |= fetch_failed;
+    s.persist_trade_plans();
+    if !outcome.fired.is_empty() {
+        s.send(Response::NewTradePlanEvents(outcome.fired));
+    }
+    s.send(Response::TradePlanFeed(outcome.batch));
+}
+
+async fn evaluate_price_alerts(s: &Shared) {
+    use tr_data::price_alerts::{
+        AlertFailure, AlertKind, EvalInput, PriceTick, evaluate, rvol_tick, setup_tick, vwap_tick,
+    };
+    use tr_data::session_alerts::{self, SessionSignal};
+    use tr_data::whats_news::archive_ticker;
+    let now = chrono::Utc::now().timestamp();
+    let sample = s.sample_mode();
+    let rules = s.price_alerts.lock().expect("price alerts").rules.clone();
+    if sample {
+        let outcome = evaluate(
+            &mut s.price_alerts.lock().expect("price alerts"),
+            EvalInput {
+                now,
+                sample_provider: true,
+                prices: Vec::new(),
+                setups: Vec::new(),
+                vwaps: Vec::new(),
+                rvols: Vec::new(),
+                sessions: Vec::new(),
+                combos: Vec::new(),
+                failures: Vec::new(),
+            },
+        );
+        s.send(Response::PriceAlertFeed(outcome.batch));
+        return;
+    }
+    if !rules.iter().any(|r| r.enabled) {
+        s.send(Response::PriceAlertFeed(s.price_alert_snapshot(now)));
+        return;
+    }
+    let combo_keys = combo_acquisition_plan(&rules);
+    let mut price_keys = Vec::new();
+    let mut vwap_keys = Vec::new();
+    let mut rvol_keys = Vec::new();
+    let mut setup_keys: Vec<(String, String)> = Vec::new();
+    let mut session_rules: Vec<(String, SessionSignal)> = Vec::new();
+    for r in rules.iter().filter(|r| r.enabled) {
+        match &r.kind {
+            AlertKind::SetupPriceRvol { .. } => {}
+            AlertKind::Price { .. } => {
+                if !price_keys.iter().any(|s| s == &r.symbol) {
+                    price_keys.push(r.symbol.clone());
+                }
+            }
+            AlertKind::Vwap { .. } => {
+                if !vwap_keys.iter().any(|s| s == &r.symbol) {
+                    vwap_keys.push(r.symbol.clone());
+                }
+            }
+            AlertKind::Rvol { .. } => {
+                if !rvol_keys.iter().any(|s| s == &r.symbol) {
+                    rvol_keys.push(r.symbol.clone());
+                }
+            }
+            AlertKind::Setup { setup, .. } => setup_keys.push((r.symbol.clone(), setup.clone())),
+            AlertKind::Session { signal } => session_rules.push((r.symbol.clone(), *signal)),
+        }
+    }
+    let mut failures = Vec::new();
+    let mut prices = Vec::new();
+    if !price_keys.is_empty() {
+        match s.provider.quotes(&price_keys).await {
+            Ok(quotes) => {
+                for key in &price_keys {
+                    if let Some(q) =
+                        quotes.iter().find(|q| q.symbol == *key || tr_data::security(&q.symbol).key() == *key)
+                    {
+                        prices.push(PriceTick {
+                            symbol: key.clone(),
+                            price: q.last,
+                            ts: q.ts,
+                            provenance: q.provenance,
+                        });
+                    } else {
+                        failures.push(AlertFailure { symbol: key.clone(), error: "no quote for this name".into() });
+                    }
+                }
+            }
+            Err(e) => {
+                for key in &price_keys {
+                    failures.push(AlertFailure { symbol: key.clone(), error: format!("{e:#}") });
+                }
+            }
+        }
+    }
+    let mut setups = Vec::new();
+    if !setup_keys.is_empty() {
+        let needs_spy = setup_keys.iter().any(|(_, setup)| setup == "ONEIL_LENS" || setup == "ALL");
+        let spy = if needs_spy {
+            let config = s.whats_news.borrow().1.clone();
+            desk_daily(s, &config.bridge(), "SPY").await.ok()
+        } else {
+            None
+        };
+        let mut wanted: Vec<String> = Vec::new();
+        let mut pairs: Vec<(String, String, Vec<String>)> = Vec::new();
+        for (symbol, setup) in setup_keys {
+            let ticker = archive_ticker(&symbol);
+            if let Some((_, _, names)) = pairs.iter_mut().find(|(k, _, _)| *k == symbol) {
+                if !names.contains(&setup) {
+                    names.push(setup);
+                }
+            } else {
+                if !ticker.is_empty() && !wanted.contains(&ticker) {
+                    wanted.push(ticker.clone());
+                }
+                pairs.push((symbol, ticker, vec![setup]));
+            }
+        }
+        let local = if wanted.is_empty() {
+            Ok(Default::default())
+        } else {
+            s.history.db(move |db| db.histories_for(&wanted)).await
+        };
+        match local {
+            Ok(map) => {
+                for (symbol, ticker, names) in pairs {
+                    match map.get(&ticker) {
+                        Some(bars) => match setup_tick(&symbol, bars, &names, now, spy.as_deref()) {
+                            Ok(result) => {
+                                setups.push(result.tick);
+                                for (setup, error) in result.failures {
+                                    failures.push(AlertFailure {
+                                        symbol: symbol.clone(),
+                                        error: format!("{setup}: {error}"),
+                                    });
+                                }
+                            }
+                            Err(error) => failures.push(AlertFailure { symbol, error }),
+                        },
+                        None => failures
+                            .push(AlertFailure { symbol, error: "no daily history in the research archive".into() }),
+                    }
+                }
+            }
+            Err(e) => {
+                for (symbol, _, _) in pairs {
+                    failures.push(AlertFailure { symbol, error: format!("{e:#}") });
+                }
+            }
+        }
+    }
+    // One name at a time: a VWAP rule reads verified 5-minute bars, never a made-up level.
+    let mut vwaps = Vec::new();
+    for key in vwap_keys {
+        match s.provider.history(&key, Timeframe::M5, None, tr_data::intraday::VWAP_ALERT_BARS).await {
+            Ok(bars) => match vwap_tick(&key, &bars, now) {
+                Ok(tick) => vwaps.push(tick),
+                Err(error) => failures.push(AlertFailure { symbol: key, error }),
+            },
+            Err(e) => failures.push(AlertFailure { symbol: key, error: format!("{e:#}") }),
+        }
+    }
+    // Relative volume needs a prior session at the same offset, so the read is the scan's window.
+    let mut rvols = Vec::new();
+    for key in rvol_keys {
+        match s.provider.history(&key, Timeframe::M5, None, tr_data::iscan::BARS).await {
+            Ok(bars) => match rvol_tick(&key, &bars, now) {
+                Ok(tick) => rvols.push(tick),
+                Err(error) => failures.push(AlertFailure { symbol: key, error }),
+            },
+            Err(e) => failures.push(AlertFailure { symbol: key, error: format!("{e:#}") }),
+        }
+    }
+    // Session alerts share one verified 5-minute read per name. Relative also needs SPY.
+    let mut sessions = Vec::new();
+    if !session_rules.is_empty() {
+        let limit = session_alerts::fetch_limit();
+        let mut symbols = Vec::new();
+        let mut needs_spy = false;
+        for (symbol, signal) in &session_rules {
+            if *signal == SessionSignal::Relative {
+                needs_spy = true;
+            }
+            if !symbols.iter().any(|s| s == symbol) {
+                symbols.push(symbol.clone());
+            }
+        }
+        let mut bars_by = std::collections::BTreeMap::new();
+        for key in symbols {
+            match s.provider.history(&key, Timeframe::M5, None, limit).await {
+                Ok(bars) => {
+                    bars_by.insert(key, bars);
+                }
+                Err(e) => failures.push(AlertFailure { symbol: key, error: format!("{e:#}") }),
+            }
+        }
+        let spy_key = tr_data::relative_path::benchmark_key();
+        let spy_bars = if needs_spy {
+            if let Some(bars) = bars_by.get(&spy_key) {
+                Some(bars.clone())
+            } else {
+                match s.provider.history(&spy_key, Timeframe::M5, None, limit).await {
+                    Ok(bars) => Some(bars),
+                    Err(e) => {
+                        failures.push(AlertFailure { symbol: spy_key, error: format!("{e:#}") });
+                        None
+                    }
+                }
+            }
+        } else {
+            None
+        };
+        let mut seen = Vec::new();
+        for (symbol, signal) in session_rules {
+            if seen.iter().any(|pair: &(String, SessionSignal)| pair.0 == symbol && pair.1 == signal) {
+                continue;
+            }
+            seen.push((symbol.clone(), signal));
+            let Some(bars) = bars_by.get(&symbol) else { continue };
+            match session_alerts::read(signal, &symbol, Timeframe::M5, bars, spy_bars.as_deref(), now) {
+                Ok(tick) => sessions.push(tick),
+                Err(error) => failures.push(AlertFailure { symbol, error }),
+            }
+        }
+    }
+    let mut combos = Vec::new();
+    for (symbol, names) in combo_keys {
+        let ticker = archive_ticker(&symbol);
+        let daily = s
+            .history
+            .db(move |db| {
+                db.histories_for(std::slice::from_ref(&ticker)).map(|mut map| map.remove(&ticker).unwrap_or_default())
+            })
+            .await;
+        let m5 = s.provider.history(&symbol, Timeframe::M5, None, tr_data::iscan::BARS).await;
+        match (daily, m5) {
+            (Ok(daily), Ok(m5)) => match tr_data::price_alerts::combo_tick(&symbol, &daily, &m5, &names, now) {
+                Ok(tick) => combos.push(tick),
+                Err(error) => failures.push(AlertFailure { symbol, error }),
+            },
+            (Err(e), _) | (_, Err(e)) => failures.push(AlertFailure { symbol, error: format!("{e:#}") }),
+        }
+    }
+    let outcome = evaluate(
+        &mut s.price_alerts.lock().expect("price alerts"),
+        EvalInput { now, sample_provider: false, prices, setups, vwaps, rvols, sessions, combos, failures },
+    );
+    s.persist_price_alerts();
+    if !outcome.fired.is_empty() {
+        s.send(Response::NewPriceAlerts(outcome.fired));
+    }
+    s.send(Response::PriceAlertFeed(outcome.batch));
+}
+
+async fn fetch_news(s: &Arc<Shared>, symbols: Option<Vec<String>>) -> tr_data::news::NewsBatch {
+    use tr_data::news::{
+        NewsBatch, NewsFailure, TOP_CACHE_KEY, assemble_batch, bound_symbols, dedup_headlines, is_stale,
+    };
+    let now = chrono::Utc::now().timestamp();
+    if s.sample_mode() {
+        return NewsBatch::sample_isolated(now);
+    }
+    match symbols {
+        None => {
+            if let Some(items) = s.news.lock().expect("news cache").fresh(TOP_CACHE_KEY, now).map(|i| i.to_vec()) {
+                let stale = s
+                    .news
+                    .lock()
+                    .expect("news cache")
+                    .get(TOP_CACHE_KEY, now)
+                    .is_some_and(|(_, at, _)| is_stale(at, now));
+                return NewsBatch {
+                    items: dedup_headlines(items),
+                    failures: Vec::new(),
+                    queried: Vec::new(),
+                    fetched_at: now,
+                    stale,
+                    sample: false,
+                };
+            }
+            match s.provider.news(None).await {
+                Ok(items) => {
+                    let items = dedup_headlines(items);
+                    s.news.lock().expect("news cache").store(TOP_CACHE_KEY, items.clone(), now);
+                    NewsBatch {
+                        items,
+                        failures: Vec::new(),
+                        queried: Vec::new(),
+                        fetched_at: now,
+                        stale: false,
+                        sample: false,
+                    }
+                }
+                Err(e) => {
+                    let err = format!("{e:#}");
+                    let mut cache = s.news.lock().expect("news cache");
+                    let cached = cache.get(TOP_CACHE_KEY, now).map(|(items, at, _)| (items.to_vec(), at));
+                    cache.store_error(TOP_CACHE_KEY, err.clone(), now);
+                    match cached {
+                        Some((items, fetched_at)) => NewsBatch {
+                            items,
+                            failures: vec![NewsFailure { symbol: "Top market".into(), error: err }],
+                            queried: Vec::new(),
+                            fetched_at,
+                            stale: true,
+                            sample: false,
+                        },
+                        None => NewsBatch {
+                            items: Vec::new(),
+                            failures: vec![NewsFailure { symbol: "Top market".into(), error: err }],
+                            queried: Vec::new(),
+                            fetched_at: now,
+                            stale: false,
+                            sample: false,
+                        },
+                    }
+                }
+            }
+        }
+        Some(raw) => {
+            let queried = bound_symbols(raw);
+            let mut ready = Vec::new();
+            let mut pending = Vec::new();
+            let mut stale = false;
+            {
+                let cache = s.news.lock().expect("news cache");
+                for key in &queried {
+                    if let Some(items) = cache.fresh(key, now) {
+                        stale |= cache.get(key, now).is_some_and(|(_, at, _)| is_stale(at, now));
+                        ready.push((key.clone(), Ok(items.to_vec())));
+                    } else {
+                        pending.push(key.clone());
+                    }
+                }
+            }
+            let fetched = {
+                use futures::StreamExt;
+                futures::stream::iter(pending.into_iter().map(|key| {
+                    let s = s.clone();
+                    async move {
+                        let result = s.provider.news(Some(&key)).await.map_err(|e| format!("{e:#}"));
+                        (key, result)
+                    }
+                }))
+                .buffered(tr_data::news::FETCH_CONCURRENCY)
+                .collect::<Vec<_>>()
+                .await
+            };
+            {
+                let mut cache = s.news.lock().expect("news cache");
+                for (key, result) in fetched {
+                    match result {
+                        Ok(items) => {
+                            cache.store(&key, items.clone(), now);
+                            ready.push((key, Ok(items)));
+                        }
+                        Err(err) => {
+                            if let Some((items, at, _)) = cache.get(&key, now) {
+                                ready.push((key.clone(), Ok(items.to_vec())));
+                                stale = true;
+                                let _ = at;
+                            } else {
+                                ready.push((key.clone(), Err(err.clone())));
+                            }
+                            cache.store_error(key, err, now);
+                        }
+                    }
+                }
+            }
+            assemble_batch(queried, ready, now, stale)
+        }
+    }
 }
 
 /// Run futures concurrently, at most 6 in flight (keeps data providers happy).
@@ -885,6 +6845,2454 @@ where
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn edge_worker_computes_and_returns_same_arc_for_identical_inputs() {
+        let (s, rx) = shared(vault_provider(vec![]), None);
+        let bars = Arc::new(stack_fixture(400, Timeframe::M5, tr_core::Provenance::Real));
+        let stack = trend_stack(&bars, Timeframe::M5, vec![], Default::default()).unwrap();
+        let key = tr_data::edge::EdgeKey {
+            digest: tr_data::stable_hash::bars_digest(&bars),
+            n: bars.len(),
+            first_ts: bars[0].ts,
+            last_ts: bars.last().unwrap().ts,
+            params: Default::default(),
+            horizons: [1, 5, 20],
+            generation: 1,
+            tf: Timeframe::M5,
+        };
+        let request = || Request::StackEdge {
+            pane: 1,
+            key: key.clone(),
+            bars: bars.clone(),
+            state: stack.medium.iter().zip(&stack.confidence).map(|(&s, c)| c.is_finite().then_some(s)).collect(),
+            entry_long: stack.entry_long.clone(),
+            entry_short: stack.entry_short.clone(),
+            stitch: None,
+        };
+        handle(&s, request()).await;
+        let first = rx
+            .try_iter()
+            .find_map(|r| if let Response::StackEdge { result, .. } = r { Some(result.unwrap()) } else { None })
+            .unwrap();
+        handle(&s, request()).await;
+        let second = rx
+            .try_iter()
+            .find_map(|r| if let Response::StackEdge { result, .. } = r { Some(result.unwrap()) } else { None })
+            .unwrap();
+        assert!(Arc::ptr_eq(&first, &second));
+    }
+
+    #[test]
+    fn source_identity_respects_chart_generation_and_retirement() {
+        let (s, _) = shared(vault_provider(vec![]), None);
+        assert!(claim_series(&s, 1, 1));
+        record_chart_source(&s, 1, 1, "yahoo");
+        assert!(claim_series(&s, 1, 2));
+        record_chart_source(&s, 1, 2, "alpaca:iex");
+        record_chart_source(&s, 1, 1, "yahoo");
+        assert_eq!(s.chart_sources.lock().unwrap().get(&1).unwrap().1, "alpaca:iex");
+        begin_request(&s, &Request::Forget(1));
+        record_chart_source(&s, 1, 2, "yahoo");
+        assert!(s.chart_sources.lock().unwrap().is_empty());
+    }
+    pub(super) struct VaultProvider {
+        pub(super) bars: std::sync::Mutex<Vec<Bar>>,
+        pub(super) calls: std::sync::atomic::AtomicUsize,
+        pub(super) fail: std::sync::atomic::AtomicBool,
+        pub(super) sample: bool,
+    }
+    #[async_trait::async_trait]
+    impl tr_data::MarketData for VaultProvider {
+        fn name(&self) -> &str {
+            "yahoo"
+        }
+        fn mode(&self) -> DataMode {
+            if self.sample { DataMode::ExplicitSample } else { DataMode::Live }
+        }
+        async fn history(&self, _: &str, _: Timeframe, _: Option<i64>, _: usize) -> anyhow::Result<Vec<Bar>> {
+            panic!("vault studies must use history_sourced");
+        }
+        async fn history_sourced(
+            &self,
+            _: &str,
+            _: Timeframe,
+            _: Option<i64>,
+            _: usize,
+        ) -> anyhow::Result<(Vec<Bar>, String)> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            tokio::task::yield_now().await;
+            if self.fail.load(std::sync::atomic::Ordering::SeqCst) {
+                anyhow::bail!("fixture offline");
+            }
+            Ok((self.bars.lock().unwrap().clone(), "yahoo".into()))
+        }
+    }
+    pub(super) fn vault_day(s: &str) -> Vec<Bar> {
+        tr_data::intraday::regular_opens(s.parse().unwrap(), Timeframe::M5)
+            .into_iter()
+            .map(|ts| Bar::new(ts, 100., 101., 99., 100., 1000.).with_provenance(tr_core::Provenance::Real))
+            .collect()
+    }
+    pub(super) fn vault_provider(bars: Vec<Bar>) -> Arc<VaultProvider> {
+        Arc::new(VaultProvider {
+            bars: std::sync::Mutex::new(bars),
+            calls: Default::default(),
+            fail: Default::default(),
+            sample: false,
+        })
+    }
+    #[test]
+    fn tune_cache_hits_closed_inputs_and_invalidates_corrections_params_source_and_epoch() {
+        let mut bars: Vec<_> = (0..320)
+            .map(|i| {
+                let c = 100.0 + (i as f64 * 0.1).sin();
+                Bar::new(i * 86400, c, c + 1.0, c - 1.0, c, 1000.0).with_provenance(tr_core::Provenance::Real)
+            })
+            .collect();
+        let cache = tr_data::report_cache::ReportCache::default();
+        let p = AdaptiveTrendParams::default();
+        let a = tune_cached(
+            &crate::perf::JobLog::default(),
+            &cache,
+            "BTCUSD",
+            Timeframe::D1,
+            p,
+            &bars,
+            "fixture",
+            None,
+            None,
+        )
+        .unwrap();
+        bars[319].close += 0.1;
+        let b = tune_cached(
+            &crate::perf::JobLog::default(),
+            &cache,
+            "BTCUSD",
+            Timeframe::D1,
+            p,
+            &bars,
+            "fixture",
+            None,
+            None,
+        )
+        .unwrap();
+        assert!(Arc::ptr_eq(&a, &b), "forming changes do not invalidate a closed report");
+        bars[100].close += 0.1;
+        let corrected = tune_cached(
+            &crate::perf::JobLog::default(),
+            &cache,
+            "BTCUSD",
+            Timeframe::D1,
+            p,
+            &bars,
+            "fixture",
+            None,
+            None,
+        )
+        .unwrap();
+        assert!(!Arc::ptr_eq(&a, &corrected));
+        let changed = tune_cached(
+            &crate::perf::JobLog::default(),
+            &cache,
+            "BTCUSD",
+            Timeframe::D1,
+            AdaptiveTrendParams { confirm_mult: 0.5, ..p },
+            &bars,
+            "fixture",
+            None,
+            None,
+        )
+        .unwrap();
+        assert!(!Arc::ptr_eq(&corrected, &changed));
+        let source = tune_cached(
+            &crate::perf::JobLog::default(),
+            &cache,
+            "BTCUSD",
+            Timeframe::D1,
+            p,
+            &bars,
+            "other",
+            None,
+            None,
+        )
+        .unwrap();
+        assert!(!Arc::ptr_eq(&corrected, &source));
+        let info = tr_data::vault::StitchInfo { epoch: 2, source: "fixture".into(), ..Default::default() };
+        let epoch = tune_cached(
+            &crate::perf::JobLog::default(),
+            &cache,
+            "BTCUSD",
+            Timeframe::D1,
+            p,
+            &bars,
+            "fixture",
+            None,
+            Some(&info),
+        )
+        .unwrap();
+        assert!(!Arc::ptr_eq(&corrected, &epoch));
+        let closed = tune_cached(
+            &crate::perf::JobLog::default(),
+            &cache,
+            "BTCUSD",
+            Timeframe::D1,
+            p,
+            &bars,
+            "fixture",
+            Some(320 * 86400),
+            None,
+        )
+        .unwrap();
+        assert!(!Arc::ptr_eq(&corrected, &closed));
+        bars[319].provenance = tr_core::Provenance::Sample;
+        assert!(
+            tune_cached(
+                &crate::perf::JobLog::default(),
+                &cache,
+                "BTCUSD",
+                Timeframe::D1,
+                p,
+                &bars,
+                "fixture",
+                None,
+                None
+            )
+            .is_err()
+        );
+    }
+    #[tokio::test]
+    async fn tune_worker_uses_vault_and_refuses_unverified_and_sample_without_network() {
+        let bars: Vec<_> =
+            ["2026-11-02", "2026-11-03", "2026-11-04", "2026-11-05"].into_iter().flat_map(vault_day).collect();
+        let provider = vault_provider(bars);
+        let (s, rx) = shared(provider.clone(), Some(BarCache::open_in_memory().unwrap()));
+        let request = || Request::TstackTune {
+            pane: 55,
+            generation: 7,
+            symbol: "AAPL US Equity".into(),
+            tf: Timeframe::M5,
+            params: Default::default(),
+        };
+        handle(&s, request()).await;
+        let Response::WhatsNews { response, .. } = rx.try_recv().unwrap() else { panic!("envelope") };
+        let Response::TstackTune { pane, generation, result } = *response else { panic!("tune") };
+        let r = result.unwrap();
+        assert_eq!((pane, generation), (55, 7));
+        assert!(r.source.contains("VAULT") && r.provenance.is_verified());
+        provider.bars.lock().unwrap().last_mut().unwrap().provenance = tr_core::Provenance::Sample;
+        handle(&s, request()).await;
+        let Response::WhatsNews { response, .. } = rx.try_recv().unwrap() else { panic!("envelope") };
+        assert!(matches!(*response, Response::TstackTune { result: Err(_), .. }));
+        let sample = Arc::new(VaultProvider {
+            bars: Default::default(),
+            calls: Default::default(),
+            fail: Default::default(),
+            sample: true,
+        });
+        let (s, rx) = shared(sample.clone(), None);
+        handle(&s, request()).await;
+        let Response::WhatsNews { response, .. } = rx.try_recv().unwrap() else { panic!("envelope") };
+        assert!(matches!(*response, Response::TstackTune { result: Err(_), .. }));
+        assert_eq!(sample.calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn studio_dist_uses_sourced_vault_history_and_refuses_sample_mode() {
+        let bars = vault_day("2026-11-09");
+        let provider = vault_provider(bars.clone());
+        let (s, rx) = shared(provider.clone(), Some(BarCache::open_in_memory().unwrap()));
+        let request = || Request::StudioDist {
+            pane: 55,
+            generation: 7,
+            symbol: "AAPL US Equity".into(),
+            timeframe: Timeframe::M5,
+            window: tr_data::studio_dist::Window::All,
+        };
+        handle(&s, request()).await;
+        let Response::WhatsNews { response, .. } = rx.try_recv().unwrap() else { panic!("archive envelope") };
+        let Response::StudioDist { pane, generation, result } = *response else { panic!("distribution report") };
+        assert_eq!((pane, generation), (55, 7));
+        let report = result.unwrap();
+        assert_eq!(report.bars, bars.len());
+        assert!(report.provenance.is_verified());
+        assert!(report.source.contains("VAULT"));
+        assert!(report.observed_at.is_some());
+        provider.fail.store(true, std::sync::atomic::Ordering::SeqCst);
+        handle(&s, request()).await;
+        let Response::WhatsNews { response, .. } = rx.try_recv().unwrap() else { panic!("archive envelope") };
+        let Response::StudioDist { result, .. } = *response else { panic!("vault-only report") };
+        let report = result.unwrap();
+        assert_eq!(report.bars, bars.len() - 1);
+        assert!(report.observed_at.is_none());
+        let sample = Arc::new(VaultProvider {
+            bars: std::sync::Mutex::new(bars),
+            calls: Default::default(),
+            fail: Default::default(),
+            sample: true,
+        });
+        let (s, rx) = shared(sample.clone(), None);
+        for timeframe in [Timeframe::D1, Timeframe::M5] {
+            handle(
+                &s,
+                Request::StudioDist {
+                    pane: 55,
+                    generation: 8,
+                    symbol: "AAPL".into(),
+                    timeframe,
+                    window: tr_data::studio_dist::Window::All,
+                },
+            )
+            .await;
+            let Response::WhatsNews { response, .. } = rx.try_recv().unwrap() else { panic!("archive envelope") };
+            let Response::StudioDist { result, .. } = *response else { panic!("sample refusal") };
+            assert!(result.unwrap_err().contains("sample"));
+        }
+        assert_eq!(sample.calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn analysis_bars_stitches_fresh_and_vault_and_outage_has_no_clock() {
+        let first = vault_day("2026-11-09");
+        let second = vault_day("2026-11-10");
+        let provider = vault_provider(first.clone());
+        let (s, _) = shared(provider.clone(), Some(BarCache::open_in_memory().unwrap()));
+        analysis_bars(&s, "AAPL", Timeframe::M5, 100, "test").await.unwrap();
+        let mut fresh = first[40..].to_vec();
+        fresh.extend(&second);
+        *provider.bars.lock().unwrap() = fresh.clone();
+        let (bars, info) = analysis_bars(&s, "AAPL", Timeframe::M5, 100, "test").await.unwrap();
+        assert_eq!(bars.len(), 156);
+        assert_eq!(info.vault_bars, 40);
+        assert_eq!(info.live_bars, fresh.len());
+        assert!(info.live_ok);
+        provider.fail.store(true, std::sync::atomic::Ordering::SeqCst);
+        let (bars, info) = analysis_bars(&s, "AAPL", Timeframe::M5, 100, "test").await.unwrap();
+        assert_eq!(bars.len(), 156);
+        assert!(!info.live_ok);
+        assert_eq!(info.fetched_at, None);
+        assert!(info.label().contains("VAULT ONLY"));
+        let snapshot =
+            s.cache.lock().unwrap().as_ref().unwrap().snapshot(None, chrono::Utc::now().timestamp()).unwrap();
+        assert!(snapshot.events.iter().any(|e| e.contains("fetch_fail")));
+    }
+    #[tokio::test]
+    async fn sample_analysis_never_locks_or_touches_vault() {
+        let provider = Arc::new(VaultProvider {
+            sample: true,
+            ..Arc::try_unwrap(vault_provider(vault_day("2026-11-10"))).ok().unwrap()
+        });
+        let (s, _) = shared(provider.clone(), Some(BarCache::open_in_memory().unwrap()));
+        assert!(analysis_bars(&s, "AAPL", Timeframe::M5, 100, "test").await.is_err());
+        assert_eq!(provider.calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert!(s.cache.lock().unwrap().as_ref().unwrap().snapshot(None, 0).unwrap().series.is_empty());
+    }
+    #[tokio::test]
+    async fn two_identical_native_requests_share_fetch_and_ingest() {
+        let bars = vault_day("2026-11-10");
+        // Vault admission waits twenty seconds past close before admitting a bar.
+        let at = bars.last().unwrap().ts + Timeframe::M5.seconds() + 30;
+        let provider = vault_provider(bars.clone());
+        let (s, _) = shared(provider.clone(), Some(BarCache::open_in_memory().unwrap()));
+        let (a, b) = tokio::join!(
+            native_fetch_with_clock(&s, "AAPL", Timeframe::M5, None, 100, || at),
+            native_fetch_with_clock(&s, "AAPL", Timeframe::M5, None, 100, || at)
+        );
+        for result in [a, b] {
+            let (fetched, source, observation) = result.unwrap();
+            assert_eq!(fetched, bars);
+            assert_eq!(source, "yahoo");
+            assert_eq!(observation.at, at);
+            assert!(observation.admitted);
+        }
+        assert_eq!(provider.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        let snap = s.cache.lock().unwrap().as_ref().unwrap().snapshot(None, at).unwrap();
+        assert_eq!(snap.series.len(), 1);
+        assert_eq!(snap.series[0].cells.iter().map(|c| u32::from(c.fetch_ok)).sum::<u32>(), 1);
+        assert_eq!(snap.series[0].bars, bars.len());
+    }
+    #[tokio::test]
+    async fn every_intraday_study_uses_sourced_analysis() {
+        let provider = vault_provider(vault_day("2026-11-10"));
+        let (s, _) = shared(provider.clone(), Some(BarCache::open_in_memory().unwrap()));
+        let _ = research_session_path(&s, "AAPL", "", "5m").await;
+        let _ = research_volume_pace(&s, "AAPL", "", "5m").await;
+        let _ = research_realized_vol(&s, "AAPL", "", "5m").await;
+        let _ = research_autocorr(&s, "AAPL", "", "5m").await;
+        let _ = research_gap_fill(&s, "AAPL", "", "5m").await;
+        let _ = research_session_extreme(&s, "AAPL", "", "5m").await;
+        let _ = research_relative_path(&s, "AAPL", "", "5m").await;
+        let _ = research_session_clock(&s, "AAPL", "", "5m").await;
+        let _ = research_intraday_backtest(&s, "AAPL", "OR", "5m", "20%", 0., 0., false, Default::default()).await;
+        let _ = research_intraday_compare(&s, "AAPL", "SPY", "5m").await;
+        let _ = research_breadth(&s, "AAPL MSFT SPY NVDA META", "5m", &[]).await;
+        let _ = research_session_brief(&s, "AAPL").await;
+        let _ = research_cash_levels(&s, "AAPL").await;
+        handle(
+            &s,
+            Request::Compare {
+                pane: 1,
+                generation: 1,
+                symbol: "MSFT US Equity".into(),
+                tf: Timeframe::M5,
+                base: Arc::new(vault_day("2026-11-10")),
+            },
+        )
+        .await;
+        let _ = fetch_stack_lane(&s, "AAPL", Timeframe::M5, false, chrono::Utc::now().timestamp()).await;
+        assert!(provider.calls.load(std::sync::atomic::Ordering::SeqCst) >= 14);
+    }
+    #[tokio::test]
+    async fn refresh_ingests_provider_bars_not_live_ticked_pane() {
+        let first = vault_day("2026-11-09");
+        let second = vault_day("2026-11-10");
+        let provider = vault_provider(first.clone());
+        let (s, _) = shared(provider.clone(), Some(BarCache::open_in_memory().unwrap()));
+        analysis_bars(&s, "AAPL", Timeframe::M5, 100, "test").await.unwrap();
+        let mut pane_bars = first.clone();
+        pane_bars[0].close = 999.;
+        pane_bars[0].high = 999.;
+        let req = Request::History { pane: 1, generation: 1, symbol: "AAPL".into(), tf: Timeframe::M5, limit: 100 };
+        assert!(begin_request(&s, &req));
+        store_series(&s, 1, 1, Arc::new(pane_bars));
+        let mut fresh = first[40..].to_vec();
+        fresh.extend(second);
+        *provider.bars.lock().unwrap() = fresh;
+        refresh_intraday(&s, 1, 1, "AAPL", Timeframe::M5, false).await;
+        let id =
+            tr_data::vault::SeriesId { symbol: "AAPL US Equity".into(), tf: Timeframe::M5, source: "yahoo".into() };
+        let read = s.cache.lock().unwrap().as_ref().unwrap().read(&id, None, 1000).unwrap();
+        assert_eq!(read[0].close, 100.);
+        assert_eq!(current_series(&s, 1, 1).unwrap()[0].close, 100.);
+    }
+    #[tokio::test]
+    async fn unchanged_study_cache_skips_compute_and_failures_are_not_cached() {
+        let (s, _) = shared(vault_provider(vec![]), None);
+        let key = tr_data::report_cache::ReportKey::new("clock", "AAPL", Timeframe::M5, "yahoo", &[], "");
+        let a = cached_study(&s, key.clone(), || Ok(4_u32)).await.unwrap();
+        let b: u32 = cached_study(&s, key, || panic!("recomputed report")).await.unwrap();
+        assert_eq!(a, b);
+    }
+
+    struct ClockProvider {
+        calls: std::sync::atomic::AtomicUsize,
+        provenance: tr_core::Provenance,
+        sample: bool,
+    }
+    #[async_trait::async_trait]
+    impl tr_data::MarketData for ClockProvider {
+        fn name(&self) -> &str {
+            "clock fixture"
+        }
+        fn mode(&self) -> DataMode {
+            if self.sample { DataMode::ExplicitSample } else { DataMode::Live }
+        }
+        async fn history(&self, _: &str, _: Timeframe, _: Option<i64>, _: usize) -> anyhow::Result<Vec<Bar>> {
+            panic!("CLOCK must use history_sourced");
+        }
+        async fn history_sourced(
+            &self,
+            symbol: &str,
+            tf: Timeframe,
+            end: Option<i64>,
+            limit: usize,
+        ) -> anyhow::Result<(Vec<Bar>, String)> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            assert_eq!(symbol, "AAPL US Equity");
+            assert_eq!(end, None);
+            assert_eq!(limit, tr_data::cash_session::research_fetch_limit(tf));
+            let date = chrono::NaiveDate::from_ymd_opt(2026, 1, 5).unwrap();
+            let ts = tr_core::ny::to_utc(date.and_hms_opt(9, 30, 0).unwrap());
+            Ok((
+                vec![Bar::new(ts, 100.0, 101.0, 99.0, 100.5, 1.0).with_provenance(self.provenance)],
+                self.name().into(),
+            ))
+        }
+    }
+    #[tokio::test]
+    async fn session_clock_worker_uses_research_gate_and_refuses_sample_daily_and_unverified() {
+        use std::sync::atomic::Ordering;
+        for provenance in [tr_core::Provenance::Real, tr_core::Provenance::Sample, tr_core::Provenance::Missing] {
+            let provider = Arc::new(ClockProvider { calls: Default::default(), provenance, sample: false });
+            let (s, _) = shared(provider.clone(), None);
+            assert!(research_session_clock(&s, "AAPL", "1d", "30m").await.is_err());
+            assert_eq!(provider.calls.load(Ordering::SeqCst), 0);
+            let result = research_session_clock(&s, "AAPL", "1h", "30m").await;
+            assert_eq!(result.is_ok(), provenance.is_verified());
+            assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+            if let Ok(report) = result {
+                assert_eq!(report.timeframe, Timeframe::H1);
+                assert!(report.source.starts_with("clock fixture"));
+                assert!(report.stale);
+            }
+        }
+        let provider =
+            Arc::new(ClockProvider { calls: Default::default(), provenance: tr_core::Provenance::Real, sample: true });
+        let (s, _) = shared(provider.clone(), None);
+        assert!(research_session_clock(&s, "AAPL", "", "30m").await.unwrap_err().to_string().contains("sample"));
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 0);
+    }
+
+    struct LaneProvider {
+        calls: std::sync::atomic::AtomicUsize,
+        started: tokio::sync::Notify,
+        release: tokio::sync::Semaphore,
+        fail: std::sync::atomic::AtomicBool,
+        frames: std::sync::Mutex<Vec<Timeframe>>,
+    }
+    #[async_trait::async_trait]
+    impl tr_data::MarketData for LaneProvider {
+        fn name(&self) -> &str {
+            "lane test"
+        }
+        async fn history(&self, _: &str, _: Timeframe, _: Option<i64>, _: usize) -> anyhow::Result<Vec<Bar>> {
+            panic!("custom lanes must use history_sourced");
+        }
+        async fn history_sourced(
+            &self,
+            symbol: &str,
+            tf: Timeframe,
+            _: Option<i64>,
+            _: usize,
+        ) -> anyhow::Result<(Vec<Bar>, String)> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.frames.lock().unwrap().push(tf);
+            if symbol == "SLOW" {
+                self.started.notify_one();
+                self.release.acquire().await.unwrap().forget();
+            }
+            if self.fail.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                anyhow::bail!("offline fixture");
+            }
+            Ok((stack_fixture(400, tf, tr_core::Provenance::Real), self.name().into()))
+        }
+    }
+    fn lane_provider() -> Arc<LaneProvider> {
+        Arc::new(LaneProvider {
+            calls: Default::default(),
+            started: Default::default(),
+            release: tokio::sync::Semaphore::new(0),
+            fail: Default::default(),
+            frames: Default::default(),
+        })
+    }
+    #[tokio::test]
+    async fn cold_wall_fetch_does_not_block_another_key() {
+        let provider = lane_provider();
+        let (s, _) = shared(provider.clone(), None);
+        let now = chrono::Utc::now().timestamp();
+        let held = s.clone();
+        let wall = tokio::spawn(async move { stack_wall_lane_bars(&held, "SLOW", Timeframe::M5, false, now).await });
+        provider.started.notified().await;
+        let fast =
+            tokio::time::timeout(Duration::from_secs(2), stack_chart_lane_bars(&s, "FAST", Timeframe::M30, false, now))
+                .await
+                .expect("unrelated key blocked by wall")
+                .unwrap();
+        assert_eq!(fast.len(), 400);
+        provider.release.add_permits(1);
+        wall.await.unwrap().unwrap();
+    }
+    #[tokio::test]
+    async fn concurrent_same_key_fetches_once() {
+        let provider = lane_provider();
+        let (s, _) = shared(provider.clone(), None);
+        let now = chrono::Utc::now().timestamp();
+        let one = s.clone();
+        let first = tokio::spawn(async move { stack_lane_bars(&one, "SLOW", Timeframe::H1, false, now).await });
+        provider.started.notified().await;
+        let two = s.clone();
+        let second = tokio::spawn(async move { stack_lane_bars(&two, "SLOW", Timeframe::H1, false, now).await });
+        tokio::task::yield_now().await;
+        provider.release.add_permits(1);
+        let (a, b) = tokio::time::timeout(Duration::from_secs(2), async {
+            (first.await.unwrap().unwrap(), second.await.unwrap().unwrap())
+        })
+        .await
+        .unwrap();
+        assert!(Arc::ptr_eq(&a, &b));
+        assert_eq!(provider.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+    #[tokio::test]
+    async fn failed_fetch_is_not_cached() {
+        let provider = lane_provider();
+        provider.fail.store(true, std::sync::atomic::Ordering::SeqCst);
+        let (s, _) = shared(provider.clone(), None);
+        let now = chrono::Utc::now().timestamp();
+        assert!(stack_lane_bars(&s, "FAST", Timeframe::M30, false, now).await.is_err());
+        assert!(s.stack_lanes.lock().unwrap().is_empty());
+        assert!(stack_lane_bars(&s, "FAST", Timeframe::M30, false, now).await.is_ok());
+        assert_eq!(provider.calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+    #[tokio::test]
+    async fn cancelled_fetch_does_not_poison_key() {
+        let provider = lane_provider();
+        let (s, _) = shared(provider.clone(), None);
+        let now = chrono::Utc::now().timestamp();
+        let one = s.clone();
+        let first = tokio::spawn(async move { stack_lane_bars(&one, "SLOW", Timeframe::H1, false, now).await });
+        provider.started.notified().await;
+        // Queue the successor before cancellation, exercising OnceCell handover.
+        let two = s.clone();
+        let second = tokio::spawn(async move { stack_lane_bars(&two, "SLOW", Timeframe::H1, false, now).await });
+        tokio::task::yield_now().await;
+        first.abort();
+        assert!(first.await.unwrap_err().is_cancelled());
+        provider.started.notified().await;
+        provider.release.add_permits(1);
+        assert_eq!(tokio::time::timeout(Duration::from_secs(2), second).await.unwrap().unwrap().unwrap().len(), 400);
+        assert_eq!(provider.calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+    #[tokio::test]
+    async fn lane_cache_evicts_completed_slots_without_removing_pending_initializers() {
+        let provider = lane_provider();
+        let (s, _) = shared(provider, None);
+        let pending = Arc::new(LaneSlot::default());
+        let key = ("PENDING".to_string(), Timeframe::H1, false);
+        {
+            let mut cache = s.stack_lanes.lock().unwrap();
+            cache.insert(key.clone(), pending.clone());
+            for i in 0..256 {
+                let slot = LaneSlot {
+                    value: tokio::sync::OnceCell::new_with(Some(Ok(Arc::new(Vec::new())))),
+                    completed: std::sync::atomic::AtomicI64::new(i),
+                };
+                cache.insert((format!("DONE{i}"), Timeframe::H1, false), Arc::new(slot));
+            }
+        }
+        stack_lane_bars(&s, "FAST", Timeframe::M30, false, chrono::Utc::now().timestamp()).await.unwrap();
+        let cache = s.stack_lanes.lock().unwrap();
+        assert_eq!(cache.len(), 256);
+        assert!(Arc::ptr_eq(cache.get(&key).unwrap(), &pending));
+    }
+
+    #[tokio::test]
+    async fn chart_lanes_bypass_wall_semaphore() {
+        let provider = lane_provider();
+        let (s, _) = shared(provider.clone(), None);
+        let now = chrono::Utc::now().timestamp();
+        let permits = s.wall_fetches.acquire_many(4).await.unwrap();
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(20),
+                stack_wall_lane_bars(&s, "WALL", Timeframe::M30, false, now)
+            )
+            .await
+            .is_err()
+        );
+        assert!(
+            tokio::time::timeout(
+                Duration::from_secs(2),
+                stack_chart_lane_bars(&s, "CHART", Timeframe::M30, false, now)
+            )
+            .await
+            .unwrap()
+            .is_ok()
+        );
+        drop(permits);
+        assert_eq!(provider.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+    #[tokio::test]
+    async fn custom_ladder_lanes_fetch_native_never_resample() {
+        let provider = lane_provider();
+        let (s, rx) = shared(provider.clone(), None);
+        let mut request = stack_request(false);
+        if let Request::TrendStack { ladder, .. } = &mut request {
+            *ladder = Some(vec![Timeframe::M5, Timeframe::M30, Timeframe::H4]);
+        }
+        handle(&s, request).await;
+        let stack = last_stack(&rx).unwrap();
+        assert_eq!(
+            stack.lanes.iter().map(|l| l.tf).collect::<Vec<_>>(),
+            vec![Timeframe::M5, Timeframe::M30, Timeframe::H4]
+        );
+        assert_eq!(*provider.frames.lock().unwrap(), vec![Timeframe::M30, Timeframe::H4]);
+        assert!(stack.lanes.iter().all(|l| l.provenance.is_verified()));
+    }
+    #[tokio::test]
+    async fn sample_provider_custom_ladder_makes_zero_fetches() {
+        let provider =
+            Arc::new(StackPrices { calls: Default::default(), name: "sample", provenance: tr_core::Provenance::Real });
+        let (s, rx) = shared(provider.clone(), None);
+        let mut request = stack_request(false);
+        if let Request::TrendStack { ladder, .. } = &mut request {
+            *ladder = Some(vec![Timeframe::M5, Timeframe::M30, Timeframe::H4]);
+        }
+        handle(&s, request).await;
+        assert!(last_stack(&rx).unwrap_err().contains("SAMPLE"));
+        assert_eq!(provider.calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    struct StackPrices {
+        calls: std::sync::atomic::AtomicUsize,
+        name: &'static str,
+        provenance: tr_core::Provenance,
+    }
+    #[async_trait::async_trait]
+    impl tr_data::MarketData for StackPrices {
+        fn mode(&self) -> DataMode {
+            if self.name == "sample" { DataMode::ExplicitSample } else { DataMode::Live }
+        }
+        fn name(&self) -> &str {
+            self.name
+        }
+        async fn history(&self, _: &str, tf: Timeframe, _: Option<i64>, _: usize) -> anyhow::Result<Vec<Bar>> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(stack_fixture(400, tf, self.provenance))
+        }
+    }
+    fn stack_fixture(n: usize, tf: Timeframe, provenance: tr_core::Provenance) -> Vec<Bar> {
+        let now = chrono::Utc::now().timestamp();
+        let latest = tf.bucket_start(now);
+        (0..n)
+            .map(|i| {
+                let c = if i < 40 { 100.0 + (i as f64 * 0.4).sin() } else { 100.0 + (i - 40) as f64 * 0.8 };
+                Bar::new(latest - (n - 1 - i) as i64 * tf.seconds(), c, c + 0.5, c - 0.5, c, 1000.0)
+                    .with_provenance(provenance)
+            })
+            .collect()
+    }
+    fn stack_request(archive: bool) -> Request {
+        let tf = if archive { Timeframe::D1 } else { Timeframe::M5 };
+        Request::TrendStack {
+            pane: 1,
+            generation: 1,
+            symbol: "BTCUSD Curncy".into(),
+            tf,
+            archive,
+            base: Arc::new(stack_fixture(400, tf, tr_core::Provenance::Real)),
+            params: Default::default(),
+            ladder: None,
+            config_revision: 0,
+        }
+    }
+    fn last_stack(rx: &mpsc::Receiver<Response>) -> Result<TrendStack, String> {
+        rx.try_iter()
+            .filter_map(|r| {
+                let r = match r {
+                    Response::WhatsNews { response, .. } => *response,
+                    other => other,
+                };
+                match r {
+                    Response::TrendStack { result, .. } => Some(result),
+                    _ => None,
+                }
+            })
+            .last()
+            .unwrap()
+    }
+    fn edge_request(generation: u64, daily: bool) -> Request {
+        Request::WallEdge { pane: 31, generation, symbols: vec!["AAPL US Equity".into()], daily, priority: vec![] }
+    }
+    fn edge_fixture() -> Vec<Bar> {
+        let mut date = tr_data::wall_edge::completed_session(chrono::Utc::now().timestamp());
+        let mut days = Vec::new();
+        for _ in 0..8 {
+            date = tr_data::history::calendar::previous_session(date);
+            days.push(date);
+        }
+        days.reverse();
+        days.iter().flat_map(|d| vault_day(&d.to_string())).collect()
+    }
+    #[tokio::test]
+    async fn wall_edge_refuses_sample_provider_without_fetching() {
+        let provider =
+            Arc::new(StackPrices { calls: Default::default(), name: "sample", provenance: tr_core::Provenance::Real });
+        let (s, rx) = shared(provider.clone(), None);
+        let r = edge_request(1, false);
+        assert!(begin_request(&s, &r));
+        handle(&s, r).await;
+        assert!(matches!(&wall_responses(&rx)[0],Response::WallEdgeDone {error:Some(e),..} if e.contains("SAMPLE")));
+        assert_eq!(provider.calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+    #[tokio::test]
+    async fn wall_edge_unverified_symbol_returns_miss_not_numbers() {
+        let provider = Arc::new(StackPrices {
+            calls: Default::default(),
+            name: "fixture",
+            provenance: tr_core::Provenance::Missing,
+        });
+        let (s, rx) = shared(provider, None);
+        let r = edge_request(1, false);
+        begin_request(&s, &r);
+        handle(&s, r).await;
+        assert!(
+            wall_responses(&rx)
+                .iter()
+                .any(|r| matches!(r,Response::WallEdgeRow {result:Err(m),..} if m.code=="UNVERIFIED" && !m.is_test))
+        );
+        assert!(s.wall_edge.lock().unwrap().is_empty());
+    }
+    #[tokio::test]
+    async fn wall_edge_daily_never_calls_the_market_provider() {
+        let provider = vault_provider(edge_fixture());
+        let (mut s, rx) = shared(provider.clone(), None);
+        Arc::get_mut(&mut s).unwrap().history = Arc::new(tr_data::history::Service::new(
+            tr_data::history::Archive::memory().unwrap(),
+            Arc::new(ArchivePrices),
+            tr_data::history::Policy { spacing: Duration::ZERO, ..Default::default() },
+        ));
+        let r = edge_request(1, true);
+        begin_request(&s, &r);
+        handle(&s, r).await;
+        assert!(
+            wall_responses(&rx)
+                .iter()
+                .any(|r| matches!(r,Response::WallEdgeRow {result:Err(m),..} if m.code=="NO DATA"))
+        );
+        s.history.run("ADD", tr_data::history::universe::resolve("AAPL").unwrap(), |_| {}).await.unwrap();
+        s.history.run("REFRESH", vec![], |_| {}).await.unwrap();
+        let r = edge_request(2, true);
+        begin_request(&s, &r);
+        handle(&s, r).await;
+        assert!(
+            wall_responses(&rx)
+                .iter()
+                .any(|r| matches!(r,Response::WallEdgeRow {result:Err(m),..} if m.code=="SHORT HISTORY" && m.is_test))
+        );
+        assert_eq!(provider.calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+    #[tokio::test]
+    async fn wall_edge_second_request_hits_memo_and_report_cache() {
+        let provider = vault_provider(edge_fixture());
+        let (s, rx) = shared(provider.clone(), None);
+        let r = edge_request(1, false);
+        begin_request(&s, &r);
+        handle(&s, r).await;
+        let a = wall_responses(&rx)
+            .into_iter()
+            .find_map(|r| if let Response::WallEdgeRow { result: Ok(r), .. } = r { Some(r) } else { None })
+            .unwrap();
+        let count = provider.calls.load(std::sync::atomic::Ordering::SeqCst);
+        let r = edge_request(2, false);
+        begin_request(&s, &r);
+        handle(&s, r).await;
+        let b = wall_responses(&rx)
+            .into_iter()
+            .find_map(|r| if let Response::WallEdgeRow { result: Ok(r), .. } = r { Some(r) } else { None })
+            .unwrap();
+        assert!(Arc::ptr_eq(&a, &b));
+        assert_eq!(provider.calls.load(std::sync::atomic::Ordering::SeqCst), count);
+        // Bypass only the acquisition memo; identical admitted inputs still reuse ReportCache.
+        s.wall_edge.lock().unwrap().clear();
+        let c = wall_edge_one(&s, "AAPL US Equity", false, 31, 2).await.unwrap();
+        assert!(Arc::ptr_eq(&a, &c));
+        // A different pane shares the memo too.
+        claim_wall_edge(&s, 32, 1);
+        let d = wall_edge_one(&s, "AAPL US Equity", false, 32, 1).await.unwrap();
+        assert!(Arc::ptr_eq(&c, &d));
+    }
+    #[test]
+    fn wall_edge_report_cache_misses_on_new_session_epoch_and_params() {
+        let mut bars = edge_fixture();
+        let cache = tr_data::report_cache::ReportCache::default();
+        let p = AdaptiveTrendParams::default();
+        let now = chrono::Utc::now().timestamp();
+        let a = wall_edge_cached(&cache, "AAPL", Timeframe::M5, p, &bars, "yahoo", Some(now), None).unwrap();
+        let b = wall_edge_cached(&cache, "AAPL", Timeframe::M5, p, &bars, "yahoo", Some(now), None).unwrap();
+        assert!(Arc::ptr_eq(&a, &b));
+        let mut info = tr_data::vault::StitchInfo { source: "yahoo".into(), epoch: 2, ..Default::default() };
+        let b = wall_edge_cached(&cache, "AAPL", Timeframe::M5, p, &bars, "yahoo", Some(now), Some(&info)).unwrap();
+        assert!(!Arc::ptr_eq(&a, &b));
+        info.epoch += 1;
+        let c = wall_edge_cached(&cache, "AAPL", Timeframe::M5, p, &bars, "yahoo", Some(now), Some(&info)).unwrap();
+        assert!(!Arc::ptr_eq(&b, &c));
+        let d = wall_edge_cached(
+            &cache,
+            "AAPL",
+            Timeframe::M5,
+            AdaptiveTrendParams { confirm_mult: 0.5, ..p },
+            &bars,
+            "yahoo",
+            Some(now),
+            None,
+        )
+        .unwrap();
+        assert!(!Arc::ptr_eq(&a, &d));
+        let date = tr_core::ny::civil(bars.last().unwrap().ts).date();
+        let next = tr_data::history::calendar::next_session(date);
+        bars.extend(vault_day(&next.to_string()));
+        let e = wall_edge_cached(&cache, "AAPL", Timeframe::M5, p, &bars, "yahoo", Some(now), None).unwrap();
+        assert!(!Arc::ptr_eq(&a, &e));
+        bars[10].close += 0.1;
+        let f = wall_edge_cached(&cache, "AAPL", Timeframe::M5, p, &bars, "yahoo", Some(now), None).unwrap();
+        assert!(!Arc::ptr_eq(&e, &f));
+        let g = wall_edge_cached(&cache, "AAPL", Timeframe::M5, p, &bars, "other", Some(now), None).unwrap();
+        assert!(!Arc::ptr_eq(&f, &g));
+    }
+    struct EdgeBlocked {
+        calls: std::sync::atomic::AtomicUsize,
+        release: tokio::sync::Semaphore,
+        seen: std::sync::Mutex<Vec<String>>,
+    }
+    fn edge_blocked() -> Arc<EdgeBlocked> {
+        Arc::new(EdgeBlocked {
+            calls: Default::default(),
+            release: tokio::sync::Semaphore::new(0),
+            seen: Default::default(),
+        })
+    }
+    #[async_trait::async_trait]
+    impl tr_data::MarketData for EdgeBlocked {
+        fn name(&self) -> &str {
+            "edge blocked"
+        }
+        async fn history(&self, symbol: &str, _: Timeframe, _: Option<i64>, _: usize) -> anyhow::Result<Vec<Bar>> {
+            self.seen.lock().unwrap().push(symbol.to_string());
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.release.acquire().await.unwrap().forget();
+            Ok(edge_fixture())
+        }
+    }
+    async fn wait_edge_calls(p: &EdgeBlocked, n: usize) {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while p.calls.load(std::sync::atomic::Ordering::SeqCst) < n {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .unwrap();
+    }
+    #[tokio::test]
+    async fn wall_edge_cancels_when_generation_advances() {
+        let provider = edge_blocked();
+        let (s, rx) = shared(provider.clone(), None);
+        let r = edge_request(1, false);
+        begin_request(&s, &r);
+        let one = s.clone();
+        let task = tokio::spawn(async move { handle(&one, r).await });
+        wait_edge_calls(&provider, 1).await;
+        let next = edge_request(2, false);
+        begin_request(&s, &next);
+        tokio::time::timeout(Duration::from_secs(1), task).await.unwrap().unwrap();
+        assert!(wall_responses(&rx).is_empty());
+        assert_eq!(s.wall_fetches.available_permits(), 4);
+        assert!(!begin_request(&s, &edge_request(1, false)));
+    }
+    #[tokio::test]
+    async fn wall_edge_forget_removes_generation() {
+        let provider = vault_provider(edge_fixture());
+        let (s, rx) = shared(provider.clone(), None);
+        let r = edge_request(1, false);
+        begin_request(&s, &r);
+        assert!(!begin_request(&s, &Request::Forget(31)));
+        assert!(!wall_edge_current(&s, 31, 1));
+        handle(&s, r).await;
+        assert!(wall_responses(&rx).is_empty());
+        assert_eq!(provider.calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+    #[tokio::test]
+    async fn wall_edge_fetches_are_bounded_by_the_wall_semaphore() {
+        let provider = edge_blocked();
+        let (s, rx) = shared(provider.clone(), None);
+        let names = ["AAPL", "MSFT", "NVDA", "META", "GOOG", "AMZN", "TSLA", "SPY", "QQQ", "IWM", "DIA", "XLF"];
+        let r = Request::WallEdge {
+            pane: 31,
+            generation: 1,
+            daily: false,
+            symbols: names.iter().map(|s| tr_data::security(s).key()).collect(),
+            // The three bottom rows are on screen.
+            priority: vec![9, 10, 11],
+        };
+        begin_request(&s, &r);
+        let one = s.clone();
+        let task = tokio::spawn(async move { handle(&one, r).await });
+        wait_edge_calls(&provider, 4).await;
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert_eq!(provider.calls.load(std::sync::atomic::Ordering::SeqCst), 4);
+        assert_eq!(s.wall_fetches.available_permits(), 0);
+        // Only the first WALL_EDGE_IN_FLIGHT rows in on-screen order were started.
+        let first = provider.seen.lock().unwrap().clone();
+        let allowed: Vec<_> = [9, 10, 11, 0, 1, 2].iter().map(|&i| tr_data::security(names[i]).key()).collect();
+        assert!(first.iter().all(|s| allowed.contains(s)), "{first:?}");
+        provider.release.add_permits(names.len());
+        tokio::time::timeout(Duration::from_secs(5), task).await.unwrap().unwrap();
+        assert_eq!(
+            wall_responses(&rx).iter().filter(|r| matches!(r, Response::WallEdgeRow { .. })).count(),
+            names.len()
+        );
+    }
+    #[test]
+    fn wall_edge_next_follows_focus_then_priority_then_row_order() {
+        let mut started = vec![false; 6];
+        assert_eq!(wall_edge_next(&[], &[4, 5], &mut started), Some(4));
+        assert_eq!(wall_edge_next(&[2, 4], &[4, 5], &mut started), Some(2));
+        assert_eq!(wall_edge_next(&[2, 4, 99], &[4, 5], &mut started), Some(5));
+        assert_eq!(wall_edge_next(&[], &[], &mut started), Some(0));
+        assert_eq!(wall_edge_next(&[], &[], &mut started), Some(1));
+        assert_eq!(wall_edge_next(&[], &[], &mut started), Some(3));
+        assert_eq!(wall_edge_next(&[], &[], &mut started), None);
+    }
+    #[tokio::test]
+    async fn wall_edge_focus_is_kept_only_for_the_current_generation() {
+        let (s, _rx) = shared(edge_blocked(), None);
+        begin_request(&s, &edge_request(3, false));
+        assert!(!begin_request(&s, &Request::WallEdgeFocus { pane: 31, generation: 2, priority: vec![1] }));
+        assert!(s.wall_edge_focus.lock().unwrap().is_empty());
+        begin_request(&s, &Request::WallEdgeFocus { pane: 31, generation: 3, priority: vec![1] });
+        assert_eq!(s.wall_edge_focus.lock().unwrap().get(&31), Some(&(3, vec![1])));
+        begin_request(&s, &Request::Forget(31));
+        assert!(s.wall_edge_focus.lock().unwrap().is_empty());
+    }
+    /// A vault that already holds a full contiguous Edge window, admitted after the last
+    /// completed close, serves Edge with zero provider requests.
+    #[tokio::test]
+    async fn wall_edge_reuses_a_full_vault_window_without_a_provider_call() {
+        let mut date = tr_data::wall_edge::completed_session(chrono::Utc::now().timestamp());
+        let mut days = vec![date];
+        while days.len() * 78 < tr_data::wall_edge::MAX_BARS + 200 {
+            date = tr_data::history::calendar::previous_session(date);
+            days.push(date);
+        }
+        days.reverse();
+        let bars: Vec<Bar> = days
+            .iter()
+            .flat_map(|d| vault_day(&d.to_string()))
+            .enumerate()
+            .map(|(i, mut b)| {
+                let c = 100.0 + (i as f64 / 23.0).sin() * 2.0;
+                (b.open, b.high, b.low, b.close) = (c, c + 0.1, c - 0.1, c);
+                b
+            })
+            .collect();
+        let provider = vault_provider(vec![]);
+        let (s, rx) = shared(provider.clone(), Some(BarCache::open_in_memory().unwrap()));
+        let now = chrono::Utc::now().timestamp();
+        let id =
+            tr_data::vault::SeriesId { symbol: "AAPL US Equity".into(), tf: Timeframe::M5, source: "yahoo".into() };
+        let stored = cache_op(&s, move |v| v.ingest(&id, &bars, DataMode::Live, now)).await.unwrap();
+        assert!(stored.inserted > tr_data::wall_edge::MAX_BARS);
+        let r = edge_request(1, false);
+        begin_request(&s, &r);
+        handle(&s, r).await;
+        let report = wall_responses(&rx)
+            .into_iter()
+            .find_map(|r| if let Response::WallEdgeRow { result, .. } = r { Some(result) } else { None })
+            .unwrap()
+            .unwrap();
+        assert_eq!(provider.calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert_eq!(report.bars, tr_data::wall_edge::MAX_BARS);
+        assert_eq!(report.source, "yahoo");
+        assert!(!report.vault_only);
+        // A vault that has not observed the last completed close still goes to the provider.
+        let (s, _rx) = shared(provider.clone(), Some(BarCache::open_in_memory().unwrap()));
+        assert!(wall_edge_vault_window(&s, "AAPL US Equity", days[days.len() - 1]).await.is_none());
+    }
+    #[tokio::test]
+    async fn wall_edge_cancelled_initializer_does_not_poison_another_pane() {
+        let provider = edge_blocked();
+        let (s, rx) = shared(provider.clone(), None);
+        let first = edge_request(1, false);
+        begin_request(&s, &first);
+        let one = s.clone();
+        let first = tokio::spawn(async move { handle(&one, first).await });
+        wait_edge_calls(&provider, 1).await;
+        let second = Request::WallEdge {
+            pane: 32,
+            generation: 1,
+            symbols: vec!["AAPL US Equity".into()],
+            daily: false,
+            priority: vec![],
+        };
+        begin_request(&s, &second);
+        let two = s.clone();
+        let second = tokio::spawn(async move { handle(&two, second).await });
+        tokio::task::yield_now().await;
+        begin_request(&s, &Request::CancelWallEdge { pane: 31, generation: 2 });
+        tokio::time::timeout(Duration::from_secs(1), first).await.unwrap().unwrap();
+        wait_edge_calls(&provider, 2).await;
+        provider.release.add_permits(1);
+        tokio::time::timeout(Duration::from_secs(2), second).await.unwrap().unwrap();
+        let responses = wall_responses(&rx);
+        assert!(responses.iter().any(|r| matches!(r, Response::WallEdgeRow { pane: 32, result: Ok(_), .. })));
+        assert!(
+            !responses
+                .iter()
+                .any(|r| matches!(r, Response::WallEdgeRow { pane: 31, .. } | Response::WallEdgeDone { pane: 31, .. }))
+        );
+    }
+    #[tokio::test]
+    async fn lane_cache_holds_fifty_names_times_four_lanes() {
+        let (s, _) = shared(lane_provider(), None);
+        let now = chrono::Utc::now().timestamp();
+        {
+            let mut cache = s.stack_lanes.lock().unwrap();
+            for i in 0..50 {
+                for tf in [Timeframe::M5, Timeframe::M15, Timeframe::H1, Timeframe::D1] {
+                    cache.insert(
+                        (format!("S{i}"), tf, false),
+                        Arc::new(LaneSlot {
+                            value: tokio::sync::OnceCell::new_with(Some(Ok(Arc::new(Vec::new())))),
+                            completed: std::sync::atomic::AtomicI64::new(now),
+                        }),
+                    );
+                }
+            }
+        }
+        stack_lane_bars(&s, "FAST", Timeframe::M30, false, now).await.unwrap();
+        assert_eq!(s.stack_lanes.lock().unwrap().len(), 201);
+    }
+    fn wall_request(generation: u64, daily: bool) -> Request {
+        Request::TrendWall { pane: 31, generation, symbols: vec!["AAPL US Equity".into()], daily }
+    }
+    fn wall_responses(rx: &mpsc::Receiver<Response>) -> Vec<Response> {
+        rx.try_iter()
+            .map(|r| match r {
+                Response::WhatsNews { response, .. } => *response,
+                r => r,
+            })
+            .collect()
+    }
+    #[tokio::test]
+    async fn trend_wall_refuses_sample_provider_without_fetching() {
+        let provider =
+            Arc::new(StackPrices { calls: Default::default(), name: "sample", provenance: tr_core::Provenance::Real });
+        let (s, rx) = shared(provider.clone(), None);
+        let request = wall_request(1, false);
+        assert!(begin_request(&s, &request));
+        handle(&s, request).await;
+        let responses = wall_responses(&rx);
+        assert_eq!(responses.len(), 1);
+        assert!(
+            matches!(&responses[0], Response::TrendWallDone { error: Some(e), .. } if e.contains("REFUSED") && e.contains("SAMPLE"))
+        );
+        assert_eq!(provider.calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert!(s.stack_lanes.lock().unwrap().is_empty());
+    }
+    #[tokio::test]
+    async fn trend_wall_unverified_symbol_is_refused_row_not_cached() {
+        let provider = Arc::new(StackPrices {
+            calls: Default::default(),
+            name: "fixture",
+            provenance: tr_core::Provenance::Missing,
+        });
+        let (s, rx) = shared(provider.clone(), Some(BarCache::open_in_memory().unwrap()));
+        let request = wall_request(1, false);
+        assert!(begin_request(&s, &request));
+        handle(&s, request).await;
+        let responses = wall_responses(&rx);
+        assert!(responses.iter().any(|r| matches!(r, Response::TrendWallRow { row, .. } if matches!(row.status, LaneStatus::Refused(_)) && row.score.is_none())));
+        assert!(s.stack_lanes.lock().unwrap().is_empty());
+        assert!(
+            s.cache.lock().unwrap().as_ref().unwrap().load("AAPL US Equity", Timeframe::M5, 400).unwrap().is_empty()
+        );
+        assert_eq!(provider.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+    #[tokio::test]
+    async fn trend_wall_daily_never_calls_the_market_provider() {
+        let provider =
+            Arc::new(StackPrices { calls: Default::default(), name: "fixture", provenance: tr_core::Provenance::Real });
+        let (mut s, rx) = shared(provider.clone(), None);
+        Arc::get_mut(&mut s).unwrap().history = Arc::new(tr_data::history::Service::new(
+            tr_data::history::Archive::memory().unwrap(),
+            Arc::new(ArchivePrices),
+            tr_data::history::Policy { spacing: Duration::ZERO, ..Default::default() },
+        ));
+        // A missing archive must not fall through to a bridge or market provider.
+        let request = wall_request(1, true);
+        assert!(begin_request(&s, &request));
+        handle(&s, request).await;
+        assert!(wall_responses(&rx).iter().any(
+            |r| matches!(r, Response::TrendWallRow { row, .. } if matches!(row.status, LaneStatus::Unavailable(_)))
+        ));
+        // Seed only through the in-memory DailyHistory fixture; no HTTP in this test.
+        s.history.run("ADD", tr_data::history::universe::resolve("AAPL").unwrap(), |_| {}).await.unwrap();
+        s.history.run("REFRESH", vec![], |_| {}).await.unwrap();
+        let request = wall_request(2, true);
+        assert!(begin_request(&s, &request));
+        handle(&s, request).await;
+        let responses = wall_responses(&rx);
+        let row = responses
+            .iter()
+            .find_map(|r| if let Response::TrendWallRow { row, .. } = r { Some(row) } else { None })
+            .unwrap();
+        assert!(row.daily);
+        assert!(row.provenance.is_verified());
+        assert_eq!(
+            row.lanes.iter().map(|l| l.tf).collect::<Vec<_>>(),
+            vec![Timeframe::D1, Timeframe::W1, Timeframe::MN1]
+        );
+        assert_eq!(provider.calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+    #[tokio::test]
+    async fn trend_wall_reuses_stack_lane_cache_with_chart() {
+        let provider =
+            Arc::new(StackPrices { calls: Default::default(), name: "fixture", provenance: tr_core::Provenance::Real });
+        let (s, rx) = shared(provider.clone(), Some(BarCache::open_in_memory().unwrap()));
+        let mut chart = stack_request(false);
+        if let Request::TrendStack { symbol, base, .. } = &mut chart {
+            *symbol = "AAPL US Equity".into();
+            *base = Arc::new(tr_data::intraday::regular_only(stack_fixture(
+                2000,
+                Timeframe::M5,
+                tr_core::Provenance::Real,
+            )));
+        }
+        handle(&s, chart).await;
+        assert_eq!(last_stack(&rx).unwrap().lanes.len(), 4);
+        let calls = provider.calls.load(std::sync::atomic::Ordering::SeqCst);
+        let request = wall_request(1, false);
+        assert!(begin_request(&s, &request));
+        handle(&s, request).await;
+        assert!(wall_responses(&rx).iter().any(|r| matches!(r, Response::TrendWallRow { .. })));
+        assert_eq!(provider.calls.load(std::sync::atomic::Ordering::SeqCst), calls);
+    }
+    #[tokio::test]
+    async fn trend_wall_drops_stale_generation() {
+        let provider =
+            Arc::new(StackPrices { calls: Default::default(), name: "fixture", provenance: tr_core::Provenance::Real });
+        let (s, rx) = shared(provider.clone(), None);
+        let old = wall_request(1, false);
+        let current = wall_request(2, false);
+        assert!(begin_request(&s, &old));
+        assert!(begin_request(&s, &current));
+        assert!(!begin_request(&s, &old));
+        handle(&s, old).await;
+        assert!(wall_responses(&rx).is_empty());
+        assert_eq!(provider.calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert!(!begin_request(&s, &Request::Forget(31)));
+        handle(&s, current).await;
+        assert!(wall_responses(&rx).is_empty());
+    }
+
+    #[tokio::test]
+    async fn trend_stack_refuses_the_sample_provider_without_fetching() {
+        let provider =
+            Arc::new(StackPrices { calls: Default::default(), name: "sample", provenance: tr_core::Provenance::Real });
+        let (s, rx) = shared(provider.clone(), None);
+        handle(&s, stack_request(false)).await;
+        assert!(last_stack(&rx).unwrap_err().contains("SAMPLE"));
+        assert_eq!(provider.calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert!(s.stack_lanes.lock().unwrap().is_empty());
+    }
+    #[tokio::test]
+    async fn trend_stack_lanes_are_cached_until_their_ttl() {
+        let provider =
+            Arc::new(StackPrices { calls: Default::default(), name: "fixture", provenance: tr_core::Provenance::Real });
+        let cache = BarCache::open_in_memory().unwrap();
+        let (s, rx) = shared(provider.clone(), Some(cache));
+        for _ in 0..2 {
+            handle(&s, stack_request(false)).await;
+            assert_eq!(last_stack(&rx).unwrap().lanes.len(), 4);
+        }
+        assert_eq!(provider.calls.load(std::sync::atomic::Ordering::SeqCst), 3);
+        assert_eq!(s.stack_lanes.lock().unwrap().len(), 3);
+        assert!(
+            s.cache.lock().unwrap().as_ref().unwrap().fetched_at("BTCUSD Curncy", Timeframe::H1).unwrap().is_some()
+        );
+        for slot in s.stack_lanes.lock().unwrap().values() {
+            slot.completed.fetch_sub(1000, std::sync::atomic::Ordering::SeqCst);
+        }
+        handle(&s, stack_request(false)).await;
+        assert_eq!(provider.calls.load(std::sync::atomic::Ordering::SeqCst), 6);
+    }
+    #[tokio::test]
+    async fn trend_stack_unverified_lane_fetch_is_not_cached_or_scored() {
+        let provider = Arc::new(StackPrices {
+            calls: Default::default(),
+            name: "fixture",
+            provenance: tr_core::Provenance::Missing,
+        });
+        let (s, rx) = shared(provider, Some(BarCache::open_in_memory().unwrap()));
+        handle(&s, stack_request(false)).await;
+        let stack = last_stack(&rx).unwrap();
+        assert_eq!(stack.score.unwrap().scored, 1);
+        assert!(stack.lanes.iter().skip(1).all(|l| matches!(l.status, LaneStatus::Refused(_))));
+        assert!(s.stack_lanes.lock().unwrap().is_empty());
+        assert!(
+            s.cache.lock().unwrap().as_ref().unwrap().load("BTCUSD Curncy", Timeframe::H1, 400).unwrap().is_empty()
+        );
+    }
+    #[tokio::test]
+    async fn archive_trend_stack_never_calls_the_market_provider() {
+        let provider =
+            Arc::new(StackPrices { calls: Default::default(), name: "fixture", provenance: tr_core::Provenance::Real });
+        let (mut s, rx) = shared(provider.clone(), None);
+        Arc::get_mut(&mut s).unwrap().history = Arc::new(tr_data::history::Service::new(
+            tr_data::history::Archive::memory().unwrap(),
+            Arc::new(ArchivePrices),
+            tr_data::history::Policy { spacing: Duration::ZERO, ..Default::default() },
+        ));
+        s.whats_news.send_replace((0, tr_data::whats_news::Config { enabled: false, ..Default::default() }));
+        s.history.run("ADD", tr_data::history::universe::resolve("AAPL").unwrap(), |_| {}).await.unwrap();
+        s.history.run("REFRESH", vec![], |_| {}).await.unwrap();
+        let mut request = stack_request(true);
+        if let Request::TrendStack { symbol, .. } = &mut request {
+            *symbol = "AAPL US Equity".into();
+        }
+        handle(&s, request).await;
+        let stack = last_stack(&rx).unwrap();
+        assert_eq!(provider.calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert_eq!(
+            stack.lanes.iter().map(|l| l.tf).collect::<Vec<_>>(),
+            vec![Timeframe::D1, Timeframe::W1, Timeframe::MN1]
+        );
+        assert!(stack.lanes.iter().all(|l| l.provenance.is_verified()));
+    }
+    #[test]
+    fn stale_lane_is_marked_and_excluded_from_score() {
+        let base = stack_fixture(1000, Timeframe::M5, tr_core::Provenance::Real);
+        let mut hourly = stack_fixture(100, Timeframe::H1, tr_core::Provenance::Real);
+        for b in &mut hourly {
+            b.ts -= 100_000;
+        }
+        let mut stack =
+            trend_stack(&base, Timeframe::M5, vec![(Timeframe::H1, Ok(hourly))], Default::default()).unwrap();
+        mark_stack_freshness(&mut stack, tr_core::AssetClass::Crypto, false, chrono::Utc::now().timestamp());
+        assert!(matches!(stack.lanes[1].status, LaneStatus::Stale { .. }));
+        assert_eq!(stack.score.unwrap().scored, 1);
+    }
+
+    struct OfflinePrices {
+        calls: std::sync::atomic::AtomicUsize,
+        provenance: tr_core::Provenance,
+    }
+
+    #[async_trait::async_trait]
+    impl tr_data::MarketData for OfflinePrices {
+        fn name(&self) -> &str {
+            "offline test provider"
+        }
+        async fn history(&self, symbol: &str, _: Timeframe, _: Option<i64>, _: usize) -> anyhow::Result<Vec<Bar>> {
+            assert_eq!(tr_data::yahoo::yahoo_symbol(&tr_data::security(symbol)), "BRL=X");
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(vec![Bar::new(6001, 5.0, 5.1, 4.9, 5.03, 1.0).with_provenance(self.provenance)])
+        }
+    }
+
+    pub(super) fn shared(provider: Provider, cache: Option<BarCache>) -> (Arc<Shared>, mpsc::Receiver<Response>) {
+        let (out, rx) = mpsc::channel();
+        (
+            Arc::new(Shared {
+                jobs: Default::default(),
+                history: Arc::new(tr_data::history::Service::new(
+                    tr_data::history::Archive::memory().unwrap(),
+                    Arc::new(tr_data::yahoo::YahooProvider::new().unwrap()),
+                    Default::default(),
+                )),
+                whats_news: tokio::sync::watch::channel((0, Default::default())).0,
+                provider,
+                series: Default::default(),
+                feed_requests: Default::default(),
+                followers: Default::default(),
+                archive_daily: Default::default(),
+                stack_lanes: Default::default(),
+                auction_fine: Default::default(),
+                wall_fetches: tokio::sync::Semaphore::new(4),
+                wall_generations: Default::default(),
+                wall_edge_generations: Default::default(),
+                wall_edge_focus: Default::default(),
+                wall_edge: Default::default(),
+                wall_edge_compute: Arc::new(tokio::sync::Semaphore::new(4)),
+                cache: Arc::new(std::sync::Mutex::new(
+                    cache.map(|c| BarVault::from_cache(c).expect("vault migration")),
+                )),
+                reports: Default::default(),
+                native: Default::default(),
+                chart_sources: Default::default(),
+                news: Default::default(),
+                price_alerts: Default::default(),
+                price_alerts_path: PathBuf::new(),
+                trade_plans: Default::default(),
+                trade_plans_path: PathBuf::new(),
+                db: Mutex::new(Db::open_in_memory().unwrap()),
+                out,
+                ctx: egui::Context::default(),
+            }),
+            rx,
+        )
+    }
+
+    #[tokio::test]
+    async fn worker_logs_wall_and_cpu_time_per_kind() {
+        let (s, rx) = shared(Arc::new(tr_data::sample::SampleProvider::at(0, 10)), None);
+        let bars = Arc::new(tr_perf::fixtures::crypto_m5(500, 1_790_000_000));
+        let now = bars.last().unwrap().ts + 300;
+        let key = tr_data::anchored_vwap::AvwapKey::new(1, Timeframe::M5, &[bars[0].ts], &bars, bars.len());
+        handle(&s, Request::AnchoredVwap { pane: 1, key, class: tr_core::AssetClass::Crypto, bars, as_of: Some(now) })
+            .await;
+        assert!(matches!(rx.try_recv().unwrap(), Response::AnchoredVwap { result: Ok(_), .. }));
+        let rows = s.jobs.snapshot();
+        for phase in [crate::perf::Phase::Cpu, crate::perf::Phase::Wall] {
+            let row = rows.iter().find(|r| r.kind == "AnchoredVwap" && r.phase == phase).expect("recorded job");
+            assert_eq!(row.count, 1);
+            assert!(row.last > 0.0);
+        }
+    }
+
+    #[tokio::test]
+    async fn sample_and_unverified_bars_are_refused() {
+        use tr_data::anchored_vwap::AvwapKey;
+        let (s, rx) = shared(Arc::new(tr_data::sample::SampleProvider::at(0, 10)), None);
+        let fixture = |p: tr_core::Provenance| {
+            Arc::new(
+                (0..5).map(|i| Bar::new(i * 60, 10.0, 11.0, 9.0, 10.0, 100.0).with_provenance(p)).collect::<Vec<_>>(),
+            )
+        };
+        let run = async |p: tr_core::Provenance| {
+            let bars = fixture(p);
+            let key = AvwapKey::new(3, Timeframe::M1, &[0], &bars, 4);
+            handle(
+                &s,
+                Request::AnchoredVwap {
+                    pane: 7,
+                    key: key.clone(),
+                    class: tr_core::AssetClass::Equity,
+                    bars,
+                    as_of: None,
+                },
+            )
+            .await;
+            rx.try_iter()
+                .find_map(|r| match r {
+                    Response::AnchoredVwap { pane: 7, key: k, result } => Some((k == key, result)),
+                    _ => None,
+                })
+                .expect("anchored vwap response")
+        };
+        for p in [tr_core::Provenance::Sample, tr_core::Provenance::Missing] {
+            let (same, result) = run(p).await;
+            assert!(same);
+            let error = result.unwrap_err();
+            assert!(error.contains("Anchored VWAP refused"), "{error}");
+        }
+        // Verified bars compute; without an observation time the last bar stays forming.
+        let (_, result) = run(tr_core::Provenance::Real).await;
+        let report = result.unwrap();
+        assert_eq!((report.n, report.closed), (5, 4));
+        assert!(report.lines[0].as_ref().unwrap().vwap.iter().all(|v| (v - 10.0).abs() < 1e-12));
+    }
+
+    struct ArchivePrices;
+    #[async_trait::async_trait]
+    impl tr_data::history::DailyHistory for ArchivePrices {
+        async fn daily(
+            &self,
+            _: &str,
+            start: Option<chrono::NaiveDate>,
+            _: chrono::NaiveDate,
+        ) -> Result<Vec<Bar>, tr_data::history::Failure> {
+            let days = if start.is_none() {
+                vec!["2026-08-31", "2026-09-01", "2026-09-04", "2026-09-08"]
+            } else {
+                vec!["2026-09-01", "2026-09-04", "2026-09-08", "2026-09-09"]
+            };
+            Ok(days
+                .into_iter()
+                .map(|day| {
+                    Bar::new(
+                        day.parse::<chrono::NaiveDate>().unwrap().and_hms_opt(0, 0, 0).unwrap().and_utc().timestamp(),
+                        10.0,
+                        12.0,
+                        9.0,
+                        11.0,
+                        5.0,
+                    )
+                    .with_provenance(tr_core::Provenance::Real)
+                })
+                .collect())
+        }
+    }
+    #[tokio::test]
+    async fn local_research_and_full_archive_candles_work_without_whats_news_or_market_provider() {
+        let (mut s, rx) = shared(Arc::new(tr_data::sample::SampleProvider::at(0, 10)), None);
+        Arc::get_mut(&mut s).unwrap().history = Arc::new(tr_data::history::Service::new(
+            tr_data::history::Archive::memory().unwrap(),
+            Arc::new(ArchivePrices),
+            tr_data::history::Policy { spacing: Duration::ZERO, ..Default::default() },
+        ));
+        let config = tr_data::whats_news::Config { enabled: false, ..Default::default() };
+        s.whats_news.send_replace((0, config.clone()));
+        s.history.run("ADD", tr_data::history::universe::resolve("AAPL").unwrap(), |_| {}).await.unwrap();
+        s.history.run("REFRESH", vec![], |_| {}).await.unwrap();
+        let universe = research_universe(&s, &config.bridge()).await.unwrap();
+        assert_eq!(universe.data.len(), 1);
+        assert_eq!(universe.data[0].last_date.as_deref(), Some("2026-09-09"));
+        let scan = research_scan(&s, &config.bridge(), "NEAR_HIGH").await.unwrap();
+        assert!(scan.provenance.is_verified());
+        for tf in [Timeframe::W1, Timeframe::MN1] {
+            let req = Request::ArchiveHistory {
+                pane: 1,
+                generation: 1,
+                symbol: "AAPL US Equity".into(),
+                tf,
+                limit: archive_page(tf),
+                before: None,
+            };
+            assert!(begin_request(&s, &req));
+            handle(&s, req).await;
+            let Response::WhatsNews { response, .. } = rx.try_recv().unwrap() else {
+                panic!("expected archive response")
+            };
+            let Response::History { bars, symbol, tf: actual, live, .. } = *response else {
+                panic!("expected verified daily-derived candles")
+            };
+            assert_eq!(actual, tf);
+            assert_eq!(symbol, "AAPL US Equity");
+            assert!(!live);
+            assert_eq!(bars.len(), 2);
+            assert!(bars.iter().all(|b| b.provenance.is_verified()));
+            assert_eq!(bars.iter().map(|b| b.volume).sum::<f64>(), 25.0);
+            if tf == Timeframe::W1 {
+                assert_eq!(bars[0].volume, 15.0);
+                assert_eq!(bars[1].volume, 10.0);
+            } else {
+                assert_eq!(bars[0].volume, 5.0);
+                assert_eq!(bars[1].volume, 20.0);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn holding_history_returns_separate_spy_and_preserves_partial_results() {
+        let (mut s, rx) = shared(Arc::new(tr_data::sample::SampleProvider::at(0, 10)), None);
+        Arc::get_mut(&mut s).unwrap().history = Arc::new(tr_data::history::Service::new(
+            tr_data::history::Archive::memory().unwrap(),
+            Arc::new(ArchivePrices),
+            tr_data::history::Policy { spacing: Duration::ZERO, ..Default::default() },
+        ));
+        s.whats_news.send_replace((0, tr_data::whats_news::Config { enabled: false, ..Default::default() }));
+        s.history.run("ADD", tr_data::history::universe::resolve("AAPL").unwrap(), |_| {}).await.unwrap();
+        s.history.run("REFRESH", vec![], |_| {}).await.unwrap();
+        handle(&s, Request::HoldingHistory { pane: 1, generation: 7, symbols: vec!["AAPL US Equity".into()] }).await;
+        let Response::WhatsNews { response, .. } = rx.try_recv().unwrap() else { panic!("expected archive envelope") };
+        let Response::HoldingHistory { generation, rows, spy, error, .. } = *response else {
+            panic!("expected holdings response")
+        };
+        assert_eq!(generation, 7);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].0, "AAPL US Equity");
+        assert!(spy.is_none());
+        assert!(error.unwrap().contains("SPY"));
+
+        s.history.run("ADD", tr_data::history::universe::resolve("SPY").unwrap(), |_| {}).await.unwrap();
+        s.history.run("REFRESH", vec![], |_| {}).await.unwrap();
+        for symbols in [vec!["AAPL US Equity".into()], vec!["AAPL US Equity".into(), "SPY US Equity".into()]] {
+            handle(&s, Request::HoldingHistory { pane: 1, generation: 8, symbols: symbols.clone() }).await;
+            let Response::WhatsNews { response, .. } = rx.try_recv().unwrap() else {
+                panic!("expected archive envelope")
+            };
+            let Response::HoldingHistory { rows, spy, error, .. } = *response else {
+                panic!("expected holdings response")
+            };
+            assert!(error.is_none());
+            assert_eq!(rows.len(), symbols.len());
+            let spy = spy.unwrap();
+            Bar::require_verified(&spy, "test benchmark").unwrap();
+            if let Some((_, held_spy)) = rows.iter().find(|(symbol, _)| symbol == "SPY US Equity") {
+                assert_eq!(*held_spy, spy);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn studio_shape_stages_are_cached_and_refuse_sample_without_fetch() {
+        let r = Arc::new(
+            tr_data::studio_dist::compute(
+                "AAPL",
+                &tr_perf::fixtures::regime_walk(500),
+                Timeframe::D1,
+                tr_data::studio_dist::Window::All,
+                "fixture",
+                None,
+            )
+            .unwrap(),
+        );
+        let provider = vault_provider(vault_day("2026-11-09"));
+        let (s, rx) = shared(provider.clone(), Some(BarCache::open_in_memory().unwrap()));
+        let mut prev = None;
+        let mut prev_ci = None;
+        for generation in [1, 2] {
+            handle(
+                &s,
+                Request::StudioShape {
+                    pane: 19,
+                    generation,
+                    report: r.clone(),
+                    horizon: 1,
+                    overlap: false,
+                    thresholds: [0.01, 0.02, 0.05],
+                },
+            )
+            .await;
+            let Response::WhatsNews { response, .. } = rx.try_recv().unwrap() else { panic!() };
+            let Response::StudioShape { result, .. } = *response else { panic!() };
+            let shape = result.unwrap();
+            if let Some(p) = prev {
+                assert!(Arc::ptr_eq(&p, &shape));
+            }
+            prev = Some(shape.clone());
+            handle(&s, Request::StudioShapeBootstrap { pane: 19, generation, input: shape }).await;
+            let Response::WhatsNews { response, .. } = rx.try_recv().unwrap() else { panic!() };
+            let Response::StudioShapeBootstrap { result, .. } = *response else { panic!() };
+            let b = result.unwrap();
+            assert_eq!(b.draws, 500);
+            if let Some(p) = prev_ci {
+                assert!(Arc::ptr_eq(&p, &b));
+            }
+            prev_ci = Some(b);
+        }
+        assert_eq!(provider.calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+        let mut provider = vault_provider(vault_day("2026-11-09"));
+        Arc::get_mut(&mut provider).unwrap().sample = true;
+        let (s, rx) = shared(provider.clone(), Some(BarCache::open_in_memory().unwrap()));
+        handle(
+            &s,
+            Request::StudioShape {
+                pane: 19,
+                generation: 3,
+                report: r,
+                horizon: 1,
+                overlap: false,
+                thresholds: [0.01, 0.02, 0.05],
+            },
+        )
+        .await;
+        let Response::WhatsNews { response, .. } = rx.try_recv().unwrap() else { panic!() };
+        let Response::StudioShape { result, .. } = *response else { panic!() };
+        assert!(result.unwrap_err().contains("sample"));
+        handle(&s, Request::StudioShapeBootstrap { pane: 19, generation: 3, input: prev.unwrap() }).await;
+        let Response::WhatsNews { response, .. } = rx.try_recv().unwrap() else { panic!() };
+        let Response::StudioShapeBootstrap { result, .. } = *response else { panic!() };
+        assert!(result.unwrap_err().contains("sample"));
+        assert_eq!(provider.calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn studio_dist_rotation_is_cached_and_refuses_sample_mode() {
+        let bars = tr_perf::fixtures::regime_walk(1500);
+        let r = tr_data::studio_dist::compute(
+            "AAPL",
+            &bars,
+            Timeframe::D1,
+            tr_data::studio_dist::Window::All,
+            "fixture",
+            None,
+        )
+        .unwrap();
+        let input = r.regime.rotation_input.unwrap();
+        let provider = vault_provider(vault_day("2026-11-09"));
+        let (s, rx) = shared(provider.clone(), Some(BarCache::open_in_memory().unwrap()));
+        let mut previous = None;
+        for generation in [1, 2] {
+            handle(
+                &s,
+                Request::StudioDistRotation {
+                    pane: 19,
+                    generation,
+                    symbol: "AAPL".into(),
+                    timeframe: Timeframe::D1,
+                    source: "fixture".into(),
+                    input: input.clone(),
+                },
+            )
+            .await;
+            let Response::WhatsNews { response, .. } = rx.try_recv().unwrap() else { panic!("band envelope") };
+            let Response::StudioDistRotation { key, result, .. } = *response else { panic!("band response") };
+            assert_eq!(key, input.seed);
+            let band = result.unwrap();
+            assert_eq!(band.draws, 499);
+            assert!(band.p.iter().all(Option::is_some));
+            if let Some(p) = previous {
+                assert!(Arc::ptr_eq(&p, &band));
+            }
+            previous = Some(band);
+        }
+        assert_eq!(provider.calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+        let mut provider = vault_provider(vault_day("2026-11-09"));
+        Arc::get_mut(&mut provider).unwrap().sample = true;
+        let (s, rx) = shared(provider.clone(), Some(BarCache::open_in_memory().unwrap()));
+        handle(
+            &s,
+            Request::StudioDistRotation {
+                pane: 19,
+                generation: 3,
+                symbol: "AAPL".into(),
+                timeframe: Timeframe::D1,
+                source: "fixture".into(),
+                input,
+            },
+        )
+        .await;
+        let Response::WhatsNews { response, .. } = rx.try_recv().unwrap() else { panic!("band envelope") };
+        let Response::StudioDistRotation { result, .. } = *response else { panic!("band response") };
+        assert!(result.unwrap_err().contains("sample"));
+        assert_eq!(provider.calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn season_band_second_stage_reuses_cache_and_never_fetches() {
+        let bars=tr_perf::fixtures::season_evidence(40);let now=bars.last().unwrap().ts+300;
+        let r=tr_data::studio_season::compute("AAPL",Timeframe::M5,&bars,"fixture",now).unwrap();
+        let input=r.evidence.unwrap().band_input;
+        let provider=vault_provider(vault_day("2026-11-09"));
+        let (s,rx)=shared(provider.clone(),Some(BarCache::open_in_memory().unwrap()));
+        let mut previous=None;
+        for generation in [1,2] {
+            handle(&s,Request::StudioSeasonBand {pane:19,generation,symbol:"AAPL".into(),tf:Timeframe::M5,source:"fixture".into(),input:input.clone()}).await;
+            let Response::WhatsNews {response,..}=rx.try_recv().unwrap() else {panic!("band envelope")};
+            let Response::StudioSeasonBand {key,result,..}=*response else {panic!("band response")};
+            assert_eq!(key,input.seed);
+            let band=result.unwrap();assert!(band.critical.is_some());
+            if let Some(p)=previous {assert!(Arc::ptr_eq(&p,&band));}
+            previous=Some(band);
+        }
+        assert_eq!(provider.calls.load(std::sync::atomic::Ordering::SeqCst),0);
+        let mut provider=vault_provider(vault_day("2026-11-09"));Arc::get_mut(&mut provider).unwrap().sample=true;
+        let (s,rx)=shared(provider.clone(),Some(BarCache::open_in_memory().unwrap()));
+        handle(&s,Request::StudioSeasonBand {pane:19,generation:3,symbol:"AAPL".into(),tf:Timeframe::M5,source:"fixture".into(),input}).await;
+        let Response::WhatsNews {response,..}=rx.try_recv().unwrap() else {panic!("band envelope")};
+        let Response::StudioSeasonBand {result,..}=*response else {panic!("band response")};
+        assert!(result.unwrap_err().contains("sample"));
+        assert_eq!(provider.calls.load(std::sync::atomic::Ordering::SeqCst),0);
+    }
+
+    #[test]
+    fn season_cache_reuses_arc_and_invalidates_corrections_clocks_source_and_gaps() {
+        let cache=tr_data::report_cache::ReportCache::new(16);
+        let jobs=crate::perf::JobLog::default();
+        let mut bars=tr_perf::fixtures::season_evidence(35);
+        let now=bars.last().unwrap().ts+300;
+        let a=cached_season_report(&cache,&jobs,"AAPL",Timeframe::M5,&bars,"test",now,now,&[]).unwrap();
+        let b=cached_season_report(&cache,&jobs,"AAPL",Timeframe::M5,&bars,"test",now,now,&[]).unwrap();
+        assert!(Arc::ptr_eq(&a,&b));
+        let same_day=cached_season_report(&cache,&jobs,"AAPL",Timeframe::M5,&bars,"test",now,now+1,&[]).unwrap();
+        assert!(Arc::ptr_eq(&a,&same_day));
+        let cached_bars:Vec<_>=bars.iter().map(|b|b.with_provenance(tr_core::Provenance::Cached)).collect();
+        let cached=cached_season_report(&cache,&jobs,"AAPL",Timeframe::M5,&cached_bars,"test",now,now,&[]).unwrap();
+        assert!(!Arc::ptr_eq(&a,&cached));
+        assert_eq!(cached.provenance,tr_core::Provenance::Cached);
+        for (source,observed,calendar,gaps) in [
+            ("other",now,now,vec![]), ("test",now-1,now,vec![]),
+            ("test",now,now+86400,vec![]), ("test",now,now,vec![(bars[78].ts,bars[79].ts)]),
+        ] {
+            let c=cached_season_report(&cache,&jobs,"AAPL",Timeframe::M5,&bars,source,observed,calendar,&gaps).unwrap();
+            assert!(!Arc::ptr_eq(&a,&c));
+        }
+        bars[2].close+=0.01;
+        let c=cached_season_report(&cache,&jobs,"AAPL",Timeframe::M5,&bars,"test",now,now,&[]).unwrap();
+        assert!(!Arc::ptr_eq(&a,&c));
+        // Even an excluded pending observation must be refused before a cached report can be reused.
+        bars.last_mut().unwrap().provenance=tr_core::Provenance::Sample;
+        assert!(cached_season_report(&cache,&jobs,"AAPL",Timeframe::M5,&bars,"test",now-1,now,&[]).is_err());
+    }
+
+    #[tokio::test]
+    async fn studio_season_uses_sourced_intraday_and_refuses_sample_without_fetching() {
+        for sample in [false, true] {
+            let mut provider = vault_provider(vault_day("2026-11-09"));
+            Arc::get_mut(&mut provider).unwrap().sample = sample;
+            let (s, rx) = shared(provider.clone(), Some(BarCache::open_in_memory().unwrap()));
+            handle(
+                &s,
+                Request::StudioSeason { pane: 19, generation: 7, symbol: "AAPL US Equity".into(), tf: Timeframe::M5 },
+            )
+            .await;
+            let Response::WhatsNews { response, .. } = rx.try_recv().unwrap() else { panic!("expected envelope") };
+            let Response::StudioSeason { pane, generation, result } = *response else { panic!("expected seasonality") };
+            assert_eq!((pane, generation), (19, 7));
+            if sample {
+                assert!(result.unwrap_err().contains("no real data"));
+                assert_eq!(provider.calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+            } else {
+                let report = result.unwrap();
+                assert!(report.provenance.is_verified());
+                assert_eq!(report.bars, 78);
+                assert_eq!(report.source, "yahoo");
+                assert_eq!(provider.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn studio_or_lens_retains_vault_witness_gaps_and_source_clock() {
+        let bars = tr_perf::fixtures::or_lens(3);
+        let provider = vault_provider(bars[..26].to_vec());
+        let (s, rx) = shared(provider.clone(), Some(BarCache::open_in_memory().unwrap()));
+        analysis_bars(&s, "AAPL US Equity", Timeframe::M30, 100, "test").await.unwrap();
+        *provider.bars.lock().unwrap() = bars[13..].to_vec();
+        handle(&s, Request::StudioSeason {
+            pane: 19, generation: 11, symbol: "AAPL US Equity".into(), tf: Timeframe::M30,
+        }).await;
+        let Response::WhatsNews { response, .. } = rx.try_recv().unwrap() else { panic!("envelope") };
+        let Response::StudioSeason { generation, result, .. } = *response else { panic!("season report") };
+        assert_eq!(generation, 11);
+        let report = result.unwrap();
+        let lens = report.or_lens.as_ref().unwrap();
+        assert_eq!(lens.provenance, tr_core::Provenance::Cached);
+        assert_eq!(lens.sessions, 3);
+        assert_eq!(lens.observed_at, report.observed_at);
+        assert_eq!(lens.closed_thru, bars.last().unwrap().ts + 1800);
+        assert_eq!(lens.gaps, report.gaps);
+        assert_eq!(lens.cell(0,1,0).selected.len(), 1);
+        assert_eq!(lens.cell(0,1,0).complement.len(), 2);
+        assert_eq!(lens.source, "yahoo");
+    }
+
+    #[tokio::test]
+    async fn studio_season_daily_reads_archive_without_market_fetches() {
+        let provider = vault_provider(vec![]);
+        let (mut s, rx) = shared(provider.clone(), None);
+        Arc::get_mut(&mut s).unwrap().history = Arc::new(tr_data::history::Service::new(
+            tr_data::history::Archive::memory().unwrap(),
+            Arc::new(ArchivePrices),
+            tr_data::history::Policy { spacing: Duration::ZERO, ..Default::default() },
+        ));
+        s.whats_news.send_replace((0, tr_data::whats_news::Config { enabled: false, ..Default::default() }));
+        s.history.run("ADD", tr_data::history::universe::resolve("AAPL").unwrap(), |_| {}).await.unwrap();
+        s.history.run("REFRESH", vec![], |_| {}).await.unwrap();
+        handle(
+            &s,
+            Request::StudioSeason { pane: 19, generation: 8, symbol: "AAPL US Equity".into(), tf: Timeframe::D1 },
+        )
+        .await;
+        let Response::WhatsNews { response, .. } = rx.try_recv().unwrap() else { panic!("expected envelope") };
+        let Response::StudioSeason { result, .. } = *response else { panic!("expected seasonality") };
+        assert!(result.unwrap().source.contains("Local Yahoo"));
+        assert_eq!(provider.calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn statistics_use_the_research_archive_and_never_sample_fallback() {
+        let (s, _) = shared(Arc::new(tr_data::sample::SampleProvider::at(0, 10)), None);
+        let config = tr_data::whats_news::Config { enabled: false, ..Default::default() };
+        s.whats_news.send_replace((0, config.clone()));
+        let err = research_stats(&s, &config.bridge(), "AAPL US Equity", "RSI(14) < 30", &[5]).await.unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("refused") || msg.contains("no daily history"), "{msg}");
+        assert!(!msg.to_ascii_lowercase().contains("fallback"));
+
+        let (mut s, _) = shared(Arc::new(tr_data::sample::SampleProvider::at(0, 10)), None);
+        Arc::get_mut(&mut s).unwrap().history = Arc::new(tr_data::history::Service::new(
+            tr_data::history::Archive::memory().unwrap(),
+            Arc::new(ArchivePrices),
+            tr_data::history::Policy { spacing: Duration::ZERO, ..Default::default() },
+        ));
+        s.whats_news.send_replace((0, config.clone()));
+        s.history.run("ADD", tr_data::history::universe::resolve("AAPL").unwrap(), |_| {}).await.unwrap();
+        s.history.run("REFRESH", vec![], |_| {}).await.unwrap();
+        let snap = research_stats(&s, &config.bridge(), "AAPL US Equity", "", &[5]).await.unwrap();
+        assert!(snap.stats.provenance.is_verified());
+        assert!(snap.conditional.provenance.is_verified());
+        assert!(snap.stats.source.contains("Local Yahoo"));
+        assert_eq!(snap.stats.ticker, "AAPL");
+        assert_eq!(snap.conditional.by_horizon[0].baseline.count, snap.stats.bars.saturating_sub(5));
+    }
+
+    #[tokio::test]
+    async fn rotation_uses_the_research_archive_and_never_sample_fallback() {
+        let (s, _) = shared(Arc::new(tr_data::sample::SampleProvider::at(0, 10)), None);
+        let query = tr_data::rotation::parse_query("AAPL MSFT", &[]).unwrap();
+        let error = research_rotation(&s, &query).await.unwrap_err().to_string();
+        assert!(error.contains("refused"));
+        assert!(!error.to_ascii_lowercase().contains("fallback"));
+        struct RotationArchive;
+        #[async_trait::async_trait]
+        impl tr_data::history::DailyHistory for RotationArchive {
+            async fn daily(
+                &self,
+                _: &str,
+                _: Option<chrono::NaiveDate>,
+                _: chrono::NaiveDate,
+            ) -> Result<Vec<Bar>, tr_data::history::Failure> {
+                let start = chrono::NaiveDate::from_ymd_opt(2024, 1, 2).unwrap();
+                Ok((0..400)
+                    .map(|i| {
+                        Bar::new(
+                            (start + chrono::Duration::days(i)).and_hms_opt(0, 0, 0).unwrap().and_utc().timestamp(),
+                            100.0,
+                            101.0,
+                            99.0,
+                            100.0,
+                            1000.0,
+                        )
+                        .with_provenance(tr_core::Provenance::Real)
+                    })
+                    .collect())
+            }
+        }
+        let (mut s, _) = shared(Arc::new(tr_data::sample::SampleProvider::at(0, 10)), None);
+        Arc::get_mut(&mut s).unwrap().history = Arc::new(tr_data::history::Service::new(
+            tr_data::history::Archive::memory().unwrap(),
+            Arc::new(RotationArchive),
+            tr_data::history::Policy { spacing: Duration::ZERO, ..Default::default() },
+        ));
+        s.history
+            .run(
+                "ADD",
+                ["SPY", "AAPL", "MSFT"]
+                    .into_iter()
+                    .flat_map(|s| tr_data::history::universe::resolve(s).unwrap())
+                    .collect(),
+                |_| {},
+            )
+            .await
+            .unwrap();
+        s.history.run("REFRESH", vec![], |_| {}).await.unwrap();
+        let report = research_rotation(&s, &query).await.unwrap();
+        assert!(report.provenance.is_verified());
+        assert!(report.source.contains("Local Yahoo"));
+        assert_eq!(report.tracks.len(), 2);
+        assert_eq!(report.dates.len(), 260);
+    }
+
+    #[tokio::test]
+    async fn lookalikes_use_the_research_archive_and_never_sample_fallback() {
+        let (s, _) = shared(Arc::new(tr_data::sample::SampleProvider::at(0, 10)), None);
+        let config = tr_data::whats_news::Config { enabled: false, ..Default::default() };
+        s.whats_news.send_replace((0, config.clone()));
+        let query = tr_data::lookalike::LookalikeQuery { k: 5, horizons: vec![5], as_of: None, gap: 5 };
+        let err = research_lookalike(&s, &config.bridge(), "AAPL US Equity", &query).await.unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("refused") || msg.contains("no daily history"), "{msg}");
+        assert!(!msg.to_ascii_lowercase().contains("fallback"));
+
+        struct LongArchive;
+        #[async_trait::async_trait]
+        impl tr_data::history::DailyHistory for LongArchive {
+            async fn daily(
+                &self,
+                _: &str,
+                _: Option<chrono::NaiveDate>,
+                _: chrono::NaiveDate,
+            ) -> Result<Vec<Bar>, tr_data::history::Failure> {
+                let start = chrono::NaiveDate::from_ymd_opt(2024, 1, 2).unwrap();
+                Ok((0..180)
+                    .map(|i| {
+                        let d = start + chrono::Duration::days(i);
+                        let c = 80.0 + i as f64 * 0.15;
+                        Bar::new(d.and_hms_opt(0, 0, 0).unwrap().and_utc().timestamp(), c, c + 1.0, c - 1.0, c, 1_000.0)
+                            .with_provenance(tr_core::Provenance::Real)
+                    })
+                    .collect())
+            }
+        }
+        let (mut s, _) = shared(Arc::new(tr_data::sample::SampleProvider::at(0, 10)), None);
+        Arc::get_mut(&mut s).unwrap().history = Arc::new(tr_data::history::Service::new(
+            tr_data::history::Archive::memory().unwrap(),
+            Arc::new(LongArchive),
+            tr_data::history::Policy { spacing: Duration::ZERO, ..Default::default() },
+        ));
+        s.whats_news.send_replace((0, config.clone()));
+        s.history.run("ADD", tr_data::history::universe::resolve("AAPL").unwrap(), |_| {}).await.unwrap();
+        s.history.run("REFRESH", vec![], |_| {}).await.unwrap();
+        let report = research_lookalike(&s, &config.bridge(), "AAPL US Equity", &query).await.unwrap();
+        assert!(report.provenance.is_verified());
+        assert!(report.source.contains("Local Yahoo"));
+        assert_eq!(report.ticker, "AAPL");
+        assert_eq!(report.by_horizon[0].completed_n + report.by_horizon[0].incomplete_n, report.selected_n);
+    }
+    #[tokio::test]
+    async fn whats_news_weekly_rows_are_ignored_in_favor_of_all_daily_rows() {
+        let path = std::env::temp_dir().join(format!("tr-worker-archive-{}.sqlite", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        // Only this isolated test database is writable. The upstream tree is never opened for writes.
+        let c = rusqlite::Connection::open(&path).unwrap();
+        c.execute_batch("CREATE TABLE symbols(symbol TEXT PRIMARY KEY,name TEXT,group_tag TEXT); CREATE TABLE ohlcv(symbol TEXT,freq TEXT,date TEXT,open REAL,high REAL,low REAL,close REAL,volume REAL); INSERT INTO symbols VALUES('AAPL','Apple','test'); INSERT INTO ohlcv VALUES('AAPL','daily','2026-09-01',10,12,9,11,5),('AAPL','daily','2026-09-04',10,12,9,11,5),('AAPL','daily','2026-09-08',10,12,9,11,5),('AAPL','weekly','2026-09-04',999,999,999,999,999);").unwrap();
+        drop(c);
+        let before = std::fs::read(&path).unwrap();
+        let (s, rx) = shared(Arc::new(tr_data::sample::SampleProvider::at(0, 10)), None);
+        s.whats_news.send_replace((
+            0,
+            tr_data::whats_news::Config {
+                enabled: true,
+                archive_path: path.to_string_lossy().into(),
+                http_url: String::new(),
+                prefer_http: false,
+            },
+        ));
+        let req = Request::ArchiveHistory {
+            pane: 1,
+            generation: 1,
+            symbol: "AAPL US Equity".into(),
+            tf: Timeframe::W1,
+            limit: archive_page(Timeframe::W1),
+            before: None,
+        };
+        assert!(begin_request(&s, &req));
+        handle(&s, req).await;
+        let Response::WhatsNews { response, .. } = rx.try_recv().unwrap() else { panic!() };
+        let Response::History { bars, .. } = *response else { panic!() };
+        assert_eq!(bars.len(), 2);
+        assert_eq!(bars[0].open, 10.0);
+        assert_eq!(bars[0].volume, 10.0);
+        assert_eq!(bars[1].volume, 5.0);
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        let _ = std::fs::remove_file(path);
+    }
+
+    struct BrokenFeed;
+    #[async_trait::async_trait]
+    impl tr_data::MarketData for BrokenFeed {
+        fn name(&self) -> &str {
+            "broken fixture"
+        }
+        async fn history(&self, _: &str, _: Timeframe, _: Option<i64>, _: usize) -> anyhow::Result<Vec<Bar>> {
+            anyhow::bail!("injected offline")
+        }
+    }
+    #[tokio::test]
+    async fn failed_refresh_with_cache_sends_stale_with_real_bars() {
+        let now = chrono::Utc::now().timestamp();
+        let mut cache = BarCache::open_in_memory().unwrap();
+        let real = Bar::new(now - 86400, 10.0, 11.0, 9.0, 10.0, 1.0).with_provenance(tr_core::Provenance::Real);
+        cache.store("AAPL", Timeframe::D1, &[real]).unwrap();
+        cache.note_fetch("AAPL", Timeframe::D1, now - 600).unwrap();
+        let (s, rx) = shared(Arc::new(tr_data::Guarded::new(BrokenFeed)), Some(cache));
+        let req = Request::History { pane: 1, generation: 1, symbol: "AAPL".into(), tf: Timeframe::D1, limit: 20 };
+        assert!(begin_request(&s, &req));
+        handle(&s, req).await;
+        let responses: Vec<_> = rx.try_iter().collect();
+        assert_eq!(responses.iter().filter(|r| matches!(r, Response::History { .. })).count(), 1);
+        assert!(responses.iter().any(|r| matches!(r, Response::History { bars, from_cache: true, .. } if bars.iter().all(|b| b.provenance == tr_core::Provenance::Cached))));
+        assert!(responses.iter().any(|r| matches!(r, Response::Feed { feed: Feed::Bars, pane: Some(1), generation: Some(1), state: FeedState::Stale { age_secs, .. }, .. } if *age_secs >= 600)));
+        assert_eq!(current_series(&s, 1, 1).unwrap()[0].provenance, tr_core::Provenance::Cached);
+    }
+    #[tokio::test]
+    async fn failed_refresh_without_cache_sends_unavailable_and_no_history() {
+        for provenance in [None, Some(tr_core::Provenance::Sample), Some(tr_core::Provenance::Missing)] {
+            let mut cache = BarCache::open_in_memory().unwrap();
+            if let Some(p) = provenance {
+                cache.store("AAPL", Timeframe::D1, &[Bar::new(1, 1.0, 1.0, 1.0, 1.0, 1.0).with_provenance(p)]).unwrap();
+            }
+            let (s, rx) = shared(Arc::new(tr_data::Guarded::new(BrokenFeed)), Some(cache));
+            let req = Request::History { pane: 1, generation: 1, symbol: "AAPL".into(), tf: Timeframe::D1, limit: 20 };
+            assert!(begin_request(&s, &req));
+            handle(&s, req).await;
+            let responses: Vec<_> = rx.try_iter().collect();
+            assert!(!responses.iter().any(|r| matches!(r, Response::History { .. })));
+            assert!(
+                responses
+                    .iter()
+                    .any(|r| matches!(r, Response::Feed { feed: Feed::Bars, state: FeedState::Unavailable(_), .. }))
+            );
+        }
+    }
+    #[tokio::test]
+    async fn quotes_and_curve_errors_emit_feed_state_not_values() {
+        let (s, rx) = shared(Arc::new(tr_data::Guarded::new(BrokenFeed)), None);
+        handle(&s, Request::Quotes(vec!["AAPL".into()])).await;
+        handle(&s, Request::YieldCurves).await;
+        let responses: Vec<_> = rx.try_iter().collect();
+        assert_eq!(responses.len(), 2);
+        assert!(responses.iter().all(|r| matches!(
+            r,
+            Response::Feed { feed: Feed::Quotes | Feed::Curve, state: FeedState::Unavailable(_), .. }
+        )));
+    }
+    #[tokio::test]
+    async fn retry_feed_reissues_only_current_pane_and_forget_retires_it() {
+        let (s, rx) = shared(Arc::new(tr_data::Guarded::new(BrokenFeed)), None);
+        for generation in [2, 1] {
+            let request = Request::History { pane: 1, generation, symbol: "AAPL".into(), tf: Timeframe::D1, limit: 20 };
+            if begin_request(&s, &request) {
+                handle(&s, request).await;
+            }
+        }
+        rx.try_iter().for_each(drop);
+        handle(&s, Request::RetryFeed { feed: Feed::Bars, pane: Some(1) }).await;
+        let responses: Vec<_> = rx.try_iter().collect();
+        assert!(responses.iter().any(|r| matches!(r, Response::Feed { generation: Some(2), .. })));
+        begin_request(&s, &Request::Forget(1));
+        handle(&s, Request::RetryFeed { feed: Feed::Bars, pane: Some(1) }).await;
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn retry_feed_bypasses_fresh_cache_without_duplicate_pollers() {
+        let provider = Arc::new(OfflinePrices { calls: Default::default(), provenance: tr_core::Provenance::Real });
+        let mut cache = BarCache::open_in_memory().unwrap();
+        let symbol = "USDBRL Curncy";
+        cache
+            .store(
+                symbol,
+                Timeframe::M5,
+                &[Bar::new(1, 5.0, 5.0, 5.0, 5.0, 1.0).with_provenance(tr_core::Provenance::Real)],
+            )
+            .unwrap();
+        cache.note_fetch(symbol, Timeframe::M5, chrono::Utc::now().timestamp()).unwrap();
+        let (s, rx) = shared(provider.clone(), Some(cache));
+        let request = Request::History { pane: 1, generation: 1, symbol: symbol.into(), tf: Timeframe::M5, limit: 20 };
+        assert!(begin_request(&s, &request));
+        handle(&s, request).await;
+        assert_eq!(provider.calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+        rx.try_iter().for_each(drop);
+        handle(&s, Request::RetryFeed { feed: Feed::Bars, pane: Some(1) }).await;
+        assert_eq!(provider.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(s.followers.lock().unwrap().len(), 1);
+        assert!(rx.try_iter().any(|r| matches!(r, Response::History { from_cache: false, .. })));
+    }
+    #[tokio::test]
+    async fn startup_refetches_sample_cache_and_does_not_publish_it_as_real() {
+        use tr_core::Provenance;
+        for provenance in [Provenance::Sample, Provenance::Missing, Provenance::Real] {
+            let provider = Arc::new(OfflinePrices { calls: Default::default(), provenance: Provenance::Real });
+            let mut cache = BarCache::open_in_memory().unwrap();
+            let old: Vec<_> =
+                (0..6000).map(|i| Bar::new(i, 300.0, 436.0, 239.0, 350.0, 1.0).with_provenance(provenance)).collect();
+            cache.store("USDBRL Curncy", Timeframe::D1, &old).unwrap();
+            let (s, rx) = shared(provider.clone(), Some(cache));
+            let req = Request::History {
+                pane: 1,
+                generation: 1,
+                symbol: "USDBRL Curncy".into(),
+                tf: Timeframe::D1,
+                limit: 6000,
+            };
+            assert!(begin_request(&s, &req));
+            handle(&s, req).await;
+            assert_eq!(provider.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+            let replies: Vec<_> = rx
+                .try_iter()
+                .filter_map(|r| match r {
+                    Response::History { from_cache, bars, .. } => Some((from_cache, bars)),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(replies.len(), if provenance.is_verified() { 2 } else { 1 });
+            assert!(!replies.last().unwrap().0);
+            assert_eq!(replies.last().unwrap().1[0].close, 5.03);
+            assert!(replies.iter().all(|(_, b)| b.iter().all(|b| b.provenance.is_verified())));
+            let cached = s.cache.lock().unwrap().as_ref().unwrap().load("USDBRL Curncy", Timeframe::D1, 6000).unwrap();
+            assert!(cached.iter().all(|b| b.provenance.is_verified()));
+            if !provenance.is_verified() {
+                assert_eq!(cached.len(), 1);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn fresh_intraday_cache_skips_the_provider_until_the_ttl_expires() {
+        use tr_core::Provenance;
+        struct Counting {
+            calls: std::sync::atomic::AtomicUsize,
+        }
+        #[async_trait::async_trait]
+        impl tr_data::MarketData for Counting {
+            fn name(&self) -> &str {
+                "offline"
+            }
+            async fn history(&self, _: &str, _: Timeframe, _: Option<i64>, _: usize) -> anyhow::Result<Vec<Bar>> {
+                self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(vec![Bar::new(1_700_000_100, 2.0, 2.0, 2.0, 2.0, 1.0).with_provenance(Provenance::Real)])
+            }
+        }
+        let provider = Arc::new(Counting { calls: Default::default() });
+        let mut cache = BarCache::open_in_memory().unwrap();
+        let cached = vec![Bar::new(1_700_000_000, 1.0, 1.0, 1.0, 1.0, 5.0).with_provenance(Provenance::Real)];
+        cache.store("AAPL", Timeframe::M5, &cached).unwrap();
+        let now = chrono::Utc::now().timestamp();
+        cache.note_fetch("AAPL", Timeframe::M5, now).unwrap();
+        // A recent daily stamp must not suppress the daily refresh.
+        cache.store("AAPL", Timeframe::D1, &cached).unwrap();
+        cache.note_fetch("AAPL", Timeframe::D1, now).unwrap();
+        let (s, rx) = shared(provider.clone(), Some(cache));
+        let m5 = Request::History { pane: 1, generation: 1, symbol: "AAPL".into(), tf: Timeframe::M5, limit: 10 };
+        assert!(begin_request(&s, &m5));
+        handle(&s, m5).await;
+        assert_eq!(provider.calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+        let replies: Vec<_> = rx.try_iter().filter(|r| matches!(r, Response::History { .. })).collect();
+        assert_eq!(replies.len(), 1);
+        match &replies[0] {
+            Response::History { from_cache, bars, .. } => {
+                assert!(*from_cache);
+                assert_eq!(bars[0].close, 1.0);
+            }
+            _ => unreachable!(),
+        }
+        s.cache.lock().unwrap().as_mut().unwrap().note_fetch("AAPL", Timeframe::M5, now - 10_000).unwrap();
+        let again = Request::History { pane: 1, generation: 2, symbol: "AAPL".into(), tf: Timeframe::M5, limit: 10 };
+        assert!(begin_request(&s, &again));
+        handle(&s, again).await;
+        assert_eq!(provider.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        let daily = Request::History { pane: 2, generation: 1, symbol: "AAPL".into(), tf: Timeframe::D1, limit: 10 };
+        assert!(begin_request(&s, &daily));
+        handle(&s, daily).await;
+        assert_eq!(provider.calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn extended_hours_do_not_read_the_regular_cache_or_paint_sample_bars() {
+        use tr_core::Provenance;
+        struct Split {
+            history_calls: std::sync::atomic::AtomicUsize,
+            extended_calls: std::sync::atomic::AtomicUsize,
+            sample: std::sync::atomic::AtomicBool,
+        }
+        #[async_trait::async_trait]
+        impl tr_data::MarketData for Split {
+            fn name(&self) -> &str {
+                "offline"
+            }
+            async fn history(&self, _: &str, _: Timeframe, _: Option<i64>, _: usize) -> anyhow::Result<Vec<Bar>> {
+                self.history_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(vec![Bar::new(10, 1.0, 1.0, 1.0, 1.0, 1.0).with_provenance(Provenance::Real)])
+            }
+            async fn extended_history(
+                &self,
+                _: &str,
+                _: Timeframe,
+                _: Option<i64>,
+                _: usize,
+            ) -> anyhow::Result<Vec<Bar>> {
+                self.extended_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let provenance = if self.sample.load(std::sync::atomic::Ordering::SeqCst) {
+                    Provenance::Sample
+                } else {
+                    Provenance::Real
+                };
+                Ok(vec![
+                    Bar::new(1_700_000_000, 4.0, 4.0, 4.0, 4.0, 3.0).with_provenance(provenance),
+                    Bar::new(1_700_000_300, 5.0, 5.0, 5.0, 5.0, 3.0).with_provenance(provenance),
+                ])
+            }
+        }
+        let provider = Arc::new(Split {
+            history_calls: Default::default(),
+            extended_calls: Default::default(),
+            sample: Default::default(),
+        });
+        let mut cache = BarCache::open_in_memory().unwrap();
+        let cached = vec![Bar::new(1_700_000_000, 9.0, 9.0, 9.0, 9.0, 1.0).with_provenance(Provenance::Real)];
+        cache.store("AAPL", Timeframe::M5, &cached).unwrap();
+        cache.note_fetch("AAPL", Timeframe::M5, chrono::Utc::now().timestamp()).unwrap();
+        let (s, rx) = shared(provider.clone(), Some(cache));
+        let req =
+            Request::ExtendedHistory { pane: 1, generation: 1, symbol: "AAPL".into(), tf: Timeframe::M5, limit: 10 };
+        assert!(begin_request(&s, &req));
+        handle(&s, req).await;
+        assert_eq!(provider.history_calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert_eq!(provider.extended_calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        let replies: Vec<_> = rx.try_iter().filter(|r| matches!(r, Response::History { .. })).collect();
+        match &replies[0] {
+            Response::History { from_cache, bars, .. } => {
+                assert!(!*from_cache);
+                assert_eq!(bars[0].close, 4.0);
+            }
+            _ => unreachable!(),
+        }
+        let stored = s.cache.lock().unwrap().as_ref().unwrap().load("AAPL", Timeframe::M5, 10).unwrap();
+        assert_eq!(stored[0].close, 9.0, "extended bars stay out of the regular cache");
+
+        provider.sample.store(true, std::sync::atomic::Ordering::SeqCst);
+        let again =
+            Request::ExtendedHistory { pane: 1, generation: 2, symbol: "AAPL".into(), tf: Timeframe::M5, limit: 10 };
+        assert!(begin_request(&s, &again));
+        handle(&s, again).await;
+        assert_eq!(provider.history_calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+        let err = rx.try_iter().find(|r| matches!(r, Response::HistoryError { .. }));
+        match err {
+            Some(Response::HistoryError { error, .. }) => assert!(error.contains("SAMPLE"), "{error}"),
+            Some(_) => panic!("sample extended bars must be refused"),
+            None => panic!("sample extended bars produced no error"),
+        }
+        let stored = s.cache.lock().unwrap().as_ref().unwrap().load("AAPL", Timeframe::M5, 10).unwrap();
+        assert_eq!(stored[0].close, 9.0);
+    }
+
+    #[tokio::test]
+    async fn intraday_refresh_merges_verified_bars_and_keeps_real_bars_when_the_refresh_is_not() {
+        use tr_core::Provenance;
+        struct Scripted {
+            calls: std::sync::atomic::AtomicUsize,
+            next: std::sync::Mutex<Vec<anyhow::Result<Vec<Bar>>>>,
+        }
+        #[async_trait::async_trait]
+        impl tr_data::MarketData for Scripted {
+            fn name(&self) -> &str {
+                "offline"
+            }
+            async fn history(&self, _: &str, _: Timeframe, _: Option<i64>, _: usize) -> anyhow::Result<Vec<Bar>> {
+                self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                self.next.lock().unwrap().remove(0)
+            }
+        }
+        let real =
+            |ts: i64, close: f64| Bar::new(ts, close, close, close, close, 1.0).with_provenance(Provenance::Real);
+        let provider = Arc::new(Scripted { calls: Default::default(), next: std::sync::Mutex::new(Vec::new()) });
+        let (s, rx) = shared(provider.clone(), Some(BarCache::open_in_memory().unwrap()));
+        let older = real(1_700_000_000, 1.0);
+        let mid = real(1_700_000_300, 1.5);
+        let req = Request::History { pane: 1, generation: 1, symbol: "AAPL".into(), tf: Timeframe::M5, limit: 10 };
+        assert!(begin_request(&s, &req));
+        assert!(store_series(&s, 1, 1, Arc::new(vec![older, mid])));
+
+        provider.next.lock().unwrap().push(Ok(vec![real(1_700_000_300, 9.0).with_provenance(Provenance::Sample)]));
+        refresh_intraday(&s, 1, 1, "AAPL", Timeframe::M5, false).await;
+        assert_eq!(provider.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(current_series(&s, 1, 1).unwrap().iter().map(|b| b.close).collect::<Vec<_>>(), vec![1.0, 1.5]);
+        assert!(rx.try_iter().all(|r| !matches!(r, Response::History { .. })));
+        assert!(s.cache.lock().unwrap().as_ref().unwrap().load("AAPL", Timeframe::M5, 10).unwrap().is_empty());
+
+        provider.next.lock().unwrap().push(Err(anyhow::anyhow!("provider down")));
+        refresh_intraday(&s, 1, 1, "AAPL", Timeframe::M5, false).await;
+        assert_eq!(provider.calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+        assert_eq!(current_series(&s, 1, 1).unwrap().len(), 2);
+
+        assert_eq!(rx.try_iter().filter(|r| matches!(r, Response::HistoryError { .. })).count(), 1);
+        provider.next.lock().unwrap().push(Ok(vec![real(1_700_000_300, 2.0), real(1_700_000_600, 3.0)]));
+        refresh_intraday(&s, 1, 1, "AAPL", Timeframe::M5, false).await;
+        assert_eq!(provider.calls.load(std::sync::atomic::Ordering::SeqCst), 3);
+        let closes: Vec<_> = current_series(&s, 1, 1).unwrap().iter().map(|b| b.close).collect();
+        assert_eq!(closes, vec![1.0, 2.0, 3.0], "paged history stays and the tail updates");
+        match rx.try_iter().find(|r| matches!(r, Response::History { .. })).unwrap() {
+            Response::History { from_cache, live, bars, .. } => {
+                assert!(!from_cache && !live);
+                assert_eq!(bars.last().unwrap().close, 3.0);
+                assert!(bars.iter().all(|b| b.provenance.is_verified()));
+            }
+            _ => panic!("expected a history refresh"),
+        }
+        let cached = s.cache.lock().unwrap().as_ref().unwrap().load("AAPL", Timeframe::M5, 10).unwrap();
+        assert_eq!(cached.iter().map(|b| b.close).collect::<Vec<_>>(), vec![1.0, 2.0, 3.0]);
+
+        provider.next.lock().unwrap().push(Ok(vec![real(1_700_000_900, 4.0)]));
+        refresh_intraday(&s, 1, 1, "AAPL", Timeframe::M5, false).await;
+        assert_eq!(provider.calls.load(std::sync::atomic::Ordering::SeqCst), 3, "a fresh fetch is not repeated");
+        assert_eq!(current_series(&s, 1, 1).unwrap().len(), 3);
+
+        s.cache
+            .lock()
+            .unwrap()
+            .as_mut()
+            .unwrap()
+            .note_fetch("AAPL", Timeframe::M5, chrono::Utc::now().timestamp() - 10_000)
+            .unwrap();
+        refresh_intraday(&s, 1, 1, "AAPL", Timeframe::M5, false).await;
+        assert_eq!(provider.calls.load(std::sync::atomic::Ordering::SeqCst), 4);
+        assert_eq!(current_series(&s, 1, 1).unwrap().last().unwrap().close, 4.0);
+
+        let daily = Request::History { pane: 2, generation: 1, symbol: "AAPL".into(), tf: Timeframe::D1, limit: 10 };
+        assert!(begin_request(&s, &daily));
+        assert!(store_series(&s, 2, 1, Arc::new(vec![real(1_700_000_000, 8.0)])));
+        refresh_intraday(&s, 2, 1, "AAPL", Timeframe::D1, false).await;
+        assert_eq!(provider.calls.load(std::sync::atomic::Ordering::SeqCst), 4, "daily is not polled on this path");
+        assert_eq!(current_series(&s, 2, 1).unwrap()[0].close, 8.0);
+
+        let sample = real(1_700_000_000, 9.0).with_provenance(Provenance::Sample);
+        let replace = Request::History { pane: 3, generation: 1, symbol: "MSFT".into(), tf: Timeframe::M1, limit: 10 };
+        assert!(begin_request(&s, &replace));
+        assert!(store_series(&s, 3, 1, Arc::new(vec![sample])));
+        provider.next.lock().unwrap().push(Ok(vec![real(1_700_000_060, 4.5)]));
+        refresh_intraday(&s, 3, 1, "MSFT", Timeframe::M1, false).await;
+        let replaced = current_series(&s, 3, 1).unwrap();
+        assert_eq!(replaced.len(), 1);
+        assert_eq!(replaced[0].close, 4.5);
+        assert!(replaced.iter().all(|b| b.provenance.is_verified()));
+
+        let stale = Request::History { pane: 4, generation: 1, symbol: "AAPL".into(), tf: Timeframe::M15, limit: 10 };
+        assert!(begin_request(&s, &stale));
+        assert!(store_series(&s, 4, 1, Arc::new(vec![real(1_700_000_000, 6.0)])));
+        let newer = Request::History { pane: 4, generation: 2, symbol: "AAPL".into(), tf: Timeframe::M15, limit: 10 };
+        assert!(begin_request(&s, &newer));
+        let calls = provider.calls.load(std::sync::atomic::Ordering::SeqCst);
+        refresh_intraday(&s, 4, 1, "AAPL", Timeframe::M15, false).await;
+        assert_eq!(provider.calls.load(std::sync::atomic::Ordering::SeqCst), calls);
+        assert!(current_series(&s, 4, 2).unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn archive_charts_load_a_bounded_daily_page_and_page_older_without_the_market_provider() {
+        struct LongArchive;
+        #[async_trait::async_trait]
+        impl tr_data::history::DailyHistory for LongArchive {
+            async fn daily(
+                &self,
+                _: &str,
+                _: Option<chrono::NaiveDate>,
+                _: chrono::NaiveDate,
+            ) -> Result<Vec<Bar>, tr_data::history::Failure> {
+                Ok((0..200)
+                    .map(|i| {
+                        let d = chrono::NaiveDate::from_ymd_opt(2025, 1, 2).unwrap() + chrono::Days::new(i);
+                        Bar::new(d.and_hms_opt(0, 0, 0).unwrap().and_utc().timestamp(), 10.0, 11.0, 9.0, 10.5, 100.0)
+                            .with_provenance(tr_core::Provenance::Real)
+                    })
+                    .collect())
+            }
+        }
+        let (mut s, rx) = shared(Arc::new(tr_data::sample::SampleProvider::at(0, 10)), None);
+        Arc::get_mut(&mut s).unwrap().history = Arc::new(tr_data::history::Service::new(
+            tr_data::history::Archive::memory().unwrap(),
+            Arc::new(LongArchive),
+            tr_data::history::Policy { spacing: Duration::ZERO, ..Default::default() },
+        ));
+        s.whats_news.send_replace((0, tr_data::whats_news::Config { enabled: false, ..Default::default() }));
+        s.history.run("ADD", tr_data::history::universe::resolve("AAPL").unwrap(), |_| {}).await.unwrap();
+        s.history.run("REFRESH", vec![], |_| {}).await.unwrap();
+        let req = Request::ArchiveHistory {
+            pane: 1,
+            generation: 1,
+            symbol: "AAPL US Equity".into(),
+            tf: Timeframe::D1,
+            limit: 40,
+            before: None,
+        };
+        assert!(begin_request(&s, &req));
+        handle(&s, req).await;
+        let Response::WhatsNews { response, .. } = rx.try_recv().unwrap() else { panic!() };
+        let Response::History { bars, exhausted, prepended, live, .. } = *response else { panic!() };
+        assert_eq!(bars.len(), 40);
+        assert!(!exhausted);
+        assert_eq!(prepended, 0);
+        assert!(!live);
+        assert!(bars.iter().all(|b| b.provenance.is_verified()));
+        let first = bars[0].ts;
+        let page = Request::ArchiveHistory {
+            pane: 1,
+            generation: 1,
+            symbol: "AAPL US Equity".into(),
+            tf: Timeframe::D1,
+            limit: 40,
+            before: Some(first),
+        };
+        assert!(begin_request(&s, &page));
+        handle(&s, page).await;
+        let Response::WhatsNews { response, .. } = rx.try_recv().unwrap() else { panic!() };
+        let Response::History { bars, exhausted, prepended, .. } = *response else { panic!() };
+        assert_eq!(prepended, 40);
+        assert_eq!(bars.len(), 80);
+        assert!(bars[40].ts == first);
+        assert!(!exhausted);
+    }
+
+    #[tokio::test]
+    async fn live_sample_results_are_rejected_and_not_written_to_the_bar_cache() {
+        let provider = Arc::new(OfflinePrices { calls: Default::default(), provenance: tr_core::Provenance::Sample });
+        let (s, rx) = shared(provider, Some(BarCache::open_in_memory().unwrap()));
+        let req =
+            Request::History { pane: 1, generation: 1, symbol: "USDBRL Curncy".into(), tf: Timeframe::D1, limit: 6000 };
+        assert!(begin_request(&s, &req));
+        handle(&s, req).await;
+        let responses: Vec<_> = rx.try_iter().collect();
+        assert!(!responses.iter().any(|r| matches!(r, Response::History { .. })));
+        assert!(responses.iter().any(|r| matches!(
+            r,
+            Response::Feed { state: FeedState::Unavailable(Unavailable { kind: DownKind::Rejected, .. }), .. }
+        )));
+        assert!(
+            s.cache.lock().unwrap().as_ref().unwrap().load("USDBRL Curncy", Timeframe::D1, 6000).unwrap().is_empty()
+        );
+    }
+
+    #[test]
+    fn retired_and_superseded_history_tasks_cannot_restore_series() {
+        let (s, _rx) = shared(Arc::new(tr_data::sample::SampleProvider::at(0, 10)), None);
+        let req = |generation| Request::History {
+            pane: 1,
+            generation,
+            symbol: "SPY US Equity".into(),
+            tf: Timeframe::D1,
+            limit: 10,
+        };
+        assert!(begin_request(&s, &req(1)));
+        assert!(begin_request(&s, &req(2)));
+        assert!(!store_series(&s, 1, 1, Arc::new(vec![])));
+        assert!(store_series(&s, 1, 2, Arc::new(vec![])));
+        assert!(!begin_request(&s, &Request::Forget(1)));
+        assert!(!store_series(&s, 1, 2, Arc::new(vec![])), "a closed pane must not be resurrected");
+        assert!(current_series(&s, 1, 2).is_none());
+    }
+
     #[test]
     fn compare_alignment_carries_last_close() {
         let base: Vec<Bar> = (0..5).map(|i| Bar::new(i * 10, 100.0, 100.0, 100.0, 100.0 + i as f64, 1.0)).collect();
@@ -894,6 +9302,79 @@ mod tests {
         assert_eq!(&a[1..], &[50.0, 50.0, 55.0, 55.0]);
     }
 
+    #[test]
+    fn honest_z_worker_greys_trending_bands_and_excludes_forming_bar() {
+        let mut price = 100.0;
+        let mut previous = 0.0;
+        let mut seed = 19_u64;
+        let mut bars: Vec<_> = (0..600)
+            .map(|i| {
+                seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+                let noise = ((seed >> 11) as f64 / (1_u64 << 53) as f64 - 0.5) * 0.01;
+                previous = 0.85 * previous + noise;
+                price *= previous.exp();
+                Bar::new(i * 86400, price, price, price, price, 1.0).with_provenance(tr_core::Provenance::Real)
+            })
+            .collect();
+        let spec = [IndicatorSpec::new("ZBAND", &[20.0]).unwrap()];
+        let palette = theme::palette();
+        let build = |b: &[Bar]| {
+            build_chart_indicators(b, Timeframe::D1, &spec, &palette, tr_core::AssetClass::Crypto, None, None)
+        };
+        let a = build(&bars);
+        let r = a[0].honest_z.as_ref().unwrap();
+        assert!(r.trending);
+        assert_eq!(a[0].overlays.len(), 10);
+        assert!(a[0].overlays[5..].iter().all(|(_, o)| o.color == theme::rgba(palette.muted)));
+        assert!(a[0].overlays[..5].iter().all(|(_, o)| o.color != theme::rgba(palette.muted)));
+        // Each bar is drawn by the half matching its own point-in-time flag.
+        let value = |k: usize, t: usize| a[0].overlays[k].1.line.pyramid.data.get(t).map_or(f64::NAN, |p| p[1] as f64);
+        for (t, &muted) in r.muted_at.iter().enumerate().take(599).skip(20) {
+            let half = if muted { 5 } else { 0 };
+            assert!(value(half + 2, t).is_finite(), "bar {t} missing from its half");
+        }
+        // The last closed bars are trending: grey only, no coloured basis there.
+        assert!(r.muted_at[598] && value(2, 597).is_nan() && value(7, 598).is_finite());
+        assert!(a[0].z_readout.as_ref().unwrap()[599].is_nan());
+        bars[599].close *= 2.0;
+        bars[599].high = bars[599].close;
+        let b = build(&bars);
+        assert_eq!(r.as_ref(), b[0].honest_z.as_ref().unwrap().as_ref());
+        bars[599].provenance = tr_core::Provenance::Sample;
+        let b = build(&bars);
+        assert!(b[0].refused.is_some() && b[0].overlays.is_empty() && b[0].honest_z.is_none());
+    }
+
+    #[test]
+    fn zband_split_joins_halves_at_transitions() {
+        let v = [1.0, 2.0, 3.0, 4.0, 5.0];
+        let muted = [true, true, false, false, true];
+        let keep = |grey| zband_split(&v, &muted, grey).iter().map(|x| x.is_finite()).collect::<Vec<_>>();
+        // Coloured: bars 2,3 plus joining bar 1; grey: 0,1, the joining bar 3, and 4.
+        assert_eq!(keep(false), [false, true, true, true, false]);
+        assert_eq!(keep(true), [true, true, false, true, true]);
+    }
+
+    #[test]
+    fn zband_readout_preserves_precision_and_refuses_sample() {
+        let bars: Vec<_> = (0..40)
+            .map(|i| {
+                let c = 1e9 + i as f64 * 0.01;
+                Bar::new(i, c, c, c, c, 1.0).with_provenance(tr_core::Provenance::Real)
+            })
+            .collect();
+        let palette = crate::themes::terminal_light().palette(theme::DEFAULT_ACCENT);
+        let specs = [IndicatorSpec::new("ZBAND", &[20.0]).unwrap()];
+        let built = build_indicators(&bars, Timeframe::D1, &specs, &palette);
+        let z = built[0].z_readout.as_ref().unwrap()[39];
+        let manual = tr_core::indicators::registry::zband(&bars.iter().map(|b| b.close).collect::<Vec<_>>(), 20);
+        assert_eq!(z, manual.z[39]);
+        assert!(z > 1.0 && z < 2.0);
+        let sample: Vec<_> = bars.iter().copied().map(|b| b.with_provenance(tr_core::Provenance::Sample)).collect();
+        let refused = build_indicators(&sample, Timeframe::D1, &specs, &palette);
+        assert!(refused[0].z_readout.is_none());
+        assert!(refused[0].overlays.is_empty());
+    }
     #[test]
     fn indicators_build_expected_overlays() {
         let bars = tr_core::sample::generate("X", Timeframe::D1, 300, 1_790_000_000);
@@ -916,12 +9397,66 @@ mod tests {
     }
 
     #[test]
+    fn adaptive_trend_overlays_refuse_sample_and_draw_on_verified() {
+        let sample = tr_core::sample::generate("X", Timeframe::D1, 300, 1_790_000_000);
+        assert!(sample.iter().all(|b| b.provenance == tr_core::Provenance::Sample));
+        let palette = crate::themes::terminal_light().palette(theme::DEFAULT_ACCENT);
+        let spec = IndicatorSpec::new("ADTREND", &[]).unwrap();
+        let refused = build_indicators(&sample, Timeframe::D1, std::slice::from_ref(&spec), &palette);
+        assert!(refused[0].overlays.is_empty(), "sample bars must not draw Adaptive Trend");
+        let msg = refused[0].refused.as_deref().unwrap_or("");
+        assert!(msg.contains("SAMPLE"), "{msg}");
+        assert!(msg.contains("never drive") || msg.contains("refused"), "{msg}");
+        assert!(refused[0].note.is_none());
+
+        let verified: Vec<Bar> = sample
+            .iter()
+            .map(|b| {
+                Bar::new(b.ts, b.open, b.high, b.low, b.close, b.volume).with_provenance(tr_core::Provenance::Real)
+            })
+            .collect();
+        let drawn = build_indicators(&verified, Timeframe::D1, &[spec], &palette);
+        assert!(drawn[0].refused.is_none());
+        assert!(drawn[0].overlays.len() >= 8, "baselines, bands, stops and flips");
+        assert!(drawn[0].note.as_deref().unwrap_or("").contains("AT"));
+        assert!(drawn[0].overlays.iter().any(|(n, _)| n == "SB"));
+        assert!(drawn[0].overlays.iter().any(|(n, o)| n == "MRT" && o.kind == LineKind::Line));
+        assert!(drawn[0].overlays.iter().any(|(n, o)| n == "Long flip" && o.kind == LineKind::Dots));
+    }
+
+    #[test]
     fn series_generations_only_move_forward() {
         let (out, _rx) = mpsc::channel();
         let s = Shared {
+            jobs: Default::default(),
+            history: Arc::new(tr_data::history::Service::new(
+                tr_data::history::Archive::memory().unwrap(),
+                Arc::new(tr_data::yahoo::YahooProvider::new().unwrap()),
+                Default::default(),
+            )),
+            whats_news: tokio::sync::watch::channel((0, Default::default())).0,
             provider: std::sync::Arc::new(tr_data::sample::SampleProvider::at(0, 10)),
             series: Default::default(),
-            cache: std::sync::Mutex::new(None),
+            feed_requests: Default::default(),
+            followers: Default::default(),
+            archive_daily: Default::default(),
+            stack_lanes: Default::default(),
+            auction_fine: Default::default(),
+            wall_fetches: tokio::sync::Semaphore::new(4),
+            wall_generations: Default::default(),
+            wall_edge_generations: Default::default(),
+            wall_edge_focus: Default::default(),
+            wall_edge: Default::default(),
+            wall_edge_compute: Arc::new(tokio::sync::Semaphore::new(4)),
+            cache: Default::default(),
+            reports: Default::default(),
+            native: Default::default(),
+            chart_sources: Default::default(),
+            news: Default::default(),
+            price_alerts: Default::default(),
+            price_alerts_path: PathBuf::new(),
+            trade_plans: Default::default(),
+            trade_plans_path: PathBuf::new(),
             db: Mutex::new(Db::open_in_memory().unwrap()),
             out,
             ctx: egui::Context::default(),
@@ -935,6 +9470,352 @@ mod tests {
         assert!(current_series(&s, 1, 1).is_none());
     }
 
+    struct NewsStub {
+        calls: std::sync::atomic::AtomicUsize,
+        fail: std::sync::Mutex<Vec<String>>,
+    }
+    #[async_trait::async_trait]
+    impl tr_data::MarketData for NewsStub {
+        fn name(&self) -> &str {
+            "yahoo-test"
+        }
+        async fn history(&self, _: &str, _: Timeframe, _: Option<i64>, _: usize) -> anyhow::Result<Vec<Bar>> {
+            anyhow::bail!("unused")
+        }
+        async fn news(&self, symbol: Option<&str>) -> anyhow::Result<Vec<tr_data::NewsItem>> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let key = symbol.unwrap_or("*").to_string();
+            if self.fail.lock().unwrap().iter().any(|s| s == &key) {
+                anyhow::bail!("HTTP 429");
+            }
+            Ok(vec![tr_data::NewsItem {
+                title: format!("{key} story"),
+                publisher: "T".into(),
+                link: format!("https://n/{key}"),
+                ts: 1_700_000_000,
+                tickers: vec![],
+            }])
+        }
+    }
+
+    #[tokio::test]
+    async fn news_is_bounded_cached_and_partial() {
+        let stub = std::sync::Arc::new(NewsStub {
+            calls: Default::default(),
+            fail: std::sync::Mutex::new(vec!["MSFT US Equity".into()]),
+        });
+        let (s, _rx) = shared(stub.clone(), None);
+        let many: Vec<String> = (0..20).map(|i| format!("S{i} US Equity")).collect();
+        let batch = fetch_news(&s, Some(many)).await;
+        assert_eq!(batch.queried.len(), tr_data::news::MAX_SCOPED_SYMBOLS);
+        assert_eq!(stub.calls.load(std::sync::atomic::Ordering::SeqCst), tr_data::news::MAX_SCOPED_SYMBOLS);
+        let again = fetch_news(&s, Some(vec!["S0 US Equity".into()])).await;
+        assert_eq!(stub.calls.load(std::sync::atomic::Ordering::SeqCst), tr_data::news::MAX_SCOPED_SYMBOLS);
+        assert_eq!(again.items.len(), 1);
+        let mixed = fetch_news(&s, Some(vec!["AAPL US Equity".into(), "MSFT US Equity".into()])).await;
+        assert!(mixed.is_partial());
+        assert_eq!(mixed.failures[0].symbol, "MSFT US Equity");
+        assert!(!mixed.items.is_empty());
+    }
+
+    #[tokio::test]
+    async fn sample_news_is_isolated() {
+        let (s, _rx) = shared(std::sync::Arc::new(tr_data::sample::SampleProvider::at(0, 10)), None);
+        let batch = fetch_news(&s, Some(vec!["AAPL US Equity".into()])).await;
+        assert!(batch.sample && batch.items.is_empty());
+    }
+
+    #[tokio::test]
+    async fn replace_price_alerts_repairs_before_publish_and_persist() {
+        use tr_data::price_alerts::{AlertKind, PriceSide, RuleState, Store};
+        let (mut shared, rx) = shared(std::sync::Arc::new(tr_data::sample::SampleProvider::at(0, 10)), None);
+        let path = std::env::temp_dir().join(format!("tr-worker-alert-repair-{}.json", std::process::id()));
+        Arc::get_mut(&mut shared).unwrap().price_alerts_path = path.clone();
+        let mut incoming = Store::default();
+        for level in [100.00001, 100.00002] {
+            incoming.add_rule("AAPL", AlertKind::Price { side: PriceSide::Above, level }, 10).unwrap();
+        }
+        let base = incoming.rules[1].id.clone();
+        incoming.rules[0].id = base.clone();
+        incoming.states.insert(base.clone(), RuleState { last_price: Some(99.0), ..Default::default() });
+        handle(&shared, Request::ReplacePriceAlerts(incoming)).await;
+        let installed = shared.price_alerts.lock().unwrap().clone();
+        assert_ne!(installed.rules[0].id, installed.rules[1].id);
+        assert_eq!(installed.rules[0].id, base);
+        assert!(installed.states.is_empty());
+        let published = rx
+            .try_iter()
+            .find_map(|response| match response {
+                Response::PriceAlertFeed(batch) => Some(batch),
+                _ => None,
+            })
+            .expect("restored feed");
+        assert_eq!(published.rules, installed.rules);
+        // Deserialize directly so load's repair cannot mask a missing repair at installation.
+        let persisted: Store = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(persisted, installed);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    fn plan_draft() -> tr_data::trade_plans::PlanDraft {
+        tr_data::trade_plans::PlanDraft {
+            symbol: "NVDA".into(),
+            entry: 100.0,
+            stop: 90.0,
+            target: Some(120.0),
+            dollar_risk: 300.0,
+            shares: 30.0,
+            stop_source: "command".into(),
+            breakeven_at_r: None,
+            trail: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn update_trade_plan_persists_and_reports_errors() {
+        use tr_data::trade_plans::{PlanChange, Store, TrailKind, TrailSpec};
+        let (mut s, rx) = shared(Arc::new(PlanQuotes { calls: Default::default(), fail: true }), None);
+        let path = std::env::temp_dir().join(format!("tr-r2-update-plan-{}.json", std::process::id()));
+        Arc::get_mut(&mut s).unwrap().trade_plans_path = path.clone();
+        let now = chrono::Utc::now().timestamp();
+        {
+            let mut store = s.trade_plans.lock().unwrap();
+            store.arm(plan_draft(), now - 4).unwrap();
+            let mut other = plan_draft();
+            other.symbol = "MSFT".into();
+            store.arm(other, now - 4).unwrap();
+            for (price, ts) in [(99.0, now - 3), (100.0, now - 2), (110.0, now - 1)] {
+                tr_data::trade_plans::evaluate(
+                    &mut store,
+                    tr_data::trade_plans::EvalInput {
+                        now,
+                        sample_provider: false,
+                        prices: vec![tr_data::price_alerts::PriceTick {
+                            symbol: "NVDA US Equity".into(),
+                            price,
+                            ts,
+                            provenance: tr_core::Provenance::Real,
+                        }],
+                        failures: vec![],
+                    },
+                );
+            }
+        }
+        let other = s.trade_plans.lock().unwrap().plans[0].clone();
+        let nvda = "NVDA".to_owned();
+        for change in [
+            PlanChange::Trail(Some(TrailSpec { kind: TrailKind::R, value: 1.5, source: "command".into() })),
+            PlanChange::Breakeven(Some(1.0)),
+            PlanChange::MoveStop(105.0),
+            PlanChange::Trail(None),
+            PlanChange::Breakeven(None),
+        ] {
+            handle(&s, Request::UpdateTradePlan { query: nvda.clone(), change }).await;
+            let saved = Store::load(&path);
+            assert_eq!(saved, *s.trade_plans.lock().unwrap());
+            assert_eq!(saved.plans[0], other);
+            let responses = rx.try_iter().collect::<Vec<_>>();
+            assert!(responses.iter().any(|r| matches!(r, Response::TradePlanFeed(_))));
+            if saved.plans[1].stop_manual {
+                assert!(saved.plans[1].breakeven_seen);
+            }
+            assert!(!responses.iter().any(|r| matches!(r, Response::NewTradePlanEvents(_))));
+            if responses.iter().any(|r| matches!(r, Response::Status(_))) {
+                assert!(responses.iter().any(
+                    |r| matches!(r, Response::Status(text) if text.contains("observed quote, no order was changed"))
+                ));
+            }
+        }
+        let before = std::fs::read(&path).unwrap();
+        for (query, change, reason) in [
+            ("NVDA", PlanChange::MoveStop(100.0), "strictly tighter"),
+            ("NVDA", PlanChange::MoveStop(110.0), "adverse side"),
+            ("MSFT", PlanChange::MoveStop(95.0), "cancel and re-arm"),
+            ("NVDA", PlanChange::Breakeven(Some(0.0)), "breakeven R"),
+            (
+                "NVDA",
+                PlanChange::Trail(Some(TrailSpec { kind: TrailKind::Percent, value: 50.0, source: "command".into() })),
+                "below 50%",
+            ),
+            ("MISSING", PlanChange::Trail(None), "no active trade plan"),
+        ] {
+            handle(&s, Request::UpdateTradePlan { query: query.into(), change }).await;
+            assert_eq!(std::fs::read(&path).unwrap(), before);
+            let responses = rx.try_iter().collect::<Vec<_>>();
+            assert_eq!(responses.len(), 1);
+            assert!(matches!(&responses[0], Response::Status(text) if text.contains(reason)), "{reason}");
+        }
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn sample_provider_never_moves_plan_stops() {
+        use tr_data::trade_plans::{PlanChange, TrailKind, TrailSpec};
+        let (s, rx) = shared(Arc::new(tr_data::sample::SampleProvider::at(0, 10)), None);
+        let now = chrono::Utc::now().timestamp();
+        {
+            let mut store = s.trade_plans.lock().unwrap();
+            let mut draft = plan_draft();
+            draft.breakeven_at_r = Some(1.0);
+            draft.trail = Some(TrailSpec { kind: TrailKind::R, value: 1.0, source: "command".into() });
+            store.arm(draft, now - 3).unwrap();
+            for (price, ts) in [(99.0, now - 2), (100.0, now - 1)] {
+                tr_data::trade_plans::evaluate(
+                    &mut store,
+                    tr_data::trade_plans::EvalInput {
+                        now,
+                        sample_provider: false,
+                        prices: vec![tr_data::price_alerts::PriceTick {
+                            symbol: "NVDA US Equity".into(),
+                            price,
+                            ts,
+                            provenance: tr_core::Provenance::Real,
+                        }],
+                        failures: vec![],
+                    },
+                );
+            }
+        }
+        let before = s.trade_plans.lock().unwrap().clone();
+        evaluate_trade_plans(&s).await;
+        handle(&s, Request::EvaluatePriceAlerts).await;
+        handle(&s, Request::UpdateTradePlan { query: "NVDA".into(), change: PlanChange::MoveStop(95.0) }).await;
+        assert_eq!(*s.trade_plans.lock().unwrap(), before);
+        let responses = rx.try_iter().collect::<Vec<_>>();
+        assert!(!responses.iter().any(|r| matches!(r, Response::NewTradePlanEvents(_))));
+        assert!(responses.iter().any(|r| matches!(r, Response::TradePlanFeed(batch) if batch.sample)));
+        assert!(
+            responses
+                .iter()
+                .any(|r| matches!(r, Response::Status(text) if text.contains("sample provider cannot move stops")))
+        );
+    }
+
+    #[tokio::test]
+    async fn sample_trade_plans_are_not_invented() {
+        let (s, rx) = shared(Arc::new(tr_data::sample::SampleProvider::at(0, 10)), None);
+        handle(&s, Request::ArmTradePlan(plan_draft())).await;
+        handle(&s, Request::EvaluatePriceAlerts).await;
+        let before = s.trade_plans.lock().unwrap().clone();
+        assert_eq!(before.plans[0].last_price, None);
+        let mut feeds = 0;
+        while let Ok(response) = rx.try_recv() {
+            match response {
+                Response::NewTradePlanEvents(_) => panic!("sample must never invent plan events"),
+                Response::TradePlanFeed(batch) => {
+                    feeds += 1;
+                    assert!(batch.sample);
+                    assert!(batch.events.is_empty());
+                    assert_eq!(batch.plans[0].status, tr_data::trade_plans::PlanStatus::Armed);
+                }
+                _ => {}
+            }
+        }
+        assert_eq!(feeds, 2);
+        assert_eq!(*s.trade_plans.lock().unwrap(), before);
+    }
+
+    struct PlanQuotes {
+        calls: std::sync::atomic::AtomicUsize,
+        fail: bool,
+    }
+    #[async_trait::async_trait]
+    impl tr_data::MarketData for PlanQuotes {
+        fn name(&self) -> &str {
+            "plan test quotes"
+        }
+        async fn history(&self, _: &str, _: Timeframe, _: Option<i64>, _: usize) -> anyhow::Result<Vec<Bar>> {
+            panic!("plans must only acquire quotes");
+        }
+        async fn quotes(&self, symbols: &[String]) -> anyhow::Result<Vec<tr_data::Quote>> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if self.fail {
+                anyhow::bail!("offline quote failure");
+            }
+            Ok(symbols
+                .iter()
+                .map(|symbol| tr_data::Quote {
+                    symbol: tr_data::security(symbol).ticker,
+                    last: 99.0,
+                    prev_close: 98.0,
+                    ts: chrono::Utc::now().timestamp(),
+                    provenance: tr_core::Provenance::Real,
+                    spark: vec![],
+                    stats: Default::default(),
+                })
+                .collect())
+        }
+    }
+
+    #[tokio::test]
+    async fn trade_plans_evaluate_without_any_price_rule() {
+        let provider = Arc::new(PlanQuotes { calls: Default::default(), fail: false });
+        let (s, rx) = shared(provider.clone(), None);
+        assert!(s.price_alerts.lock().unwrap().rules.is_empty());
+        handle(&s, Request::EvaluatePriceAlerts).await;
+        assert_eq!(provider.calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+        s.trade_plans.lock().unwrap().arm(plan_draft(), 10).unwrap();
+        handle(&s, Request::EvaluatePriceAlerts).await;
+        assert_eq!(provider.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        let feeds: Vec<_> = rx
+            .try_iter()
+            .filter_map(|r| match r {
+                Response::TradePlanFeed(b) => Some(b),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(feeds.len(), 2);
+        assert_eq!(feeds[1].plans[0].last_price, Some(99.0));
+        assert!(!feeds[1].sample);
+        assert!(feeds[1].failures.is_empty());
+    }
+
+    #[tokio::test]
+    async fn trade_plan_quote_fetch_error_holds_state_and_reports_stale() {
+        let (s, rx) = shared(Arc::new(PlanQuotes { calls: Default::default(), fail: true }), None);
+        s.trade_plans.lock().unwrap().arm(plan_draft(), 10).unwrap();
+        let before = s.trade_plans.lock().unwrap().clone();
+        evaluate_trade_plans(&s).await;
+        assert_eq!(*s.trade_plans.lock().unwrap(), before);
+        match rx.try_recv().unwrap() {
+            Response::TradePlanFeed(batch) => {
+                assert!(batch.stale);
+                assert_eq!(batch.failures.len(), 1);
+                assert!(batch.failures[0].error.contains("offline quote failure"));
+            }
+            _ => panic!("expected feed"),
+        }
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn sample_price_alerts_are_not_invented() {
+        let (s, rx) = shared(std::sync::Arc::new(tr_data::sample::SampleProvider::at(0, 10)), None);
+        handle(
+            &s,
+            Request::AddPriceAlert {
+                symbol: "AAPL US Equity".into(),
+                kind: tr_data::price_alerts::AlertKind::Price {
+                    side: tr_data::price_alerts::PriceSide::Above,
+                    level: 1.0,
+                },
+            },
+        )
+        .await;
+        let mut feed = None;
+        while let Ok(r) = rx.try_recv() {
+            match r {
+                Response::PriceAlertFeed(batch) => feed = Some(batch),
+                Response::NewPriceAlerts(_) => panic!("sample must not invent price alerts"),
+                _ => {}
+            }
+        }
+        let batch = feed.expect("sample eval still publishes a feed");
+        assert!(batch.sample);
+        assert!(batch.events.is_empty());
+        assert_eq!(batch.rules.len(), 1);
+    }
+
     #[test]
     fn join_all_runs_everything() {
         let rt = tokio::runtime::Builder::new_current_thread().enable_time().build().unwrap();
@@ -943,5 +9824,707 @@ mod tests {
             i * 2
         })));
         assert_eq!(out, (0..20).map(|i| i * 2).collect::<Vec<_>>());
+    }
+    #[tokio::test]
+    async fn stop_cloud_worker_refuses_sample_unverified_and_mixed_history() {
+        use tr_data::stop_cloud::{Params, StopKey};
+        let (s, rx) = shared(Arc::new(tr_data::sample::SampleProvider::at(0, 10)), None);
+        for provenance in [tr_core::Provenance::Sample, tr_core::Provenance::Missing, tr_core::Provenance::Cached] {
+            let mut bars = stack_fixture(180, Timeframe::M5, tr_core::Provenance::Real);
+            bars[179].provenance = provenance;
+            let key = StopKey::new(42, Timeframe::M5, 179, Params::default(), Default::default(), &bars);
+            handle(
+                &s,
+                Request::StopCloud {
+                    stitch: None,
+                    pane: 7,
+                    key: key.clone(),
+                    class: tr_core::AssetClass::Crypto,
+                    bars: Arc::new(bars),
+                    as_of: None,
+                },
+            )
+            .await;
+            let result = rx
+                .try_iter()
+                .find_map(|r| {
+                    if let Response::StopCloud { pane: 7, key: k, result } = r {
+                        assert_eq!(k, key);
+                        Some(result)
+                    } else {
+                        None
+                    }
+                })
+                .unwrap();
+            assert!(result.unwrap_err().contains("refused"));
+        }
+    }
+    #[tokio::test]
+    async fn stop_cloud_second_request_hits_report_cache_and_misses_on_params() {
+        use tr_data::stop_cloud::{Params, StopKey};
+        let (s, rx) = shared(Arc::new(tr_data::sample::SampleProvider::at(0, 10)), None);
+        let bars = Arc::new(stack_fixture(400, Timeframe::M5, tr_core::Provenance::Real));
+        let mut results = vec![];
+        for ks in [vec![1.0, 2.0, 3.0], vec![1.0, 2.0, 3.0], vec![1.5, 2.5, 3.5]] {
+            let key =
+                StopKey::new(42, Timeframe::M5, 399, Params { ks, ..Default::default() }, Default::default(), &bars);
+            handle(
+                &s,
+                Request::StopCloud {
+                    stitch: None,
+                    pane: 7,
+                    key,
+                    class: tr_core::AssetClass::Crypto,
+                    bars: bars.clone(),
+                    as_of: None,
+                },
+            )
+            .await;
+            results.push(
+                rx.try_iter()
+                    .find_map(|r| if let Response::StopCloud { result, .. } = r { Some(result.unwrap()) } else { None })
+                    .unwrap(),
+            );
+        }
+        assert!(Arc::ptr_eq(&results[0], &results[1]));
+        assert!(!Arc::ptr_eq(&results[0], &results[2]));
+        // The verified gate must run before a cached closed-prefix report can hit.
+        let mut tainted = (*bars).clone();
+        tainted.last_mut().unwrap().provenance = tr_core::Provenance::Sample;
+        let key = StopKey::new(42, Timeframe::M5, 399, Params::default(), Default::default(), &tainted);
+        handle(
+            &s,
+            Request::StopCloud {
+                stitch: None,
+                pane: 7,
+                key,
+                class: tr_core::AssetClass::Crypto,
+                bars: Arc::new(tainted),
+                as_of: None,
+            },
+        )
+        .await;
+        let result = rx
+            .try_iter()
+            .find_map(|r| if let Response::StopCloud { result, .. } = r { Some(result) } else { None })
+            .unwrap();
+        assert!(result.unwrap_err().contains("refused"));
+    }
+    #[tokio::test]
+    async fn trend_cone_worker_refuses_sample_unverified_and_mixed_history() {
+        use tr_data::trend_cone::{ConeKey, Params};
+        let (s, rx) = shared(Arc::new(tr_data::sample::SampleProvider::at(0, 10)), None);
+        for provenance in [tr_core::Provenance::Sample, tr_core::Provenance::Missing, tr_core::Provenance::Cached] {
+            let mut bars = stack_fixture(180, Timeframe::M5, tr_core::Provenance::Real);
+            bars[179].provenance = provenance;
+            let key = ConeKey::new(42, Timeframe::M5, 179, Params::default(), Default::default(), &bars);
+            handle(
+                &s,
+                Request::TrendCone {
+                    stitch: None,
+                    pane: 7,
+                    key: key.clone(),
+                    class: tr_core::AssetClass::Crypto,
+                    bars: Arc::new(bars),
+                    as_of: None,
+                },
+            )
+            .await;
+            let result = rx
+                .try_iter()
+                .find_map(|r| {
+                    if let Response::TrendCone { pane: 7, key: k, result } = r {
+                        assert_eq!(k, key);
+                        Some(result)
+                    } else {
+                        None
+                    }
+                })
+                .unwrap();
+            assert!(result.unwrap_err().contains("refused"));
+        }
+    }
+}
+
+#[cfg(test)]
+mod enriched_scan_tests {
+    use super::filter_enriched_scan;
+    use tr_data::whats_news::{Metrics, Scan, ScanRow};
+
+    #[test]
+    fn added_spy_is_stripped_and_decrements_scanned() {
+        let mut scan = Scan {
+            provenance: tr_core::Provenance::Cached,
+            scanned: 2,
+            skipped: vec![],
+            results: vec![
+                ScanRow { symbol: "SPY".into(), ..Default::default() },
+                ScanRow { symbol: "WIN".into(), ..Default::default() },
+            ],
+        };
+        super::strip_spy_from_scan(&mut scan, true);
+        assert_eq!(scan.scanned, 1);
+        assert_eq!(scan.results.len(), 1);
+        assert_eq!(scan.results[0].symbol, "WIN");
+        assert!(scan.skipped.is_empty());
+    }
+
+    #[test]
+    fn oneil_selection_uses_enriched_metrics_and_preserves_scan_counts() {
+        let mut positive = Metrics::default();
+        positive.oneil_lens.oneil_rs = true;
+        let scan = Scan {
+            provenance: tr_core::Provenance::Cached,
+            scanned: 3,
+            skipped: vec![],
+            results: vec![
+                ScanRow { symbol: "WIN".into(), metrics: Some(positive), ..Default::default() },
+                ScanRow { symbol: "LOSE".into(), metrics: Some(Metrics::default()), ..Default::default() },
+                ScanRow { symbol: "MISSING".into(), ..Default::default() },
+            ],
+        };
+        assert_eq!(filter_enriched_scan("MA", scan.clone()).results.len(), 3);
+        let filtered = filter_enriched_scan("ONEIL_LENS", scan);
+        assert_eq!(filtered.scanned, 3);
+        assert_eq!(filtered.results.len(), 1);
+        assert_eq!(filtered.results[0].symbol, "WIN");
+    }
+}
+
+#[cfg(test)]
+mod auction_tests {
+    use super::{tests::*, *};
+    use std::sync::atomic::Ordering;
+    use tr_data::auction::{AuctionKey, AuctionParams};
+    fn fine_day() -> Vec<Bar> {
+        tr_data::intraday::regular_opens("2026-11-10".parse().unwrap(), Timeframe::M1)
+            .into_iter()
+            .map(|ts| Bar::new(ts, 100., 101., 99., 100., 100.).with_provenance(tr_core::Provenance::Real))
+            .collect()
+    }
+    async fn run(
+        s: &Shared,
+        bars: Vec<Bar>,
+        tf: Timeframe,
+        params: AuctionParams,
+        epoch: u32,
+    ) -> Result<Arc<tr_data::auction::AuctionReport>, String> {
+        let n = bars.len();
+        let as_of = bars.last().unwrap().ts + tf.seconds();
+        let key = AuctionKey::new(1, tf, n, params, &bars, epoch);
+        auction_map(
+            s,
+            "AAPL US Equity",
+            tr_core::AssetClass::Equity,
+            Arc::new(bars),
+            &key,
+            Some(as_of),
+            Some(Arc::new(tr_data::vault::StitchInfo { epoch, source: "yahoo".into(), ..Default::default() })),
+        )
+        .await
+    }
+    #[tokio::test]
+    async fn session_summary_admits_full_input_refuses_sample_mode_and_performs_no_provider_calls() {
+        for scenario in 0..4 {
+            let provider = Arc::new(VaultProvider { bars: Default::default(), calls: Default::default(), fail: Default::default(), sample: scenario == 0 });
+            let (s, rx) = shared(provider.clone(), None);
+            let mut bars = fine_day();
+            if scenario == 2 { bars.last_mut().unwrap().provenance = tr_core::Provenance::Sample; }
+            if scenario == 3 { bars[0].provenance = tr_core::Provenance::Cached; }
+            let key = crate::chart_view::SessionSummaryKey { generation: 7, bars_revision: 2, stitch_revision: 0, tf: Timeframe::M1, extended: false, as_of: Some(bars.last().unwrap().ts+60) };
+            handle(&s,Request::ChartSessionSummary { pane: 9, key, bars: Arc::new(bars), class: tr_core::AssetClass::Equity, stitch: None }).await;
+            let Response::ChartSessionSummary { pane, key: received, result } = rx.recv().unwrap() else { panic!("wrong response") };
+            assert_eq!(pane,9); assert_eq!(received,key);
+            assert_eq!(result.is_ok(),scenario==1);
+            if let Ok(r) = result { assert!(r.stats.vwap.is_some() && r.opening.is_some()); }
+            assert_eq!(provider.calls.load(Ordering::SeqCst),0);
+        }
+    }
+    #[tokio::test]
+    async fn auction_refuses_sample_mode_and_unverified_bars_without_network() {
+        let sample = Arc::new(VaultProvider {
+            bars: Default::default(),
+            calls: Default::default(),
+            fail: Default::default(),
+            sample: true,
+        });
+        let (s, _) = shared(sample.clone(), None);
+        assert!(
+            run(&s, fine_day(), Timeframe::M1, Default::default(), 0).await.unwrap_err().contains("sample / offline")
+        );
+        assert_eq!(sample.calls.load(Ordering::SeqCst), 0);
+        let provider = vault_provider(vec![]);
+        let (s, _) = shared(provider.clone(), None);
+        for p in [tr_core::Provenance::Sample, tr_core::Provenance::Missing] {
+            let mut b = vault_day("2026-11-10");
+            b[0].provenance = p;
+            assert!(run(&s, b, Timeframe::M5, Default::default(), 0).await.is_err());
+        }
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 0);
+    }
+    #[tokio::test]
+    async fn auction_uses_vault_one_minute_bars_under_a_five_minute_chart_and_outage() {
+        let provider = vault_provider(fine_day());
+        let (s, _) = shared(provider.clone(), Some(BarCache::open_in_memory().unwrap()));
+        let r = run(&s, vault_day("2026-11-10"), Timeframe::M5, Default::default(), 1).await.unwrap();
+        assert_eq!(r.sessions[0].source_tf, Timeframe::M1);
+        assert!(r.fine_note.is_none());
+        provider.fail.store(true, Ordering::SeqCst);
+        s.auction_fine.lock().unwrap().clear();
+        let f = auction_fine_bars(&s, "AAPL").await.unwrap();
+        assert_eq!(f.0.len(), 390);
+        assert!(f.0.iter().all(|b| b.provenance.is_verified()));
+        assert!(s.chart_sources.lock().unwrap().is_empty());
+        assert!(s.feed_requests.lock().unwrap().is_empty());
+    }
+    #[tokio::test]
+    async fn auction_falls_back_to_chart_bars_with_a_note_when_one_minute_is_unavailable() {
+        let p = vault_provider(vec![]);
+        p.fail.store(true, Ordering::SeqCst);
+        let (s, _) = shared(p, None);
+        let r = run(&s, vault_day("2026-11-10"), Timeframe::M5, Default::default(), 0).await.unwrap();
+        assert_eq!(r.sessions[0].source_tf, Timeframe::M5);
+        assert!(r.fine_note.as_ref().unwrap().contains("fallback"));
+    }
+    #[tokio::test]
+    async fn auction_report_cache_hits_and_misses_on_closed_inputs_params_epoch_and_gaps() {
+        let (s, _) = shared(vault_provider(vec![]), None);
+        let bars = fine_day();
+        let a = run(&s, bars.clone(), Timeframe::M1, Default::default(), 0).await.unwrap();
+        let b = run(&s, bars.clone(), Timeframe::M1, Default::default(), 0).await.unwrap();
+        assert!(Arc::ptr_eq(&a, &b));
+        let mut shorter = bars.clone();
+        shorter.pop();
+        let b = run(&s, shorter, Timeframe::M1, Default::default(), 0).await.unwrap();
+        assert!(!Arc::ptr_eq(&a, &b));
+        let b = run(&s, bars.clone(), Timeframe::M1, AuctionParams { value_area_pct: 68, ..Default::default() }, 0)
+            .await
+            .unwrap();
+        assert!(!Arc::ptr_eq(&a, &b));
+        let b = run(&s, bars.clone(), Timeframe::M1, Default::default(), 2).await.unwrap();
+        assert!(!Arc::ptr_eq(&a, &b));
+        let mut corrected = bars.clone();
+        corrected[0].volume *= 2.;
+        let b = run(&s, corrected, Timeframe::M1, Default::default(), 0).await.unwrap();
+        assert!(!Arc::ptr_eq(&a, &b));
+        let info = tr_data::vault::StitchInfo {
+            source: "yahoo".into(),
+            gaps: vec![(bars[10].ts, bars[30].ts)],
+            ..Default::default()
+        };
+        let key = AuctionKey::new(1, Timeframe::M1, bars.len(), Default::default(), &bars, 0);
+        let b = auction_map(
+            &s,
+            "AAPL US Equity",
+            tr_core::AssetClass::Equity,
+            Arc::new(bars.clone()),
+            &key,
+            Some(bars.last().unwrap().ts + 60),
+            Some(Arc::new(info)),
+        )
+        .await
+        .unwrap();
+        assert!(!Arc::ptr_eq(&a, &b));
+    }
+    #[tokio::test]
+    async fn auction_fine_slot_is_shared_within_ttl() {
+        let provider = vault_provider(fine_day());
+        let (s, _) = shared(provider.clone(), None);
+        let (a, b) = tokio::join!(auction_fine_bars(&s, "AAPL"), auction_fine_bars(&s, "AAPL US Equity"));
+        assert!(Arc::ptr_eq(&a.unwrap(), &b.unwrap()));
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+    }
+    #[tokio::test]
+    async fn auction_errors_are_not_cached() {
+        let (s, _) = shared(vault_provider(vec![]), None);
+        let mut b = fine_day();
+        for b in &mut b {
+            b.volume = 0.;
+        }
+        assert!(run(&s, b.clone(), Timeframe::M1, Default::default(), 0).await.is_err());
+        assert!(run(&s, b, Timeframe::M1, Default::default(), 0).await.is_err());
+        assert!(run(&s, fine_day(), Timeframe::M1, Default::default(), 0).await.is_ok());
+    }
+    #[tokio::test]
+    async fn auction_discards_unverified_fine_bars_and_refuses_non_us_symbols_before_fetch() {
+        let fine = fine_day().into_iter().map(|b| b.with_provenance(tr_core::Provenance::Sample)).collect();
+        let provider = vault_provider(fine);
+        let (s, _) = shared(provider.clone(), None);
+        let bars = vault_day("2026-11-10");
+        let key = AuctionKey::new(1, Timeframe::M5, bars.len(), Default::default(), &bars, 0);
+        let bad = auction_map(
+            &s,
+            "VOD.L",
+            tr_core::AssetClass::Equity,
+            Arc::new(bars.clone()),
+            &key,
+            Some(bars.last().unwrap().ts + 300),
+            None,
+        )
+        .await;
+        assert_eq!(bad.unwrap_err(), "Auction Map needs a US cash session");
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 0);
+        let r = run(&s, bars, Timeframe::M5, Default::default(), 0).await.unwrap();
+        assert_eq!(r.sessions[0].source_tf, Timeframe::M5);
+        assert!(r.fine_note.is_some());
+    }
+    #[tokio::test]
+    async fn auction_vault_stitch_performance() {
+        let (s, _) = shared(vault_provider(vec![]), Some(BarCache::open_in_memory().unwrap()));
+        let mut date = "2026-09-01".parse().unwrap();
+        let mut bars = vec![];
+        for _ in 0..20 {
+            bars.extend(
+                tr_data::intraday::regular_opens(date, Timeframe::M1)
+                    .into_iter()
+                    .map(|ts| Bar::new(ts, 100., 101., 99., 100., 100.).with_provenance(tr_core::Provenance::Real)),
+            );
+            date = tr_data::history::calendar::next_session(date);
+        }
+        let id =
+            tr_data::vault::SeriesId { symbol: "AAPL US Equity".into(), tf: Timeframe::M1, source: "yahoo".into() };
+        let write_id = id.clone();
+        cache_op(&s, move |v| v.ingest(&write_id, &bars, DataMode::Live, chrono::Utc::now().timestamp()))
+            .await
+            .unwrap();
+        let start = std::time::Instant::now();
+        for _ in 0..10 {
+            let id = id.clone();
+            let (bars, _) = cache_op(&s, move |v| v.stitch(&id, &[], AUCTION_FINE_LIMIT, None)).await.unwrap();
+            assert_eq!(bars.len(), 7800);
+        }
+        eprintln!(
+            "Auction in-memory vault read + stitch, 7800 rows, worker scheduling included: {:?}",
+            start.elapsed() / 10
+        );
+    }
+}
+
+#[cfg(test)]
+mod honest_backtest_tests {
+    use super::tests::{shared, vault_provider};
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tr_data::{
+        backtest_honesty::{Estimate, HonestReport, HonestySettings, Reason},
+        backtest_trials,
+    };
+    fn daily(n: usize) -> Vec<Bar> {
+        let mut date = "2025-01-02".parse().unwrap();
+        let mut out = Vec::new();
+        while out.len() < n {
+            let p = 100. + out.len() as f64 * 0.1 + (out.len() as f64 * 0.7).sin();
+            out.push(
+                Bar::new(
+                    chrono::NaiveDate::and_hms_opt(&date, 0, 0, 0).unwrap().and_utc().timestamp(),
+                    p,
+                    p + 1.,
+                    p - 1.,
+                    p + 0.3,
+                    100.,
+                )
+                .with_provenance(tr_core::Provenance::Real),
+            );
+            date = tr_data::history::calendar::next_session(date);
+        }
+        out
+    }
+    #[allow(clippy::too_many_arguments)]
+    async fn science(
+        s: &Shared,
+        bars: Vec<Bar>,
+        tf: Timeframe,
+        observed: Option<i64>,
+        stitch: Option<tr_data::vault::StitchInfo>,
+        settings: HonestySettings,
+        shorts: bool,
+        counter: Arc<AtomicUsize>,
+    ) -> anyhow::Result<Arc<HonestReport>> {
+        let current = if tf.is_intraday() {
+            backtest_trials::intraday_experiments(
+                &tr_data::intraday_backtest::RunSettings { timeframe: tf, allow_short: shorts, ..Default::default() },
+                settings,
+            )
+        } else {
+            backtest_trials::daily_experiments(
+                &tr_data::backtest::RunSettings {
+                    strategies: vec![tr_data::backtest::StrategySpec::BuyAndHold],
+                    allow_short: shorts,
+                    ..Default::default()
+                },
+                settings,
+            )
+        };
+        honest_cached(
+            s,
+            "AAPL US Equity".into(),
+            tf,
+            bars,
+            "fixture-native".into(),
+            observed,
+            stitch,
+            settings,
+            current,
+            move |_, h| {
+                counter.fetch_add(1, Ordering::SeqCst);
+                Ok(h)
+            },
+        )
+        .await
+    }
+    #[tokio::test]
+    async fn backtest_worker_cache_closed_prefix_durable_revisions_and_concurrency() {
+        let path = std::env::temp_dir().join(format!("tr-honest-worker-{}.sqlite", std::process::id()));
+        let (s, rx) = shared(vault_provider(vec![]), Some(BarCache::open(&path).unwrap()));
+        let count = Arc::new(AtomicUsize::new(0));
+        let bars = daily(160);
+        let wf = HonestySettings::default();
+        let (a, b) = tokio::join!(
+            science(&s, bars.clone(), Timeframe::D1, None, None, wf, false, count.clone()),
+            science(&s, bars.clone(), Timeframe::D1, None, None, wf, false, count.clone())
+        );
+        let a = a.unwrap();
+        let b = b.unwrap();
+        assert!(Arc::ptr_eq(&a, &b));
+        assert_eq!(count.load(Ordering::SeqCst), 1);
+        assert_eq!(a.trial_family.value().unwrap().trials.len(), 2);
+        assert!(a.family_statistics.value().is_some());
+        assert_eq!(rx.try_iter().filter(|r| matches!(r, Response::BacktestTrialRevision { .. })).count(), 1);
+        let mut forming = bars.clone();
+        forming.last_mut().unwrap().close = f64::NAN;
+        let same = science(&s, forming, Timeframe::D1, None, None, wf, false, count.clone()).await.unwrap();
+        assert!(Arc::ptr_eq(&a, &same));
+        let mut correction = bars.clone();
+        correction[50].close += 0.1;
+        let changed = science(&s, correction, Timeframe::D1, None, None, wf, false, count.clone()).await.unwrap();
+        assert!(!Arc::ptr_eq(&a, &changed));
+        assert_eq!(changed.trial_family.value().unwrap().revision, a.trial_family.value().unwrap().revision);
+        let new_history = science(&s, daily(161), Timeframe::D1, None, None, wf, false, count.clone()).await.unwrap();
+        assert!(!Arc::ptr_eq(&a, &new_history));
+        let new_trial = science(&s, bars.clone(), Timeframe::D1, None, None, wf, true, count.clone()).await.unwrap();
+        assert_eq!(new_trial.trial_family.value().unwrap().trials.len(), 4);
+        assert_eq!(new_trial.trial_family.value().unwrap().revision, 4);
+        let reload = science(&s, bars, Timeframe::D1, None, None, wf, true, count.clone()).await.unwrap();
+        assert!(Arc::ptr_eq(&new_trial, &reload));
+        assert_eq!(rx.try_iter().filter(|r| matches!(r, Response::BacktestTrialRevision { .. })).count(), 1);
+        drop(s);
+        std::fs::remove_file(path).unwrap();
+    }
+    #[tokio::test]
+    async fn backtest_worker_verified_gate_precedes_cache_and_missing_register_has_no_dsr() {
+        let (s, _) = shared(vault_provider(vec![]), Some(BarCache::open_in_memory().unwrap()));
+        let bars = daily(160);
+        let count = Arc::new(AtomicUsize::new(0));
+        let wf = HonestySettings::default();
+        let a = science(&s, bars.clone(), Timeframe::D1, None, None, wf, false, count.clone()).await.unwrap();
+        assert_eq!(a.family_statistics, Estimate::Unavailable(Reason::RegisterUnavailable));
+        assert!(a.variants[0].evaluation.value().is_some());
+        for provenance in [tr_core::Provenance::Sample, tr_core::Provenance::Missing] {
+            for tf in [Timeframe::D1, Timeframe::M5] {
+                let mut bad = bars.clone();
+                bad.last_mut().unwrap().provenance = provenance;
+                assert!(science(&s, bad, tf, None, None, wf, false, count.clone()).await.is_err());
+            }
+        }
+        let mut mixed = bars.clone();
+        mixed[0].provenance = tr_core::Provenance::Cached;
+        assert!(
+            science(&s, mixed.clone(), Timeframe::D1, None, None, wf, false, count.clone())
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("stitch")
+        );
+        let witness = tr_data::vault::StitchInfo { source: "fixture-native".into(), epoch: 1, ..Default::default() };
+        assert!(science(&s, mixed, Timeframe::D1, None, Some(witness), wf, false, count.clone()).await.is_ok());
+        let mut gap = bars;
+        gap.remove(20);
+        assert!(
+            science(&s, gap, Timeframe::D1, None, None, wf, false, count)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("hole")
+        );
+    }
+    #[tokio::test]
+    async fn backtest_worker_sample_mode_refuses_both_without_fetching() {
+        let sample = Arc::new(tr_data::sample::SampleProvider::at(0, 10));
+        let (s, _) = shared(sample, None);
+        let count = Arc::new(AtomicUsize::new(0));
+        for tf in [Timeframe::D1, Timeframe::M5] {
+            assert!(
+                science(&s, daily(160), tf, None, None, Default::default(), false, count.clone())
+                    .await
+                    .unwrap_err()
+                    .to_string()
+                    .contains("sample")
+            );
+        }
+        assert_eq!(count.load(Ordering::SeqCst), 0);
+    }
+    #[tokio::test]
+    async fn backtest_worker_intraday_uses_complete_sessions_and_current_outage_receipt() {
+        let mut date = "2025-06-02".parse().unwrap();
+        let mut bars = Vec::new();
+        for i in 0..40 {
+            for (j, ts) in tr_data::intraday::regular_opens(date, Timeframe::M30).into_iter().enumerate() {
+                let p = 100. + i as f64 * 0.1 + j as f64 * 0.02 + (i as f64 * 0.4).sin();
+                bars.push(
+                    Bar::new(ts, p, p + 1., p - 1., p + (i as f64 * 0.3).sin() * 0.2, 100.)
+                        .with_provenance(tr_core::Provenance::Real),
+                );
+            }
+            date = tr_data::history::calendar::next_session(date);
+        }
+        let provider = vault_provider(bars);
+        let (s, _) = shared(provider.clone(), Some(BarCache::open_in_memory().unwrap()));
+        let (a, fresh) = research_intraday_backtest(&s, "AAPL", "ALL", "30m", "20%", 5., 5., false, Default::default())
+            .await
+            .unwrap();
+        assert_eq!(a.sessions, 40);
+        assert!(!fresh.contains("VAULT ONLY"));
+        let e = a.honesty.as_ref().unwrap().variants[0].evaluation.value().unwrap();
+        assert_eq!(e.returns.len(), 18);
+        assert_eq!(e.folds[0].removed_labels, 0);
+        assert_eq!(e.folds[1].removed_labels, 1);
+        provider.fail.store(true, Ordering::SeqCst);
+        let (b, receipt) =
+            research_intraday_backtest(&s, "AAPL", "ALL", "30m", "20%", 5., 5., false, Default::default())
+                .await
+                .unwrap();
+        assert!(receipt.contains("VAULT ONLY"));
+        assert_eq!(b.sessions, 39);
+        assert_eq!(b.partial_sessions, 1);
+        assert_eq!(b.honesty.as_ref().unwrap().variants[0].evaluation.value().unwrap().returns.len(), 17);
+    }
+}
+
+/// Process-wide tokens prevent recreated research children accepting an old completion.
+pub(crate) fn studio_token() -> u64 {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1 << 32);
+    NEXT.try_update(std::sync::atomic::Ordering::Relaxed,std::sync::atomic::Ordering::Relaxed,|n|n.checked_add(1)).expect("Studio request token exhausted")
+}
+
+#[cfg(test)]
+mod studio_canvas_tests {
+    use super::tests::{VaultProvider, shared, vault_provider};
+    use super::*;
+    use crate::chart_view::{
+        SessionSummaryKey,
+        studio_canvas::{CanvasKey, PeerSources},
+    };
+    use tr_data::studio_canvas::{CanvasInput, CanvasSpec, CompareMode};
+    fn fixture() -> (CanvasInput, CanvasKey, CanvasSpec) {
+        let i = tr_perf::fixtures::canvas_inputs(2).remove(0);
+        let key = CanvasKey {
+            session: SessionSummaryKey {
+                generation: studio_token(),
+                bars_revision: 1,
+                stitch_revision: 0,
+                tf: i.tf,
+                extended: false,
+                as_of: i.observed_at,
+            },
+            revision: studio_token(),
+            events_revision: 0,
+            visible: None,
+            selected: None,
+        };
+        let spec = CanvasSpec { mode: CompareMode::Index100, base_ts: i.bars[0].ts, ..Default::default() };
+        (i, key, spec)
+    }
+    fn request(
+        input: CanvasInput,
+        key: CanvasKey,
+        spec: CanvasSpec,
+        token: u64,
+        peers: Option<Arc<PeerSources>>,
+    ) -> Request {
+        Request::StudioCanvas {
+            pane: 19,
+            token,
+            key,
+            input,
+            peers,
+            comparisons: vec!["QQQ US Equity".into()],
+            spec,
+            news: vec![],
+            earnings: None,
+        }
+    }
+    fn response(
+        rx: &mpsc::Receiver<Response>,
+    ) -> (u64, CanvasKey, Result<Arc<crate::chart_view::studio_canvas::PreparedCanvas>, String>) {
+        let Response::WhatsNews { response, .. } = rx.try_recv().unwrap() else { panic!("response envelope") };
+        let Response::StudioCanvas { pane, token, key, result } = *response else { panic!("canvas response") };
+        assert_eq!(pane, 19);
+        (token, key, result)
+    }
+    #[tokio::test]
+    async fn canvas_worker_cache_corrections_and_peer_reuse() {
+        let (input, key, spec) = fixture();
+        let provider = vault_provider((*input.bars).clone());
+        let (s, rx) = shared(provider.clone(), Some(BarCache::open_in_memory().unwrap()));
+        let token = studio_token();
+        handle(&s, request(input.clone(), key, spec.clone(), token, None)).await;
+        let (returned, k, result) = response(&rx);
+        assert_eq!((returned, k), (token, key));
+        let a = result.unwrap();
+        assert_eq!(a.report.lines.len(), 2);
+        assert!(a.report.strip.as_ref().unwrap().n >= 780);
+        let calls = provider.calls.load(std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(calls, 1);
+        handle(&s, request(input.clone(), key, spec.clone(), studio_token(), Some(a.peers.clone()))).await;
+        let (_, _, result) = response(&rx);
+        let b = result.unwrap();
+        assert!(Arc::ptr_eq(&a, &b));
+        assert_eq!(provider.calls.load(std::sync::atomic::Ordering::SeqCst), calls);
+        let mut corrected = input.clone();
+        let bars = Arc::make_mut(&mut corrected.bars);
+        bars[100].close += 0.001;
+        let mut revised = key;
+        revised.session.bars_revision += 1;
+        handle(&s, request(corrected, revised, spec.clone(), studio_token(), Some(a.peers.clone()))).await;
+        let (_, _, result) = response(&rx);
+        let c = result.unwrap();
+        assert_ne!(a.report.key, c.report.key);
+        assert!(!Arc::ptr_eq(&a, &c));
+        assert_ne!(a.report.lines[0].values[100], c.report.lines[0].values[100]);
+        let mut invalid = input;
+        Arc::make_mut(&mut invalid.bars)[0].low = f64::NAN;
+        handle(&s, request(invalid, key, spec, studio_token(), Some(a.peers.clone()))).await;
+        assert!(response(&rx).2.is_err());
+        assert_eq!(provider.calls.load(std::sync::atomic::Ordering::SeqCst), calls);
+    }
+    #[tokio::test]
+    async fn sample_canvas_worker_makes_zero_provider_calls() {
+        let (input, key, spec) = fixture();
+        let provider = Arc::new(VaultProvider {
+            bars: Default::default(),
+            calls: Default::default(),
+            fail: Default::default(),
+            sample: true,
+        });
+        let (s, rx) = shared(provider.clone(), None);
+        handle(&s, request(input, key, spec, studio_token(), None)).await;
+        assert!(response(&rx).2.err().unwrap().contains("sample"));
+        assert_eq!(provider.calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+    #[tokio::test]
+    async fn canvas_bad_peer_stays_unavailable_without_substitution() {
+        let (input, key, spec) = fixture();
+        let provider = vault_provider(vec![]);
+        let (s, rx) = shared(provider.clone(), None);
+        let mut peer = input.clone();
+        peer.symbol = "QQQ US Equity".into();
+        Arc::make_mut(&mut peer.bars)[100].provenance = tr_core::Provenance::Sample;
+        let peers =
+            Arc::new(PeerSources { inputs: vec![peer], failures: vec![], requested: vec!["QQQ US Equity".into()] });
+        handle(&s, request(input, key, spec, studio_token(), Some(peers))).await;
+        let result = response(&rx).2.unwrap();
+        assert_eq!(result.report.lines.len(), 1);
+        assert!(result.failures.iter().any(|f| f.contains("QQQ") && f.to_ascii_lowercase().contains("sample")));
+        assert_eq!(provider.calls.load(std::sync::atomic::Ordering::SeqCst), 0);
     }
 }

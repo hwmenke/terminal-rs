@@ -1,4 +1,4 @@
-//! Command palette overlay (⌘K, Ctrl+K elsewhere): the live catalogue of items built
+//! Command palette overlay (⌘⇧K, Ctrl+Shift+K elsewhere): the live catalogue of items built
 //! from the app's state, the centred search card, and running the picked item.
 
 use egui::{Color32, Id, Key, Modifiers, Rect, Sense, Stroke, StrokeKind, Ui, UiBuilder, pos2, vec2};
@@ -21,6 +21,69 @@ const VISIBLE_ROWS: usize = 10;
 /// Function codes offered by the palette: code, description (empty uses the command
 /// line's own hint), extra search words, and the action whose shortcut is shown.
 const COMMANDS: &[(&str, &str, &str, Option<Action>)] = &[
+    ("STUDIO", "Native canvas and named research lenses", "distribution relate when season backtest", None),
+    ("STUDIO lens=dist", "Distribution lens", "studio dist", None),
+    ("STUDIO lens=relate benchmark=QQQ", "Relationship lens", "studio corr regression", None),
+    ("RELATE", "Relate · transforms, β and frozen-fit fair-value bands", "studio corr fair value residual", None),
+    ("STUDIO lens=relate transform=logreturn h=5", "Relate with a 5-bar log-return fair value", "studio relate beta", None),
+    ("RELATE transform=level bands=off", "Relate · adjust the focused Studio", "transform bands matrix", None),
+    ("STUDIO lens=when", "When rule evidence lens", "studio condition rule", None),
+    ("WHEN", "When · rule mask and fixed-family forward evidence", "studio condition rule rsi forward", None),
+    ("WHEN h=6 threshold=10bp", "When · selected horizon and event threshold", "studio probability", None),
+    ("STUDIO lens=season", "Seasonality lens", "studio calendar", None),
+    ("STUDIO lens=backtest", "Research backtest lens", "studio simulation", None),
+    ("QUICK", "Quick time canvas · five comparison modes", "studio chart base brush", None),
+    ("QUICK mode=index100", "Compare from a pinned base", "studio normalize", None),
+    ("DSTRIP", "Toggle distribution margin strip", "chart histogram", None),
+    ("STUDIO lab factors=SPY,TLT", "Regression Lab · multi-factor OLS, purged holdout", "regression factors ols hac vif", None),
+    ("STUDIO resid", "Residual tickers · saved models scored on live data, never refit", "studio residual frozen", None),
+    ("STUDIO resid open AAPL-v-SPY-v1", "Open a saved residual model (alias RESID OPEN <id>)", "residual open model", None),
+    ("STUDIO resid save name=AAPL-v-SPY monitor=250", "Freeze the focused Lab / Relate fit (alias RESID SAVE)", "residual save freeze", None),
+    ("STUDIO resid check", "Fresh reload, rescore and checks (alias RESID CHECK)", "residual adf cusum check", None),
+    ("STUDIO attr", "Attribution · drift + factor contributions + residual of a saved model", "studio attribution factor", None),
+    ("STUDIO attr model=AAPL-v-SPY-v1 obs=20", "Attribute the last 20 observations of a saved model", "attribution model obs", None),
+    ("STUDIO attr model=AAPL-v-SPY-v1 from=2026-03-02 to=2026-03-20", "Attribute a dated window (on-or-before bars, UTC)", "attribution range from to", None),
+    (
+        "STOPS",
+        "ATR Stop Cloud and empirical Stop Odds",
+        "scloud trailing atr probability",
+        Some(Action::ToggleStopCloud),
+    ),
+    ("STOPS K 1 2 3", "Set ascending ATR guide multiples", "stops multiples", None),
+    ("STOPS H AUTO", "Per-interval Stop Odds horizons", "stops horizon", None),
+    ("STOPS OFF", "Hide Stop Cloud", "stops disable", None),
+    (
+        "AUCTION",
+        "Auction Map: session profiles, composite and naked levels",
+        "amap volume value area poc",
+        Some(Action::ToggleAuctionMap),
+    ),
+    ("AUCTION VIS", "Visible whole-session composite", "auction profile visible", None),
+    ("AUCTION NAKED", "Toggle naked POC / VAH / VAL", "auction levels", None),
+    (
+        "CONE",
+        "Trend Cone: regime path quantiles + walk-forward coverage",
+        "quant bootstrap fan forecast trend cone",
+        Some(Action::ToggleTrendCone),
+    ),
+    ("CONE 30", "Trend Cone: horizon 30 bars (bootstrap block = horizon)", "quant cone horizon", None),
+    ("CONE 20 10", "Trend Cone: horizon 20 bars, mean bootstrap block 10", "quant cone horizon block", None),
+    ("CONE OFF", "Hide Trend Cone", "cone disable", None),
+    (
+        "TSTACK TUNE",
+        "Plateau grid: 49 Edge tests, FDR and effective smoothing",
+        "quant robustness parameters er hold",
+        None,
+    ),
+    ("TSTACK EDGE", "Regime-conditional forward returns and confidence intervals", "quant edge hit rate flips", None),
+    (
+        "ZBAND",
+        "Closed sample-sigma bands, robust VR and empirical tails",
+        "statistics sigma bands honest variance ratio",
+        None,
+    ),
+    ("VAULT", "Closed intraday bar vault", "vlt cache history coverage verify prune", None),
+    ("HEALTH", "Real data feed health", "src source offline stale retry", None),
     ("PORT", "", "portfolio prtu brokerage holdings value", Some(Action::Portfolio)),
     ("ACCT", "", "accounts balances brokerage", None),
     ("POS", "", "positions holdings brokerage", Some(Action::Positions)),
@@ -32,13 +95,200 @@ const COMMANDS: &[(&str, &str, &str, Option<Action>)] = &[
     ("OMON", "", "options chain calls puts greeks", Some(Action::NewOptions)),
     ("CONG", "Congressional trades feed", "congress disclosures", Some(Action::Congress)),
     ("POL", "Politicians", "congress members profile", Some(Action::Politicians)),
-    ("ALRT", "", "alerts tracked filings", Some(Action::Alerts)),
+    ("ALRT", "", "alerts price setup tracked filings", Some(Action::Alerts)),
+    (
+        "ALERTS",
+        "Price, VWAP, RVOL, setup and congressional alerts",
+        "price level crossing setup change vwap rvol",
+        Some(Action::Alerts),
+    ),
+    ("AAPL ALERT 150", "Watch AAPL crossing above 150", "price alert above", None),
+    ("AAPL ALERT BELOW 140", "Watch AAPL crossing below 140", "price alert below", None),
+    ("AAPL ALERT VWAP", "Watch AAPL crossing above session VWAP", "vwap alert intraday", None),
+    ("AAPL ALERT VWAP BELOW", "Watch AAPL crossing below session VWAP", "vwap alert below", None),
+    ("AAPL ALERT RVOL 2", "Watch AAPL session relative volume crossing 2×", "rvol alert relative volume", None),
+    ("AAPL ALERT PATH", "Watch AAPL leaving the usual session path", "session alert path pace gap", None),
+    ("AAPL ALERT PACE", "Watch AAPL running above the usual volume pace", "session alert pace volume", None),
+    ("AAPL ALERT GAP", "Watch AAPL when today's gap fills", "session alert gap fill", None),
+    ("AAPL ALERT XTRM", "Watch an unusually early session high or low", "session alert extreme", None),
+    ("AAPL ALERT RPATH", "Watch AAPL leaving the usual path versus SPY", "session alert relative spy", None),
+    ("NVDA ALERT SETUP NEAR_HIGH", "Watch NVDA entering NEAR_HIGH", "setup alert scan", None),
+    (
+        "NVDA PLAN 142.5 STOP 138.2 TARGET 151.1 RISK 300",
+        "Arm an entry → stop/target quote plan",
+        "trade risk bracket plan",
+        None,
+    ),
+    ("PLANS", "Open trade plans in Alerts", "trade risk bracket plan", None),
+    ("UNPLAN NVDA", "Cancel NVDA's active trade plan", "trade risk bracket cancel", None),
+    ("UNALERT", "Remove price/setup alerts: UNALERT <ticker>", "price setup remove", None),
     ("REFRESH", "", "congress disclosures sync", Some(Action::Refresh)),
     ("WL", "", "watchlist monitor", Some(Action::Watchlist)),
-    ("N", "", "news headlines", None),
+    ("EARNINGS", "Earnings dates across the selected watchlist", "calendar ern report quote", None),
+    ("ISCAN", "Intraday scan of the selected watchlist", "rvol vwap spy relative strength session", None),
+    (
+        "IDESK",
+        "Intraday desk: 5-minute chart, scan, breadth, and volume pace",
+        "dashboard layout iscan brd vpace",
+        None,
+    ),
+    ("IDASH", "Intraday desk (alias)", "dashboard layout", None),
+    ("AAPL IDESK", "Open the intraday desk for AAPL", "dashboard chart scan breadth pace", None),
+    (
+        "COCKPIT",
+        "Intraday Cockpit: linked native 1m · 5m · 15m charts",
+        "ckpt time link lens anchored vwap multi timeframe",
+        None,
+    ),
+    ("AAPL COCKPIT", "Open the Cockpit for AAPL", "ckpt linked charts intraday", None),
+    ("COCKPIT 5m 15m 1h", "Cockpit with a custom ascending ladder", "ckpt ladder intervals native", None),
+    (
+        "AVWAP",
+        "Anchored VWAP: click a bar to anchor",
+        "vwap anchor tool volume weighted",
+        Some(Action::DrawAnchoredVwap),
+    ),
+    ("AVWAP OPEN", "Anchored VWAP from today's cash open", "vwap anchor 09:30", None),
+    ("AVWAP HIGH", "Anchored VWAP from the session high bar", "vwap anchor extreme", None),
+    ("AVWAP LOW", "Anchored VWAP from the session low bar", "vwap anchor extreme", None),
+    ("AVWAP CLEAR", "Remove this name's anchored VWAPs", "vwap anchor remove", None),
+    ("DESK", "PM Desk: watchlist leaders and position size", "pm risk planner watchlist rank", Some(Action::Desk)),
+    ("PMDESK", "PM Desk (alias)", "pm risk planner", None),
+    ("RISK", "PM Desk (alias)", "pm position size planner", None),
+    ("EXPORT", "Export focused scan, history or journal", "backup restore portable", None),
+    ("EXPORT SCAN", "Export scan results with source and date", "research snapshot", None),
+    ("EXPORT JOURNAL", "Export trade journal entries", "setups notes backup", None),
+    ("EXPORT HIST", "Export archived daily prices with source and dates", "yahoo archive backup", None),
+    ("BACKUP", "Back up personal workspace (credentials excluded)", "restore export layouts journal", None),
+    ("RESTORE", "Restore a workspace, journal or history export", "backup import recovery", None),
+    ("CORR", "Relationship Studio: beta, correlation, ratios and matrix", "rbeta benchmark regression", None),
+    ("AAPL CORR QQQ", "Compare AAPL with QQQ", "relationship studio scatter beta", None),
+    ("SEASON", "Seasonality Studio: calendar and New York clock patterns", "SSN seasonal month weekday heatmap", None),
+    ("AAPL SEASON 30M", "AAPL intraday seasonality from verified history", "time of day volume smile", None),
+    ("STATS", "Historical risk, returns and what followed a condition", "conditional returns sma baseline", None),
+    (
+        "DIST",
+        "Distribution Studio: log returns, tails, QQ, drawdowns and regimes",
+        "rdist histogram normal student jarque bera var cvar",
+        None,
+    ),
+    ("AAPL DIST 1H", "AAPL intraday return distribution from verified closed bars", "studio vault distribution", None),
+    ("AAPL STATS", "AAPL historical risk and returns", "statistics research archive", None),
+    ("COND", "Conditional forward returns vs baseline", "sma distribution overlap", None),
+    ("AAPL COND RSI(14) < 30", "What followed oversold RSI on AAPL", "conditional returns", None),
+    ("CDIST", "Conditional returns (alias)", "distribution baseline", None),
+    ("EXPORT STATS", "Export statistics with source and date", "conditional returns provenance", None),
+    (
+        "BACKTEST",
+        "Honest backtest: DSR, purged walk-forward and holdout tables",
+        "strategy DSR PSR purged walk forward equity",
+        None,
+    ),
+    ("AAPL BACKTEST", "AAPL paper backtest versus buy-and-hold", "holdout costs next open", None),
+    ("AAPL BT ADTREND", "AAPL Adaptive Trend vs buy-and-hold on the evaluate window", "adaptive trend backtest", None),
+    ("EXPORT BACKTEST", "Export backtest settings, costs, holdout and metrics", "paper research provenance", None),
+    (
+        "IBT",
+        "Honest intraday backtest: DSR and complete-session walk-forward",
+        "vwap opening range next open session holdout",
+        None,
+    ),
+    ("AAPL IBT", "AAPL session VWAP and opening range vs holding the cash session", "intraday backtest 5m", None),
+    ("AAPL IBT VWAP", "AAPL VWAP cross vs session hold on the unseen sessions", "vwap cross fill", None),
+    ("AAPL IBT OR 15m", "AAPL opening-range break on 15-minute bars", "opening range 15m", None),
+    ("ICMP", "Intraday compare: percent from each name's 09:30 open", "session open relative spy multi symbol", None),
+    ("AAPL ICMP MSFT NVDA", "AAPL, MSFT, NVDA and SPY from each 09:30 open", "intraday compare 5m", None),
+    ("AAPL ICMP 1m", "AAPL and SPY on 1-minute bars, percent from the open", "session compare 1m", None),
+    (
+        "SPATH",
+        "Today versus the typical path of prior sessions, percent from each 09:30 open",
+        "session path mean band prior sessions",
+        None,
+    ),
+    ("AAPL SPATH 20", "AAPL today versus the last 20 sessions from the 09:30 open", "typical path 20", None),
+    ("AAPL SPATH 15m", "AAPL session path on 15-minute bars", "typical path 15m", None),
+    (
+        "BRD",
+        "Session breadth: share of the watchlist at or above the open and VWAP",
+        "breadth participation vwap session open list",
+        None,
+    ),
+    ("BRD AAPL MSFT NVDA", "AAPL, MSFT and NVDA at or above their opens and VWAP", "breadth 5m", None),
+    ("BRD 15m", "Watchlist breadth on 15-minute bars", "breadth 15m", None),
+    (
+        "VPACE",
+        "Cumulative volume versus the usual pace of prior sessions",
+        "volume pace cumulative rvol prior sessions",
+        None,
+    ),
+    ("AAPL RVAR 20 5m", "Session and rolling realized volatility", "realized volatility log returns", None),
+    ("AAPL ACOR 20 5m", "Session and rolling return autocorrelation", "return autocorrelation choppiness", None),
+    ("AAPL VPACE 20", "AAPL cumulative volume versus the last 20 sessions", "volume pace 20", None),
+    ("AAPL VPACE 15m", "AAPL volume pace on 15-minute bars", "cumulative volume 15m", None),
+    ("GFILL", "Gap fill: today's open versus the prior cash close", "gap fill prior close opening drive", None),
+    ("AAPL GFILL 40", "AAPL gap versus the last 40 sessions' cash closes", "gap fill 40", None),
+    ("AAPL GFILL 15m", "AAPL gap fill on 15-minute bars", "gap fill 15m", None),
+    ("XTRM", "When the session high and low print", "session extreme high low minute", None),
+    ("AAPL XTRM 20", "AAPL high and low versus the last 20 complete sessions", "hilo 20", None),
+    ("AAPL XTRM 15m", "AAPL session extreme on 15-minute bars", "hilo 15m", None),
+    ("RPATH", "Percent from the 09:30 open minus SPY", "relative path spy spread lead lag", None),
+    ("AAPL RPATH 20", "AAPL versus SPY over the last 20 sessions", "relative spy 20", None),
+    ("AAPL RPATH 15m", "AAPL versus SPY on 15-minute bars", "relative spy 15m", None),
+    ("BRIEF", "Session brief: path, pace, gap, extreme, and versus SPY", "dashboard reads signals", None),
+    ("SBRIEF", "Session brief (alias)", "path pace gap extreme spy", None),
+    ("AAPL BRIEF", "Open the session brief for AAPL", "path pace gap extreme relative", None),
+    ("MARKS", "Prior close, open, opening range, and VWAP on the chart", "levels horizontal lines", None),
+    ("SMARKS", "Chart cash levels (alias)", "prior close open vwap", None),
+    ("AAPL MARKS", "Draw AAPL cash levels on the chart", "opening range prior close vwap", None),
+    (
+        "LOOKALIKE",
+        "Historical lookalikes: nearest past conditions and subsequent returns",
+        "knn analog neighbor overlap horizon",
+        None,
+    ),
+    ("AAPL LOOKALIKE", "AAPL historical lookalikes from the research archive", "knn analog neighbors", None),
+    ("AAPL KNN 2024-01-15", "AAPL lookalikes as-of 2024-01-15", "nearest neighbor date", None),
+    ("GOTO 2024-01-15", "Jump the archive chart to that session", "lookalike neighbor date jump", None),
+    ("EXPORT LOOKALIKE", "Export lookalikes with source, counts and overlap", "knn provenance horizons", None),
+    (
+        "JOURNAL",
+        "Trade journal: setups, checklist, $ and R outcomes",
+        "checklist tradelog notes",
+        Some(Action::Journal),
+    ),
+    ("JRNL", "Trade journal (alias)", "checklist notes", None),
+    ("CHECKLIST", "Trade journal checklist (alias)", "journal setup", None),
+    ("AAPL JOURNAL", "Journal for AAPL, prefilled from the chart date", "setup checklist", None),
+    ("AAPL NOTE 2026-10-24", "Note on AAPL's 2026-10-24 chart date", "journal historical note", None),
+    ("NOTE", "Attach a note to the focused chart date", "journal historical", None),
+    ("WL NEW", "Create a named watchlist group: WL NEW <group>", "watchlist group create", None),
+    ("WL ADD", "Save symbols: WL ADD <group> <symbols…> · w picker / W last-used", "watchlist group scan save", None),
+    ("WL DEL", "Remove symbols (alias): WL DEL <group> <symbols…>", "watchlist remove", None),
+    ("WL RM", "Remove symbols: WL RM <group> <symbols…>", "watchlist group remove", None),
+    ("WL RENAME", "Rename group: WL RENAME <old> <new>", "watchlist group rename", None),
+    ("WL DELETE", "Delete a group after confirmation: WL DELETE <group>", "watchlist group delete", None),
+    ("WL SHOW", "Show a group: WL SHOW <group>", "watchlist group members", None),
+    (
+        "WL LINK",
+        "Link active chart: WL LINK <group> · [ / ] or Alt+Up/Down step",
+        "watchlist quick switch next previous",
+        None,
+    ),
+    ("N", "Watchlist news", "headlines catalysts watchlist scanner", None),
+    ("TOP", "Top market headlines", "news general market", None),
     ("OB", "", "order book depth dom", None),
     ("WEI", "", "world equity indices markets", None),
     ("GC", "", "yield curve treasury rates", None),
+    ("HIST", "Price history", "archive download refresh cancel resume prices", None),
+    ("HIST REFRESH", "Refresh archived daily prices", "incremental corrections adjustments", None),
+    ("HIST CANCEL", "Cancel history download", "pause archive", None),
+    ("HIST RESUME", "Resume unfinished history download", "restart archive", None),
+    ("HIST RETRY", "Retry failed history downloads", "errors failures archive", None),
+    ("HIST ADD ALL", "Download bundled research universe", "daily yahoo history", None),
+    ("UNIV", "Research archive universe", "coverage stale missing research", None),
+    ("SCAN DARVAS_BREAKOUT", "Scan archived Darvas breakouts", "whats-news research setups", None),
+    ("SCAN VIEW PATTERN", "Pattern scanner: daily/weekly breakouts, breakdowns and thirds", "whats-news research scanner view", None),
+    ("SCAN VIEW RSI-C", "RSI Counter: RSI 2–21 shares, alignment, D/W agreement", "whats-news research scanner view rsic", None),
     ("SECF", "Security search", "search find", None),
     ("LAYOUTS", "", "saved layouts workspaces", None),
     ("LAYOUT NEW", "Start a new saved layout", "workspace", None),
@@ -71,7 +321,24 @@ const COMMANDS: &[(&str, &str, &str, Option<Action>)] = &[
     ("VL", "", "vertical line draw", Some(Action::DrawVertical)),
     ("FIB", "", "fibonacci retracement draw", Some(Action::DrawFib)),
     ("MAGNET", "", "snap ohlc drawings", Some(Action::Magnet)),
+    ("REVIEW", "Linked daily and weekly archive charts", "candidate review darvas", None),
+    ("LATEST", "Jump to the latest candle", "end newest last", Some(Action::JumpLatest)),
+    ("BOX", "Toggle box levels on this interval", "darvas review overlay", None),
+    ("RS", "Toggle 21-bar close return (not SPY-relative)", "strength review overlay", None),
+    ("VCTX", "Toggle volume context", "volume review overlay", None),
+    ("TSTACK", "Trend Stack lanes and confidence cloud", "stack mtf regime confidence adaptive trend", None),
+    ("TSTACK ON", "Enable Trend Stack on the chart", "stack overlay on", None),
+    ("TSTACK OFF", "Disable Trend Stack", "stack overlay off", None),
+    ("TSTACK 5m 30m 4H", "Custom native ladder and Regime Candles", "stack ladder intervals native", None),
+    ("TSTACK AUTO", "Restore automatic ladder", "stack ladder auto", None),
+    ("TSTACK TINT", "Toggle Regime Candles", "stack candle tint confidence", None),
+    ("TSTACK SESSION", "Toggle 09:30 base-lane reset", "stack anchor session kama", None),
+    ("RAIL", "Toggle Truth Rail", "provenance freshness holes stale rail", None),
+    ("NEW TSTACK", "Open a 5m Trend Stack chart", "stack new pane", None),
+    ("SPLIT DOWN TSTACK", "Split with a Trend Stack chart", "stack split pane", None),
+    ("ADTREND", "Adaptive Trend bands, states and trailing stops", "adaptive trend overlay kama mrt", None),
     ("CLEAR DRAW", "", "drawings remove", None),
+    ("UNDO DRAW", "Restore the last deleted drawings on this symbol", "drawings undo", None),
     ("1", "", "interval timeframe minute", None),
     ("5", "", "interval timeframe minutes", None),
     ("15", "", "interval timeframe minutes", None),
@@ -90,6 +357,47 @@ const COMMANDS: &[(&str, &str, &str, Option<Action>)] = &[
     ("RANGE ALL", "", "quick range full history", None),
 ];
 
+/// Argument-taking function forms offered by toolbar autocomplete.
+pub(super) fn bar_items() -> Vec<Item> {
+    let mut items = static_items();
+    let extra: &[(&str, &str, &str, Option<Action>)] = &[
+        ("SCAN", "Scan Whats-News archive setups", "research setups", None),
+        ("TRACK", "Track a politician: TRACK <name>", "congress alerts", None),
+        ("UNTRACK", "Stop tracking a politician: UNTRACK <name>", "congress alerts", None),
+        (
+            "ALERT",
+            "Set an alert: ALERT <level|VWAP|RVOL n|PATH|PACE|GAP|XTRM|RPATH|SETUP name>",
+            "price setup session",
+            None,
+        ),
+        ("PLAN", "Arm a plan: <ticker> PLAN <entry> STOP <stop> [TARGET <t>] [RISK <$>]", "trade risk bracket", None),
+        ("UNPLAN", "Cancel a plan: UNPLAN <ticker>", "trade risk bracket cancel", None),
+        ("UNALERT", "Remove price/setup alerts: UNALERT <ticker>", "price setup remove", None),
+        ("LAYOUT", "Switch or manage layouts: LAYOUT <name|preset|subcommand>", "workspace", None),
+        ("NEW", "Add a panel: NEW <panel> [ticker]", "pane chart", None),
+        ("LINK", "Link a pane: LINK <colour|OFF>", "group", None),
+        ("SIDEBAR", "Toggle or position sidebar: SIDEBAR LEFT|RIGHT|SWAP|SHOW|HIDE", "view", None),
+        ("THEME", "Select theme or density: THEME <name>", "appearance", None),
+        ("TITLE", "Rename the focused tab: TITLE <name>", "rename", None),
+        ("BUY", "Fill a buy ticket: BUY <ticker> <quantity>", "trade", None),
+        ("SELL", "Fill a sell ticket: SELL <ticker> <quantity>", "trade", None),
+        ("BROKER", "Brokerage connection settings", "snaptrade", None),
+        ("DEMO", "Use the paper trading account", "account", None),
+        ("MODE LIVE", "Switch to live brokerage accounts (confirmation required)", "account", None),
+        ("30", "", "interval timeframe minutes", None),
+    ];
+    items.extend(extra.iter().map(|(code, desc, words, _)| {
+        Item::new(
+            Kind::Command,
+            *code,
+            if desc.is_empty() { command::hint(code) } else { (*desc).into() },
+            Target::Run((*code).into()),
+        )
+        .keywords(*words)
+    }));
+    items
+}
+
 /// Workspace actions run through their hotkey handler, with extra search words.
 const ACTIONS: &[(Action, &str)] = &[
     (Action::ToggleSidebar, "show hide sidebar"),
@@ -99,6 +407,7 @@ const ACTIONS: &[(Action, &str)] = &[
     (Action::NewTab, "chart tab"),
     (Action::SaveLayout, "layout workspace"),
     (Action::ResetView, "chart zoom fit"),
+    (Action::JumpLatest, "latest candle end"),
     (Action::FrameTiming, "fps performance perf"),
 ];
 
@@ -111,6 +420,8 @@ fn settings_blurb(tab: SettingsTab) -> &'static str {
         SettingsTab::Layouts => "Saved layouts and presets",
         SettingsTab::Brokerage => "SnapTrade keys and connected brokerages",
         SettingsTab::Trading => "Enable trading, order limits and confirmations",
+        SettingsTab::WhatsNews => "Archive path, local HTTP connection, status and test connection",
+        SettingsTab::Backup => "Export scans, history and journal; back up or restore the workspace",
     }
 }
 
@@ -132,6 +443,82 @@ pub(super) fn static_items() -> Vec<Item> {
     v.push(
         Item::new(Kind::Panel, "New Portfolio pane", "NEW PORT", Target::Run("NEW PORT".into()))
             .keywords("panel pane brokerage"),
+    );
+    v.push(
+        Item::new(Kind::Panel, "New PM Desk pane", "NEW DESK", Target::Run("NEW DESK".into()))
+            .keywords("panel pane watchlist risk size"),
+    );
+    v.push(
+        Item::new(Kind::Panel, "New Journal pane", "NEW JOURNAL", Target::Run("NEW JOURNAL".into()))
+            .keywords("panel pane journal checklist notes"),
+    );
+    v.push(
+        Item::new(Kind::Panel, "New Relationship Studio pane", "NEW CORR", Target::Run("NEW CORR".into()))
+            .keywords("panel pane relationship beta correlation"),
+    );
+    v.push(
+        Item::new(Kind::Panel, "New Seasonality Studio", "NEW SEASON", Target::Run("NEW SEASON".into()))
+            .keywords("panel pane seasonal calendar SSN month weekday intraday"),
+    );
+    v.push(
+        Item::new(Kind::Panel, "New Statistics pane", "NEW STATS", Target::Run("NEW STATS".into()))
+            .keywords("panel pane statistics conditional returns"),
+    );
+    v.push(
+        Item::new(Kind::Panel, "New Backtest pane", "NEW BACKTEST", Target::Run("NEW BACKTEST".into()))
+            .keywords("panel pane backtest strategy buy hold holdout costs"),
+    );
+    v.push(
+        Item::new(Kind::Panel, "New intraday backtest", "NEW IBT", Target::Run("NEW IBT".into()))
+            .keywords("panel pane ibt vwap opening range session"),
+    );
+    v.push(
+        Item::new(Kind::Panel, "New session compare", "NEW ICMP", Target::Run("NEW ICMP".into()))
+            .keywords("panel pane icmp intraday compare session open spy"),
+    );
+    v.push(
+        Item::new(Kind::Panel, "New session path", "NEW SPATH", Target::Run("NEW SPATH".into()))
+            .keywords("panel pane spath typical session path mean band"),
+    );
+    for command in ["TWALL", "TWALL D", "NEW TWALL", "SPLIT DOWN TWALL", "EWALL", "EWALL D"] {
+        v.push(
+            Item::new(Kind::Panel, "Trend Wall", command, Target::Run(command.into()))
+                .keywords("stack tgrid stacks mtfgrid watchlist breadth native session edge evidence fdr scatter 50"),
+        );
+    }
+    for command in ["RRG", "RRG WL", "RRG WEEKLY", "NEW RRG"] {
+        v.push(
+            Item::new(Kind::Panel, "Relative rotation graph", command, Target::Run(command.into()))
+                .keywords("rotation sectors leadership research archive"),
+        );
+    }
+    v.push(
+        Item::new(Kind::Panel, "New session breadth", "NEW BRD", Target::Run("NEW BRD".into()))
+            .keywords("panel pane breadth open vwap participation"),
+    );
+    v.push(
+        Item::new(Kind::Panel, "New volume pace", "NEW VPACE", Target::Run("NEW VPACE".into()))
+            .keywords("panel pane vpace cumulative volume prior sessions"),
+    );
+    v.push(
+        Item::new(Kind::Panel, "New gap fill", "NEW GFILL", Target::Run("NEW GFILL".into()))
+            .keywords("panel pane gfill gap fill prior close"),
+    );
+    v.push(
+        Item::new(Kind::Panel, "New session extreme", "NEW XTRM", Target::Run("NEW XTRM".into()))
+            .keywords("panel pane hilo session extreme high low"),
+    );
+    v.push(
+        Item::new(Kind::Panel, "New session brief", "NEW BRIEF", Target::Run("NEW BRIEF".into()))
+            .keywords("panel pane brief path pace gap extreme spy"),
+    );
+    v.push(
+        Item::new(Kind::Panel, "New relative path", "NEW RPATH", Target::Run("NEW RPATH".into()))
+            .keywords("panel pane rpath relative spy spread"),
+    );
+    v.push(
+        Item::new(Kind::Panel, "New Lookalikes pane", "NEW LOOKALIKE", Target::Run("NEW LOOKALIKE".into()))
+            .keywords("panel pane lookalike knn analog neighbor"),
     );
     v.push(
         Item::new(
@@ -288,7 +675,12 @@ impl TerminalApp {
                     v.push(Item::new(Kind::Indicator, spec.label(), sub, Target::Run(q.into())));
                 }
                 Some(command::Command::Symbol(key)) => {
-                    v.push(ticker_item(&key));
+                    let mut item = ticker_item(&key);
+                    // The typed alias (e.g. BRL=X) must survive ranking after
+                    // resolution changes the displayed market key.
+                    item.keywords.push(' ');
+                    item.keywords.push_str(q);
+                    v.push(item);
                     let sec = tr_data::security(&key);
                     if matches!(sec.class, tr_core::AssetClass::Equity | tr_core::AssetClass::Etf) {
                         let t = &sec.ticker;
@@ -361,9 +753,13 @@ impl TerminalApp {
     /// Keyboard handling, the overlay, and running the pick. Runs before the panes so
     /// arrows, Enter and Esc go to the palette while it is open.
     pub(super) fn command_palette(&mut self, ctx: &egui::Context) {
+        if self.palette.query.len() > command::MAX_INPUT_BYTES {
+            self.palette.query.clear();
+            self.status = "Command too long (maximum 4096 bytes)".into();
+        }
         let input_id = Id::new(INPUT_ID);
         if !self.palette.open {
-            // Give the keyboard back once closed (by ⌘K, a pick or Esc).
+            // Give the keyboard back once closed (by its hotkey, a pick or Esc).
             if ctx.memory(|m| m.has_focus(input_id)) {
                 ctx.memory_mut(|m| m.surrender_focus(input_id));
             }
@@ -399,6 +795,7 @@ impl TerminalApp {
 
                 // The query first, so results (and Enter) see this frame's typing.
                 let edit = egui::TextEdit::singleline(&mut self.palette.query)
+                    .char_limit(command::MAX_INPUT_BYTES)
                     .id(input_id)
                     .font(ui_font(16.0))
                     .frame(egui::Frame::NONE)
@@ -665,6 +1062,10 @@ mod tests {
         assert_eq!(top("psar"), "Parabolic SAR");
         assert_eq!(top("ichimoku"), "Ichimoku Cloud");
         assert_eq!(top("supertrend"), "SuperTrend");
+        assert!(
+            rank(&items, &[], "adaptive trend").iter().any(|i| i.title == "Adaptive Trend"),
+            "Adaptive Trend is in the picker"
+        );
         assert_eq!(top("on balance volume"), "On-Balance Volume");
         assert_eq!(top("ind"), "IND");
         let rsi = items.iter().find(|i| i.title == "Relative Strength Index").unwrap();

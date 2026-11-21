@@ -101,13 +101,7 @@ fn pct(x: f64) -> String {
 }
 
 fn pnl_color(x: f64) -> Color32 {
-    if x > 0.0 {
-        theme::up()
-    } else if x < 0.0 {
-        theme::down()
-    } else {
-        muted()
-    }
+    theme::sign(x)
 }
 
 // ---- tables -------------------------------------------------------------------------------
@@ -294,6 +288,7 @@ pub fn portfolio(
     b: &BrokerState,
     demo: Option<&Portfolio>,
     quotes: &HashMap<String, Quote>,
+    planning: Option<(&mut super::portfolio_stops::Store, &mut super::portfolio_risk::State)>,
 ) -> Vec<PortAction> {
     let mut out = Vec::new();
     toolbar(ui, pane, b, demo, &mut out);
@@ -326,6 +321,15 @@ pub fn portfolio(
             }
             if pane.account.as_ref().is_some_and(|a| pf.account(a).is_none()) {
                 pane.account = None;
+            }
+            if matches!(pane.view, PortView::Summary | PortView::Positions)
+                && let Some((store, state)) = planning
+            {
+                egui::ScrollArea::vertical()
+                    .id_salt("planned-risk")
+                    .max_height(dp(300.0))
+                    .auto_shrink([false, true])
+                    .show(ui, |ui| super::portfolio_risk::panel(ui, pf, pane.account.as_deref(), quotes, store, state));
             }
             let price_of = |p: &Position| b.live_price(quotes, p);
             match pane.view {
@@ -1181,13 +1185,13 @@ mod tests {
         for view in PortView::ALL {
             let mut pane = PortfolioPane::new(view);
             let mut out = ctx.run_ui(Default::default(), |ui| {
-                let _ = portfolio(ui, &mut pane, &b, None, &quotes);
+                let _ = portfolio(ui, &mut pane, &b, None, &quotes, None);
             });
             out.textures_delta.clear();
             pane.account = Some("sim-ira".into());
             pane.symbol = Some("SPY US Equity".into());
             let mut out = ctx.run_ui(Default::default(), |ui| {
-                let _ = portfolio(ui, &mut pane, &b, None, &quotes);
+                let _ = portfolio(ui, &mut pane, &b, None, &quotes, None);
             });
             out.textures_delta.clear();
         }
@@ -1196,7 +1200,7 @@ mod tests {
         for view in PortView::ALL {
             let mut pane = PortfolioPane::new(view);
             let mut out = ctx.run_ui(Default::default(), |ui| {
-                let _ = portfolio(ui, &mut pane, &b, Some(&demo), &quotes);
+                let _ = portfolio(ui, &mut pane, &b, Some(&demo), &quotes, None);
             });
             out.textures_delta.clear();
         }
@@ -1204,8 +1208,95 @@ mod tests {
         b.simulate = false;
         let mut pane = PortfolioPane::new(PortView::Summary);
         let mut out = ctx.run_ui(Default::default(), |ui| {
-            let _ = portfolio(ui, &mut pane, &b, None, &quotes);
+            let _ = portfolio(ui, &mut pane, &b, None, &quotes, None);
         });
         out.textures_delta.clear();
     }
+}
+
+/// Compute risks with the same account, symbol and currency scope as the strip.
+pub(super) fn holding_risks(pane: &PortfolioPane, pf: &Portfolio, risk: &super::desk::HoldingRiskState) -> Vec<tr_core::indicators::HoldingRisk> {
+    pf.positions.iter()
+        .filter(|p| pane.account.as_ref().is_none_or(|a| *a == p.account_id))
+        .filter(|p| matches_symbol(pane, p.market_key()))
+        .map(|p| {
+            let bars = p.market_key().and_then(|k| risk.history.get(&k));
+            let values: Option<Vec<_>> = pf.positions.iter()
+                .filter(|q| q.currency == p.currency && pane.account.as_ref().is_none_or(|a| *a == q.account_id))
+                .map(|q| q.market_value().filter(|v| v.is_finite()).map(f64::abs)).collect();
+            let total = values.map(|v| v.iter().sum::<f64>()).filter(|v| *v > 0.0);
+            let weight = p.market_value().zip(total).map(|(v, t)| v.abs() / t);
+            tr_core::indicators::holding_risk(bars.map(Vec::as_slice).unwrap_or(&[]), weight, risk.concentration)
+        }).collect()
+}
+
+/// Risk strip for the selected holdings scope, using explicitly loaded archive history.
+pub(super) fn risk_chips(
+    ui: &mut Ui,
+    pane: &mut PortfolioPane,
+    pf: &Portfolio,
+    worker: &crate::worker::Worker,
+    id: crate::dock::PaneId,
+    risk: &mut super::desk::HoldingRiskState,
+) {
+    if !matches!(pane.view, PortView::Summary | PortView::Positions) {
+        return;
+    }
+    let force_open = std::mem::take(&mut pane.open_risk);
+    egui::CollapsingHeader::new("Holdings risk · daily archive").open(force_open.then_some(true)).show(ui, |ui| {
+        ui.horizontal(|ui| {
+            ui.label("Concentration threshold (%)");
+            let mut percent = risk.concentration * 100.0;
+            if ui.add(egui::DragValue::new(&mut percent).range(0.0..=100.0)).changed() {
+                risk.concentration = percent / 100.0;
+                risk.recompute(Some(pf));
+            }
+            if ui.add_enabled(!risk.loading, egui::Button::new("Load / refresh risk")).clicked() {
+                risk.generation += 1;
+                risk.requested = true;
+                risk.loading = true;
+                let mut symbols: Vec<_> = pf.positions.iter()
+                    .filter(|p| pane.account.as_ref().is_none_or(|a| *a == p.account_id))
+                    .filter_map(|p| p.market_key()).collect();
+                symbols.sort(); symbols.dedup();
+                worker.send(crate::worker::Request::HoldingHistory { pane: id,
+                    generation: risk.generation, symbols });
+            }
+            if risk.loading { ui.spinner(); }
+        });
+        ui.label("SMA50 and RSI14 use daily archive closes. Weight = absolute broker value / gross holdings in the same currency and selected account scope. RSI OB ≥70; OS ≤30.");
+        if let Some(e) = &risk.error { ui.colored_label(amber(), e); }
+        for p in pf.positions.iter().filter(|p| pane.account.as_ref().is_none_or(|a| *a == p.account_id))
+            .filter(|p| matches_symbol(pane, p.market_key())) {
+            let key = p.market_key();
+            let bars = key.as_ref().and_then(|k| risk.history.get(k));
+            let values: Option<Vec<_>> = pf.positions.iter()
+                .filter(|q| q.currency == p.currency && pane.account.as_ref().is_none_or(|a| *a == q.account_id))
+                .map(|q| q.market_value().filter(|v| v.is_finite()).map(f64::abs)).collect();
+            let total = values.map(|v| v.iter().sum::<f64>()).filter(|v| *v > 0.0);
+            let weight = p.market_value().zip(total).map(|(v,t)| v.abs()/t);
+            let stretch = key.as_ref().and_then(|k| risk.adma_stretch.get(k)).copied().flatten();
+            let setup_count = key.as_ref().and_then(|k| risk.setup_count.get(k)).copied().flatten();
+            let setup_hover = key.as_ref().and_then(|k| risk.setups.get(k)).and_then(Option::as_ref)
+                .map(|tags| if tags.is_empty() { "No active setups".into() } else { tags.join(", ") })
+                .unwrap_or_else(|| "Verified daily history unavailable".into());
+            let risk = tr_core::indicators::holding_risk(bars.map(Vec::as_slice).unwrap_or(&[]), weight, risk.concentration);
+            ui.horizontal_wrapped(|ui| {
+                ui.label(&p.symbol);
+                let ma = match risk.above_sma50 { Some(true) => "≥ SMA50", Some(false) => "< SMA50", None => "SMA50 —" };
+                ui.label(RichText::new(ma).color(if risk.above_sma50 == Some(false) { amber() } else { muted() }).background_color(theme::control()));
+                ui.label(RichText::new(stretch.map(|s| format!("ADMA Stretch {s:+.2}%")).unwrap_or_else(|| "ADMA Stretch —".into()))
+                    .color(muted()).background_color(theme::control()));
+                ui.label(RichText::new(setup_count.map(|n| format!("Setups {n}")).unwrap_or_else(|| "Setups —".into()))
+                    .color(muted()).background_color(theme::control())).on_hover_text(setup_hover);
+                let rsi = risk.rsi14.map(|r| format!("RSI14 {r:.1} {}", if r >= 70.0 { "OB" } else if r <= 30.0 { "OS" } else { "neutral" })).unwrap_or_else(|| "RSI14 —".into());
+                ui.label(RichText::new(rsi).color(if risk.rsi14.is_some_and(|r| r >= 70.0 || r <= 30.0) { amber() } else { muted() }).background_color(theme::control()));
+                ui.label(RichText::new(weight.map(|w| format!("{:.1}%{}", w*100.0, if risk.concentrated == Some(true) { " concentrated" } else { "" })).unwrap_or_else(|| "Weight —".into()))
+                    .color(if risk.concentrated == Some(true) { amber() } else { muted() }).background_color(theme::control()));
+                if let Some(last) = bars.and_then(|b| b.last()) {
+                    if let Some(date) = chrono::DateTime::from_timestamp(last.ts, 0) { ui.small(format!("as of {}", date.date_naive())); }
+                }
+            });
+        }
+    });
 }

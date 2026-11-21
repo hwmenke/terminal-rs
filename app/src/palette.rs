@@ -1,4 +1,4 @@
-//! Command palette (⌘K, Ctrl+K elsewhere): fuzzy search over every command, ticker,
+//! Command palette (⌘⇧K, Ctrl+Shift+K elsewhere): fuzzy search over every command, ticker,
 //! panel, layout, theme, settings tab and workspace action.
 //!
 //! This module is the model: items, ranking and the persisted list of recent picks. The

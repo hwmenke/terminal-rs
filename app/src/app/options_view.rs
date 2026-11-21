@@ -130,6 +130,24 @@ fn rows(o: &OptionsPane) -> Vec<Row> {
 pub fn options_chain(ui: &mut Ui, o: &mut OptionsPane) -> (Option<Action>, bool) {
     let mut action = None;
     let mut refetch = false;
+    if o.feed_state.is_down() || (o.chain.is_none() && o.error.is_some()) {
+        let state = if o.feed_state.is_down() {
+            o.feed_state.clone()
+        } else {
+            tr_data::FeedState::Unsupported { reason: o.error.clone().unwrap_or_default() }
+        };
+        refetch = crate::widgets::unavailable_card(ui, ui.available_rect_before_wrap(), &state);
+        return (None, refetch);
+    }
+    let mut shown = o.feed_state.clone();
+    if let tr_data::FeedState::Stale { age_secs, .. } = &mut shown {
+        *age_secs =
+            (chrono::Utc::now().timestamp() - o.chain.as_ref().map_or(chrono::Utc::now().timestamp(), |c| c.ts)).max(0);
+    }
+    crate::widgets::stale_chip(ui, &shown);
+    if matches!(shown, tr_data::FeedState::Stale { .. }) {
+        ui.multiply_opacity(0.55);
+    }
     let key = tr_data::security(&o.symbol);
     ui.horizontal_wrapped(|ui| {
         let r = ui.label(RichText::new(&key.ticker).font(mono(13.0)).color(amber())).interact(Sense::click());
@@ -144,10 +162,8 @@ pub fn options_chain(ui: &mut Ui, o: &mut OptionsPane) -> (Option<Action>, bool)
                 .unwrap_or_default();
             ui.label(RichText::new(format!("{} · {asof}", ch.source)).font(ui_font(11.0)).color(muted()));
             if ch.simulated {
-                ui.label(
-                    RichText::new(" SIMULATED ").font(ui_font(10.5)).color(Color32::BLACK).background_color(amber()),
-                )
-                .on_hover_text("Offline or no options source: prices are synthetic (Black-Scholes).");
+                crate::widgets::chip(ui, crate::widgets::ChipKind::Caution, "SIMULATED")
+                    .on_hover_text("Explicit sample mode: prices are synthetic (Black-Scholes).");
             }
         }
         if o.loading {

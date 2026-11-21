@@ -124,8 +124,9 @@ fn crypto(
 }
 
 fn fx(ticker: &'static str, name: &'static str, level: f64) -> Listing {
-    // Yahoo quotes pairs as `EURUSD=X`; leaked lifetimes are fine for a static table.
-    let y: &'static str = Box::leak(format!("{ticker}=X").into_boxed_str());
+    // USD-base pairs use Yahoo's quote-only shorthand (`USDJPY` -> `JPY=X`).
+    let pair = ticker.strip_prefix("USD").unwrap_or(ticker);
+    let y: &'static str = Box::leak(format!("{pair}=X").into_boxed_str());
     yahoo(ticker, AssetClass::Fx, name, Group::Fx, y, level)
 }
 

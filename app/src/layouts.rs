@@ -3,12 +3,12 @@
 //! `<data dir>/layouts/` (`~/Library/Application Support/terminal-rs/layouts` on macOS),
 //! so they can be shared, hand-edited, imported and exported.
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
-use tr_chart::drawings::Drawing;
+use tr_chart::drawings::{AnnotationStore, Drawing};
 use tr_chart::scene::ChartType;
 use tr_core::Timeframe;
 
@@ -16,6 +16,16 @@ use crate::command::IndicatorSpec;
 use crate::congress_view::FeedFilter;
 use crate::dock::{Node, PaneId};
 use crate::layout::Layout;
+
+fn one_bar() -> usize {
+    1
+}
+fn rotation_tail() -> u8 {
+    10
+}
+fn rotation_table() -> bool {
+    true
+}
 
 pub const FORMAT_VERSION: u32 = 1;
 
@@ -42,34 +52,109 @@ impl Link {
         }
     }
 
+    /// Categorical identity colour (light/dark variants live in the theme roles).
     pub fn color(self) -> egui::Color32 {
-        match self {
-            Link::Red => egui::Color32::from_rgb(255, 69, 58),
-            Link::Orange => egui::Color32::from_rgb(255, 159, 10),
-            Link::Green => egui::Color32::from_rgb(48, 209, 88),
-            Link::Blue => egui::Color32::from_rgb(10, 132, 255),
-            Link::Purple => egui::Color32::from_rgb(191, 90, 242),
-        }
+        crate::theme::link(self)
+    }
+}
+
+/// Optional Auction Map view and calculation settings. Missing fields use defaults.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct AuctionSettings {
+    pub strips: bool,
+    pub composite: u8,
+    pub value_area: u8,
+    pub naked: bool,
+    pub max_age: u8,
+    pub filled: bool,
+    pub ib: bool,
+}
+impl Default for AuctionSettings {
+    fn default() -> Self {
+        Self { strips: true, composite: 10, value_area: 70, naked: true, max_age: 10, filled: false, ib: true }
+    }
+}
+
+/// Optional ATR Stop Cloud. Missing fields retain safe, compatible defaults.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct StopCloudSettings {
+    pub ks: Vec<f64>,
+    pub horizons: Option<(usize, usize)>,
+    pub odds: bool,
+}
+impl Default for StopCloudSettings {
+    fn default() -> Self {
+        Self { ks: vec![1.0, 2.0, 3.0], horizons: None, odds: true }
     }
 }
 
 /// A pane's kind plus its persisted, panel-specific settings.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum PaneSettings {
+    Vault {
+        #[serde(default)]
+        symbol: Option<String>,
+    },
     Chart {
+        #[serde(default)]
+        archive: bool,
+        #[serde(default)]
+        watch_group: Option<String>,
         symbol: String,
         tf: Timeframe,
         chart_type: ChartType,
         log: bool,
         indicators: Vec<IndicatorSpec>,
         drawings: Vec<Drawing>,
+        /// Per-security drawings for names this pane has visited. The live `drawings`
+        /// field stays the current symbol so older builds still load.
+        #[serde(default, skip_serializing_if = "AnnotationStore::is_empty")]
+        drawing_store: AnnotationStore,
         compare: Option<String>,
         #[serde(default = "yes")]
         show_volume: bool,
         #[serde(default = "yes")]
         show_congress: bool,
+        #[serde(default = "yes")]
+        show_news: bool,
+        #[serde(default = "yes")]
+        show_journal: bool,
         #[serde(default)]
         magnet: bool,
+        #[serde(default)]
+        show_box: bool,
+        #[serde(default)]
+        show_rs: bool,
+        #[serde(default)]
+        show_volume_ctx: bool,
+        #[serde(default)]
+        show_stack: bool,
+        #[serde(default)]
+        stack_ladder: Option<Vec<Timeframe>>,
+        #[serde(default)]
+        stack_tint: bool,
+        #[serde(default)]
+        stack_session: bool,
+        #[serde(default = "yes")]
+        show_rail: bool,
+        #[serde(default)]
+        show_edge: bool,
+        /// Enabled Trend Cone: (horizon bars, mean stationary-bootstrap block).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cone: Option<(usize, usize)>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        stops: Option<StopCloudSettings>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        auction: Option<AuctionSettings>,
+        /// Anchored VWAP anchors (UTC bar opens) per security, keyed like drawings.
+        #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+        avwap: BTreeMap<String, Vec<i64>>,
+        /// `COCKPIT 1m · 5m · 15m` header chip on the Cockpit's main chart. Older layouts
+        /// without the field load with no chip.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cockpit_chip: Option<String>,
     },
     /// Congress feed with its filter (`None` = unfiltered).
     Feed(Option<FeedSettings>),
@@ -77,13 +162,18 @@ pub enum PaneSettings {
     Profile(String),
     Politicians,
     Alerts,
+    Research(Option<String>),
+    PriceHistory,
     Watchlist,
+    /// Watchlist pane showing the intraday scan. Older layouts store plain `Watchlist`.
+    IntradayScan,
     Help,
+    Health,
     Wei,
     Curve,
     Search(String),
-    /// Headlines for a security (`None` = general market news).
-    News(Option<String>),
+    /// Headlines. Legacy `null` / `"AAPL US Equity"` still load.
+    News(NewsSettings),
     OrderBook {
         symbol: String,
         depth: usize,
@@ -100,6 +190,255 @@ pub enum PaneSettings {
         strikes: usize,
         #[serde(default = "yes")]
         greeks: bool,
+    },
+    /// PM Desk for a watchlist group (brokerage credentials are never stored).
+    Desk {
+        #[serde(default)]
+        group: String,
+        #[serde(default)]
+        selected: Option<String>,
+    },
+    /// Trade journal (entries live in `trade_journal.json`, not the layout).
+    Journal {
+        #[serde(default)]
+        filter: String,
+    },
+    /// TSTACK Plateau grid. Every field defaults so partial/older entries load;
+    /// missing parameter fields take the Adaptive Trend defaults individually.
+    TstackTune {
+        #[serde(default)]
+        symbol: String,
+        #[serde(default)]
+        tf: Timeframe,
+        #[serde(default)]
+        params: tr_core::indicators::AdaptiveTrendParams,
+    },
+    /// Studio / Quick / When view inputs; new canvas and When fields
+    /// (`when_threshold`, `when_horizon`) default when loading older layouts.
+    Studio {
+        #[serde(default)]
+        view: crate::app::studio_hub::StudioViewSpec,
+    },
+    StudioRoute {
+        route: tr_data::studio::StudioRoute,
+    },
+    StudioDist {
+        #[serde(default)]
+        symbol: String,
+        #[serde(default)]
+        timeframe: Timeframe,
+        #[serde(default)]
+        window: tr_data::studio_dist::Window,
+    },
+    /// Relationship Studio asset, benchmark and timeframe.
+    StudioCorr {
+        #[serde(default)]
+        symbol: String,
+        #[serde(default)]
+        spec: String,
+        /// Return horizon in bars (1, 5 or 20); old layouts restore h=1.
+        #[serde(default = "one_bar")]
+        horizon: usize,
+        /// Relate transform inputs; absent is the legacy CORR / RBETA behaviour.
+        #[serde(default)]
+        relate: Option<tr_data::studio_corr::RelateSpec>,
+    },
+    /// Regression Lab: target symbol, interval and model. Fits and reports are never saved;
+    /// every field defaults so older layouts and partial JSON load.
+    StudioLab {
+        #[serde(default)]
+        symbol: String,
+        #[serde(default)]
+        tf: Timeframe,
+        #[serde(default)]
+        spec: tr_data::studio_lab::LabSpec,
+    },
+    /// Frozen residual ticker: the saved model id only. Models live on disk (immutable); reports and
+    /// checks are never saved. A legacy `StudioRoute{Resid}` restores as an empty pane.
+    StudioResid {
+        #[serde(default)]
+        model_id: String,
+    },
+    /// Factor attribution: the saved model id and the canonical window words (`obs=20`,
+    /// `from=… to=…`). Reports are never saved; an invalid id or window restores as empty / default.
+    StudioAttr {
+        #[serde(default)]
+        model_id: String,
+        #[serde(default)]
+        window: String,
+    },
+    /// Statistics / conditional returns for one research symbol.
+    Stats {
+        #[serde(default)]
+        symbol: String,
+        #[serde(default)]
+        condition: String,
+        #[serde(default)]
+        conditional: bool,
+    },
+    /// Calendar seasonality for verified history.
+    StudioSeason {
+        #[serde(default)]
+        symbol: String,
+        #[serde(default)]
+        spec: String,
+    },
+    /// Paper strategy backtest vs buy-and-hold for one research symbol.
+    Backtest {
+        #[serde(default)]
+        symbol: String,
+        #[serde(default)]
+        spec: String,
+        #[serde(default)]
+        holdout: String,
+        #[serde(default)]
+        commission: String,
+        #[serde(default)]
+        slippage: String,
+        #[serde(default)]
+        shorts: bool,
+        /// Session VWAP / opening-range backtest. Daily archive backtests stay false.
+        #[serde(default)]
+        intraday: bool,
+        /// Intraday bar size (`5m`). Ignored by the daily archive backtest.
+        #[serde(default)]
+        tf: String,
+        #[serde(default)]
+        honesty: tr_data::backtest_honesty::HonestySettings,
+        #[serde(default)]
+        holdout_tables: bool,
+        #[serde(default)]
+        selected_variant: usize,
+        #[serde(default)]
+        selected_fold: usize,
+    },
+    /// Intraday multi-symbol compare, percent from each 09:30 open.
+    IntradayCompare {
+        #[serde(default)]
+        symbol: String,
+        #[serde(default)]
+        peers: String,
+        #[serde(default)]
+        tf: String,
+    },
+    /// Today versus the typical path of prior regular sessions.
+    SessionPath {
+        #[serde(default)]
+        symbol: String,
+        #[serde(default)]
+        spec: String,
+        #[serde(default)]
+        tf: String,
+    },
+    /// Native Trend Stack wall and its saved view preferences.
+    TrendWall {
+        #[serde(default)]
+        spec: String,
+        #[serde(default)]
+        daily: bool,
+        #[serde(default)]
+        sort: tr_data::stack_wall::Sort,
+        #[serde(default = "yes")]
+        edge: bool,
+        #[serde(default)]
+        scatter: bool,
+    },
+    /// Relative rotation graph and its saved view preferences.
+    Rotation {
+        #[serde(default)]
+        spec: String,
+        #[serde(default = "rotation_tail")]
+        tail: u8,
+        #[serde(default = "rotation_table")]
+        table: bool,
+    },
+    /// Share of a list at or above the 09:30 open and session VWAP.
+    Breadth {
+        #[serde(default)]
+        spec: String,
+        #[serde(default)]
+        tf: String,
+    },
+    /// Cumulative volume versus the usual pace of prior sessions.
+    VolumePace {
+        #[serde(default)]
+        symbol: String,
+        #[serde(default)]
+        spec: String,
+        #[serde(default)]
+        tf: String,
+    },
+    RealizedVol {
+        #[serde(default)]
+        symbol: String,
+        #[serde(default)]
+        spec: String,
+        #[serde(default)]
+        tf: String,
+    },
+    Autocorr {
+        #[serde(default)]
+        symbol: String,
+        #[serde(default)]
+        spec: String,
+        #[serde(default)]
+        tf: String,
+    },
+    /// Today's open versus the prior cash close, and the historical fill rate.
+    GapFill {
+        #[serde(default)]
+        symbol: String,
+        #[serde(default)]
+        spec: String,
+        #[serde(default)]
+        tf: String,
+    },
+    /// When the session high and low print.
+    SessionExtreme {
+        #[serde(default)]
+        symbol: String,
+        #[serde(default)]
+        spec: String,
+        #[serde(default)]
+        tf: String,
+    },
+    /// Weekday by cash-bucket returns, with BH and a joint test.
+    SessionClock {
+        #[serde(default)]
+        symbol: String,
+        #[serde(default)]
+        spec: String,
+        #[serde(default)]
+        tf: String,
+    },
+    /// Percent from the 09:30 open minus SPY, against prior sessions.
+    RelativePath {
+        #[serde(default)]
+        symbol: String,
+        #[serde(default)]
+        spec: String,
+        #[serde(default)]
+        tf: String,
+    },
+    /// Five session reads for one name. Not a chart.
+    SessionBrief {
+        #[serde(default)]
+        symbol: String,
+    },
+    /// Historical lookalikes for one research symbol.
+    Lookalike {
+        #[serde(default)]
+        symbol: String,
+        #[serde(default)]
+        spec: String,
+        #[serde(default)]
+        as_of: String,
+        #[serde(default)]
+        k: String,
+        #[serde(default)]
+        gap: String,
+        #[serde(default)]
+        horizons: String,
     },
     /// Brokerage portfolio view (credentials are never stored in layouts).
     Portfolio {
@@ -118,6 +457,46 @@ pub enum PaneSettings {
 
 fn yes() -> bool {
     true
+}
+
+/// Persisted news-pane scope. Older layouts stored `null` (top market) or a market key.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum NewsSettings {
+    Legacy(Option<String>),
+    Full {
+        #[serde(default)]
+        symbol: Option<String>,
+        #[serde(default)]
+        scope: tr_data::news::NewsScope,
+    },
+}
+
+impl NewsSettings {
+    pub fn from_pane(n: &crate::app::NewsPane) -> Self {
+        Self::Full { symbol: n.symbol.clone(), scope: n.scope }
+    }
+
+    pub fn into_pane(self) -> crate::app::NewsPane {
+        match self {
+            Self::Legacy(Some(s)) => crate::app::NewsPane::for_symbol(s),
+            Self::Legacy(None) => crate::app::NewsPane::top(),
+            Self::Full { symbol, scope } => {
+                let mut pane = match scope {
+                    tr_data::news::NewsScope::Symbol => {
+                        symbol.clone().map(crate::app::NewsPane::for_symbol).unwrap_or_else(crate::app::NewsPane::top)
+                    }
+                    tr_data::news::NewsScope::Watchlist => crate::app::NewsPane::watchlist(),
+                    tr_data::news::NewsScope::Leaders => crate::app::NewsPane::leaders(),
+                    tr_data::news::NewsScope::Top => crate::app::NewsPane::top(),
+                };
+                if pane.symbol.is_none() {
+                    pane.symbol = symbol;
+                }
+                pane
+            }
+        }
+    }
 }
 
 /// Serializable mirror of the Congress feed filter.
@@ -263,16 +642,35 @@ impl LayoutDoc {
 
 pub fn chart_settings(symbol: &str, d: &crate::prefs::PanelDefaults) -> PaneSettings {
     PaneSettings::Chart {
+        archive: false,
+        watch_group: None,
         symbol: symbol.into(),
         tf: d.timeframe,
         chart_type: d.chart_type,
         log: false,
         indicators: crate::command::default_indicators(),
         drawings: Vec::new(),
+        drawing_store: AnnotationStore::new(),
         compare: None,
         show_volume: d.show_volume,
         show_congress: d.congress_markers,
+        show_news: d.news_markers,
+        show_journal: true,
         magnet: false,
+        show_box: false,
+        show_rs: false,
+        show_volume_ctx: false,
+        show_stack: false,
+        stack_ladder: None,
+        stack_tint: false,
+        stack_session: false,
+        show_rail: true,
+        show_edge: false,
+        cone: None,
+        stops: None,
+        auction: None,
+        avwap: BTreeMap::new(),
+        cockpit_chip: None,
     }
 }
 
@@ -432,9 +830,171 @@ impl Store {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn older_layout_without_stops_field_loads_with_cloud_off() {
+        let p = chart_settings("AAPL", &PanelDefaults::default());
+        let json = serde_json::to_value(p).unwrap();
+        assert!(json["Chart"].get("stops").is_none());
+        let restored: PaneSettings = serde_json::from_value(json).unwrap();
+        assert!(matches!(restored, PaneSettings::Chart { stops: None, .. }));
+    }
+    #[test]
+    fn partial_stops_object_takes_defaults() {
+        let s: StopCloudSettings = serde_json::from_str(r#"{"odds":false}"#).unwrap();
+        assert_eq!(s, StopCloudSettings { odds: false, ..Default::default() });
+        let mut json = serde_json::to_value(chart_settings("AAPL", &PanelDefaults::default())).unwrap();
+        json["Chart"]["stops"] = serde_json::json!({});
+        assert!(
+            matches!(serde_json::from_value::<PaneSettings>(json).unwrap(),PaneSettings::Chart{stops:Some(s),..} if s==StopCloudSettings::default())
+        );
+    }
+    #[test]
+    fn edge_layout_round_trip_defaults_off() {
+        let mut settings = chart_settings("AAPL", &Default::default());
+        if let PaneSettings::Chart { show_edge, .. } = &mut settings {
+            *show_edge = true;
+        }
+        let mut value = serde_json::to_value(&settings).unwrap();
+        assert_eq!(serde_json::from_value::<PaneSettings>(value.clone()).unwrap(), settings);
+        value["Chart"].as_object_mut().unwrap().remove("show_edge");
+        assert!(matches!(
+            serde_json::from_value::<PaneSettings>(value).unwrap(),
+            PaneSettings::Chart { show_edge: false, cone: None, .. }
+        ));
+    }
+    #[test]
+    fn stack_settings_round_trip_and_old_layouts_load_auto_tint_off_rail_on() {
+        let mut settings = chart_settings("AAPL", &Default::default());
+        if let PaneSettings::Chart { stack_ladder, stack_tint, stack_session, show_rail, .. } = &mut settings {
+            *stack_ladder = Some(vec![Timeframe::M5, Timeframe::M30, Timeframe::H4]);
+            *stack_tint = true;
+            *stack_session = true;
+            *show_rail = false;
+        }
+        let mut json = serde_json::to_value(&settings).unwrap();
+        assert_eq!(serde_json::from_value::<PaneSettings>(json.clone()).unwrap(), settings);
+        let chart = json.get_mut("Chart").unwrap().as_object_mut().unwrap();
+        for key in ["stack_ladder", "stack_tint", "stack_session", "show_rail"] {
+            chart.remove(key);
+        }
+        assert!(matches!(
+            serde_json::from_value::<PaneSettings>(json).unwrap(),
+            PaneSettings::Chart { stack_ladder: None, stack_tint: false, stack_session: false, show_rail: true, .. }
+        ));
+    }
+
+    #[test]
+    fn pre_tune_layout_json_loads_with_trend_defaults() {
+        // A chart pane as saved before TSTACK TUNE / Honest Z / ADTREND ER+hold:
+        // 3-parameter ADTREND label, ZBAND, and no stack / edge / rail / cone keys.
+        let old = r#"{"Chart":{"symbol":"AAPL US Equity","tf":"M5","chart_type":"Candles","log":false,
+            "indicators":["ADTREND 14 0.3 1","ZBAND 20"],"drawings":[],"compare":null}}"#;
+        let PaneSettings::Chart { indicators, show_stack, stack_session, stack_ladder, show_edge, show_rail, .. } =
+            serde_json::from_str::<PaneSettings>(old).unwrap()
+        else {
+            panic!("chart")
+        };
+        assert!(!show_stack && !stack_session && stack_ladder.is_none() && !show_edge && show_rail);
+        assert_eq!(indicators[0].label(), "ADTREND 14 0.3 1 20 10");
+        let p = tr_core::indicators::AdaptiveTrendParams::from_registry(&indicators[0].params);
+        assert_eq!((p.atr_n, p.mb_er, p.min_hold), (14, 20, 10));
+        assert_eq!(indicators[1].label(), "ZBAND 20");
+        // TSTACK TUNE entries with missing or partial fields still load.
+        let defaults = tr_core::indicators::AdaptiveTrendParams::default();
+        assert_eq!(
+            serde_json::from_str::<PaneSettings>(r#"{"TstackTune":{"symbol":"AAPL US Equity","tf":"M5"}}"#).unwrap(),
+            PaneSettings::TstackTune { symbol: "AAPL US Equity".into(), tf: Timeframe::M5, params: defaults }
+        );
+        let partial = r#"{"TstackTune":{"symbol":"AAPL US Equity","tf":"D1","params":{"atr_n":14,"min_hold":4}}}"#;
+        let PaneSettings::TstackTune { params, .. } = serde_json::from_str::<PaneSettings>(partial).unwrap() else {
+            panic!("tune")
+        };
+        assert_eq!(params, tr_core::indicators::AdaptiveTrendParams { atr_n: 14, min_hold: 4, ..defaults });
+        assert!(matches!(
+            serde_json::from_str::<PaneSettings>(r#"{"TstackTune":{}}"#).unwrap(),
+            PaneSettings::TstackTune { tf: Timeframe::D1, .. }
+        ));
+    }
+
+    #[test]
+    fn trend_wall_settings_round_trip_keeps_edge_scatter_and_edge_sort() {
+        let settings = PaneSettings::TrendWall {
+            spec: "WL Growth".into(),
+            daily: true,
+            sort: tr_data::stack_wall::Sort::EdgeQ,
+            edge: true,
+            scatter: true,
+        };
+        assert_eq!(serde_json::from_str::<PaneSettings>(&serde_json::to_string(&settings).unwrap()).unwrap(), settings);
+    }
+    #[test]
+    fn older_trend_wall_layout_without_edge_fields_loads() {
+        assert_eq!(
+            serde_json::from_str::<PaneSettings>(r#"{"TrendWall":{}}"#).unwrap(),
+            PaneSettings::TrendWall {
+                spec: String::new(),
+                daily: false,
+                sort: Default::default(),
+                edge: true,
+                scatter: false
+            }
+        );
+    }
+
     use super::*;
     use crate::dock::Zone;
     use crate::prefs::PanelDefaults;
+
+    #[test]
+    fn show_stack_round_trips_and_defaults_off_for_old_layouts() {
+        let mut settings = chart_settings("AAPL", &Default::default());
+        if let PaneSettings::Chart { show_stack, .. } = &mut settings {
+            *show_stack = true;
+        }
+        let json = serde_json::to_value(&settings).unwrap();
+        let restored: PaneSettings = serde_json::from_value(json.clone()).unwrap();
+        assert!(matches!(restored, PaneSettings::Chart { show_stack: true, .. }));
+        let mut old = json;
+        old.get_mut("Chart").unwrap().as_object_mut().unwrap().remove("show_stack");
+        assert!(matches!(
+            serde_json::from_value::<PaneSettings>(old).unwrap(),
+            PaneSettings::Chart {
+                show_stack: false,
+                stack_ladder: None,
+                stack_tint: false,
+                stack_session: false,
+                show_rail: true,
+                show_edge: false,
+                cone: None,
+                stops: None,
+                auction: None,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn rotation_settings_round_trip() {
+        let settings = PaneSettings::Rotation { spec: "WL Growth VS QQQ WEEKLY".into(), tail: 20, table: false };
+        assert_eq!(serde_json::from_str::<PaneSettings>(&serde_json::to_string(&settings).unwrap()).unwrap(), settings);
+    }
+    #[test]
+    fn rotation_settings_default_when_fields_missing() {
+        assert_eq!(
+            serde_json::from_str::<PaneSettings>(r#"{"Rotation":{}}"#).unwrap(),
+            PaneSettings::Rotation { spec: String::new(), tail: 10, table: true }
+        );
+    }
+
+    #[test]
+    fn intraday_scan_is_its_own_layout_pane_and_watchlist_still_loads() {
+        let watch: PaneSettings = serde_json::from_str("\"Watchlist\"").unwrap();
+        assert_eq!(watch, PaneSettings::Watchlist);
+        let raw = serde_json::to_string(&PaneSettings::IntradayScan).unwrap();
+        assert_eq!(raw, "\"IntradayScan\"");
+        let back: PaneSettings = serde_json::from_str(&raw).unwrap();
+        assert_eq!(back, PaneSettings::IntradayScan);
+    }
 
     fn temp_store(tag: &str) -> Store {
         let dir = std::env::temp_dir().join(format!("tr-layouts-{tag}-{}", std::process::id()));
@@ -453,7 +1013,7 @@ mod tests {
         });
         doc.panes.push(SavedPane {
             id: 6,
-            settings: PaneSettings::News(Some("BTCUSD Curncy".into())),
+            settings: PaneSettings::News(NewsSettings::Legacy(Some("BTCUSD Curncy".into()))),
             link: Some(Link::Blue),
             title: None,
             window: Some(WindowGeometry { x: 40.0, y: 60.0, w: 640.0, h: 480.0 }),
@@ -513,8 +1073,20 @@ mod tests {
             {"id":2,"Feed":null}]}"#;
         let doc = LayoutDoc::from_json(raw.as_bytes()).unwrap();
         match &doc.panes[0].settings {
-            PaneSettings::Chart { show_volume, show_congress, magnet, log, .. } => {
-                assert!(*show_volume && *show_congress && !*magnet && *log)
+            PaneSettings::Chart {
+                show_volume,
+                show_congress,
+                show_news,
+                show_journal,
+                magnet,
+                log,
+                show_box,
+                show_rs,
+                show_volume_ctx,
+                ..
+            } => {
+                assert!(*show_volume && *show_congress && *show_news && *show_journal && !*magnet && *log);
+                assert!(!*show_box && !*show_rs && !*show_volume_ctx);
             }
             other => panic!("{other:?}"),
         }
@@ -564,10 +1136,140 @@ mod tests {
     }
 
     #[test]
+    fn news_settings_keep_legacy_null_as_top_and_persist_watchlist() {
+        let raw = r#"{"name":"N","dock":{"type":"tabs","panes":[1,2]},"panes":[
+            {"id":1,"News":null},
+            {"id":2,"News":{"scope":"Watchlist","symbol":null}}]}"#;
+        let doc = LayoutDoc::from_json(raw.as_bytes()).unwrap();
+        match &doc.panes[0].settings {
+            PaneSettings::News(s) => assert_eq!(s.clone().into_pane().scope, tr_data::news::NewsScope::Top),
+            other => panic!("{other:?}"),
+        }
+        match &doc.panes[1].settings {
+            PaneSettings::News(s) => assert_eq!(s.clone().into_pane().scope, tr_data::news::NewsScope::Watchlist),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    fn hline(price: f64) -> Drawing {
+        Drawing::new(
+            tr_chart::drawings::Tool::Horizontal,
+            tr_chart::drawings::Anchor { ts: 0, price },
+            tr_chart::drawings::Anchor { ts: 0, price },
+        )
+    }
+
+    #[test]
+    fn drawing_store_round_trips_and_legacy_drawings_seed_the_current_symbol() {
+        let mut store = AnnotationStore::new();
+        store.stash("AAPL", &[hline(150.0)]);
+        store.stash("MSFT", &[hline(400.0)]);
+        let doc = LayoutDoc::preset(
+            "Marks",
+            Layout::One,
+            vec![PaneSettings::Chart {
+                archive: false,
+                watch_group: None,
+                symbol: "AAPL US Equity".into(),
+                tf: Timeframe::D1,
+                chart_type: ChartType::Candles,
+                log: false,
+                indicators: vec![],
+                drawings: vec![hline(150.0)],
+                drawing_store: store,
+                compare: None,
+                show_volume: true,
+                show_congress: true,
+                show_news: true,
+                show_journal: true,
+                magnet: false,
+                show_box: false,
+                show_rs: false,
+                show_volume_ctx: false,
+                show_stack: false,
+                stack_ladder: None,
+                stack_tint: false,
+                stack_session: false,
+                show_rail: true,
+                show_edge: false,
+                cone: None,
+                stops: None,
+                auction: None,
+                avwap: BTreeMap::new(),
+                cockpit_chip: None,
+            }],
+        );
+        let back = LayoutDoc::from_json(&doc.to_json()).unwrap();
+        match &back.panes[0].settings {
+            PaneSettings::Chart { symbol, drawings, drawing_store, .. } => {
+                assert_eq!(symbol, "AAPL US Equity");
+                assert_eq!(drawings[0].horizontal_price(), Some(150.0));
+                assert_eq!(drawing_store.get("AAPL").len(), 1);
+                assert_eq!(drawing_store.get("MSFT")[0].horizontal_price(), Some(400.0));
+                assert!(drawing_store.get("NVDA").is_empty());
+            }
+            other => panic!("{other:?}"),
+        }
+
+        let legacy = r#"{"name":"OldMarks","dock":{"type":"tabs","panes":[1]},"panes":[{"id":1,"Chart":{
+            "symbol":"AAPL US Equity","tf":"D1","chart_type":"Candles","log":false,"indicators":[],
+            "drawings":[{"tool":"Horizontal","a":{"ts":0,"price":188.5},"b":{"ts":0,"price":188.5}}],
+            "compare":null}}]}"#;
+        let loaded = LayoutDoc::from_json(legacy.as_bytes()).unwrap();
+        match &loaded.panes[0].settings {
+            PaneSettings::Chart { drawings, drawing_store, .. } => {
+                assert_eq!(drawings[0].horizontal_price(), Some(188.5));
+                assert!(drawing_store.is_empty(), "legacy files have no store; seed happens on pane load");
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
     fn file_stems_are_safe() {
         assert_eq!(Store::file_stem("../../etc/passwd"), "_.._etc_passwd");
         assert_eq!(Store::file_stem("  "), "Untitled");
         assert_eq!(Store::file_stem("My Layout 2"), "My Layout 2");
         assert_eq!(Store::file_stem(".hidden"), "hidden");
+    }
+
+    #[test]
+    fn cone_settings_round_trip_and_older_layout_defaults_hidden() {
+        let mut settings = chart_settings("AAPL", &Default::default());
+        if let PaneSettings::Chart { cone, .. } = &mut settings {
+            *cone = Some((30, 7));
+        }
+        let mut value = serde_json::to_value(&settings).unwrap();
+        assert_eq!(serde_json::from_value::<PaneSettings>(value.clone()).unwrap(), settings);
+        value["Chart"].as_object_mut().unwrap().remove("cone");
+        assert!(matches!(
+            serde_json::from_value::<PaneSettings>(value).unwrap(),
+            PaneSettings::Chart { cone: None, .. }
+        ));
+    }
+}
+
+#[cfg(test)]
+mod auction_tests {
+    use super::*;
+    #[test]
+    fn older_layout_without_auction_field_loads_with_the_map_off() {
+        let mut value = serde_json::to_value(chart_settings("AAPL", &Default::default())).unwrap();
+        value["Chart"].as_object_mut().unwrap().remove("auction");
+        assert!(matches!(
+            serde_json::from_value::<PaneSettings>(value).unwrap(),
+            PaneSettings::Chart { auction: None, .. }
+        ));
+    }
+    #[test]
+    fn partial_auction_settings_take_defaults_and_round_trip() {
+        let v: AuctionSettings = serde_json::from_str(r#"{"value_area":68}"#).unwrap();
+        assert_eq!(v, AuctionSettings { value_area: 68, ..Default::default() });
+        let mut pane = chart_settings("AAPL", &Default::default());
+        if let PaneSettings::Chart { auction, .. } = &mut pane {
+            *auction = Some(v);
+        }
+        let json = serde_json::to_string(&pane).unwrap();
+        assert_eq!(serde_json::from_str::<PaneSettings>(&json).unwrap(), pane);
     }
 }

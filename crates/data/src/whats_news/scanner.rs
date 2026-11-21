@@ -1,0 +1,1385 @@
+//! SCAN calculation contract, shared by both archives and HTTP enrichment.
+//!
+//! RSI is Wilder's 14-change SMA seed followed by 1/14 smoothing (flat = 50).
+//! Strength is the exact 21-bar close return, ranked within each as-of-date cohort.
+//! Volume surge uses last volume / previous 20 mean; ADR is mean((H-L)/C)*100
+//! over exactly 20 bars. Thresholds use unrounded values. Score = near-high +
+//! surge + EP + 2 for Darvas breakout, or 1 for a box within 2% of its top.
+//! W/M use calendar buckets from ALL daily bars, omitting incomplete edge buckets.
+//! Conditions are close versus SMA20 and RSI14, never shortened lookbacks.
+use super::*;
+use chrono::Duration as Days;
+use std::{
+    cmp::Ordering,
+    sync::{Mutex, OnceLock},
+};
+use tr_core::Timeframe;
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct Conditions {
+    pub bars: usize,
+    pub rsi: Option<f64>,
+    pub above_sma20: Option<bool>,
+    pub unavailable: Option<String>,
+}
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct Metrics {
+    #[serde(default)]
+    pub fragile_lens: super::scan_pack::FragileMetrics,
+    #[serde(default)]
+    pub vcp_lens: super::scan_pack::VcpMetrics,
+    #[serde(default)]
+    pub oneil_lens: super::scan_pack::OneilMetrics,
+    #[serde(default)]
+    pub qulla_lens: super::scan_pack::QullaMetrics,
+    #[serde(default)]
+    pub breakout_lens: super::scan_pack::BreakoutMetrics,
+    #[serde(default)]
+    pub rsi_lens: super::scan_pack::RsiMetrics,
+    #[serde(default)]
+    pub ma: super::scan_pack::MaMetrics,
+    #[serde(default)]
+    pub adma_stretch: Option<f64>,
+    #[serde(default)]
+    pub stretch_pct: Option<f64>,
+    #[serde(default)]
+    pub stretch_atr: Option<f64>,
+    #[serde(default)]
+    pub rs_spy_63d: Option<f64>,
+    pub change_pct: f64,
+    pub ret_21d_pct: f64,
+    pub rs_rank: usize,
+    pub rs_n: usize,
+    pub volume: f64,
+    pub avg_volume20: f64,
+    pub volume_ratio: Option<f64>,
+    pub vol_ratio_5_20: Option<f64>,
+    pub adr_pct: f64,
+    pub dist_20d_high_pct: f64,
+    pub gap_pct: f64,
+    pub score: f64,
+    pub daily: Conditions,
+    pub weekly: Conditions,
+    pub monthly: Conditions,
+}
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Skipped {
+    pub symbol: String,
+    pub reason: String,
+}
+
+pub fn rsi(bars: &[Bar], period: usize) -> Option<f64> {
+    if period == 0 || bars.len() <= period {
+        return None;
+    }
+    let changes: Vec<_> = bars.windows(2).map(|b| b[1].close - b[0].close).collect();
+    let mut gain = changes[..period].iter().map(|x| x.max(0.0)).sum::<f64>() / period as f64;
+    let mut loss = changes[..period].iter().map(|x| (-x).max(0.0)).sum::<f64>() / period as f64;
+    for delta in &changes[period..] {
+        gain = (gain * (period - 1) as f64 + delta.max(0.0)) / period as f64;
+        loss = (loss * (period - 1) as f64 + (-delta).max(0.0)) / period as f64;
+    }
+    Some(if gain == 0.0 && loss == 0.0 {
+        50.0
+    } else if loss == 0.0 {
+        100.0
+    } else {
+        100.0 - 100.0 / (1.0 + gain / loss)
+    })
+}
+
+/// Only full calendar periods supported by the archived date span. No padding,
+/// synthetic months, or fixed 30-day approximations; February and years stay distinct.
+pub fn completed_periods(bars: &[Bar], tf: Timeframe) -> Vec<Bar> {
+    if bars.is_empty() {
+        return vec![];
+    }
+    if tf == Timeframe::D1 {
+        return bars.to_vec();
+    }
+    let first = chrono::DateTime::from_timestamp(bars[0].ts, 0).unwrap().date_naive();
+    let last = chrono::DateTime::from_timestamp(bars.last().unwrap().ts, 0).unwrap().date_naive();
+    tf.resample(bars)
+        .into_iter()
+        .filter(|b| {
+            let start = chrono::DateTime::from_timestamp(b.ts, 0).unwrap().date_naive();
+            let end = match tf {
+                Timeframe::W1 => start + Days::days(6),
+                Timeframe::MN1 => {
+                    let Some(next) = start.checked_add_months(chrono::Months::new(1)) else {
+                        return false;
+                    };
+                    next - Days::days(1)
+                }
+                _ => return false,
+            };
+            let mut first_session = start;
+            while !is_session(first_session) {
+                first_session += Days::days(1);
+            }
+            let mut last_session = end;
+            while !is_session(last_session) {
+                last_session -= Days::days(1);
+            }
+            first <= first_session && last >= last_session
+        })
+        .collect()
+}
+fn conditions(bars: &[Bar], label: &str) -> Conditions {
+    if bars.len() < 20 {
+        return Conditions {
+            bars: bars.len(),
+            unavailable: Some(format!("insufficient {label} history: need 20 bars, have {}", bars.len())),
+            ..Default::default()
+        };
+    }
+    let sma = bars[bars.len() - 20..].iter().map(|b| b.close / 20.0).sum::<f64>();
+    Conditions {
+        bars: bars.len(),
+        rsi: rsi(bars, 14),
+        above_sma20: Some(bars.last().unwrap().close >= sma),
+        unavailable: None,
+    }
+}
+/// Date/OHLC (and optionally finite volume) admission. Scanner views pass
+/// `require_volume = false`: a missing (NaN) volume is a valid observation there.
+pub(super) fn validate_ohlc(bars: &[Bar], require_volume: bool) -> std::result::Result<(), String> {
+    if bars.is_empty() {
+        return Err("missing daily history".into());
+    }
+    if bars.iter().any(|b| {
+        let volume_bad = if require_volume {
+            !b.volume.is_finite() || b.volume < 0.0
+        } else {
+            !(b.volume.is_nan() || (b.volume.is_finite() && b.volume >= 0.0))
+        };
+        chrono::DateTime::from_timestamp(b.ts, 0).is_none()
+            || ![b.open, b.high, b.low, b.close].iter().all(|v| v.is_finite())
+            || volume_bad
+            || b.low <= 0.0
+            || b.open <= 0.0
+            || b.close <= 0.0
+            || b.high < b.open.max(b.close).max(b.low)
+            || b.low > b.open.min(b.close)
+    }) {
+        return Err("invalid archived OHLCV or date".into());
+    }
+    if bars.windows(2).any(|b| b[0].ts >= b[1].ts) {
+        return Err("daily bars must have unique ascending dates".into());
+    }
+    Ok(())
+}
+fn validate(bars: &[Bar]) -> std::result::Result<(), String> {
+    validate_ohlc(bars, true)?;
+    if bars.len() < 30 {
+        return Err(format!("insufficient daily history: need 30 bars, have {}", bars.len()));
+    }
+    Ok(())
+}
+pub fn calculate(b: &[Bar]) -> std::result::Result<Metrics, String> {
+    validate(b)?;
+    let n = b.len();
+    let last = b[n - 1];
+    let avg = b[n - 21..n - 1].iter().map(|b| b.volume / 20.0).sum::<f64>();
+    let current_avg = b[n - 20..].iter().map(|b| b.volume / 20.0).sum::<f64>();
+    let ratio = (avg > 0.0).then(|| last.volume / avg);
+    let dist = (last.close / b[n - 20..].iter().map(|b| b.high).fold(0.0, f64::max) - 1.0) * 100.0;
+    let gap = (last.open / b[n - 2].close - 1.0) * 100.0;
+    let near = dist >= -5.0;
+    let surge = ratio.is_some_and(|v| v >= 1.5);
+    let ep = gap >= 4.0 && surge;
+    let box_ = darvas(b);
+    let score = near as u8
+        + surge as u8
+        + ep as u8
+        + match box_ {
+            Some((_, _, "DARVAS_BREAKOUT")) => 2,
+            Some((_, _, "DARVAS_BOX")) if dist >= -2.0 => 1,
+            _ => 0,
+        };
+    let stretch = tr_core::indicators::sma50_stretch(b);
+    let breakout_lens = super::scan_pack::measure_breakout(&b.iter().map(|b| b.close).collect::<Vec<_>>(), &b.iter().map(|b| b.high).collect::<Vec<_>>(), &b.iter().map(|b| b.volume).collect::<Vec<_>>());
+    let metrics = Metrics {
+        fragile_lens: super::scan_pack::measure_fragile(&b.iter().map(|b| b.close).collect::<Vec<_>>()),
+        vcp_lens: super::scan_pack::measure_vcp(&b.iter().map(|b| b.close).collect::<Vec<_>>(), &b.iter().map(|b| b.high).collect::<Vec<_>>(), &b.iter().map(|b| b.low).collect::<Vec<_>>(), &breakout_lens),
+        qulla_lens: super::scan_pack::measure_qulla(&b.iter().map(|b| b.close).collect::<Vec<_>>(), Some(&b.iter().map(|b| b.open).collect::<Vec<_>>()), &breakout_lens),
+        breakout_lens,
+        rsi_lens: super::scan_pack::measure_rsi(&b.iter().map(|b| b.close).collect::<Vec<_>>()),
+        ma: super::scan_pack::measure(&b.iter().map(|b| b.close).collect::<Vec<_>>()),
+        adma_stretch: tr_core::indicators::adma_stretch(&b.iter().map(|b| b.close).collect::<Vec<_>>()),
+        stretch_pct: stretch.map(|s| s.pct),
+        stretch_atr: stretch.and_then(|s| s.atr_units),
+        change_pct: (last.close / b[n - 2].close - 1.0) * 100.0,
+        ret_21d_pct: (last.close / b[n - 22].close - 1.0) * 100.0,
+        volume: last.volume,
+        avg_volume20: avg,
+        volume_ratio: ratio,
+        vol_ratio_5_20: (current_avg > 0.0)
+            .then(|| b[n - 5..].iter().map(|b| b.volume).sum::<f64>() / 5.0 / current_avg),
+        adr_pct: b[n - 20..].iter().map(|b| (b.high - b.low) / b.close * 100.0).sum::<f64>() / 20.0,
+        dist_20d_high_pct: dist,
+        gap_pct: gap,
+        score: score as f64,
+        daily: conditions(b, "daily"),
+        weekly: conditions(&completed_periods(b, Timeframe::W1), "completed weekly"),
+        monthly: conditions(&completed_periods(b, Timeframe::MN1), "completed monthly"),
+        ..Default::default()
+    };
+    if [
+        Some(metrics.change_pct),
+        Some(metrics.ret_21d_pct),
+        Some(metrics.gap_pct),
+        Some(metrics.adr_pct),
+        Some(metrics.dist_20d_high_pct),
+        Some(metrics.avg_volume20),
+        metrics.volume_ratio,
+        metrics.vol_ratio_5_20,
+        metrics.daily.rsi,
+        metrics.weekly.rsi,
+        metrics.monthly.rsi,
+    ]
+    .into_iter()
+    .flatten()
+    .any(|v| !v.is_finite())
+    {
+        return Err("non-finite calculation from archived bars".into());
+    }
+    Ok(metrics)
+}
+/// 128-bit content key (FNV + independent SipHash) plus len and last_ts. Stores no bars,
+/// so a 1024-entry cache stays small; any corrected bar changes both digests.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+struct CalcKey {
+    len: usize,
+    last_ts: i64,
+    fnv: u64,
+    sip: u64,
+}
+impl CalcKey {
+    fn of(bars: &[Bar]) -> Self {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        for b in bars {
+            b.ts.hash(&mut h);
+            for v in [b.open, b.high, b.low, b.close, b.volume] {
+                v.to_bits().hash(&mut h);
+            }
+            b.provenance.is_verified().hash(&mut h);
+        }
+        Self {
+            len: bars.len(),
+            last_ts: bars.last().map_or(0, |b| b.ts),
+            fnv: crate::stable_hash::bars_digest(bars),
+            sip: h.finish(),
+        }
+    }
+}
+const CALC_CACHE_CAP: usize = 1024;
+#[derive(Default)]
+struct CalculationCache {
+    map: std::collections::HashMap<CalcKey, (u64, std::result::Result<Metrics, String>)>,
+    tick: u64,
+}
+impl CalculationCache {
+    fn get(&mut self, key: &CalcKey) -> Option<std::result::Result<Metrics, String>> {
+        self.tick += 1;
+        let tick = self.tick;
+        self.map.get_mut(key).map(|e| {
+            e.0 = tick;
+            e.1.clone()
+        })
+    }
+    fn insert(&mut self, key: CalcKey, value: std::result::Result<Metrics, String>) {
+        self.tick += 1;
+        if !self.map.contains_key(&key) && self.map.len() >= CALC_CACHE_CAP {
+            if let Some(oldest) = self.map.iter().min_by_key(|(_, (t, _))| *t).map(|(k, _)| *k) {
+                self.map.remove(&oldest);
+            }
+        }
+        self.map.insert(key, (self.tick, value));
+    }
+}
+/// Lock → lookup → unlock → compute without the lock → lock → insert. Returns (result, hit).
+fn cached_with(
+    cache: &Mutex<CalculationCache>,
+    bars: &[Bar],
+    compute: impl FnOnce(&[Bar]) -> std::result::Result<Metrics, String>,
+) -> (std::result::Result<Metrics, String>, bool) {
+    let key = CalcKey::of(bars);
+    let hit = cache.lock().unwrap().get(&key);
+    if let Some(hit) = hit {
+        return (hit, true);
+    }
+    let value = compute(bars);
+    cache.lock().unwrap().insert(key, value.clone());
+    (value, false)
+}
+/// Cached metrics for daily bars; callers must check provenance before using setup hits.
+pub fn cached_calculate(bars: &[Bar]) -> std::result::Result<Metrics, String> {
+    static CACHE: OnceLock<Mutex<CalculationCache>> = OnceLock::new();
+    cached_with(CACHE.get_or_init(|| Mutex::new(CalculationCache::default())), bars, calculate).0
+}
+/// Whether `name` is active on verified daily bars. Sample / unverified history is refused.
+pub fn setup_active(name: &str, bars: &[Bar]) -> std::result::Result<bool, String> {
+    setup_active_with_spy(name, bars, None)
+}
+
+/// Evaluate setup membership with a verified SPY benchmark for O’Neil relative strength.
+pub fn setup_active_with_spy(name: &str, bars: &[Bar], spy: Option<&[Bar]>) -> std::result::Result<bool, String> {
+    if !super::SETUPS.contains(&name) {
+        return Err(format!("unknown setup {name}"));
+    }
+    Bar::require_verified(bars, "price/setup alert")?;
+    let mut m = cached_calculate(bars)?;
+    // ONEIL_LENS needs SPY or it silently stays false. ALL still matches other
+    // tags without a benchmark; enrich O'Neil only when verified SPY is present.
+    if name == "ONEIL_LENS" {
+        let spy = spy.ok_or_else(|| "SPY benchmark unavailable for O'Neil setup".to_string())?;
+        Bar::require_verified(spy, "SPY benchmark")
+            .map_err(|e| format!("SPY benchmark unavailable: {e}"))?;
+        m.oneil_lens = super::scan_pack::OneilMetrics::from_relative_return(
+            tr_core::indicators::daily_relative_return(bars, spy, super::scan_pack::RS_BARS),
+        );
+    } else if name == "ALL" {
+        if let Some(spy) = spy {
+            if Bar::require_verified(spy, "SPY benchmark").is_ok() {
+                m.oneil_lens = super::scan_pack::OneilMetrics::from_relative_return(
+                    tr_core::indicators::daily_relative_return(bars, spy, super::scan_pack::RS_BARS),
+                );
+            }
+        }
+    }
+    if name == "ALL" {
+        return Ok(!active_setups(bars, &m).is_empty());
+    }
+    Ok(matches_setup(name, bars, &m))
+}
+
+fn matches_setup(name: &str, b: &[Bar], m: &Metrics) -> bool {
+    let near = m.dist_20d_high_pct >= -5.0;
+    let surge = m.volume_ratio.is_some_and(|v| v >= 1.5);
+    match name {
+        "ALL" => false,
+        "BREAKOUT_LENS" => m.breakout_lens.matches_breakout(),
+        "QULLA_LENS" => m.qulla_lens.qulla,
+        "ONEIL_LENS" => m.oneil_lens.oneil_rs,
+        "VCP_LENS" => m.vcp_lens.vcp_proxy,
+        "FRAGILE_LENS" => m.fragile_lens.fragile,
+        "MA" => m.ma.matches_ma(),
+        "RSI_LENS" => m.rsi_lens.matches_rsi(),
+        "NEAR_HIGH" => near,
+        "VOL_SURGE" => surge,
+        "EP" => m.gap_pct >= 4.0 && surge,
+        "BREAKOUT_QUEUE" => near || surge,
+        "RSI_OB" => m.daily.rsi.is_some_and(|r| r >= 70.0),
+        "RSI_OS" => m.daily.rsi.is_some_and(|r| r <= 30.0),
+        _ => darvas(b).is_some_and(|(_, _, state)| state == name),
+    }
+}
+
+/// All individual setup hits, in scan menu order.
+pub fn active_setups(bars: &[Bar], metrics: &Metrics) -> Vec<String> {
+    SETUPS.iter().filter(|name| **name != "ALL" && matches_setup(name, bars, metrics))
+        .map(|name| (*name).to_string()).collect()
+}
+
+/// Bounded, exact-content cache. Full bar/provenance equality catches corrections
+/// with unchanged last dates/counts, deletions and archive switches. Clock-dependent
+/// staleness is deliberately evaluated by the view after this cache.
+#[derive(Default)]
+pub struct ScanCache {
+    entries: Vec<(String, Provenance, Vec<(String, Vec<Bar>)>, Scan)>,
+}
+impl ScanCache {
+    pub fn scan(
+        &mut self,
+        name: &str,
+        histories: Vec<(String, Vec<Bar>)>,
+        provenance: Provenance,
+    ) -> Result<(Scan, bool)> {
+        verify(provenance, "Whats-News scan")?;
+        for (_, bars) in &histories {
+            if !bars.is_empty() {
+                verify(Bar::provenance(bars), "Whats-News scan")?;
+            }
+        }
+        if let Some((_, _, _, scan)) =
+            self.entries.iter().find(|(n, p, h, _)| n == name && *p == provenance && *h == histories)
+        {
+            return Ok((scan.clone(), true));
+        }
+        if !SETUPS.contains(&name) {
+            bail!("Unknown scan {name}");
+        }
+        let mut scan = Scan { provenance, scanned: 0, results: vec![], skipped: vec![] };
+        let mut candidates = vec![];
+        let spy = histories.iter().find(|(s, _)| crate::security(s).ticker == "SPY").map(|(_, b)| b);
+        for (symbol, b) in &histories {
+            let m = match cached_calculate(b) {
+                Ok(mut m) => {
+                    // Dated alignment on the symbol's own sessions; one pass feeds both fields.
+                    let rs = spy.and_then(|spy| tr_core::indicators::daily_relative_return(b, spy, super::scan_pack::RS_BARS));
+                    m.rs_spy_63d = rs;
+                    m.oneil_lens = super::scan_pack::OneilMetrics::from_relative_return(rs);
+                    m
+                }
+                Err(reason) => {
+                    scan.skipped.push(Skipped { symbol: symbol.clone(), reason });
+                    continue;
+                }
+            };
+            scan.scanned += 1;
+            let box_ = darvas(b);
+            let setups = active_setups(b, &m);
+            let matched = if name == "ALL" { !setups.is_empty() } else { matches_setup(name, b, &m) };
+            candidates.push((
+                matched,
+                ScanRow {
+                    provenance,
+                    symbol: symbol.clone(),
+                    price: Some(b.last().unwrap().close),
+                    setup_score: Some(m.score),
+                    darvas_top: box_.map(|b| b.0),
+                    darvas_bottom: box_.map(|b| b.1),
+                    last_date: Some(date(b.last().unwrap().ts)),
+                    metrics: Some(m),
+                    service: super::ServiceFields { setup_count: Some(setups.len()), setups, ..Default::default() },
+                    ..Default::default()
+                },
+            ));
+        }
+        // Rank the eligible archive universe before setup/filter selection. Ties share
+        // competition rank; different dates never compete against one another.
+        let mut cohorts = std::collections::BTreeMap::<Option<String>, Vec<usize>>::new();
+        for (i, (_, row)) in candidates.iter().enumerate() {
+            cohorts.entry(row.last_date.clone()).or_default().push(i);
+        }
+        for indices in cohorts.values_mut() {
+            indices.sort_by(|a, b| {
+                candidates[*b]
+                    .1
+                    .metrics
+                    .as_ref()
+                    .unwrap()
+                    .ret_21d_pct
+                    .total_cmp(&candidates[*a].1.metrics.as_ref().unwrap().ret_21d_pct)
+            });
+            let mut rank = 1;
+            let mut previous = None;
+            let count = indices.len();
+            for (place, i) in indices.iter().enumerate() {
+                let m = candidates[*i].1.metrics.as_mut().unwrap();
+                if previous.is_some_and(|ret| ret != m.ret_21d_pct) {
+                    rank = place + 1;
+                }
+                previous = Some(m.ret_21d_pct);
+                m.rs_rank = rank;
+                m.rs_n = count;
+            }
+        }
+        scan.results = candidates.into_iter().filter(|(matched, _)| *matched).map(|(_, r)| r).collect();
+        if self.entries.len() == 2 {
+            self.entries.remove(0);
+        }
+        self.entries.push((name.into(), provenance, histories, scan.clone()));
+        Ok((scan, false))
+    }
+}
+pub(super) fn scan_cached(name: &str, histories: Vec<(String, Vec<Bar>)>, provenance: Provenance) -> Result<Scan> {
+    static CACHE: OnceLock<Mutex<ScanCache>> = OnceLock::new();
+    CACHE
+        .get_or_init(|| Mutex::new(ScanCache::default()))
+        .lock()
+        .unwrap()
+        .scan(name, histories, provenance)
+        .map(|(s, _)| s)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum Condition {
+    #[default]
+    Any,
+    AboveSma20,
+    BelowSma20,
+    Overbought,
+    Oversold,
+}
+impl Condition {
+    pub const ALL: [Self; 5] = [Self::Any, Self::AboveSma20, Self::BelowSma20, Self::Overbought, Self::Oversold];
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Any => "Any",
+            Self::AboveSma20 => "Close ≥ SMA20",
+            Self::BelowSma20 => "Close < SMA20",
+            Self::Overbought => "RSI ≥ 70",
+            Self::Oversold => "RSI ≤ 30",
+        }
+    }
+    fn accepts(self, c: &Conditions) -> bool {
+        match self {
+            Self::Any => true,
+            Self::AboveSma20 => c.above_sma20 == Some(true),
+            Self::BelowSma20 => c.above_sma20 == Some(false),
+            Self::Overbought => c.rsi.is_some_and(|r| r >= 70.0),
+            Self::Oversold => c.rsi.is_some_and(|r| r <= 30.0),
+        }
+    }
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum Sort {
+    Symbol,
+    #[default]
+    Score,
+    Strength,
+    Rsi,
+    Volume,
+    VolumeRatio,
+    Range,
+    StretchAtr,
+    StretchPct,
+    SpyStrength,
+    AdmaStretch,
+    StackedMa,
+    PullbackMa,
+}
+impl Sort {
+    /// Additional desk sorts, alongside the original scanner sort set.
+    pub const DESK: [Self; 6] =
+        [Self::StretchAtr, Self::StretchPct, Self::SpyStrength, Self::AdmaStretch, Self::StackedMa, Self::PullbackMa];
+    pub const ALL: [Self; 7] =
+        [Self::Symbol, Self::Score, Self::Strength, Self::Rsi, Self::Volume, Self::VolumeRatio, Self::Range];
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Symbol => "Symbol",
+            Self::Score => "Rust score",
+            Self::Strength => "21-bar return",
+            Self::Rsi => "Daily RSI14",
+            Self::Volume => "Volume",
+            Self::VolumeRatio => "Volume / prior 20",
+            Self::Range => "ADR20 %",
+            Self::StretchAtr => "SMA50 Stretch ATR14",
+            Self::StretchPct => "SMA50 Stretch %",
+            Self::SpyStrength => "SPY relative 63d %",
+            Self::AdmaStretch => "ADMA Stretch",
+            Self::StackedMa => "Stacked MAs",
+            Self::PullbackMa => "Pullback to rising MA",
+        }
+    }
+    fn value(self, r: &ScanRow) -> Option<f64> {
+        let m = r.metrics.as_ref()?;
+        match self {
+            Self::Symbol => None,
+            Self::Score => Some(m.score),
+            Self::Strength => Some(m.ret_21d_pct),
+            Self::Rsi => m.daily.rsi,
+            Self::Volume => Some(m.volume),
+            Self::VolumeRatio => m.volume_ratio,
+            Self::Range => Some(m.adr_pct),
+            Self::StretchAtr => m.stretch_atr,
+            Self::StretchPct => m.stretch_pct,
+            Self::SpyStrength => m.rs_spy_63d,
+            Self::AdmaStretch => m.adma_stretch,
+            Self::StackedMa => Some(u8::from(m.ma.stacked_ma) as f64),
+            Self::PullbackMa => Some(u8::from(m.ma.pullback_rising_ma) as f64),
+        }
+    }
+}
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ScanFilter {
+    #[serde(default)]
+    pub setup_tag: Option<String>,
+    pub include_stale: bool,
+    pub min_score: Option<f64>,
+    pub min_strength: Option<f64>,
+    pub min_rsi: Option<f64>,
+    pub max_rsi: Option<f64>,
+    pub min_volume: Option<f64>,
+    pub min_volume_ratio: Option<f64>,
+    pub min_range: Option<f64>,
+    pub max_range: Option<f64>,
+    pub daily: Condition,
+    pub weekly: Condition,
+    pub monthly: Condition,
+    pub sort: Sort,
+    pub descending: bool,
+}
+impl Default for ScanFilter {
+    fn default() -> Self {
+        Self {
+            setup_tag: None,
+            include_stale: false,
+            min_score: None,
+            min_strength: None,
+            min_rsi: None,
+            max_rsi: None,
+            min_volume: None,
+            min_volume_ratio: None,
+            min_range: None,
+            max_range: None,
+            daily: Condition::Any,
+            weekly: Condition::Any,
+            monthly: Condition::Any,
+            sort: Sort::Score,
+            descending: true,
+        }
+    }
+}
+impl ScanFilter {
+    pub fn reason(&self, r: &ScanRow, expected: NaiveDate) -> Option<String> {
+        if self.setup_tag.as_ref().is_some_and(|tag| !r.service.setups.contains(tag)) {
+            return Some("setup tag not selected".into());
+        }
+        let date = r.last_date.as_deref().and_then(|d| NaiveDate::parse_from_str(d, "%Y-%m-%d").ok());
+        if !self.include_stale {
+            match date {
+                None => return Some("missing last daily bar date".into()),
+                Some(d) if d < expected => return Some(format!("stale: last bar {d}, expected {expected}")),
+                _ => {}
+            }
+        }
+        let checks = [
+            (self.min_score, r.metrics.as_ref().map(|m| m.score), false, "score"),
+            (self.min_strength, r.metrics.as_ref().map(|m| m.ret_21d_pct), false, "21-bar return"),
+            (self.min_rsi, r.metrics.as_ref().and_then(|m| m.daily.rsi), false, "RSI14"),
+            (self.max_rsi, r.metrics.as_ref().and_then(|m| m.daily.rsi), true, "RSI14"),
+            (self.min_volume, r.metrics.as_ref().map(|m| m.volume), false, "volume"),
+            (self.min_volume_ratio, r.metrics.as_ref().and_then(|m| m.volume_ratio), false, "volume ratio"),
+            (self.min_range, r.metrics.as_ref().map(|m| m.adr_pct), false, "ADR20"),
+            (self.max_range, r.metrics.as_ref().map(|m| m.adr_pct), true, "ADR20"),
+        ];
+        for (limit, value, max, label) in checks {
+            if let Some(limit) = limit {
+                match value.filter(|v| v.is_finite()) {
+                    None => return Some(format!("{label} unavailable from archived history")),
+                    Some(v) if (max && v > limit) || (!max && v < limit) => {
+                        return Some(format!("{label} outside filter"));
+                    }
+                    _ => {}
+                }
+            }
+        }
+        for (cond, label) in [(self.daily, "daily"), (self.weekly, "weekly"), (self.monthly, "monthly")] {
+            if cond == Condition::Any {
+                continue;
+            }
+            let c = r.metrics.as_ref().map(|m| match label {
+                "daily" => &m.daily,
+                "weekly" => &m.weekly,
+                _ => &m.monthly,
+            });
+            match c {
+                None => return Some(format!("{label} conditions unavailable from archived history")),
+                Some(c) if c.unavailable.is_some() => return c.unavailable.clone(),
+                Some(c) if !cond.accepts(c) => return Some(format!("{label}: {} not met", cond.label())),
+                _ => {}
+            }
+        }
+        None
+    }
+    pub fn rows<'a>(&self, scan: &'a Scan, query: &str, expected: NaiveDate) -> Vec<&'a ScanRow> {
+        let query = query.trim().to_ascii_uppercase();
+        let mut rows: Vec<_> = scan
+            .results
+            .iter()
+            .filter(|r| r.symbol.to_ascii_uppercase().contains(&query) && self.reason(r, expected).is_none())
+            .collect();
+        rows.sort_by(|a, b| {
+            let cmp = if self.sort == Sort::Symbol {
+                if self.descending { b.symbol.cmp(&a.symbol) } else { a.symbol.cmp(&b.symbol) }
+            } else {
+                match (self.sort.value(a).filter(|v| v.is_finite()), self.sort.value(b).filter(|v| v.is_finite())) {
+                    (Some(a), Some(b)) => {
+                        if self.descending {
+                            b.total_cmp(&a)
+                        } else {
+                            a.total_cmp(&b)
+                        }
+                    }
+                    (Some(_), None) => Ordering::Less,
+                    (None, Some(_)) => Ordering::Greater,
+                    _ => Ordering::Equal,
+                }
+            };
+            cmp.then_with(|| a.symbol.cmp(&b.symbol))
+        });
+        rows
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    fn d(s: &str) -> NaiveDate {
+        s.parse().unwrap()
+    }
+    // Artificial prices remain isolated in unit tests.
+    fn bar(day: NaiveDate, close: f64) -> Bar {
+        Bar::new(day.and_hms_opt(0, 0, 0).unwrap().and_utc().timestamp(), close, close + 1.0, close - 1.0, close, 100.0)
+            .with_provenance(Provenance::Real)
+    }
+    fn bars(n: usize) -> Vec<Bar> {
+        (0..n).map(|i| bar(d("2024-01-02") + Days::days(i as i64), 100.0)).collect()
+    }
+    #[test]
+    fn oneil_setup_requires_verified_spy_and_enriches_cached_metrics() {
+        let mut symbol = bars(80);
+        for (i, bar) in symbol.iter_mut().enumerate() {
+            bar.close = 100.0 + i as f64;
+            bar.open = bar.close;
+            bar.high = bar.close + 1.0;
+            bar.low = bar.close - 1.0;
+        }
+        let spy = bars(80);
+        assert!(!cached_calculate(&symbol).unwrap().oneil_lens.oneil_rs);
+        assert!(setup_active("ONEIL_LENS", &symbol).unwrap_err().contains("benchmark unavailable"));
+        assert!(setup_active_with_spy("ONEIL_LENS", &symbol, Some(&spy)).unwrap());
+        let sample: Vec<_> = spy.iter().cloned().map(|b| b.with_provenance(Provenance::Sample)).collect();
+        assert!(setup_active_with_spy("ONEIL_LENS", &symbol, Some(&sample)).unwrap_err().contains("benchmark unavailable"));
+        // ALL still fires on other tags without SPY; with SPY it can include O'Neil.
+        assert!(setup_active("ALL", &symbol).unwrap());
+        assert!(setup_active_with_spy("ALL", &symbol, Some(&spy)).unwrap());
+        assert!(setup_active_with_spy("ALL", &symbol, Some(&sample)).unwrap());
+        assert!(!cached_calculate(&symbol).unwrap().oneil_lens.oneil_rs);
+    }
+
+    fn row(symbol: &str, value: f64) -> ScanRow {
+        ScanRow {
+            symbol: symbol.into(),
+            provenance: Provenance::Real,
+            last_date: Some("2026-10-21".into()),
+            metrics: Some(Metrics {
+                score: value,
+                ret_21d_pct: value,
+                volume: value,
+                volume_ratio: Some(value),
+                adr_pct: value,
+                daily: Conditions { rsi: Some(value), above_sma20: Some(true), bars: 30, unavailable: None },
+                weekly: Conditions { rsi: Some(75.0), above_sma20: Some(true), bars: 30, unavailable: None },
+                monthly: Conditions { rsi: Some(20.0), above_sma20: Some(false), bars: 30, unavailable: None },
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+    fn close(a: f64, b: f64) {
+        assert!((a - b).abs() < 1e-8, "{a} != {b}");
+    }
+    #[test]
+    fn all_scan_tags_only_active_setups_and_keeps_near_high() {
+        assert_eq!(SETUPS.first(), Some(&"ALL"));
+        let near = bars(30);
+        let mut quiet = bars(30);
+        for (i, bar) in quiet.iter_mut().enumerate() {
+            bar.close = 100.0 + (i % 2) as f64;
+            bar.high = 150.0 + i as f64;
+        }
+        assert!(active_setups(&quiet, &calculate(&quiet).unwrap()).is_empty());
+        let histories = vec![("NEAR".into(), near.clone()), ("QUIET".into(), quiet), ("SHORT".into(), bars(2))];
+        let mut cache = ScanCache::default();
+        let (scan, _) = cache.scan("ALL", histories.clone(), Provenance::Real).unwrap();
+        assert_eq!(scan.results.len(), 1);
+        let row = &scan.results[0];
+        assert_eq!(row.symbol, "NEAR");
+        assert!(row.service.setups.iter().any(|s| s == "NEAR_HIGH"));
+        assert!(!row.service.setups.iter().any(|s| s == "ALL"));
+        assert_eq!(row.service.setup_count, Some(row.service.setups.len()));
+        assert!(scan.results.iter().all(|r| !r.service.setups.is_empty()));
+        let (single, _) = cache.scan("NEAR_HIGH", histories.clone(), Provenance::Real).unwrap();
+        assert_eq!(single.results[0].service.setups, row.service.setups);
+        assert!(!matches_setup("ALL", &near, &calculate(&near).unwrap()));
+        assert!(setup_active_with_spy("ALL", &near, Some(&near)).unwrap());
+        assert!(cache.scan("UNKNOWN", histories, Provenance::Real).is_err());
+    }
+
+    #[test]
+    fn setup_tag_filter_and_all_tags() {
+        let mut near = row("NEAR", 1.0);
+        near.service.setups = vec!["NEAR_HIGH".into()];
+        let mut other = row("OTHER", 2.0);
+        other.service.setups = vec!["VOL_SURGE".into()];
+        let scan = Scan { provenance: Provenance::Real, scanned: 2, results: vec![near, other], skipped: vec![] };
+        let mut filter = ScanFilter { setup_tag: Some("NEAR_HIGH".into()), include_stale: true, ..Default::default() };
+        assert_eq!(filter.rows(&scan, "", d("2026-10-21")).iter().map(|r| r.symbol.as_str()).collect::<Vec<_>>(), ["NEAR"]);
+        filter.setup_tag = None;
+        assert_eq!(filter.rows(&scan, "", d("2026-10-21")).len(), 2);
+    }
+
+    #[test]
+    fn all_setup_tags_refresh_after_benchmark_changes() {
+        let mut positive = Metrics::default();
+        positive.oneil_lens.oneil_rs = true;
+        let mut scan = Scan {
+            provenance: Provenance::Real, scanned: 3, skipped: vec![],
+            results: vec![row("OTHER", 0.0), row("ONLY_ONEIL", 0.0), row("GAIN_ONEIL", 0.0)],
+        };
+        scan.results[0].service.setups = vec!["NEAR_HIGH".into(), "ONEIL_LENS".into()];
+        scan.results[1].service.setups = vec!["ONEIL_LENS".into()];
+        scan.results[2].metrics = Some(positive);
+        super::super::refresh_setup_tags(&mut scan);
+        assert_eq!(scan.scanned, 3);
+        assert_eq!(scan.results.len(), 2);
+        assert_eq!(scan.results[0].service.setups, ["NEAR_HIGH"]);
+        assert_eq!(scan.results[1].service.setups, ["ONEIL_LENS"]);
+        assert!(scan.results.iter().all(|r| r.service.setup_count == Some(1)));
+    }
+
+    #[test]
+    fn wilder_rsi_seed_smoothing_and_extremes() {
+        let prices = [
+            44.34, 44.09, 44.15, 43.61, 44.33, 44.83, 45.10, 45.42, 45.84, 46.08, 45.89, 46.03, 45.61, 46.28, 46.28,
+            46.0,
+        ];
+        let b: Vec<_> =
+            prices.iter().enumerate().map(|(i, c)| bar(d("2026-01-01") + Days::days(i as i64), *c)).collect();
+        close(rsi(&b[..15], 14).unwrap(), 70.46413502109705);
+        close(rsi(&b, 14).unwrap(), 66.24961855355505);
+        assert_eq!(rsi(&b[..14], 14), None);
+        assert_eq!(rsi(&b, 0), None);
+        assert_eq!(rsi(&bars(30), 14), Some(50.0));
+        let rising: Vec<_> = (0..30).map(|i| bar(d("2024-01-02") + Days::days(i), 100.0 + i as f64)).collect();
+        assert_eq!(rsi(&rising, 14), Some(100.0));
+        let falling: Vec<_> = (0..30).map(|i| bar(d("2024-01-02") + Days::days(i), 100.0 - i as f64)).collect();
+        assert_eq!(rsi(&falling, 14), Some(0.0));
+    }
+    #[test]
+    fn exact_returns_volume_range_gap_distance_score_and_conditions() {
+        let mut b = bars(60);
+        for b in &mut b {
+            b.high = 110.0;
+            b.low = 90.0;
+        }
+        let last = b.last_mut().unwrap();
+        last.open = 105.0;
+        last.close = 106.0;
+        last.volume = 200.0;
+        let m = calculate(&b).unwrap();
+        close(m.change_pct, 6.0);
+        close(m.ret_21d_pct, 6.0);
+        close(m.gap_pct, 5.0);
+        close(m.volume, 200.0);
+        close(m.avg_volume20, 100.0);
+        close(m.volume_ratio.unwrap(), 2.0);
+        close(m.vol_ratio_5_20.unwrap(), 120.0 / 105.0);
+        close(m.adr_pct, (19.0 * 20.0 + 20.0 / 106.0 * 100.0) / 20.0);
+        close(m.dist_20d_high_pct, (106.0 / 110.0 - 1.0) * 100.0);
+        assert_eq!(m.score, 3.0);
+        assert_eq!(m.daily.above_sma20, Some(true));
+        assert_eq!(m.daily.rsi, Some(100.0));
+        assert!(m.monthly.unavailable.as_deref().unwrap().contains("need 20"));
+        assert!(matches_setup("NEAR_HIGH", &b, &m));
+        assert!(matches_setup("VOL_SURGE", &b, &m));
+        assert!(matches_setup("EP", &b, &m));
+        assert!(matches_setup("BREAKOUT_QUEUE", &b, &m));
+        assert!(matches_setup("RSI_OB", &b, &m));
+        assert!(!matches_setup("RSI_OS", &b, &m));
+        assert!(matches_setup("DARVAS_BOX", &b, &m));
+        for b in &mut b {
+            b.volume = 0.0;
+        }
+        let m = calculate(&b).unwrap();
+        assert_eq!(m.volume_ratio, None);
+        assert_eq!(m.vol_ratio_5_20, None);
+        assert_eq!(m.avg_volume20, 0.0);
+        assert!(!matches_setup("VOL_SURGE", &b, &m));
+        assert!(!matches_setup("EP", &b, &m));
+    }
+    #[test]
+    fn score_box_bonus_breakout_failure_and_thresholds_do_not_round() {
+        let mut b = bars(30);
+        for b in &mut b {
+            b.high = 101.0;
+            b.low = 90.0;
+        }
+        let m = calculate(&b).unwrap();
+        assert_eq!(m.score, 2.0); // near high + box bonus
+        b[29].close = 105.0;
+        b[29].open = 105.0;
+        b[29].high = 106.0;
+        b[29].volume = 200.0;
+        let m = calculate(&b).unwrap();
+        assert_eq!(m.score, 5.0);
+        assert!(matches_setup("DARVAS_BREAKOUT", &b, &m));
+        b[29].close = 89.0;
+        b[29].open = 89.0;
+        b[29].high = 90.0;
+        b[29].low = 88.0;
+        let m = calculate(&b).unwrap();
+        assert!(matches_setup("DARVAS_FAIL", &b, &m));
+        assert!(matches_setup("RSI_OS", &b, &m));
+        let mut b = bars(30);
+        b[29].volume = 149.999;
+        let m = calculate(&b).unwrap();
+        assert!(!matches_setup("VOL_SURGE", &b, &m));
+        b[29].volume = 150.0;
+        assert!(matches_setup("VOL_SURGE", &b, &calculate(&b).unwrap()));
+    }
+    #[test]
+    fn calendar_months_leap_year_year_boundary_ohlcv_and_incomplete_edges() {
+        let input = vec![
+            bar(d("2023-12-29"), 100.0),
+            bar(d("2024-01-02"), 102.0),
+            bar(d("2024-01-31"), 110.0),
+            bar(d("2024-02-01"), 105.0),
+            bar(d("2024-02-29"), 107.0),
+            bar(d("2024-03-01"), 109.0),
+        ];
+        let months = completed_periods(&input, Timeframe::MN1);
+        assert_eq!(months.len(), 2); // leading December and trailing March incomplete
+        assert_eq!(date(months[0].ts), "2024-01-01");
+        assert_eq!(date(months[1].ts), "2024-02-01");
+        assert_eq!(
+            (months[0].open, months[0].high, months[0].low, months[0].close, months[0].volume),
+            (102.0, 111.0, 101.0, 110.0, 200.0)
+        );
+        assert_eq!(months[0].provenance, Provenance::Real);
+        let b = vec![
+            bar(d("2025-12-01"), 100.0),
+            bar(d("2025-12-31"), 101.0),
+            bar(d("2026-01-02"), 102.0),
+            bar(d("2026-01-30"), 103.0),
+        ];
+        assert_eq!(
+            completed_periods(&b, Timeframe::MN1).iter().map(|b| date(b.ts)).collect::<Vec<_>>(),
+            vec!["2025-12-01", "2026-01-01"]
+        );
+        assert!(completed_periods(&[], Timeframe::MN1).is_empty());
+    }
+    #[test]
+    fn weekly_calendar_holiday_completion_and_full_twenty_bar_lookback() {
+        let b = vec![bar(d("2026-03-30"), 100.0), bar(d("2026-04-02"), 101.0)]; // Good Friday closed
+        let w = completed_periods(&b, Timeframe::W1);
+        assert_eq!(w.len(), 1);
+        assert_eq!(date(w[0].ts), "2026-03-30");
+        assert_eq!(w[0].volume, 200.0);
+        assert!(completed_periods(&b[..1], Timeframe::W1).is_empty());
+        let b = bars(150);
+        let m = calculate(&b).unwrap();
+        assert!(m.weekly.bars >= 20);
+        assert_eq!(m.weekly.rsi, Some(50.0));
+        assert_eq!(m.weekly.above_sma20, Some(true));
+        let short = conditions(&b[..19], "monthly");
+        assert_eq!(short.rsi, None);
+        assert_eq!(short.above_sma20, None);
+        assert!(short.unavailable.unwrap().contains("have 19"));
+        assert!(conditions(&b[..20], "monthly").unavailable.is_none());
+    }
+    #[test]
+    fn monthly_uses_all_daily_history_and_never_a_260_bar_tail() {
+        let first = d("2022-01-03");
+        let b: Vec<_> =
+            (0..1100).map(|i| first + Days::days(i)).filter(|d| is_session(*d)).map(|d| bar(d, 100.0)).collect();
+        let m = calculate(&b).unwrap();
+        assert!(m.monthly.bars >= 35);
+        assert_eq!(m.monthly.rsi, Some(50.0));
+        assert!(m.monthly.unavailable.is_none());
+        let tail = calculate(&b[b.len() - 260..]).unwrap();
+        assert!(tail.monthly.unavailable.unwrap().contains("need 20"));
+    }
+    #[test]
+    fn skip_reasons_for_missing_short_invalid_and_unsorted_history() {
+        let valid = bars(30);
+        let mut bad = valid.clone();
+        bad[29].close = f64::NAN;
+        let mut duplicate = valid.clone();
+        duplicate[29].ts = duplicate[28].ts;
+        let histories = vec![
+            ("EMPTY".into(), vec![]),
+            ("SHORT".into(), valid[..29].to_vec()),
+            ("BAD".into(), bad),
+            ("DUP".into(), duplicate),
+            ("OK".into(), valid),
+        ];
+        let scan = ScanCache::default().scan("NEAR_HIGH", histories, Provenance::Cached).unwrap().0;
+        assert_eq!(scan.scanned, 1);
+        assert_eq!(scan.results.len(), 1);
+        assert_eq!(scan.skipped.len(), 4);
+        for (symbol, text) in [
+            ("EMPTY", "missing daily"),
+            ("SHORT", "need 30 bars, have 29"),
+            ("BAD", "invalid archived"),
+            ("DUP", "unique ascending"),
+        ] {
+            assert!(scan.skipped.iter().find(|s| s.symbol == symbol).unwrap().reason.contains(text));
+        }
+        let mut invalid = bars(30);
+        invalid[0].volume = -1.0;
+        assert!(calculate(&invalid).is_err());
+    }
+    #[test]
+    fn cache_reuses_unchanged_bars_invalidates_corrections_and_refuses_samples() {
+        let mut cache = ScanCache::default();
+        let input = vec![("X".into(), bars(30))];
+        assert!(!cache.scan("NEAR_HIGH", input.clone(), Provenance::Cached).unwrap().1);
+        assert!(cache.scan("NEAR_HIGH", input.clone(), Provenance::Cached).unwrap().1);
+        let mut revised = input.clone();
+        revised[0].1[29].volume = 200.0;
+        let (scan, hit) = cache.scan("NEAR_HIGH", revised.clone(), Provenance::Cached).unwrap();
+        assert!(!hit);
+        assert_eq!(scan.results[0].metrics.as_ref().unwrap().volume, 200.0);
+        assert!(!cache.scan("NEAR_HIGH", revised.clone(), Provenance::Real).unwrap().1);
+        assert!(!cache.scan("RSI_OB", revised.clone(), Provenance::Real).unwrap().1);
+        revised[0].1[0].provenance = Provenance::Sample;
+        assert!(cache.scan("NEAR_HIGH", revised, Provenance::Cached).unwrap_err().to_string().contains("refused"));
+        assert!(cache.scan("NEAR_HIGH", input.clone(), Provenance::Sample).is_err());
+        let mut sample = bars(30);
+        for b in &mut sample {
+            b.provenance = Provenance::Sample;
+        }
+        assert!(setup_active("NEAR_HIGH", &sample).unwrap_err().contains("SAMPLE"));
+        assert!(setup_active("NEAR_HIGH", &bars(30)).unwrap());
+        assert!(cache.scan("TYPO", input, Provenance::Cached).is_err());
+        let cache = Mutex::new(CalculationCache::default());
+        let mut b = bars(30);
+        let original = cached_with(&cache, &b, calculate).0.unwrap();
+        assert_eq!(cache.lock().unwrap().map.len(), 1);
+        assert!(cached_with(&cache, &b, calculate).1);
+        assert_eq!(cache.lock().unwrap().map.len(), 1);
+        b[29].volume = 200.0;
+        assert_ne!(cached_with(&cache, &b, calculate).0.unwrap().volume, original.volume);
+        assert_eq!(cache.lock().unwrap().map.len(), 2);
+    }
+    fn varied(n: usize, seed: usize) -> Vec<Bar> {
+        (0..n)
+            .map(|i| bar(d("2023-01-02") + Days::days(i as i64), 100.0 + ((i * 7 + seed * 13) % 23) as f64 + seed as f64 * 0.01))
+            .collect()
+    }
+    #[test]
+    fn calc_cache_corrected_old_bar_misses() {
+        let cache = Mutex::new(CalculationCache::default());
+        let mut b = varied(300, 1);
+        let first = cached_with(&cache, &b, calculate);
+        assert!(!first.1);
+        b[5].close += 3.0;
+        b[5].high += 3.0;
+        let second = cached_with(&cache, &b, calculate);
+        assert!(!second.1, "same len and last bar but a corrected old bar must miss");
+        assert_eq!(cache.lock().unwrap().map.len(), 2);
+        assert_ne!(first.0.unwrap().daily.rsi, second.0.unwrap().daily.rsi);
+    }
+    #[test]
+    fn calc_cache_500_names_second_pass_all_hits() {
+        let cache = Mutex::new(CalculationCache::default());
+        let all: Vec<_> = (0..500).map(|i| varied(60, i)).collect();
+        assert!(all.iter().all(|b| !cached_with(&cache, b, calculate).1));
+        assert!(all.iter().all(|b| cached_with(&cache, b, calculate).1));
+        assert_eq!(cache.lock().unwrap().map.len(), 500);
+    }
+    #[test]
+    fn calc_cache_lru_evicts_least_recent_at_1024() {
+        let cache = Mutex::new(CalculationCache::default());
+        let all: Vec<_> = (0..CALC_CACHE_CAP + 1).map(|i| varied(40 + i % 3, i)).collect();
+        let dummy = |_: &[Bar]| Err::<Metrics, String>("x".into());
+        for b in &all[..CALC_CACHE_CAP] {
+            let _ = cached_with(&cache, b, dummy);
+        }
+        assert!(cached_with(&cache, &all[0], dummy).1, "touch the oldest entry");
+        let _ = cached_with(&cache, &all[CALC_CACHE_CAP], dummy);
+        assert_eq!(cache.lock().unwrap().map.len(), CALC_CACHE_CAP);
+        assert!(cached_with(&cache, &all[0], dummy).1, "recently touched survives");
+        assert!(!cached_with(&cache, &all[1], dummy).1, "least recent was evicted");
+    }
+    #[test]
+    fn calc_cache_lock_not_held_during_compute() {
+        let cache = Mutex::new(CalculationCache::default());
+        let (r, hit) = cached_with(&cache, &bars(30), |b| {
+            assert!(cache.try_lock().is_ok(), "lock must be free while computing");
+            calculate(b)
+        });
+        assert!(r.is_ok() && !hit);
+    }
+    fn dated_bars(closes: impl Iterator<Item = f64>) -> Vec<Bar> {
+        closes.enumerate().map(|(i, c)| bar(d("2024-01-02") + Days::days(i as i64), c)).collect()
+    }
+    /// Stale symbol (D0..D99, last 110) vs SPY D0..D199 close 100+i; own-dates result is -24.82.
+    #[test]
+    fn oneil_stale_symbol_uses_own_dates_not_newer_spy_window() {
+        let spy = dated_bars((0..200).map(|i| 100.0 + i as f64));
+        let sym = dated_bars((0..100).map(|i| if i == 99 { 110.0 } else { 100.0 }));
+        let expected = super::super::scan_pack::OneilMetrics { rs_spy_pct: Some(-24.82), oneil_rs: false };
+        let hist = vec![("WIN".to_string(), sym.clone()), ("SPY".to_string(), spy.clone())];
+        // Path 1: ScanCache::scan with SPY in the universe.
+        let mut all = ScanCache::default().scan("ALL", hist.clone(), Provenance::Real).unwrap().0;
+        let m = all.results.iter().find(|r| r.symbol == "WIN").unwrap().metrics.clone().unwrap();
+        assert_eq!(m.oneil_lens, expected);
+        assert!((m.rs_spy_63d.unwrap() + 24.8241).abs() < 1e-3);
+        // Path 2: apply_spy_benchmark.
+        crate::whats_news::apply_spy_benchmark(&mut all, &hist, Some(&spy)).unwrap();
+        let m = all.results.iter().find(|r| r.symbol == "WIN").unwrap().metrics.clone().unwrap();
+        assert_eq!(m.oneil_lens, expected);
+        // Path 3: setup_active_with_spy. A 140 close is positive positionally (+10.5) but negative dated.
+        let mut strong = sym.clone();
+        strong[99].close = 140.0;
+        strong[99].high = 141.0;
+        assert!(!setup_active_with_spy("ONEIL_LENS", &strong, Some(&spy)).unwrap());
+        assert!(!setup_active_with_spy("ONEIL_LENS", &sym, Some(&spy)).unwrap());
+        // The positional Python-parity function would have said -13.18 for the stale case.
+        let closes = |b: &[Bar]| b.iter().map(|b| b.close).collect::<Vec<_>>();
+        assert_eq!(
+            super::super::scan_pack::measure_oneil(&closes(&sym), Some(&closes(&spy))).rs_spy_pct,
+            Some(-13.18)
+        );
+    }
+    #[test]
+    fn oneil_missing_spy_start_date_none() {
+        let mut spy = dated_bars((0..200).map(|i| 100.0 + i as f64));
+        spy.remove(36);
+        let sym = dated_bars((0..100).map(|i| if i == 99 { 110.0 } else { 100.0 }));
+        let hist = vec![("WIN".to_string(), sym.clone()), ("SPY".to_string(), spy.clone())];
+        let mut all = ScanCache::default().scan("ALL", hist.clone(), Provenance::Real).unwrap().0;
+        let m = all.results.iter().find(|r| r.symbol == "WIN").unwrap().metrics.clone().unwrap();
+        assert_eq!((m.rs_spy_63d, m.oneil_lens.rs_spy_pct, m.oneil_lens.oneil_rs), (None, None, false));
+        crate::whats_news::apply_spy_benchmark(&mut all, &hist, Some(&spy)).unwrap();
+        let m = all.results.iter().find(|r| r.symbol == "WIN").unwrap().metrics.clone().unwrap();
+        assert_eq!((m.rs_spy_63d, m.oneil_lens.rs_spy_pct, m.oneil_lens.oneil_rs), (None, None, false));
+        assert!(!setup_active_with_spy("ONEIL_LENS", &sym, Some(&spy)).unwrap());
+    }
+    #[test]
+    fn relative_strength_ties_same_date_cohorts_and_universe_before_filtering() {
+        let mut a = bars(30);
+        a[29].close = 100.5;
+        let mut c = bars(30);
+        c[29].close = 99.5;
+        let mut old = bars(30);
+        for b in &mut old {
+            b.ts -= 86400;
+        }
+        let histories = vec![("A".into(), a.clone()), ("B".into(), a), ("C".into(), c), ("OLD".into(), old)];
+        let scan = ScanCache::default().scan("NEAR_HIGH", histories, Provenance::Cached).unwrap().0;
+        for r in &scan.results {
+            let m = r.metrics.as_ref().unwrap();
+            assert_eq!(
+                (m.rs_rank, m.rs_n),
+                match r.symbol.as_str() {
+                    "A" | "B" => (1, 3),
+                    "C" => (3, 3),
+                    _ => (1, 1),
+                }
+            );
+        }
+    }
+    #[test]
+    fn every_numeric_filter_inclusive_bounds_missing_values_and_combination() {
+        let r = row("X", 50.0);
+        let expected = d("2026-10-21");
+        let filters: Vec<Box<dyn Fn(&mut ScanFilter, f64)>> = vec![
+            Box::new(|f, v| f.min_score = Some(v)),
+            Box::new(|f, v| f.min_strength = Some(v)),
+            Box::new(|f, v| f.min_rsi = Some(v)),
+            Box::new(|f, v| f.min_volume = Some(v)),
+            Box::new(|f, v| f.min_volume_ratio = Some(v)),
+            Box::new(|f, v| f.min_range = Some(v)),
+        ];
+        for set in filters {
+            let mut f = ScanFilter::default();
+            set(&mut f, 50.0);
+            assert!(f.reason(&r, expected).is_none());
+            set(&mut f, 50.01);
+            assert!(f.reason(&r, expected).unwrap().contains("outside filter"));
+        }
+        for range in [false, true] {
+            let mut f = ScanFilter::default();
+            if range {
+                f.max_range = Some(50.0)
+            } else {
+                f.max_rsi = Some(50.0)
+            };
+            assert!(f.reason(&r, expected).is_none());
+            if range {
+                f.max_range = Some(49.0)
+            } else {
+                f.max_rsi = Some(49.0)
+            };
+            assert!(f.reason(&r, expected).is_some());
+        }
+        let mut f = ScanFilter {
+            min_score: Some(10.0),
+            min_rsi: Some(20.0),
+            max_rsi: Some(60.0),
+            min_volume: Some(40.0),
+            min_range: Some(0.0),
+            max_range: Some(100.0),
+            ..Default::default()
+        };
+        assert!(f.reason(&r, expected).is_none());
+        let mut missing = r.clone();
+        missing.metrics = None;
+        assert!(f.reason(&missing, expected).unwrap().contains("unavailable"));
+        f = ScanFilter { min_volume_ratio: Some(1.0), ..Default::default() };
+        missing.metrics = Some(Metrics::default());
+        assert!(f.reason(&missing, expected).unwrap().contains("volume ratio unavailable"));
+    }
+    #[test]
+    fn all_timeframe_conditions_and_insufficient_history_skip_reason() {
+        let mut r = row("X", 75.0);
+        let expected = d("2026-10-21");
+        for cond in Condition::ALL {
+            let mut f = ScanFilter { daily: cond, ..Default::default() };
+            let accepted = matches!(cond, Condition::Any | Condition::AboveSma20 | Condition::Overbought);
+            assert_eq!(f.reason(&r, expected).is_none(), accepted);
+            f.daily = Condition::Any;
+            f.weekly = cond;
+            assert_eq!(f.reason(&r, expected).is_none(), accepted);
+            f.weekly = Condition::Any;
+            f.monthly = cond;
+            assert_eq!(
+                f.reason(&r, expected).is_none(),
+                matches!(cond, Condition::Any | Condition::BelowSma20 | Condition::Oversold)
+            );
+        }
+        r.metrics.as_mut().unwrap().monthly = conditions(&[], "completed monthly");
+        let f = ScanFilter { monthly: Condition::AboveSma20, ..Default::default() };
+        assert!(f.reason(&r, expected).unwrap().contains("insufficient completed monthly history"));
+        r.metrics = None;
+        assert!(f.reason(&r, expected).unwrap().contains("monthly conditions unavailable"));
+    }
+    #[test]
+    fn all_sorts_both_directions_stable_ties_and_missing_last() {
+        let mut missing = row("MISSING", 1.0);
+        missing.metrics = None;
+        let scan = Scan {
+            provenance: Provenance::Real,
+            scanned: 4,
+            skipped: vec![],
+            results: vec![row("B", 10.0), row("C", 20.0), row("A", 10.0), missing],
+        };
+        for sort in Sort::ALL {
+            for descending in [false, true] {
+                let f = ScanFilter { sort, descending, ..Default::default() };
+                let names: Vec<_> = f.rows(&scan, "", d("2026-10-21")).iter().map(|r| r.symbol.as_str()).collect();
+                let expected = if sort == Sort::Symbol {
+                    if descending { vec!["MISSING", "C", "B", "A"] } else { vec!["A", "B", "C", "MISSING"] }
+                } else if descending {
+                    vec!["C", "A", "B", "MISSING"]
+                } else {
+                    vec!["A", "B", "C", "MISSING"]
+                };
+                assert_eq!(names, expected, "{sort:?}, {descending}");
+                assert_eq!(f.rows(&scan, " b ", d("2026-10-21"))[0].symbol, "B");
+            }
+        }
+    }
+    #[test]
+    fn staleness_defaults_toggle_missing_and_session_close_rollover() {
+        let r = row("X", 50.0);
+        let mut f = ScanFilter::default();
+        assert!(!f.include_stale);
+        assert!(f.reason(&r, d("2026-10-21")).is_none());
+        assert!(f.reason(&r, d("2026-10-22")).unwrap().contains("stale: last bar 2026-10-21"));
+        f.include_stale = true;
+        assert!(f.reason(&r, d("2026-10-22")).is_none());
+        let mut missing = r.clone();
+        missing.last_date = None;
+        f.include_stale = false;
+        assert!(f.reason(&missing, d("2026-10-21")).unwrap().contains("missing last"));
+        missing.last_date = Some("invalid".into());
+        assert!(f.reason(&missing, d("2026-10-21")).is_some());
+        f.include_stale = true;
+        assert!(f.reason(&missing, d("2026-10-21")).is_none());
+        let expected = |s: &str| crate::history::calendar::last_expected_session(s.parse().unwrap());
+        assert_eq!(expected("2026-10-22T19:59:00Z"), d("2026-10-21"));
+        assert_eq!(expected("2026-10-22T20:16:00Z"), d("2026-10-22"));
+        assert_eq!(expected("2026-07-05T16:00:00Z"), d("2026-07-02"));
+    }
+    #[test]
+    fn invalid_dates_and_calculation_overflow_skip_with_a_reason() {
+        let mut b = bars(30);
+        b[29].ts = i64::MAX;
+        assert!(calculate(&b).unwrap_err().contains("invalid archived OHLCV or date"));
+        let mut b = bars(30);
+        for bar in &mut b {
+            bar.volume = 1e-300;
+        }
+        b[29].volume = 1e300;
+        assert!(calculate(&b).unwrap_err().contains("non-finite calculation"));
+    }
+}
+
+#[cfg(test)]
+mod desk_metric_tests {
+    use super::*;
+
+    #[test]
+    fn desk_sorts_rank_signed_values_and_keep_missing_last() {
+        let mut rows = vec![];
+        for (symbol, value) in [("LOW", Some(-2.0)), ("HIGH", Some(3.0)), ("MISSING", None)] {
+            rows.push(ScanRow {
+                symbol: symbol.into(),
+                metrics: Some(Metrics {
+                    stretch_atr: value,
+                    stretch_pct: value,
+                    rs_spy_63d: value,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            });
+        }
+        let scan = Scan { provenance: Provenance::Real, scanned: 3, results: rows, skipped: vec![] };
+        for sort in [Sort::StretchAtr, Sort::StretchPct, Sort::SpyStrength] {
+            for descending in [true, false] {
+                let filter = ScanFilter { sort, descending, include_stale: true, ..Default::default() };
+                let rows = filter.rows(&scan, "", NaiveDate::from_ymd_opt(2026, 10, 30).unwrap());
+                assert_eq!(rows[0].symbol, if descending { "HIGH" } else { "LOW" });
+                assert_eq!(rows[2].symbol, "MISSING");
+            }
+        }
+    }
+
+    #[test]
+    fn separate_benchmark_keeps_universe_and_verifies_provenance() {
+        let bars = |end: f64| (0..70).map(|i| {
+            let close = if i == 69 { end } else { 100.0 };
+            Bar::new(i * 86400, close, close + 1.0, close - 1.0, close, 10.0)
+                .with_provenance(Provenance::Real)
+        }).collect::<Vec<_>>();
+        let histories = vec![("AAPL".into(), bars(110.0))];
+        let mut scan = ScanCache::default().scan("RSI_OB", histories.clone(), Provenance::Real).unwrap().0;
+        let scanned = scan.scanned;
+        super::super::apply_spy_benchmark(&mut scan, &histories, Some(&bars(100.0))).unwrap();
+        assert_eq!(scan.scanned, scanned);
+        assert_eq!(scan.results.len(), 1);
+        assert_eq!(scan.results[0].symbol, "AAPL");
+        assert!((scan.results[0].metrics.as_ref().unwrap().rs_spy_63d.unwrap() - 10.0).abs() < 1e-9);
+        super::super::apply_spy_benchmark(&mut scan, &histories, Some(&bars(110.0))).unwrap();
+        assert_eq!(scan.results[0].metrics.as_ref().unwrap().rs_spy_63d, Some(0.0));
+        super::super::apply_spy_benchmark(&mut scan, &histories, None).unwrap();
+        assert_eq!(scan.results[0].metrics.as_ref().unwrap().rs_spy_63d, None);
+        let sample: Vec<_> = bars(100.0).into_iter().map(|b| b.with_provenance(Provenance::Sample)).collect();
+        assert!(super::super::apply_spy_benchmark(&mut scan, &histories, Some(&sample)).is_err());
+    }
+
+    #[test]
+    fn scan_enriches_from_spy_and_preserves_missing_benchmark() {
+        let bars = |end: f64| {
+            (0..70)
+                .map(|i| {
+                    let close = if i == 69 { end } else { 100.0 };
+                    Bar::new(i * 86400, close, close + 1.0, close - 1.0, close, 10.0).with_provenance(Provenance::Real)
+                })
+                .collect::<Vec<_>>()
+        };
+        let mut cache = ScanCache::default();
+        let histories = vec![("AAPL".into(), bars(110.0)), ("SPY".into(), bars(100.0))];
+        let scan = cache.scan("RSI_OB", histories, Provenance::Real).unwrap().0;
+        let m = scan.results.iter().find(|r| r.symbol == "AAPL").unwrap().metrics.as_ref().unwrap();
+        assert!((m.rs_spy_63d.unwrap() - 10.0).abs() < 1e-9);
+        assert!(m.stretch_atr.unwrap() > 0.0);
+        let scan = cache.scan("RSI_OB", vec![("AAPL".into(), bars(110.0))], Provenance::Real).unwrap().0;
+        assert_eq!(scan.results[0].metrics.as_ref().unwrap().rs_spy_63d, None);
+    }
+}
+
+#[cfg(test)]
+mod adma_sort_tests {
+    use super::*;
+
+    #[test]
+    fn adma_is_a_separate_signed_sort() {
+        let row = ScanRow { metrics: Some(Metrics {
+            adma_stretch: Some(-3.0), stretch_pct: Some(8.0), ..Default::default()
+        }), ..Default::default() };
+        assert_eq!(Sort::AdmaStretch.value(&row), Some(-3.0));
+        assert_eq!(Sort::StretchPct.value(&row), Some(8.0));
+        assert_eq!(Sort::AdmaStretch.value(&ScanRow::default()), None);
+        assert!(Sort::DESK.contains(&Sort::AdmaStretch));
+    }
+}

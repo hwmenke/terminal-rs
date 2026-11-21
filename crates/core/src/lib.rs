@@ -4,11 +4,15 @@
 pub mod bar;
 pub mod catalog;
 pub mod indicators;
+pub mod ny;
 pub mod options;
+pub mod portfolio_risk;
+pub mod provenance;
 pub mod sample;
 pub mod security;
 pub mod timeframe;
 
 pub use bar::{Bar, Series};
+pub use provenance::Provenance;
 pub use security::{AssetClass, Security, YellowKey};
 pub use timeframe::Timeframe;

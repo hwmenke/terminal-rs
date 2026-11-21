@@ -1,0 +1,530 @@
+{
+  "schema": 1,
+  "cases": {
+    "paint.intraday.steady.ui": {
+      "budget_us": 1500,
+      "relative": false,
+      "class": "frame"
+    },
+    "paint.intraday.steady.tess": {
+      "budget_us": 1500,
+      "relative": false,
+      "class": "frame"
+    },
+    "paint.intraday.steady.total": {
+      "budget_us": 2500,
+      "relative": false,
+      "class": "frame"
+    },
+    "paint.intraday.pan.ui": {
+      "budget_us": 3500,
+      "relative": false,
+      "class": "frame"
+    },
+    "paint.intraday.pan.tess": {
+      "budget_us": 2000,
+      "relative": false,
+      "class": "frame"
+    },
+    "paint.intraday.pan.total": {
+      "budget_us": 5000,
+      "relative": false,
+      "class": "frame"
+    },
+    "paint.auction.steady.ui": {
+      "budget_us": 1500,
+      "relative": false,
+      "class": "frame"
+    },
+    "paint.auction.steady.tess": {
+      "budget_us": 1000,
+      "relative": false,
+      "class": "frame"
+    },
+    "paint.auction.steady.total": {
+      "budget_us": 2500,
+      "relative": false,
+      "class": "frame"
+    },
+    "paint.auction.pan.ui": {
+      "budget_us": 2000,
+      "relative": false,
+      "class": "frame"
+    },
+    "paint.auction.pan.tess": {
+      "budget_us": 1000,
+      "relative": false,
+      "class": "frame"
+    },
+    "paint.auction.pan.total": {
+      "budget_us": 2800,
+      "relative": false,
+      "class": "frame"
+    },
+    "paint.auction_refresh.ui": {
+      "budget_us": 2000,
+      "relative": false,
+      "class": "frame"
+    },
+    "paint.auction_refresh.tess": {
+      "budget_us": 1000,
+      "relative": false,
+      "class": "frame"
+    },
+    "paint.auction_refresh.total": {
+      "budget_us": 2800,
+      "relative": false,
+      "class": "frame"
+    },
+    "paint.scan_view.steady.ui": {
+      "budget_us": 1200,
+      "relative": false,
+      "class": "frame"
+    },
+    "paint.scan_view.steady.tess": {
+      "budget_us": 800,
+      "relative": false,
+      "class": "frame"
+    },
+    "paint.scan_view.steady.total": {
+      "budget_us": 2000,
+      "relative": false,
+      "class": "frame"
+    },
+    "paint.scan_view.hover.ui": {
+      "budget_us": 1200,
+      "relative": false,
+      "class": "frame"
+    },
+    "paint.scan_view.hover.tess": {
+      "budget_us": 800,
+      "relative": false,
+      "class": "frame"
+    },
+    "paint.scan_view.hover.total": {
+      "budget_us": 2000,
+      "relative": false,
+      "class": "frame"
+    },
+    "paint.studio_or.steady.ui": {
+      "budget_us": 1200,
+      "relative": false,
+      "class": "frame"
+    },
+    "paint.studio_or.steady.tess": {
+      "budget_us": 800,
+      "relative": false,
+      "class": "frame"
+    },
+    "paint.studio_or.steady.total": {
+      "budget_us": 2000,
+      "relative": false,
+      "class": "frame"
+    },
+    "paint.studio_or.hover.ui": {
+      "budget_us": 1200,
+      "relative": false,
+      "class": "frame"
+    },
+    "paint.studio_or.hover.tess": {
+      "budget_us": 800,
+      "relative": false,
+      "class": "frame"
+    },
+    "paint.studio_or.hover.total": {
+      "budget_us": 2000,
+      "relative": false,
+      "class": "frame"
+    },
+    "paint.studio_season.steady.ui": {
+      "budget_us": 1200,
+      "relative": false,
+      "class": "frame"
+    },
+    "paint.studio_season.steady.tess": {
+      "budget_us": 800,
+      "relative": false,
+      "class": "frame"
+    },
+    "paint.studio_season.steady.total": {
+      "budget_us": 2000,
+      "relative": false,
+      "class": "frame"
+    },
+    "paint.studio_season.hover.ui": {
+      "budget_us": 1200,
+      "relative": false,
+      "class": "frame"
+    },
+    "paint.studio_season.hover.tess": {
+      "budget_us": 800,
+      "relative": false,
+      "class": "frame"
+    },
+    "paint.studio_season.hover.total": {
+      "budget_us": 2000,
+      "relative": false,
+      "class": "frame"
+    },
+    "paint.studio_corr.steady.ui": {
+      "budget_us": 1500,
+      "relative": false,
+      "class": "frame"
+    },
+    "paint.studio_corr.steady.tess": {
+      "budget_us": 800,
+      "relative": false,
+      "class": "frame"
+    },
+    "paint.studio_corr.steady.total": {
+      "budget_us": 2500,
+      "relative": false,
+      "class": "frame"
+    },
+    "paint.studio_corr.hover.ui": {
+      "budget_us": 1500,
+      "relative": false,
+      "class": "frame"
+    },
+    "paint.studio_corr.hover.tess": {
+      "budget_us": 800,
+      "relative": false,
+      "class": "frame"
+    },
+    "paint.studio_corr.hover.total": {
+      "budget_us": 2500,
+      "relative": false,
+      "class": "frame"
+    },
+    "paint.studio_regime.steady.ui": {
+      "budget_us": 1200,
+      "relative": false,
+      "class": "frame"
+    },
+    "paint.studio_regime.steady.tess": {
+      "budget_us": 800,
+      "relative": false,
+      "class": "frame"
+    },
+    "paint.studio_regime.steady.total": {
+      "budget_us": 2000,
+      "relative": false,
+      "class": "frame"
+    },
+    "paint.studio_regime.hover.ui": {
+      "budget_us": 1200,
+      "relative": false,
+      "class": "frame"
+    },
+    "paint.studio_regime.hover.tess": {
+      "budget_us": 800,
+      "relative": false,
+      "class": "frame"
+    },
+    "paint.studio_regime.hover.total": {
+      "budget_us": 2000,
+      "relative": false,
+      "class": "frame"
+    },
+    "paint.studio_shape.steady.ui": {
+      "budget_us": 1500,
+      "relative": false,
+      "class": "frame"
+    },
+    "paint.studio_shape.steady.tess": {
+      "budget_us": 800,
+      "relative": false,
+      "class": "frame"
+    },
+    "paint.studio_shape.steady.total": {
+      "budget_us": 2500,
+      "relative": false,
+      "class": "frame"
+    },
+    "paint.studio_shape.hover.ui": {
+      "budget_us": 1500,
+      "relative": false,
+      "class": "frame"
+    },
+    "paint.studio_shape.hover.tess": {
+      "budget_us": 800,
+      "relative": false,
+      "class": "frame"
+    },
+    "paint.studio_shape.hover.total": {
+      "budget_us": 2500,
+      "relative": false,
+      "class": "frame"
+    },
+    "paint.studio_shell.steady.ui": {
+      "budget_us": 1200,
+      "relative": false,
+      "class": "frame"
+    },
+    "paint.studio_shell.steady.tess": {
+      "budget_us": 800,
+      "relative": false,
+      "class": "frame"
+    },
+    "paint.studio_shell.steady.total": {
+      "budget_us": 2000,
+      "relative": false,
+      "class": "frame"
+    },
+    "paint.studio_shell.hover.ui": {
+      "budget_us": 1200,
+      "relative": false,
+      "class": "frame"
+    },
+    "paint.studio_shell.hover.tess": {
+      "budget_us": 800,
+      "relative": false,
+      "class": "frame"
+    },
+    "paint.studio_shell.hover.total": {
+      "budget_us": 2000,
+      "relative": false,
+      "class": "frame"
+    },
+    "paint.studio_shell.chart_dist.ui": {
+      "budget_us": 3000,
+      "relative": false,
+      "class": "frame"
+    },
+    "paint.studio_shell.chart_dist.tess": {
+      "budget_us": 1500,
+      "relative": false,
+      "class": "frame"
+    },
+    "paint.studio_shell.chart_dist.total": {
+      "budget_us": 4500,
+      "relative": false,
+      "class": "frame"
+    },
+    "paint.studio_quick.steady.ui": {
+      "budget_us": 1500,
+      "relative": false,
+      "class": "frame"
+    },
+    "paint.studio_quick.steady.tess": {
+      "budget_us": 1000,
+      "relative": false,
+      "class": "frame"
+    },
+    "paint.studio_quick.steady.total": {
+      "budget_us": 2500,
+      "relative": false,
+      "class": "frame"
+    },
+    "paint.studio_quick.hover.ui": {
+      "budget_us": 1500,
+      "relative": false,
+      "class": "frame"
+    },
+    "paint.studio_quick.hover.tess": {
+      "budget_us": 1000,
+      "relative": false,
+      "class": "frame"
+    },
+    "paint.studio_quick.hover.total": {
+      "budget_us": 2500,
+      "relative": false,
+      "class": "frame"
+    },
+    "paint.studio_when.steady.ui": {
+      "budget_us": 1200,
+      "relative": false,
+      "class": "frame"
+    },
+    "paint.studio_when.steady.tess": {
+      "budget_us": 800,
+      "relative": false,
+      "class": "frame"
+    },
+    "paint.studio_when.steady.total": {
+      "budget_us": 2000,
+      "relative": false,
+      "class": "frame"
+    },
+    "paint.studio_when.hover.ui": {
+      "budget_us": 1200,
+      "relative": false,
+      "class": "frame"
+    },
+    "paint.studio_when.hover.tess": {
+      "budget_us": 800,
+      "relative": false,
+      "class": "frame"
+    },
+    "paint.studio_when.hover.total": {
+      "budget_us": 2000,
+      "relative": false,
+      "class": "frame"
+    },
+    "paint.studio_when.chart_shaded.ui": {
+      "budget_us": 1500,
+      "relative": false,
+      "class": "frame"
+    },
+    "paint.studio_when.chart_shaded.tess": {
+      "budget_us": 1500,
+      "relative": false,
+      "class": "frame"
+    },
+    "paint.studio_when.chart_shaded.total": {
+      "budget_us": 2500,
+      "relative": false,
+      "class": "frame"
+    },
+    "paint.studio_relate.steady.ui": {
+      "budget_us": 1200,
+      "relative": false,
+      "class": "frame"
+    },
+    "paint.studio_relate.steady.tess": {
+      "budget_us": 800,
+      "relative": false,
+      "class": "frame"
+    },
+    "paint.studio_relate.steady.total": {
+      "budget_us": 2000,
+      "relative": false,
+      "class": "frame"
+    },
+    "paint.studio_relate.hover.ui": {
+      "budget_us": 1200,
+      "relative": false,
+      "class": "frame"
+    },
+    "paint.studio_relate.hover.tess": {
+      "budget_us": 800,
+      "relative": false,
+      "class": "frame"
+    },
+    "paint.studio_relate.hover.total": {
+      "budget_us": 2000,
+      "relative": false,
+      "class": "frame"
+    },
+    "paint.studio_lab.steady.ui": {
+      "budget_us": 1200,
+      "relative": false,
+      "class": "frame"
+    },
+    "paint.studio_lab.steady.tess": {
+      "budget_us": 800,
+      "relative": false,
+      "class": "frame"
+    },
+    "paint.studio_lab.steady.total": {
+      "budget_us": 2000,
+      "relative": false,
+      "class": "frame"
+    },
+    "paint.studio_lab.hover.ui": {
+      "budget_us": 1200,
+      "relative": false,
+      "class": "frame"
+    },
+    "paint.studio_lab.hover.tess": {
+      "budget_us": 800,
+      "relative": false,
+      "class": "frame"
+    },
+    "paint.studio_lab.hover.total": {
+      "budget_us": 2000,
+      "relative": false,
+      "class": "frame"
+    },
+    "paint.studio_fair_value.steady.ui": {
+      "budget_us": 1500,
+      "relative": false,
+      "class": "frame"
+    },
+    "paint.studio_fair_value.steady.tess": {
+      "budget_us": 1500,
+      "relative": false,
+      "class": "frame"
+    },
+    "paint.studio_fair_value.steady.total": {
+      "budget_us": 2500,
+      "relative": false,
+      "class": "frame"
+    },
+    "paint.studio_fair_value.hover.ui": {
+      "budget_us": 1500,
+      "relative": false,
+      "class": "frame"
+    },
+    "paint.studio_fair_value.hover.tess": {
+      "budget_us": 1500,
+      "relative": false,
+      "class": "frame"
+    },
+    "paint.studio_fair_value.hover.total": {
+      "budget_us": 2500,
+      "relative": false,
+      "class": "frame"
+    },
+    "paint.studio_residual.steady.ui": {
+      "budget_us": 1200,
+      "relative": false,
+      "class": "frame"
+    },
+    "paint.studio_residual.steady.tess": {
+      "budget_us": 800,
+      "relative": false,
+      "class": "frame"
+    },
+    "paint.studio_residual.steady.total": {
+      "budget_us": 2000,
+      "relative": false,
+      "class": "frame"
+    },
+    "paint.studio_residual.hover.ui": {
+      "budget_us": 1200,
+      "relative": false,
+      "class": "frame"
+    },
+    "paint.studio_residual.hover.tess": {
+      "budget_us": 800,
+      "relative": false,
+      "class": "frame"
+    },
+    "paint.studio_residual.hover.total": {
+      "budget_us": 2000,
+      "relative": false,
+      "class": "frame"
+    },
+    "paint.studio_attribution.steady.ui": {
+      "budget_us": 1200,
+      "relative": false,
+      "class": "frame"
+    },
+    "paint.studio_attribution.steady.tess": {
+      "budget_us": 800,
+      "relative": false,
+      "class": "frame"
+    },
+    "paint.studio_attribution.steady.total": {
+      "budget_us": 2000,
+      "relative": false,
+      "class": "frame"
+    },
+    "paint.studio_attribution.hover.ui": {
+      "budget_us": 1200,
+      "relative": false,
+      "class": "frame"
+    },
+    "paint.studio_attribution.hover.tess": {
+      "budget_us": 800,
+      "relative": false,
+      "class": "frame"
+    },
+    "paint.studio_attribution.hover.total": {
+      "budget_us": 2000,
+      "relative": false,
+      "class": "frame"
+    }
+  }
+}

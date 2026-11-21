@@ -1,0 +1,1587 @@
+//! PM Desk pane: watchlist leaders, group performance, and risk-based position size.
+use super::{PaneKind, TerminalApp};
+use crate::{congress_view::Action, dock::PaneId, worker::Request};
+use egui::{RichText, Ui};
+use tr_data::whats_news::{
+    ATR_MULT, GroupSummary, HandoffBlock, MemberRow, RiskPlan, StopSource, box_stop, drawing_stops, resolve_stop,
+    size_position,
+};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TrailChoice {
+    Off,
+    R1,
+    R2,
+    Atr,
+}
+impl TrailChoice {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Off => "Off",
+            Self::R1 => "1R",
+            Self::R2 => "2R",
+            Self::Atr => "ATR×",
+        }
+    }
+    fn available(self, row: &MemberRow) -> bool {
+        self != Self::Atr || row.atr14.is_some_and(|atr| atr.is_finite() && atr > 0.0)
+    }
+    fn spec(self, mult: f64, row: &MemberRow) -> Result<Option<tr_data::trade_plans::TrailSpec>, String> {
+        use tr_data::trade_plans::{TrailKind, TrailSpec};
+        if !self.available(row) {
+            return Err("ATR trail needs a verified ATR(14) value".into());
+        }
+        Ok(match self {
+            Self::Off => None,
+            Self::R1 | Self::R2 => Some(TrailSpec {
+                kind: TrailKind::R,
+                value: if self == Self::R1 { 1.0 } else { 2.0 },
+                source: "desk".into(),
+            }),
+            Self::Atr => {
+                let atr = row.atr14.unwrap();
+                Some(TrailSpec {
+                    kind: TrailKind::Price,
+                    value: mult * atr,
+                    source: format!("desk {mult}×ATR14 {atr} as of {}", row.last_date.as_deref().unwrap_or("unknown")),
+                })
+            }
+        })
+    }
+}
+
+pub struct DeskPane {
+    pub group: String,
+    pub selected: Option<String>,
+    pub generation: u64,
+    pub rows: Option<tr_data::whats_news::Snapshot<Vec<MemberRow>>>,
+    pub loading: bool,
+    pub error: Option<String>,
+    pub requested: Vec<String>,
+    pub entry: f64,
+    pub stop: f64,
+    pub target: f64,
+    pub has_target: bool,
+    pub dollar_risk: f64,
+    pub atr_mult: f64,
+    pub be_at_1r: bool,
+    pub trail_choice: TrailChoice,
+    pub user_stop: Option<f64>,
+}
+
+impl DeskPane {
+    pub fn new(group: impl Into<String>) -> Self {
+        Self {
+            group: group.into(),
+            selected: None,
+            generation: 0,
+            rows: None,
+            loading: false,
+            error: None,
+            requested: vec![],
+            entry: 0.0,
+            stop: 0.0,
+            target: 0.0,
+            has_target: false,
+            dollar_risk: 250.0,
+            atr_mult: ATR_MULT,
+            be_at_1r: false,
+            trail_choice: TrailChoice::Off,
+            user_stop: None,
+        }
+    }
+
+    pub fn accept(&mut self, generation: u64, result: Result<tr_data::whats_news::Snapshot<Vec<MemberRow>>, String>) {
+        if generation != self.generation {
+            return;
+        }
+        self.loading = false;
+        match result {
+            Ok(snapshot) => {
+                if let Err(error) = snapshot.provenance.require_verified("PM Desk") {
+                    self.error = Some(error);
+                    return;
+                }
+                for row in &snapshot.data {
+                    if row.skip.is_none() {
+                        if let Err(e) = row.provenance.require_verified("PM Desk row") {
+                            self.error = Some(e);
+                            return;
+                        }
+                    }
+                }
+                self.error = None;
+                self.rows = Some(snapshot);
+                if self.selected.as_ref().is_none_or(|s| self.rows.as_ref().unwrap().data.iter().all(|r| r.key != *s)) {
+                    self.selected = self.rows.as_ref().and_then(|s| s.data.first().map(|r| r.key.clone()));
+                    self.user_stop = None;
+                }
+                self.sync_plan();
+            }
+            Err(e) => {
+                self.error = Some(e);
+            }
+        }
+    }
+
+    pub fn request(&mut self, pane: PaneId, worker: &crate::worker::Worker, symbols: Vec<String>) {
+        if self.loading && self.requested == symbols {
+            return;
+        }
+        self.generation += 1;
+        self.loading = true;
+        self.error = None;
+        self.requested = symbols.clone();
+        worker.send(Request::Desk { pane, generation: self.generation, symbols });
+    }
+
+    fn selected_row(&self) -> Option<&MemberRow> {
+        let key = self.selected.as_deref()?;
+        self.rows.as_ref()?.data.iter().find(|r| r.key == key)
+    }
+
+    fn sync_plan(&mut self) {
+        let Some(row) = self.selected_row().cloned() else {
+            return;
+        };
+        if let Some(close) = row.close.filter(|c| c.is_finite() && *c > 0.0) {
+            self.entry = close;
+        }
+        let long = self.user_stop.map(|s| s < self.entry).unwrap_or(true);
+        if let Some((stop, source)) =
+            resolve_stop(self.user_stop, box_stop(&row, long), row.atr14, self.entry, long, self.atr_mult)
+        {
+            self.stop = stop;
+            if source != StopSource::User {
+                self.user_stop = None;
+            }
+        }
+        if !self.has_target {
+            if let (Some(entry), Some(stop)) = (row.close, Some(self.stop).filter(|s| *s > 0.0)) {
+                let risk = (entry - stop).abs();
+                if risk > 0.0 {
+                    self.target = if stop < entry { entry + 2.0 * risk } else { entry - 2.0 * risk };
+                }
+            }
+        }
+    }
+
+    fn plan(&self) -> Result<RiskPlan, String> {
+        let row = self.selected_row();
+        let long = self.stop < self.entry;
+        let source = resolve_stop(
+            self.user_stop,
+            row.and_then(|r| box_stop(r, long)),
+            row.and_then(|r| r.atr14),
+            self.entry,
+            long,
+            self.atr_mult,
+        )
+        .map(|(_, s)| s)
+        .unwrap_or(if self.user_stop.is_some() { StopSource::User } else { StopSource::Atr });
+        size_position(self.entry, self.stop, self.has_target.then_some(self.target), self.dollar_risk, source)
+    }
+}
+
+impl TerminalApp {
+    fn open_holdings_risk(&mut self) {
+        if let Some(p) = self.panes.iter_mut().find(|p| matches!(p.kind, PaneKind::Portfolio(_))) {
+            if let PaneKind::Portfolio(pp) = &mut p.kind {
+                pp.open_risk = true;
+                pp.view = crate::command::PortView::Positions;
+            }
+            self.focus = p.id;
+            self.dock.activate(p.id);
+        } else {
+            let mut pane = super::broker::PortfolioPane::new(crate::command::PortView::Positions);
+            pane.open_risk = true;
+            self.open_panel(PaneKind::Portfolio(Box::new(pane)));
+        }
+    }
+
+    pub(super) fn open_desk(&mut self, symbol: Option<&str>) {
+        let group = self
+            .watchlists
+            .index(&self.watch_ui.selected_group)
+            .map(|_| self.watch_ui.selected_group.clone())
+            .unwrap_or_else(|| self.watchlists.last_used.clone());
+        let mut pane = DeskPane::new(group);
+        if let Some(s) = symbol {
+            pane.selected = Some(tr_data::security(s).key());
+        }
+        self.open_panel(PaneKind::Desk(Box::new(pane)));
+        self.sync_holding_risk();
+    }
+
+    pub(super) fn desk(&mut self, ui: &mut Ui, id: PaneId) -> Vec<Action> {
+        let i = match self.idx(id) {
+            Some(i) => i,
+            None => return vec![],
+        };
+        if self.watchlists.index(&self.watch_ui.selected_group).is_none() {
+            self.watch_ui.selected_group = self.watchlists.last_used.clone();
+        }
+        self.sync_holding_risk();
+        let breaches = self.holding_risk.breaches;
+        let setup_hits = self.holding_risk.total_setup_hits();
+        let setup_hits_hover = self.holding_risk.setup_hits_hover();
+        let threshold = self.holding_risk.concentration * 100.0;
+        let (breadth, breadth_label) = self.holding_risk.selected_breadth();
+        let breadth_chips = breadth_chips(breadth);
+        let breadth_hint =
+            format!("A/D is advances / (advances + declines), excluding unchanged.\n{}", breadth.summary());
+        let mut open_risk = false;
+        let mut armed_plan = None;
+        let mut actions = vec![];
+        let mut refresh = false;
+        let mut pick = None;
+        let mut use_line = None;
+        let selected_key = match &self.panes[i].kind {
+            PaneKind::Desk(d) => d.selected.clone(),
+            _ => None,
+        };
+        if let Some(chart) = self.panes.iter_mut().find_map(|p| match &mut p.kind {
+            PaneKind::Chart(chart)
+                if selected_key.as_deref() == Some(chart.symbol.as_str()) && chart.tf == tr_core::Timeframe::D1 =>
+            {
+                Some(chart)
+            }
+            _ => None,
+        }) {
+            let mut enabled = chart.show_spy_strength;
+            if ui.checkbox(&mut enabled, "RS vs SPY").changed() {
+                chart.set_spy_strength(enabled, &self.worker);
+            }
+        } else {
+            ui.add_enabled(false, egui::Checkbox::new(&mut false, "RS vs SPY"))
+                .on_hover_text("Open a daily chart for the selected symbol");
+        }
+        let chart_lines =
+            selected_key.as_deref().map(|k| drawing_stops(&self.chart_horizontals(k))).unwrap_or_default();
+        {
+            let PaneKind::Desk(pane) = &mut self.panes[i].kind else { return vec![] };
+            if self.watchlists.index(&pane.group).is_none() {
+                pane.group = self.watchlists.last_used.clone();
+            }
+            let members: Vec<String> = self
+                .watchlists
+                .group(&pane.group)
+                .map(|g| g.members.iter().map(|m| m.symbol.clone()).collect())
+                .unwrap_or_default();
+            if !pane.loading && pane.rows.is_none() && pane.error.is_none() {
+                pane.request(id, &self.worker, members.clone());
+            } else if !pane.loading && pane.requested != members {
+                pane.request(id, &self.worker, members.clone());
+            }
+
+            ui.horizontal_wrapped(|ui| {
+                ui.label(RichText::new("PM Desk").strong().color(crate::theme::text()));
+                ui.small(&breadth_label).on_hover_text(&breadth_hint);
+                for chip in &breadth_chips {
+                    ui.small(chip).on_hover_text(&breadth_hint);
+                }
+                ui.label(breaches.map(|n| format!("Risk breaches: {n} (known)")).unwrap_or_else(|| "Risk breaches: —".into()))
+                    .on_hover_text(format!("Holdings with any known breach: below SMA50, RSI14 ≥70 / ≤30, or weight >{threshold}%. Daily signals require loaded holdings history; unknown signals are not counted."));
+                ui.label(setup_hits.map(|n| format!("Setup hits: {n}")).unwrap_or_else(|| "Setup hits: —".into()))
+                    .on_hover_text(&setup_hits_hover);
+                open_risk = ui.small_button("Holdings risk →").clicked();
+                egui::ComboBox::from_id_salt("desk-group").selected_text(&pane.group).show_ui(ui, |ui| {
+                    for g in &self.watchlists.groups {
+                        ui.selectable_value(
+                            &mut pane.group,
+                            g.name.clone(),
+                            format!("{} ({})", g.name, g.members.len()),
+                        );
+                    }
+                });
+                if ui.small_button("Refresh").on_hover_text("Reload this watchlist only").clicked() {
+                    refresh = true;
+                }
+                if pane.loading {
+                    ui.add(egui::Spinner::new().size(12.0));
+                    ui.label(RichText::new("Loading watchlist history…").color(crate::theme::muted()));
+                }
+            });
+            ui.label(
+                RichText::new(
+                    "Leaders and ranks are this watchlist group only — not every registered symbol, not SCAN's archive-universe RS, not SPY-relative.",
+                )
+                .font(crate::theme::ui_font(11.5))
+                .color(crate::theme::muted()),
+            );
+
+            if let Some(err) = &pane.error {
+                ui.label(RichText::new(format!("Refresh failed: {err}")).color(crate::theme::down()));
+            }
+            if let Some(snap) = &pane.rows {
+                ui.label(
+                    RichText::new(format!("[{}] {}", snap.provenance.label(), snap.source))
+                        .font(crate::theme::ui_font(11.0))
+                        .color(crate::theme::muted()),
+                );
+                let summary = GroupSummary::from_rows(&pane.group, &snap.data);
+                group_card(ui, &summary);
+                ui.add_space(crate::theme::dp(6.0));
+                ui.label(
+                    RichText::new("Watchlist leaders (21-bar close return, this group)").color(crate::theme::text()),
+                );
+                header(ui);
+                for row in &snap.data {
+                    let selected = pane.selected.as_deref() == Some(row.key.as_str());
+                    let r = leader_row(ui, row, selected);
+                    if r.clicked() {
+                        pick = Some(row.key.clone());
+                    }
+                    r.context_menu(|ui| {
+                        if ui.button("Open archive chart").clicked() {
+                            actions.push(Action::OpenArchiveChart(row.key.clone()));
+                            ui.close();
+                        }
+                        if ui.button("Open review (daily + weekly)").clicked() {
+                            actions.push(Action::Command(format!("{} REVIEW", row.key)));
+                            ui.close();
+                        }
+                    });
+                }
+                if snap.data.is_empty() {
+                    ui.label("This watchlist group is empty. Add names with WL ADD, then Refresh.");
+                }
+            }
+
+            ui.add_space(crate::theme::dp(8.0));
+            ui.separator();
+            ui.label(RichText::new("Risk planner").strong().color(crate::theme::text()));
+            if let Some(row) = pane.selected_row().cloned() {
+                ui.label(RichText::new(format!("{} · {}", row.key, row.rank_label())).color(crate::theme::text()));
+                if let Some(skip) = &row.skip {
+                    ui.label(RichText::new(skip).color(crate::theme::amber()));
+                }
+                ui.horizontal_wrapped(|ui| {
+                    field(ui, "Entry", &mut pane.entry);
+                    let prev = pane.stop;
+                    field(ui, "Stop", &mut pane.stop);
+                    if (pane.stop - prev).abs() > 1e-9 {
+                        pane.user_stop = Some(pane.stop);
+                    }
+                    ui.checkbox(&mut pane.has_target, "Target");
+                    if pane.has_target {
+                        field(ui, "Target", &mut pane.target);
+                    }
+                    field(ui, "$ risk", &mut pane.dollar_risk);
+                });
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(RichText::new("ATR ×").color(crate::theme::muted()));
+                    ui.add(egui::DragValue::new(&mut pane.atr_mult).speed(0.05).range(0.5..=8.0).max_decimals(2));
+                    if ui.small_button("Use box").on_hover_text("Box bottom (long) or box top (short)").clicked() {
+                        pane.user_stop = None;
+                        if let Some(p) = box_stop(&row, pane.stop <= pane.entry) {
+                            pane.stop = p;
+                        }
+                    }
+                    if ui
+                        .small_button("Use ATR")
+                        .on_hover_text("2 × ATR(14) from entry unless you change the multiple")
+                        .clicked()
+                    {
+                        pane.user_stop = None;
+                        if let Some((stop, _)) =
+                            resolve_stop(None, None, row.atr14, pane.entry, pane.stop <= pane.entry, pane.atr_mult)
+                        {
+                            pane.stop = stop;
+                        }
+                    }
+                    if ui.small_button("Chart").clicked() {
+                        actions.push(Action::OpenArchiveChart(row.key.clone()));
+                    }
+                    match pane.plan() {
+                        Ok(plan) => match risk_plan_ticket(&row.key, &plan) {
+                            Ok(action) => {
+                                let qty = plan_ticket_quantity(&action).unwrap_or(0);
+                                if ui.small_button(format!("Buy {qty}…")).clicked() {
+                                    actions.push(action);
+                                }
+                            }
+                            // A short plan has no buy ticket. The explanation is shown with the size.
+                            Err(HandoffBlock::Short) => {}
+                            Err(block) => {
+                                let _ = ui
+                                    .add_enabled(false, egui::Button::new("Buy…"))
+                                    .on_disabled_hover_text(block.explain());
+                            }
+                        },
+                        Err(reason) => {
+                            let _ = ui.add_enabled(false, egui::Button::new("Buy…")).on_disabled_hover_text(reason);
+                        }
+                    }
+                    ui.checkbox(&mut pane.be_at_1r, "BE at +1R")
+                        .on_hover_text("Move the plan stop to entry at +1R observed quote; no order was changed");
+                    ui.label("Trail");
+                    egui::ComboBox::from_id_salt("plan-trail")
+                        .selected_text(if pane.trail_choice == TrailChoice::Atr {
+                            format!("ATR×{}", pane.atr_mult)
+                        } else {
+                            pane.trail_choice.label().into()
+                        })
+                        .show_ui(ui, |ui| {
+                            for choice in [TrailChoice::Off, TrailChoice::R1, TrailChoice::R2, TrailChoice::Atr] {
+                                let label = if choice == TrailChoice::Atr {
+                                    format!("ATR×{}", pane.atr_mult)
+                                } else {
+                                    choice.label().into()
+                                };
+                                ui.add_enabled_ui(choice.available(&row), |ui| {
+                                    ui.selectable_value(&mut pane.trail_choice, choice, label)
+                                })
+                                .inner
+                                .on_disabled_hover_text("ATR trail needs a verified ATR(14) value");
+                            }
+                        });
+                    let draft = pane.plan().and_then(|plan| {
+                        if let Some(reason) = &row.skip {
+                            return Err(reason.clone());
+                        }
+                        if !row.provenance.is_verified() {
+                            return Err("Trade plans need verified real data".into());
+                        }
+                        Ok(tr_data::trade_plans::PlanDraft {
+                            symbol: row.key.clone(),
+                            entry: plan.entry,
+                            stop: plan.stop,
+                            target: plan.target,
+                            dollar_risk: plan.dollar_risk,
+                            shares: plan.whole_shares,
+                            stop_source: plan.stop_source.label().into(),
+                            breakeven_at_r: pane.be_at_1r.then_some(1.0),
+                            trail: pane.trail_choice.spec(pane.atr_mult, &row)?,
+                        })
+                    });
+                    let arm = ui
+                        .add_enabled_ui(draft.is_ok(), |ui| ui.small_button("Arm plan"))
+                        .inner
+                        .on_hover_text("Watch entry, then stop/target, from verified quotes. Places no orders.");
+                    let arm = if let Err(reason) = &draft { arm.on_disabled_hover_text(reason) } else { arm };
+                    if arm.clicked() {
+                        armed_plan = draft.ok();
+                    }
+                    if ui
+                        .small_button("Journal")
+                        .on_hover_text("Open a journal draft with this name, last bar date, and planned $ risk")
+                        .clicked()
+                    {
+                        let date = row.last_date.clone().unwrap_or_default();
+                        let cmd = if date.is_empty() {
+                            format!("{} JOURNAL", row.key)
+                        } else {
+                            format!("{} JOURNAL {date}", row.key)
+                        };
+                        actions.push(Action::Command(cmd));
+                    }
+                });
+                match pane.plan() {
+                    Ok(plan) => {
+                        ui.label(
+                            RichText::new(format!(
+                                "{} · {} shares ({:.0} whole) · notional {} · {} / share risk · {}{}",
+                                if plan.long { "Long" } else { "Short" },
+                                crate::app::portfolio_view::qty(plan.shares),
+                                plan.whole_shares,
+                                crate::app::portfolio_view::money(plan.position_value, "USD"),
+                                crate::app::portfolio_view::money(plan.risk_per_share, "USD"),
+                                plan.stop_source.label(),
+                                plan.r_multiple.map(|r| format!(" · {r:.2}R to target")).unwrap_or_default()
+                            ))
+                            .color(crate::theme::text()),
+                        );
+                        match plan.handoff() {
+                            Ok(ctx) => {
+                                ui.label(
+                                    RichText::new(format!(
+                                        "Ticket will buy {} shares at market. Entry, stop, target, and the risk budget stay planning context and are not sent as orders.",
+                                        ctx.quantity
+                                    ))
+                                    .color(crate::theme::muted()),
+                                );
+                            }
+                            Err(block) => {
+                                ui.label(RichText::new(block.explain()).color(crate::theme::amber()));
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        ui.label(RichText::new(e).color(crate::theme::amber()));
+                    }
+                }
+                if !chart_lines.is_empty() {
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label(RichText::new("Chart horizontal lines:").color(crate::theme::muted()));
+                        for p in &chart_lines {
+                            if ui.small_button(format!("Use {}", crate::app::portfolio_view::price(*p))).clicked() {
+                                use_line = Some(*p);
+                            }
+                        }
+                    });
+                }
+            } else {
+                ui.label("Select a watchlist name to plan entry, stop, target and dollar risk.");
+            }
+        }
+        if refresh {
+            if let PaneKind::Desk(pane) = &mut self.panes[i].kind {
+                let symbols = self
+                    .watchlists
+                    .group(&pane.group)
+                    .map(|g| g.members.iter().map(|m| m.symbol.clone()).collect())
+                    .unwrap_or_default();
+                pane.request(id, &self.worker, symbols);
+            }
+        }
+        if let Some(key) = pick
+            && let PaneKind::Desk(pane) = &mut self.panes[i].kind
+        {
+            pane.selected = Some(key);
+            pane.user_stop = None;
+            pane.sync_plan();
+        }
+        if let Some(p) = use_line
+            && let PaneKind::Desk(pane) = &mut self.panes[i].kind
+        {
+            pane.user_stop = Some(p);
+            pane.stop = p;
+        }
+        if let Some(draft) = armed_plan {
+            self.worker.send(Request::ArmTradePlan(draft));
+            actions.push(Action::Command("PLANS".into()));
+        }
+        if open_risk {
+            self.open_holdings_risk();
+            if !self.demo_mode() && self.broker.portfolio.is_none() && !self.broker.loading {
+                self.refresh_portfolio();
+            }
+        }
+        actions
+    }
+
+    fn chart_horizontals(&self, key: &str) -> Vec<f64> {
+        self.panes
+            .iter()
+            .filter_map(|p| match &p.kind {
+                PaneKind::Chart(c) if c.symbol == key => Some(c),
+                _ => None,
+            })
+            .flat_map(|c| c.drawings.iter().filter_map(|d| d.horizontal_price()))
+            .collect()
+    }
+}
+
+fn group_card(ui: &mut Ui, g: &GroupSummary) {
+    let ret = |v: Option<f64>| v.map(|v| format!("{v:+.2}%")).unwrap_or_else(|| "—".into());
+    let dates = if g.mixed_dates {
+        format!("{} (mixed dates in this group)", g.as_of.as_deref().unwrap_or("—"))
+    } else {
+        g.as_of.clone().unwrap_or_else(|| "—".into())
+    };
+    ui.label(
+        RichText::new(format!(
+            "Group {} · {} names · {} ranked · {} skipped · 21-bar return (this group): {} mean · {} median · {} up / {} down / {} flat · as of {}",
+            g.group,
+            g.members,
+            g.ranked,
+            g.skipped,
+            ret(g.mean_ret),
+            ret(g.median_ret),
+            g.advancing,
+            g.declining,
+            g.unchanged,
+            dates
+        ))
+        .color(crate::theme::text()),
+    );
+}
+
+fn header(ui: &mut Ui) {
+    ui.label(
+        RichText::new(format!(
+            "{:<4} {:<12} {:>9} {:>8} {:>8} {:>10} {:>8} {}",
+            "#", "Symbol", "Last", "Chg%", "21d%", "Box stop", "ATR14", "Watchlist rank / note"
+        ))
+        .monospace()
+        .color(crate::theme::muted()),
+    );
+}
+
+fn leader_row(ui: &mut Ui, row: &MemberRow, selected: bool) -> egui::Response {
+    let num = |v: Option<f64>, d: usize| {
+        v.filter(|x| x.is_finite()).map(|x| format!("{x:.d$}")).unwrap_or_else(|| "—".into())
+    };
+    let rank = match (row.watchlist_rank, row.watchlist_n) {
+        (Some(r), Some(n)) => format!("{r}/{n} wl"),
+        _ => "—".into(),
+    };
+    let note = row.skip.clone().unwrap_or(rank);
+    let warning = row.skip.is_some() || !row.provenance.is_verified();
+    let text = format!(
+        "{:<4} {:<12} {:>9} {:>8} {:>8} {:>10} {:>8} {}",
+        row.watchlist_rank.map(|r| r.to_string()).unwrap_or_else(|| "—".into()),
+        tr_data::security(&row.key).ticker,
+        num(row.close, 2),
+        num(row.change_pct, 2),
+        num(row.ret_21d_pct, 2),
+        num(row.box_bottom, 2),
+        num(row.atr14, 2),
+        note
+    );
+    let color = if warning {
+        crate::theme::amber()
+    } else if selected {
+        crate::theme::amber()
+    } else {
+        crate::theme::text()
+    };
+    ui.selectable_label(selected, RichText::new(text).monospace().color(color)).on_hover_text(row.rank_label())
+}
+
+/// The typed handoff for a reviewed plan. Callers must not turn this into `BUY … 1`.
+fn risk_plan_ticket(symbol: &str, plan: &RiskPlan) -> Result<Action, HandoffBlock> {
+    Ok(Action::RiskPlanTicket { symbol: symbol.to_string(), plan: plan.handoff()? })
+}
+
+fn plan_ticket_quantity(action: &Action) -> Option<u64> {
+    match action {
+        Action::RiskPlanTicket { plan, .. } => Some(plan.quantity),
+        _ => None,
+    }
+}
+
+fn field(ui: &mut Ui, label: &str, value: &mut f64) {
+    ui.horizontal(|ui| {
+        ui.label(RichText::new(label).color(crate::theme::muted()));
+        ui.add(egui::DragValue::new(value).speed(0.05).range(0.0..=1_000_000.0).prefix("$").max_decimals(4));
+    });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::app::tests::test_app;
+    use crate::command::{Command, Function};
+    use crate::worker::Worker;
+    use tr_core::Provenance;
+    use tr_data::whats_news::Snapshot;
+
+    fn row(key: &str, ret: f64) -> MemberRow {
+        MemberRow {
+            key: key.into(),
+            ticker: tr_data::security(key).ticker,
+            last_date: Some("2026-10-24".into()),
+            close: Some(100.0 + ret),
+            change_pct: Some(1.0),
+            ret_21d_pct: Some(ret),
+            box_top: Some(110.0),
+            box_bottom: Some(90.0),
+            box_state: Some("DARVAS_BOX"),
+            atr14: Some(2.0),
+            provenance: Provenance::Real,
+            skip: None,
+            watchlist_rank: None,
+            watchlist_n: None,
+        }
+    }
+
+    fn paint(
+        ctx: &egui::Context,
+        app: &mut TerminalApp,
+        id: PaneId,
+        events: Vec<egui::Event>,
+    ) -> (Vec<egui::epaint::ClippedShape>, Vec<Action>) {
+        let mut actions = Vec::new();
+        let mut output = ctx.run_ui(
+            egui::RawInput {
+                time: Some(ctx.input(|i| i.time) + 0.2),
+                events,
+                screen_rect: Some(egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(1800.0, 1400.0))),
+                ..Default::default()
+            },
+            |ui| actions = app.desk(ui, id),
+        );
+        output.textures_delta.clear();
+        (output.shapes, actions)
+    }
+    fn arm_position(shapes: &[egui::epaint::ClippedShape]) -> egui::Pos2 {
+        fn find(shape: &egui::Shape) -> Option<egui::Pos2> {
+            match shape {
+                egui::Shape::Text(t) if t.galley.job.text == "Arm plan" => Some(t.pos + t.galley.size() * 0.5),
+                egui::Shape::Vec(v) => v.iter().find_map(find),
+                _ => None,
+            }
+        }
+        shapes.iter().find_map(|s| find(&s.shape)).expect("Arm plan button")
+    }
+    fn click(
+        ctx: &egui::Context,
+        app: &mut TerminalApp,
+        id: PaneId,
+        shapes: &[egui::epaint::ClippedShape],
+    ) -> Vec<Action> {
+        let pos = arm_position(shapes);
+        let pointer = |pressed| egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        };
+        paint(ctx, app, id, vec![egui::Event::PointerMoved(pos), pointer(true)]);
+        paint(ctx, app, id, vec![pointer(false)]).1
+    }
+
+    #[test]
+    fn desk_arm_plan_carries_breakeven_and_atr_trail() {
+        use tr_data::trade_plans::TrailKind;
+        let ctx = egui::Context::default();
+        let mut app = test_app();
+        let (worker, mut requests) = Worker::test_channel();
+        app.worker = worker;
+        app.open_desk(None);
+        let id = app.focus;
+        let pane = match &mut app.panes.iter_mut().find(|p| p.id == id).unwrap().kind {
+            PaneKind::Desk(pane) => pane,
+            _ => unreachable!(),
+        };
+        assert!(!pane.be_at_1r);
+        assert_eq!(pane.trail_choice, TrailChoice::Off);
+        pane.accept(
+            pane.generation,
+            Ok(Snapshot {
+                failures: vec![],
+                source: "test".into(),
+                provenance: Provenance::Real,
+                data: vec![row("NVDA US Equity", 0.0)],
+            }),
+        );
+        pane.be_at_1r = true;
+        pane.trail_choice = TrailChoice::Atr;
+        pane.atr_mult = 3.0;
+        let (shapes, _) = paint(&ctx, &mut app, id, vec![]);
+        click(&ctx, &mut app, id, &shapes);
+        let draft = std::iter::from_fn(|| requests.try_recv().ok())
+            .find_map(|r| match r {
+                Request::ArmTradePlan(d) => Some(d),
+                _ => None,
+            })
+            .expect("arm request");
+        assert_eq!(draft.breakeven_at_r, Some(1.0));
+        let spec = draft.trail.unwrap();
+        assert_eq!(spec.kind, TrailKind::Price);
+        assert_eq!(spec.value, 3.0 * 2.0);
+        assert_eq!(spec.source, "desk 3×ATR14 2 as of 2026-10-24");
+        let pane = match &mut app.panes.iter_mut().find(|p| p.id == id).unwrap().kind {
+            PaneKind::Desk(p) => p,
+            _ => unreachable!(),
+        };
+        let row = &mut pane.rows.as_mut().unwrap().data[0];
+        row.atr14 = None;
+        assert!(!TrailChoice::Atr.available(row));
+        assert!(TrailChoice::Atr.spec(3.0, row).is_err());
+        assert!(TrailChoice::R1.available(row));
+        let (shapes, _) = paint(&ctx, &mut app, id, vec![]);
+        click(&ctx, &mut app, id, &shapes);
+        assert!(!std::iter::from_fn(|| requests.try_recv().ok()).any(|r| matches!(r, Request::ArmTradePlan(_))));
+    }
+
+    #[test]
+    fn desk_arm_plan_sends_draft_with_whole_shares_and_is_disabled_for_unverified_rows() {
+        let ctx = egui::Context::default();
+        let mut app = test_app();
+        let (worker, mut requests) = Worker::test_channel();
+        app.worker = worker;
+        app.open_desk(None);
+        let id = app.focus;
+        let pane = match &mut app.panes.iter_mut().find(|p| p.id == id).unwrap().kind {
+            PaneKind::Desk(pane) => pane,
+            _ => unreachable!(),
+        };
+        pane.accept(
+            pane.generation,
+            Ok(Snapshot {
+                failures: vec![],
+                source: "test".into(),
+                provenance: Provenance::Real,
+                data: vec![row("NVDA US Equity", 0.0)],
+            }),
+        );
+        pane.entry = 100.0;
+        pane.stop = 93.0;
+        pane.user_stop = Some(93.0);
+        pane.has_target = true;
+        pane.target = 114.0;
+        pane.dollar_risk = 300.0;
+        let expected = pane.plan().unwrap();
+        let (shapes, _) = paint(&ctx, &mut app, id, vec![]);
+        let actions = click(&ctx, &mut app, id, &shapes);
+        let draft = std::iter::from_fn(|| requests.try_recv().ok())
+            .find_map(|r| match r {
+                Request::ArmTradePlan(draft) => Some(draft),
+                _ => None,
+            })
+            .expect("arm request");
+        assert_eq!(draft.symbol, "NVDA US Equity");
+        assert_eq!(draft.entry, expected.entry);
+        assert_eq!(draft.stop, expected.stop);
+        assert_eq!(draft.target, expected.target);
+        assert_eq!(draft.dollar_risk, 300.0);
+        assert_eq!(draft.shares, 42.0);
+        assert_eq!(draft.shares, expected.whole_shares);
+        assert_eq!(draft.stop_source, expected.stop_source.label());
+        assert!(actions.iter().any(|a| matches!(a, Action::Command(c) if c == "PLANS")));
+        for mode in 0..3 {
+            if let PaneKind::Desk(pane) = &mut app.panes.iter_mut().find(|p| p.id == id).unwrap().kind {
+                let row = &mut pane.rows.as_mut().unwrap().data[0];
+                row.provenance = if mode == 0 { Provenance::Sample } else { Provenance::Real };
+                row.skip = (mode == 1).then(|| "missing history".into());
+                if mode == 2 {
+                    pane.stop = pane.entry;
+                }
+            }
+            let (shapes, _) = paint(&ctx, &mut app, id, vec![]);
+            let actions = click(&ctx, &mut app, id, &shapes);
+            assert!(actions.is_empty());
+            assert!(!std::iter::from_fn(|| requests.try_recv().ok()).any(|r| matches!(r, Request::ArmTradePlan(_))));
+        }
+    }
+
+    #[test]
+    fn failed_refresh_preserves_desk_snapshot_and_selection() {
+        let mut pane = DeskPane::new("Growth");
+        let snapshot =
+            |provenance, rows| Snapshot { failures: vec![], source: "archive".into(), provenance, data: rows };
+        pane.accept(0, Ok(snapshot(Provenance::Real, vec![row("A", 1.0), row("B", 2.0)])));
+        pane.selected = Some("B".into());
+        let (worker, _requests) = Worker::test_channel();
+        pane.request(1, &worker, vec!["A".into(), "B".into()]);
+        assert_eq!(pane.rows.as_ref().unwrap().data.len(), 2);
+        pane.accept(pane.generation, Err("offline".into()));
+        assert_eq!(pane.selected.as_deref(), Some("B"));
+        assert_eq!(pane.rows.as_ref().unwrap().data.len(), 2);
+        pane.accept(pane.generation, Ok(snapshot(Provenance::Sample, vec![])));
+        assert_eq!(pane.rows.as_ref().unwrap().data.len(), 2);
+        let mut bad = row("BAD", 0.0);
+        bad.provenance = Provenance::Sample;
+        pane.accept(pane.generation, Ok(snapshot(Provenance::Real, vec![bad])));
+        assert_eq!(pane.rows.as_ref().unwrap().data.len(), 2);
+        pane.accept(pane.generation, Ok(snapshot(Provenance::Real, vec![row("B", 3.0), row("A", 1.0)])));
+        assert_eq!(pane.selected.as_deref(), Some("B"));
+        assert!(pane.error.is_none());
+    }
+
+    #[test]
+    fn desk_request_lists_only_the_selected_watchlist() {
+        let mut app = test_app();
+        let (worker, mut requests) = Worker::test_channel();
+        app.worker = worker;
+        app.watch_command("NEW Growth");
+        app.watch_command("ADD Growth AAPL MSFT");
+        app.watch_command("NEW Other");
+        app.watch_command("ADD Other NVDA");
+        app.watch_ui.selected_group = "Growth".into();
+        app.apply(Function::Desk);
+        let req = std::iter::from_fn(|| requests.try_recv().ok()).find_map(|r| match r {
+            Request::Desk { symbols, .. } => Some(symbols),
+            _ => None,
+        });
+        let symbols = req.expect("desk request");
+        assert!(symbols.iter().any(|s| s.contains("AAPL")));
+        assert!(symbols.iter().any(|s| s.contains("MSFT")));
+        assert!(!symbols.iter().any(|s| s.contains("NVDA")), "other groups must not be loaded");
+        assert!(!symbols.iter().any(|s| s == "SPY US Equity"));
+    }
+
+    #[test]
+    fn desk_accepts_verified_rows_and_sizes_from_box_stop() {
+        let mut pane = DeskPane::new("Growth");
+        pane.accept(
+            pane.generation,
+            Ok(Snapshot {
+                failures: vec![],
+                source: "test".into(),
+                provenance: Provenance::Real,
+                data: {
+                    let mut rows = vec![row("AAPL US Equity", 8.0), row("MSFT US Equity", 3.0)];
+                    tr_data::whats_news::rank_watchlist(&mut rows);
+                    rows
+                },
+            }),
+        );
+        assert_eq!(pane.selected.as_deref(), Some("AAPL US Equity"));
+        assert!((pane.entry - 108.0).abs() < 1e-9);
+        assert!((pane.stop - 90.0).abs() < 1e-9, "box bottom is the default long stop");
+        let plan = pane.plan().unwrap();
+        assert!(plan.long);
+        assert_eq!(plan.stop_source, StopSource::Box);
+        assert!(plan.shares > 0.0);
+        pane.user_stop = Some(100.0);
+        pane.stop = 100.0;
+        assert_eq!(pane.plan().unwrap().stop_source, StopSource::User);
+    }
+
+    #[test]
+    fn desk_command_does_not_open_brokerage_port() {
+        assert_eq!(crate::command::parse("DESK"), Some(Command::Function(Function::Desk)));
+        assert_eq!(crate::command::parse("PMDESK"), Some(Command::Function(Function::Desk)));
+        assert_eq!(
+            crate::command::parse("AAPL DESK"),
+            Some(Command::SymbolFunction("AAPL US Equity".into(), Function::Desk))
+        );
+        assert_eq!(
+            crate::command::parse("PORT"),
+            Some(Command::Function(Function::Portfolio(crate::command::PortView::Summary, "".into())))
+        );
+    }
+
+    #[test]
+    fn long_plan_opens_a_buy_ticket_for_the_exact_share_count() {
+        let mut pane = DeskPane::new("Growth");
+        pane.entry = 100.0;
+        pane.stop = 95.0;
+        pane.dollar_risk = 250.0;
+        pane.has_target = true;
+        pane.target = 110.0;
+        let plan = pane.plan().unwrap();
+        let action = risk_plan_ticket("AAPL US Equity", &plan).unwrap();
+        assert!(matches!(action, Action::RiskPlanTicket { plan: ref ctx, .. } if ctx.quantity == 50));
+
+        let mut app = test_app();
+        app.run_actions(vec![action]);
+        let ticket = app.trading.ticket.as_ref().expect("ticket");
+        assert_eq!(ticket.symbol, "AAPL");
+        assert_eq!(ticket.side, tr_broker::trading::Side::Buy);
+        assert_eq!(ticket.qty, "50");
+        assert_eq!(ticket.order_type, tr_broker::trading::OrderType::Market);
+        assert!(ticket.stop.is_empty(), "plan stop is not an order");
+        assert!(ticket.limit.is_empty(), "plan target is not a limit");
+        let ctx = ticket.plan_context().expect("planning context");
+        assert!((ctx.entry - 100.0).abs() < 1e-12);
+        assert!((ctx.stop - 95.0).abs() < 1e-12);
+        assert_eq!(ctx.target, Some(110.0));
+        assert!((ctx.dollar_risk - 250.0).abs() < 1e-12);
+        assert_eq!(ctx.quantity, 50);
+        let note = super::super::trading::plan_review_text(ctx);
+        assert!(note.contains("100.00"));
+        assert!(note.contains("95.00"));
+        assert!(note.contains("110.00"));
+        assert!(note.contains("$250.00"));
+        assert!(note.contains("not a submitted order"));
+        assert!(note.contains("not a bracket"));
+        let req = ticket.request().unwrap();
+        assert_eq!(req.amount, tr_broker::trading::Amount::Units(50.0));
+        assert_eq!(req.stop, None);
+        assert_eq!(req.limit, None);
+        assert_eq!(req.side, tr_broker::trading::Side::Buy);
+    }
+
+    #[test]
+    fn short_plans_and_sub_one_share_budgets_do_not_hand_off() {
+        let mut pane = DeskPane::new("Growth");
+        pane.entry = 50.0;
+        pane.stop = 55.0;
+        pane.dollar_risk = 100.0;
+        pane.has_target = true;
+        pane.target = 40.0;
+        let short = pane.plan().unwrap();
+        assert!(!short.long);
+        let blocked = risk_plan_ticket("AAPL US Equity", &short).unwrap_err();
+        assert_eq!(blocked, HandoffBlock::Short);
+        assert!(blocked.explain().contains("does not open a short"));
+
+        pane.entry = 100.0;
+        pane.stop = 95.0;
+        pane.dollar_risk = 1.0;
+        pane.has_target = false;
+        let tiny = pane.plan().unwrap();
+        assert_eq!(tiny.whole_shares, 0.0);
+        assert_eq!(risk_plan_ticket("AAPL US Equity", &tiny).unwrap_err(), HandoffBlock::ZeroShares);
+
+        pane.has_target = true;
+        pane.target = 100.0;
+        assert!(pane.plan().unwrap_err().contains("differ from entry"));
+        pane.target = 90.0;
+        assert!(pane.plan().unwrap_err().contains("above entry"));
+        pane.entry = f64::NAN;
+        assert!(pane.plan().is_err());
+    }
+}
+
+/// Shared archive data and cached, whole-portfolio breach count.
+pub(super) struct HoldingRiskState {
+    pub history: std::collections::HashMap<String, Vec<tr_core::Bar>>,
+    pub spy: Option<Vec<tr_core::Bar>>,
+    pub breadth: tr_data::whats_news::scan_pack::Breadth,
+    pub scan_breadth: Option<tr_data::whats_news::scan_pack::ScanBreadth>,
+    pub scan_breadth_received: Option<std::time::Instant>,
+    pub concentration: f64,
+    pub breaches: Option<usize>,
+    pub adma_stretch: std::collections::HashMap<String, Option<f64>>,
+    pub setup_count: std::collections::HashMap<String, Option<usize>>,
+    pub setups: std::collections::HashMap<String, Option<Vec<String>>>,
+    pub loading: bool,
+    pub requested: bool,
+    pub generation: u64,
+    pub error: Option<String>,
+    positions: Option<Vec<tr_broker::Position>>,
+    held_keys: std::collections::BTreeSet<String>,
+}
+
+impl Default for HoldingRiskState {
+    fn default() -> Self {
+        Self {
+            history: Default::default(),
+            spy: None,
+            breadth: Default::default(),
+            scan_breadth: None,
+            scan_breadth_received: None,
+            setup_count: Default::default(),
+            setups: Default::default(),
+            adma_stretch: Default::default(),
+            concentration: 0.2,
+            breaches: None,
+            loading: false,
+            requested: false,
+            generation: 0,
+            error: None,
+            positions: None,
+            held_keys: Default::default(),
+        }
+    }
+}
+
+/// Pure set comparison and history pruning; quote/position ordering is irrelevant.
+fn reconcile_held_history<T>(
+    previous: &std::collections::BTreeSet<String>,
+    current: &std::collections::BTreeSet<String>,
+    history: std::collections::HashMap<String, T>,
+) -> (bool, std::collections::HashMap<String, T>) {
+    (previous != current, history.into_iter().filter(|(key, _)| current.contains(key)).collect())
+}
+
+fn format_scan_age(age: std::time::Duration) -> String {
+    let seconds = age.as_secs();
+    let (value, unit) = match seconds {
+        0..60 => (seconds, "s"),
+        60..3600 => (seconds / 60, "m"),
+        3600..86400 => (seconds / 3600, "h"),
+        _ => (seconds / 86400, "d"),
+    };
+    format!("{value}{unit}")
+}
+
+impl HoldingRiskState {
+    /// Unknown histories contribute nothing; a verified zero remains known.
+    fn total_setup_hits(&self) -> Option<usize> {
+        self.held_keys
+            .iter()
+            .filter_map(|key| self.setup_count.get(key).copied().flatten())
+            .fold(None, |total, count| Some(total.unwrap_or(0) + count))
+    }
+
+    fn setup_hits_hover(&self) -> String {
+        let mut lines = vec!["Sum of active setup tags on holdings with verified daily history; O'Neil needs SPY history with verified provenance.".to_owned()];
+        let mut zeros = 0;
+        let mut unknown = 0;
+        for key in &self.held_keys {
+            match self.setup_count.get(key).copied().flatten() {
+                Some(0) => zeros += 1,
+                Some(count) => {
+                    let label =
+                        tr_core::Security::parse(key).map(|security| security.ticker).unwrap_or_else(|| key.clone());
+                    lines.push(format!("{label} {count}"));
+                }
+                None => unknown += 1,
+            }
+        }
+        lines.push(format!("Zero hits: {zeros} holdings; unknown: {unknown} holdings."));
+        lines.join("\n")
+    }
+
+    /// Called only when loaded histories change, independently of portfolio edits.
+    fn selected_breadth(&self) -> (&tr_data::whats_news::scan_pack::Breadth, String) {
+        if let Some(scan) = self.scan_breadth.as_ref().filter(|s| s.symbols > 0 && s.breadth.n > 0) {
+            let age = self
+                .scan_breadth_received
+                .map(|t| format!(", {} ago", format_scan_age(t.elapsed())))
+                .unwrap_or_default();
+            return (
+                &scan.breadth,
+                format!(
+                    "Market breadth (SCAN, {} {}, as of {}{})",
+                    scan.symbols,
+                    if scan.symbols == 1 { "symbol" } else { "symbols" },
+                    scan.as_of.map(|d| d.to_string()).unwrap_or_else(|| "—".into()),
+                    age
+                ),
+            );
+        }
+        (&self.breadth, if self.breadth.ready { format!("Holdings breadth ({})", self.breadth.n) } else { "—".into() })
+    }
+    pub fn refresh_breadth(&mut self) {
+        self.breadth = tr_data::whats_news::scan_pack::breadth(
+            &self.history.values().map(|bars| bars.iter().map(|b| b.close).collect()).collect::<Vec<_>>(),
+        );
+    }
+    pub fn recompute(&mut self, pf: Option<&tr_broker::Portfolio>) {
+        self.adma_stretch = pf
+            .into_iter()
+            .flat_map(|pf| &pf.positions)
+            .filter_map(|p| p.market_key())
+            .map(|key| {
+                let stretch = self.history.get(&key).and_then(|bars| {
+                    tr_core::indicators::adma_stretch(&bars.iter().map(|b| b.close).collect::<Vec<_>>())
+                });
+                (key, stretch)
+            })
+            .collect();
+        let spy = self
+            .spy
+            .as_deref()
+            .filter(|bars| tr_core::Bar::require_verified(bars, "holding SPY benchmark").is_ok());
+        self.setups = pf
+            .into_iter()
+            .flat_map(|pf| &pf.positions)
+            .filter_map(|p| p.market_key())
+            .map(|key| {
+                let setups = self.history.get(&key).and_then(|bars| {
+                    tr_core::Bar::require_verified(bars, "holding setups").ok()?;
+                    let mut metrics = tr_data::whats_news::cached_calculate(bars).ok()?;
+                    metrics.oneil_lens = holding_oneil(bars, spy);
+                    Some(tr_data::whats_news::active_setups(bars, &metrics))
+                });
+                (key, setups)
+            })
+            .collect();
+        self.setup_count =
+            self.setups.iter().map(|(key, setups)| (key.clone(), setups.as_ref().map(Vec::len))).collect();
+        self.breaches = pf.map(|pf| {
+            tr_core::indicators::risk_breaches(super::portfolio_view::holding_risks(
+                &super::broker::PortfolioPane::new(crate::command::PortView::Positions),
+                pf,
+                self,
+            ))
+        });
+        self.positions = pf.map(|pf| pf.positions.clone());
+    }
+}
+
+impl TerminalApp {
+    /// Compare only portfolio inputs; archive histories are never cloned during rendering.
+    pub(super) fn sync_holding_risk(&mut self) {
+        let pf = if self.demo_mode() { Some(&*self.demo.pf) } else { self.broker.portfolio.as_deref() };
+        let keys: std::collections::BTreeSet<_> =
+            pf.into_iter().flat_map(|pf| pf.positions.iter()).filter_map(|p| p.market_key()).collect();
+        let previous_history_len = self.holding_risk.history.len();
+        let (changed, history) =
+            reconcile_held_history(&self.holding_risk.held_keys, &keys, std::mem::take(&mut self.holding_risk.history));
+        self.holding_risk.history = history;
+        self.holding_risk.held_keys = keys;
+        if self.holding_risk.history.len() != previous_history_len {
+            self.holding_risk.refresh_breadth();
+        }
+        if changed {
+            // Invalidate in-flight results even when no request target is open.
+            self.holding_risk.generation += 1;
+            self.holding_risk.requested = false;
+            self.holding_risk.loading = false;
+            self.holding_risk.error = None;
+        }
+        if changed || self.holding_risk.positions.as_deref() != pf.map(|pf| pf.positions.as_slice()) {
+            self.holding_risk.recompute(pf);
+        }
+        if self.holding_risk.held_keys.is_empty() {
+            self.holding_risk.requested = true;
+        }
+        if pf.is_some()
+            && !self.holding_risk.requested
+            && let Some(pane) =
+                self.panes.iter().find(|p| matches!(p.kind, PaneKind::Desk(_) | PaneKind::Portfolio(_))).map(|p| p.id)
+        {
+            let symbols = self.holding_risk.held_keys.iter().cloned().collect();
+            self.holding_risk.requested = true;
+            self.holding_risk.loading = true;
+            self.holding_risk.generation += 1;
+            self.worker.send(Request::HoldingHistory { pane, generation: self.holding_risk.generation, symbols });
+        }
+    }
+}
+
+/// Date-matched O'Neil lens for a holding (never positional against SPY).
+fn holding_oneil(bars: &[tr_core::Bar], spy: Option<&[tr_core::Bar]>) -> tr_data::whats_news::scan_pack::OneilMetrics {
+    use tr_data::whats_news::scan_pack::{OneilMetrics, RS_BARS};
+    OneilMetrics::from_relative_return(
+        spy.and_then(|s| tr_core::indicators::daily_relative_return(bars, s, RS_BARS)),
+    )
+}
+
+#[cfg(test)]
+mod holding_risk_tests {
+    use super::*;
+
+    /// §4.6 stale-symbol vector: own-dates -24.82/false, not the positional -13.18.
+    #[test]
+    fn holding_oneil_is_date_matched_for_stale_history() {
+        let mk = |n: usize, f: &dyn Fn(usize) -> f64| -> Vec<tr_core::Bar> {
+            (0..n)
+                .map(|i| {
+                    let c = f(i);
+                    tr_core::Bar::new(1_704_153_600 + i as i64 * 86_400, c, c + 1.0, c - 1.0, c, 100.0)
+                        .with_provenance(tr_core::Provenance::Real)
+                })
+                .collect()
+        };
+        let spy = mk(200, &|i| 100.0 + i as f64);
+        let sym = mk(100, &|i| if i == 99 { 110.0 } else { 100.0 });
+        let m = holding_oneil(&sym, Some(&spy));
+        assert_eq!((m.rs_spy_pct, m.oneil_rs), (Some(-24.82), false));
+        assert_eq!(holding_oneil(&sym, None).rs_spy_pct, None);
+    }
+
+    #[test]
+    fn symbol_sets_diff_and_prune_without_price_or_order_inputs() {
+        let old = ["A".into(), "B".into()].into_iter().collect();
+        let same = ["B".into(), "A".into(), "A".into()].into_iter().collect();
+        let history = [("A".into(), 1), ("B".into(), 2), ("stale".into(), 3)].into_iter().collect();
+        let (changed, history) = reconcile_held_history(&old, &same, history);
+        assert!(!changed);
+        assert_eq!(history.len(), 2);
+        let next = ["B".into(), "C".into()].into_iter().collect();
+        let (changed, history) = reconcile_held_history(&old, &next, history);
+        assert!(changed);
+        assert_eq!(history, [("B".into(), 2)].into_iter().collect());
+        let (changed, history) = reconcile_held_history(&next, &Default::default(), history);
+        assert!(changed);
+        assert!(history.is_empty());
+    }
+
+    #[test]
+    fn holdings_risk_reuses_and_focuses_portfolio() {
+        let mut app = super::super::tests::test_app();
+        app.open_holdings_risk();
+        let id = app.focus;
+        let count = app.panes.len();
+        app.open_desk(None);
+        app.open_holdings_risk();
+        assert_eq!(app.focus, id);
+        assert_eq!(app.panes.len(), count + 1);
+        assert!(app.panes.iter().any(|p| p.id == id
+            && matches!(&p.kind,
+            PaneKind::Portfolio(pp) if pp.open_risk && pp.view == crate::command::PortView::Positions)));
+    }
+
+    #[test]
+    fn desk_requests_once_even_after_failure_and_without_portfolio_pane() {
+        let mut app = super::super::tests::test_app();
+        let (worker, mut requests) = crate::worker::Worker::test_channel();
+        app.worker = worker;
+        app.prefs.trading.account_mode = crate::prefs::AccountMode::Demo;
+        app.demo.pf = Box::new(tr_broker::sample::portfolio());
+        app.open_desk(None);
+        let mut found = false;
+        while let Ok(request) = requests.try_recv() {
+            found |= matches!(request, Request::HoldingHistory { .. });
+        }
+        assert!(found);
+        let generation = app.holding_risk.generation;
+        app.holding_risk.loading = false;
+        app.holding_risk.error = Some("archive unavailable".into());
+        app.sync_holding_risk();
+        app.sync_holding_risk();
+        assert_eq!(app.holding_risk.generation, generation);
+        assert!(requests.try_recv().is_err());
+    }
+
+    #[test]
+    fn held_set_change_refreshes_generation_prunes_and_recounts() {
+        let mut app = super::super::tests::test_app();
+        let (worker, mut requests) = crate::worker::Worker::test_channel();
+        app.worker = worker;
+        app.prefs.trading.account_mode = crate::prefs::AccountMode::Demo;
+        app.demo.pf = Box::new(tr_broker::sample::portfolio());
+        app.open_desk(None);
+        while requests.try_recv().is_ok() {}
+        let generation = app.holding_risk.generation;
+        assert!(!app.demo.pf.positions.is_empty());
+        app.demo.pf.positions[0].price = Some(123.0);
+        app.demo.pf.positions.reverse();
+        app.sync_holding_risk();
+        assert_eq!(app.holding_risk.generation, generation);
+        assert!(requests.try_recv().is_err());
+        let key = app.demo.pf.positions[0].market_key().unwrap();
+        app.holding_risk.history.insert(key, vec![]);
+        app.demo.pf.positions.clear();
+        app.sync_holding_risk();
+        assert!(app.holding_risk.history.is_empty());
+        assert_eq!(app.holding_risk.breaches, Some(0));
+        assert!(app.holding_risk.generation > generation);
+        assert!(requests.try_recv().is_err());
+        let generation = app.holding_risk.generation;
+        app.sync_holding_risk();
+        assert_eq!(app.holding_risk.generation, generation);
+        assert!(requests.try_recv().is_err());
+    }
+
+    #[test]
+    fn setup_hits_hover_lists_only_held_positive_counts() {
+        let state = HoldingRiskState {
+            held_keys: ["AAPL US Equity", "MSFT US Equity", "ZERO", "UNKNOWN", "MISSING"]
+                .map(String::from)
+                .into_iter()
+                .collect(),
+            setup_count: [
+                ("AAPL US Equity", Some(3)),
+                ("MSFT US Equity", Some(2)),
+                ("ZERO", Some(0)),
+                ("UNKNOWN", None),
+                ("STALE", Some(9)),
+            ]
+            .into_iter()
+            .map(|(key, count)| (key.into(), count))
+            .collect(),
+            ..Default::default()
+        };
+        let hover = state.setup_hits_hover();
+        assert!(hover.contains("\nAAPL 3\n"));
+        assert!(hover.contains("\nMSFT 2\n"));
+        assert!(hover.contains("Zero hits: 1 holdings; unknown: 2 holdings."));
+        assert!(hover.contains("O'Neil needs SPY"));
+        assert!(!hover.contains("STALE"));
+        assert!(!hover.contains("US Equity"));
+    }
+
+    #[test]
+    fn total_setup_hits_preserves_unknown_and_known_zero() {
+        let mut state = HoldingRiskState::default();
+        assert_eq!(state.total_setup_hits(), None);
+        state.held_keys = ["A", "B", "C"].into_iter().map(str::to_owned).collect();
+        state.setup_count.insert("A".into(), None);
+        assert_eq!(state.total_setup_hits(), None);
+        state.setup_count.insert("A".into(), Some(0));
+        assert_eq!(state.total_setup_hits(), Some(0));
+        state.setup_count.insert("A".into(), Some(3));
+        state.setup_count.insert("B".into(), Some(4));
+        state.setup_count.insert("NOT_HELD".into(), Some(99));
+        assert_eq!(state.total_setup_hits(), Some(7));
+    }
+
+    #[test]
+    fn cached_setup_hits_require_verified_history() {
+        let pf = tr_broker::sample::portfolio();
+        let key = pf.positions.iter().find_map(|p| p.market_key()).unwrap();
+        let mut state = HoldingRiskState::default();
+        state.recompute(Some(&pf));
+        assert_eq!(state.setup_count[&key], None);
+        state.history.insert(key.clone(), vec![]);
+        state.recompute(Some(&pf));
+        assert_eq!(state.setup_count[&key], None);
+        let bars = (0..40)
+            .map(|i| {
+                tr_core::Bar::new(i * 86400, 100.0, 101.0, 99.0, 100.0, 100.0)
+                    .with_provenance(tr_core::Provenance::Real)
+            })
+            .collect();
+        state.history.insert(key.clone(), bars);
+        state.recompute(Some(&pf));
+        let setups = state.setups[&key].as_ref().unwrap();
+        assert!(setups.iter().any(|s| s == "NEAR_HIGH"));
+        assert!(!setups.iter().any(|s| s == "ONEIL_LENS"));
+        assert_eq!(state.setup_count[&key], Some(setups.len()));
+        state.history.get_mut(&key).unwrap()[0].provenance = tr_core::Provenance::Sample;
+        state.recompute(Some(&pf));
+        assert_eq!(state.setup_count[&key], None);
+        state.recompute(None);
+        assert!(state.setup_count.is_empty());
+    }
+
+    #[test]
+    fn holding_oneil_hits_follow_verified_shared_spy_and_refreshes() {
+        let pf = tr_broker::sample::portfolio();
+        let keys: Vec<_> = pf.positions.iter().filter_map(|p| p.market_key()).take(2).collect();
+        assert_eq!(keys.len(), 2);
+        let bars = |step: f64| {
+            (0..80)
+                .map(|i| {
+                    let close = 100.0 + i as f64 * step;
+                    tr_core::Bar::new(i * 86400, close, close + 1.0, close - 1.0, close, 100.0)
+                        .with_provenance(tr_core::Provenance::Real)
+                })
+                .collect::<Vec<_>>()
+        };
+        let mut state = HoldingRiskState::default();
+        for key in &keys {
+            state.history.insert(key.clone(), bars(1.0));
+        }
+        state.refresh_breadth();
+        let breadth_n = state.breadth.n;
+        let has_oneil = |state: &HoldingRiskState| {
+            keys.iter().all(|key| state.setups[key].as_ref().unwrap().iter().any(|tag| tag == "ONEIL_LENS"))
+        };
+        state.recompute(Some(&pf));
+        assert!(!has_oneil(&state));
+        let counts = state.setup_count.clone();
+
+        state.spy = Some(bars(0.0));
+        state.recompute(Some(&pf));
+        assert!(has_oneil(&state));
+        for key in &keys {
+            assert_eq!(state.setup_count[key], counts[key].map(|n| n + 1));
+        }
+        state.refresh_breadth();
+        assert_eq!(state.breadth.n, breadth_n, "benchmark must not enter holdings breadth");
+        assert_eq!(state.history.len(), keys.len());
+
+        // Reusing cached symbol metrics must still reflect a refreshed benchmark.
+        state.spy = Some(bars(2.0));
+        state.recompute(Some(&pf));
+        assert!(!has_oneil(&state));
+        state.spy = Some(bars(0.0));
+        state.spy.as_mut().unwrap()[0].provenance = tr_core::Provenance::Sample;
+        state.recompute(Some(&pf));
+        assert!(!has_oneil(&state));
+        state.spy = Some(bars(0.0)[..63].to_vec());
+        state.recompute(Some(&pf));
+        assert!(!has_oneil(&state));
+        state.spy = None;
+        state.recompute(Some(&pf));
+        for key in &keys {
+            assert_eq!(state.setup_count[key], counts[key]);
+        }
+    }
+
+    #[test]
+    fn cached_stretch_tracks_history_and_pruned_holdings() {
+        let mut pf = tr_broker::sample::portfolio();
+        let key = pf.positions.iter().find_map(|p| p.market_key()).unwrap();
+        let mut state = HoldingRiskState::default();
+        state.recompute(Some(&pf));
+        assert_eq!(state.adma_stretch.get(&key), Some(&None));
+        let bars = (0..40).map(|i| tr_core::Bar::new(i, 10.0, 10.0, 10.0, 10.0, 1.0)).collect();
+        state.history.insert(key.clone(), bars);
+        state.recompute(Some(&pf));
+        assert_eq!(state.adma_stretch.get(&key), Some(&Some(0.0)));
+        state.history.get_mut(&key).unwrap().last_mut().unwrap().close = 15.0;
+        state.recompute(Some(&pf));
+        let expected =
+            tr_core::indicators::adma_stretch(&state.history[&key].iter().map(|b| b.close).collect::<Vec<_>>());
+        assert_eq!(state.adma_stretch[&key], expected);
+        assert_ne!(expected, Some(0.0));
+        pf.positions.clear();
+        state.history.clear();
+        state.recompute(Some(&pf));
+        assert!(state.adma_stretch.is_empty());
+        state.recompute(None);
+        assert!(state.adma_stretch.is_empty());
+    }
+
+    #[test]
+    fn cached_count_uses_shared_threshold_and_portfolio_scope() {
+        let pf = tr_broker::sample::portfolio();
+        let mut state = HoldingRiskState::default();
+        state.recompute(Some(&pf));
+        let expected = tr_core::indicators::risk_breaches(super::super::portfolio_view::holding_risks(
+            &super::super::broker::PortfolioPane::new(crate::command::PortView::Positions),
+            &pf,
+            &state,
+        ));
+        assert_eq!(state.breaches, Some(expected));
+        state.concentration = 1.0;
+        state.recompute(Some(&pf));
+        assert_eq!(state.breaches, Some(0));
+        state.recompute(None);
+        assert_eq!(state.breaches, None);
+    }
+}
+
+/// Formatting is pure; breadth itself is cached when histories change.
+fn breadth_chips(b: &tr_data::whats_news::scan_pack::Breadth) -> [String; 4] {
+    let pct = |v: Option<f64>, n| v.map(|v| format!("{v:.1}%/{n}")).unwrap_or_else(|| "—".into());
+    let ad = |v: Option<f64>| v.map(|v| format!("{v:.3}")).unwrap_or_else(|| "—".into());
+    [
+        format!(">SMA50 {}", pct(b.pct_above_sma50, b.n_sma50)),
+        format!(">SMA200 {}", pct(b.pct_above_sma200, b.n_sma200)),
+        format!("1d A/D {}", ad(b.ad_1d)),
+        format!("5d A/D {}", ad(b.ad_5d)),
+    ]
+}
+#[cfg(test)]
+mod breadth_chip_tests {
+    use super::*;
+    #[test]
+    fn loaded_scope_and_missing_values() {
+        let mut state = HoldingRiskState::default();
+        assert_eq!(breadth_chips(&state.breadth), [">SMA50 —", ">SMA200 —", "1d A/D —", "5d A/D —"]);
+        state
+            .history
+            .insert("A".into(), (0..201).map(|i| tr_core::Bar::new(i, 1., 1., 1., i as f64 + 1., 1.)).collect());
+        state.refresh_breadth();
+        assert_eq!(
+            breadth_chips(&state.breadth),
+            [">SMA50 100.0%/1", ">SMA200 100.0%/1", "1d A/D 1.000", "5d A/D 1.000"]
+        );
+        state.history.clear();
+        state.refresh_breadth();
+        assert!(!state.breadth.ready);
+    }
+}
+
+#[cfg(test)]
+mod scan_breadth_selection_tests {
+    use super::*;
+    #[test]
+    fn scan_takes_precedence_and_preserves_empty_scan_scope() {
+        let mut state = HoldingRiskState::default();
+        assert_eq!(state.selected_breadth().1, "—");
+        state.breadth = tr_data::whats_news::scan_pack::breadth(&[vec![100.; 201]]);
+        assert_eq!(state.selected_breadth().1, "Holdings breadth (1)");
+        state.scan_breadth = Some(tr_data::whats_news::scan_pack::ScanBreadth {
+            breadth: tr_data::whats_news::scan_pack::breadth(&[vec![90.; 201], vec![100.; 201]]),
+            symbols: 2,
+            as_of: Some(chrono::NaiveDate::from_ymd_opt(2026, 10, 30).unwrap()),
+        });
+        assert_eq!(state.selected_breadth().0.n, 2);
+        assert_eq!(state.selected_breadth().1, "Market breadth (SCAN, 2 symbols, as of 2026-10-30)");
+        state.scan_breadth = Some(Default::default());
+        assert_eq!(state.selected_breadth().0.n, 1);
+        assert_eq!(state.selected_breadth().1, "Holdings breadth (1)");
+    }
+}
+
+#[cfg(test)]
+mod scan_age_tests {
+    use super::*;
+    #[test]
+    fn age_units_and_boundaries() {
+        for (seconds, expected) in [
+            (0, "0s"),
+            (59, "59s"),
+            (60, "1m"),
+            (720, "12m"),
+            (3599, "59m"),
+            (3600, "1h"),
+            (86399, "23h"),
+            (86400, "1d"),
+            (172800, "2d"),
+        ] {
+            assert_eq!(format_scan_age(std::time::Duration::from_secs(seconds)), expected);
+        }
+    }
+    #[test]
+    fn scan_age_and_empty_fallbacks() {
+        let mut state = HoldingRiskState::default();
+        state.scan_breadth = Some(tr_data::whats_news::scan_pack::ScanBreadth {
+            symbols: 1,
+            breadth: tr_data::whats_news::scan_pack::breadth(&[vec![100.]]),
+            as_of: chrono::NaiveDate::from_ymd_opt(2026, 10, 30),
+        });
+        state.scan_breadth_received = Some(std::time::Instant::now());
+        assert_eq!(state.selected_breadth().1, "Market breadth (SCAN, 1 symbol, as of 2026-10-30, 0s ago)");
+        state.scan_breadth.as_mut().unwrap().symbols = 0;
+        assert_eq!(state.selected_breadth().1, "—");
+        state.scan_breadth.as_mut().unwrap().symbols = 1;
+        state.scan_breadth.as_mut().unwrap().breadth = Default::default();
+        assert_eq!(state.selected_breadth().1, "—");
+    }
+}

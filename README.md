@@ -1,5 +1,7 @@
 # terminal-rs
 
+PM Desk [trade plans](docs/TRADE_PLANS.md) watch entry → stop/target brackets from verified quotes, with no orders.
+
 A fast, keyboard-driven market terminal in pure Rust: TradingView-class GPU charting with a
 Bloomberg Terminal look (dense tiled panes, monospace numbers, a command line like `AAPL <GO>`)
 across **stocks, ETFs, indices, FX, crypto, US Treasuries, futures/commodities and options**,
@@ -48,15 +50,15 @@ gets the native title bar with traffic lights, window vibrancy behind the sideba
   matches across all asset classes (catalog instantly, plus Yahoo search after a short pause);
   ↑/↓, Tab, Enter; history with ↑/↓. `SECF gold cmdty` opens a full search panel.
 - **Charts** — GPU-rendered candles, OHLC bars, line and area; 1m, 5m, 15m, 30m, 1H, 4H, 1D, 1W,
-  1M plus quick ranges (1D … ALL); volume; 151 indicators; `CMP <SYM>` compare; log scale;
+  1M plus quick ranges (1D … ALL); volume; 152 indicators; `CMP <SYM>` compare; log scale;
   crosshair with OHLC legend; smooth pan and zoom over a million bars. Live crypto bars from the
   Binance websocket (Coinbase fallback).
-- **Indicators** — 151 built-in studies: 23 moving averages (SMA, EMA, WMA, Hull, DEMA/TEMA, KAMA,
+- **Indicators** — 152 built-in studies: 23 moving averages (SMA, EMA, WMA, Hull, DEMA/TEMA, KAMA,
   ALMA, T3, McGinley, VIDYA, FRAMA, MAMA/FAMA, Ehlers filters, GMMA…), 8 bands and channels
   (Bollinger, Keltner, Donchian, STARC, standard-error and VWAP bands…), 43 momentum oscillators
   (RSI, MACD, Stochastic, StochRSI, CCI, Williams %R, TSI, KST, Fisher, Schaff, QQE, WaveTrend,
-  Connors RSI…), 22 trend tools (ADX/DMI, Aroon, Vortex, Parabolic SAR, SuperTrend, Ichimoku,
-  Alligator, ZigZag, fractals, Chandelier and Chande Kroll stops…), 16 volatility measures (ATR,
+  Connors RSI…), 23 trend tools (ADX/DMI, Aroon, Vortex, Parabolic SAR, SuperTrend, Ichimoku,
+  Alligator, ZigZag, fractals, Chandelier, Chande Kroll and Adaptive Trend…), 16 volatility measures (ATR,
   close-to-close and Parkinson, Garman-Klass, Rogers-Satchell and Yang-Zhang estimators, Ulcer,
   Mass index, squeeze momentum…), 23 volume studies (OBV, A/D, CMF, MFI, Klinger, NVI/PVI, VZO…),
   11 rolling statistics and five pivot-point families. Type a code with optional parameters
@@ -73,9 +75,10 @@ gets the native title bar with traffic lights, window vibrancy behind the sideba
   strikes; offline mode shows a flagged simulated chain.
 - **Markets** — `WEI` world markets (Americas/EMEA/Asia-Pacific indices, futures, Treasuries, FX,
   crypto and commodities with sparklines), `GC` US Treasury yield curve (now vs 1M and 1Y ago,
-  2s10s / 3m10y / 5s30s), **news** (`AAPL CN`; Yahoo headlines, CoinDesk for crypto) and
+  2s10s / 3m10y / 5s30s), **news** (`NEWS` / `AAPL CN` / `TOP`; watchlist or scanner-leader
+  headlines, Yahoo / CoinDesk, chart catalyst markers) and
   **order book** depth (`BTCUSD CRNCY OB`; live Binance book, Coinbase fallback; markets without a
-  free public book show a clearly marked simulation).
+  free public book show an Unsupported card).
 - **Market data behind a trait** (`tr_data::MarketData`), routed per asset class to free sources:
 
   | Asset class | History | Quotes | Live |
@@ -87,8 +90,10 @@ gets the native title bar with traffic lights, window vibrancy behind the sideba
 
   No keys are required. `TR_PROVIDER=sample` runs fully offline on deterministic, class-aware sample
   data (BTCUSD near 65,000, EURUSD near 1.09, US10Y near 4.2%) **with simulated live ticks**, and
-  the live router falls back to sample data when a source is unreachable. Bars are cached in SQLite
-  so charts paint from disk on start. Older history pages in as you scroll left.
+  live mode returns real data or an explicit **NO REAL DATA** card. Verified cached bars remain visible
+  with a **STALE** chip when refresh fails. `HEALTH` (`SRC`) shows feed diagnostics; `R` retries the
+  focused failed feed. Startup failures stay offline. [Real-data guarantee](docs/REAL_DATA.md).
+  Bars are cached in SQLite; older history pages in as you scroll left.
 - **Congress trades** (key feature)
   - Ingests Periodic Transaction Reports from the **Senate eFD** (efdsearch.senate.gov: agreement
     + CSRF session, DataTables search API, HTML transaction tables) and the **House Clerk**
@@ -107,7 +112,9 @@ gets the native title bar with traffic lights, window vibrancy behind the sideba
   - **Chart overlay**: B/S markers at transaction dates coloured by party (blue D, red R, purple
     I); hover for a card with politician, amount, owner, traded/filed dates and the disclosure lag.
   - **Alerts**: `TRACK <name>` (or ☆ in the directory/profile); when a tracked politician files a
-    new PTR you get a toast, an `ALERTS n` badge and an entry in `ALERTS`.
+    new PTR you get a toast, an `ALERTS n` badge and an entry in `ALERTS`. Price and setup rules
+    (`AAPL ALERT 150`, `NVDA ALERT SETUP NEAR_HIGH`) persist, dedupe, and jump to the chart; sample
+    bars never invent them.
 
 - **Dockable workspace and saved layouts**
   - Any panel (chart, watchlist, news, order book, world markets, yield curve, options, Congress
@@ -164,7 +171,196 @@ gets the native title bar with traffic lights, window vibrancy behind the sideba
   the quote crosses) and persist in the app data folder; Settings › Trading resets the account.
   Live orders stay opt-in and go through SnapTrade's preview and a single confirmation. See
   [Trading](#trading-opt-in).
-- **Command palette** — ⌘K (Ctrl+K on Linux and Windows) opens a centred, theme-matched palette
+- **Ticker / command bar** — `/`, `:` or Ctrl+K focuses the top bar. Typing a letter from
+  a chart or panel starts a new query; other text fields keep normal typing. Enter loads
+  the typed ticker in the active chart or runs a command. The dropdown mixes tickers,
+  company names, recent symbols, functions and indicators: ↑↓ select, Tab completes,
+  Enter or a click accepts, Esc closes. Whats-News symbols are loaded in the background
+  and cached for five minutes; only verified archive metadata is accepted.
+- **Price history and research archive** — `HIST` opens the Price history panel; `HIST ADD ALL`
+  downloads full Yahoo daily history for 582 named bundled equities, ETFs and indices. Add your own
+  symbols or the connected Whats-News universe. Refreshes use an overlap and rebuild history when
+  adjusted prices change. Progress, failures, freshness, cancel/resume and retry-failed controls are
+  available in the panel. `UNIV` and `SCAN` use archived daily prices; archived charts support
+  daily, weekly and monthly candles. See [Price history](docs/PRICE_HISTORY.md).
+- **Broader archive scanners** — `SCAN` supports strength/RSI, volume and ADR range
+  filters, daily/weekly/monthly conditions, ascending/descending sorts and named skip
+  reasons. Stale names are hidden by default with a toggle. SQLite computes RSI and
+  scores from verified full history; original HTTP service fields remain inspectable.
+  See [Scanner calculations and controls](docs/SCANNERS.md).
+- **Scan → chart → watchlist** — `SCAN <setup>` and `UNIV` highlight a selected row.
+  ↑/↓ or j/k, PageUp/PageDown and Home/End move through results; Enter opens the archived
+  symbol in the active chart and updates its linked panes while keeping the result list focused.
+  Clicks still open symbols. With a result or chart focused, **w** opens a group picker (↑/↓,
+  Enter, Esc), and **W** saves directly to the last-used group. `/` focuses the command bar.
+  `WL NEW Growth`, `WL ADD Growth AAPL MSFT`, `WL RM Growth MSFT`, `WL RENAME Growth Winners`,
+  `WL SHOW Winners` and `WL DELETE Winners` manage groups; deletion asks for confirmation.
+  Quote names with spaces, for example `WL NEW "Long Term"`. The watchlist panel also has
+  create, rename, delete and remove controls. Saved scan rows retain scan name, source,
+  save time and bar date. The panel shows last price, change %, provenance and completed-session
+  freshness; sample and unverified quotes are explicitly labelled, and scan closes are dated
+  archive observations. Existing flat watchlists migrate to **Default**; settings save atomically
+  in the background. Click a member or use `WL LINK Winners` / **Link active chart**, then
+  **] / [** or **Alt+Down / Alt+Up** step forward/back through the group with wrapping.
+  The status bar shows the group and position (for example `Winners 3/12`); chart links save
+  with the layout.
+- **Daily / weekly chart review** — `REVIEW` (or `AAPL REVIEW`) opens linked daily and weekly
+  archive charts. `LATEST` / `End` jumps to the latest candle without changing zoom. `BOX`,
+  `RS` and `VCTX` toggle box levels, 21-bar close return (this series, not SPY-relative) and
+  volume context; those overlays persist in the layout. Archive charts load a bounded daily
+  page and page older history. Daily-bar VWAP is labelled **Monthly VWAP**. See
+  [Chart review](docs/CHART_REVIEW.md).
+- **PM Desk and risk planning** — `DESK` (or `AAPL DESK`) shows watchlist leaders and
+  group 21-bar performance for the **selected group only**, then sizes a position from
+  entry, stop, target and dollar risk. Stops prefer a typed level or chart horizontal
+  line, then the SCAN box, then 2 × ATR(14). Ranks are labelled as watchlist-relative,
+  not SCAN universe RS. Brokerage `PORT` is unchanged. See [PM Desk](docs/PM_DESK.md).
+- **Trade journal** — `JOURNAL` (or `AAPL JOURNAL`, `AAPL JOURNAL 2026-10-24`) saves a
+  setup with its chart date, reasoning, planned dollar risk and a pre-trade checklist,
+  then records the outcome in dollars and R-multiples of that risk. `AAPL NOTE 2026-10-24 …`
+  attaches a note to a historical date; cyan **J** pins mark those dates on the chart.
+  Rows persist in `trade_journal.json`. Sample bars never invent P&L. See
+  [Trade journal](docs/TRADE_JOURNAL.md).
+- **Seasonality Studio** — `SEASON` / `SSN`, `AAPL SEASON 30M`: verified month heatmaps, calendar and New York clock profiles, and conditional forward returns. [Guide](docs/STUDIO_SEASON.md).
+- **Statistics and conditional returns** — `STATS` (or `AAPL STATS`) shows historical
+  risk and returns from the research archive: annualised volatility, Sharpe, max
+  drawdown, win rate, daily-return distribution, RSI/vol/KAMA deciles and
+  seasonality. `COND` (or `AAPL COND RSI(14) < 30`) compares what followed a
+  filter to the unconditional baseline. Only completed outcomes count; overlapping
+  windows report effective N = N / H. Sample bars are refused. See
+  [Statistics](docs/STATS.md).
+- **Distribution Studio** — `AAPL DIST` / `DIST 1H` (`RDIST`): verified log-return tails, fitted distributions, QQ, drawdowns, volatility regimes, regime fingerprints and a Shape tab with horizon tails, KDE, robust scales and causal percentile bands (`DIST H=5`). [Guide](docs/STUDIO_DIST.md).
+- **Adaptive Trend overlays** — `ADTREND` (or `ATREND`) draws Whats-News Adaptive
+  Trend on the chart: SB/MB/LB baselines, destination bands, medium-regime flips
+  and MRT/LRT trailing-stop guides. Sample / unverified bars are refused. See
+  [Adaptive Trend](docs/ADAPTIVE_TREND.md).
+- **Adaptive Trend Stack** — `TSTACK` (`STACK`, `MTF`, `REGIME`) adds completed
+  native-timeframe regime lanes, a confidence cloud and a verified `STACK n/m`
+  chip. Regime Candles tint completed states; the independent Truth Rail exposes
+  provenance, missing buckets and stale tails. Sample data is refused; stale lanes are excluded. Intraday ADTREND uses
+  session ATR, leaving daily output unchanged. See [Trend Stack](docs/TREND_STACK.md).
+
+  | Input | Chart action |
+  | --- | --- |
+  | `TSTACK ON` / `TSTACK OFF` | Enable / disable; saved with layout |
+  | `TSTACK 5m 30m 4H` / `TSTACK AUTO` | Native custom ladder / restore defaults |
+  | `AAPL TSTACK TUNE [5m]` | [Plateau grid](docs/TSTACK_TUNE.md): 49 FDR-gated Edge tests, robustness and smoothing; Apply (Enter / double-click) sets the chart's ADTREND MB ER + Min Hold, Revert undoes |
+  | `ZBAND [length]` | Honest Z: closed bars only, robust VR/z*, empirical tails and named sample σ; bars grey point-in-time when trending |
+  | `TSTACK TINT` / `TSTACK SESSION` | Regime Candles / 09:30 base anchor |
+  | `RAIL [ON\|OFF]` | Intraday provenance strip, holes and stale tail |
+  | `NEW TSTACK NVDA` / `SPLIT DOWN TSTACK NVDA` | Open a 5m stacked chart |
+  | `,` / `.` | Shorter / longer interval (empty command line) |
+  | `\` | Last intraday interval ⇄ 1D; archive uses D/W/M only |
+  | Click lane label or cell | Jump to that interval |
+
+- **Intraday Cockpit** — `COCKPIT` (`CKPT`, `AAPL COCKPIT`, `COCKPIT 5m 15m 1h`)
+  replaces the workspace with three native intraday charts of one name in the
+  Blue link group (TSTACK and RAIL on), saved as the `Cockpit` layout; the
+  previous layout is saved first. Each chart loads its own interval; nothing is
+  resampled. On any linked charts of the same name, hovering paints a ghost
+  cursor on the others, each chart brackets the finer chart's visible window
+  (Lens), and `⇧ Click` centres them all. Anchored VWAP (`Alt+A` or `AVWAP`, then
+  click a bar; `AVWAP OPEN|HIGH|LOW|CLEAR`) draws ±1σ/±2σ volume-weighted bands,
+  follows linked charts and saves per name with the layout. Sample or unverified
+  bars get a refusal and no line or number. See [Cockpit](docs/COCKPIT.md).
+
+  | Input | Chart action |
+  | --- | --- |
+  | `COCKPIT` / `AAPL COCKPIT` | 1m · 5m · 15m linked native charts |
+  | `Alt+A` / `AVWAP` | Arm the anchor tool; one click anchors at that bar's open |
+  | `AVWAP OPEN` / `HIGH` / `LOW` | Anchor at the cash open or the session's high / low bar |
+  | `AVWAP CLEAR` / click flag + `Del` | Remove all / one anchor (max 4 per name) |
+  | `⇧ Click` / menu "Center linked charts here" | Scroll linked charts to that time |
+
+- **Auction Map** — `AUCTION` / `AMAP` / **Alt+P** toggles verified closed RTH session profiles, a composite dock, naked POC/VAH/VAL and a session concentration ribbon with a printed key and formula cards; cached worker summaries keep chart painting responsive. `AUCTION VIS` follows visible whole sessions; click a level tag to centre its origin, Alt+click to anchor VWAP. See [Auction Map](docs/AUCTION_MAP.md).
+- **ATR Stop Cloud + Stop Odds** — `STOPS` / `SCLOUD` / **Alt+S** toggles closed-bar ATR envelopes, ratcheting guides and empirical stop-touch odds with Wilson intervals and small-sample refusals. Settings save with layouts. See [Stop Cloud](docs/STOP_CLOUD.md).
+- **Trend Cone (Edge v2)** — `CONE` / **Alt+C** toggles a forward
+  P10/25/50/75/90 fan from the last closed bar, coloured by the current TSTACK
+  medium regime, with a grey unconditional fan underneath. Gradient fills,
+  a bold median and horizon price/% pills make it readable intraday or daily.
+  Bands are empirical quantiles of completed paths; horizon whiskers show a
+  stationary block bootstrap (Politis–Romano) 90% interval for each edge.
+  `CONE 30` sets the horizon (block = horizon); `CONE 20 10` sets horizon and
+  mean block; `CONE ON|OFF`, `TRENDCONE` and `TSTACK CONE` also work. The card
+  reports walk-forward 50%/80% coverage at the horizon versus nominal, with n
+  and an OK/NARROW/WIDE verdict. Deterministic bootstrap and causal calibration
+  run in the worker and cache by input. Sample/unverified history is refused.
+  Settings save with layouts. See [Trend Cone](docs/TRENDCONE.md).
+
+- **Honest strategy backtests** — `BACKTEST` (or `AAPL BACKTEST`, `AAPL BT ADTREND`)
+  compares declared strategies to buy-and-hold on a chronological holdout, with
+  commission and slippage, next-open fills, CAGR and **completed-trade** win
+  rate (not up-days). Sample bars are refused. Paper / research only. See
+  [Backtests](docs/BACKTEST.md). Both BT and IBT default to DSR, purged
+  walk-forward folds and stitched OOS equity, with durable tracked trials and
+  hover math. See [Honest Backtest](docs/HONEST_BACKTEST.md).
+- **Intraday setup backtests** — `IBT` (or `AAPL IBT VWAP`, `AAPL IBT OR 15m`)
+  compares a session VWAP cross and the 30-minute opening range to holding the
+  cash session. Signals fill at the next regular open and flatten at that
+  session's close. Missing buckets are skipped. Sample bars are refused. See
+  [Intraday backtests](docs/INTRADAY_BACKTEST.md).
+- **Intraday session compare** — `ICMP` (or `AAPL ICMP MSFT NVDA`, `AAPL ICMP 1m`)
+  draws several cash names as percent from each name's own 09:30 open, with SPY
+  on the same clock. A missing bucket is a gap. Sample bars are refused. See
+  [Intraday compare](docs/INTRADAY_COMPARE.md).
+- **Typical session path** — `SPATH` (or `AAPL SPATH 20 15m`) draws today against
+  the mean and the 25th–75th band of prior sessions. Each point is that
+  session's close versus its own 09:30 open. Today is left out of the mean.
+  A missing bucket does not vote, and the line past the last print is not a
+  forecast. Sample bars are refused. See [Session path](docs/SESSION_PATH.md).
+- **Trend Wall** — `TWALL` shows the active watchlist's completed native TSTACK
+  lanes on a shared session clock, with stack alignment, flip age, cushion, VWAP,
+  RVOL and verified breadth for up to 50 names. Edge adds conditional forward-return
+  evidence with wall-wide FDR, fold stability and a scatter; E cycles evidence sorts,
+  Shift+E hides the column, X toggles scatter. `EWALL` opens sorted by Edge score.
+  `TWALL D` reads only the daily research archive.
+  Use `TWALL WL Growth`, explicit symbols, `NEW TWALL` or `SPLIT DOWN TWALL`.
+  Stale/refused rows never contribute stack scores. See [Trend Wall](docs/TREND_WALL.md)
+  and [Edge on the Wall](docs/EDGE_WALL.md).
+
+- **Rotation graph** — `RRG` animates sector, watchlist or typed-name relative
+  strength and momentum against a benchmark, using only verified local daily
+  research history. Replay, quadrant filters and dated hollow stale heads make
+  archive gaps visible. See [Rotation](docs/ROTATION.md).
+- **Session breadth** — `BRD` (or `AAPL BRD MSFT NVDA`, `BRD 15m`) charts the
+  share of a list at or above each name's own 09:30 open, and the share at or
+  above each name's session VWAP. The rate stays blank below five names. A
+  hole does not vote. Sample bars are refused. See
+  [Session breadth](docs/SESSION_BREADTH.md).
+- **Volume pace** — `VPACE` (or `AAPL VPACE 20 15m`) draws today's cumulative
+  regular-session volume against the mean and the 25th–75th band of prior
+  sessions. A hole ends that session's total. Pace is today's total divided
+  by the typical total at the same minute. Sample bars are refused. See
+  [Volume pace](docs/VOLUME_PACE.md).
+- **Gap fill** — `GFILL` (or `AAPL GFILL 40 15m`) draws today's open against
+  the prior cash close, and the share of earlier same-direction gaps that had
+  traded back through that close by the same minute. A hole ends the known
+  path. The rate past the last print is not a forecast. Sample bars are
+  refused. See [Gap fill](docs/GAP_FILL.md).
+- **Session extreme** — `XTRM` (or `AAPL XTRM 20 15m`) shows when the high and
+  the low of the cash session print. The minute is the first print of that
+  extreme. Only a complete session votes. Today's marker is the running high
+  and low so far. Sample bars are refused. See
+  [Session extreme](docs/SESSION_EXTREME.md).
+- **Relative path** — `RPATH` (or `AAPL RPATH 20 15m`) draws this name's percent
+  from its 09:30 open minus SPY's percent from SPY's own 09:30 open, against
+  the mean and the 25th–75th band of prior sessions. A minute counts only when
+  both printed once. Today is not inside the mean. Sample bars are refused.
+  See [Relative path](docs/RELATIVE_PATH.md).
+- **Historical lookalikes** — `LOOKALIKE` (or `AAPL LOOKALIKE`, `AAPL KNN
+  2024-01-15`) finds past sessions whose backward-looking features match the
+  query date (standardized Euclidean distance), shows **per-horizon completed /
+  incomplete counts before frequencies**, reduces overlapping neighbors, and
+  jumps the archive chart to a neighbor date. Incomplete horizons are labelled,
+  never invented. Sample bars are refused. Paper / research only. See
+  [Lookalikes](docs/LOOKALIKE.md).
+- **Export and recovery** — `EXPORT SCAN`, `EXPORT JOURNAL`, `EXPORT HIST`,
+  `EXPORT STATS`, `EXPORT BACKTEST` and `EXPORT LOOKALIKE` write JSON
+  with source, as-of date and provenance. Sample-tagged rows name the file `SAMPLE`.
+  `BACKUP` / `RESTORE` copy personal workspace data (layouts, themes, prefs, watchlists,
+  journal, alerts) and **exclude credentials**. See
+  [Export and recovery](docs/EXPORT_RECOVERY.md).
+- **Command palette** — ⌘⇧K (Ctrl+Shift+K on Linux and Windows) opens a centred, theme-matched palette
   that fuzzy-searches every function code (`PORT`, `POS`, `ORD`, `OMON`, `THEME`, …), tickers
   (load the quote and chart), new panels, layout presets and saved layouts, themes, Settings tabs
   and workspace actions (move the sidebar, open Brokerage settings). Each row shows its shortcut;
@@ -285,9 +481,10 @@ Settings › Hotkeys. On Linux and Windows ⌘ is Ctrl and ⌥ is Alt.
 
 | Keys | Action |
 |---|---|
-| ⌘K (Ctrl+K) | command palette: fuzzy search over commands, tickers, panels, layouts, themes, settings and actions |
+| / · : · Ctrl+K | focus the ticker / command bar |
+| ⌘⇧K (Ctrl+Shift+K) | command palette: fuzzy search over commands, tickers, panels, layouts, themes, settings and actions |
 | F1 · F2 · F3 · F4 · F5 · F6 · F12 | help · Congress feed · politicians · alerts · watchlist · refresh filings · frame timing |
-| F7 · F8 · F9 | brokerage portfolio · positions · orders |
+| F7 · F8 · F9 · F10 · F11 | brokerage portfolio · positions · orders · PM Desk · trade journal |
 | Tab · ⇧Tab | next · previous pane |
 | ⌘1 … ⌘0 · ⌘⇧O | new chart, watchlist, news, order book, world markets, yield curve, Congress, politicians, alerts, search pane · options chain |
 | ⌘D · ⌘⇧D · ⌘T · ⌘W · ⌘⇧P | split right · split down · new tab · close pane · pop out |
@@ -303,13 +500,30 @@ Settings › Hotkeys. On Linux and Windows ⌘ is Ctrl and ⌥ is Alt.
 | `AAPL` · `AAPL US EQUITY <GO>` | load a security in the focused chart |
 | `BTCUSD <CRNCY>` · `EURUSD <CRNCY>` · `US10Y <GOVT>` · `CL1 <CMDTY>` · `SPX <INDEX>` | other asset classes |
 | `5` `1H` `D` `1W` `1M` · `YTD` `5Y` `ALL` | interval · quick range |
-| `RSI` `MACD` `SMA 200` `BB 20 2.5` · `IND` `IND VOLUME` · `CLEAR` | toggle any of the 151 indicators (optional parameters) · indicator picker · remove all |
+| `RSI` `MACD` `SMA 200` `BB 20 2.5` `ADTREND` · `IND` `IND VOLUME` · `CLEAR` | toggle any of the 152 indicators (optional parameters) · indicator picker · remove all |
 | `CMP MSFT` · `LOG` · `CANDLE` `BAR` `LINE` `AREA` | compare · log scale · chart type |
-| `AAPL OMON` · `AAPL CN` · `BTCUSD CRNCY OB` · `WEI` · `GC` · `SECF <query>` | options · news · order book · world markets · yield curve · search |
+| `ICMP` · `AAPL ICMP MSFT NVDA` · `AAPL ICMP 1m` · `NEW ICMP` | Intraday compare: percent from each 09:30 open, SPY on the same clock |
+| `SPATH` · `AAPL SPATH 20 15m` · `NEW SPATH` | Today versus the typical path of prior sessions, percent from each 09:30 open |
+| `RRG` · `RRG WL` · `RRG WEEKLY` · `NVDA RRG AMD AVGO VS SMH TAIL 20` · `NEW RRG` | Animated relative rotation from the verified daily research archive |
+| `BRD` · `AAPL BRD MSFT NVDA` · `BRD 15m` · `NEW BRD` | Share of a list at or above each 09:30 open and session VWAP |
+| `VPACE` · `AAPL VPACE 20 15m` · `NEW VPACE` | Cumulative volume versus the usual pace of prior sessions |
+| `GFILL` · `AAPL GFILL 40 15m` · `NEW GFILL` | Open versus the prior cash close, and how often that gap had filled |
+| `XTRM` · `AAPL XTRM 20 15m` · `NEW XTRM` | When the session high and low print |
+| `RPATH` · `AAPL RPATH 20 15m` · `NEW RPATH` | Percent from the 09:30 open minus SPY |
+| `NEWS` · `AAPL CN` · `TOP` · `BTCUSD CRNCY OB` · `WEI` · `GC` | watchlist news · one name · top headlines · order book · markets · curve |
 | `CONG` · `NVDA CONG` · `POL PELOSI` · `TRACK PELOSI` · `ALERTS` · `REFRESH` | Congress feed · who traded it · profile · track · alerts · refresh |
+| `AAPL ALERT 150` · `AAPL ALERT BELOW 140` · `NVDA ALERT SETUP NEAR_HIGH` · `UNALERT AAPL` | Price/setup alerts (click a fired row to open the chart) |
 | `NEW BOOK` · `SPLIT DOWN NEWS` · `POP` · `LINK GREEN` · `TITLE Desk` · `CLOSE` | add, split, pop out, link, rename, close panes |
 | `LAYOUT 4` · `LAYOUT SAVE Macro` · `LAYOUT Macro` · `LAYOUT RENAME Rates` · `LAYOUT DUP` · `LAYOUT DEL` · `LAYOUT EXPORT` | grid preset · saved layouts |
 | `THEME BLOOMBERG` · `THEME NEXT` · `THEME SYSTEM` · `THEME EDIT` · `THEME COMPACT` · `LAYOUT THEME ON` | themes |
+| `NVDA PLAN 100 STOP 90 BE 1 TRAIL 2R` · `NVDA TRAIL OFF` · `NVDA BREAKEVEN 1` · `NVDA MOVESTOP 105` | Manage quote-plan stops (places no orders); [trade plans](docs/TRADE_PLANS.md) |
+| `DESK` · `AAPL DESK` · `NEW DESK` | PM Desk: watchlist leaders, group performance, position size |
+| `JOURNAL` · `AAPL JOURNAL` · `AAPL NOTE 2026-10-24 wait` · `NEW JOURNAL` | Trade journal: setup, checklist, $ risk, $ and R outcome, date notes |
+| `STATS` · `AAPL STATS` · `AAPL COND RSI(14) < 30` | Historical risk/returns and what followed a condition |
+| `BACKTEST` · `AAPL BACKTEST` · `AAPL BT ADTREND` · `NEW BACKTEST` | Honest backtest: DSR, purged walk-forward, net OOS equity and holdout tables |
+| `IBT` · `AAPL IBT` · `AAPL IBT VWAP` · `AAPL IBT OR 15m` · `NEW IBT` | Honest intraday backtest: DSR and complete-session walk-forward vs session hold |
+| `LOOKALIKE` · `AAPL LOOKALIKE` · `AAPL KNN 2024-01-15` · `GOTO 2024-01-15` · `NEW LOOKALIKE` | Historical lookalikes: nearest past conditions, per-horizon counts, jump to neighbor dates |
+| `EXPORT` · `EXPORT SCAN` · `EXPORT JOURNAL` · `EXPORT HIST` · `EXPORT STATS` · `EXPORT BACKTEST` · `EXPORT LOOKALIKE` · `BACKUP` · `RESTORE path` | Export scans/history/journal/stats/backtests/lookalikes; workspace backup/restore (no credentials) |
 | `PORT` · `ACCT` · `POS` · `ORD` · `ACTV` · `AAPL POS` · `AAPL ORD` | brokerage portfolio · accounts and balances · positions · orders · activity · one security |
 | `PORT REFRESH` · `PORT CONNECT` · `PORT SETUP` (`BROKER`) | reload accounts · connect a broker in the browser · SnapTrade keys |
 | `BUY AAPL 10` · `SELL ALL TSLA` · `SELL MSFT 5 LMT 410` · `SELL TSLA 3 STP 250 LMT 245` · `BUY NVDA $500` · `TRADE` | order ticket, prefilled (demo: one click; live: review and confirm) |
@@ -378,10 +592,13 @@ Measured on Linux with Mesa **llvmpipe (a CPU software rasterizer)** — a real 
   is the benchmark above).
 - **Indicators over 1M bars** (`cargo bench -p tr-core`): SMA 1.8 ms, EMA 2.2 ms, VWAP 7.0 ms,
   Bollinger 29 ms; RSI and MACD are single-pass (≈ 12 ms and 26 ms including first-touch of their
-  output memory). The whole 151-indicator catalogue at default parameters over 100k one-minute
+  output memory). The whole 152-indicator catalogue at default parameters over 100k one-minute
   bars takes ≈ 134 ms on macOS (Ichimoku, the slowest, 6.6 ms).
 
 ## Tests
+
+Offline CPU/data and headless paint regression gates: [performance budgets and F12 HUD](docs/PERF.md).
+Run both with `scripts/perf-gate.sh`.
 
 ```sh
 cargo test --workspace                       # unit + fixture tests (parsers, indicators, chart, app)
@@ -440,3 +657,34 @@ cargo bench -p tr-core && cargo bench -p tr-chart
 - Yahoo's chart endpoint is unofficial and rate-limited; use Alpaca for a supported free source.
   Senate eFD terms prohibit using the data for commercial purposes or credit decisions; the terminal
   accepts the eFD agreement on your behalf for personal research use.
+
+`VAULT` / `AAPL VAULT` (`Alt+B`) opens the local closed-bar vault and session coverage.
+See [Bar Vault](docs/BARVAULT.md) for admission, merge, retention and current limits.
+
+- **Relationship Studio** (`AAPL CORR QQQ`, alias `RBETA`): verified-data OLS, rolling beta/correlation, return scatter, ratio z-scores and peer matrix. See [STUDIO_CORR.md](docs/STUDIO_CORR.md).
+
+`AAPL STUDIO 5m lens=dist` connects a native time canvas to Distribution, Relate,
+When, Season and Backtest. `AAPL WHEN 5m RSI(14)<30` (or `STUDIO lens=when
+rule="RSI(14)<30"`) shades the accepted rule mask on the native chart and prints
+fixed-family (m=8) within-clock HAC/BY evidence at h=1,3,6,12 bars, shared-bin
+distributions, session-block probability tiles and prior-only quintile buckets;
+`WHEN h=6 threshold=10bp` adjusts the focused When lens. COND has an explicit
+Open in When action. Committing a span in Distribution adds a selected-versus-rest
+comparison. See [When](docs/STUDIO_WHEN.md). `STUDIO lens=relate
+benchmark=QQQ` selects a benchmark. Local Alt+Left/Right cycles lenses, Escape
+cancels Brush before closing Inspector, and Ctrl+Z undoes Studio parameters outside text editing. Accepted
+lenses are retained without recomputing. `AAPL QUICK QQQ 5m mode=index100` opens
+five comparison modes, pinned Base UTC, the 44 px Distribution strip, dated lanes
+and a release-committed Brush. `DSTRIP` toggles the strip. See [Quick canvas](docs/STUDIO_CANVAS.md).
+`RELATE` (or `STUDIO lens=relate benchmark=QQQ transform=logreturn h=5`) adds Relate
+transforms (level, change, log return, log level; h = 1, 5 or 20), a rolling or
+expanding β, a common-panel correlation matrix and a frozen-training fair-value overlay
+with residual ±σ bands drawn on the native chart; `RELATE transform=level bands=off`
+adjusts the focused Studio. See [Relate](docs/STUDIO_CORR.md).
+`STUDIO lab` (`AAPL STUDIO lab 5m factors=SPY,TLT`, `STUDIO lab factor=TLT transform=change h=5 lag=1`,
+`NEW LAB`) opens the Regression Lab: up to seven factors with per-factor transform and lag, pivoted-QR OLS with
+rank/κ guards, Classical/HC3/HAC covariances, a purged frozen holdout (R²_OOS), VIF and residual diagnostics on
+verified data only; bare `LAB` is still the LAB ticker. See [Regression Lab](docs/STUDIO_LAB.md).
+`STUDIO resid` opens frozen residual tickers (`docs/STUDIO_RESIDUAL.md`); `STUDIO attr model=<id> obs=20` splits a window's move into drift + factor contributions + residual from a saved model (`docs/STUDIO_ATTRIBUTION.md`; bare `RESID` / `ATTR` load their tickers). Legacy standalone research commands stay
+available. See [Studio shell](docs/STUDIO.md) for selection, data and persistence
+limits.

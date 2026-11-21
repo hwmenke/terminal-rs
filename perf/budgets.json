@@ -1,0 +1,267 @@
+{
+  "schema": 1,
+  "cases": {
+    "data.vault_read_5k": {
+      "budget_us": 15000,
+      "relative": true,
+      "class": "load"
+    },
+    "data.vault_stitch_7800": {
+      "budget_us": 25000,
+      "relative": true,
+      "class": "load"
+    },
+    "data.vault_ingest_390": {
+      "budget_us": 60000,
+      "relative": true,
+      "class": "load",
+      "over_target": true
+    },
+    "data.bars_digest_23k": {
+      "budget_us": 5000,
+      "relative": true,
+      "class": "load"
+    },
+    "data.series_gpu_23k": {
+      "budget_us": 5000,
+      "relative": true,
+      "class": "load"
+    },
+    "scene.price_pane_all": {
+      "budget_us": 500,
+      "relative": true,
+      "class": "frame"
+    },
+    "scene.price_pane_200": {
+      "budget_us": 300,
+      "relative": true,
+      "class": "frame"
+    },
+    "stack.trend_stack_5k": {
+      "budget_us": 20000,
+      "relative": true,
+      "class": "interactive"
+    },
+    "edge.regime_edge_5k": {
+      "budget_us": 93000,
+      "relative": true,
+      "class": "interactive",
+      "over_target": true
+    },
+    "edge.wall_edge_5k": {
+      "budget_us": 50000,
+      "relative": true,
+      "class": "interactive"
+    },
+    "nulls.bh_10k": {
+      "budget_us": 3000,
+      "relative": true,
+      "class": "interactive"
+    },
+    "nulls.sign_test": {
+      "budget_us": 210,
+      "relative": true,
+      "class": "interactive"
+    },
+    "clock.build_60d_30m": {
+      "budget_us": 50000,
+      "relative": true,
+      "class": "command"
+    },
+    "stack.tune_7x7_5k": {
+      "budget_us": 500000,
+      "relative": false,
+      "class": "command"
+    },
+    "avwap.report_23k_x4": {
+      "budget_us": 2000,
+      "relative": true,
+      "class": "interactive"
+    },
+    "avwap.time_link_span": {
+      "budget_us": 20,
+      "relative": true,
+      "class": "frame"
+    },
+    "auction.build_20x390": {
+      "budget_us": 6000,
+      "relative": true,
+      "class": "interactive"
+    },
+    "auction.composite_20": {
+      "budget_us": 50,
+      "relative": true,
+      "class": "interactive"
+    },
+    "stops.report_5k": {
+      "budget_us": 50000,
+      "relative": true,
+      "class": "interactive"
+    },
+    "cone.report_5k": {
+      "budget_us": 250000,
+      "relative": true,
+      "class": "command"
+    },
+    "bt.report_5y": {
+      "budget_us": 40000,
+      "relative": true,
+      "class": "command"
+    },
+    "bt.dsr_family_64": {
+      "budget_us": 60000,
+      "relative": true,
+      "class": "command"
+    },
+    "chart.session_summary_7800": {
+      "budget_us": 35000,
+      "relative": true,
+      "class": "interactive"
+    },
+    "auction.concentration_20": {
+      "budget_us": 200,
+      "relative": true,
+      "class": "interactive"
+    },
+    "studio.or_lens_120d_30m": {
+      "budget_us": 40000,
+      "relative": true,
+      "class": "interactive"
+    },
+    "nulls.by_117": {
+      "budget_us": 500,
+      "relative": true,
+      "class": "interactive"
+    },
+    "studio.season_evidence_120d_5m": {
+      "budget_us": 40000,
+      "relative": true,
+      "class": "interactive"
+    },
+    "studio.corr_hac_5k": {
+      "budget_us": 40000,
+      "relative": true,
+      "class": "interactive"
+    },
+    "studio.relate_transforms_5k": {
+      "budget_us": 10000,
+      "relative": true,
+      "class": "interactive"
+    },
+    "studio.relate_expanding_5k": {
+      "budget_us": 40000,
+      "relative": true,
+      "class": "interactive"
+    },
+    "studio.fair_value_5k": {
+      "budget_us": 5000,
+      "relative": true,
+      "class": "interactive"
+    },
+    "studio.lab_design_7x5000": {
+      "budget_us": 10000,
+      "relative": true,
+      "class": "interactive"
+    },
+    "studio.lab_7x5000": {
+      "budget_us": 40000,
+      "relative": true,
+      "class": "interactive"
+    },
+    "studio.residual_score_7x5000": {
+      "budget_us": 12000,
+      "relative": true,
+      "class": "interactive"
+    },
+    "studio.residual_adf_2000": {
+      "budget_us": 20000,
+      "relative": true,
+      "class": "interactive"
+    },
+    "studio.residual_monitor_250x499": {
+      "budget_us": 150000,
+      "relative": true,
+      "class": "command"
+    },
+    "studio.attribution_7x5000": {
+      "budget_us": 10000,
+      "relative": true,
+      "class": "interactive"
+    },
+    "scan.engine_board_500_cold": {
+      "budget_us": 120000,
+      "relative": true,
+      "class": "command"
+    },
+    "scan.engine_board_500_warm": {
+      "budget_us": 25000,
+      "relative": true,
+      "class": "interactive"
+    },
+    "inference.stationary_bootstrap_5k_x500": {
+      "budget_us": 120000,
+      "relative": true,
+      "class": "command"
+    },
+    "inference.maxt_78x500": {
+      "budget_us": 150000,
+      "relative": true,
+      "class": "command"
+    },
+    "studio.regime_fingerprints_5k": {
+      "budget_us": 40000,
+      "relative": true,
+      "class": "interactive"
+    },
+    "studio.regime_rotation_5k_x499": {
+      "budget_us": 150000,
+      "relative": true,
+      "class": "command"
+    },
+    "studio.shape_5k": {
+      "budget_us": 45000,
+      "relative": true,
+      "class": "interactive"
+    },
+    "studio.shape_bootstrap_5k_x500": {
+      "budget_us": 200000,
+      "relative": true,
+      "class": "command"
+    },
+    "studio.route_1000": {
+      "budget_us": 500,
+      "relative": true,
+      "class": "interactive"
+    },
+    "studio.canvas_4x7800": {
+      "budget_us": 12000,
+      "relative": true,
+      "class": "interactive"
+    },
+    "chart.margin_strip_7800": {
+      "budget_us": 1500,
+      "relative": true,
+      "class": "interactive"
+    },
+    "studio.events_2000": {
+      "budget_us": 3000,
+      "relative": true,
+      "class": "interactive"
+    },
+    "studio.when_120d_5m": {
+      "budget_us": 45000,
+      "relative": true,
+      "class": "interactive"
+    },
+    "studio.when_bootstrap_120d_x499": {
+      "budget_us": 200000,
+      "relative": true,
+      "class": "command"
+    },
+    "studio.subset_5k": {
+      "budget_us": 15000,
+      "relative": true,
+      "class": "interactive"
+    }
+  }
+}

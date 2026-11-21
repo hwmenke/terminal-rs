@@ -22,3 +22,20 @@ rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
 rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "std"] }
+criterion.workspace = true
+
+[[bench]]
+name = "anchored_vwap"
+harness = false
+
+[[bench]]
+name = "barvault"
+harness = false
+
+[[bench]]
+name = "auction"
+harness = false
+
+[[bench]]
+name = "wall_edge"
+harness = false

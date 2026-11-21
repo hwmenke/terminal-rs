@@ -97,13 +97,21 @@ impl AssetClass {
     }
 }
 
-const FIAT: [&str; 26] = [
+const FIAT: &[&str] = &[
     "USD", "EUR", "JPY", "GBP", "CHF", "AUD", "CAD", "NZD", "SEK", "NOK", "DKK", "CNH", "CNY", "HKD", "SGD", "MXN",
-    "BRL", "ZAR", "TRY", "INR", "KRW", "PLN", "HUF", "CZK", "ILS", "THB",
+    "BRL", "ZAR", "TRY", "INR", "KRW", "PLN", "HUF", "CZK", "ILS", "THB", "CLP", "COP", "ARS", "PEN", "IDR", "PHP",
+    "TWD", "RUB", "SAR", "AED", "MYR", "VND", "PKR", "BDT", "EGP", "NGN", "KES", "GHS", "MAD", "QAR", "KWD", "BHD",
+    "OMR", "JOD", "RON", "BGN", "ISK", "UAH", "RSD", "GEL", "KZT", "UZS", "LKR", "NPR", "MUR", "BWP", "NAD", "ZMW",
+    "UGX", "TZS", "BOB", "UYU", "PYG", "DOP", "CRC", "GTQ", "HNL", "NIO", "PAB", "BAM", "ALL", "MKD", "MDL", "AMD",
+    "AZN",
 ];
 
 pub fn is_fiat(code: &str) -> bool {
     FIAT.contains(&code)
+}
+
+fn is_fiat_pair(ticker: &str) -> bool {
+    ticker.is_ascii() && ticker.len() == 6 && is_fiat(&ticker[..3]) && is_fiat(&ticker[3..])
 }
 
 /// A resolved security.
@@ -168,27 +176,44 @@ impl Security {
     /// Parse a full key or bare ticker (e.g. persisted settings).
     pub fn parse(input: &str) -> Option<Self> {
         let tokens: Vec<&str> = input.split_whitespace().collect();
-        Self::resolve_tokens(&tokens).map(|(s, _)| s)
+        Self::resolve_tokens(&tokens).filter(|(_, used)| *used == tokens.len()).map(|(s, _)| s)
     }
 
     fn classify(ticker: &str, key: Option<YellowKey>) -> Self {
+        // Yahoo's three-letter shorthand means USD/quote. Only currency inputs
+        // use bare fiat codes, so equity tickers such as CAD keep their meaning.
+        let yahoo_fx = ticker.strip_suffix("=X");
+        let fx_ticker = yahoo_fx.unwrap_or(ticker);
+        if (key == Some(YellowKey::Curncy) || key.is_none() && yahoo_fx.is_some()) && is_fiat(fx_ticker) {
+            return Self::new(format!("USD{fx_ticker}"), AssetClass::Fx);
+        }
+        if key.is_none_or(|k| k == YellowKey::Curncy) && is_fiat_pair(fx_ticker) {
+            return Self::new(fx_ticker, AssetClass::Fx);
+        }
+        // Recover persisted FX keys carrying an extra USD suffix.
+        if key.is_none_or(|k| k == YellowKey::Curncy)
+            && let Some(pair) = ticker.strip_suffix("USD").filter(|pair| is_fiat_pair(pair))
+        {
+            return Self::new(pair, AssetClass::Fx);
+        }
         let listed = catalog::lookup(ticker, key);
         if let Some(l) = listed {
+            return Self::new(l.ticker, l.class);
+        }
+        // Only a known crypto base alias may acquire a USD quote. In particular,
+        // never append USD to arbitrary currency-key input or a complete FX pair.
+        if key.is_none_or(|k| k == YellowKey::Curncy)
+            && let Some(l) = catalog::lookup(&format!("{ticker}USD"), Some(YellowKey::Curncy))
+            && l.class == AssetClass::Crypto
+        {
             return Self::new(l.ticker, l.class);
         }
         let class = match key {
             Some(YellowKey::Index) => AssetClass::Index,
             Some(YellowKey::Govt) => AssetClass::Govt,
             Some(YellowKey::Comdty) => AssetClass::Cmdty,
-            Some(YellowKey::Curncy) => {
-                if ticker.len() == 6 && is_fiat(&ticker[..3]) && is_fiat(&ticker[3..]) {
-                    AssetClass::Fx
-                } else {
-                    AssetClass::Crypto
-                }
-            }
+            Some(YellowKey::Curncy) => AssetClass::Crypto,
             Some(YellowKey::Equity) => AssetClass::Equity,
-            None if ticker.len() == 6 && is_fiat(&ticker[..3]) && is_fiat(&ticker[3..]) => AssetClass::Fx,
             None => AssetClass::Equity,
         };
         Self::new(ticker, class)
@@ -203,6 +228,9 @@ impl Security {
     pub fn pair(&self) -> Option<(&str, &str)> {
         if !matches!(self.class, AssetClass::Fx | AssetClass::Crypto) {
             return None;
+        }
+        if self.class == AssetClass::Fx && is_fiat_pair(&self.ticker) {
+            return Some(self.ticker.split_at(3));
         }
         for q in ["USDT", "USDC", "USD", "EUR", "GBP", "JPY", "BTC", "ETH"] {
             if let Some(base) = self.ticker.strip_suffix(q).filter(|b| !b.is_empty()) {
@@ -253,6 +281,34 @@ mod tests {
 
     fn r(s: &str) -> Security {
         Security::parse(s).unwrap()
+    }
+
+    #[test]
+    fn fx_aliases_and_all_supported_fiat_pairs_are_canonical() {
+        for input in ["USDBRL CURNCY", "usdbrl curncy", "BRL Curncy", "BRL=X", "brl=x", "USDBRL=X", "USDBRLUSD Curncy"]
+        {
+            assert_eq!(r(input), Security::new("USDBRL", AssetClass::Fx), "{input}");
+            assert_eq!(r(input).pair(), Some(("USD", "BRL")));
+        }
+        assert_eq!(r("EURBRL Curncy"), Security::new("EURBRL", AssetClass::Fx));
+        assert_eq!(r("EURBRL Curncy").pair(), Some(("EUR", "BRL")));
+        for code in FIAT {
+            let pair = format!("USD{code}");
+            assert_eq!(r(&format!("{pair} Curncy")).ticker, pair);
+            assert_eq!(r(&pair).class, AssetClass::Fx, "{pair}");
+            assert_eq!(r(&format!("{code} Curncy")).ticker, pair);
+            assert_eq!(r(&format!("{code}=X")).ticker, pair);
+        }
+        for input in ["BTC", "BTCUSD", "BTCUSD Curncy"] {
+            assert_eq!(r(input), Security::new("BTCUSD", AssetClass::Crypto));
+        }
+        assert_eq!(r("SPY").class, AssetClass::Etf);
+        assert_eq!(r("SPX Index").class, AssetClass::Index);
+        assert_eq!(r("CAD Equity").class, AssetClass::Equity);
+        assert_eq!(r("UNKNOWN Curncy").ticker, "UNKNOWN", "unknowns do not acquire a USD suffix");
+        for input in ["???", "", "ação", "💱", &"A".repeat(100_000)] {
+            assert!(Security::parse(input).is_none());
+        }
     }
 
     #[test]

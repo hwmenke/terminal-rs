@@ -46,11 +46,19 @@ fn sparkline(ui: &Ui, rect: Rect, values: &[f64], color: Color32) {
     ui.painter().add(egui::Shape::line(pts, Stroke::new(1.2, color)));
 }
 
-fn row(ui: &mut Ui, l: &Listing, quotes: &HashMap<String, Quote>, out: &mut Vec<Action>, width: f32) {
+fn row(
+    ui: &mut Ui,
+    l: &Listing,
+    quotes: &HashMap<String, Quote>,
+    states: &HashMap<String, tr_data::FeedState>,
+    out: &mut Vec<Action>,
+    width: f32,
+) {
     let sec = l.security();
     let key = l.key();
     let q = quotes.get(&key);
-    let h = theme::dp(16.0);
+    let stale = states.get(&key).is_some_and(|s| matches!(s, tr_data::FeedState::Stale { .. }));
+    let h = theme::dp(30.0);
     let (rect, resp) = ui.allocate_exact_size(vec2(width, h), Sense::click());
     if resp.hovered() {
         ui.painter().rect_filled(rect, 3.0, theme::control());
@@ -60,8 +68,20 @@ fn row(ui: &mut Ui, l: &Listing, quotes: &HashMap<String, Quote>, out: &mut Vec<
         out.push(Action::OpenChart(key.clone()));
     }
     let p = ui.painter_at(rect);
-    let y = rect.center().y;
+    let y = rect.top() + theme::dp(8.0);
     let x = rect.left() + 2.0;
+    let provenance = q.map(|q| q.provenance).unwrap_or_default();
+    p.text(
+        pos2(x, rect.bottom() - 2.0),
+        Align2::LEFT_BOTTOM,
+        if stale {
+            format!("STALE {}", crate::widgets::age_label(chrono::Utc::now().timestamp() - q.map_or(0, |q| q.ts)))
+        } else {
+            provenance.label().into()
+        },
+        mono(10.0),
+        theme::provenance(provenance),
+    );
     p.text(pos2(x, y), Align2::LEFT_CENTER, l.ticker, mono(12.0), amber());
     let right = rect.right() - 2.0;
     // Narrow columns drop the net change, then the sparkline, then the name.
@@ -70,7 +90,11 @@ fn row(ui: &mut Ui, l: &Listing, quotes: &HashMap<String, Quote>, out: &mut Vec<
     let mut name_right = last_right - 92.0;
     match q {
         Some(q) => {
-            let c = if q.change() >= 0.0 { theme::up() } else { theme::down() };
+            let c = (if q.change() >= 0.0 { theme::up() } else { theme::down() }).gamma_multiply(if stale {
+                0.55
+            } else {
+                1.0
+            });
             let d = sec.decimals(q.last);
             let pct =
                 if sec.class == AssetClass::Govt { change_text(&sec, q) } else { format!("{:+.2}%", q.change_pct()) };
@@ -78,7 +102,13 @@ fn row(ui: &mut Ui, l: &Listing, quotes: &HashMap<String, Quote>, out: &mut Vec<
             if !compact {
                 p.text(pos2(right - 66.0, y), Align2::RIGHT_CENTER, change_text(&sec, q), mono(12.0), c);
             }
-            p.text(pos2(last_right, y), Align2::RIGHT_CENTER, format!("{:.d$}", q.last), mono(12.0), text());
+            p.text(
+                pos2(last_right, y),
+                Align2::RIGHT_CENTER,
+                format!("{:.d$}", q.last),
+                mono(12.0),
+                text().gamma_multiply(if stale { 0.55 } else { 1.0 }),
+            );
             let spark = Rect::from_min_size(pos2(name_right - 52.0, rect.top() + 3.0), vec2(48.0, h - 6.0));
             if spark.left() > rect.left() + 180.0 {
                 sparkline(ui, spark, &q.spark, c);
@@ -86,7 +116,7 @@ fn row(ui: &mut Ui, l: &Listing, quotes: &HashMap<String, Quote>, out: &mut Vec<
             }
         }
         None => {
-            p.text(pos2(right, y), Align2::RIGHT_CENTER, "…", mono(12.0), muted());
+            p.text(pos2(right, y), Align2::RIGHT_CENTER, "—", mono(12.0), muted());
         }
     }
     let name_left = x + 70.0;
@@ -97,8 +127,26 @@ fn row(ui: &mut Ui, l: &Listing, quotes: &HashMap<String, Quote>, out: &mut Vec<
 }
 
 /// WEI-style overview: regional indices, futures, Treasuries, FX, crypto, commodities.
-pub fn wei(ui: &mut Ui, quotes: &HashMap<String, Quote>, updated: Option<&str>) -> Vec<Action> {
+pub fn wei(
+    ui: &mut Ui,
+    quotes: &HashMap<String, Quote>,
+    updated: Option<&str>,
+    states: &HashMap<String, tr_data::FeedState>,
+    worker: &crate::worker::Worker,
+) -> Vec<Action> {
     let mut out = Vec::new();
+    let keys = overview_keys();
+    if !keys.iter().any(|k| quotes.contains_key(k))
+        && let Some(down) = keys.iter().filter_map(|k| states.get(k)).find(|s| s.is_down())
+    {
+        if crate::widgets::unavailable_card(ui, ui.available_rect_before_wrap(), down) {
+            worker.send(crate::worker::Request::RetryFeed { feed: tr_data::Feed::Quotes, pane: None });
+        }
+        return out;
+    }
+    if let Some(stale) = states.values().find(|s| matches!(s, tr_data::FeedState::Stale { .. })) {
+        crate::widgets::stale_chip(ui, stale);
+    }
     let width = ui.available_width();
     let cols = ((width / 460.0).floor() as usize).clamp(1, 3);
     let col_w = (width - 8.0 * (cols - 1) as f32) / cols as f32;
@@ -134,7 +182,7 @@ pub fn wei(ui: &mut Ui, quotes: &HashMap<String, Quote>, updated: Option<&str>) 
                             amber_dim(),
                         );
                         for l in catalog::group(*g) {
-                            row(ui, l, quotes, &mut out, col_w);
+                            row(ui, l, quotes, states, &mut out, col_w);
                         }
                         ui.add_space(6.0);
                     }
@@ -352,9 +400,25 @@ mod tests {
 
     #[test]
     fn change_formatting() {
-        let q = Quote { symbol: "US10Y Govt".into(), last: 4.25, prev_close: 4.22, ts: 0, spark: vec![] };
+        let q = Quote {
+            provenance: tr_core::Provenance::Real,
+            symbol: "US10Y Govt".into(),
+            last: 4.25,
+            prev_close: 4.22,
+            ts: 0,
+            spark: vec![],
+            stats: tr_data::QuoteStats::default(),
+        };
         assert_eq!(change_text(&Security::parse("US10Y Govt").unwrap(), &q), "+3.0bp");
-        let q = Quote { symbol: "EURUSD Curncy".into(), last: 1.0912, prev_close: 1.0900, ts: 0, spark: vec![] };
+        let q = Quote {
+            provenance: tr_core::Provenance::Real,
+            symbol: "EURUSD Curncy".into(),
+            last: 1.0912,
+            prev_close: 1.0900,
+            ts: 0,
+            spark: vec![],
+            stats: tr_data::QuoteStats::default(),
+        };
         assert_eq!(change_text(&Security::parse("EURUSD Curncy").unwrap(), &q), "+0.0012");
     }
 

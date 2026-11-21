@@ -35,7 +35,7 @@
 
 ## As built
 
-- One registry (`tr-core::indicators::registry`) describes all 151 indicators: code and aliases,
+- One registry (`tr-core::indicators::registry`) describes all 152 indicators: code and aliases,
   name, category, parameters (default, bounds, integer or real), overlay or pane, a fixed range and
   reference levels for bounded oscillators, and a compute function returning named, styled outputs
   (line, histogram, dots, or per-bar steps for session levels such as pivots; main, signal,

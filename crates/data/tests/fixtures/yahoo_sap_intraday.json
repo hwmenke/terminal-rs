@@ -1,0 +1,1 @@
+{"chart":{"result":[{"meta":{"symbol":"SAP.DE","exchangeTimezoneName":"Europe/Berlin","currentTradingPeriod":{"regular":{"start":1773043200,"end":1773073800,"gmtoffset":3600}}},"timestamp":[1773043200,1773043500],"indicators":{"quote":[{"open":[200,201],"high":[202,203],"low":[199,200],"close":[201,202],"volume":[1000,1200]}]}}],"error":null}}

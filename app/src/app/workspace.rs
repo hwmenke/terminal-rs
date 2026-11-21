@@ -14,28 +14,73 @@ use crate::anim;
 use crate::congress_view::{Action, FeedFilter};
 use crate::dock::{Dir, Node, PaneId, Zone};
 use crate::layout::Layout;
-use crate::layouts::{LayoutDoc, Link, SavedPane, WindowGeometry};
+use crate::layouts::{LayoutDoc, Link, PaneSettings, SavedPane, WindowGeometry};
+
+/// Saved name of the 2×2 intraday desk (`IDESK`).
+const INTRADAY_DESK: &str = "Intraday";
+const COCKPIT: &str = "Cockpit";
 use crate::theme::{self, amber, dp, mono, muted, text, ui_font};
 use crate::widgets::{self, Icon};
 use crate::worker::{Request, Worker};
 
 /// Panels offered by the + menus: label and command word.
-pub const PANELS: [(&str, &str); 14] = [
+pub const PANELS: [(&str, &str); 37] = [
     ("Chart", "CHART"),
+    ("Studio", "STUDIO"),
+    ("When", "WHEN"),
+    ("Quick canvas", "QUICK"),
+    ("Regression Lab", "LAB"),
+    ("Residual tickers", "RESID"),
+    ("Attribution", "ATTR"),
     ("Watchlist", "WL"),
     ("News", "NEWS"),
     ("Order Book", "BOOK"),
     ("Options", "OMON"),
     ("Portfolio", "PORT"),
     ("World Markets", "WEI"),
+    ("Feed Health", "HEALTH"),
     ("Yield Curve", "GC"),
     ("Congress Feed", "CONG"),
     ("Politicians", "POL"),
     ("Alerts", "ALRT"),
+    ("Journal", "JOURNAL"),
+    ("Backtest", "BACKTEST"),
+    ("Intraday BT", "IBT"),
+    ("Session compare", "ICMP"),
+    ("Session path", "SPATH"),
+    ("Session breadth", "BRD"),
+    ("Rotation", "RRG"),
+    ("Trend Wall", "TWALL"),
+    ("Volume pace", "VPACE"),
+    ("Realized volatility", "RVAR"),
+    ("Return autocorrelation", "ACOR"),
+    ("Gap fill", "GFILL"),
+    ("Session extreme", "XTRM"),
+    ("Relative path", "RPATH"),
+    ("Session brief", "BRIEF"),
+    ("Lookalikes", "LOOKALIKE"),
     ("Security Search", "SECF"),
     ("Settings", "PREFS"),
     ("Help", "HELP"),
 ];
+
+fn cash_level_status(levels: &tr_data::cash_levels::CashLevels) -> String {
+    let px = |name: &str| levels.price(name).map(|price| format!("{price:.2}")).unwrap_or_else(|| "off".into());
+    let mut line = format!(
+        "{}: prior close {}, open {}, OR {}–{}, VWAP {}",
+        levels.ticker,
+        px(tr_data::cash_levels::PRIOR_CLOSE),
+        px(tr_data::cash_levels::OPEN),
+        px(tr_data::cash_levels::OR_LOW),
+        px(tr_data::cash_levels::OR_HIGH),
+        px(tr_data::cash_levels::VWAP)
+    );
+    if let Some(note) = levels.notes.first() {
+        line.push_str(" · ");
+        line.push_str(note);
+    }
+    line
+}
 
 /// Length of a dock transition (panes added, closed, moved, or a layout switch).
 const DOCK_SECS: f32 = 0.42;
@@ -290,7 +335,7 @@ impl TerminalApp {
     }
 
     pub(super) fn focused_is_chart(&self) -> bool {
-        self.idx(self.focus).is_some_and(|i| matches!(self.panes[i].kind, PaneKind::Chart(_)))
+        self.idx(self.focus).is_some_and(|i| matches!(self.panes[i].kind, PaneKind::Chart(_) | PaneKind::Studio(_)))
     }
 
     /// The focused pane if it is docked, else the first visible docked pane.
@@ -367,10 +412,196 @@ impl TerminalApp {
 
     fn init_kind(&mut self, id: PaneId, kind: PaneKind) -> PaneKind {
         match kind {
+            PaneKind::Studio(mut s) => {
+                s.chart.id = id;
+                s.sample_mode(self.provider.eq_ignore_ascii_case("sample"));
+                PaneKind::Studio(s)
+            }
+            PaneKind::Research(mut r) => {
+                r.request(id, &self.worker);
+                PaneKind::Research(r)
+            }
             PaneKind::Chart(mut c) => {
                 c.id = id;
                 c.load(&self.worker);
                 PaneKind::Chart(c)
+            }
+            PaneKind::Desk(mut d) => {
+                if self.watchlists.index(&d.group).is_none() {
+                    d.group = self.watchlists.last_used.clone();
+                }
+                let symbols = self
+                    .watchlists
+                    .group(&d.group)
+                    .map(|g| g.members.iter().map(|m| m.symbol.clone()).collect())
+                    .unwrap_or_default();
+                d.request(id, &self.worker, symbols);
+                PaneKind::Desk(d)
+            }
+            PaneKind::StudioDist(mut s) => {
+                if s.symbol.trim().is_empty() {
+                    s.symbol = self.focused_symbol().unwrap_or_default();
+                }
+                s.request(id, &self.worker);
+                PaneKind::StudioDist(s)
+            }
+            PaneKind::StudioCorr(mut s) => {
+                if s.symbol.trim().is_empty()
+                    && let Some(sym) = self.focused_symbol()
+                {
+                    s.symbol = sym;
+                }
+                s.request(id, &self.worker);
+                PaneKind::StudioCorr(s)
+            }
+            PaneKind::StudioSeason(mut s) => {
+                if s.symbol.trim().is_empty()
+                    && let Some(sym) = self.focused_symbol()
+                {
+                    s.symbol = sym;
+                }
+                s.request(id, &self.worker);
+                PaneKind::StudioSeason(s)
+            }
+            PaneKind::Stats(mut s) => {
+                if s.symbol.trim().is_empty() {
+                    if let Some(sym) = self.focused_symbol() {
+                        s.symbol = sym;
+                    }
+                }
+                s.request(id, &self.worker);
+                PaneKind::Stats(s)
+            }
+            PaneKind::Backtest(mut b) => {
+                if b.symbol.trim().is_empty() {
+                    if let Some(sym) = self.focused_symbol() {
+                        b.symbol = sym;
+                    }
+                }
+                b.request(id, &self.worker);
+                PaneKind::Backtest(b)
+            }
+            PaneKind::IntradayCompare(mut c) => {
+                if c.symbol.trim().is_empty() {
+                    if let Some(sym) = self.focused_symbol() {
+                        c.symbol = sym;
+                    }
+                }
+                c.request(id, &self.worker);
+                PaneKind::IntradayCompare(c)
+            }
+            PaneKind::SessionPath(mut p) => {
+                if p.symbol.trim().is_empty() {
+                    if let Some(sym) = self.focused_symbol() {
+                        p.symbol = sym;
+                    }
+                }
+                p.request(id, &self.worker);
+                PaneKind::SessionPath(p)
+            }
+            PaneKind::TrendWall(mut p) => {
+                let symbols = self.wall_watchlist(&p.spec);
+                p.request(id, &self.worker, &symbols);
+                PaneKind::TrendWall(p)
+            }
+            PaneKind::Rotation(mut p) => {
+                let symbols = self.rotation_watchlist(&p.spec);
+                p.request(id, &self.worker, &symbols);
+                PaneKind::Rotation(p)
+            }
+            PaneKind::Breadth(mut b) => {
+                let symbols: Vec<String> = self
+                    .watchlists
+                    .group(&self.watch_ui.selected_group)
+                    .map(|g| g.members.iter().map(|m| m.symbol.clone()).collect())
+                    .unwrap_or_default();
+                b.request(id, &self.worker, &symbols);
+                PaneKind::Breadth(b)
+            }
+            PaneKind::VolumePace(mut p) => {
+                if p.symbol.trim().is_empty() {
+                    if let Some(sym) = self.focused_symbol() {
+                        p.symbol = sym;
+                    }
+                }
+                p.request(id, &self.worker);
+                PaneKind::VolumePace(p)
+            }
+            PaneKind::RealizedVol(mut p) => {
+                if p.symbol.trim().is_empty() {
+                    if let Some(sym) = self.focused_symbol() {
+                        p.symbol = sym;
+                    }
+                }
+                p.request(id, &self.worker);
+                PaneKind::RealizedVol(p)
+            }
+            PaneKind::Autocorr(mut p) => {
+                if p.symbol.trim().is_empty() {
+                    if let Some(sym) = self.focused_symbol() {
+                        p.symbol = sym;
+                    }
+                }
+                p.request(id, &self.worker);
+                PaneKind::Autocorr(p)
+            }
+            PaneKind::GapFill(mut p) => {
+                if p.symbol.trim().is_empty() {
+                    if let Some(sym) = self.focused_symbol() {
+                        p.symbol = sym;
+                    }
+                }
+                p.request(id, &self.worker);
+                PaneKind::GapFill(p)
+            }
+            PaneKind::SessionExtreme(mut p) => {
+                if p.symbol.trim().is_empty() {
+                    if let Some(sym) = self.focused_symbol() {
+                        p.symbol = sym;
+                    }
+                }
+                p.request(id, &self.worker);
+                PaneKind::SessionExtreme(p)
+            }
+            PaneKind::Vault(mut p) => {
+                p.request(id, &self.worker);
+                PaneKind::Vault(p)
+            }
+            PaneKind::SessionClock(mut p) => {
+                if p.symbol.trim().is_empty() {
+                    if let Some(sym) = self.focused_symbol() {
+                        p.symbol = sym;
+                    }
+                }
+                p.request(id, &self.worker);
+                PaneKind::SessionClock(p)
+            }
+            PaneKind::RelativePath(mut p) => {
+                if p.symbol.trim().is_empty() {
+                    if let Some(sym) = self.focused_symbol() {
+                        p.symbol = sym;
+                    }
+                }
+                p.request(id, &self.worker);
+                PaneKind::RelativePath(p)
+            }
+            PaneKind::SessionBrief(mut p) => {
+                if p.symbol.trim().is_empty() {
+                    if let Some(sym) = self.focused_symbol() {
+                        p.symbol = sym;
+                    }
+                }
+                p.request(id, &self.worker);
+                PaneKind::SessionBrief(p)
+            }
+            PaneKind::Lookalike(mut l) => {
+                if l.symbol.trim().is_empty() {
+                    if let Some(sym) = self.focused_symbol() {
+                        l.symbol = sym;
+                    }
+                }
+                l.request(id, &self.worker);
+                PaneKind::Lookalike(l)
             }
             PaneKind::Ticker { symbol, .. } => {
                 self.worker.send(Request::TickerTrades { pane: id, symbol: symbol.clone() });
@@ -456,8 +687,12 @@ impl TerminalApp {
     /// Point a symbol-driven pane at `symbol`. Returns whether it follows symbols.
     pub(super) fn set_pane_symbol(&mut self, i: usize, symbol: &str) -> bool {
         let id = self.panes[i].id;
-        let key = tr_data::security(symbol).key();
+        let Some(sec) = tr_core::Security::parse(symbol) else { return false };
+        let key = sec.key();
         match &mut self.panes[i].kind {
+            PaneKind::Studio(s) => {
+                s.set_context_symbol(&key);
+            }
             PaneKind::Chart(c) => {
                 if c.symbol != key {
                     c.set_symbol(&key, &self.worker);
@@ -472,8 +707,8 @@ impl TerminalApp {
                 }
             }
             PaneKind::News(n) => {
-                if n.symbol.as_deref() != Some(key.as_str()) {
-                    **n = NewsPane::new(Some(key));
+                if n.symbol.as_deref() != Some(key.as_str()) || n.scope != tr_data::news::NewsScope::Symbol {
+                    **n = NewsPane::for_symbol(key);
                 }
             }
             PaneKind::OrderBook(b) => {
@@ -484,6 +719,42 @@ impl TerminalApp {
             PaneKind::Options(o) => {
                 if o.symbol != key {
                     **o = super::OptionsPane::new(&key, o.strikes, o.show_greeks);
+                }
+            }
+            PaneKind::VolumePace(p) => {
+                if p.symbol != key {
+                    p.symbol = key.clone();
+                    p.pace = None;
+                    p.error = None;
+                    p.loading = false;
+                    p.request(id, &self.worker);
+                }
+            }
+            PaneKind::RealizedVol(p) => {
+                if p.symbol != key {
+                    p.symbol = key.clone();
+                    p.vol = None;
+                    p.error = None;
+                    p.loading = false;
+                    p.request(id, &self.worker);
+                }
+            }
+            PaneKind::Autocorr(p) => {
+                if p.symbol != key {
+                    p.symbol = key.clone();
+                    p.autocorr = None;
+                    p.error = None;
+                    p.loading = false;
+                    p.request(id, &self.worker);
+                }
+            }
+            PaneKind::SessionBrief(p) => {
+                if p.symbol != key {
+                    p.symbol = key.clone();
+                    p.brief = None;
+                    p.error = None;
+                    p.loading = false;
+                    p.request(id, &self.worker);
                 }
             }
             _ => return false,
@@ -499,6 +770,36 @@ impl TerminalApp {
             }
         }
         self.status = format!("{} ({} link)", tr_data::security(symbol).key(), link.label());
+        self.sync_linked_review_levels();
+    }
+
+    /// Daily/weekly linked archive panes share horizontal levels for the same name.
+    /// Trendlines, verticals and fibs stay on the pane that drew them.
+    pub(super) fn sync_linked_review_levels(&mut self) {
+        let mut groups: HashMap<(Link, String), Vec<usize>> = HashMap::new();
+        for (i, p) in self.panes.iter().enumerate() {
+            if let (Some(link), PaneKind::Chart(c)) = (p.link, &p.kind)
+                && c.archive
+            {
+                groups.entry((link, c.symbol.clone())).or_default().push(i);
+            }
+        }
+        for idxs in groups.into_values() {
+            if idxs.len() < 2 {
+                continue;
+            }
+            let mut levels = Vec::new();
+            for &i in &idxs {
+                if let PaneKind::Chart(c) = &self.panes[i].kind {
+                    levels.extend(c.compatible_levels());
+                }
+            }
+            for &i in &idxs {
+                if let PaneKind::Chart(c) = &mut self.panes[i].kind {
+                    c.merge_compatible_levels(&levels);
+                }
+            }
+        }
     }
 
     pub(super) fn set_link(&mut self, id: PaneId, link: Option<Link>) {
@@ -521,10 +822,78 @@ impl TerminalApp {
         };
     }
 
+    /// Open or focus a linked daily + weekly archive pair for candidate review.
+    pub(super) fn open_review(&mut self, symbol: Option<&str>) {
+        let key = symbol
+            .map(|s| tr_data::security(s).key())
+            .or_else(|| self.focused_symbol())
+            .unwrap_or_else(|| "AAPL US Equity".into());
+        let mut daily = None;
+        let mut weekly = None;
+        for p in &self.panes {
+            if let PaneKind::Chart(c) = &p.kind
+                && c.archive
+            {
+                if c.tf == tr_core::Timeframe::D1 {
+                    daily = Some(p.id);
+                }
+                if c.tf == tr_core::Timeframe::W1 {
+                    weekly = Some(p.id);
+                }
+            }
+        }
+        let link = daily
+            .and_then(|id| self.idx(id).and_then(|i| self.panes[i].link))
+            .or_else(|| weekly.and_then(|id| self.idx(id).and_then(|i| self.panes[i].link)))
+            .unwrap_or(crate::layouts::Link::Blue);
+        let daily = daily.unwrap_or_else(|| {
+            let mut c = crate::chart_view::ChartState::new(0, &key, tr_core::Timeframe::D1);
+            c.archive = true;
+            c.enable_review_overlays();
+            let id = self.new_pane(PaneKind::Chart(Box::new(c)));
+            self.dock_pane(id, self.focused_visible(), crate::dock::Zone::Right);
+            id
+        });
+        let weekly = weekly.unwrap_or_else(|| {
+            let mut c = crate::chart_view::ChartState::new(0, &key, tr_core::Timeframe::W1);
+            c.archive = true;
+            c.enable_review_overlays();
+            let id = self.new_pane(PaneKind::Chart(Box::new(c)));
+            self.dock_pane(id, Some(daily), crate::dock::Zone::Right);
+            id
+        });
+        self.set_link(daily, Some(link));
+        self.set_link(weekly, Some(link));
+        for id in [daily, weekly] {
+            if let Some(i) = self.idx(id)
+                && let PaneKind::Chart(c) = &mut self.panes[i].kind
+            {
+                c.archive = true;
+                c.enable_review_overlays();
+                if c.symbol != key {
+                    c.request_jump_latest();
+                    c.set_symbol(&key, &self.worker);
+                } else {
+                    c.request_jump_latest();
+                }
+            }
+        }
+        self.watch_ui.active_chart = Some(daily);
+        self.sync_linked_review_levels();
+        self.status = format!("{key} · daily + weekly archive review ({})", link.label());
+    }
+
     /// Load a security: into the focused pane when it follows symbols (and its link group),
     /// else into the focused pane's link group, else into a chart.
     pub(super) fn open_security(&mut self, symbol: &str) {
-        let key = tr_data::security(symbol).key();
+        let Some(sec) = tr_core::Security::parse(symbol) else {
+            self.status = "Invalid security".into();
+            return;
+        };
+        let key = sec.key();
+        self.recent_symbols.retain(|s| s != &key);
+        self.recent_symbols.insert(0, key.clone());
+        self.recent_symbols.truncate(30);
         if let Some(i) = self.idx(self.focus) {
             let link = self.panes[i].link;
             if self.panes[i].kind.follows_symbol() {
@@ -567,7 +936,7 @@ impl TerminalApp {
         if let Some(p) = self.panes.iter().find(|p| same(&p.kind)) {
             return Some(p.id);
         }
-        let disc = |id: PaneId| kind_of(id).map(std::mem::discriminant);
+        let disc = |id: PaneId| kind_of(id).map(PaneKind::panel_type);
         let non_chart: Vec<PaneId> = visible
             .iter()
             .copied()
@@ -583,9 +952,9 @@ impl TerminalApp {
     /// tab beside a suitable panel, else split it in next to the focused pane. Panels the
     /// user arranged are never discarded.
     pub(super) fn open_panel(&mut self, kind: PaneKind) {
-        let disc = std::mem::discriminant(&kind);
-        let same = self.panes.iter().any(|p| std::mem::discriminant(&p.kind) == disc);
-        let id = match self.target_pane(|k| std::mem::discriminant(k) == disc) {
+        let disc = kind.panel_type();
+        let same = self.panes.iter().any(|p| p.kind.panel_type() == disc);
+        let id = match self.target_pane(|k| k.panel_type() == disc) {
             Some(t) if same => {
                 let id = self.replace_pane(t, kind);
                 self.reveal(id);
@@ -609,11 +978,11 @@ impl TerminalApp {
 
     /// The chart commands act on: the focused one, a visible one, any (revealed), or a new
     /// chart beside the focused pane.
-    fn chart_target(&mut self) -> PaneId {
+    pub(super) fn chart_target(&mut self) -> PaneId {
         if self.focused_is_chart() {
             return self.focus;
         }
-        let is_chart = |p: &Pane| matches!(p.kind, PaneKind::Chart(_));
+        let is_chart = |p: &Pane| matches!(p.kind, PaneKind::Chart(_) | PaneKind::Studio(_));
         let visible = self.dock.visible();
         if let Some(id) = visible.iter().copied().find(|&id| self.idx(id).is_some_and(|i| is_chart(&self.panes[i]))) {
             return id;
@@ -634,6 +1003,7 @@ impl TerminalApp {
         let chart = |id: PaneId| {
             self.idx(id).and_then(|i| match &self.panes[i].kind {
                 PaneKind::Chart(c) => Some(&**c),
+                PaneKind::Studio(s) => Some(&*s.chart),
                 _ => None,
             })
         };
@@ -646,9 +1016,12 @@ impl TerminalApp {
         let id = self.chart_target();
         self.focus = id;
         if let Some(i) = self.idx(id)
-            && let PaneKind::Chart(c) = &mut self.panes[i].kind
+            && let Some(c) = self.panes[i].kind.native_chart_mut()
         {
             f(c, &self.worker);
+            if let PaneKind::Studio(s) = &mut self.panes[i].kind {
+                s.sync_chart_context();
+            }
         }
     }
 
@@ -663,12 +1036,30 @@ impl TerminalApp {
         let current = given.clone().or_else(|| self.focused_symbol());
         let d = &self.prefs.panels;
         Some(match head.as_str() {
+            "TSTACK" | "STACK" | "MTF" | "REGIME" => {
+                let mut settings = crate::layouts::chart_settings(current.as_deref().unwrap_or("AAPL US Equity"), d);
+                if let PaneSettings::Chart { tf, show_stack, archive, .. } = &mut settings {
+                    *archive = self.peek_chart().is_some_and(|c| c.archive);
+                    *tf = if *archive { tr_core::Timeframe::D1 } else { tr_core::Timeframe::M5 };
+                    *show_stack = true;
+                }
+                PaneKind::from_settings(settings)
+            }
             "CHART" | "GP" | "G" | "GRAPH" => PaneKind::from_settings(crate::layouts::chart_settings(
                 current.as_deref().unwrap_or("AAPL US Equity"),
                 d,
             )),
-            "WL" | "WATCHLIST" | "W" => PaneKind::Watchlist,
-            "NEWS" | "N" | "CN" | "TOP" => PaneKind::News(Box::new(NewsPane::new(current))),
+            "HIST" | "HISTORY" => PaneKind::Research(Box::new(super::research::ResearchPane::price_history())),
+            "UNIV" => PaneKind::Research(Box::new(super::research::ResearchPane::new(None))),
+            "SCAN" => PaneKind::Research(Box::new(super::research::ResearchPane::new(Some(
+                words[1..].join(" ").to_ascii_uppercase(),
+            )))),
+            "WL" | "WATCHLIST" | "W" | "EARN" | "EARNINGS" | "ECAL" | "ISCAN" | "INTRADAY" => PaneKind::Watchlist,
+            "TOP" => PaneKind::News(Box::new(NewsPane::top())),
+            "NEWS" | "N" | "CN" => PaneKind::News(Box::new(match current {
+                Some(s) if head == "CN" => NewsPane::for_symbol(s),
+                _ => NewsPane::watchlist(),
+            })),
             "BOOK" | "OB" | "DEPTH" | "DOM" => {
                 // Default to a market with a public book.
                 let sym = given
@@ -679,6 +1070,185 @@ impl TerminalApp {
             "OMON" | "OPT" | "OPTIONS" | "CHAIN" => {
                 let sym = given.unwrap_or_else(|| self.optionable_symbol());
                 PaneKind::Options(Box::new(super::OptionsPane::new(&sym, 12, true)))
+            }
+            "JOURNAL" | "JRNL" | "CHECKLIST" | "TRADELOG" => {
+                let filter = given.clone().or(current.clone()).unwrap_or_default();
+                PaneKind::Journal(Box::new(super::journal::JournalPane::new(filter)))
+            }
+            "STUDIO" => {
+                let (lens, tf, benchmark, inputs) =
+                    super::studio_hub::parse_studio(&words.get(1..).unwrap_or(&[]).join(" ")).ok()?;
+                let symbol = symbol.map(|s| tr_data::security(s).key()).or(current).unwrap_or_default();
+                PaneKind::Studio(Box::new(super::studio_hub::StudioPane::new(super::studio_hub::StudioViewSpec {
+                    context: tr_data::studio::StudioContext { symbol, tf, ..Default::default() },
+                    lens,
+                    benchmark,
+                    inputs,
+                    ..Default::default()
+                })))
+            }
+            "WHEN" => {
+                let cmd = tr_data::studio_when::parse_command(&words.get(1..).unwrap_or(&[]).join(" ")).ok()?;
+                let symbol = symbol.map(|s| tr_data::security(s).key()).or(current).unwrap_or_default();
+                PaneKind::Studio(Box::new(super::studio_hub::when_studio(symbol, cmd)))
+            }
+            "QUICK" => {
+                let (tf,mode,peers)=tr_data::studio_canvas::parse_spec(&words.get(1..).unwrap_or(&[]).join(" ")).ok()?;
+                let symbol=symbol.map(|s|tr_data::security(s).key()).or(current).unwrap_or_default();
+                let mut canvas=crate::chart_view::studio_canvas::CanvasView {enabled:true,peers,..Default::default()};canvas.spec.mode=mode;
+                PaneKind::Studio(Box::new(super::studio_hub::StudioPane::new(super::studio_hub::StudioViewSpec {context:tr_data::studio::StudioContext {symbol,tf,..Default::default()},quick:true,canvas,..Default::default()})))
+            },
+            // `NEW LAB` opens the Lab for the current symbol (typed `LAB` alone stays the LAB ticker).
+            "LAB" => {
+                let symbol =
+                    symbol.map(|s| tr_data::security(s).key()).or_else(|| self.focused_symbol()).unwrap_or_default();
+                let spec = if symbol.is_empty() {
+                    tr_data::studio_lab::LabSpec::default()
+                } else {
+                    tr_data::studio_lab::LabSpec::default_for(&symbol)
+                };
+                PaneKind::StudioLab(Box::new(super::studio_lab::LabPane::new(symbol, tr_core::Timeframe::D1, spec)))
+            }
+            "RESID" => PaneKind::StudioResid(Box::new(super::studio_residual::ResidPane::new(String::new()))),
+            "ATTR" => PaneKind::StudioAttr(Box::new(super::studio_attribution::AttrPane::new(String::new()))),
+            "DIST" | "RDIST" => {
+                let symbol =
+                    symbol.map(|s| tr_data::security(s).key()).or_else(|| self.focused_symbol()).unwrap_or_default();
+                let timeframe = tr_data::studio_dist::parse_timeframe(&words.get(1..).unwrap_or(&[]).join(" ")).ok()?;
+                PaneKind::StudioDist(Box::new(super::studio_dist::DistPane::new(
+                    symbol,
+                    timeframe,
+                    tr_data::studio_dist::Window::All,
+                )))
+            }
+            "CORR" | "RBETA" => {
+                let symbol =
+                    symbol.map(|s| tr_data::security(s).key()).or_else(|| self.focused_symbol()).unwrap_or_default();
+                let spec = words.get(1..).unwrap_or(&[]).join(" ");
+                PaneKind::StudioCorr(Box::new(super::studio_corr::CorrPane::new(symbol, spec)))
+            }
+            "SEASON" | "SSN" => {
+                let symbol =
+                    symbol.map(|s| tr_data::security(s).key()).or_else(|| self.focused_symbol()).unwrap_or_default();
+                let spec = words.get(1..).unwrap_or(&[]).join(" ");
+                PaneKind::StudioSeason(Box::new(super::studio_season::SeasonPane::new(symbol, spec)))
+            }
+            "STATS" | "STAT" | "STATISTICS" | "COND" | "CDIST" | "CONDRET" => {
+                let symbol = given.or(current).unwrap_or_default();
+                let condition = if matches!(head.as_str(), "COND" | "CDIST" | "CONDRET") {
+                    words.get(1..).unwrap_or(&[]).join(" ")
+                } else {
+                    String::new()
+                };
+                PaneKind::Stats(Box::new(super::stats::StatsPane::new(
+                    symbol,
+                    condition,
+                    matches!(head.as_str(), "COND" | "CDIST" | "CONDRET"),
+                )))
+            }
+            "BACKTEST" | "BT" | "BTEST" => {
+                let symbol = given.or(current).unwrap_or_default();
+                let spec = words.get(1..).unwrap_or(&[]).join(" ");
+                PaneKind::Backtest(Box::new(super::backtest::BacktestPane::new(symbol, spec)))
+            }
+            "ICMP" | "ICOMPARE" | "ICOMP" => {
+                // Peer tickers and the bar size stay in the spec. The anchor is the named or focused symbol.
+                let symbol = symbol.map(|s| tr_data::security(s).key()).or(current).unwrap_or_default();
+                let spec = words.get(1..).unwrap_or(&[]).join(" ");
+                PaneKind::IntradayCompare(Box::new(super::compare::ComparePane::new(symbol, spec)))
+            }
+            "SPATH" | "SESSIONPATH" | "TPATH" => {
+                // A count and a bar size stay in the spec. They are not tickers.
+                let symbol = symbol.map(|s| tr_data::security(s).key()).or(current).unwrap_or_default();
+                let spec = words.get(1..).unwrap_or(&[]).join(" ");
+                PaneKind::SessionPath(Box::new(super::session_path::SessionPathPane::new(symbol, spec)))
+            }
+            "EWALL" | "TWALL" | "TGRID" | "STACKS" | "MTFGRID" => {
+                let mut p = super::trend_wall::TrendWallPane::new(words[1..].join(" "));
+                if words[0].eq_ignore_ascii_case("EWALL") {
+                    p.sort = tr_data::stack_wall::Sort::EdgeScore;
+                }
+                p.spec = super::rotation::prepend_symbol(symbol, &p.spec);
+                PaneKind::TrendWall(Box::new(p))
+            }
+            "RRG" | "ROT" | "ROTATION" | "ROTATE" => {
+                let spec = super::rotation::prepend_symbol(symbol, &words[1..].join(" "));
+                PaneKind::Rotation(Box::new(super::rotation::RotationPane::new(spec)))
+            }
+            "BRD" | "BREADTH" | "SBREADTH" => {
+                // Tickers and a bar size stay in the spec. They are not a single focused name.
+                let spec = words.get(1..).unwrap_or(&[]).join(" ");
+                PaneKind::Breadth(Box::new(super::session_breadth::BreadthPane::new(spec)))
+            }
+            "VPACE" | "VOLPACE" | "CUMVOL" => {
+                // A count and a bar size stay in the spec. They are not tickers.
+                let symbol = symbol.map(|s| tr_data::security(s).key()).or(current).unwrap_or_default();
+                let spec = words.get(1..).unwrap_or(&[]).join(" ");
+                PaneKind::VolumePace(Box::new(super::volume_pace::VolumePacePane::new(symbol, spec)))
+            }
+            "RVAR" | "REALVOL" | "REALIZEDVOL" => {
+                // A count and a bar size stay in the spec. They are not tickers.
+                let symbol = symbol.map(|s| tr_data::security(s).key()).or(current).unwrap_or_default();
+                let spec = words.get(1..).unwrap_or(&[]).join(" ");
+                PaneKind::RealizedVol(Box::new(super::realized_vol::RealizedVolPane::new(symbol, spec)))
+            }
+            "ACOR" | "AUTOCORR" | "SERIALCORR" => {
+                // A count and a bar size stay in the spec. They are not tickers.
+                let symbol = symbol.map(|s| tr_data::security(s).key()).or(current).unwrap_or_default();
+                let spec = words.get(1..).unwrap_or(&[]).join(" ");
+                PaneKind::Autocorr(Box::new(super::autocorr::AutocorrPane::new(symbol, spec)))
+            }
+            "GFILL" | "GAPFILL" => {
+                // A count and a bar size stay in the spec. They are not tickers.
+                let symbol = symbol.map(|s| tr_data::security(s).key()).or(current).unwrap_or_default();
+                let spec = words.get(1..).unwrap_or(&[]).join(" ");
+                PaneKind::GapFill(Box::new(super::gap_fill::GapFillPane::new(symbol, spec)))
+            }
+            "XTRM" | "EXTREME" => {
+                // A count and a bar size stay in the spec. They are not tickers.
+                let symbol = symbol.map(|s| tr_data::security(s).key()).or(current).unwrap_or_default();
+                let spec = words.get(1..).unwrap_or(&[]).join(" ");
+                PaneKind::SessionExtreme(Box::new(super::session_extreme::SessionExtremePane::new(symbol, spec)))
+            }
+            "CLOCK" => {
+                // The bucket size stays in the spec; the ticker follows the focused security.
+                let symbol = symbol.map(|s| tr_data::security(s).key()).or(current).unwrap_or_default();
+                let spec = words.get(1..).unwrap_or(&[]).join(" ");
+                PaneKind::SessionClock(Box::new(super::session_clock::SessionClockPane::new(symbol, spec)))
+            }
+            "RPATH" | "RELPATH" => {
+                // A count and a bar size stay in the spec. They are not tickers.
+                let symbol = symbol.map(|s| tr_data::security(s).key()).or(current).unwrap_or_default();
+                let spec = words.get(1..).unwrap_or(&[]).join(" ");
+                PaneKind::RelativePath(Box::new(super::relative_path::RelativePathPane::new(symbol, spec)))
+            }
+            "BRIEF" | "SBRIEF" => {
+                let symbol = symbol
+                    .map(|s| tr_data::security(s).key())
+                    .or(current)
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or_else(|| tr_data::security("AAPL").key());
+                PaneKind::SessionBrief(Box::new(super::session_brief::SessionBriefPane::new(symbol)))
+            }
+            "IBT" | "IBACKTEST" | "SETUPBT" => {
+                // VWAP and OR are setup names, not tickers.
+                let symbol = symbol.map(|s| tr_data::security(s).key()).or(current).unwrap_or_default();
+                let spec = words.get(1..).unwrap_or(&[]).join(" ");
+                PaneKind::Backtest(Box::new(super::backtest::BacktestPane::intraday(symbol, spec)))
+            }
+            "LOOKALIKE" | "LOOKALIKES" | "KNN" | "ANALOG" | "ANALOGUE" | "NN" => {
+                let symbol = given.or(current).unwrap_or_default();
+                let spec = words.get(1..).unwrap_or(&[]).join(" ");
+                PaneKind::Lookalike(Box::new(super::lookalike::LookalikePane::new(symbol, spec)))
+            }
+            "DESK" | "PM" | "PMDESK" | "RISK" => {
+                let group = words.get(1).cloned().unwrap_or(self.watch_ui.selected_group.as_str()).to_string();
+                let group = if self.watchlists.index(&group).is_some() {
+                    self.watchlists.groups[self.watchlists.index(&group).unwrap()].name.clone()
+                } else {
+                    self.watchlists.last_used.clone()
+                };
+                PaneKind::Desk(Box::new(super::desk::DeskPane::new(group)))
             }
             "PORT" | "PORTFOLIO" | "ACCT" | "POS" | "POSITIONS" | "ORD" | "ORDERS" | "ACTV" | "ACTIVITY" => {
                 let view = match head.as_str() {
@@ -698,6 +1268,8 @@ impl TerminalApp {
             "SECF" | "SEARCH" => PaneKind::Search { query: words[1..].join(" ") },
             "PREFS" | "SETTINGS" | "PDF" => PaneKind::Settings,
             "HELP" => PaneKind::Help,
+            "HEALTH" | "SRC" => PaneKind::Health,
+            "VAULT" | "VLT" => PaneKind::Vault(Box::new(super::vault_view::VaultPane::new(None))),
             _ => return None,
         })
     }
@@ -737,6 +1309,263 @@ impl TerminalApp {
         self.ensure_focus();
     }
 
+    /// Replace the workspace with the saved Intraday desk: 5-minute chart, ISCAN, watchlist
+    /// breadth, and volume pace. The previous layout is kept under its own name.
+    pub(super) fn open_intraday_desk(&mut self, symbol: Option<&str>) {
+        let key = symbol
+            .map(|s| tr_data::security(s).key())
+            .filter(|s| !s.is_empty())
+            .or_else(|| self.focused_symbol())
+            .unwrap_or_else(|| tr_data::security("AAPL").key());
+        self.handoff_unwind();
+        if !self.layout_name.eq_ignore_ascii_case(INTRADAY_DESK) {
+            self.save_layout();
+        }
+        for p in std::mem::take(&mut self.panes) {
+            self.worker.send(Request::Forget(p.id));
+        }
+        self.dock = Node::default();
+        if self.watchlists.index(&self.watch_ui.selected_group).is_none() {
+            self.watch_ui.selected_group = self.watchlists.last_used.clone();
+        }
+        let mut chart = crate::layouts::chart_settings(&key, &self.prefs.panels);
+        if let PaneSettings::Chart { tf, .. } = &mut chart {
+            *tf = tr_core::Timeframe::M5;
+        }
+        let ids = [
+            self.new_pane(PaneKind::from_settings(chart)),
+            self.new_pane(PaneKind::Watchlist),
+            self.new_pane(PaneKind::Breadth(Box::new(super::session_breadth::BreadthPane::new("")))),
+            self.new_pane(PaneKind::VolumePace(Box::new(super::volume_pace::VolumePacePane::new(&key, "")))),
+        ];
+        if let Some(p) = self.pane_mut(ids[0]) {
+            p.link = Some(Link::Blue);
+        }
+        if let Some(p) = self.pane_mut(ids[3]) {
+            p.link = Some(Link::Blue);
+        }
+        self.dock = Node::preset(Layout::Grid2x2, &ids);
+        self.preset = Some(Layout::Grid2x2);
+        self.focus = ids[0];
+        self.last_opened = Some(ids[3]);
+        self.watch_ui.calendar = false;
+        self.watch_ui.intraday = true;
+        self.reload_intraday_scan();
+        self.layout_name = INTRADAY_DESK.into();
+        self.save_layout();
+        self.save_settings();
+        let ticker = tr_data::security(&key).ticker;
+        self.status = format!("{ticker}: intraday desk — 5-minute chart, scan, breadth, and volume pace");
+    }
+
+    /// Replace the workspace with the saved Cockpit: three native intraday charts of one
+    /// name in the Blue link group (middle interval large, slow top-right, fast
+    /// bottom-right), TSTACK and RAIL on. The previous layout is kept under its own name.
+    pub(super) fn open_cockpit(&mut self, symbol: Option<&str>, spec: &str) {
+        self.build_cockpit(symbol, spec, true);
+    }
+
+    /// Hand-off workspaces are temporary: no synchronous layout/settings writes.
+    pub(super) fn handoff_cockpit(&mut self, symbol: &str) {
+        self.build_cockpit(Some(symbol), "", false);
+    }
+
+    fn build_cockpit(&mut self, symbol: Option<&str>, spec: &str, persist: bool) {
+        let frames = match crate::command::cockpit_ladder(spec) {
+            Ok(frames) => frames,
+            Err(e) => {
+                self.status = e;
+                return;
+            }
+        };
+        let key = symbol
+            .map(|s| tr_data::security(s).key())
+            .filter(|s| !s.is_empty())
+            .or_else(|| self.focused_symbol())
+            .unwrap_or_else(|| tr_data::security("AAPL").key());
+        if persist {
+            // The COCKPIT command leaves any hand-off: back to the real layout first.
+            self.handoff_unwind();
+        }
+        if persist && !self.layout_name.eq_ignore_ascii_case(COCKPIT) {
+            self.save_layout();
+        }
+        for p in std::mem::take(&mut self.panes) {
+            self.worker.send(Request::Forget(p.id));
+        }
+        self.dock = Node::default();
+        let [fast, mid, slow] = frames;
+        let chip = format!("COCKPIT {} · {} · {}", fast.label(), mid.label(), slow.label());
+        // `Node::preset(MainRight2, ..)` puts the first pane left, then top-right, bottom-right.
+        let mut ids = Vec::new();
+        for tf in [mid, slow, fast] {
+            let mut chart = crate::layouts::chart_settings(&key, &self.prefs.panels);
+            if let PaneSettings::Chart { tf: t, show_stack, show_rail, .. } = &mut chart {
+                *t = tf;
+                *show_stack = true;
+                *show_rail = true;
+            }
+            let id = self.new_pane(PaneKind::from_settings(chart));
+            if let Some(p) = self.pane_mut(id) {
+                p.link = Some(Link::Blue);
+                if tf == mid
+                    && let PaneKind::Chart(c) = &mut p.kind
+                {
+                    c.cockpit_chip = Some(chip.clone());
+                }
+            }
+            ids.push(id);
+        }
+        self.dock = Node::preset(Layout::MainRight2, &ids);
+        self.preset = Some(Layout::MainRight2);
+        self.focus = ids[0];
+        self.layout_name = COCKPIT.into();
+        if persist {
+            self.save_layout();
+            self.save_settings();
+        }
+        let ticker = tr_data::security(&key).ticker;
+        self.status = format!("{ticker}: {chip} — native linked charts, Time Link, Lens, Alt+A anchors VWAP");
+    }
+
+    /// `AVWAP …` on the focused chart, then copied to its linked charts of the same name.
+    pub(super) fn anchored_vwap_command(&mut self, cmd: crate::command::AnchorCmd) {
+        let mut status = None;
+        self.with_chart(|c, _| status = Some(c.anchor_command(cmd)));
+        self.status = match status {
+            Some(Ok(s)) | Some(Err(s)) => s,
+            None => "AVWAP needs a chart".into(),
+        };
+        self.sync_linked_anchors();
+    }
+
+    /// A chart that edited its anchors pushes them to every chart in its link group that
+    /// shows the same security. Other names and unlinked panes are untouched.
+    pub(super) fn sync_linked_anchors(&mut self) {
+        let mut sources = Vec::new();
+        for p in &mut self.panes {
+            if let PaneKind::Chart(c) = &mut p.kind
+                && std::mem::take(&mut c.avwap_dirty)
+                && let Some(link) = p.link
+            {
+                sources.push((p.id, link, c.symbol.clone(), c.avwap_anchors.clone()));
+            }
+        }
+        for (id, link, symbol, anchors) in sources {
+            for p in &mut self.panes {
+                if p.id != id
+                    && p.link == Some(link)
+                    && let PaneKind::Chart(c) = &mut p.kind
+                    && c.symbol == symbol
+                {
+                    c.set_avwap_anchors(anchors.clone());
+                }
+            }
+        }
+    }
+
+    /// Time Link: resolve which linked chart the pointer is over from last frame's plot
+    /// geometry and egui's hit test, and publish its cursor before any chart paints, so every
+    /// chart in the group shows the ghost on the same frame regardless of paint order.
+    pub(super) fn seed_link_hover(&mut self, ctx: &egui::Context) {
+        let dragging = self.drag.is_some_and(|d| d.active);
+        let pointer = ctx.input(|i| i.pointer.hover_pos()).filter(|_| !dragging);
+        let panes = self.panes.iter().filter_map(|p| match (&p.kind, p.link) {
+            (PaneKind::Chart(c), Some(_)) => c.link_geom.map(|g| (p.id, g)),
+            _ => None,
+        });
+        let hit = pointer.and_then(|pos| {
+            crate::chart_view::resolve_hover(panes, pos, |id| ctx.read_response(id).is_some_and(|r| r.hovered()))
+        });
+        let seed = hit.and_then(|(id, bar)| {
+            let p = self.panes.iter().find(|p| p.id == id)?;
+            let PaneKind::Chart(c) = &p.kind else { return None };
+            Some((p.link?, bar.and_then(|(i, price)| c.link_cursor(i, price))))
+        });
+        self.link_bus.seed_hover(seed);
+    }
+
+    /// Scroll every other chart in `link` showing `symbol` so `ts` is centred.
+    pub(super) fn center_linked(&mut self, link: Link, source: PaneId, symbol: &str, ts: i64) {
+        let mut n = 0;
+        for p in &mut self.panes {
+            if p.id != source
+                && p.link == Some(link)
+                && let PaneKind::Chart(c) = &mut p.kind
+                && c.symbol == symbol
+            {
+                c.center_on_ts(ts);
+                n += 1;
+            }
+        }
+        if n > 0 {
+            self.status = format!(
+                "Centred {n} linked chart{} on {} ET",
+                if n == 1 { "" } else { "s" },
+                tr_core::ny::civil(ts).format("%Y-%m-%d %H:%M")
+            );
+        }
+    }
+
+    /// Draw the prior close, open, opening range, and VWAP on this name's chart.
+    pub(super) fn open_cash_levels(&mut self, symbol: Option<&str>) {
+        let key = symbol
+            .map(|s| tr_data::security(s).key())
+            .filter(|s| !s.is_empty())
+            .or_else(|| self.focused_symbol())
+            .unwrap_or_else(|| tr_data::security("AAPL").key());
+        let existing = self
+            .idx(self.focus)
+            .and_then(|i| match &self.panes[i].kind {
+                PaneKind::Chart(c) if c.symbol == key => Some(self.panes[i].id),
+                _ => None,
+            })
+            .or_else(|| {
+                self.panes.iter().find_map(|pane| match &pane.kind {
+                    PaneKind::Chart(c) if c.symbol == key => Some(pane.id),
+                    _ => None,
+                })
+            });
+        let id = match existing {
+            Some(id) => {
+                self.reveal(id);
+                self.focus = id;
+                id
+            }
+            None => {
+                let mut chart = crate::layouts::chart_settings(&key, &self.prefs.panels);
+                if let PaneSettings::Chart { tf, .. } = &mut chart {
+                    *tf = tr_core::Timeframe::M5;
+                }
+                let id = self.new_pane(PaneKind::from_settings(chart));
+                self.dock_pane(id, self.focused_visible(), Zone::Right);
+                id
+            }
+        };
+        self.worker.send(Request::CashLevels { pane: id, symbol: key.clone() });
+        let ticker = tr_data::security(&key).ticker;
+        self.status = format!("{ticker}: reading prior close, open, opening range, and VWAP");
+    }
+
+    pub(super) fn accept_cash_levels(
+        &mut self,
+        pane: PaneId,
+        result: Result<tr_data::cash_levels::CashLevels, String>,
+    ) {
+        match result {
+            Ok(levels) => {
+                let Some(i) = self.idx(pane) else { return };
+                let PaneKind::Chart(chart) = &mut self.panes[i].kind else { return };
+                if chart.symbol != levels.symbol {
+                    return;
+                }
+                chart.apply_cash_levels(&levels);
+                self.status = cash_level_status(&levels);
+            }
+            Err(err) => self.status = err,
+        }
+    }
+
     // ---- saved layouts -------------------------------------------------------------------
 
     pub(super) fn current_doc(&self) -> LayoutDoc {
@@ -749,7 +1578,10 @@ impl TerminalApp {
                 .iter()
                 .map(|p| SavedPane {
                     id: p.id,
-                    settings: p.kind.settings(),
+                    settings: match p.kind.settings() {
+                        PaneSettings::Watchlist if self.watch_ui.intraday => PaneSettings::IntradayScan,
+                        other => other,
+                    },
                     link: p.link,
                     title: p.title.clone(),
                     window: p.window,
@@ -763,14 +1595,40 @@ impl TerminalApp {
 
     /// Replace the workspace with `doc`. Pane ids are reassigned so responses for the old
     /// panes can never reach the new ones.
-    pub(super) fn apply_doc(&mut self, mut doc: LayoutDoc) {
+    pub(super) fn apply_doc(&mut self, doc: LayoutDoc) {
+        // A replaced workspace makes any hand-off snapshots stale.
+        self.handoff_forget();
+        self.apply_doc_with_origin(doc, None);
+    }
+
+    /// Restore a cached hand-off source at its snapshot ordinal, including transient
+    /// selection/filter/replay state. New ids isolate it from all departure responses.
+    /// Returns the doc-id → new-id map.
+    pub(super) fn apply_doc_with_origin(
+        &mut self,
+        mut doc: LayoutDoc,
+        mut origin: Option<(usize, PaneKind)>,
+    ) -> HashMap<PaneId, PaneId> {
+        let transient = origin.is_some();
         doc.repair();
         for p in std::mem::take(&mut self.panes) {
             self.worker.send(Request::Forget(p.id));
         }
+        let scan = doc.panes.iter().any(|sp| matches!(sp.settings, PaneSettings::IntradayScan));
+        if scan && self.watchlists.index(&self.watch_ui.selected_group).is_none() {
+            self.watch_ui.selected_group = self.watchlists.last_used.clone();
+        }
         let mut map = HashMap::new();
-        for sp in doc.panes {
-            let id = self.new_pane(PaneKind::from_settings(sp.settings));
+        for (ordinal, sp) in doc.panes.into_iter().enumerate() {
+            let id = if origin.as_ref().is_some_and(|(at, _)| *at == ordinal) {
+                let (_, kind) = origin.take().expect("source ordinal");
+                let id = self.next_id;
+                self.next_id += 1;
+                self.panes.push(Pane { id, kind, link: None, title: None, window: None });
+                id
+            } else {
+                self.new_pane(PaneKind::from_settings(sp.settings))
+            };
             map.insert(sp.id, id);
             if let Some(p) = self.pane_mut(id) {
                 p.link = sp.link;
@@ -784,31 +1642,82 @@ impl TerminalApp {
             && !name.eq_ignore_ascii_case(&self.prefs.appearance.theme)
             && (name.eq_ignore_ascii_case(crate::themes::SYSTEM) || crate::themes::find(&self.themes, name).is_some())
         {
-            self.select_theme(name);
+            if transient {
+                self.prefs.appearance.theme = name.to_owned();
+            } else {
+                self.select_theme(name);
+            }
         }
         if let Some(side) = doc.sidebar_side
             && side != self.prefs.appearance.sidebar_side
         {
             self.prefs.appearance.sidebar_side = side;
-            self.save_prefs();
+            if !transient {
+                self.save_prefs();
+            }
         }
         self.dock = doc.dock;
         self.focus = doc.focus.and_then(|f| map.get(&f).copied()).unwrap_or(0);
         self.ensure_focus();
         self.layout_name = doc.name;
+        self.watch_ui.intraday = scan;
+        if scan {
+            self.watch_ui.calendar = false;
+            self.reload_intraday_scan();
+        }
         self.preset = None;
         self.drag = None;
         self.renaming_tab = None;
         self.last_saved = self.current_doc().to_json();
+        map
     }
 
-    pub(super) fn save_layout(&mut self) {
-        let doc = self.current_doc();
+    /// Write the active layout under its name. While hand-off hops are live this
+    /// writes the hop stack's origin layout (with safe edits folded in) under the
+    /// origin's name instead: a temporary hop layout never reaches a named file.
+    pub(super) fn save_layout(&mut self) -> bool {
+        let (doc, hop) = match self.handoff_persist_doc() {
+            Some(doc) => (doc, true),
+            None => (self.current_doc(), false),
+        };
         match self.store.save(&doc) {
+            Ok(_) if hop => self.handoff_mark_saved(doc.to_json()),
             Ok(_) => self.last_saved = doc.to_json(),
-            Err(e) => self.status = format!("Could not save layout: {e:#}"),
+            Err(e) => {
+                self.status = format!("Could not save layout: {e:#}");
+                return false;
+            }
         }
         self.refresh_layout_names();
+        true
+    }
+
+    /// Explicitly adopt the visible workspace, only clearing navigation once both
+    /// the origin and the requested view have reached disk successfully.
+    fn save_layout_view_as(&mut self, name: &str) -> bool {
+        if !self.save_layout() {
+            return false;
+        }
+        let mut doc = self.current_doc();
+        doc.name = name.to_owned();
+        if let Err(e) = self.store.save(&doc) {
+            self.status = format!("Could not save layout: {e:#}");
+            return false;
+        }
+        self.handoff_forget();
+        self.layout_name = doc.name.clone();
+        self.last_saved = doc.to_json();
+        self.refresh_layout_names();
+        self.save_settings();
+        true
+    }
+
+    /// The JSON autosave would write now, and whether it differs from the last write.
+    pub(super) fn layout_dirty(&self) -> bool {
+        match self.handoff_persist_doc() {
+            Some(doc) => self.handoff_saved_json() != Some(doc.to_json().as_slice()),
+            None => self.current_doc().to_json() != self.last_saved,
+        }
     }
 
     pub(super) fn refresh_layout_names(&mut self) {
@@ -816,11 +1725,14 @@ impl TerminalApp {
     }
 
     pub(super) fn switch_layout(&mut self, name: &str) {
+        self.handoff_unwind();
         if name.eq_ignore_ascii_case(&self.layout_name) {
             self.status = format!("Already on layout {name:?}");
             return;
         }
-        self.save_layout();
+        if !self.save_layout() {
+            return;
+        }
         match self.store.load(name) {
             Ok(doc) => {
                 self.apply_doc(doc);
@@ -839,6 +1751,15 @@ impl TerminalApp {
             self.apply(crate::command::Function::Layouts);
             return;
         };
+        // Saving adopts the current view (after persisting the hop origin); presets
+        // rearrange it in place. Anything else manages named layouts: unwind first
+        // so ops below name the user's real layout, never a temporary hop one.
+        if matches!(
+            first.as_str(),
+            "RENAME" | "MV" | "DUP" | "DUPLICATE" | "COPY" | "DEL" | "DELETE" | "RM" | "EXPORT" | "THEME"
+        ) {
+            self.handoff_unwind();
+        }
         if words.len() == 1
             && let Some(l) = Layout::parse(&first)
         {
@@ -846,8 +1767,22 @@ impl TerminalApp {
             return;
         }
         let op = match first.as_str() {
+            // Bare SAVE / Ctrl+S mid-hop saves only the origin under its own name:
+            // the visible view may carry a temporary name (e.g. "Cockpit") that is
+            // also a user layout, so keeping it takes an explicit LAYOUT SAVE <name>.
+            "SAVE" if words.len() == 1 && self.handoff_live() => {
+                if self.save_layout() {
+                    let origin = self.handoff_origin_name().unwrap_or_default().to_owned();
+                    self.status = format!(
+                        "Saved layout {origin:?}; this hand-off view is temporary (LAYOUT SAVE <name> keeps it)"
+                    );
+                }
+                return;
+            }
             "SAVE" if words.len() == 1 => {
-                self.save_layout();
+                if !self.save_layout_view_as(&self.layout_name.clone()) {
+                    return;
+                }
                 self.status = format!("Saved layout {:?}", self.layout_name);
                 return;
             }
@@ -880,6 +1815,9 @@ impl TerminalApp {
     }
 
     pub(super) fn layout_op(&mut self, op: LayoutOp) {
+        if !matches!(op, LayoutOp::SaveAs(_) | LayoutOp::OpenFolder | LayoutOp::Import(_)) {
+            self.handoff_unwind();
+        }
         let result: anyhow::Result<String> = (|| match op {
             LayoutOp::Switch(name) => {
                 self.switch_layout(&name);
@@ -898,13 +1836,17 @@ impl TerminalApp {
                 if name.is_empty() {
                     anyhow::bail!("LAYOUT SAVEAS needs a name");
                 }
-                if self.store.exists(&name) && !name.eq_ignore_ascii_case(&self.layout_name) {
+                // Mid-hop the user's real layout is the origin; the hop's temporary
+                // name (which may match a saved layout) never licenses an overwrite.
+                let current = self.handoff_origin_name().unwrap_or(&self.layout_name);
+                if self.store.exists(&name) && !name.eq_ignore_ascii_case(current) {
                     anyhow::bail!("a layout named {name:?} already exists (LAYOUT DEL it first)");
                 }
-                self.save_layout();
-                self.layout_name = name.clone();
-                self.save_layout();
-                self.save_settings();
+                // With hops live this persists the origin; the view then stops being
+                // temporary and is saved under the new name only.
+                if !self.save_layout_view_as(&name) {
+                    anyhow::bail!("{}", self.status);
+                }
                 Ok(format!("Saved as {name:?}"))
             }
             LayoutOp::Rename(old, new) => {
@@ -1441,6 +2383,7 @@ impl TerminalApp {
     /// Draw each popped-out pane in its own native window.
     pub(super) fn render_windows(&mut self, ctx: &egui::Context) -> Vec<Action> {
         let mut actions = Vec::new();
+        let mut handoff = None;
         let ids: Vec<PaneId> = self.panes.iter().filter(|p| p.window.is_some()).map(|p| p.id).collect();
         for id in ids {
             let Some(i) = self.idx(id) else { continue };
@@ -1453,7 +2396,13 @@ impl TerminalApp {
                 .with_min_inner_size([320.0, 220.0]);
             let mut dock_back = false;
             let mut new_geom = None;
-            ctx.show_viewport_immediate(ViewportId::from_hash_of(("pane-window", id)), builder, |ui, _class| {
+            ctx.show_viewport_immediate(ViewportId::from_hash_of(("pane-window", id)), builder, |ui, class| {
+                // Native focus can change through the window manager, without a
+                // click in the pane. Embedded viewports share the root input.
+                if class != egui::ViewportClass::EmbeddedWindow && ui.input(|inp| inp.viewport().focused == Some(true))
+                {
+                    self.focus = id;
+                }
                 let rect = ui.max_rect();
                 ui.painter().rect_filled(rect, 0.0, theme::window());
                 let bar = Rect::from_min_size(rect.min, vec2(rect.width(), dp(30.0)));
@@ -1479,8 +2428,25 @@ impl TerminalApp {
                 let content =
                     Rect::from_min_max(pos2(rect.left() + 6.0, bar.bottom() + 6.0), rect.max - vec2(6.0, 6.0));
                 let inner = widgets::card(ui, content, 0.0);
+                // Keys typed in this window never reach the root hotkeys. Read
+                // hand-off keys here, run them after the loop (they replace panes).
+                if self.focus == id {
+                    self.clear_handoff_arrival_on_input(ui.ctx());
+                    let (consumed, intent) = self.handoff_input(ui.ctx());
+                    if let Some(intent) = intent {
+                        handoff = Some((id, intent));
+                    }
+                    if !consumed {
+                        self.backtest_keys(ui.ctx());
+                    }
+                }
                 let (acts, clicked) = self.render_content(ui, i, inner, self.focus == id);
                 actions.extend(acts);
+                if self.focus == id
+                    && let Some(intent) = self.handoff_menu_input(ui.ctx(), content.left_bottom())
+                {
+                    handoff = Some((id, intent));
+                }
                 if clicked || ui.input(|inp| inp.pointer.primary_pressed()) {
                     self.focus = id;
                 }
@@ -1505,6 +2471,10 @@ impl TerminalApp {
             {
                 p.window = Some(g);
             }
+        }
+        if let Some((id, intent)) = handoff {
+            self.focus = id;
+            self.run_handoff(intent);
         }
         actions
     }
@@ -1557,12 +2527,79 @@ fn tab_menu(ui: &mut Ui, pid: PaneId, link: Option<Link>, cmds: &mut Vec<GroupCm
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn panel_labels_have_no_unavailable_builds() {
+        assert!(PANELS.iter().all(|(label, _)| !label.contains("(unavailable)")), "stale label in PANELS");
+        assert!(PANELS.contains(&("Regression Lab", "LAB")));
+        assert!(PANELS.contains(&("Attribution", "ATTR")));
+    }
+
+    #[test]
+    fn new_twall_opens_default_pane() {
+        let mut app = crate::app::tests::test_app();
+        app.execute("NEW TWALL");
+        assert!(
+            matches!(&app.pane_mut(app.focus).unwrap().kind, PaneKind::TrendWall(p) if !p.daily && p.loading && p.spec.is_empty())
+        );
+        app.execute("SPLIT DOWN TWALL D");
+        assert!(matches!(&app.pane_mut(app.focus).unwrap().kind, PaneKind::TrendWall(p) if p.daily && p.loading));
+        assert_eq!(app.panes.iter().filter(|p| matches!(p.kind, PaneKind::TrendWall(_))).count(), 2);
+        assert!(PANELS.contains(&("Trend Wall", "TWALL")));
+        let settings = app.pane_mut(app.focus).unwrap().kind.settings();
+        assert_eq!(PaneKind::from_settings(settings.clone()).settings(), settings);
+    }
+
     use super::*;
     use crate::dock::Node;
 
     fn groups(n: &Node) -> (Rect, Vec<crate::dock::Group>) {
         let area = Rect::from_min_size(pos2(0.0, 0.0), vec2(1000.0, 600.0));
         (area, n.layout(area, 6.0).0)
+    }
+
+    #[test]
+    fn new_and_split_tstack_open_five_minute_charts_and_preserve_archive_source() {
+        let mut app = crate::app::tests::test_app();
+        for command in ["NEW TSTACK NVDA", "SPLIT DOWN TSTACK AAPL", "NEW TSTACK D"] {
+            app.execute(command);
+            let PaneKind::Chart(c) = &app.pane_mut(app.focus).unwrap().kind else { panic!("stack chart") };
+            assert_eq!(c.tf, tr_core::Timeframe::M5);
+            if command == "NEW TSTACK D" {
+                assert_eq!(c.symbol, "D US Equity");
+            }
+            assert!(c.show_stack);
+            assert!(!c.archive);
+            let settings = app.pane_mut(app.focus).unwrap().kind.settings();
+            assert!(matches!(PaneKind::from_settings(settings),PaneKind::Chart(c) if c.show_stack));
+        }
+        if let PaneKind::Chart(c) = &mut app.pane_mut(app.focus).unwrap().kind {
+            c.archive = true;
+        }
+        app.execute("NEW TSTACK MSFT");
+        assert!(
+            matches!(&app.pane_mut(app.focus).unwrap().kind,PaneKind::Chart(c) if c.archive && c.tf==tr_core::Timeframe::D1 && c.show_stack)
+        );
+    }
+
+    #[test]
+    fn new_rrg_opens_default_pane() {
+        let mut app = crate::app::tests::test_app();
+        app.execute("NEW RRG");
+        assert!(app.panes.iter().any(
+            |p| matches!(&p.kind,PaneKind::Rotation(r) if r.spec.is_empty() && r.tail==10 && r.show_table && r.loading)
+        ));
+        app.execute("SPLIT DOWN RRG");
+        assert_eq!(app.panes.iter().filter(|p| matches!(p.kind, PaneKind::Rotation(_))).count(), 2);
+        assert!(PANELS.contains(&("Rotation", "RRG")));
+        let PaneKind::Rotation(p) = &mut app.pane_mut(app.focus).unwrap().kind else { panic!() };
+        p.spec = "AAPL MSFT VS QQQ WEEKLY TAIL 20".into();
+        p.tail = 30;
+        p.show_table = false;
+        app.save_layout();
+        let doc = app.store.load("Default").unwrap();
+        let mut restored = crate::app::tests::test_app();
+        restored.apply_doc(doc);
+        assert!(restored.panes.iter().any(|p|matches!(&p.kind,PaneKind::Rotation(r) if r.spec=="AAPL MSFT VS QQQ WEEKLY TAIL 20" && r.tail==30 && !r.show_table && r.loading)));
     }
 
     #[test]
@@ -1645,5 +2682,492 @@ mod tests {
         let dragged = Node::split_with(Dir::Column, vec![Node::leaf(2), Node::leaf(1)], vec![0.3, 0.7]);
         let (shown, target, _) = step(&dragged, 6.1, 900.0);
         assert_eq!(shown, target);
+    }
+
+    #[test]
+    fn intraday_desk_saves_the_previous_layout_and_restores_the_scan() {
+        use crate::app::tests::test_app;
+
+        let mut app = test_app();
+        app.layout_name = "Scratch".into();
+        let help = app.new_pane(PaneKind::Help);
+        app.dock = Node::leaf(help);
+        app.focus = help;
+        app.save_layout();
+
+        app.execute("IDESK");
+        assert_eq!(app.layout_name, "Intraday");
+        assert!(app.store.exists("Scratch") && app.store.exists("Intraday"));
+        assert!(app.watch_ui.intraday);
+        assert!(!app.watch_ui.calendar);
+        assert_eq!(app.dock.visible().len(), 4);
+        assert!(app.status.contains("intraday desk"));
+        let chart = app.panes.iter().find_map(|p| match &p.kind {
+            PaneKind::Chart(c) => Some((p.link, c.symbol.clone(), c.tf)),
+            _ => None,
+        });
+        assert_eq!(chart, Some((Some(Link::Blue), "AAPL US Equity".into(), tr_core::Timeframe::M5)));
+        let pace = app.panes.iter().find_map(|p| match &p.kind {
+            PaneKind::VolumePace(v) => Some((p.link, v.symbol.clone(), v.spec.clone())),
+            _ => None,
+        });
+        assert_eq!(pace, Some((Some(Link::Blue), "AAPL US Equity".into(), String::new())));
+        let breadth = app.panes.iter().find_map(|p| match &p.kind {
+            PaneKind::Breadth(b) => Some(b.spec.clone()),
+            _ => None,
+        });
+        assert_eq!(breadth, Some(String::new()));
+        assert!(app.panes.iter().any(|p| matches!(p.kind, PaneKind::Watchlist)));
+        let saved = app.store.load("Intraday").unwrap();
+        assert!(saved.panes.iter().any(|p| matches!(p.settings, PaneSettings::IntradayScan)));
+        assert!(saved.panes.iter().any(|p| {
+            matches!(&p.settings, PaneSettings::Chart { symbol, tf, .. } if symbol == "AAPL US Equity" && *tf == tr_core::Timeframe::M5)
+        }));
+        let scratch = app.store.load("Scratch").unwrap();
+        assert!(scratch.panes.iter().all(|p| !matches!(p.settings, PaneSettings::IntradayScan)));
+        assert!(scratch.panes.iter().any(|p| matches!(p.settings, PaneSettings::Help)));
+
+        app.open_security("NVDA");
+        let symbols: Vec<_> = app
+            .panes
+            .iter()
+            .filter_map(|p| match &p.kind {
+                PaneKind::Chart(c) => Some(c.symbol.clone()),
+                PaneKind::VolumePace(v) => Some(v.symbol.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(symbols, vec!["NVDA US Equity".to_string(), "NVDA US Equity".to_string()]);
+        assert_eq!(app.panes.len(), 4);
+        assert!(app.watch_ui.intraday);
+
+        app.execute("MSFT IDESK");
+        assert_eq!(app.layout_name, "Intraday");
+        assert_eq!(app.panes.len(), 4);
+        assert!(app.panes.iter().any(
+            |p| matches!(&p.kind, PaneKind::Chart(c) if c.symbol == "MSFT US Equity" && c.tf == tr_core::Timeframe::M5)
+        ));
+        assert!(app.panes.iter().any(|p| matches!(&p.kind, PaneKind::VolumePace(v) if v.symbol == "MSFT US Equity")));
+
+        app.switch_layout("Scratch");
+        assert!(!app.watch_ui.intraday);
+        assert_eq!(app.panes.len(), 1);
+        assert!(app.panes.iter().any(|p| matches!(p.kind, PaneKind::Help)));
+
+        app.switch_layout("Intraday");
+        assert!(app.watch_ui.intraday);
+        assert_eq!(app.dock.visible().len(), 4);
+        assert!(app.panes.iter().any(|p| matches!(&p.kind, PaneKind::Chart(c) if c.symbol == "MSFT US Equity")));
+        assert!(app.panes.iter().any(|p| matches!(&p.kind, PaneKind::VolumePace(v) if v.symbol == "MSFT US Equity")));
+        assert!(app.panes.iter().any(|p| matches!(&p.kind, PaneKind::Breadth(b) if b.spec.is_empty())));
+    }
+
+    fn charts(app: &TerminalApp) -> Vec<(PaneId, Option<Link>, String, tr_core::Timeframe)> {
+        app.panes
+            .iter()
+            .filter_map(|p| match &p.kind {
+                PaneKind::Chart(c) => Some((p.id, p.link, c.symbol.clone(), c.tf)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn chart(app: &mut TerminalApp, id: PaneId) -> &mut crate::chart_view::ChartState {
+        match &mut app.pane_mut(id).unwrap().kind {
+            PaneKind::Chart(c) => c,
+            _ => panic!("chart pane"),
+        }
+    }
+
+    #[test]
+    fn cockpit_opens_three_linked_native_charts_and_saves_the_layout() {
+        use tr_core::Timeframe::*;
+        let mut app = crate::app::tests::test_app();
+        let (worker, mut requests) = Worker::test_channel();
+        app.worker = worker;
+        app.execute("AAPL COCKPIT");
+        assert_eq!(app.layout_name, "Cockpit");
+        let got = charts(&app);
+        assert_eq!(got.len(), 3);
+        // Middle interval is the main (left) pane, then slow top-right, fast bottom-right.
+        assert_eq!(got.iter().map(|c| c.3).collect::<Vec<_>>(), vec![M5, M15, M1]);
+        assert!(got.iter().all(|c| c.1 == Some(Link::Blue) && c.2 == "AAPL US Equity"));
+        assert_eq!(app.dock, Node::preset(Layout::MainRight2, &got.iter().map(|c| c.0).collect::<Vec<_>>()));
+        assert_eq!(app.focus, got[0].0);
+        for p in &app.panes {
+            let PaneKind::Chart(c) = &p.kind else { panic!() };
+            assert!(c.show_stack && c.show_rail);
+        }
+        assert_eq!(chart(&mut app, got[0].0).cockpit_chip.as_deref(), Some("COCKPIT 1m · 5m · 15m"));
+        // Each pane asks for its own native interval; nothing is resampled from another lane.
+        let mut native = Vec::new();
+        while let Ok(r) = requests.try_recv() {
+            if let Request::History { pane, symbol, tf, .. } = r {
+                native.push((pane, symbol, tf));
+            }
+        }
+        native.sort();
+        let mut want: Vec<_> = got.iter().map(|c| (c.0, c.2.clone(), c.3)).collect();
+        want.sort();
+        assert_eq!(native, want);
+        let saved = app.store.load("Cockpit").unwrap();
+        let mut tfs: Vec<_> = saved
+            .panes
+            .iter()
+            .filter_map(|p| match &p.settings {
+                PaneSettings::Chart { tf, show_stack: true, .. } if p.link == Some(Link::Blue) => Some(*tf),
+                _ => None,
+            })
+            .collect();
+        tfs.sort_by_key(|t| t.seconds());
+        assert_eq!(tfs, vec![M1, M5, M15]);
+
+        // Custom ladder, and a bad one changes nothing.
+        app.execute("NVDA CKPT 5m 15m 1h");
+        assert_eq!(charts(&app).iter().map(|c| c.3).collect::<Vec<_>>(), vec![M15, H1, M5]);
+        let before = charts(&app);
+        for bad in ["COCKPIT 15m 5m 1m", "COCKPIT 5m 5m 15m", "COCKPIT 1m 5m 1D"] {
+            app.execute(bad);
+            assert!(app.status.starts_with("COCKPIT"), "{bad}: {}", app.status);
+            assert_eq!(charts(&app), before, "{bad}");
+        }
+    }
+
+    #[test]
+    fn cockpit_keeps_the_previous_layout_under_its_name() {
+        let mut app = crate::app::tests::test_app();
+        app.layout_name = "Scratch".into();
+        let help = app.new_pane(PaneKind::Help);
+        app.dock = Node::leaf(help);
+        app.focus = help;
+        app.save_layout();
+        app.execute("MSFT COCKPIT");
+        assert_eq!(app.layout_name, "Cockpit");
+        assert!(app.store.exists("Scratch") && app.store.exists("Cockpit"));
+        let scratch = app.store.load("Scratch").unwrap();
+        assert!(scratch.panes.iter().any(|p| matches!(p.settings, PaneSettings::Help)));
+        assert!(scratch.panes.iter().all(|p| !matches!(p.settings, PaneSettings::Chart { .. })));
+        // Re-running inside the Cockpit does not overwrite another layout.
+        app.execute("AAPL COCKPIT");
+        assert!(app.store.load("Scratch").unwrap().panes.iter().any(|p| matches!(p.settings, PaneSettings::Help)));
+        app.switch_layout("Scratch");
+        assert!(app.panes.iter().any(|p| matches!(p.kind, PaneKind::Help)));
+        app.switch_layout("Cockpit");
+        assert_eq!(charts(&app).len(), 3);
+        assert!(charts(&app).iter().all(|c| c.2 == "AAPL US Equity" && c.1 == Some(Link::Blue)));
+    }
+
+    #[test]
+    fn anchors_propagate_to_linked_charts_of_the_same_symbol_only() {
+        let mut app = crate::app::tests::test_app();
+        let add = |app: &mut TerminalApp, symbol: &str, link: Option<Link>| {
+            let id = app.new_pane(PaneKind::Chart(Box::new(crate::chart_view::ChartState::new(
+                0,
+                symbol,
+                tr_core::Timeframe::M5,
+            ))));
+            app.pane_mut(id).unwrap().link = link;
+            id
+        };
+        let a = add(&mut app, "AAPL", Some(Link::Blue));
+        let b = add(&mut app, "AAPL", Some(Link::Blue));
+        let other_name = add(&mut app, "MSFT", Some(Link::Blue));
+        let other_group = add(&mut app, "AAPL", Some(Link::Red));
+        let unlinked = add(&mut app, "AAPL", None);
+        let anchors = vec![1_790_000_000, 1_790_003_600];
+        let c = chart(&mut app, a);
+        c.avwap_anchors = anchors.clone();
+        c.avwap_dirty = true;
+        app.sync_linked_anchors();
+        assert_eq!(chart(&mut app, b).avwap_anchors, anchors);
+        for id in [other_name, other_group, unlinked] {
+            assert!(chart(&mut app, id).avwap_anchors.is_empty(), "pane {id}");
+        }
+        assert!(!chart(&mut app, a).avwap_dirty, "propagated once");
+        assert!(!chart(&mut app, b).avwap_dirty, "a copy does not echo back");
+        // AVWAP CLEAR on the focused chart clears its linked twin too.
+        app.focus = b;
+        app.execute("AVWAP CLEAR");
+        assert!(chart(&mut app, a).avwap_anchors.is_empty());
+        assert!(app.status.contains("cleared"));
+    }
+
+    #[test]
+    fn pane_settings_round_trip_keeps_avwap_anchors() {
+        let mut c = crate::chart_view::ChartState::new(0, "AAPL", tr_core::Timeframe::M5);
+        c.avwap_anchors = vec![1_790_000_000];
+        c.avwap_store.insert("MSFT US Equity".into(), vec![1_790_100_000, 1_790_200_000]);
+        let settings = PaneKind::Chart(Box::new(c)).settings();
+        let PaneSettings::Chart { avwap, .. } = &settings else { panic!() };
+        assert_eq!(avwap.get("AAPL US Equity"), Some(&vec![1_790_000_000]));
+        let json = serde_json::to_string(&settings).unwrap();
+        let back: PaneSettings = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, settings);
+        let PaneKind::Chart(restored) = PaneKind::from_settings(back) else { panic!() };
+        assert_eq!(restored.avwap_anchors, vec![1_790_000_000]);
+        assert_eq!(restored.avwap_store.get("MSFT US Equity").map(Vec::len), Some(2));
+        assert_eq!(PaneKind::Chart(restored).settings(), settings);
+        // A chart without anchors does not write the field at all.
+        let plain = PaneKind::Chart(Box::new(crate::chart_view::ChartState::new(0, "AAPL", tr_core::Timeframe::M5)));
+        assert!(!serde_json::to_string(&plain.settings()).unwrap().contains("avwap"));
+    }
+
+    #[test]
+    fn older_layout_without_avwap_field_loads() {
+        let mut settings = crate::layouts::chart_settings("AAPL US Equity", &Default::default());
+        let PaneSettings::Chart { avwap, .. } = &mut settings else { panic!() };
+        avwap.insert("AAPL US Equity".into(), vec![1]);
+        let mut value = serde_json::to_value(&settings).unwrap();
+        let fields = value.get_mut("Chart").and_then(|v| v.as_object_mut()).expect("chart object");
+        assert!(fields.remove("avwap").is_some());
+        let old: PaneSettings = serde_json::from_value(value).unwrap();
+        let PaneSettings::Chart { avwap, symbol, .. } = &old else { panic!() };
+        assert!(avwap.is_empty());
+        assert_eq!(symbol, "AAPL US Equity");
+        let PaneKind::Chart(c) = PaneKind::from_settings(old) else { panic!() };
+        assert!(c.avwap_anchors.is_empty());
+    }
+
+    #[test]
+    fn shift_click_requests_jump_on_linked_charts() {
+        use crate::worker::Response;
+        use tr_chart::scene::SeriesGpu;
+        let mut app = crate::app::tests::test_app();
+        let (worker, mut requests, responses) = Worker::test_channel_with_responses();
+        app.worker = worker;
+        let add = |app: &mut TerminalApp, symbol: &str, tf: tr_core::Timeframe, link: Link| {
+            let id = app.new_pane(PaneKind::Chart(Box::new(crate::chart_view::ChartState::new(0, symbol, tf))));
+            app.pane_mut(id).unwrap().link = Some(link);
+            id
+        };
+        let five = add(&mut app, "AAPL", tr_core::Timeframe::M5, Link::Blue);
+        let one = add(&mut app, "AAPL", tr_core::Timeframe::M1, Link::Blue);
+        let other_name = add(&mut app, "MSFT", tr_core::Timeframe::M1, Link::Blue);
+        let other_group = add(&mut app, "AAPL", tr_core::Timeframe::M1, Link::Red);
+        // Real 5-minute bars for the source chart only, delivered through the drain.
+        let date = chrono::NaiveDate::from_ymd_opt(2026, 11, 10).unwrap();
+        while let Ok(r) = requests.try_recv() {
+            if let Request::History { pane, generation, symbol, tf, .. } = r
+                && pane == five
+            {
+                let bars = std::sync::Arc::new(
+                    tr_data::intraday::regular_opens(date, tf)
+                        .into_iter()
+                        .map(|ts| {
+                            tr_core::Bar::new(ts, 100.0, 101.0, 99.0, 100.5, 1000.0)
+                                .with_provenance(tr_core::Provenance::Real)
+                        })
+                        .collect::<Vec<_>>(),
+                );
+                let gpu = SeriesGpu::build(&bars);
+                responses
+                    .send(Response::History {
+                        pane,
+                        generation,
+                        symbol,
+                        tf,
+                        bars,
+                        gpu,
+                        prepended: 0,
+                        from_cache: false,
+                        exhausted: true,
+                        live: false,
+                    })
+                    .unwrap();
+            }
+        }
+        app.drain();
+        assert!(!chart(&mut app, five).is_empty());
+        let ctx = egui::Context::default();
+        let rect = Rect::from_min_size(pos2(0.0, 0.0), vec2(1000.0, 700.0));
+        let i = app.idx(five).unwrap();
+        let frame = |app: &mut TerminalApp, events: Vec<egui::Event>| {
+            app.link_bus.begin_frame();
+            ctx.run_ui(
+                egui::RawInput {
+                    time: Some(ctx.input(|i| i.time) + 0.2),
+                    screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(1100.0, 800.0))),
+                    events,
+                    ..Default::default()
+                },
+                |ui| {
+                    app.render_content(ui, i, rect, true);
+                },
+            )
+            .textures_delta
+            .clear();
+        };
+        frame(&mut app, vec![]);
+        let pos = pos2(400.0, 400.0);
+        let press = |pressed| egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::SHIFT,
+        };
+        frame(&mut app, vec![egui::Event::PointerMoved(pos)]);
+        frame(&mut app, vec![press(true)]);
+        frame(&mut app, vec![press(false)]);
+        let target = chart(&mut app, one).pending_jump().expect("linked 1m chart jumps");
+        let bars_ts: Vec<i64> = tr_data::intraday::regular_opens(date, tr_core::Timeframe::M5);
+        assert!(bars_ts.contains(&target), "the jump is to the clicked bar's open");
+        assert!(app.status.starts_with("Centred 1 linked chart"));
+        assert_eq!(chart(&mut app, other_name).pending_jump(), None);
+        assert_eq!(chart(&mut app, other_group).pending_jump(), None);
+        assert_eq!(chart(&mut app, five).pending_jump(), None);
+    }
+
+    #[test]
+    fn linked_ghost_appears_on_the_same_frame_for_charts_painted_first() {
+        use crate::worker::Response;
+        use tr_chart::scene::SeriesGpu;
+        let mut app = crate::app::tests::test_app();
+        let (worker, mut requests, responses) = Worker::test_channel_with_responses();
+        app.worker = worker;
+        let add = |app: &mut TerminalApp, tf: tr_core::Timeframe| {
+            let id = app.new_pane(PaneKind::Chart(Box::new(crate::chart_view::ChartState::new(0, "AAPL", tf))));
+            app.pane_mut(id).unwrap().link = Some(Link::Blue);
+            id
+        };
+        // `first` paints before `second`; the pointer will hover `second`.
+        let first = add(&mut app, tr_core::Timeframe::M15);
+        let second = add(&mut app, tr_core::Timeframe::M5);
+        let date = chrono::NaiveDate::from_ymd_opt(2026, 11, 10).unwrap();
+        while let Ok(r) = requests.try_recv() {
+            if let Request::History { pane, generation, symbol, tf, .. } = r {
+                let bars = std::sync::Arc::new(
+                    tr_data::intraday::regular_opens(date, tf)
+                        .into_iter()
+                        .map(|ts| {
+                            tr_core::Bar::new(ts, 100.0, 101.0, 99.0, 100.5, 1000.0)
+                                .with_provenance(tr_core::Provenance::Real)
+                        })
+                        .collect::<Vec<_>>(),
+                );
+                let gpu = SeriesGpu::build(&bars);
+                let r = Response::History {
+                    pane,
+                    generation,
+                    symbol,
+                    tf,
+                    bars,
+                    gpu,
+                    prepended: 0,
+                    from_cache: false,
+                    exhausted: true,
+                    live: false,
+                };
+                responses.send(r).unwrap();
+            }
+        }
+        app.drain();
+        let ctx = egui::Context::default();
+        let rects = [
+            (app.idx(first).unwrap(), Rect::from_min_size(pos2(0.0, 0.0), vec2(800.0, 600.0))),
+            (app.idx(second).unwrap(), Rect::from_min_size(pos2(0.0, 620.0), vec2(800.0, 600.0))),
+        ];
+        let frame = |app: &mut TerminalApp, events: Vec<egui::Event>| {
+            ctx.run_ui(
+                egui::RawInput {
+                    time: Some(ctx.input(|i| i.time) + 0.2),
+                    screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(900.0, 1300.0))),
+                    events,
+                    ..Default::default()
+                },
+                |ui| {
+                    app.link_bus.begin_frame();
+                    app.seed_link_hover(ui.ctx());
+                    for (i, rect) in rects {
+                        app.render_content(ui, i, rect, false);
+                    }
+                },
+            )
+            .textures_delta
+            .clear();
+        };
+        // What the first chart was fed, and what the second chart's own paint published
+        // (the group's final cursor this frame).
+        let ghost = |app: &mut TerminalApp| {
+            chart(app, first).link_in.as_ref().and_then(|f| f.cursor.as_ref()).map(|c| (c.source, c.span))
+        };
+        let published = |app: &TerminalApp| {
+            let feed = app.link_bus.feed(Link::Blue, PaneId::MAX, "AAPL US Equity", tr_core::Timeframe::M5);
+            feed.cursor.map(|c| (c.source, c.span))
+        };
+        frame(&mut app, vec![]);
+        frame(&mut app, vec![]);
+        assert_eq!(ghost(&mut app), None);
+        // The pointer arrives on the second chart: the first chart, painted earlier in the
+        // same frame, already gets the cursor the second one publishes.
+        frame(&mut app, vec![egui::Event::PointerMoved(pos2(400.0, 820.0))]);
+        let a = published(&app);
+        assert_eq!(a.map(|c| c.0), Some(second), "the second chart hovers a bar");
+        assert_eq!(ghost(&mut app), a);
+        // Moving to another bar updates the first chart on that same frame too.
+        frame(&mut app, vec![egui::Event::PointerMoved(pos2(200.0, 820.0))]);
+        let b = published(&app);
+        assert!(b.is_some() && b != a);
+        assert_eq!(ghost(&mut app), b);
+        // Leaving every chart clears the ghost on the same frame.
+        frame(&mut app, vec![egui::Event::PointerMoved(pos2(850.0, 1250.0))]);
+        assert_eq!(published(&app), None);
+        assert_eq!(ghost(&mut app), None);
+    }
+
+    #[test]
+    fn cockpit_chip_round_trips_with_the_layout() {
+        let mut c = crate::chart_view::ChartState::new(0, "AAPL", tr_core::Timeframe::M5);
+        c.cockpit_chip = Some("COCKPIT 1m · 5m · 15m".into());
+        let settings = PaneKind::Chart(Box::new(c)).settings();
+        let PaneSettings::Chart { cockpit_chip, .. } = &settings else { panic!() };
+        assert_eq!(cockpit_chip.as_deref(), Some("COCKPIT 1m · 5m · 15m"));
+        let json = serde_json::to_string(&settings).unwrap();
+        let back: PaneSettings = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, settings);
+        let PaneKind::Chart(restored) = PaneKind::from_settings(back) else { panic!() };
+        assert_eq!(restored.cockpit_chip.as_deref(), Some("COCKPIT 1m · 5m · 15m"));
+        // A chart without a chip does not write the field.
+        let plain = PaneKind::Chart(Box::new(crate::chart_view::ChartState::new(0, "AAPL", tr_core::Timeframe::M5)));
+        assert!(!serde_json::to_string(&plain.settings()).unwrap().contains("cockpit_chip"));
+
+        // Switching layouts and back keeps the chip on the Cockpit's main chart.
+        let mut app = crate::app::tests::test_app();
+        app.layout_name = "Scratch".into();
+        let help = app.new_pane(PaneKind::Help);
+        app.dock = Node::leaf(help);
+        app.focus = help;
+        app.save_layout();
+        app.execute("AAPL COCKPIT");
+        app.switch_layout("Scratch");
+        app.switch_layout("Cockpit");
+        let chips: Vec<_> = app
+            .panes
+            .iter()
+            .filter_map(|p| match &p.kind {
+                PaneKind::Chart(c) => Some((c.tf, c.cockpit_chip.clone())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(chips.len(), 3);
+        for (tf, chip) in chips {
+            let want = (tf == tr_core::Timeframe::M5).then(|| "COCKPIT 1m · 5m · 15m".to_string());
+            assert_eq!(chip, want, "{tf:?}");
+        }
+    }
+
+    #[test]
+    fn older_layout_without_cockpit_chip_field_loads() {
+        let mut settings = crate::layouts::chart_settings("AAPL US Equity", &Default::default());
+        let PaneSettings::Chart { cockpit_chip, .. } = &mut settings else { panic!() };
+        *cockpit_chip = Some("COCKPIT 1m · 5m · 15m".into());
+        let mut value = serde_json::to_value(&settings).unwrap();
+        let fields = value.get_mut("Chart").and_then(|v| v.as_object_mut()).expect("chart object");
+        assert!(fields.remove("cockpit_chip").is_some());
+        let old: PaneSettings = serde_json::from_value(value).unwrap();
+        let PaneSettings::Chart { cockpit_chip, symbol, .. } = &old else { panic!() };
+        assert_eq!(*cockpit_chip, None);
+        assert_eq!(symbol, "AAPL US Equity");
+        let PaneKind::Chart(c) = PaneKind::from_settings(old) else { panic!() };
+        assert_eq!(c.cockpit_chip, None);
     }
 }

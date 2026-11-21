@@ -4,17 +4,60 @@
 //! drag and drop, pop-out windows, link groups, saved layouts), `panels` (per-kind pane
 //! content) and `settings_view` (preferences UI).
 
+mod alerts;
+mod autocorr;
+mod backtest;
+mod backup;
 mod broker;
 mod chrome;
+mod command_bar;
+mod compare;
 mod demo;
+mod desk;
+mod gap_fill;
+mod handoff;
+mod health_view;
 mod hotkeys_view;
+mod journal;
+mod lookalike;
 mod options_view;
 mod palette_view;
 mod panels;
+mod portfolio_risk;
+mod portfolio_stops;
 mod portfolio_view;
+mod realized_vol;
+mod relative_path;
+pub(crate) mod research;
+mod rotation;
+mod session_breadth;
+mod session_brief;
+mod session_clock;
+mod session_extreme;
+mod session_path;
 mod settings_view;
+mod settings_writer;
+mod stats;
+pub(crate) mod studio_corr;
+pub(crate) mod studio_dist;
+pub(crate) mod studio_frame;
+pub(crate) mod studio_hub;
+pub(crate) mod studio_lab;
+pub(crate) mod studio_attribution;
+pub(crate) mod studio_residual;
+pub(crate) mod studio_when;
+#[cfg(test)]
+mod scan_perf_gate;
+#[cfg(test)]
+mod studio_perf_gate;
+mod studio_season;
 mod theming;
 mod trading;
+mod trend_wall;
+pub(crate) mod tstack_tune;
+pub(crate) mod vault_view;
+mod volume_pace;
+mod watchlists;
 mod workspace;
 
 pub use broker::PosSort;
@@ -27,7 +70,8 @@ use serde::{Deserialize, Serialize};
 use tr_chart::drawings::Tool;
 use tr_congress::Trade;
 use tr_congress::db::{Alert, PoliticianSummary};
-use tr_data::{NewsItem, OrderBook, Quote, SearchHit, YieldCurves};
+use tr_data::health::{DataMode, Feed, FeedState, Snapshot};
+use tr_data::{OrderBook, Quote, SearchHit, YieldCurves};
 
 use crate::anim;
 use crate::chart_view::ChartState;
@@ -45,6 +89,7 @@ use chrome::{SIDEBAR_W, STATUS_H, SidebarCmd};
 use settings_view::SettingsTab;
 
 pub enum PaneKind {
+    Vault(Box<vault_view::VaultPane>),
     Chart(Box<ChartState>),
     Feed {
         filter: FeedFilter,
@@ -61,8 +106,10 @@ pub enum PaneKind {
     },
     Politicians,
     Alerts,
+    Research(Box<research::ResearchPane>),
     Watchlist,
     Help,
+    Health,
     Wei,
     Curve,
     Search {
@@ -73,6 +120,51 @@ pub enum PaneKind {
     Options(Box<OptionsPane>),
     /// Brokerage accounts through SnapTrade (`PORT`, `ACCT`, `POS`, `ORD`, `ACTV`).
     Portfolio(Box<broker::PortfolioPane>),
+    /// Watchlist-scoped PM Desk (`DESK` / `PM`): leaders, group performance, position size.
+    Desk(Box<desk::DeskPane>),
+    /// Trade journal / checklist (`JOURNAL`).
+    Journal(Box<journal::JournalPane>),
+    /// Historical risk/return and conditional forward returns (`STATS` / `COND`).
+    Stats(Box<stats::StatsPane>),
+    Studio(Box<studio_hub::StudioPane>),
+    /// Legacy route placeholder; every route (QUICK, LAB, RESID, ATTR) now opens a real pane.
+    #[allow(dead_code)]
+    StudioRoute(tr_data::studio::StudioRoute),
+    StudioDist(Box<studio_dist::DistPane>),
+    StudioCorr(Box<studio_corr::CorrPane>),
+    /// Regression Lab (`STUDIO lab`, `NEW LAB`); bare `LAB` stays a ticker.
+    StudioLab(Box<studio_lab::LabPane>),
+    /// Frozen residual ticker (`STUDIO resid open <id>`, `NEW RESID`); bare `RESID` stays a ticker.
+    StudioResid(Box<studio_residual::ResidPane>),
+    /// Factor attribution of a saved model (`STUDIO attr`, `NEW ATTR`); bare `ATTR` stays a ticker.
+    StudioAttr(Box<studio_attribution::AttrPane>),
+    TstackTune(Box<tstack_tune::TunePane>),
+    StudioSeason(Box<studio_season::SeasonPane>),
+    /// Strategy vs buy-and-hold paper backtest (`BACKTEST` / `BT`).
+    Backtest(Box<backtest::BacktestPane>),
+    /// Historical lookalikes / nearest neighbors (`LOOKALIKE` / `KNN`).
+    Lookalike(Box<lookalike::LookalikePane>),
+    /// Multi-symbol intraday compare, percent from each 09:30 open (`ICMP`).
+    IntradayCompare(Box<compare::ComparePane>),
+    /// Today versus the typical intraday path (`SPATH`).
+    SessionPath(Box<session_path::SessionPathPane>),
+    /// Share of a list at or above the 09:30 open and session VWAP (`BRD`).
+    Breadth(Box<session_breadth::BreadthPane>),
+    Rotation(Box<rotation::RotationPane>),
+    TrendWall(Box<trend_wall::TrendWallPane>),
+    /// Cumulative volume versus the usual pace of prior sessions (`VPACE`).
+    VolumePace(Box<volume_pace::VolumePacePane>),
+    RealizedVol(Box<realized_vol::RealizedVolPane>),
+    Autocorr(Box<autocorr::AutocorrPane>),
+    /// Today's open versus the prior cash close (`GFILL`).
+    GapFill(Box<gap_fill::GapFillPane>),
+    /// When the session high and low print (`XTRM`).
+    SessionExtreme(Box<session_extreme::SessionExtremePane>),
+    SessionClock(Box<session_clock::SessionClockPane>),
+    /// This name's percent from the 09:30 open minus SPY (`RPATH`).
+    RelativePath(Box<relative_path::RelativePathPane>),
+    /// Path, pace, gap, extreme, and versus SPY for one name (`BRIEF`).
+    SessionBrief(Box<session_brief::SessionBriefPane>),
     Settings,
 }
 
@@ -81,6 +173,7 @@ pub struct OptionsPane {
     /// Selected expiration (`None` = nearest).
     pub expiration: Option<i64>,
     pub chain: Option<Box<tr_data::OptionChain>>,
+    pub feed_state: FeedState,
     /// Greeks per call and put, aligned with the chain's contracts.
     pub call_greeks: Vec<Option<tr_core::options::Greeks>>,
     pub put_greeks: Vec<Option<tr_core::options::Greeks>>,
@@ -100,6 +193,7 @@ impl OptionsPane {
             symbol: symbol.into(),
             expiration: None,
             chain: None,
+            feed_state: Default::default(),
             call_greeks: Vec::new(),
             put_greeks: Vec::new(),
             rate: 0.04,
@@ -132,17 +226,55 @@ impl OptionsPane {
 }
 
 pub struct NewsPane {
-    /// `None` = general market headlines.
+    pub scope: tr_data::news::NewsScope,
+    /// Set when [`NewsScope::Symbol`] (and kept when switching away so Symbol can restore).
     pub symbol: Option<String>,
-    pub items: Vec<NewsItem>,
-    pub error: Option<String>,
+    pub batch: Option<tr_data::news::NewsBatch>,
     pub loading: bool,
     pub fetched: Option<Instant>,
 }
 
 impl NewsPane {
     pub fn new(symbol: Option<String>) -> Self {
-        Self { symbol, items: Vec::new(), error: None, loading: true, fetched: None }
+        match symbol {
+            Some(s) => Self::for_symbol(s),
+            None => Self::watchlist(),
+        }
+    }
+
+    pub fn watchlist() -> Self {
+        Self::with_scope(tr_data::news::NewsScope::Watchlist, None)
+    }
+
+    pub fn leaders() -> Self {
+        Self::with_scope(tr_data::news::NewsScope::Leaders, None)
+    }
+
+    pub fn top() -> Self {
+        Self::with_scope(tr_data::news::NewsScope::Top, None)
+    }
+
+    pub fn for_symbol(symbol: impl Into<String>) -> Self {
+        Self::with_scope(tr_data::news::NewsScope::Symbol, Some(symbol.into()))
+    }
+
+    fn with_scope(scope: tr_data::news::NewsScope, symbol: Option<String>) -> Self {
+        Self { scope, symbol, batch: None, loading: true, fetched: None }
+    }
+
+    pub fn accept(&mut self, batch: tr_data::news::NewsBatch) {
+        self.loading = false;
+        if batch.items.is_empty()
+            && !batch.failures.is_empty()
+            && self.batch.as_ref().is_some_and(|b| !b.items.is_empty())
+        {
+            if let Some(prev) = &mut self.batch {
+                prev.stale = true;
+                prev.failures = batch.failures;
+            }
+            return;
+        }
+        self.batch = Some(batch);
     }
 }
 
@@ -152,17 +284,81 @@ pub struct BookPane {
     /// Price bucket; 0 = raw levels.
     pub group: f64,
     pub book: Option<OrderBook>,
+    pub feed_state: FeedState,
+    pub last_ok: Option<i64>,
     pub error: Option<String>,
     pub fetched: Option<Instant>,
 }
 
 impl BookPane {
     pub fn new(symbol: &str, depth: usize, group: f64) -> Self {
-        Self { symbol: symbol.into(), depth, group, book: None, error: None, fetched: None }
+        Self {
+            symbol: symbol.into(),
+            depth,
+            group,
+            book: None,
+            feed_state: Default::default(),
+            last_ok: None,
+            error: None,
+            fetched: None,
+        }
     }
 }
 
 impl PaneKind {
+    fn native_chart_mut(&mut self) -> Option<&mut ChartState> {
+        match self {
+            Self::Chart(c) => Some(c),
+            Self::Studio(s) => Some(&mut s.chart),
+            _ => None,
+        }
+    }
+    fn dist_mut(&mut self) -> Option<&mut studio_dist::DistPane> {
+        match self {
+            Self::StudioDist(p) => Some(p),
+            Self::Studio(s) => s.dist_mut(),
+            _ => None,
+        }
+    }
+    fn corr_mut(&mut self) -> Option<&mut studio_corr::CorrPane> {
+        match self {
+            Self::StudioCorr(p) => Some(p),
+            Self::Studio(s) => s.corr_mut(),
+            _ => None,
+        }
+    }
+    fn season_mut(&mut self) -> Option<&mut studio_season::SeasonPane> {
+        match self {
+            Self::StudioSeason(p) => Some(p),
+            Self::Studio(s) => s.season_mut(),
+            _ => None,
+        }
+    }
+    fn stats_mut(&mut self) -> Option<&mut stats::StatsPane> {
+        match self {
+            Self::Stats(p) => Some(p),
+            _ => None,
+        }
+    }
+    fn backtest_mut(&mut self) -> Option<&mut backtest::BacktestPane> {
+        match self {
+            Self::Backtest(p) => Some(p),
+            Self::Studio(s) => s.backtest_mut(),
+            _ => None,
+        }
+    }
+
+    /// Price history has its own panel identity, so opening research keeps job progress visible.
+    fn panel_type(&self) -> (std::mem::Discriminant<Self>, u8) {
+        let kind = match self {
+            Self::Research(r) if r.history => 1,
+            Self::Backtest(b) if b.intraday => 2,
+            Self::StudioRoute(r) => 10 + *r as u8,
+            _ => 0,
+        };
+        (std::mem::discriminant(self), kind)
+    }
+
     /// Short tab title.
     fn tab_title(&self) -> String {
         let short = |s: &str| tr_data::security(s).ticker;
@@ -175,19 +371,162 @@ impl PaneKind {
             }
             PaneKind::Politicians => "Politicians".into(),
             PaneKind::Alerts => "Alerts".into(),
+            PaneKind::Research(r) => {
+                if r.history {
+                    "Price history".into()
+                } else if let Some(Ok(spec)) = r.view.as_ref().map(|v| &v.spec) {
+                    format!("Scan view: {}", spec.view.title())
+                } else {
+                    r.scan.as_ref().map(|s| format!("Scan: {s}")).unwrap_or_else(|| "Archive universe".into())
+                }
+            }
             PaneKind::Watchlist => "Watchlist".into(),
             PaneKind::Help => "Help".into(),
+            PaneKind::Health => "Feed Health".into(),
+            PaneKind::Vault(_) => "Bar Vault".into(),
             PaneKind::Wei => "World Markets".into(),
             PaneKind::Curve => "Yield Curve".into(),
             PaneKind::Search { query } if query.is_empty() => "Search".into(),
             PaneKind::Search { query } => format!("Search: {query}"),
-            PaneKind::News(n) => match &n.symbol {
-                Some(s) => format!("{} News", short(s)),
-                None => "Top News".into(),
+            PaneKind::News(n) => match n.scope {
+                tr_data::news::NewsScope::Symbol => {
+                    n.symbol.as_deref().map(|s| format!("{} News", short(s))).unwrap_or_else(|| "News".into())
+                }
+                tr_data::news::NewsScope::Watchlist => "Watchlist News".into(),
+                tr_data::news::NewsScope::Leaders => "Leaders News".into(),
+                tr_data::news::NewsScope::Top => "Top News".into(),
             },
             PaneKind::OrderBook(b) => format!("{} Depth", short(&b.symbol)),
             PaneKind::Options(o) => format!("{} Options", short(&o.symbol)),
             PaneKind::Portfolio(p) => p.title(),
+            PaneKind::Desk(d) => {
+                if d.group.is_empty() {
+                    "PM Desk".into()
+                } else {
+                    format!("Desk: {}", d.group)
+                }
+            }
+            PaneKind::Journal(j) => {
+                if j.filter.is_empty() {
+                    "Journal".into()
+                } else {
+                    format!("{} Journal", tr_data::security(&j.filter).ticker)
+                }
+            }
+            PaneKind::Studio(s) => if s.quick {format!("{} Quick",short(&s.context.symbol))}else{format!("{} Studio · {}", short(&s.context.symbol), s.lens.label())},
+            PaneKind::StudioRoute(route) => route.code().into(),
+            PaneKind::StudioDist(s) => format!("{} Distribution", tr_data::security(&s.symbol).ticker),
+            PaneKind::TstackTune(s) => format!("{} TSTACK Tune", tr_data::security(&s.symbol).ticker),
+            PaneKind::StudioCorr(s) => format!("{} CORR", tr_data::security(&s.symbol).ticker),
+            PaneKind::StudioLab(s) => format!("{} Lab", tr_data::security(&s.symbol).ticker),
+            PaneKind::StudioResid(s) => {
+                if s.model_id.is_empty() { "Residual".into() } else { format!("{} Residual", s.model_id) }
+            }
+            PaneKind::StudioAttr(s) => {
+                if s.model_id.is_empty() { "Attribution".into() } else { format!("{} Attribution", s.model_id) }
+            }
+            PaneKind::StudioSeason(s) => {
+                if s.symbol.trim().is_empty() {
+                    "Seasonality".into()
+                } else {
+                    format!("{} Seasonality", tr_data::security(&s.symbol).ticker)
+                }
+            }
+            PaneKind::Stats(s) => {
+                if s.symbol.trim().is_empty() {
+                    "Stats".into()
+                } else {
+                    format!("{} Stats", tr_data::security(&s.symbol).ticker)
+                }
+            }
+            PaneKind::Backtest(b) => {
+                let kind = if b.intraday { "Intraday" } else { "Backtest" };
+                if b.symbol.trim().is_empty() {
+                    kind.into()
+                } else {
+                    format!("{} {kind}", tr_data::security(&b.symbol).ticker)
+                }
+            }
+            PaneKind::Lookalike(l) => {
+                if l.symbol.trim().is_empty() {
+                    "Lookalikes".into()
+                } else {
+                    format!("{} Lookalikes", tr_data::security(&l.symbol).ticker)
+                }
+            }
+            PaneKind::IntradayCompare(c) => {
+                if c.symbol.trim().is_empty() {
+                    "Compare".into()
+                } else {
+                    format!("{} Compare", tr_data::security(&c.symbol).ticker)
+                }
+            }
+            PaneKind::SessionPath(p) => {
+                if p.symbol.trim().is_empty() {
+                    "Path".into()
+                } else {
+                    format!("{} Path", tr_data::security(&p.symbol).ticker)
+                }
+            }
+            PaneKind::Breadth(_) => "Breadth".into(),
+            PaneKind::Rotation(_) => "Rotation".into(),
+            PaneKind::TrendWall(_) => "Trend Wall".into(),
+            PaneKind::VolumePace(p) => {
+                if p.symbol.trim().is_empty() {
+                    "Pace".into()
+                } else {
+                    format!("{} Pace", tr_data::security(&p.symbol).ticker)
+                }
+            }
+            PaneKind::RealizedVol(p) => {
+                if p.symbol.trim().is_empty() {
+                    "RVAR".into()
+                } else {
+                    format!("{} RVAR", tr_data::security(&p.symbol).ticker)
+                }
+            }
+            PaneKind::Autocorr(p) => {
+                if p.symbol.trim().is_empty() {
+                    "ACOR".into()
+                } else {
+                    format!("{} ACOR", tr_data::security(&p.symbol).ticker)
+                }
+            }
+            PaneKind::GapFill(p) => {
+                if p.symbol.trim().is_empty() {
+                    "Gap".into()
+                } else {
+                    format!("{} Gap", tr_data::security(&p.symbol).ticker)
+                }
+            }
+            PaneKind::SessionExtreme(p) => {
+                if p.symbol.trim().is_empty() {
+                    "High".into()
+                } else {
+                    format!("{} High", tr_data::security(&p.symbol).ticker)
+                }
+            }
+            PaneKind::SessionClock(p) => {
+                if p.symbol.trim().is_empty() {
+                    "CLOCK".into()
+                } else {
+                    format!("{} CLOCK", tr_data::security(&p.symbol).ticker)
+                }
+            }
+            PaneKind::RelativePath(p) => {
+                if p.symbol.trim().is_empty() {
+                    "SPY path".into()
+                } else {
+                    format!("{} vs SPY", tr_data::security(&p.symbol).ticker)
+                }
+            }
+            PaneKind::SessionBrief(p) => {
+                if p.symbol.trim().is_empty() {
+                    "Brief".into()
+                } else {
+                    format!("{} Brief", tr_data::security(&p.symbol).ticker)
+                }
+            }
             PaneKind::Settings => "Settings".into(),
         }
     }
@@ -199,8 +538,19 @@ impl PaneKind {
             PaneKind::Feed { .. } | PaneKind::Ticker { .. } => "CONG",
             PaneKind::Profile { .. } | PaneKind::Politicians => "POL",
             PaneKind::Alerts => "ALRT",
+            PaneKind::Research(r) => {
+                if r.history {
+                    "HIST"
+                } else if r.scan.is_some() {
+                    "SCAN"
+                } else {
+                    "UNIV"
+                }
+            }
             PaneKind::Watchlist => "WL",
             PaneKind::Help => "HELP",
+            PaneKind::Health => "HEALTH",
+            PaneKind::Vault(_) => "VAULT",
             PaneKind::Wei => "WEI",
             PaneKind::Curve => "GC",
             PaneKind::Search { .. } => "SECF",
@@ -208,6 +558,34 @@ impl PaneKind {
             PaneKind::OrderBook(_) => "OB",
             PaneKind::Options(_) => "OMON",
             PaneKind::Portfolio(p) => p.view.code(),
+            PaneKind::Desk(_) => "DESK",
+            PaneKind::Journal(_) => "JRNL",
+            PaneKind::Stats(_) => "STATS",
+            PaneKind::Studio(s) => if s.quick {"QUICK"}else{"STUDIO"},
+            PaneKind::StudioRoute(route) => route.code(),
+            PaneKind::StudioDist(_) => "DIST",
+            PaneKind::StudioCorr(_) => "CORR",
+            PaneKind::StudioLab(_) => "LAB",
+            PaneKind::StudioResid(_) => "RESID",
+            PaneKind::StudioAttr(_) => "ATTR",
+            PaneKind::TstackTune(_) => "TUNE",
+            PaneKind::StudioSeason(_) => "SEASON",
+            PaneKind::Backtest(b) if b.intraday => "IBT",
+            PaneKind::Backtest(_) => "BT",
+            PaneKind::Lookalike(_) => "KNN",
+            PaneKind::IntradayCompare(_) => "ICMP",
+            PaneKind::SessionPath(_) => "SPATH",
+            PaneKind::Breadth(_) => "BRD",
+            PaneKind::Rotation(_) => "RRG",
+            PaneKind::TrendWall(_) => "TWALL",
+            PaneKind::VolumePace(_) => "VPACE",
+            PaneKind::RealizedVol(_) => "RVAR",
+            PaneKind::Autocorr(_) => "ACOR",
+            PaneKind::GapFill(_) => "GFILL",
+            PaneKind::SessionExtreme(_) => "XTRM",
+            PaneKind::SessionClock(_) => "CLOCK",
+            PaneKind::RelativePath(_) => "RPATH",
+            PaneKind::SessionBrief(_) => "BRIEF",
             PaneKind::Settings => "PDF",
         }
     }
@@ -216,10 +594,19 @@ impl PaneKind {
     fn symbol(&self) -> Option<&str> {
         match self {
             PaneKind::Chart(c) => Some(&c.symbol),
+            PaneKind::Studio(s) => Some(&s.context.symbol),
             PaneKind::Ticker { symbol, .. } => Some(symbol),
-            PaneKind::News(n) => n.symbol.as_deref(),
+            PaneKind::News(n) if n.scope == tr_data::news::NewsScope::Symbol => n.symbol.as_deref(),
+            PaneKind::News(_) => None,
             PaneKind::OrderBook(b) => Some(&b.symbol),
             PaneKind::Options(o) => Some(&o.symbol),
+            PaneKind::VolumePace(p) => Some(&p.symbol),
+            PaneKind::RealizedVol(p) => Some(&p.symbol),
+            PaneKind::Autocorr(p) => Some(&p.symbol),
+            PaneKind::SessionBrief(p) => Some(&p.symbol),
+            PaneKind::SessionClock(p) => Some(&p.symbol),
+            PaneKind::StudioDist(p) => Some(&p.symbol),
+            PaneKind::TstackTune(p) => Some(&p.symbol),
             _ => None,
         }
     }
@@ -228,26 +615,62 @@ impl PaneKind {
         matches!(
             self,
             PaneKind::Chart(_)
+                | PaneKind::Studio(_)
                 | PaneKind::Ticker { .. }
-                | PaneKind::News(_)
                 | PaneKind::OrderBook(_)
                 | PaneKind::Options(_)
-        )
+                | PaneKind::VolumePace(_)
+                | PaneKind::RealizedVol(_)
+                | PaneKind::Autocorr(_)
+                | PaneKind::SessionBrief(_)
+        ) || matches!(self, PaneKind::News(n) if n.scope == tr_data::news::NewsScope::Symbol)
     }
 
     fn settings(&self) -> PaneSettings {
         match self {
             PaneKind::Chart(c) => PaneSettings::Chart {
+                archive: c.archive,
+                watch_group: c.watch_group.clone(),
                 symbol: c.symbol.clone(),
                 tf: c.tf,
                 chart_type: c.chart_type,
                 log: c.log,
                 indicators: c.indicators.clone(),
                 drawings: c.drawings.clone(),
+                drawing_store: {
+                    let mut store = c.drawing_store.clone();
+                    store.stash_view(&c.symbol, c.tf, &c.drawings);
+                    store
+                },
                 compare: c.compare.clone(),
                 show_volume: c.show_volume,
                 show_congress: c.show_congress,
+                show_news: c.show_news,
+                show_journal: c.show_journal,
                 magnet: c.magnet,
+                show_box: c.show_box,
+                show_rs: c.show_rs,
+                show_volume_ctx: c.show_volume_ctx,
+                show_stack: c.show_stack,
+                stack_ladder: c.stack_ladder.clone(),
+                stack_tint: c.stack_tint,
+                stack_session: c.stack_session,
+                show_rail: c.show_rail,
+                show_edge: c.show_edge,
+                cone: c.cone_settings(),
+                stops: c.stop_settings(),
+                auction: c.auction_settings(),
+                avwap: {
+                    let mut store = c.avwap_store.clone();
+                    let key = tr_chart::drawings::store_key(&c.symbol);
+                    if c.avwap_anchors.is_empty() {
+                        store.remove(&key);
+                    } else {
+                        store.insert(key, c.avwap_anchors.clone());
+                    }
+                    store
+                },
+                cockpit_chip: c.cockpit_chip.clone(),
             },
             PaneKind::Feed { filter } => {
                 PaneSettings::Feed((*filter != FeedFilter::default()).then(|| (*filter).into()))
@@ -256,12 +679,21 @@ impl PaneKind {
             PaneKind::Profile { query, .. } => PaneSettings::Profile(query.clone()),
             PaneKind::Politicians => PaneSettings::Politicians,
             PaneKind::Alerts => PaneSettings::Alerts,
+            PaneKind::Research(r) => {
+                if r.history {
+                    PaneSettings::PriceHistory
+                } else {
+                    PaneSettings::Research(r.scan.clone())
+                }
+            }
             PaneKind::Watchlist => PaneSettings::Watchlist,
             PaneKind::Help => PaneSettings::Help,
+            PaneKind::Health => PaneSettings::Health,
+            PaneKind::Vault(p) => PaneSettings::Vault { symbol: p.symbol.clone() },
             PaneKind::Wei => PaneSettings::Wei,
             PaneKind::Curve => PaneSettings::Curve,
             PaneKind::Search { query } => PaneSettings::Search(query.clone()),
-            PaneKind::News(n) => PaneSettings::News(n.symbol.clone()),
+            PaneKind::News(n) => PaneSettings::News(crate::layouts::NewsSettings::from_pane(n)),
             PaneKind::OrderBook(b) => {
                 PaneSettings::OrderBook { symbol: b.symbol.clone(), depth: b.depth, group: b.group }
             }
@@ -276,32 +708,178 @@ impl PaneKind {
                 sort: p.sort,
                 open_only: p.open_only,
             },
+            PaneKind::Desk(d) => PaneSettings::Desk { group: d.group.clone(), selected: d.selected.clone() },
+            PaneKind::Journal(j) => PaneSettings::Journal { filter: j.filter.clone() },
+            PaneKind::Studio(s) => PaneSettings::Studio { view: s.view() },
+            PaneKind::StudioRoute(route) => PaneSettings::StudioRoute { route: *route },
+            PaneKind::StudioDist(s) => {
+                PaneSettings::StudioDist { symbol: s.symbol.clone(), timeframe: s.timeframe, window: s.window }
+            }
+            PaneKind::TstackTune(s) => {
+                PaneSettings::TstackTune { symbol: s.symbol.clone(), tf: s.tf, params: s.params }
+            }
+            PaneKind::StudioCorr(s) => PaneSettings::StudioCorr {
+                symbol: s.symbol.clone(),
+                spec: s.spec.clone(),
+                horizon: s.horizon,
+                relate: s.relate.clone(),
+            },
+            PaneKind::StudioLab(s) => {
+                // The editor's covariance chip is the persisted display default.
+                let mut spec = s.spec.clone();
+                spec.covariance = tr_data::studio_corr::SE_METHODS[s.ui.shown_cov.min(3)];
+                PaneSettings::StudioLab { symbol: s.symbol.clone(), tf: s.tf, spec }
+            }
+            PaneKind::StudioResid(s) => PaneSettings::StudioResid { model_id: s.model_id.clone() },
+            PaneKind::StudioAttr(s) => PaneSettings::StudioAttr {
+                model_id: s.model_id.clone(),
+                window: s.window.words(s.is_daily()),
+            },
+            PaneKind::StudioSeason(s) => PaneSettings::StudioSeason { symbol: s.symbol.clone(), spec: s.spec.clone() },
+            PaneKind::Stats(s) => PaneSettings::Stats {
+                symbol: s.symbol.clone(),
+                condition: s.condition.clone(),
+                conditional: s.tab == stats::StatsTab::Conditional,
+            },
+            PaneKind::Backtest(b) => PaneSettings::Backtest {
+                symbol: b.symbol.clone(),
+                spec: b.strategies.clone(),
+                holdout: b.holdout.clone(),
+                commission: b.commission.clone(),
+                slippage: b.slippage.clone(),
+                shorts: b.allow_short,
+                intraday: b.intraday,
+                tf: b.tf.clone(),
+                honesty: b.honesty,
+                holdout_tables: b.holdout_tables,
+                selected_variant: b.selected_variant,
+                selected_fold: b.selected_fold,
+            },
+            PaneKind::IntradayCompare(c) => {
+                PaneSettings::IntradayCompare { symbol: c.symbol.clone(), peers: c.peers.clone(), tf: c.tf.clone() }
+            }
+            PaneKind::SessionPath(p) => {
+                PaneSettings::SessionPath { symbol: p.symbol.clone(), spec: p.spec.clone(), tf: p.tf.clone() }
+            }
+            PaneKind::TrendWall(p) => PaneSettings::TrendWall {
+                spec: p.spec.clone(),
+                daily: p.daily,
+                sort: p.sort,
+                edge: p.edge,
+                scatter: p.scatter,
+            },
+            PaneKind::Rotation(p) => {
+                PaneSettings::Rotation { spec: p.spec.clone(), tail: p.tail as u8, table: p.show_table }
+            }
+            PaneKind::Breadth(b) => PaneSettings::Breadth { spec: b.spec.clone(), tf: b.tf.clone() },
+            PaneKind::VolumePace(p) => {
+                PaneSettings::VolumePace { symbol: p.symbol.clone(), spec: p.spec.clone(), tf: p.tf.clone() }
+            }
+            PaneKind::RealizedVol(p) => {
+                PaneSettings::RealizedVol { symbol: p.symbol.clone(), spec: p.spec.clone(), tf: p.tf.clone() }
+            }
+            PaneKind::Autocorr(p) => {
+                PaneSettings::Autocorr { symbol: p.symbol.clone(), spec: p.spec.clone(), tf: p.tf.clone() }
+            }
+            PaneKind::GapFill(p) => {
+                PaneSettings::GapFill { symbol: p.symbol.clone(), spec: p.spec.clone(), tf: p.tf.clone() }
+            }
+            PaneKind::SessionExtreme(p) => {
+                PaneSettings::SessionExtreme { symbol: p.symbol.clone(), spec: p.spec.clone(), tf: p.tf.clone() }
+            }
+            PaneKind::SessionClock(p) => {
+                PaneSettings::SessionClock { symbol: p.symbol.clone(), spec: p.spec.clone(), tf: p.tf.clone() }
+            }
+            PaneKind::RelativePath(p) => {
+                PaneSettings::RelativePath { symbol: p.symbol.clone(), spec: p.spec.clone(), tf: p.tf.clone() }
+            }
+            PaneKind::SessionBrief(p) => PaneSettings::SessionBrief { symbol: p.symbol.clone() },
+            PaneKind::Lookalike(l) => PaneSettings::Lookalike {
+                symbol: l.symbol.clone(),
+                spec: l.spec.clone(),
+                as_of: l.as_of.clone(),
+                k: l.k.clone(),
+                gap: l.gap.clone(),
+                horizons: l.horizons.clone(),
+            },
         }
     }
 
     fn from_settings(p: PaneSettings) -> PaneKind {
         match p {
             PaneSettings::Chart {
+                archive,
+                watch_group,
                 symbol,
                 tf,
                 chart_type,
                 log,
                 indicators,
                 drawings,
+                drawing_store,
                 compare,
                 show_volume,
                 show_congress,
+                show_news,
+                show_journal,
                 magnet,
+                show_box,
+                show_rs,
+                show_volume_ctx,
+                show_stack,
+                stack_ladder,
+                stack_tint,
+                stack_session,
+                show_rail,
+                show_edge,
+                cone,
+                stops,
+                auction,
+                avwap,
+                cockpit_chip,
             } => {
                 let mut c = ChartState::new(0, &symbol, tf);
+                c.cockpit_chip = cockpit_chip;
+                c.avwap_store = avwap
+                    .into_iter()
+                    .map(|(k, mut v)| {
+                        v.sort_unstable();
+                        v.dedup();
+                        v.truncate(tr_data::anchored_vwap::MAX_ANCHORS);
+                        (k, v)
+                    })
+                    .filter(|(_, v)| !v.is_empty())
+                    .collect();
+                c.restore_anchors();
+                c.archive = archive;
+                c.watch_group = watch_group;
                 c.chart_type = chart_type;
                 c.log = log;
                 c.indicators = indicators;
-                c.drawings = drawings;
+                c.drawing_store = drawing_store;
+                c.drawing_store.seed_view_if_absent(&c.symbol, tf, &drawings);
+                let stored = c.drawing_store.get_view(&c.symbol, tf);
+                c.drawings = if stored.is_empty() { drawings } else { stored };
                 c.compare = compare;
                 c.show_volume = show_volume;
                 c.show_congress = show_congress;
+                c.show_news = show_news;
+                c.show_journal = show_journal;
                 c.magnet = magnet;
+                c.show_box = show_box;
+                c.show_rs = show_rs;
+                c.show_volume_ctx = show_volume_ctx;
+                c.show_stack = show_stack;
+                c.stack_ladder =
+                    stack_ladder.filter(|frames| tr_core::indicators::ladder_custom(tf, frames, archive).is_ok());
+                c.stack_tint = stack_tint;
+                c.stack_session = stack_session;
+                c.show_rail = show_rail;
+                c.show_edge = show_edge;
+                c.restore_cone(cone);
+                c.restore_stops(stops);
+                c.restore_auction(auction);
+                c.show_stack |= show_edge;
                 PaneKind::Chart(Box::new(c))
             }
             PaneSettings::Feed(f) => PaneKind::Feed { filter: f.map(Into::into).unwrap_or_default() },
@@ -309,12 +887,16 @@ impl PaneKind {
             PaneSettings::Profile(q) => PaneKind::Profile { query: q, data: None, loading: true },
             PaneSettings::Politicians => PaneKind::Politicians,
             PaneSettings::Alerts => PaneKind::Alerts,
-            PaneSettings::Watchlist => PaneKind::Watchlist,
+            PaneSettings::PriceHistory => PaneKind::Research(Box::new(research::ResearchPane::price_history())),
+            PaneSettings::Research(scan) => PaneKind::Research(Box::new(research::ResearchPane::new(scan))),
+            PaneSettings::Watchlist | PaneSettings::IntradayScan => PaneKind::Watchlist,
             PaneSettings::Help => PaneKind::Help,
+            PaneSettings::Health => PaneKind::Health,
+            PaneSettings::Vault { symbol } => PaneKind::Vault(Box::new(vault_view::VaultPane::new(symbol))),
             PaneSettings::Wei => PaneKind::Wei,
             PaneSettings::Curve => PaneKind::Curve,
             PaneSettings::Search(q) => PaneKind::Search { query: q },
-            PaneSettings::News(s) => PaneKind::News(Box::new(NewsPane::new(s))),
+            PaneSettings::News(s) => PaneKind::News(Box::new(s.into_pane())),
             PaneSettings::OrderBook { symbol, depth, group } => {
                 PaneKind::OrderBook(Box::new(BookPane::new(&symbol, depth, group)))
             }
@@ -323,7 +905,201 @@ impl PaneKind {
                 PaneKind::Options(Box::new(OptionsPane::new(&symbol, strikes, greeks)))
             }
             PaneSettings::Portfolio { view, account, symbol, sort, open_only } => {
-                PaneKind::Portfolio(Box::new(broker::PortfolioPane { view, account, symbol, sort, open_only }))
+                PaneKind::Portfolio(Box::new(broker::PortfolioPane {
+                    view,
+                    account,
+                    symbol,
+                    sort,
+                    open_only,
+                    ..broker::PortfolioPane::new(view)
+                }))
+            }
+            PaneSettings::Desk { group, selected } => {
+                let mut d = desk::DeskPane::new(group);
+                d.selected = selected;
+                PaneKind::Desk(Box::new(d))
+            }
+            PaneSettings::Journal { filter } => PaneKind::Journal(Box::new(journal::JournalPane::new(filter))),
+            PaneSettings::Studio { view } => PaneKind::Studio(Box::new(studio_hub::StudioPane::new(view))),
+            PaneSettings::StudioRoute { route:tr_data::studio::StudioRoute::Quick } => PaneKind::Studio(Box::new(studio_hub::StudioPane::new(studio_hub::StudioViewSpec {quick:true,..Default::default()}))),
+            // A saved LAB route restores as a default Lab pane.
+            PaneSettings::StudioRoute { route: tr_data::studio::StudioRoute::Lab } => PaneKind::StudioLab(Box::new(
+                studio_lab::LabPane::new(String::new(), tr_core::Timeframe::D1, tr_data::studio_lab::LabSpec::default()),
+            )),
+            // A saved RESID route restores as an empty residual pane (the model list).
+            PaneSettings::StudioRoute { route: tr_data::studio::StudioRoute::Resid } => {
+                PaneKind::StudioResid(Box::new(studio_residual::ResidPane::new(String::new())))
+            }
+            // A saved ATTR route restores as an empty attribution pane (the model list).
+            PaneSettings::StudioRoute { route: tr_data::studio::StudioRoute::Attr } => {
+                PaneKind::StudioAttr(Box::new(studio_attribution::AttrPane::new(String::new())))
+            }
+            // Invalid id or window words restore as an empty pane / the default window.
+            PaneSettings::StudioAttr { model_id, window } => {
+                PaneKind::StudioAttr(Box::new(studio_attribution::AttrPane::restore(&model_id, &window)))
+            }
+            // Only the id is saved; an invalid id restores as an empty pane rather than a bad path.
+            PaneSettings::StudioResid { model_id } => PaneKind::StudioResid(Box::new(studio_residual::ResidPane::new(
+                if tr_data::studio_residual::valid_id(&model_id) { model_id } else { String::new() },
+            ))),
+            PaneSettings::StudioLab { symbol, tf, spec } => {
+                PaneKind::StudioLab(Box::new(studio_lab::LabPane::new(symbol, tf, spec)))
+            }
+            PaneSettings::StudioDist { symbol, timeframe, window } => {
+                PaneKind::StudioDist(Box::new(studio_dist::DistPane::new(symbol, timeframe, window)))
+            }
+            PaneSettings::TstackTune { symbol, tf, params } => {
+                PaneKind::TstackTune(Box::new(tstack_tune::TunePane::new(symbol, tf, params)))
+            }
+            PaneSettings::StudioCorr { symbol, spec, horizon, relate } => {
+                let mut pane = studio_corr::CorrPane::new(symbol, spec);
+                pane.horizon = if [1, 5, 20].contains(&horizon) { horizon } else { 1 };
+                pane.relate = relate.map(|mut r| {
+                    r.transform = r.transform.with_valid_horizon();
+                    r
+                });
+                PaneKind::StudioCorr(Box::new(pane))
+            }
+            PaneSettings::StudioSeason { symbol, spec } => {
+                PaneKind::StudioSeason(Box::new(studio_season::SeasonPane::new(symbol, spec)))
+            }
+            PaneSettings::Stats { symbol, condition, conditional } => {
+                PaneKind::Stats(Box::new(stats::StatsPane::new(symbol, condition, conditional)))
+            }
+            PaneSettings::Backtest {
+                symbol,
+                spec,
+                holdout,
+                commission,
+                slippage,
+                shorts,
+                intraday,
+                tf,
+                honesty,
+                holdout_tables,
+                selected_variant,
+                selected_fold,
+            } => {
+                let mut pane = if intraday {
+                    backtest::BacktestPane::intraday(symbol, spec)
+                } else {
+                    backtest::BacktestPane::new(symbol, spec)
+                };
+                pane.holdout = holdout;
+                pane.commission = commission;
+                pane.slippage = slippage;
+                pane.allow_short = shorts;
+                pane.honesty = honesty;
+                pane.holdout_tables = holdout_tables;
+                pane.selected_variant = selected_variant;
+                pane.selected_fold = selected_fold;
+                if !tf.is_empty() {
+                    pane.tf = tf;
+                }
+                PaneKind::Backtest(Box::new(pane))
+            }
+            PaneSettings::Lookalike { symbol, spec, as_of, k, gap, horizons } => {
+                let mut pane = lookalike::LookalikePane::new(symbol, spec);
+                if !as_of.is_empty() {
+                    pane.as_of = as_of;
+                }
+                if !k.is_empty() {
+                    pane.k = k;
+                }
+                if !gap.is_empty() {
+                    pane.gap = gap;
+                }
+                if !horizons.is_empty() {
+                    pane.horizons = horizons;
+                }
+                PaneKind::Lookalike(Box::new(pane))
+            }
+            PaneSettings::SessionPath { symbol, spec, tf } => {
+                let mut pane = session_path::SessionPathPane::new(symbol, spec);
+                if !tf.is_empty() {
+                    pane.tf = tf;
+                }
+                PaneKind::SessionPath(Box::new(pane))
+            }
+            PaneSettings::TrendWall { spec, daily, sort, edge, scatter } => {
+                let mut p = trend_wall::TrendWallPane::new(spec);
+                p.daily = daily;
+                p.sort = sort;
+                p.edge = edge;
+                p.scatter = scatter;
+                PaneKind::TrendWall(Box::new(p))
+            }
+            PaneSettings::Rotation { spec, tail, table } => {
+                let mut p = rotation::RotationPane::new(spec);
+                p.tail = *tr_data::rotation::TAILS.iter().min_by_key(|t| t.abs_diff(tail as usize)).unwrap();
+                p.show_table = table;
+                PaneKind::Rotation(Box::new(p))
+            }
+            PaneSettings::Breadth { spec, tf } => {
+                let mut pane = session_breadth::BreadthPane::new(spec);
+                if !tf.is_empty() {
+                    pane.tf = tf;
+                }
+                PaneKind::Breadth(Box::new(pane))
+            }
+            PaneSettings::VolumePace { symbol, spec, tf } => {
+                let mut pane = volume_pace::VolumePacePane::new(symbol, spec);
+                if !tf.is_empty() {
+                    pane.tf = tf;
+                }
+                PaneKind::VolumePace(Box::new(pane))
+            }
+            PaneSettings::RealizedVol { symbol, spec, tf } => {
+                let mut pane = realized_vol::RealizedVolPane::new(symbol, spec);
+                if !tf.is_empty() {
+                    pane.tf = tf;
+                }
+                PaneKind::RealizedVol(Box::new(pane))
+            }
+            PaneSettings::Autocorr { symbol, spec, tf } => {
+                let mut pane = autocorr::AutocorrPane::new(symbol, spec);
+                if !tf.is_empty() {
+                    pane.tf = tf;
+                }
+                PaneKind::Autocorr(Box::new(pane))
+            }
+            PaneSettings::GapFill { symbol, spec, tf } => {
+                let mut pane = gap_fill::GapFillPane::new(symbol, spec);
+                if !tf.is_empty() {
+                    pane.tf = tf;
+                }
+                PaneKind::GapFill(Box::new(pane))
+            }
+            PaneSettings::SessionExtreme { symbol, spec, tf } => {
+                let mut pane = session_extreme::SessionExtremePane::new(symbol, spec);
+                if !tf.is_empty() {
+                    pane.tf = tf;
+                }
+                PaneKind::SessionExtreme(Box::new(pane))
+            }
+            PaneSettings::SessionClock { symbol, spec, tf } => {
+                let mut pane = session_clock::SessionClockPane::new(symbol, spec);
+                if !tf.is_empty() {
+                    pane.tf = tf;
+                }
+                PaneKind::SessionClock(Box::new(pane))
+            }
+            PaneSettings::RelativePath { symbol, spec, tf } => {
+                let mut pane = relative_path::RelativePathPane::new(symbol, spec);
+                if !tf.is_empty() {
+                    pane.tf = tf;
+                }
+                PaneKind::RelativePath(Box::new(pane))
+            }
+            PaneSettings::SessionBrief { symbol } => {
+                PaneKind::SessionBrief(Box::new(session_brief::SessionBriefPane::new(symbol)))
+            }
+            PaneSettings::IntradayCompare { symbol, peers, tf } => {
+                let mut pane = compare::ComparePane::new(symbol, peers);
+                if !tf.is_empty() {
+                    pane.tf = tf;
+                }
+                PaneKind::IntradayCompare(Box::new(pane))
             }
         }
     }
@@ -346,15 +1122,19 @@ impl Pane {
 }
 
 /// App-wide state persisted in `settings.json` (layouts live in their own files).
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 struct Settings {
     #[serde(default)]
     watchlist: Vec<String>,
+    #[serde(default)]
+    watchlists: Option<watchlists::Watchlists>,
     #[serde(default = "default_true")]
     sidebar: bool,
     /// Name of the layout to restore on launch.
     #[serde(default)]
     active_layout: Option<String>,
+    #[serde(default)]
+    recent_symbols: Vec<String>,
     // Pre-docking settings files stored a preset and a pane list here.
     #[serde(default, skip_serializing)]
     layout: Option<Layout>,
@@ -417,10 +1197,17 @@ pub struct Drag {
 pub struct TerminalApp {
     worker: Worker,
     provider: String,
+    data_mode: DataMode,
+    health: Snapshot,
+    quote_states: HashMap<String, FeedState>,
+    curve_state: FeedState,
+    last_health: Option<Instant>,
+    health_selected: Feed,
     panes: Vec<Pane>,
     dock: Node,
     focus: PaneId,
     next_id: PaneId,
+    handoff: handoff::Handoff,
     last_opened: Option<PaneId>,
     /// Preset last applied, for the toolbar picker (cleared by manual rearranging).
     preset: Option<Layout>,
@@ -455,6 +1242,8 @@ pub struct TerminalApp {
     rebinding: Option<prefs::Action>,
     hotkey_filter: String,
     settings_tab: SettingsTab,
+    whats_news_epoch: u64,
+    whats_news_health: tr_data::whats_news::Health,
     io_path: String,
 
     curves: Option<Box<YieldCurves>>,
@@ -466,6 +1255,8 @@ pub struct TerminalApp {
     /// Query typed in the command line awaiting a debounced network search.
     search_pending: Option<(String, Instant)>,
     suggestion: Option<usize>,
+    command_catalogue: command_bar::Catalogue,
+    recent_symbols: Vec<String>,
 
     cmd: String,
     cmd_history: Vec<String>,
@@ -479,11 +1270,23 @@ pub struct TerminalApp {
     politicians: Vec<PoliticianSummary>,
     pol_search: String,
     alerts: Vec<Alert>,
+    price_alerts: tr_data::price_alerts::AlertBatch,
+    trade_plans: tr_data::trade_plans::PlanBatch,
+    alert_draft: alerts::AlertDraft,
+    last_price_alerts: Option<Instant>,
+    journal: tr_data::journal::Store,
     congress_status: String,
     /// When the last Congress ingest finished.
     congress_checked: Option<chrono::DateTime<chrono::Local>>,
 
     watchlist: Vec<String>,
+    watchlists: watchlists::Watchlists,
+    watch_ui: watchlists::UiState,
+    /// Last intraday scan for one watchlist group. Absent until a read finishes.
+    intraday_scan: Option<watchlists::IntradayScan>,
+    planning_stops: portfolio_stops::Store,
+    planning_ui: portfolio_risk::State,
+    settings_writer: Option<settings_writer::Writer>,
     quotes: HashMap<String, Quote>,
     last_quotes: Option<Instant>,
     last_feed: Option<Instant>,
@@ -492,6 +1295,9 @@ pub struct TerminalApp {
     smoke_done: bool,
     /// Frame-time readout (F12): smoothed CPU time of `ui()` and interval between frames.
     show_perf: bool,
+    /// Time Link cursors and Lens windows exchanged between linked charts each frame.
+    link_bus: crate::chart_view::LinkBus,
+    perf_profile: crate::perf::FrameProfile,
     perf_cpu_ms: f64,
     perf_dt_ms: f64,
     last_frame: Option<Instant>,
@@ -509,11 +1315,12 @@ pub struct TerminalApp {
     last_chrome_poll: Option<Instant>,
     /// Brokerage integration (SnapTrade credentials and the loaded portfolio).
     broker: broker::BrokerState,
+    holding_risk: desk::HoldingRiskState,
     /// Order ticket and trading dialogs.
     trading: trading::TradingState,
     /// The paper-trading demo account (selected by default).
     demo: demo::DemoState,
-    /// ⌘K command palette.
+    /// Full command palette (separate from the toolbar input).
     palette: crate::palette::Palette,
 }
 
@@ -529,6 +1336,23 @@ fn keys_from_words(words: &[String]) -> Vec<String> {
                 i += used;
             }
             None => i += 1,
+        }
+    }
+    out
+}
+
+/// Canonicalise persisted recents, including old malformed FX/crypto keys.
+fn canonical_recent_symbols(symbols: &[String]) -> Vec<String> {
+    let mut out = Vec::new();
+    for symbol in symbols {
+        if let Some(sec) = tr_core::Security::parse(symbol) {
+            let key = sec.key();
+            if !out.contains(&key) {
+                out.push(key);
+            }
+        }
+        if out.len() == 30 {
+            break;
         }
     }
     out
@@ -573,14 +1397,22 @@ impl TerminalApp {
         let (demo, demo_note) = demo::DemoState::load(demo::demo_path());
         let mut app = Self {
             broker,
+            holding_risk: Default::default(),
             trading: Default::default(),
             demo,
+            data_mode: worker.mode(),
+            health: worker.health().unwrap_or_else(|| tr_data::HealthBoard::new(&provider).snapshot()),
+            quote_states: Default::default(),
+            curve_state: Default::default(),
+            last_health: None,
+            health_selected: Feed::Bars,
             worker,
             provider,
             panes: Vec::new(),
             dock: Node::default(),
             focus: 0,
             next_id: 1,
+            handoff: Default::default(),
             last_opened: None,
             preset: None,
             drag: None,
@@ -605,6 +1437,8 @@ impl TerminalApp {
             rebinding: None,
             hotkey_filter: String::new(),
             settings_tab: SettingsTab::Appearance,
+            whats_news_epoch: 0,
+            whats_news_health: tr_data::whats_news::Health::pending(),
             io_path: String::new(),
             curves: None,
             last_wei: None,
@@ -613,6 +1447,8 @@ impl TerminalApp {
             net_hits: (String::new(), Vec::new()),
             search_pending: None,
             suggestion: None,
+            command_catalogue: Default::default(),
+            recent_symbols: settings.as_ref().map(|s| canonical_recent_symbols(&s.recent_symbols)).unwrap_or_default(),
             cmd: String::new(),
             cmd_history: Vec::new(),
             cmd_hist_pos: None,
@@ -623,9 +1459,20 @@ impl TerminalApp {
             politicians: Vec::new(),
             pol_search: String::new(),
             alerts: Vec::new(),
+            price_alerts: tr_data::price_alerts::AlertBatch::empty(0),
+            trade_plans: tr_data::trade_plans::PlanBatch::empty(0),
+            alert_draft: alerts::AlertDraft::default(),
+            last_price_alerts: None,
+            journal: tr_data::journal::Store::load(&tr_data::journal::store_path(data_dir())),
             congress_status: String::new(),
             congress_checked: None,
             watchlist: DEFAULT_WATCHLIST.map(String::from).to_vec(),
+            watchlists: watchlists::Watchlists::migrate(&DEFAULT_WATCHLIST.map(String::from)),
+            watch_ui: Default::default(),
+            intraday_scan: None,
+            planning_stops: portfolio_stops::Store::load(data_dir()),
+            planning_ui: Default::default(),
+            settings_writer: None,
             quotes: HashMap::new(),
             last_quotes: None,
             last_feed: None,
@@ -633,6 +1480,8 @@ impl TerminalApp {
             started: Instant::now(),
             smoke_done: false,
             show_perf: std::env::var_os("TR_FPS").is_some(),
+            link_bus: Default::default(),
+            perf_profile: Default::default(),
             perf_cpu_ms: 0.0,
             perf_dt_ms: 0.0,
             last_frame: None,
@@ -648,11 +1497,8 @@ impl TerminalApp {
         };
         let mut doc = None;
         if let Some(s) = &settings {
-            if !s.watchlist.is_empty() {
-                // Older settings stored bare tickers; normalise to market keys.
-                app.watchlist = s.watchlist.iter().map(|w| tr_data::security(w).key()).collect();
-                app.watchlist.dedup();
-            }
+            app.watchlists = s.watchlists.clone().unwrap_or_else(|| watchlists::Watchlists::migrate(&s.watchlist));
+            app.watchlist = app.watchlists.symbols();
             app.sidebar_open = s.sidebar;
             if let Some(name) = &s.active_layout {
                 match app.store.load(name) {
@@ -667,6 +1513,8 @@ impl TerminalApp {
         let doc = doc
             .or_else(|| app.store.list().first().and_then(|n| app.store.load(n).ok()))
             .unwrap_or_else(|| LayoutDoc::default_workspace("Default", &app.prefs.panels));
+        app.worker
+            .send(Request::ConfigureWhatsNews { epoch: app.whats_news_epoch, config: app.prefs.whats_news.clone() });
         app.apply_doc(doc);
         if !app.store.exists(&app.layout_name) {
             app.save_layout();
@@ -675,24 +1523,30 @@ impl TerminalApp {
         app.worker.send(Request::Latest { limit: 2_000 });
         app.worker.send(Request::SearchPoliticians(String::new()));
         app.worker.send(Request::Alerts);
+        app.worker.send(Request::TradePlans);
         if let Some(note) = demo_note {
             app.trade_toast(note, false);
         }
         app
     }
 
-    fn save_settings(&self) {
+    fn save_settings(&mut self) {
         let s = Settings {
             watchlist: self.watchlist.clone(),
+            watchlists: Some(self.watchlists.clone()),
+            recent_symbols: self.recent_symbols.clone(),
             sidebar: self.sidebar_open,
-            active_layout: Some(self.layout_name.clone()),
+            // A temporary hand-off layout is never reopened; its origin is.
+            active_layout: Some(self.handoff_origin_name().unwrap_or(&self.layout_name).to_owned()),
             layout: None,
             panes: None,
         };
-        if let Ok(json) = serde_json::to_vec_pretty(&s)
-            && let Err(e) = crate::layouts::write_atomic(&settings_path(), &json)
-        {
-            tracing::warn!("saving settings: {e}");
+        match serde_json::to_vec_pretty(&s) {
+            Ok(json) => {
+                let path = self.store.dir.parent().expect("layouts parent").join("settings.json");
+                self.settings_writer.get_or_insert_with(|| settings_writer::Writer::new(path)).save(json);
+            }
+            Err(e) => self.status = format!("Could not serialize settings: {e}"),
         }
     }
 
@@ -705,24 +1559,24 @@ impl TerminalApp {
     fn run_actions(&mut self, actions: Vec<Action>) {
         for a in actions {
             match a {
+                Action::OpenArchiveChart(s) => self.open_list_symbol(&s, true, None),
+                Action::OpenArchiveAt { symbol, ts } => self.open_archive_at(&symbol, ts),
+                Action::WatchChart(group, symbol, archive) => self.open_list_symbol(&symbol, archive, Some(group)),
                 Action::OpenChart(s) => self.open_security(&s),
                 Action::OpenTicker(s) => {
                     self.open_panel(PaneKind::Ticker { symbol: s, trades: Vec::new(), loading: true })
                 }
                 Action::OpenProfile(q) => self.open_panel(PaneKind::Profile { query: q, data: None, loading: true }),
                 Action::AddToWatchlist(s) => {
-                    let key = tr_data::security(&s).key();
-                    if !self.watchlist.contains(&key) {
-                        self.status = format!("Added {key} to the watchlist");
-                        self.watchlist.push(key);
-                        self.last_quotes = None;
-                    }
+                    self.watch_ui.picker = Some(self.member_for_save(&s));
+                    self.watch_ui.picker_index = self.watchlists.index(&self.watchlists.last_used).unwrap_or(0);
                 }
                 Action::LinkedSymbol(link, s) => self.broadcast(link, &s, None),
                 Action::Command(line) => match command::parse(&line) {
                     Some(cmd) => self.dispatch(cmd),
                     None => tracing::warn!("internal command did not parse: {line}"),
                 },
+                Action::RiskPlanTicket { symbol, plan } => self.open_plan_ticket(&symbol, plan),
                 Action::Track(q, on) => {
                     self.worker.send(Request::Track { query: q.clone(), on });
                     // Refresh any open profile so the star updates.
@@ -737,6 +1591,10 @@ impl TerminalApp {
     }
 
     fn execute(&mut self, input: &str) {
+        if input.len() > command::MAX_INPUT_BYTES {
+            self.status = "Command too long (maximum 4096 bytes)".into();
+            return;
+        }
         let Some(cmd) = command::parse(input) else {
             self.status = format!("Unknown command: {input}  (HELP lists functions)");
             return;
@@ -753,7 +1611,7 @@ impl TerminalApp {
                 self.status = format!("{s}: congressional trades");
             }
             Command::SymbolFunction(s, Function::News) => {
-                self.open_panel(PaneKind::News(Box::new(NewsPane::new(Some(s.clone())))));
+                self.open_panel(PaneKind::News(Box::new(NewsPane::for_symbol(s.clone()))));
                 self.status = format!("{s}: news");
             }
             Command::SymbolFunction(s, Function::OrderBook(depth)) => {
@@ -773,6 +1631,80 @@ impl TerminalApp {
             Command::SymbolFunction(s, f @ (Function::NewPanel(_) | Function::Split { .. })) => {
                 self.apply_with_symbol(f, Some(s));
             }
+            Command::SymbolFunction(s, Function::StopCloud(cmd)) => {
+                self.open_security(&s);
+                self.apply_with_symbol(Function::StopCloud(cmd), Some(s));
+            }
+            Command::SymbolFunction(s, Function::AuctionMap(cmd)) => {
+                self.open_security(&s);
+                self.apply_with_symbol(Function::AuctionMap(cmd), Some(s));
+            }
+            Command::SymbolFunction(s, Function::TrendStack(on)) => {
+                self.open_security(&s);
+                self.with_chart(|c, w| c.set_trend_stack(Some(on.unwrap_or(true)), w));
+            }
+            Command::SymbolFunction(s, Function::Review) => self.open_review(Some(&s)),
+            Command::SymbolFunction(s, Function::Desk) => self.open_desk(Some(&s)),
+            Command::SymbolFunction(s, Function::Journal(extra)) => self.open_journal(Some(&s), &extra),
+            Command::SymbolFunction(s, Function::StudioWhen { spec }) => self.open_when(Some(&s), &spec),
+            Command::SymbolFunction(s, Function::StudioQuick {spec}) => self.open_quick(Some(&s),&spec),
+            Command::SymbolFunction(s, Function::StudioRelate { spec }) => self.open_relate(Some(&s), &spec),
+            Command::SymbolFunction(s, Function::Studio { spec }) => self.open_studio(Some(&s), &spec),
+            Command::SymbolFunction(s, Function::StudioRoute(tr_data::studio::StudioRoute::Quick)) => self.open_quick(Some(&s),""),
+            Command::SymbolFunction(s, Function::StudioRoute(tr_data::studio::StudioRoute::Lab)) => self.open_lab(Some(&s), ""),
+            Command::SymbolFunction(s, Function::StudioLab { spec }) => self.open_lab(Some(&s), &spec),
+            Command::SymbolFunction(_, Function::StudioRoute(tr_data::studio::StudioRoute::Resid)) => self.open_resid(""),
+            Command::SymbolFunction(_, Function::StudioResid { spec }) => self.open_resid(&spec),
+            Command::SymbolFunction(_, Function::StudioRoute(tr_data::studio::StudioRoute::Attr)) => self.open_attr(""),
+            Command::SymbolFunction(_, Function::StudioAttr { spec }) => self.open_attr(&spec),
+            Command::SymbolFunction(s, Function::StudioDistHorizon(h)) => self.set_shape_horizon(Some(&s), h),
+            Command::SymbolFunction(s, Function::StudioDist { timeframe }) => {
+                self.open_studio_dist(Some(&s), timeframe)
+            }
+            Command::SymbolFunction(s, Function::TstackTune(tf)) => self.open_tstack_tune(Some(&s), tf),
+            Command::SymbolFunction(s, Function::StudioCorr { spec }) => self.open_studio_corr(Some(&s), &spec),
+            Command::SymbolFunction(s, Function::StudioSeason { spec }) => self.open_studio_season(Some(&s), &spec),
+            Command::SymbolFunction(s, Function::Stats { condition, conditional }) => {
+                self.open_stats(Some(&s), &condition, conditional)
+            }
+            Command::SymbolFunction(s, Function::Backtest { spec }) => self.open_backtest(Some(&s), &spec),
+            Command::SymbolFunction(s, Function::IntradayBacktest { spec }) => {
+                self.open_intraday_backtest(Some(&s), &spec)
+            }
+            Command::SymbolFunction(s, Function::Lookalike { spec }) => self.open_lookalike(Some(&s), &spec),
+            Command::SymbolFunction(s, Function::IntradayCompare { spec }) => {
+                self.open_intraday_compare(Some(&s), &spec)
+            }
+            Command::SymbolFunction(s, Function::SessionPath { spec }) => self.open_session_path(Some(&s), &spec),
+            Command::SymbolFunction(s, Function::TrendWall { spec }) => self.open_trend_wall(Some(&s), &spec),
+            Command::SymbolFunction(s, Function::EdgeWall { spec }) => self.open_edge_wall(Some(&s), &spec),
+            Command::SymbolFunction(s, Function::Rotation { spec }) => self.open_rotation(Some(&s), &spec),
+            Command::SymbolFunction(s, Function::Breadth { spec }) => self.open_breadth(Some(&s), &spec),
+            Command::SymbolFunction(s, Function::VolumePace { spec }) => self.open_volume_pace(Some(&s), &spec),
+            Command::SymbolFunction(s, Function::RealizedVol { spec }) => self.open_realized_vol(Some(&s), &spec),
+            Command::SymbolFunction(s, Function::Autocorr { spec }) => self.open_autocorr(Some(&s), &spec),
+            Command::SymbolFunction(s, Function::IntradayDesk) => self.open_intraday_desk(Some(&s)),
+            Command::SymbolFunction(s, Function::Cockpit { spec }) => self.open_cockpit(Some(&s), &spec),
+            Command::SymbolFunction(s, Function::GapFill { spec }) => self.open_gap_fill(Some(&s), &spec),
+            Command::SymbolFunction(s, Function::SessionExtreme { spec }) => self.open_session_extreme(Some(&s), &spec),
+            Command::SymbolFunction(s, Function::Vault(cmd)) => self.vault_command(cmd, Some(s)),
+            Command::SymbolFunction(s, Function::SessionClock { spec }) => self.open_session_clock(Some(&s), &spec),
+            Command::SymbolFunction(s, Function::RelativePath { spec }) => self.open_relative_path(Some(&s), &spec),
+            Command::SymbolFunction(s, Function::SessionBrief) => self.open_session_brief(Some(&s)),
+            Command::SymbolFunction(s, Function::CashLevels) => self.open_cash_levels(Some(&s)),
+            Command::SymbolFunction(s, Function::Goto { date }) => self.goto_chart_date(Some(&s), &date),
+            Command::SymbolFunction(s, Function::JournalNote { date, text }) => {
+                self.add_journal_note(Some(&s), &date, &text)
+            }
+            Command::SymbolFunction(s, Function::ArmPlan { entry, stop, target, risk, breakeven, trail }) => {
+                self.arm_trade_plan(Some(s), entry, stop, target, risk, (breakeven, trail));
+            }
+            Command::SymbolFunction(
+                s,
+                f @ (Function::TrailPlan(_) | Function::BreakevenPlan(_) | Function::MovePlanStop(_)),
+            ) => self.apply_with_symbol(f, Some(s)),
+            Command::SymbolFunction(s, Function::SetPriceAlert(kind)) => self.set_price_alert(Some(s), kind),
+            Command::SymbolFunction(s, Function::ClearPriceAlert(_)) => self.clear_price_alert(&s),
             Command::SymbolFunction(s, f) => {
                 self.open_security(&s);
                 self.apply(f);
@@ -787,40 +1719,103 @@ impl TerminalApp {
 
     fn apply_with_symbol(&mut self, f: Function, symbol: Option<String>) {
         match f {
+            Function::StackLadder(frames) => self.with_chart(|c, w| c.set_stack_ladder(frames, w)),
+            Function::StackTint(on) => self.with_chart(|c, w| c.set_stack_tint(on, w)),
+            Function::StackSession(on) => self.with_chart(|c, w| c.set_stack_session(on, w)),
+            Function::StopCloud(cmd) => {
+                let cmd = if symbol.is_some() && cmd == command::StopCmd::Toggle(None) {
+                    command::StopCmd::Toggle(Some(true))
+                } else {
+                    cmd
+                };
+                self.with_chart(|c, w| c.set_stop_cloud(cmd, w));
+            }
+            Function::AuctionMap(cmd) => {
+                let cmd = if symbol.is_some() && cmd == command::AuctionCmd::Toggle(None) {
+                    command::AuctionCmd::Toggle(Some(true))
+                } else {
+                    cmd
+                };
+                self.with_chart(|c, w| c.set_auction(cmd, w));
+            }
+            Function::TrendCone { on, spec } => self.with_chart(|c, w| c.set_trend_cone(on, spec, w)),
+            Function::StackEdge(on) => self.with_chart(|c, w| c.set_stack_edge(on, w)),
+            Function::TruthRail(on) => self.with_chart(|c, _| c.show_rail = on.unwrap_or(!c.show_rail)),
+            Function::TrendStack(on) => self.with_chart(|c, w| c.set_trend_stack(on, w)),
             Function::Timeframe(tf) => self.with_chart(|c, w| c.set_timeframe(tf, w)),
             Function::ChartType(t) => self.with_chart(|c, _| c.chart_type = t),
             Function::Indicator(spec) => self.with_chart(|c, w| c.toggle_indicator(spec, w)),
             Function::IndicatorPicker(q) => self.palette.open_scoped(crate::palette::Kind::Indicator, &q),
-            Function::ClearIndicators => self.with_chart(|c, _| c.clear_indicators()),
+            Function::ClearIndicators => self.with_chart(|c, w| {
+                c.clear_indicators();
+                if c.show_stack {
+                    c.set_trend_stack(Some(true), w);
+                }
+            }),
             Function::Compare(s) => self.with_chart(|c, w| c.set_compare(s, w)),
             Function::LogScale => self.with_chart(|c, _| c.log = !c.log),
             Function::Range(r) => self.with_chart(|c, w| c.set_range(r, w)),
             Function::Draw(t) => self.with_chart(|c, _| c.start_tool(t)),
-            Function::ClearDrawings => self.with_chart(|c, _| c.drawings.clear()),
+            Function::ClearDrawings => self.with_chart(|c, _| c.clear_drawings()),
+            Function::UndoDrawings => self.with_chart(|c, _| {
+                c.undo_drawings();
+            }),
             Function::Magnet => self.with_chart(|c, _| c.magnet = !c.magnet),
             Function::Congress => self.open_panel(PaneKind::Feed { filter: FeedFilter::default() }),
             Function::Politician(q) if q.trim().is_empty() => self.open_panel(PaneKind::Politicians),
             Function::Politician(q) => self.open_panel(PaneKind::Profile { query: q, data: None, loading: true }),
             Function::Track(q) => self.worker.send(Request::Track { query: q, on: true }),
             Function::Untrack(q) => self.worker.send(Request::Track { query: q, on: false }),
-            Function::Alerts => {
+            Function::Alerts | Function::Plans => {
                 self.worker.send(Request::Alerts);
+                self.worker.send(Request::PriceAlerts);
+                self.worker.send(Request::TradePlans);
+                self.worker.send(Request::EvaluatePriceAlerts);
                 self.open_panel(PaneKind::Alerts);
             }
+            Function::ArmPlan { entry, stop, target, risk, breakeven, trail } => {
+                self.arm_trade_plan(symbol, entry, stop, target, risk, (breakeven, trail))
+            }
+            Function::TrailPlan(trail) => {
+                self.update_trade_plan(symbol, tr_data::trade_plans::PlanChange::Trail(trail))
+            }
+            Function::BreakevenPlan(r) => {
+                self.update_trade_plan(symbol, tr_data::trade_plans::PlanChange::Breakeven(r))
+            }
+            Function::MovePlanStop(stop) => {
+                self.update_trade_plan(symbol, tr_data::trade_plans::PlanChange::MoveStop(stop))
+            }
+            Function::CancelPlans(query) => {
+                self.worker.send(Request::CancelTradePlansFor { query });
+                self.open_panel(PaneKind::Alerts);
+            }
+            Function::SetPriceAlert(kind) => self.set_price_alert(symbol, kind),
+            Function::ClearPriceAlert(q) => {
+                let q = if q.trim().is_empty() {
+                    symbol.unwrap_or_else(|| self.focused_symbol().unwrap_or_default())
+                } else {
+                    q
+                };
+                self.clear_price_alert(&q);
+            }
             Function::Refresh => self.worker.send(Request::RefreshCongress),
-            Function::Watchlist => self.open_panel(PaneKind::Watchlist),
-            Function::WatchAdd(words) => {
-                for key in keys_from_words(&words) {
-                    if !self.watchlist.contains(&key) {
-                        self.watchlist.push(key);
-                    }
+            Function::History(command) => {
+                if !command.is_empty() {
+                    self.worker.send(Request::HistoryTask(command));
                 }
-                self.last_quotes = None;
+                self.open_panel(PaneKind::Research(Box::new(research::ResearchPane::price_history())));
             }
-            Function::WatchRemove(words) => {
-                let keys = keys_from_words(&words);
-                self.watchlist.retain(|s| !keys.contains(s));
+            Function::Universe => self.open_panel(PaneKind::Research(Box::new(research::ResearchPane::new(None)))),
+            Function::Scan(name) => {
+                self.open_panel(PaneKind::Research(Box::new(research::ResearchPane::new(Some(name)))))
             }
+            Function::Watchlist => self.open_watchlist(false),
+            Function::Earnings => self.open_watchlist(true),
+            Function::Intraday => self.open_intraday(),
+            Function::IntradayDesk => self.open_intraday_desk(symbol.as_deref()),
+            Function::Cockpit { spec } => self.open_cockpit(symbol.as_deref(), &spec),
+            Function::AnchoredVwap(cmd) => self.anchored_vwap_command(cmd),
+            Function::WatchCommand(line) => self.watch_command(&line),
             Function::Layout(arg) => self.layout_command(&arg),
             Function::Layouts => {
                 self.settings_tab = SettingsTab::Layouts;
@@ -828,6 +1823,7 @@ impl TerminalApp {
                 self.status = format!("Layouts: {}", self.layout_names.join(" · "));
             }
             Function::NewPanel(spec) => {
+                self.apply_watchlist_spec(&spec);
                 let kind = self.panel_from_spec(&spec, symbol.as_deref());
                 match kind {
                     Some(kind) => {
@@ -835,25 +1831,33 @@ impl TerminalApp {
                         let id = self.new_pane(kind);
                         self.dock_pane(id, target, crate::dock::Zone::Right);
                     }
-                    None => self.status = format!("Unknown panel {spec:?}; try CHART, NEWS, BOOK, WEI, GC, CONG, WL"),
+                    None => {
+                        self.status = format!(
+                            "Unknown panel {spec:?}; try CHART, NEWS, BOOK, WEI, GC, CONG, WL, DESK, JOURNAL, STATS, BACKTEST, IBT, ICMP, SPATH, BRD, VPACE, GFILL, XTRM, CLOCK, RPATH, LOOKALIKE, PORT"
+                        )
+                    }
                 }
             }
-            Function::Split { down, panel } => match self.panel_from_spec(&panel, symbol.as_deref()) {
-                Some(kind) => {
-                    let target = self.focused_visible();
-                    let id = self.new_pane(kind);
-                    let zone = if down { crate::dock::Zone::Bottom } else { crate::dock::Zone::Right };
-                    self.dock_pane(id, target, zone);
+            Function::Split { down, panel } => {
+                self.apply_watchlist_spec(&panel);
+                match self.panel_from_spec(&panel, symbol.as_deref()) {
+                    Some(kind) => {
+                        let target = self.focused_visible();
+                        let id = self.new_pane(kind);
+                        let zone = if down { crate::dock::Zone::Bottom } else { crate::dock::Zone::Right };
+                        self.dock_pane(id, target, zone);
+                    }
+                    None => self.status = format!("Unknown panel {panel:?}"),
                 }
-                None => self.status = format!("Unknown panel {panel:?}"),
-            },
+            }
             Function::ClosePane => self.close_pane(self.focus),
             Function::PopOut => self.pop_out(self.focus),
             Function::Link(link) => {
                 let focus = self.focus;
                 self.set_link(focus, link);
             }
-            Function::News => self.open_panel(PaneKind::News(Box::new(NewsPane::new(self.focused_symbol())))),
+            Function::News => self.open_panel(PaneKind::News(Box::new(NewsPane::new(None)))),
+            Function::TopNews => self.open_panel(PaneKind::News(Box::new(NewsPane::top()))),
             Function::OrderBook(depth) => {
                 let sym = self.focused_symbol().unwrap_or_else(|| "BTCUSD Curncy".into());
                 let depth = depth.unwrap_or(self.prefs.panels.book_depth).clamp(5, 200);
@@ -896,6 +1900,11 @@ impl TerminalApp {
                 }
             }
             Function::Help => self.open_panel(PaneKind::Help),
+            Function::Vault(cmd) => self.vault_command(cmd, symbol.or_else(|| self.focused_symbol())),
+            Function::Health => {
+                self.worker.send(Request::Health);
+                self.open_panel(PaneKind::Health);
+            }
             Function::Wei => {
                 self.last_wei = None;
                 self.open_panel(PaneKind::Wei);
@@ -920,21 +1929,495 @@ impl TerminalApp {
                 }
                 self.set_account_mode(mode, false);
             }
+            Function::Review => self.open_review(symbol.as_deref()),
+            Function::Desk => self.open_desk(symbol.as_deref()),
+            Function::Journal(extra) => self.open_journal(symbol.as_deref(), &extra),
+            Function::TstackTune(tf) => self.open_tstack_tune(symbol.as_deref(), tf),
+            Function::StudioWhen { spec } => self.open_when(symbol.as_deref(), &spec),
+            Function::StudioQuick {spec} => self.open_quick(symbol.as_deref(),&spec),
+            Function::StudioRelate { spec } => self.open_relate(symbol.as_deref(), &spec),
+            Function::DistributionStrip => self.with_chart(|c,_|c.toggle_canvas_strip()),
+            Function::Studio { spec } => self.open_studio(symbol.as_deref(), &spec),
+            Function::StudioRoute(tr_data::studio::StudioRoute::Quick) => self.open_quick(symbol.as_deref(),""),
+            Function::StudioRoute(tr_data::studio::StudioRoute::Lab) => self.open_lab(symbol.as_deref(), ""),
+            Function::StudioLab { spec } => self.open_lab(symbol.as_deref(), &spec),
+            Function::StudioRoute(tr_data::studio::StudioRoute::Resid) => self.open_resid(""),
+            Function::StudioResid { spec } => self.open_resid(&spec),
+            Function::StudioRoute(tr_data::studio::StudioRoute::Attr) => self.open_attr(""),
+            Function::StudioAttr { spec } => self.open_attr(&spec),
+            Function::StudioCorr { spec } => self.open_studio_corr(symbol.as_deref(), &spec),
+            Function::StudioSeason { spec } => self.open_studio_season(symbol.as_deref(), &spec),
+            Function::Stats { condition, conditional } => self.open_stats(symbol.as_deref(), &condition, conditional),
+            Function::StudioDistHorizon(h) => self.set_shape_horizon(symbol.as_deref(), h),
+            Function::StudioDist { timeframe } => self.open_studio_dist(symbol.as_deref(), timeframe),
+            Function::Backtest { spec } => self.open_backtest(symbol.as_deref(), &spec),
+            Function::IntradayBacktest { spec } => self.open_intraday_backtest(symbol.as_deref(), &spec),
+            Function::Lookalike { spec } => self.open_lookalike(symbol.as_deref(), &spec),
+            Function::IntradayCompare { spec } => self.open_intraday_compare(symbol.as_deref(), &spec),
+            Function::SessionPath { spec } => self.open_session_path(symbol.as_deref(), &spec),
+            Function::TrendWall { spec } => self.open_trend_wall(symbol.as_deref(), &spec),
+            Function::EdgeWall { spec } => self.open_edge_wall(symbol.as_deref(), &spec),
+            Function::Rotation { spec } => self.open_rotation(symbol.as_deref(), &spec),
+            Function::Breadth { spec } => self.open_breadth(symbol.as_deref(), &spec),
+            Function::VolumePace { spec } => self.open_volume_pace(symbol.as_deref(), &spec),
+            Function::RealizedVol { spec } => self.open_realized_vol(symbol.as_deref(), &spec),
+            Function::Autocorr { spec } => self.open_autocorr(symbol.as_deref(), &spec),
+            Function::GapFill { spec } => self.open_gap_fill(symbol.as_deref(), &spec),
+            Function::SessionExtreme { spec } => self.open_session_extreme(symbol.as_deref(), &spec),
+            Function::SessionClock { spec } => self.open_session_clock(symbol.as_deref(), &spec),
+            Function::RelativePath { spec } => self.open_relative_path(symbol.as_deref(), &spec),
+            Function::SessionBrief => self.open_session_brief(symbol.as_deref()),
+            Function::CashLevels => self.open_cash_levels(symbol.as_deref()),
+            Function::Goto { date } => self.goto_chart_date(symbol.as_deref(), &date),
+            Function::JournalNote { date, text } => self.add_journal_note(symbol.as_deref(), &date, &text),
+            Function::Latest => self.with_chart(|c, _| c.jump_latest()),
+            Function::ReviewOverlay(which) => self.with_chart(|c, _| match which {
+                command::ReviewOverlay::BoxLevels => c.show_box = !c.show_box,
+                command::ReviewOverlay::Strength => c.show_rs = !c.show_rs,
+                command::ReviewOverlay::Volume => c.show_volume_ctx = !c.show_volume_ctx,
+            }),
+            Function::Export(kind, path) => self.run_export(kind, &path),
+            Function::Backup(path) => self.backup_workspace(&path),
+            Function::Restore(path) => self.restore_portable(&path),
         }
     }
 
     // ---- worker responses ----------------------------------------------------------------
 
-    fn chart_mut(&mut self, pane: PaneId) -> Option<&mut ChartState> {
-        match self.panes.iter_mut().find(|p| p.id == pane).map(|p| &mut p.kind) {
-            Some(PaneKind::Chart(c)) => Some(c),
-            _ => None,
+    /// Store quotes and copy a provider earnings or ex-dividend date onto charts of that name.
+    fn apply_quotes(&mut self, q: Vec<tr_data::Quote>) {
+        if q.len() > 20 {
+            self.wei_updated = Some(format!("updated {}", chrono::Local::now().format("%H:%M:%S")));
         }
+        let keys: Vec<String> = q.iter().map(|x| x.symbol.clone()).collect();
+        for x in q {
+            let earnings = x.stats.earnings_label();
+            let ex_dividend = x.stats.ex_dividend_label();
+            let earnings_stats=x.stats.clone();
+            let earnings_provenance=x.provenance;
+            let key = x.symbol.clone();
+            self.quotes.insert(key.clone(), x);
+            for pane in &mut self.panes {
+                if let Some(c) = pane.kind.native_chart_mut()
+                    && c.symbol == key
+                {
+                    c.set_earnings(earnings.clone());
+                    c.set_canvas_earnings(&earnings_stats,earnings_provenance,&self.provider);
+                    c.set_ex_dividend(ex_dividend.clone());
+                }
+            }
+        }
+        self.demo_on_quotes(&keys);
+    }
+
+    fn chart_mut(&mut self, pane: PaneId) -> Option<&mut ChartState> {
+        self.panes.iter_mut().find(|p| p.id == pane).and_then(|p| p.kind.native_chart_mut())
     }
 
     fn drain(&mut self) {
+        let sample = self.provider.eq_ignore_ascii_case("sample");
+        for pane in &mut self.panes {
+            if let PaneKind::Studio(s) = &mut pane.kind {
+                s.sample_mode(sample);
+            }
+        }
         while let Ok(r) = self.worker.rx.try_recv() {
+            let r = match r {
+                Response::WhatsNews { epoch, response } if epoch == self.whats_news_epoch => *response,
+                Response::WhatsNews { .. } => continue,
+                other => other,
+            };
             match r {
+                Response::WhatsNews { .. } => unreachable!(),
+                Response::WhatsNewsHealth { epoch, health } => {
+                    if epoch != self.whats_news_epoch {
+                        continue;
+                    }
+                    let changed = self.whats_news_health.state != health.state
+                        || self.whats_news_health.source != health.source
+                        || self.whats_news_health.message != health.message;
+                    self.whats_news_health = health;
+                    if changed {
+                        self.refresh_whats_news_panes();
+                    }
+                }
+                Response::Health(snapshot) => self.health = snapshot,
+                Response::StackEdge { pane, key, result } => {
+                    if let Some(c) = self.chart_mut(pane) {
+                        c.on_stack_edge(key, result);
+                    }
+                }
+                Response::VaultStitch { pane, generation, info } => {
+                    if let Some(c) = self.chart_mut(pane) {
+                        c.on_vault_stitch(generation, info);
+                    }
+                }
+                Response::VaultSnapshot { pane, generation, result } => {
+                    if let Some(PaneKind::Vault(p)) = self.panes.iter_mut().find(|p| p.id == pane).map(|p| &mut p.kind)
+                    {
+                        p.accept(generation, result);
+                    }
+                }
+
+                Response::Feed { feed, pane, symbol, generation, state } => {
+                    self.on_feed(feed, pane, symbol, generation, state)
+                }
+                Response::HistoryStatus(result) => {
+                    for pane in &mut self.panes {
+                        if let PaneKind::Research(r) = &mut pane.kind
+                            && r.history
+                        {
+                            r.accept_history(result.clone());
+                        }
+                    }
+                }
+                Response::HistoryChanged => {
+                    self.reload_rotation_panes();
+                    self.command_catalogue = Default::default();
+                    let desk: Vec<(crate::dock::PaneId, String)> = self
+                        .panes
+                        .iter()
+                        .filter_map(|p| match &p.kind {
+                            PaneKind::Desk(d) => Some((p.id, d.group.clone())),
+                            _ => None,
+                        })
+                        .collect();
+                    for pane in &mut self.panes {
+                        match &mut pane.kind {
+                            PaneKind::Research(r) => r.request(pane.id, &self.worker),
+                            PaneKind::Chart(c) if c.archive => c.load(&self.worker),
+                            PaneKind::Stats(s) => s.request(pane.id, &self.worker),
+                            PaneKind::Studio(s) => s.invalidate(),
+                            PaneKind::StudioDist(s) => s.request(pane.id, &self.worker),
+                            PaneKind::TstackTune(s) => s.request(pane.id, &self.worker),
+                            PaneKind::StudioCorr(s) => s.request(pane.id, &self.worker),
+                            PaneKind::StudioLab(s) => {
+                                s.invalidate(false);
+                                s.request(pane.id, &self.worker)
+                            }
+                            PaneKind::StudioResid(s) if s.model.is_some() => s.reload(),
+                            PaneKind::StudioAttr(s) if s.model.is_some() => s.reload(),
+                            PaneKind::StudioSeason(s) => s.request(pane.id, &self.worker),
+                            PaneKind::Backtest(b) => b.request(pane.id, &self.worker),
+                            PaneKind::Lookalike(l) => l.request(pane.id, &self.worker),
+                            _ => {}
+                        }
+                    }
+                    for (id, group) in desk {
+                        let symbols = self
+                            .watchlists
+                            .group(&group)
+                            .map(|g| g.members.iter().map(|m| m.symbol.clone()).collect())
+                            .unwrap_or_default();
+                        if let Some(PaneKind::Desk(d)) = self.panes.iter_mut().find(|p| p.id == id).map(|p| &mut p.kind)
+                        {
+                            d.request(id, &self.worker, symbols);
+                        }
+                    }
+                }
+                Response::AutocompleteUniverse(result) => self.command_catalogue.accept(result),
+                Response::Universe { pane, generation, result } => {
+                    if let Some(PaneKind::Research(r)) =
+                        self.panes.iter_mut().find(|p| p.id == pane).map(|p| &mut p.kind)
+                        && r.generation == generation
+                    {
+                        r.accept_universe(result);
+                    }
+                }
+                Response::Scan { pane, generation, result } => {
+                    if let Some(PaneKind::Research(r)) =
+                        self.panes.iter_mut().find(|p| p.id == pane).map(|p| &mut p.kind)
+                        && r.generation == generation
+                    {
+                        let result = result.map(|scan| {
+                            if scan.provenance.require_verified("SCAN").is_ok() {
+                                self.holding_risk.scan_breadth = Some(scan.breadth);
+                                self.holding_risk.scan_breadth_received = Some(std::time::Instant::now());
+                            }
+                            scan.snapshot
+                        });
+                        r.accept_scan(result);
+                    }
+                }
+                Response::ScanView { pane, generation, result } => {
+                    // Deliberately no `holding_risk.scan_breadth`: only SCAN breadth feeds that.
+                    if let Some(PaneKind::Research(r)) =
+                        self.panes.iter_mut().find(|p| p.id == pane).map(|p| &mut p.kind)
+                        && r.generation == generation
+                    {
+                        r.accept_view(result);
+                    }
+                }
+                Response::HoldingHistory { pane, generation, rows, spy, error } => {
+                    let _ = pane;
+                    if self.holding_risk.generation == generation {
+                        self.holding_risk.loading = false;
+                        let history_changed =
+                            rows.iter().any(|(key, bars)| self.holding_risk.history.get(key) != Some(bars));
+                        self.holding_risk.history.extend(rows);
+                        self.holding_risk.spy = spy;
+                        if history_changed {
+                            self.holding_risk.refresh_breadth();
+                        }
+                        self.holding_risk.error = error;
+                        let pf = if self.demo_mode() { Some(&*self.demo.pf) } else { self.broker.portfolio.as_deref() };
+                        self.holding_risk.recompute(pf);
+                    }
+                }
+                Response::Desk { pane, generation, result } => {
+                    if let Some(PaneKind::Desk(d)) = self.panes.iter_mut().find(|p| p.id == pane).map(|p| &mut p.kind) {
+                        d.accept(generation, result);
+                    }
+                }
+                Response::StudioWhen { pane, generation, result } => {
+                    if let Some(PaneKind::Studio(s)) = self.panes.iter_mut().find(|p| p.id == pane).map(|p| &mut p.kind)
+                        && let Some(p) = s.when_mut()
+                    {
+                        p.accept(generation, result);
+                    }
+                }
+                Response::StudioWhenBootstrap { pane, generation, key, result } => {
+                    if let Some(PaneKind::Studio(s)) = self.panes.iter_mut().find(|p| p.id == pane).map(|p| &mut p.kind)
+                        && let Some(p) = s.when_mut()
+                    {
+                        p.accept_bootstrap(generation, key, result);
+                    }
+                }
+                Response::StudioSubset { pane, generation, key, selection, result } => {
+                    if let Some(PaneKind::Studio(s)) = self.panes.iter_mut().find(|p| p.id == pane).map(|p| &mut p.kind)
+                    {
+                        s.accept_subset(generation, key, selection, result);
+                    }
+                }
+                Response::StudioCanvas {pane,token,key,result} => {
+                    if let Some(c)=self.chart_mut(pane) {c.on_studio_canvas(token,key,result);}
+                }
+                Response::StudioDist { pane, generation, result } => {
+                    if let Some(s) = self.panes.iter_mut().find(|p| p.id == pane).and_then(|p| p.kind.dist_mut()) {
+                        s.accept(generation, result);
+                    }
+                }
+                Response::TstackTune { pane, generation, result } => {
+                    if let Some(PaneKind::TstackTune(s)) =
+                        self.panes.iter_mut().find(|p| p.id == pane).map(|p| &mut p.kind)
+                    {
+                        s.accept(generation, result);
+                    }
+                }
+                Response::StudioCorr { pane, generation, result } => {
+                    if let Some(s) = self.panes.iter_mut().find(|p| p.id == pane).and_then(|p| p.kind.corr_mut()) {
+                        s.accept_shared(generation, result);
+                    }
+                }
+                Response::StudioLab { pane, token, spec, result } => {
+                    if let Some(PaneKind::StudioLab(s)) = self.panes.iter_mut().find(|p| p.id == pane).map(|p| &mut p.kind) {
+                        s.accept(token, &spec, result);
+                    }
+                }
+                Response::StudioFitSaved { pane, token, result } => self.on_fit_saved(pane, token, result),
+                Response::StudioFitList { pane, token, result } => {
+                    match self.panes.iter_mut().find(|p| p.id == pane).map(|p| &mut p.kind) {
+                        Some(PaneKind::StudioResid(s)) => s.accept_list(token, result),
+                        Some(PaneKind::StudioAttr(s)) => s.accept_list(token, result),
+                        _ => {}
+                    }
+                }
+                Response::StudioFitLoaded { pane, token, id, result } => {
+                    match self.panes.iter_mut().find(|p| p.id == pane).map(|p| &mut p.kind) {
+                        Some(PaneKind::StudioResid(s)) => s.accept_loaded(token, &id, result),
+                        Some(PaneKind::StudioAttr(s)) => s.accept_loaded(token, &id, result),
+                        _ => {}
+                    }
+                }
+                Response::StudioResidualScored { pane, token, model_digest, result } => {
+                    match self.panes.iter_mut().find(|p| p.id == pane).map(|p| &mut p.kind) {
+                        Some(PaneKind::StudioResid(s)) => s.accept_scored(token, model_digest, result),
+                        Some(PaneKind::StudioAttr(s)) => s.accept_scored(token, model_digest, result),
+                        _ => {}
+                    }
+                }
+                Response::StudioAttributed { pane, token, model_digest, score_key, window, result } => {
+                    if let Some(PaneKind::StudioAttr(s)) = self.panes.iter_mut().find(|p| p.id == pane).map(|p| &mut p.kind) {
+                        s.accept_attributed(token, model_digest, score_key, &window, result);
+                    }
+                }
+                Response::StudioResidualChecked { pane, token, model_digest, score_key, result } => {
+                    if let Some(PaneKind::StudioResid(s)) = self.panes.iter_mut().find(|p| p.id == pane).map(|p| &mut p.kind) {
+                        s.accept_checked(token, model_digest, score_key, result);
+                    }
+                }
+                Response::StudioShape { pane, generation, result } => {
+                    if let Some(s) = self.panes.iter_mut().find(|p| p.id == pane).and_then(|p| p.kind.dist_mut()) {
+                        s.accept_shape(generation, result);
+                    }
+                }
+                Response::StudioShapeBootstrap { pane, generation, key, result } => {
+                    if let Some(s) = self.panes.iter_mut().find(|p| p.id == pane).and_then(|p| p.kind.dist_mut()) {
+                        s.accept_shape_bootstrap(generation, key, result);
+                    }
+                }
+                Response::StudioDistRotation { pane, generation, key, result } => {
+                    if let Some(s) = self.panes.iter_mut().find(|p| p.id == pane).and_then(|p| p.kind.dist_mut()) {
+                        s.accept_rotation(generation, key, result);
+                    }
+                }
+                Response::StudioSeasonBand { pane, generation, key, result } => {
+                    if let Some(s) = self.panes.iter_mut().find(|p| p.id == pane).and_then(|p| p.kind.season_mut()) {
+                        s.accept_band(generation, key, result);
+                    }
+                }
+                Response::StudioSeason { pane, generation, result } => {
+                    if let Some(s) = self.panes.iter_mut().find(|p| p.id == pane).and_then(|p| p.kind.season_mut()) {
+                        s.accept_shared(generation, result);
+                    }
+                }
+                Response::Stats { pane, generation, result } => {
+                    if let Some(s) = self.panes.iter_mut().find(|p| p.id == pane).and_then(|p| p.kind.stats_mut()) {
+                        s.accept(generation, result);
+                    }
+                }
+                Response::BacktestTrialRevision { scope, revision } => {
+                    for pane in &mut self.panes {
+                        if let Some(b) = pane.kind.backtest_mut()
+                            && b.note_revision(&scope, revision)
+                        {
+                            b.request(pane.id, &self.worker);
+                        }
+                    }
+                }
+                Response::Backtest { pane, generation, result } => {
+                    if let Some(b) = self.panes.iter_mut().find(|p| p.id == pane).and_then(|p| p.kind.backtest_mut()) {
+                        b.accept(generation, result);
+                    }
+                }
+                Response::IntradayBacktest { pane, generation, result } => {
+                    if let Some(b) = self.panes.iter_mut().find(|p| p.id == pane).and_then(|p| p.kind.backtest_mut()) {
+                        b.accept_intraday(generation, result);
+                    }
+                }
+                Response::SessionPath { pane, generation, result } => {
+                    if let Some(PaneKind::SessionPath(p)) =
+                        self.panes.iter_mut().find(|p| p.id == pane).map(|p| &mut p.kind)
+                    {
+                        p.accept(generation, result);
+                    }
+                }
+                Response::WallEdgeRow { pane, generation, index, symbol, result } => {
+                    if let Some(PaneKind::TrendWall(p)) =
+                        self.panes.iter_mut().find(|p| p.id == pane).map(|p| &mut p.kind)
+                    {
+                        p.accept_edge(generation, index, symbol, result);
+                    }
+                }
+                Response::WallEdgeDone { pane, generation, error } => {
+                    if let Some(PaneKind::TrendWall(p)) =
+                        self.panes.iter_mut().find(|p| p.id == pane).map(|p| &mut p.kind)
+                    {
+                        p.edge_done(generation, error);
+                    }
+                }
+                Response::TrendWallRow { pane, generation, index, row } => {
+                    if let Some(PaneKind::TrendWall(p)) =
+                        self.panes.iter_mut().find(|p| p.id == pane).map(|p| &mut p.kind)
+                    {
+                        p.accept(generation, index, row);
+                    }
+                }
+                Response::TrendWallDone { pane, generation, error } => {
+                    if let Some(PaneKind::TrendWall(p)) =
+                        self.panes.iter_mut().find(|p| p.id == pane).map(|p| &mut p.kind)
+                    {
+                        p.done(generation, error);
+                        if self.provider != "sample" {
+                            p.ensure_edge(pane, &self.worker, chrono::Utc::now().timestamp());
+                        }
+                    }
+                }
+                Response::Rotation { pane, generation, result } => {
+                    if let Some(PaneKind::Rotation(p)) =
+                        self.panes.iter_mut().find(|p| p.id == pane).map(|p| &mut p.kind)
+                    {
+                        p.accept(generation, result);
+                    }
+                }
+                Response::Breadth { pane, generation, result } => {
+                    if let Some(PaneKind::Breadth(b)) =
+                        self.panes.iter_mut().find(|p| p.id == pane).map(|p| &mut p.kind)
+                    {
+                        b.accept(generation, result);
+                    }
+                }
+                Response::VolumePace { pane, generation, result } => {
+                    if let Some(PaneKind::VolumePace(p)) =
+                        self.panes.iter_mut().find(|p| p.id == pane).map(|p| &mut p.kind)
+                    {
+                        p.accept(generation, result);
+                    }
+                }
+                Response::RealizedVol { pane, generation, result } => {
+                    if let Some(PaneKind::RealizedVol(p)) =
+                        self.panes.iter_mut().find(|p| p.id == pane).map(|p| &mut p.kind)
+                    {
+                        p.accept(generation, result);
+                    }
+                }
+                Response::Autocorr { pane, generation, result } => {
+                    if let Some(PaneKind::Autocorr(p)) =
+                        self.panes.iter_mut().find(|p| p.id == pane).map(|p| &mut p.kind)
+                    {
+                        p.accept(generation, result);
+                    }
+                }
+                Response::GapFill { pane, generation, result } => {
+                    if let Some(PaneKind::GapFill(p)) =
+                        self.panes.iter_mut().find(|p| p.id == pane).map(|p| &mut p.kind)
+                    {
+                        p.accept(generation, result);
+                    }
+                }
+                Response::SessionExtreme { pane, generation, result } => {
+                    if let Some(PaneKind::SessionExtreme(p)) =
+                        self.panes.iter_mut().find(|p| p.id == pane).map(|p| &mut p.kind)
+                    {
+                        p.accept(generation, result);
+                    }
+                }
+                Response::SessionClock { pane, generation, result } => {
+                    if let Some(PaneKind::SessionClock(p)) =
+                        self.panes.iter_mut().find(|p| p.id == pane).map(|p| &mut p.kind)
+                    {
+                        p.accept(generation, result);
+                    }
+                }
+                Response::RelativePath { pane, generation, result } => {
+                    if let Some(PaneKind::RelativePath(p)) =
+                        self.panes.iter_mut().find(|p| p.id == pane).map(|p| &mut p.kind)
+                    {
+                        p.accept(generation, result);
+                    }
+                }
+                Response::SessionBrief { pane, generation, result } => {
+                    if let Some(PaneKind::SessionBrief(p)) =
+                        self.panes.iter_mut().find(|p| p.id == pane).map(|p| &mut p.kind)
+                    {
+                        p.accept(generation, result);
+                    }
+                }
+                Response::CashLevels { pane, result } => self.accept_cash_levels(pane, result),
+                Response::IntradayCompare { pane, generation, result } => {
+                    if let Some(PaneKind::IntradayCompare(c)) =
+                        self.panes.iter_mut().find(|p| p.id == pane).map(|p| &mut p.kind)
+                    {
+                        c.accept(generation, result);
+                    }
+                }
+                Response::Lookalike { pane, generation, result } => {
+                    if let Some(PaneKind::Lookalike(l)) =
+                        self.panes.iter_mut().find(|p| p.id == pane).map(|p| &mut p.kind)
+                    {
+                        l.accept(generation, result);
+                    }
+                }
                 Response::History {
                     pane,
                     generation,
@@ -948,7 +2431,8 @@ impl TerminalApp {
                     live,
                 } => {
                     let worker = &self.worker;
-                    if let Some(PaneKind::Chart(c)) = self.panes.iter_mut().find(|p| p.id == pane).map(|p| &mut p.kind)
+                    if let Some(c) =
+                        self.panes.iter_mut().find(|p| p.id == pane).and_then(|p| p.kind.native_chart_mut())
                         && c.symbol == symbol
                         && c.tf == tf
                     {
@@ -957,10 +2441,8 @@ impl TerminalApp {
                 }
                 Response::HistoryError { pane, generation, error } => {
                     // Errors while paging just mean "no older history"; only report failed loads.
-                    let empty = self.chart_mut(pane).map(|c| {
-                        c.on_history_error(generation, error.clone());
-                        c.is_empty()
-                    });
+                    let empty =
+                        self.chart_mut(pane).map(|c| c.on_history_error(generation, error.clone()) && c.is_empty());
                     if empty == Some(true) {
                         self.status = format!("data error: {error}");
                     }
@@ -968,6 +2450,43 @@ impl TerminalApp {
                 Response::Indicators { pane, generation, built } => {
                     if let Some(c) = self.chart_mut(pane) {
                         c.on_indicators(generation, built);
+                    }
+                }
+                Response::TrendStack { pane, generation, base_len, result, config_revision } => {
+                    if let Some(c) = self.chart_mut(pane) {
+                        if c.stack_config_revision == config_revision {
+                            c.on_trend_stack(generation, base_len, result);
+                        }
+                    }
+                }
+                Response::ChartSessionSummary { pane, key, result } => {
+                    if let Some(c) = self.chart_mut(pane) {
+                        c.on_session_summary(key, result);
+                    }
+                }
+                Response::AuctionMap { pane, key, result } => {
+                    if let Some(c) = self.chart_mut(pane) {
+                        c.on_auction_map(key, result);
+                    }
+                }
+                Response::StopCloud { pane, key, result } => {
+                    if let Some(c) = self.chart_mut(pane) {
+                        c.on_stop_cloud(key, result);
+                    }
+                }
+                Response::TrendCone { pane, key, result } => {
+                    if let Some(c) = self.chart_mut(pane) {
+                        c.on_trend_cone(key, result);
+                    }
+                }
+                Response::AnchoredVwap { pane, key, result } => {
+                    if let Some(c) = self.chart_mut(pane) {
+                        c.on_anchored_vwap(key, result);
+                    }
+                }
+                Response::DailyStrength { pane, generation, base_len, result } => {
+                    if let Some(c) = self.chart_mut(pane) {
+                        c.on_daily_strength(generation, base_len, result);
                     }
                 }
                 Response::Compare { pane, generation, symbol, line } => {
@@ -980,15 +2499,9 @@ impl TerminalApp {
                         c.on_markers(&symbol, trades);
                     }
                 }
-                Response::Quotes(q) => {
-                    if q.len() > 20 {
-                        self.wei_updated = Some(format!("updated {}", chrono::Local::now().format("%H:%M:%S")));
-                    }
-                    let keys: Vec<String> = q.iter().map(|x| x.symbol.clone()).collect();
-                    for x in q {
-                        self.quotes.insert(x.symbol.clone(), x);
-                    }
-                    self.demo_on_quotes(&keys);
+                Response::Quotes(q) => self.apply_quotes(q),
+                Response::IntradayScan { group, board, generation } => {
+                    self.store_intraday_scan(group, board, generation)
                 }
                 Response::Latest(t) => self.latest = t,
                 Response::TickerTrades { pane, symbol, trades } => {
@@ -1025,18 +2538,25 @@ impl TerminalApp {
                         }
                     }
                 }
-                Response::News { pane, symbol, items } => {
-                    if let Some(p) = self.panes.iter_mut().find(|p| p.id == pane)
-                        && let PaneKind::News(n) = &mut p.kind
-                        && n.symbol == symbol
-                    {
-                        n.loading = false;
-                        match items {
-                            Ok(items) => {
-                                n.items = items;
-                                n.error = None;
+                Response::News { pane, symbols, batch } => {
+                    if let Some(p) = self.panes.iter_mut().find(|p| p.id == pane) {
+                        match &mut p.kind {
+                            PaneKind::News(n) => n.accept(batch.clone()),
+                            PaneKind::Chart(c) => c.on_news(&batch),
+                            PaneKind::Studio(s) => s.chart.on_news(&batch),
+                            _ => {}
+                        }
+                    }
+                    for p in &mut self.panes {
+                        if p.id == pane {
+                            continue;
+                        }
+                        if let Some(c) = p.kind.native_chart_mut() {
+                            let ours = symbols.as_ref().is_some_and(|s| s.iter().any(|k| k == &c.symbol))
+                                || batch.queried.iter().any(|k| k == &c.symbol);
+                            if ours {
+                                c.on_news(&batch);
                             }
-                            Err(e) => n.error = Some(e),
                         }
                     }
                 }
@@ -1048,15 +2568,15 @@ impl TerminalApp {
                         match book {
                             Ok(book) => {
                                 b.book = Some(book);
+                                b.last_ok = Some(chrono::Utc::now().timestamp());
                                 b.error = None;
                             }
                             Err(e) => b.error = Some(e),
                         }
                     }
                 }
-                Response::Portfolio(result) => {
-                    let result = self.keep_simulated_trades(result);
-                    self.on_portfolio(result)
+                Response::Portfolio(generation, request_id, result) => {
+                    self.on_portfolio(generation, request_id, result)
                 }
                 Response::BrokerRegistered(result) => self.on_broker_registered(result),
                 Response::BrokerPortal(result) => self.on_broker_portal(result),
@@ -1070,6 +2590,30 @@ impl TerminalApp {
                     }
                     self.worker.send(Request::Alerts);
                 }
+                Response::TradePlanFeed(batch) => self.trade_plans = batch,
+                Response::NewTradePlanEvents(events) => {
+                    for event in events {
+                        tracing::info!("ALERT: {}", event.message);
+                        self.toasts.push((event.message, Instant::now()));
+                    }
+                }
+                Response::PriceAlertFeed(batch) => {
+                    self.price_alerts = batch;
+                    self.sync_chart_alerts();
+                }
+                Response::Portable(result) => {
+                    self.status = match result {
+                        Ok(s) => s,
+                        Err(e) => format!("Export / restore: {e}"),
+                    };
+                }
+                Response::NewPriceAlerts(new) => {
+                    for a in new {
+                        tracing::info!("ALERT: {}", a.message);
+                        self.toasts.push((a.message, Instant::now()));
+                    }
+                    self.worker.send(Request::PriceAlerts);
+                }
                 Response::Status(s) => self.status = s,
                 Response::Curves(c) => self.curves = Some(c),
                 Response::SearchHits { query, hits } => self.net_hits = (query, hits),
@@ -1082,6 +2626,79 @@ impl TerminalApp {
                 }
             }
         }
+    }
+
+    fn arm_trade_plan(
+        &mut self,
+        symbol: Option<String>,
+        entry: f64,
+        stop: f64,
+        target: Option<f64>,
+        risk: Option<f64>,
+        (breakeven_at_r, trail): (Option<f64>, Option<tr_data::trade_plans::TrailSpec>),
+    ) {
+        let Some(symbol) = symbol.or_else(|| self.focused_symbol()) else {
+            self.status = "PLAN needs a ticker: NVDA PLAN 142.5 STOP 138.2 TARGET 151.1 RISK 300".into();
+            return;
+        };
+        let shares = risk.map(|risk| (risk / (entry - stop).abs()).floor()).unwrap_or(0.0);
+        self.worker.send(Request::ArmTradePlan(tr_data::trade_plans::PlanDraft {
+            symbol,
+            entry,
+            stop,
+            target,
+            dollar_risk: risk.unwrap_or(0.0),
+            shares,
+            stop_source: "command".into(),
+            breakeven_at_r,
+            trail,
+        }));
+        self.open_panel(PaneKind::Alerts);
+    }
+
+    fn update_trade_plan(&mut self, symbol: Option<String>, change: tr_data::trade_plans::PlanChange) {
+        let Some(query) = symbol.or_else(|| self.focused_symbol()) else {
+            self.status = "Plan management needs a ticker: NVDA TRAIL 1R / BREAKEVEN 1 / MOVESTOP 145".into();
+            return;
+        };
+        self.worker.send(Request::UpdateTradePlan { query, change });
+        self.open_panel(PaneKind::Alerts);
+    }
+
+    fn set_price_alert(&mut self, symbol: Option<String>, kind: tr_data::price_alerts::AlertKind) {
+        let Some(symbol) = symbol.or_else(|| self.focused_symbol()) else {
+            self.status =
+                "ALERT needs a ticker (AAPL ALERT 150, AAPL ALERT VWAP, AAPL ALERT RVOL 2, AAPL ALERT COMBO NEAR_HIGH ABOVE 250 RVOL 2, or AAPL ALERT SETUP NEAR_HIGH)"
+                    .into();
+            return;
+        };
+        let symbol = tr_data::security(&symbol).key();
+        self.worker.send(Request::AddPriceAlert { symbol, kind });
+        self.worker.send(Request::Alerts);
+        self.open_panel(PaneKind::Alerts);
+    }
+
+    fn clear_price_alert(&mut self, query: &str) {
+        if query.trim().is_empty() {
+            self.status = "UNALERT needs a ticker or rule".into();
+            return;
+        }
+        self.worker.send(Request::RemovePriceAlert { query: query.to_string() });
+        self.open_panel(PaneKind::Alerts);
+    }
+
+    fn sync_chart_alerts(&mut self) {
+        for pane in &mut self.panes {
+            if let PaneKind::Chart(c) = &mut pane.kind {
+                c.set_alert_rules(
+                    self.price_alerts.rules.iter().filter(|r| r.enabled && r.symbol == c.symbol).cloned().collect(),
+                );
+            }
+        }
+    }
+
+    fn unread_alerts(&self) -> usize {
+        self.alerts.iter().filter(|a| !a.seen).count() + self.price_alerts.unread() + self.trade_plans.unread()
     }
 
     /// Freshness line for the Congress feed: last check, newest filing, next check.
@@ -1130,6 +2747,7 @@ impl TerminalApp {
     /// Global and chart hotkeys. Runs before the command line so it can claim keys; when
     /// the command line holds text, keys belong to it.
     fn hotkeys(&mut self, ctx: &egui::Context) {
+        self.clear_handoff_arrival_on_input(ctx);
         let presses: Vec<(Key, Modifiers)> = ctx.input(|i| {
             i.events
                 .iter()
@@ -1160,36 +2778,124 @@ impl TerminalApp {
             }
             return;
         }
-        // ⌘K (Ctrl+K) opens and closes the palette from anywhere, even from a text field.
-        if let Some(&(key, m)) =
-            presses.iter().find(|(k, m)| self.prefs.hotkeys.action_for(*k, *m) == Some(prefs::Action::CommandPalette))
-        {
+        let focus_chord = presses.iter().find(|(k, m)| *k == Key::K && m.ctrl && !m.alt && !m.shift);
+        let focus_text = ctx.input(|i| i.events.iter().any(|e| matches!(e, Event::Text(t) if t == "/" || t == ":")))
+            && !ctx.text_edit_focused();
+        if focus_chord.is_some() || focus_text {
+            ctx.input_mut(|i| {
+                if let Some(&(key, m)) = focus_chord {
+                    i.consume_key(m, key);
+                }
+                i.events.retain(|e| !matches!(e, Event::Text(t) if t == "/" || t == ":"));
+            });
+            self.palette.open = false;
+            self.cmd.clear();
+            self.command_changed();
+            self.focus_cmd = true;
+            ctx.memory_mut(|m| m.request_focus(egui::Id::new("command-line")));
+            return;
+        }
+        // The full palette remains available from text fields; Ctrl+K is reserved for the bar.
+        if let Some(&(key, m)) = presses.iter().find(|(k, m)| {
+            (*k == Key::K && m.shift && (m.command || m.ctrl) && !m.alt)
+                || self.prefs.hotkeys.action_for(*k, *m) == Some(prefs::Action::CommandPalette)
+        }) {
             ctx.input_mut(|i| i.consume_key(m, key));
             self.palette.toggle();
             return;
         }
         // While it is open, the palette owns the keyboard.
-        if self.palette.open {
+        if self.palette.open
+            || self.watch_ui.picker.is_some()
+            || self.watch_ui.delete.is_some()
+            || self.watch_ui.edit.is_some()
+        {
             return;
         }
         let cmd_id = egui::Id::new("command-line");
+        // egui processes focus navigation at begin_pass, before app hotkeys. A newly
+        // focused TextEdit may not have installed its filter yet; keep its first Tab,
+        // arrows and Escape in the command bar instead of moving to another widget.
+        let navigation = presses
+            .iter()
+            .any(|(k, m)| !m.any() && matches!(k, Key::Tab | Key::Escape | Key::ArrowUp | Key::ArrowDown));
+        let owns_navigation =
+            ctx.memory(|m| m.has_focus(cmd_id) || (m.focused().is_none() && m.had_focus_last_frame(cmd_id)));
+        if navigation && owns_navigation {
+            ctx.memory_mut(|m| {
+                if !m.has_focus(cmd_id) {
+                    m.request_focus(cmd_id);
+                }
+                m.move_focus(egui::FocusDirection::None);
+            });
+        }
         let focused = ctx.memory(|m| m.focused());
         let cmd_focused = focused == Some(cmd_id);
-        let other_text_focused = focused.is_some() && !cmd_focused;
+        let other_text_focused = ctx.text_edit_focused() && !cmd_focused;
         if other_text_focused {
             return;
         }
+        if !cmd_focused && !ctx.text_edit_focused() && !self.focus_cmd && self.cmd.is_empty() {
+            for &(key, m) in &presses {
+                if let Some(
+                    a @ (prefs::Action::StudioPrevLens
+                    | prefs::Action::StudioNextLens
+                    | prefs::Action::StudioCloseInspector
+                    | prefs::Action::StudioUndo),
+                ) = self.prefs.hotkeys.action_for(key, m)
+                    && self.hotkey_applies(a)
+                {
+                    ctx.input_mut(|i| i.consume_key(m, key));
+                    self.run_hotkey(a);
+                    return;
+                }
+            }
+        }
+        if !cmd_focused && !self.focus_cmd && self.cmd.is_empty() && self.handoff_keys(ctx) {
+            return;
+        }
+        if !cmd_focused && !self.focus_cmd && self.cmd.is_empty() && self.backtest_keys(ctx) {
+            return;
+        }
+        if !cmd_focused && !self.focus_cmd && self.cmd.is_empty() && self.clock_keys(ctx) {
+            return;
+        }
+        if !cmd_focused
+            && !self.focus_cmd
+            && self.cmd.is_empty()
+            && presses.iter().any(|(k, m)| *k == Key::R && !m.any())
+            && self.retry_focused()
+        {
+            ctx.input_mut(|i| {
+                i.consume_key(Modifiers::NONE, Key::R);
+                i.events.retain(|e| !matches!(e, Event::Text(t) if t.eq_ignore_ascii_case("r")));
+            });
+            return;
+        }
+        if !cmd_focused && !self.focus_cmd && self.cmd.is_empty() && self.rotation_keys(ctx) {
+            return;
+        }
+        if !cmd_focused && !self.focus_cmd && self.cmd.is_empty() && self.wall_keys(ctx) {
+            return;
+        }
+        if !cmd_focused && !self.focus_cmd && self.cmd.is_empty() && self.workflow_keys(ctx) {
+            return;
+        }
         // Chorded bindings (⌘, Ctrl, Alt) work even while the command line has text.
+        let typing = ctx.input(|i| i.events.iter().any(|e| matches!(e, Event::Text(t) if !t.is_empty())));
         let mut swallow_text = false;
         for &(key, m) in &presses {
             let Some(action) = self.prefs.hotkeys.action_for(key, m) else { continue };
+            if action == prefs::Action::StudioUndo && ctx.text_edit_focused() {
+                continue;
+            }
             let chorded = m.command || m.ctrl || m.alt;
-            if !chorded && !self.cmd.is_empty() {
+            if !chorded && (!self.cmd.is_empty() || (cmd_focused && key == Key::Tab)) {
                 continue;
             }
             // ⇧B / ⇧S type letters: never while the command line is being typed into.
             let letter = !chorded && Self::types_text(key);
-            if letter && cmd_focused {
+            if letter && (cmd_focused || typing) {
                 continue;
             }
             if !self.hotkey_applies(action) {
@@ -1221,12 +2927,16 @@ impl TerminalApp {
                 let starts = !self.cmd.is_empty()
                     || typed.chars().next().is_some_and(|c| c.is_ascii_alphanumeric() || c == '^' || c == '?');
                 if starts {
-                    self.cmd.push_str(&typed.to_ascii_uppercase());
+                    self.cmd = typed.to_ascii_uppercase();
+                    self.command_changed();
                     self.focus_cmd = true;
+                    // Transfer these text events once, before TextEdit is rendered.
+                    ctx.input_mut(|i| i.events.retain(|e| !matches!(e, Event::Text(_))));
+                    ctx.memory_mut(|m| m.request_focus(cmd_id));
                 }
             }
         }
-        if !self.cmd.is_empty() || !self.focused_is_chart() {
+        if cmd_focused || self.focus_cmd || !self.cmd.is_empty() || !self.focused_is_chart() {
             return;
         }
         let pressed = |m: Modifiers, k: Key| ctx.input_mut(|i| i.consume_key(m, k));
@@ -1235,7 +2945,9 @@ impl TerminalApp {
                 c.cancel();
             });
         }
-        if pressed(Modifiers::NONE, Key::Delete) || pressed(Modifiers::NONE, Key::Backspace) {
+        let delete = pressed(Modifiers::NONE, Key::Delete);
+        let backspace = !self.handoff_live() && pressed(Modifiers::NONE, Key::Backspace);
+        if delete || backspace {
             self.with_chart(|c, _| {
                 c.delete_selected();
             });
@@ -1266,11 +2978,21 @@ impl TerminalApp {
     fn hotkey_applies(&self, a: prefs::Action) -> bool {
         use prefs::Action as A;
         match a {
+            A::CanvasBrush => self.panes.iter().any(|p|p.id==self.focus&&matches!(p.kind,PaneKind::Studio(_))),
+            A::CanvasStrip => self.focused_is_chart(),
+            A::StudioPrevLens | A::StudioNextLens | A::StudioCloseInspector | A::StudioUndo => {
+                self.panes.iter().any(|p| p.id == self.focus && matches!(p.kind, PaneKind::Studio(_)))
+            }
             A::DrawTrendline
             | A::DrawHorizontal
             | A::DrawVertical
             | A::DrawFib
+            | A::ToggleAuctionMap
+            | A::ToggleStopCloud
+            | A::ToggleTrendCone
+            | A::DrawAnchoredVwap
             | A::ResetView
+            | A::JumpLatest
             | A::LogScale
             | A::Magnet => self.focused_is_chart(),
             a => a.layout_slot().is_none_or(|i| i < self.layout_names.len()),
@@ -1280,13 +3002,36 @@ impl TerminalApp {
     fn run_hotkey(&mut self, a: prefs::Action) {
         use prefs::Action as A;
         match a {
+            A::CanvasBrush => self.with_chart(|c,_|c.toggle_canvas_brush()),
+            A::CanvasStrip => self.with_chart(|c,_|c.toggle_canvas_strip()),
+            A::StudioPrevLens | A::StudioNextLens | A::StudioCloseInspector | A::StudioUndo => {
+                if let Some(PaneKind::Studio(s)) =
+                    self.panes.iter_mut().find(|p| p.id == self.focus).map(|p| &mut p.kind)
+                {
+                    match a {
+                        A::StudioPrevLens => s.cycle_lens(-1),
+                        A::StudioNextLens => s.cycle_lens(1),
+                        A::StudioCloseInspector => {if !s.chart.cancel_canvas_brush(){s.inspector_open = false;}},
+                        A::StudioUndo => {
+                            s.undo_inputs();
+                        }
+                        _ => {}
+                    }
+                }
+            }
             A::Help => self.apply(Function::Help),
+            A::Vault => self.vault_command(command::VaultCmd::Open, self.focused_symbol()),
             A::Congress => self.apply(Function::Congress),
             A::Politicians => self.apply(Function::Politician(String::new())),
             A::Alerts => self.apply(Function::Alerts),
             A::Watchlist => self.apply(Function::Watchlist),
+            A::Desk => self.apply(Function::Desk),
+            A::Journal => self.apply(Function::Journal(String::new())),
             A::Refresh => self.apply(Function::Refresh),
-            A::FrameTiming => self.show_perf = !self.show_perf,
+            A::FrameTiming => {
+                self.show_perf = !self.show_perf;
+                crate::perf::set_enabled(self.show_perf);
+            }
             A::Portfolio => self.apply(Function::Portfolio(command::PortView::Summary, String::new())),
             A::Positions => self.apply(Function::Portfolio(command::PortView::Positions, String::new())),
             A::Orders => self.apply(Function::Portfolio(command::PortView::Orders, String::new())),
@@ -1307,17 +3052,20 @@ impl TerminalApp {
             }
             A::ClosePane => self.close_pane(self.focus),
             A::PopOut => self.pop_out(self.focus),
-            A::SaveLayout => {
-                self.save_layout();
-                self.status = format!("Saved layout {:?}", self.layout_name);
-            }
+            // Same as LAYOUT SAVE (mid-hop: saves the origin only, never the temporary view).
+            A::SaveLayout => self.layout_command("SAVE"),
             A::Settings => self.apply(Function::Settings),
             A::CommandPalette => self.palette.toggle(),
             A::DrawTrendline => self.with_chart(|c, _| c.start_tool(Tool::Trendline)),
             A::DrawHorizontal => self.with_chart(|c, _| c.start_tool(Tool::Horizontal)),
             A::DrawVertical => self.with_chart(|c, _| c.start_tool(Tool::Vertical)),
             A::DrawFib => self.with_chart(|c, _| c.start_tool(Tool::Fib)),
+            A::ToggleAuctionMap => self.with_chart(|c, w| c.set_auction(command::AuctionCmd::Toggle(None), w)),
+            A::ToggleStopCloud => self.with_chart(|c, w| c.set_stop_cloud(command::StopCmd::Toggle(None), w)),
+            A::ToggleTrendCone => self.with_chart(|c, w| c.set_trend_cone(None, None, w)),
+            A::DrawAnchoredVwap => self.anchored_vwap_command(command::AnchorCmd::Arm),
             A::ResetView => self.with_chart(|c, _| c.reset_view()),
+            A::JumpLatest => self.with_chart(|c, _| c.jump_latest()),
             A::LogScale => self.with_chart(|c, _| c.log = !c.log),
             A::Magnet => self.with_chart(|c, _| c.magnet = !c.magnet),
             a => {
@@ -1330,8 +3078,42 @@ impl TerminalApp {
         }
     }
 
+    fn news_watchlist_keys(&self) -> Vec<String> {
+        self.watchlists
+            .group(&self.watch_ui.selected_group)
+            .or_else(|| self.watchlists.group(&self.watchlists.last_used))
+            .map(|g| g.members.iter().map(|m| m.symbol.clone()).collect())
+            .unwrap_or_else(|| self.watchlist.clone())
+    }
+
+    fn news_leader_keys(&self) -> Vec<String> {
+        self.panes
+            .iter()
+            .find_map(|p| match &p.kind {
+                PaneKind::Research(r) => {
+                    r.results.as_ref().map(|s| s.data.results.iter().map(|row| row.symbol.clone()).collect())
+                }
+                _ => None,
+            })
+            .unwrap_or_default()
+    }
+
     fn periodic(&mut self) {
         let visible = self.visible_panes();
+        for &i in &visible {
+            let id = self.panes[i].id;
+            if let PaneKind::Vault(p) = &mut self.panes[i].kind
+                && p.fetched.is_none_or(|t| t.elapsed() >= Duration::from_secs(60))
+            {
+                p.request(id, &self.worker);
+            }
+        }
+        if visible.iter().any(|&i| matches!(self.panes[i].kind, PaneKind::Health))
+            && self.last_health.is_none_or(|t| t.elapsed() >= Duration::from_secs(1))
+        {
+            self.worker.send(Request::Health);
+            self.last_health = Some(Instant::now());
+        }
         let shown = |f: &dyn Fn(&PaneKind) -> bool| visible.iter().any(|&i| f(&self.panes[i].kind));
         let visible_wl = self.sidebar_open || shown(&|k| matches!(k, PaneKind::Watchlist));
         if visible_wl && self.last_quotes.is_none_or(|t| t.elapsed() > Duration::from_secs(20)) {
@@ -1349,15 +3131,41 @@ impl TerminalApp {
             self.worker.send(Request::YieldCurves);
             self.last_curve = Some(Instant::now());
         }
+        let watch_news = tr_data::news::bound_symbols(self.news_watchlist_keys());
+        let leader_news = tr_data::news::bound_symbols(self.news_leader_keys());
         // News every 5 minutes and order books every second, while visible.
         for &i in &visible {
             let p = &mut self.panes[i];
             match &mut p.kind {
                 PaneKind::News(n) if n.fetched.is_none_or(|t| t.elapsed() > Duration::from_secs(300)) => {
                     n.fetched = Some(Instant::now());
-                    self.worker.send(Request::News { pane: p.id, symbol: n.symbol.clone() });
+                    n.loading = true;
+                    let symbols = match n.scope {
+                        tr_data::news::NewsScope::Watchlist => Some(watch_news.clone()),
+                        tr_data::news::NewsScope::Leaders => Some(leader_news.clone()),
+                        tr_data::news::NewsScope::Symbol => n.symbol.clone().map(|s| vec![s]),
+                        tr_data::news::NewsScope::Top => None,
+                    };
+                    self.worker.send(Request::News { pane: p.id, symbols });
                 }
-                PaneKind::Options(o) if o.fetched.is_none_or(|t| t.elapsed() > Duration::from_secs(30)) => {
+                PaneKind::Studio(s)
+                    if !self.provider.eq_ignore_ascii_case("sample")
+                        && s.chart.show_news
+                        && s.chart.news_fetched.is_none_or(|t| t.elapsed() > Duration::from_secs(300)) =>
+                {
+                    s.chart.news_fetched = Some(Instant::now());
+                    self.worker.send(Request::News { pane: p.id, symbols: Some(vec![s.context.symbol.clone()]) });
+                }
+                PaneKind::Chart(c)
+                    if c.show_news && c.news_fetched.is_none_or(|t| t.elapsed() > Duration::from_secs(300)) =>
+                {
+                    c.news_fetched = Some(Instant::now());
+                    self.worker.send(Request::News { pane: p.id, symbols: Some(vec![c.symbol.clone()]) });
+                }
+                PaneKind::Options(o)
+                    if health_view::auto_retry_ready(&o.feed_state)
+                        && o.fetched.is_none_or(|t| t.elapsed() > Duration::from_secs(30)) =>
+                {
                     o.fetched = Some(Instant::now());
                     self.worker.send(Request::Options {
                         pane: p.id,
@@ -1365,13 +3173,18 @@ impl TerminalApp {
                         expiration: o.expiration,
                     });
                 }
-                PaneKind::OrderBook(b) if b.fetched.is_none_or(|t| t.elapsed() > Duration::from_millis(1000)) => {
+                PaneKind::OrderBook(b)
+                    if health_view::auto_retry_ready(&b.feed_state)
+                        && b.fetched.is_none_or(|t| t.elapsed() > Duration::from_millis(1000)) =>
+                {
                     b.fetched = Some(Instant::now());
                     self.worker.send(Request::OrderBook { pane: p.id, symbol: b.symbol.clone(), depth: b.depth });
                 }
                 _ => {}
             }
         }
+        self.session_clock_periodic(&visible);
+        self.trend_wall_periodic(&visible);
         self.broker_periodic(&visible);
         if let Some((q, at)) = &self.search_pending
             && at.elapsed() > Duration::from_millis(300)
@@ -1383,6 +3196,15 @@ impl TerminalApp {
             self.worker.send(Request::Latest { limit: 2_000 });
             self.last_feed = Some(Instant::now());
         }
+        if (self.price_alerts.rules.iter().any(|r| r.enabled)
+            || self.trade_plans.plans.iter().any(|p| p.status.active()))
+            && self.last_price_alerts.is_none_or(|t| t.elapsed() > Duration::from_secs(20))
+        {
+            self.worker.send(Request::EvaluatePriceAlerts);
+            self.last_price_alerts = Some(Instant::now());
+        }
+        self.sync_chart_alerts();
+        self.sync_chart_journal();
         self.save_dirty_themes(false);
         if self.last_save.elapsed() > Duration::from_secs(10) {
             self.autosave();
@@ -1392,10 +3214,11 @@ impl TerminalApp {
     }
 
     /// Save the active layout (only when it changed) and app settings.
+    /// With hand-off hops live this keeps saving: the hop origin under its own name
+    /// (see `save_layout`), preserving pre-hop work through long navigation sessions.
     fn autosave(&mut self) {
         self.save_dirty_themes(true);
-        let json = self.current_doc().to_json();
-        if json != self.last_saved {
+        if self.layout_dirty() {
             self.save_layout();
         }
         self.save_settings();
@@ -1442,9 +3265,12 @@ impl eframe::App for TerminalApp {
     }
 
     fn ui(&mut self, ui: &mut Ui, frame: &mut eframe::Frame) {
+        crate::perf::set_enabled(self.show_perf);
         let frame_start = Instant::now();
+        let mut frame_dt_ms = self.perf_dt_ms as f32;
         if let Some(prev) = self.last_frame.replace(frame_start) {
             let dt = prev.elapsed().as_secs_f64() * 1e3;
+            frame_dt_ms = dt as f32;
             self.perf_dt_ms = if self.perf_dt_ms == 0.0 { dt } else { self.perf_dt_ms * 0.9 + dt * 0.1 };
         }
         let ctx = ui.ctx().clone();
@@ -1478,8 +3304,12 @@ impl eframe::App for TerminalApp {
             self.applied_theme = Some(self.themes[ti].clone());
         }
         theme::refresh(&ctx, &self.themes[ti], self.system_accent);
-        self.drain();
+        {
+            let _s = crate::perf::scope(crate::perf::Layer::Drain);
+            self.drain();
+        }
         self.periodic();
+        self.sync_holding_risk();
 
         let screen = ui.max_rect();
         let open = anim::spring_with(
@@ -1497,7 +3327,7 @@ impl eframe::App for TerminalApp {
             Rect::from_min_max(pos2(screen.left() + sb_w, screen.top()), screen.max)
         };
         ui.painter().rect_filled(main, 0.0, theme::window());
-        let toolbar = Rect::from_min_size(main.min, vec2(main.width(), self.toolbar_h()));
+        let toolbar = self.toolbar_rect(main);
         let status = Rect::from_min_max(pos2(main.left(), main.bottom() - STATUS_H), main.max);
         let gap = theme::dp(6.0);
         let area = Rect::from_min_max(
@@ -1505,8 +3335,13 @@ impl eframe::App for TerminalApp {
             pos2(main.right() - gap, status.top() - gap * 0.5),
         );
 
+        if let Some(error) = self.settings_writer.as_ref().and_then(|w| w.error()) {
+            self.status = error;
+        }
         self.hotkeys(&ctx);
         self.command_palette(&ctx);
+        self.watchlist_dialogs(&ctx);
+        let _chrome_scope = crate::perf::scope(crate::perf::Layer::Chrome);
         let mut sidebar_cmds = Vec::new();
         if sb_w >= 1.0 {
             // The sidebar slides in from its edge.
@@ -1526,6 +3361,7 @@ impl eframe::App for TerminalApp {
         let inset = if right_side { self.traffic_inset() } else { (self.traffic_inset() - sb_w).max(0.0) };
         self.toolbar(ui, toolbar, inset);
         self.status_bar(ui, status);
+        drop(_chrome_scope);
 
         let mut actions = Vec::new();
         for c in sidebar_cmds {
@@ -1535,9 +3371,19 @@ impl eframe::App for TerminalApp {
                 SidebarCmd::Layout(op) => self.layout_op(op),
             }
         }
-        actions.extend(self.render_dock(ui, area, gap));
-        actions.extend(self.render_windows(&ctx));
+        self.link_bus.begin_frame();
+        self.seed_link_hover(&ctx);
+        {
+            let _s = crate::perf::scope(crate::perf::Layer::Dock);
+            actions.extend(self.render_dock(ui, area, gap));
+        }
+        {
+            let _s = crate::perf::scope(crate::perf::Layer::Windows);
+            actions.extend(self.render_windows(&ctx));
+        }
         self.run_actions(actions);
+        self.sync_linked_review_levels();
+        self.sync_linked_anchors();
         self.trading_windows(&ctx);
         self.toasts(&ctx);
 
@@ -1557,6 +3403,11 @@ impl eframe::App for TerminalApp {
                 self.autosave();
                 ctx.send_viewport_cmd(egui::ViewportCommand::Close);
             }
+        }
+        if self.show_perf {
+            crate::perf::hud(&ctx, status, &self.perf_profile, &self.worker.jobs().snapshot());
+            let sums = crate::perf::end_frame();
+            self.perf_profile.push(sums, frame_start.elapsed().as_secs_f32() * 1000.0, frame_dt_ms);
         }
         let cpu = frame_start.elapsed().as_secs_f64() * 1e3;
         self.perf_cpu_ms = self.perf_cpu_ms * 0.9 + cpu * 0.1;
@@ -1584,6 +3435,215 @@ mod tests {
     use super::*;
 
     #[test]
+    fn f12_toggles_the_hud_and_layer_recording() {
+        let mut app = test_app();
+        let ctx = egui::Context::default();
+        crate::perf::set_enabled(false);
+        for on in [true, false] {
+            let mut out = ctx.run_ui(
+                egui::RawInput {
+                    events: vec![egui::Event::Key {
+                        key: Key::F12,
+                        physical_key: Some(Key::F12),
+                        pressed: true,
+                        repeat: false,
+                        modifiers: Modifiers::NONE,
+                    }],
+                    ..Default::default()
+                },
+                |ui| app.hotkeys(ui.ctx()),
+            );
+            out.textures_delta.clear();
+            assert_eq!(app.show_perf, on);
+            assert_eq!(crate::perf::enabled(), on);
+            ctx.run_ui(
+                egui::RawInput {
+                    events: vec![egui::Event::Key {
+                        key: Key::F12,
+                        physical_key: Some(Key::F12),
+                        pressed: false,
+                        repeat: false,
+                        modifiers: Modifiers::NONE,
+                    }],
+                    ..Default::default()
+                },
+                |_| {},
+            )
+            .textures_delta
+            .clear();
+        }
+    }
+
+    /// Isolated UI fixture: all paths are temporary and the worker only records requests.
+    pub(super) fn test_app() -> TerminalApp {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "terminal-rs-bar-{}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        let (worker, _) = Worker::test_channel();
+        let ctx = egui::Context::default();
+        let prefs = Prefs::default();
+        let themes = crate::themes::builtins();
+        let theme_store = crate::themes::ThemeStore::new(dir.join("themes"));
+        let system_accent = theme::DEFAULT_ACCENT;
+        let (demo, _) = demo::DemoState::load(dir.join("demo.json"));
+        let broker = broker::BrokerState {
+            store: tr_broker::SecretStore::file(dir.join("unused-secrets.json")),
+            saved: Default::default(),
+            form: Default::default(),
+            creds: Default::default(),
+            from_env: false,
+            reveal: false,
+            portfolio: None,
+            credential_generation: 0,
+            portfolio_request_id: 0,
+            error: None,
+            loading: false,
+            fetched: None,
+            message: None,
+            busy: None,
+            registering: None,
+            portal_url: None,
+            connecting_since: None,
+            simulate: true,
+            last_quotes: None,
+            testing: false,
+            confirm_disconnect: None,
+            disconnecting: None,
+        };
+        TerminalApp {
+            broker,
+            holding_risk: Default::default(),
+            trading: Default::default(),
+            demo,
+            worker,
+            provider: "sample".into(),
+            data_mode: DataMode::ExplicitSample,
+            health: tr_data::HealthBoard::new("sample").snapshot(),
+            quote_states: Default::default(),
+            curve_state: Default::default(),
+            last_health: None,
+            health_selected: Feed::Bars,
+            panes: Vec::new(),
+            dock: Node::default(),
+            focus: 0,
+            next_id: 1,
+            handoff: Default::default(),
+            last_opened: None,
+            preset: None,
+            drag: None,
+            dock_motion: Default::default(),
+            renaming_tab: None,
+            store: Store::new(dir.join("layouts")),
+            layout_name: "Default".into(),
+            layout_names: Vec::new(),
+            last_saved: Vec::new(),
+            renaming_layout: None,
+            editing_theme: prefs.appearance.theme.clone(),
+            themes,
+            theme_store,
+            applied_theme: None,
+            dirty_themes: Vec::new(),
+            themes_changed_at: None,
+            renaming_theme: None,
+            theme_io: String::new(),
+            system_theme: ctx.system_theme(),
+            layout_theme: false,
+            prefs,
+            rebinding: None,
+            hotkey_filter: String::new(),
+            settings_tab: SettingsTab::Appearance,
+            whats_news_epoch: 0,
+            whats_news_health: tr_data::whats_news::Health::pending(),
+            io_path: String::new(),
+            curves: None,
+            last_wei: None,
+            last_curve: None,
+            wei_updated: None,
+            net_hits: (String::new(), Vec::new()),
+            search_pending: None,
+            suggestion: None,
+            command_catalogue: Default::default(),
+            recent_symbols: Vec::new(),
+            cmd: String::new(),
+            cmd_history: Vec::new(),
+            cmd_hist_pos: None,
+            focus_cmd: true,
+            status: "Ready. Type a ticker and press <GO> (Enter). F1 for help.".into(),
+            toasts: Vec::new(),
+            latest: Vec::new(),
+            politicians: Vec::new(),
+            pol_search: String::new(),
+            alerts: Vec::new(),
+            price_alerts: tr_data::price_alerts::AlertBatch::empty(0),
+            trade_plans: tr_data::trade_plans::PlanBatch::empty(0),
+            alert_draft: alerts::AlertDraft::default(),
+            last_price_alerts: None,
+            journal: Default::default(),
+            congress_status: String::new(),
+            congress_checked: None,
+            watchlist: DEFAULT_WATCHLIST.map(String::from).to_vec(),
+            watchlists: watchlists::Watchlists::migrate(&DEFAULT_WATCHLIST.map(String::from)),
+            watch_ui: Default::default(),
+            intraday_scan: None,
+            planning_stops: portfolio_stops::Store::load(dir.clone()),
+            planning_ui: Default::default(),
+            settings_writer: None,
+            quotes: HashMap::new(),
+            last_quotes: None,
+            last_feed: None,
+            last_save: Instant::now(),
+            started: Instant::now(),
+            smoke_done: false,
+            show_perf: false,
+            link_bus: Default::default(),
+            perf_profile: Default::default(),
+            perf_cpu_ms: 0.0,
+            perf_dt_ms: 0.0,
+            last_frame: None,
+            sidebar_open: true,
+            system_accent,
+            last_accent_poll: None,
+            window_styled: false,
+            updater_started: false,
+            vibrancy: false,
+            chrome: None,
+            last_chrome_poll: None,
+            palette: Default::default(),
+        }
+    }
+
+    #[test]
+    fn price_history_commands_preserve_progress_panel_and_submit_background_work() {
+        let mut app = test_app();
+        let (worker, mut requests) = Worker::test_channel();
+        app.worker = worker;
+        app.apply(Function::History("ADD AAPL,MSFT".into()));
+        assert!(matches!(requests.try_recv(),Ok(Request::HistoryTask(command)) if command=="ADD AAPL,MSFT"));
+        assert!(matches!(requests.try_recv(), Ok(Request::HistoryStatus)));
+        assert!(app.panes.iter().any(|p| p.kind.settings() == PaneSettings::PriceHistory));
+        app.apply(Function::Universe);
+        assert!(matches!(requests.try_recv(), Ok(Request::Research { scan: None, .. })));
+        assert_eq!(app.panes.len(), 2, "Research must preserve the price-history progress panel");
+        app.apply(Function::History("CANCEL".into()));
+        assert!(matches!(requests.try_recv(),Ok(Request::HistoryTask(command)) if command=="CANCEL"));
+        assert!(app.panes.iter().any(|p| p.kind.settings() == PaneSettings::Research(None)));
+        assert_eq!(app.panes.len(), 2);
+        let kind = app.panel_from_spec("HIST", None).unwrap();
+        assert_eq!(kind.settings(), PaneSettings::PriceHistory);
+    }
+
+    #[test]
+    fn recent_fx_keys_are_repaired_and_deduplicated_at_startup() {
+        let symbols = ["USDBRLUSD Curncy", "BRL Curncy", "BRL=X", "BTC", "???", "ação", "SPY"].map(String::from);
+        assert_eq!(canonical_recent_symbols(&symbols), ["USDBRL Curncy", "BTCUSD Curncy", "SPY US Equity"]);
+    }
+
+    #[test]
     fn legacy_settings_migrate_to_a_layout() {
         let old = r#"{"layout":"MainRight2","watchlist":["AAPL","BTCUSD Curncy"],"sidebar":false,
             "panes":[{"Chart":{"symbol":"NVDA","tf":"D1","chart_type":"Candles","log":false,"indicators":[],
@@ -1607,14 +3667,401 @@ mod tests {
         for s in [
             crate::layouts::chart_settings("BTCUSD Curncy", &d),
             PaneSettings::Feed(Some(crate::layouts::FeedSettings { buys: Some(true), ..Default::default() })),
-            PaneSettings::News(Some("AAPL US Equity".into())),
-            PaneSettings::News(None),
+            PaneSettings::News(crate::layouts::NewsSettings::Full {
+                symbol: Some("AAPL US Equity".into()),
+                scope: tr_data::news::NewsScope::Symbol,
+            }),
+            PaneSettings::News(crate::layouts::NewsSettings::Full {
+                symbol: None,
+                scope: tr_data::news::NewsScope::Top,
+            }),
+            PaneSettings::News(crate::layouts::NewsSettings::Full {
+                symbol: None,
+                scope: tr_data::news::NewsScope::Watchlist,
+            }),
             PaneSettings::OrderBook { symbol: "ETHUSD Curncy".into(), depth: 50, group: 1.0 },
             PaneSettings::Search("gold".into()),
             PaneSettings::Settings,
             PaneSettings::Wei,
+            PaneSettings::PriceHistory,
+            PaneSettings::Research(None),
+            PaneSettings::Research(Some("DARVAS_BREAKOUT".into())),
+            PaneSettings::Desk { group: "Growth".into(), selected: Some("AAPL US Equity".into()) },
+            PaneSettings::Vault { symbol: Some("AAPL US Equity".into()) },
+            PaneSettings::SessionBrief { symbol: "AAPL US Equity".into() },
+            PaneSettings::SessionClock { symbol: "AAPL US Equity".into(), spec: "1h".into(), tf: "30m".into() },
+            PaneSettings::Backtest {
+                symbol: "AAPL US Equity".into(),
+                spec: "ADTREND".into(),
+                holdout: "20%".into(),
+                commission: "5".into(),
+                slippage: "5".into(),
+                shorts: false,
+                intraday: false,
+                tf: String::new(),
+                honesty: Default::default(),
+                holdout_tables: false,
+                selected_variant: 0,
+                selected_fold: 0,
+            },
+            {
+                let mut c = ChartState::new(0, "AAPL", tr_core::Timeframe::D1);
+                c.archive = true;
+                c.enable_review_overlays();
+                PaneKind::Chart(Box::new(c)).settings()
+            },
         ] {
             assert_eq!(PaneKind::from_settings(s.clone()).settings(), s);
         }
+    }
+
+    #[test]
+    fn marks_draws_cash_levels_on_the_named_chart() {
+        let mut app = test_app();
+        let (worker, mut requests) = Worker::test_channel();
+        app.worker = worker;
+        app.apply(Function::CashLevels);
+        let chart = app
+            .panes
+            .iter()
+            .find_map(|pane| match &pane.kind {
+                PaneKind::Chart(chart) => Some((pane.id, chart.symbol.clone(), chart.tf)),
+                _ => None,
+            })
+            .expect("chart");
+        assert_eq!(chart.1, "AAPL US Equity");
+        assert_eq!(chart.2, tr_core::Timeframe::M5);
+        assert!(app.status.contains("opening range"));
+        let marks = std::iter::from_fn(|| requests.try_recv().ok()).find_map(|request| match request {
+            Request::CashLevels { pane, symbol } => Some((pane, symbol)),
+            _ => None,
+        });
+        assert_eq!(marks, Some((chart.0, "AAPL US Equity".into())));
+        assert_eq!(crate::command::parse("MARKS"), Some(Command::Function(Function::CashLevels)));
+        assert_eq!(crate::command::parse("SMARKS"), Some(Command::Function(Function::CashLevels)));
+        assert_eq!(
+            crate::command::parse("MSFT MARKS"),
+            Some(Command::SymbolFunction("MSFT US Equity".into(), Function::CashLevels))
+        );
+        assert!(!matches!(
+            crate::command::parse("MARKS 5"),
+            Some(Command::Function(Function::CashLevels) | Command::SymbolFunction(_, Function::CashLevels))
+        ));
+        assert!(crate::command::hint("MARKS").contains("opening-range"));
+
+        app.execute("MSFT MARKS");
+        let charts: Vec<_> = app
+            .panes
+            .iter()
+            .filter_map(|pane| match &pane.kind {
+                PaneKind::Chart(chart) => Some(chart.symbol.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(charts, ["AAPL US Equity", "MSFT US Equity"]);
+        let marks = std::iter::from_fn(|| requests.try_recv().ok()).find_map(|request| match request {
+            Request::CashLevels { symbol, .. } => Some(symbol),
+            _ => None,
+        });
+        assert_eq!(marks.as_deref(), Some("MSFT US Equity"));
+    }
+
+    #[test]
+    fn review_opens_linked_daily_and_weekly_archive_charts() {
+        let mut app = test_app();
+        let (worker, mut requests) = Worker::test_channel();
+        app.worker = worker;
+        app.apply(Function::Review);
+        let charts: Vec<_> = app
+            .panes
+            .iter()
+            .filter_map(|p| match &p.kind {
+                PaneKind::Chart(c) => Some((c.archive, c.tf, c.show_box, c.show_rs, c.show_volume_ctx, p.link)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(charts.len(), 2);
+        assert!(charts.iter().any(|c| c.0 && c.1 == tr_core::Timeframe::D1 && c.2 && c.3 && c.4));
+        assert!(charts.iter().any(|c| c.0 && c.1 == tr_core::Timeframe::W1 && c.2 && c.3 && c.4));
+        assert_eq!(charts[0].5, charts[1].5);
+        assert!(charts[0].5.is_some());
+        let reqs: Vec<_> = std::iter::from_fn(|| requests.try_recv().ok()).collect();
+        let archive: Vec<_> = reqs.iter().filter(|r| matches!(r, Request::ArchiveHistory { .. })).collect();
+        assert_eq!(archive.len(), 2);
+        assert!(archive.iter().all(|r| matches!(r, Request::ArchiveHistory { before: None, .. })));
+        assert!(!reqs.iter().any(|r| matches!(r, Request::History { .. })));
+    }
+
+    fn hline(price: f64) -> tr_chart::drawings::Drawing {
+        tr_chart::drawings::Drawing::new(
+            Tool::Horizontal,
+            tr_chart::drawings::Anchor { ts: 0, price },
+            tr_chart::drawings::Anchor { ts: 0, price },
+        )
+    }
+
+    #[test]
+    fn review_step_through_keeps_per_symbol_drawings_and_shares_horizontals() {
+        let mut app = test_app();
+        let (worker, _) = Worker::test_channel();
+        app.worker = worker;
+        app.apply(Function::Review);
+        let daily = app
+            .panes
+            .iter()
+            .find_map(|p| match &p.kind {
+                PaneKind::Chart(c) if c.archive && c.tf == tr_core::Timeframe::D1 => Some(p.id),
+                _ => None,
+            })
+            .unwrap();
+        let weekly = app
+            .panes
+            .iter()
+            .find_map(|p| match &p.kind {
+                PaneKind::Chart(c) if c.archive && c.tf == tr_core::Timeframe::W1 => Some(p.id),
+                _ => None,
+            })
+            .unwrap();
+        let daily_i = app.idx(daily).unwrap();
+        if let PaneKind::Chart(c) = &mut app.panes[daily_i].kind {
+            c.drawings.push(hline(188.5));
+            c.commit_drawings();
+        }
+        app.sync_linked_review_levels();
+        match &app.panes[app.idx(weekly).unwrap()].kind {
+            PaneKind::Chart(c) => {
+                assert_eq!(c.drawings.len(), 1, "weekly review inherits the daily horizontal");
+                assert_eq!(c.drawings[0].horizontal_price(), Some(188.5));
+            }
+            _ => panic!("expected weekly chart"),
+        }
+        app.open_security("MSFT");
+        for id in [daily, weekly] {
+            match &app.panes[app.idx(id).unwrap()].kind {
+                PaneKind::Chart(c) => {
+                    assert_eq!(c.symbol, "MSFT US Equity");
+                    assert!(c.drawings.is_empty(), "MSFT must not show AAPL's drawings");
+                }
+                _ => panic!("expected chart pane"),
+            }
+        }
+        app.open_security("AAPL");
+        for id in [daily, weekly] {
+            match &app.panes[app.idx(id).unwrap()].kind {
+                PaneKind::Chart(c) => {
+                    assert_eq!(c.symbol, "AAPL US Equity");
+                    assert_eq!(c.drawings[0].horizontal_price(), Some(188.5));
+                }
+                _ => panic!("expected chart pane"),
+            }
+        }
+
+        let doc = app.current_doc();
+        let json = doc.to_json();
+        let text = String::from_utf8(json.clone()).unwrap();
+        assert!(text.contains("drawing_store") || text.contains("AAPL US Equity"));
+        let loaded = LayoutDoc::from_json(&json).unwrap();
+        app.apply_doc(loaded);
+        let restored: Vec<_> = app
+            .panes
+            .iter()
+            .filter_map(|p| match &p.kind {
+                PaneKind::Chart(c) if c.archive => {
+                    Some((c.tf, c.symbol.clone(), c.drawings.clone(), c.drawing_store.get("AAPL")))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(restored.len(), 2);
+        assert!(restored.iter().all(|r| r.1 == "AAPL US Equity" && r.2[0].horizontal_price() == Some(188.5)));
+        assert!(restored.iter().all(|r| r.3[0].horizontal_price() == Some(188.5)));
+    }
+
+    #[test]
+    fn legacy_layout_drawings_seed_the_per_symbol_store() {
+        let raw = r#"{"name":"OldMarks","dock":{"type":"tabs","panes":[1]},"panes":[{"id":1,"Chart":{
+            "symbol":"AAPL US Equity","tf":"D1","chart_type":"Candles","log":false,"indicators":[],
+            "drawings":[{"tool":"Horizontal","a":{"ts":0,"price":188.5},"b":{"ts":0,"price":188.5}}],
+            "compare":null}}]}"#;
+        let loaded = LayoutDoc::from_json(raw.as_bytes()).unwrap();
+        let kind = PaneKind::from_settings(loaded.panes[0].settings.clone());
+        match kind {
+            PaneKind::Chart(c) => {
+                assert_eq!(c.drawings.len(), 1);
+                assert_eq!(c.drawings[0].horizontal_price(), Some(188.5));
+                assert_eq!(c.drawing_store.get("AAPL").len(), 1);
+                let saved = PaneKind::Chart(c).settings();
+                match PaneKind::from_settings(saved) {
+                    PaneKind::Chart(c) => {
+                        assert!(c.drawing_store.get("MSFT").is_empty());
+                        assert_eq!(c.drawing_store.get("AAPL")[0].horizontal_price(), Some(188.5));
+                    }
+                    _ => panic!("expected chart after save/load"),
+                }
+            }
+            _ => panic!("expected chart from legacy layout"),
+        }
+    }
+
+    #[test]
+    fn a_quote_earnings_date_lands_on_that_chart_only() {
+        let mut app = test_app();
+        let chart = |id, symbol| Pane {
+            id,
+            kind: PaneKind::Chart(Box::new(ChartState::new(id, symbol, tr_core::Timeframe::D1))),
+            link: None,
+            title: None,
+            window: None,
+        };
+        app.panes.push(chart(1, "AAPL"));
+        app.panes.push(chart(2, "MSFT"));
+        let ts =
+            chrono::NaiveDate::from_ymd_opt(2026, 10, 30).unwrap().and_hms_opt(0, 0, 0).unwrap().and_utc().timestamp();
+        let mut quote = tr_data::Quote {
+            provenance: tr_data::Provenance::Real,
+            symbol: "AAPL US Equity".into(),
+            last: 10.0,
+            prev_close: 9.0,
+            ts: 1,
+            spark: vec![],
+            stats: tr_data::QuoteStats { earnings_ts: Some(ts), ..Default::default() },
+        };
+        app.apply_quotes(vec![quote.clone()]);
+        match &app.panes[0].kind {
+            PaneKind::Chart(c) => assert_eq!(c.earnings_line(), Some("ERN 2026-10-29")),
+            _ => panic!("expected the AAPL chart"),
+        }
+        match &app.panes[1].kind {
+            PaneKind::Chart(c) => assert!(c.earnings_line().is_none()),
+            _ => panic!("expected the MSFT chart"),
+        }
+        quote.stats = tr_data::QuoteStats::default();
+        app.apply_quotes(vec![quote]);
+        match &app.panes[0].kind {
+            PaneKind::Chart(c) => assert!(c.earnings_line().is_none()),
+            _ => panic!("expected the AAPL chart"),
+        }
+    }
+
+    #[test]
+    fn a_quote_ex_dividend_date_lands_on_that_chart_only() {
+        let mut app = test_app();
+        let chart = |id, symbol| Pane {
+            id,
+            kind: PaneKind::Chart(Box::new(ChartState::new(id, symbol, tr_core::Timeframe::D1))),
+            link: None,
+            title: None,
+            window: None,
+        };
+        app.panes.push(chart(1, "AAPL"));
+        app.panes.push(chart(2, "MSFT"));
+        let ts =
+            tr_core::ny::to_utc(chrono::NaiveDate::from_ymd_opt(2026, 11, 6).unwrap().and_hms_opt(9, 30, 0).unwrap());
+        let mut quote = tr_data::Quote {
+            provenance: tr_data::Provenance::Real,
+            symbol: "AAPL US Equity".into(),
+            last: 10.0,
+            prev_close: 9.0,
+            ts: 1,
+            spark: vec![],
+            stats: tr_data::QuoteStats { ex_dividend_ts: Some(ts), ..Default::default() },
+        };
+        app.apply_quotes(vec![quote.clone()]);
+        match &app.panes[0].kind {
+            PaneKind::Chart(c) => {
+                assert_eq!(c.ex_dividend_line(), Some("EXDIV 2026-11-06"));
+                assert!(c.earnings_line().is_none());
+            }
+            _ => panic!("expected the AAPL chart"),
+        }
+        match &app.panes[1].kind {
+            PaneKind::Chart(c) => assert!(c.ex_dividend_line().is_none()),
+            _ => panic!("expected the MSFT chart"),
+        }
+        quote.stats = tr_data::QuoteStats::default();
+        app.apply_quotes(vec![quote]);
+        match &app.panes[0].kind {
+            PaneKind::Chart(c) => assert!(c.ex_dividend_line().is_none()),
+            _ => panic!("expected the AAPL chart"),
+        }
+    }
+}
+
+#[cfg(test)]
+mod ticker_switch_tests;
+
+#[cfg(test)]
+mod auction_tests {
+    use super::*;
+    #[test]
+    fn alt_p_toggles_the_auction_map_only_on_a_focused_chart_and_settings_round_trip() {
+        let mut app = tests::test_app();
+        let chart = app.new_pane(PaneKind::Chart(Box::new(ChartState::new(0, "AAPL", tr_core::Timeframe::M5))));
+        let help = app.new_pane(PaneKind::Help);
+        app.focus = help;
+        assert!(!app.hotkey_applies(prefs::Action::ToggleAuctionMap));
+        app.focus = chart;
+        assert!(app.hotkey_applies(prefs::Action::ToggleAuctionMap));
+        app.run_hotkey(prefs::Action::ToggleAuctionMap);
+        let c = app.chart_mut(chart).unwrap();
+        assert!(c.auction_settings().is_some());
+        let settings = app.panes.iter().find(|p| p.id == chart).unwrap().kind.settings();
+        let round_trip =
+            PaneKind::from_settings(serde_json::from_str(&serde_json::to_string(&settings).unwrap()).unwrap());
+        assert_eq!(round_trip.settings(), settings);
+        app.run_hotkey(prefs::Action::ToggleAuctionMap);
+        assert!(app.chart_mut(chart).unwrap().auction_settings().is_none());
+        app.execute("MSFT AUCTION");
+        assert!(app.chart_mut(chart).unwrap().auction_settings().is_some());
+        app.execute("MSFT AUCTION");
+        assert!(app.chart_mut(chart).unwrap().auction_settings().is_some());
+        assert_eq!(app.chart_mut(chart).unwrap().symbol, "MSFT US Equity");
+    }
+}
+
+#[cfg(test)]
+mod stops_tests {
+    use super::*;
+    #[test]
+    fn hotkey_and_command_toggle_stop_cloud_on_the_focused_chart() {
+        let mut app = tests::test_app();
+        let chart = app.new_pane(PaneKind::Chart(Box::new(ChartState::new(0, "AAPL", tr_core::Timeframe::M5))));
+        let help = app.new_pane(PaneKind::Help);
+        app.focus = help;
+        assert!(!app.hotkey_applies(prefs::Action::ToggleStopCloud));
+        app.focus = chart;
+        assert!(app.hotkey_applies(prefs::Action::ToggleStopCloud));
+        app.run_hotkey(prefs::Action::ToggleStopCloud);
+        assert!(app.chart_mut(chart).unwrap().stop_settings().is_some());
+        app.execute("STOPS");
+        assert!(app.chart_mut(chart).unwrap().stop_settings().is_none());
+        app.execute("MSFT STOPS");
+        app.execute("MSFT STOPS");
+        let c = app.chart_mut(chart).unwrap();
+        assert_eq!(c.symbol, "MSFT US Equity");
+        assert!(c.stop_settings().is_some());
+        app.execute("STOPS ODDS OFF");
+        assert!(!app.chart_mut(chart).unwrap().stop_settings().unwrap().odds);
+        app.run_hotkey(prefs::Action::ToggleStopCloud);
+        assert!(app.chart_mut(chart).unwrap().stop_settings().is_none());
+    }
+    #[test]
+    fn pane_settings_round_trip_keeps_stop_cloud_settings() {
+        let mut chart = ChartState::new(0, "AAPL", tr_core::Timeframe::M5);
+        chart.restore_stops(Some(crate::layouts::StopCloudSettings {
+            ks: vec![0.5, 1.5, 2.5],
+            horizons: Some((8, 40)),
+            odds: false,
+        }));
+        let s = PaneKind::Chart(Box::new(chart)).settings();
+        let restored = PaneKind::from_settings(serde_json::from_str(&serde_json::to_string(&s).unwrap()).unwrap());
+        assert_eq!(restored.settings(), s);
+        let mut chart = ChartState::new(0, "AAPL", tr_core::Timeframe::D1);
+        chart.restore_stops(Some(crate::layouts::StopCloudSettings {
+            ks: vec![3.0, 1.0],
+            horizons: Some((48, 12)),
+            odds: true,
+        }));
+        assert_eq!(chart.stop_settings(), Some(Default::default()));
     }
 }

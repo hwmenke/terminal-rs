@@ -107,6 +107,7 @@ pub struct Input<'a> {
 }
 
 impl<'a> Input<'a> {
+    /// Normalizes unavailable volume through Ohlcv for VWMA/EVWMA and volume studies.
     pub fn new(bars: &'a [Bar], tf: Timeframe) -> Self {
         Input { bars, tf, d: Ohlcv::new(bars) }
     }
@@ -133,6 +134,9 @@ pub struct Def {
     pub levels: &'static [f64],
     /// Several instances with different parameters can share a chart.
     pub multi: bool,
+    /// Research overlay: the worker refuses sample / unverified bars instead of
+    /// drawing bands that would look like live archive analysis.
+    pub research: bool,
     compute: Compute,
 }
 
@@ -148,6 +152,7 @@ impl Def {
             range: None,
             levels: &[],
             multi: false,
+            research: false,
             compute,
         }
     }
@@ -188,6 +193,11 @@ impl Def {
 
     fn multi(mut self) -> Self {
         self.multi = true;
+        self
+    }
+
+    fn research(mut self) -> Self {
+        self.research = true;
         self
     }
 
@@ -381,6 +391,70 @@ fn nth(name: &'static str, values: Vec<f64>, k: u8) -> Output {
     out(name, values, Plot::Line, Tone::Series(k))
 }
 
+/// Causal rolling sample-sigma bands; warm-up and non-finite windows stay absent.
+#[derive(Debug)]
+pub struct ZBand {
+    pub mean: Vec<f64>,
+    pub sigma: Vec<f64>,
+    pub z: Vec<f64>,
+    pub upper_one: Vec<f64>,
+    pub lower_one: Vec<f64>,
+    pub upper_two: Vec<f64>,
+    pub lower_two: Vec<f64>,
+}
+pub fn zband(closes: &[f64], n: usize) -> ZBand {
+    let len = closes.len();
+    let mut out = ZBand {
+        mean: vec![f64::NAN; len],
+        sigma: vec![f64::NAN; len],
+        z: vec![f64::NAN; len],
+        upper_one: vec![f64::NAN; len],
+        lower_one: vec![f64::NAN; len],
+        upper_two: vec![f64::NAN; len],
+        lower_two: vec![f64::NAN; len],
+    };
+    if n < 2 {
+        return out;
+    }
+    let (mut count, mut mean, mut m2) = (0usize, 0.0, 0.0);
+    for (i, &x) in closes.iter().enumerate() {
+        if i >= n {
+            let old = closes[i - n];
+            if old.is_finite() {
+                if count > 1 {
+                    let next = mean - (old - mean) / (count - 1) as f64;
+                    m2 -= (old - mean) * (old - next);
+                    mean = next;
+                    count -= 1;
+                } else {
+                    count = 0;
+                    mean = 0.0;
+                    m2 = 0.0;
+                }
+            }
+        }
+        if x.is_finite() {
+            count += 1;
+            let delta = x - mean;
+            mean += delta / count as f64;
+            m2 += delta * (x - mean);
+        }
+        if i + 1 >= n && count == n {
+            let sigma = (m2.max(0.0) / (n - 1) as f64).sqrt();
+            out.mean[i] = mean;
+            out.sigma[i] = sigma;
+            if sigma > 0.0 {
+                out.z[i] = (x - mean) / sigma;
+            }
+            out.upper_one[i] = mean + sigma;
+            out.lower_one[i] = mean - sigma;
+            out.upper_two[i] = mean + 2.0 * sigma;
+            out.lower_two[i] = mean - 2.0 * sigma;
+        }
+    }
+    out
+}
+
 fn bands(b: Bands, middle: &'static str) -> Vec<Output> {
     vec![
         out("Upper", b.upper, Plot::Line, Tone::Dim),
@@ -572,9 +646,11 @@ fn catalog() -> Vec<Def> {
         .int("Length", 21.0, 3.0, MAX_LENGTH)
         .n("Smoothing", 3.0)
         .real("StdErr", 2.0, 0.1, 10.0),
-        overlay("VWAPB", "VWAP Bands", bnd, |i, p| bands(vwap_bands(&i.d, session_key(i.tf), p[0]), "VWAP"))
-            .alias(&["VWAPBANDS"])
-            .real("StdDev", 1.0, 0.1, 10.0),
+        overlay("VWAPB", "VWAP Bands", bnd, |i, p| {
+            bands(vwap_bands(&i.d, session_key(i.tf), p[0]), vwap_anchor_label(i.tf))
+        })
+        .alias(&["VWAPBANDS"])
+        .real("StdDev", 1.0, 0.1, 10.0),
         // Momentum.
         pane("RSI", "Relative Strength Index", mom, |i, p| one("RSI", rsi(i.c(), n(p, 0))))
             .n("Length", 14.0)
@@ -966,6 +1042,34 @@ fn catalog() -> Vec<Def> {
         .alias(&["CE", "CHEXIT"])
         .n("Length", 22.0)
         .real("Multiplier", 3.0, 0.1, 20.0),
+        overlay("ADTREND", "Adaptive Trend", trd, |i, p| {
+            let mut params = AdaptiveTrendParams::from_registry(p);
+            params.session_atr = i.tf.is_intraday();
+            let starts = i.tf.is_intraday().then(|| session_starts(&i.d.ts));
+            let t = adaptive_trend_with(&i.d, params, starts.as_deref());
+            let (lng, sht) = t.flip_dots(&i.d.close);
+            vec![
+                nth("SB", t.sb, 0),
+                nth("MB", t.mb, 1),
+                nth("LB", t.lb, 2),
+                out("SDB", t.sdb, Plot::Line, Tone::Dim),
+                out("MDB", t.mdb, Plot::Line, Tone::Dim),
+                out("LDB", t.ldb, Plot::Line, Tone::Dim),
+                signal("MRT", t.mrt),
+                nth("LRT", t.lrt, 3),
+                out("Long flip", lng, Plot::Dots, Tone::Up),
+                out("Short flip", sht, Plot::Dots, Tone::Down),
+            ]
+        })
+        .alias(&["ATREND", "ADAPTIVE"])
+        .n("ATR Length", 20.0)
+        .real("Confirm", 0.25, 0.0, 2.0)
+        .int("Method", 0.0, 0.0, 1.0)
+        // Appended so older 3-parameter labels ("ADTREND 20 0.25 0") normalize to
+        // the historical defaults MB ER 20 / min hold 10.
+        .int("MB ER", 20.0, 2.0, 200.0)
+        .int("Min Hold", 10.0, 1.0, 200.0)
+        .research(),
         // Volatility.
         pane("ATR", "Average True Range", vol, |i, p| one("ATR", atr(&i.d, n(p, 0)))).n("Length", 14.0),
         pane("NATR", "Normalized Average True Range", vol, |i, p| one("NATR", natr(&i.d, n(p, 0)))).n("Length", 14.0),
@@ -1040,7 +1144,9 @@ fn catalog() -> Vec<Def> {
         .int("KC Length", 20.0, 2.0, MAX_LENGTH)
         .real("KC Multiplier", 1.5, 0.1, 10.0),
         // Volume.
-        overlay("VWAP", "Volume-Weighted Average Price", vlm, |i, _| one("VWAP", vwap_by(i.bars, session_key(i.tf)))),
+        overlay("VWAP", "Volume-Weighted Average Price", vlm, |i, _| {
+            one(vwap_anchor_label(i.tf), vwap_by(i.bars, session_key(i.tf)))
+        }),
         pane("OBV", "On-Balance Volume", vlm, |i, _| one("OBV", obv(&i.d))),
         pane("AD", "Accumulation/Distribution", vlm, |i, _| one("A/D", adl(&i.d))).alias(&["ADL", "ACCDIST"]),
         pane("CMF", "Chaikin Money Flow", vlm, |i, p| one("CMF", cmf(&i.d, n(p, 0)))).n("Length", 20.0).levels(&[0.0]),
@@ -1118,6 +1224,18 @@ fn catalog() -> Vec<Def> {
         pane("VAR", "Variance", sta, |i, p| one("Variance", variance(i.c(), n(p, 0))))
             .alias(&["VARIANCE"])
             .n("Length", 20.0),
+        overlay("ZBAND", "Z Bands", sta, |i, p| {
+            let b = zband(i.c(), n(p, 0));
+            vec![
+                out("+2σ", b.upper_two, Plot::Line, Tone::Dim),
+                out("+1σ", b.upper_one, Plot::Line, Tone::Dim),
+                line("Basis", b.mean),
+                out("−1σ", b.lower_one, Plot::Line, Tone::Dim),
+                out("−2σ", b.lower_two, Plot::Line, Tone::Dim),
+            ]
+        })
+        .int("Length", 20.0, 2.0, MAX_LENGTH)
+        .research(),
         pane("ZSCORE", "Z-Score", sta, |i, p| one("Z", zscore(i.c(), n(p, 0))))
             .int("Length", 20.0, 2.0, MAX_LENGTH)
             .levels(&[-2.0, 0.0, 2.0]),
@@ -1193,6 +1311,29 @@ mod tests {
     }
 
     #[test]
+    fn zband_matches_manual_sigma() {
+        let closes: Vec<_> = (1..=80).map(|i| i as f64).collect();
+        let b = zband(&closes, 20);
+        assert!(b.mean[..19].iter().all(|v| v.is_nan()));
+        for i in 19..80 {
+            let window = &closes[i - 19..=i];
+            let mean = window.iter().sum::<f64>() / 20.0;
+            let sigma = (window.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / 19.0).sqrt();
+            assert!((b.mean[i] - mean).abs() < 1e-12);
+            assert!((b.sigma[i] - sigma).abs() < 1e-12);
+            assert!((b.z[i] - (closes[i] - mean) / sigma).abs() < 1e-12);
+            assert!((b.upper_two[i] - (mean + 2.0 * sigma)).abs() < 1e-12);
+        }
+        let short = zband(&closes[..40], 20);
+        assert_eq!(&b.z[19..40], &short.z[19..]);
+        assert!(zband(&[5.0; 30], 20).z.iter().all(|v| v.is_nan()));
+        let mut hole = closes.clone();
+        hole[30] = f64::NAN;
+        let holed = zband(&hole, 20);
+        assert!(holed.z[30..50].iter().all(|v| v.is_nan()));
+        assert!(holed.z[50].is_finite());
+    }
+    #[test]
     fn codes_and_aliases_are_unique_and_uppercase() {
         let mut seen = HashSet::new();
         for d in all() {
@@ -1236,6 +1377,8 @@ mod tests {
             assert!(d.range.is_none() || d.pane, "{} has a range but draws over prices", d.code);
             assert!(d.levels.is_empty() || d.pane, "{} has levels but draws over prices", d.code);
         }
+        assert!(find("ADTREND").is_some_and(|d| d.research), "Adaptive Trend is a research overlay");
+        assert!(!find("SMA").unwrap().research);
     }
 
     #[test]
@@ -1250,7 +1393,11 @@ mod tests {
                     assert!(o.values.len() >= bars.len(), "{} {} is short", d.code, o.name);
                     let finite: Vec<f64> = o.values.iter().copied().filter(|v| v.is_finite()).collect();
                     assert!(
-                        !finite.is_empty() || d.code == "FRACTALS" || o.name.starts_with("Squeeze"),
+                        !finite.is_empty()
+                            || d.code == "FRACTALS"
+                            || d.code == "ADTREND"
+                            || o.name.starts_with("Squeeze")
+                            || o.name.ends_with("flip"),
                         "{} {} is blank",
                         d.code,
                         o.name
@@ -1326,7 +1473,29 @@ mod tests {
         assert_eq!(Spec::parse("NOPE", &[]), None);
         assert_eq!(Spec::parse("BB", &["20", "2.5"]).unwrap().label(), "BB 20 2.5");
         assert_eq!(Spec::parse("VWAP", &[]).unwrap().label(), "VWAP");
+        let vwap = Spec::parse("VWAP", &[]).unwrap();
+        assert_eq!(vwap.compute(&Input::new(&[], Timeframe::D1))[0].name, "Monthly VWAP");
+        assert_eq!(vwap.compute(&Input::new(&[], Timeframe::M5))[0].name, "Session VWAP");
+        assert_eq!(vwap.compute(&Input::new(&[], Timeframe::W1))[0].name, "Yearly VWAP");
         assert_eq!(Spec::parse("psar", &[]).unwrap().label(), "PSAR 0.02 0.02 0.2");
+        assert_eq!(Spec::parse("ADTREND", &[]).unwrap().label(), "ADTREND 20 0.25 0 20 10");
+        assert!(Spec::parse("ADTREND", &[]).unwrap().def().is_some_and(|d| d.research));
+    }
+
+    #[test]
+    fn old_three_parameter_adtrend_label_loads_with_historical_er_and_hold() {
+        // Layouts saved before MB ER / Min Hold existed store the 3-parameter label.
+        let old: Spec = serde_json::from_str("\"ADTREND 14 0.3 1\"").unwrap();
+        assert_eq!(old.params, vec![14.0, 0.3, 1.0, 20.0, 10.0]);
+        let p = AdaptiveTrendParams::from_registry(&old.params);
+        assert_eq!((p.atr_n, p.mb_er, p.min_hold), (14, 20, 10));
+        assert_eq!(p.method, super::super::AdaptiveMethod::Adma);
+        // Round trip of the new label keeps the tuned settings.
+        let tuned = Spec::new("ADTREND", &AdaptiveTrendParams { mb_er: 32, min_hold: 4, ..p }.to_registry()).unwrap();
+        let back: Spec = serde_json::from_str(&serde_json::to_string(&tuned).unwrap()).unwrap();
+        assert_eq!(back, tuned);
+        let q = AdaptiveTrendParams::from_registry(&back.params);
+        assert_eq!((q.atr_n, q.confirm_mult, q.mb_er, q.min_hold), (14, 0.3, 32, 4));
     }
 
     #[test]

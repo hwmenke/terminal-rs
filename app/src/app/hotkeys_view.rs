@@ -251,15 +251,108 @@ impl TerminalApp {
                 ui,
                 "help-panels",
                 &[
+                    (&["HIST"], "Price history: bundled universe, download, refresh, cancel, resume and retry failed"),
+                    (&["HIST ADD ALL"], "Archive full daily Yahoo history for the bundled research universe"),
+                    (&["UNIV"], "Whats-News archive: last bar date, STALE and MISSING coverage"),
+                    (
+                        &["SCAN DARVAS_BREAKOUT", "SCAN NEAR_HIGH"],
+                        "Scan archived bars; Enter opens the linked archive chart (REVIEW for daily+weekly)",
+                    ),
+                    (
+                        &["SCAN VIEW PATTERN", "SCAN VIEW RSI-C", "SCAN VIEW RSI-C N=9 K=3"],
+                        "Scanner views: Pattern (D 63/21, W 52/26) and RSI Counter (RSI 2–21); ←/→ pick D or W, Enter opens the trigger bar",
+                    ),
                     (&["WEI"], "World markets overview"),
+                    (&["STUDIO", "AAPL STUDIO 5m lens=dist", "STUDIO lens=relate benchmark=QQQ", "STUDIO lens=when", "STUDIO lens=season", "STUDIO lens=backtest"], "Native time canvas and retained research lenses; local Alt+Left/Right, Escape inspector, Ctrl+Z parameter undo"),
+                    (&["WHEN", "AAPL WHEN 5m RSI(14)<30", "AAPL STUDIO 5m lens=when rule=\"RSI(14)<30\"", "WHEN h=6 threshold=10bp"], "When lens: rule mask shading, fixed m=8 within-clock HAC/BY evidence at h=1,3,6,12, session-block probability tiles; daily or 1m–1h US cash; COND has Open in When"),
+                    (&["RELATE", "STUDIO lens=relate benchmark=QQQ transform=logreturn h=5", "RELATE transform=level|change|logreturn|loglevel [h=1|5|20]", "RELATE beta=rolling|expanding bands=on|off matrix=common|pairwise"], "Relate lens: strict fixed-bar transforms, expanding β (descriptive), common-panel matrix, frozen 80% training fit with residual ±σ fair-value bands on the native chart; h is 1, 5 or 20"),
+                    (&["QUICK", "AAPL QUICK QQQ 5m mode=index100", "QUICK mode=level|index100|change|z|vol", "DSTRIP"], "Quick canvas; explicit base UTC, Distribution strip, dated Events, dedicated Brush (Escape cancels), compatible Shared y"),
+                    (&["STUDIO lab", "AAPL STUDIO lab 5m factors=SPY,TLT", "STUDIO lab factors=SPY,TLT:change:5:1 target=logreturn:5 covariance=hac-auto holdout=20%", "STUDIO lab factor=TLT transform=change h=5 lag=1", "STUDIO lab remove=TLT"], "Regression Lab: up to 7 factors with per-factor transform / lag, pivoted-QR fit, four covariances, purged frozen holdout (bare LAB is a ticker; NEW LAB opens the pane)"),
+                    (&["STUDIO resid", "STUDIO resid save name=AAPL-v-SPY monitor=250", "STUDIO resid open AAPL-v-SPY-v1", "STUDIO resid check [<id>]", "RESID SAVE|OPEN|CHECK …", "NEW RESID"], "Residual tickers: freeze a verified Lab / Relate fit (immutable, versioned), then score it on live re-admitted data with TRAIN | EMBARGO | SCORED segments, ADF, a fixed-horizon CUSUM change check and half-life. Never refit; a refit is a new version. Bare RESID is still a ticker"),
+                    (&["STUDIO attr", "STUDIO attr model=<id> obs=N | from=<t> [to=<t>]", "ATTR model=<id> obs=20", "NEW ATTR"], "Factor attribution of a saved frozen model: actual = drift + factor contributions + residual over a window, with coefficient and predictive SE, never refit. Bare ATTR is a ticker"),
+                    (&["VAULT", "VLT"], "Closed intraday bars and session coverage · Alt+B · VERIFY / PRUNE / DROP · tickers: VAULT US Equity, VLT 5m"),
+                    (&["HEALTH", "SRC"], "Feed states, last success, errors and retry; R retries a failed pane or selected feed"),
                     (&["GC"], "US Treasury yield curve"),
-                    (&["N", "AAPL CN"], "News headlines (for a security)"),
+                    (&["N", "AAPL CN", "TOP"], "Watchlist / scanner-leader news; AAPL CN for one name; TOP for the market"),
                     (&["OB", "BTCUSD CRNCY OB 50"], "Order book depth"),
                     (&["OMON", "AAPL OMON", "SPX INDEX OMON"], "Option chain: calls/puts by strike, IV, greeks"),
                     (&["CONG", "NVDA CONG"], "Congress trades feed / who traded a ticker"),
                     (&["POL", "POL PELOSI", "TRACK PELOSI"], "Politicians, profiles and alerts"),
+                    (
+                        &[
+                            "ALERTS",
+                            "AAPL ALERT 150",
+                            "AAPL ALERT VWAP",
+                            "AAPL ALERT RVOL 2",
+                            "AAPL ALERT PATH",
+                            "AAPL ALERT PACE",
+                            "AAPL ALERT GAP",
+                            "AAPL ALERT XTRM",
+                            "AAPL ALERT RPATH",
+                            "NVDA ALERT SETUP NEAR_HIGH",
+                        ],
+                        "Price, VWAP, RVOL, session path/pace/gap/extreme/relative, and setup alerts",
+                    ),
+                    (&["NVDA PLAN 142.5 STOP 138.2 TARGET 151.1 RISK 300", "PLANS", "UNPLAN NVDA"], "Arm, view, or cancel a quote-only entry → stop/target plan"),
+                    (&["UNALERT AAPL"], "Remove price/setup alerts for a name"),
                     (&["WL", "WL ADD SOLUSD CRNCY"], "Watchlist"),
-                    (&["PREFS"], "Settings: theme, fonts, density, hotkeys, layouts"),
+                    (
+                        &["EARNINGS", "EARN", "ECAL"],
+                        "Earnings calendar for the selected watchlist: provider dates only, click a row to open the chart",
+                    ),
+                    (
+                        &["ISCAN", "INTRADAY"],
+                        "Intraday scan of the selected watchlist: session RVOL, close versus VWAP, and return versus SPY from verified 5-minute bars",
+                    ),
+                    (
+                        &["IDESK", "IDASH", "AAPL IDESK"],
+                        "Intraday desk: 5-minute chart, ISCAN, breadth, and volume pace for one name, saved as the Intraday layout",
+                    ),
+                    (
+                        &["COCKPIT", "CKPT", "AAPL COCKPIT", "COCKPIT 5m 15m 1h"],
+                        "Intraday Cockpit: three linked native intraday charts (TSTACK + RAIL), saved as the Cockpit layout",
+                    ),
+                    (
+                        &["DESK", "AAPL DESK", "NEW DESK"],
+                        "PM Desk: watchlist leaders, group performance, position size (not PORT)",
+                    ),
+                    (
+                        &["JOURNAL", "AAPL JOURNAL", "AAPL NOTE 2026-10-24"],
+                        "Trade journal: setup + checklist + planned $ risk; record $ and R; notes on chart dates",
+                    ),
+                    (
+                        &["CORR", "RBETA", "AAPL CORR QQQ", "AAPL CORR QQQ 1H"],
+                        "Relationship Studio: OLS, rolling beta/correlation, ratio z-score and verified peer matrix · tickers: CORR US Equity, RBETA Equity",
+                    ),
+                    (
+                        &["SEASON", "SSN", "AAPL SEASON 30M"],
+                        "Seasonality Studio: month heatmap, calendar profiles and New York clock buckets · tickers: SEASON US Equity, SSN Equity",
+                    ),
+                    (
+                        &["STATS", "AAPL STATS", "AAPL COND RSI(14) < 30"],
+                        "Historical risk/returns; what followed low RSI or price above a moving average",
+                    ),
+                    (
+                        &["DIST", "RDIST", "AAPL DIST", "DIST 1H"],
+                        "Distribution Studio: log returns, tail risk, QQ, drawdowns and volatility regimes on verified bars · tickers: DIST US Equity, RDIST Equity",
+                    ),
+                    (
+                        &["BACKTEST", "AAPL BACKTEST", "AAPL BT ADTREND"],
+                        "Honest backtest: DSR, purged walk-forward, net OOS equity and holdout tables. Focused pane: PageUp/Down, Home/End select folds; text entry, menus and customized bindings take priority.",
+                    ),
+                    (
+                        &["IBT", "AAPL IBT", "AAPL IBT VWAP", "AAPL IBT OR 15m"],
+                        "Honest intraday backtest: DSR and complete-session walk-forward vs session hold; same fold keys as BT.",
+                    ),
+                    (
+                        &["LOOKALIKE", "AAPL LOOKALIKE", "AAPL KNN 2024-01-15", "GOTO 2024-01-15"],
+                        "Historical lookalikes: nearest past conditions, per-horizon counts, jump to neighbor dates",
+                    ),
+                    (
+                        &["EXPORT", "EXPORT SCAN", "EXPORT JOURNAL", "EXPORT HIST", "EXPORT BACKTEST", "EXPORT LOOKALIKE", "BACKUP", "RESTORE"],
+                        "Export scans/history/journal/backtests/lookalikes with source and date; back up or restore workspace (no credentials)",
+                    ),
+                    (&["PREFS"], "Settings: theme, fonts, density, hotkeys, layouts, backup"),
                     (&["UPDATE"], "Check for updates"),
                 ],
             );
@@ -304,12 +397,77 @@ impl TerminalApp {
                     (&["CANDLE", "BAR", "LINE", "AREA", "LOG"], "Chart type and log scale"),
                     (&["SMA 50", "RSI", "IND"], "Indicators (see below)"),
                     (&["CMP MSFT"], "Compare, rebased to the main symbol"),
+                    (
+                        &["ICMP", "AAPL ICMP MSFT NVDA"],
+                        "Intraday compare: percent from each name's 09:30 open, with SPY",
+                    ),
+                    (
+                        &["SPATH", "AAPL SPATH 20 15m"],
+                        "Today versus the typical path of prior sessions, percent from each 09:30 open",
+                    ),
+                    (
+                        &["RRG", "RRG WL", "RRG WEEKLY"],
+                        "Rotation: Space replay; arrows/Home/End scrub; T tail; 1–4 quadrants; L table; R reload; A HIST ADD skipped; j/k select; Enter chart",
+                    ),
+                    (
+                        &["BRD", "AAPL BRD MSFT NVDA"],
+                        "Share of the list at or above each 09:30 open and session VWAP",
+                    ),
+                    (
+                        &["VPACE", "AAPL VPACE 20 15m"],
+                        "Cumulative volume versus the usual pace of prior sessions",
+                    ),
+                    (
+                        &["GFILL", "AAPL GFILL 40 15m"],
+                        "Today's open versus the prior cash close, and how often that gap had filled",
+                    ),
+                    (
+                        &["XTRM", "AAPL XTRM 20 15m"],
+                        "When the session high and low print, against completed prior sessions",
+                    ),
+                    (
+                        &["RPATH", "AAPL RPATH 20 15m"],
+                        "Percent from the 09:30 open minus SPY, against prior sessions",
+                    ),
+                    (
+                        &["BRIEF", "SBRIEF", "AAPL BRIEF"],
+                        "Session brief: path, pace, gap, extreme, and versus SPY for one name. Not a chart",
+                    ),
+                    (
+                        &["MARKS", "SMARKS", "AAPL MARKS"],
+                        "Draw the prior cash close, 09:30 open, opening range, and session VWAP on the chart",
+                    ),
                     (&["TL", "HL", "VL", "FIB", "MAGNET"], "Drawing tools and snapping"),
+                    (
+                        &["AVWAP", "AVWAP OPEN", "AVWAP HIGH", "AVWAP LOW", "AVWAP CLEAR"],
+                        "Anchored VWAP (Alt+A, click a bar; ≤4 per name, linked charts follow; Del removes a selected flag); verified bars only",
+                    ),
+                    (
+                        &["⇧ Click"],
+                        "Centre every linked chart of the same name on that bar; hovering shows a ghost cursor on them",
+                    ),
+                    (&["CLEAR DRAW", "UNDO DRAW"], "Remove all drawings on this name, or undo the last delete"),
+                    (&["REVIEW", "AAPL REVIEW"], "Linked daily + weekly archive charts for candidate review"),
+                    (&["LATEST", "END"], "Jump to the latest candle (keeps zoom)"),
+                    (&["BOX", "RS", "VCTX"], "Toggle box levels, 21-bar return, volume context"),
+                    (&["TWALL", "TWALL D", "TWALL WL Growth", "NEW TWALL", "EWALL"], "Trend Wall: j/k select; Enter linked stacked chart; S sort; E edge sort; Shift+E edge; X scatter; D daily; R reload; / command"),
+                    (&["TSTACK", "STACK", "MTF", "REGIME"], "Trend Stack: completed timeframe lanes, confidence cloud, verified bars only"),
+                    (&["TSTACK ON", "TSTACK OFF", "NEW TSTACK NVDA", "SPLIT DOWN TSTACK"], "Enable, disable, or open a stacked chart; saved with the layout"),
+                    (&["AUCTION", "AMAP", "AUCTION 10", "AUCTION VIS", "AUCTION NAKED", "AUCTION VA 70"], "Auction Map (Alt+P): closed verified RTH profiles, composite, naked levels; click level to centre; Alt+click anchors VWAP"),
+                    (&["STOPS", "SCLOUD", "STOPS K 1 2 3", "STOPS H AUTO", "STOPS ODDS OFF"], "Stop Cloud (Alt+S): closed-bar ATR envelope and ratcheting guides; empirical non-overlapping Stop Odds, Wilson intervals; verified bars only"),
+                    (&["CONE", "CONE ON|OFF", "CONE 30", "CONE 20 10"], "Trend Cone (Alt+C): closed-bar regime quantile fan, grey baseline, bootstrap edge whiskers, walk-forward coverage at the horizon; verified bars only"),
+                    (&["TSTACK EDGE ON", "TSTACK EDGE OFF"], "Regime forward returns, confidence intervals and completed flip outcomes; verified bars only"),
+                    (&["ZBAND 20"], "One/two sample-sigma bands with a causal z readout"),
+                    (&["TSTACK 5m 30m 4H", "TSTACK AUTO"], "2–4 ascending native intervals; click LADDER to restore AUTO"),
+                    (&["TSTACK TINT ON", "TSTACK TINT OFF", "TSTACK SESSION ON"], "Regime Candles and 09:30 base reset; higher lanes stay continuous"),
+                    (&["RAIL", "RAIL ON", "RAIL OFF"], "Truth Rail: provenance, missing buckets and stale tail"),
+                    (&[",", ".", "\\"], "Chart interval shorter / longer / last intraday ↔ daily (empty command line)"),
+                    (&["ADTREND", "ATREND"], "Adaptive Trend bands, regime flips, MRT/LRT stops (verified bars)"),
                 ],
             );
             para(
                 ui,
-                "Wheel zooms, drag pans, drag an axis to stretch, double-click resets. Right-click for the chart menu.",
+                "Wheel zooms, drag pans, drag an axis to stretch, double-click resets, End jumps to the latest candle. Right-click for the chart menu. Daily VWAP is labelled Monthly VWAP because it resets each calendar month.",
             );
 
             section(ui, &format!("Indicators ({})", registry::all().len()));

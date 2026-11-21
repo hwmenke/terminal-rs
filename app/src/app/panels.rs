@@ -2,7 +2,7 @@
 
 use std::time::Instant;
 
-use egui::{Align2, Color32, Rect, RichText, Sense, Stroke, Ui, UiBuilder, pos2, vec2};
+use egui::{Align2, Rect, RichText, Sense, Stroke, Ui, UiBuilder, pos2, vec2};
 use tr_data::OrderBook;
 
 use super::{PaneKind, TerminalApp};
@@ -15,16 +15,54 @@ use crate::worker::Request;
 impl TerminalApp {
     /// Draw pane `i` into `rect`. Returns its actions and whether it was clicked.
     pub(super) fn render_content(&mut self, ui: &mut Ui, i: usize, rect: Rect, focused: bool) -> (Vec<Action>, bool) {
+        if self.handoff_refusal(ui, self.panes[i].id, rect) {
+            return (vec![], false);
+        }
+        let result = self.render_content_inner(ui, i, rect, focused);
+        self.paint_handoff_arrival(ui, self.panes[i].id, rect);
+        result
+    }
+
+    fn render_content_inner(&mut self, ui: &mut Ui, i: usize, rect: Rect, focused: bool) -> (Vec<Action>, bool) {
         let mut actions = Vec::new();
         let id = self.panes[i].id;
         let dragging = self.drag.is_some_and(|d| d.active);
+        let link = self.panes[i].link;
         if let PaneKind::Chart(c) = &mut self.panes[i].kind {
             c.hover_enabled = !dragging;
+            if focused {
+                self.watch_ui.active_chart = Some(id);
+            }
+            // Time Link: hand the chart its group's cursor and the finer chart's window.
+            c.link_in = link.map(|l| self.link_bus.feed(l, id, &c.symbol, c.tf));
             let clicked = c.show(ui, rect, focused, &self.worker);
             actions.append(&mut c.actions);
+            let out = std::mem::take(&mut c.link_out);
+            let symbol = c.symbol.clone();
+            if let Some(l) = link {
+                if self.link_bus.publish(l, id, &symbol, c.tf, &out) {
+                    // Charts already painted this frame saw the old cursor.
+                    ui.ctx().request_repaint();
+                }
+                if let Some(ts) = out.center {
+                    self.center_linked(l, id, &symbol, ts);
+                }
+            }
             return (actions, clicked);
         }
+        // QUICK and WHEN share Studio persistence and native response routing.
+        if let PaneKind::Studio(s) = &mut self.panes[i].kind {
+            let mut child = ui.new_child(UiBuilder::new().max_rect(rect.shrink(4.)).id_salt(("studio", id)));
+            let actions = s.show(&mut child, id, &self.worker, self.provider.eq_ignore_ascii_case("sample"), focused);
+            let clicked = child.response().contains_pointer() && child.input(|i| i.pointer.any_pressed());
+            return (actions, clicked);
+        }
+        if let PaneKind::StudioRoute(route) = self.panes[i].kind {
+            super::studio_frame::unavailable(ui, rect, route.code(), route.reason());
+            return (vec![], false);
+        }
         let freshness = self.congress_freshness();
+        let has_leaders = self.panes.iter().any(|p| matches!(&p.kind, PaneKind::Research(r) if r.results.is_some()));
         let inner = rect.shrink2(vec2(dp(8.0), dp(4.0)));
         let mut child = ui.new_child(UiBuilder::new().max_rect(inner).id_salt(("pane", id)));
         child.set_clip_rect(inner.intersect(ui.clip_rect()));
@@ -45,14 +83,31 @@ impl TerminalApp {
                 actions.extend(congress_view::politicians(ui, &self.politicians, &mut self.pol_search))
             }
             PaneKind::Alerts => {
-                let (a, seen) = congress_view::alerts(ui, &self.alerts);
+                let (a, seen) = self.alerts_pane(ui);
                 actions.extend(a);
                 if seen {
                     self.worker.send(Request::MarkAlertsSeen);
                 }
             }
-            PaneKind::Wei => actions.extend(markets_view::wei(ui, &self.quotes, self.wei_updated.as_deref())),
-            PaneKind::Curve => actions.extend(markets_view::curve(ui, self.curves.as_deref())),
+            PaneKind::Health => self.health_pane(ui),
+            PaneKind::Vault(p) => p.show(ui, id, &self.worker),
+            PaneKind::Wei => actions.extend(markets_view::wei(
+                ui,
+                &self.quotes,
+                self.wei_updated.as_deref(),
+                &self.quote_states,
+                &self.worker,
+            )),
+            PaneKind::Curve => {
+                widgets::stale_chip(ui, &self.curve_state);
+                if self.curves.is_none() && self.curve_state.is_down() {
+                    if widgets::unavailable_card(ui, ui.available_rect_before_wrap(), &self.curve_state) {
+                        self.worker.send(Request::RetryFeed { feed: tr_data::Feed::Curve, pane: None });
+                    }
+                } else {
+                    actions.extend(markets_view::curve(ui, self.curves.as_deref()));
+                }
+            }
             PaneKind::Search { query } => {
                 let hits = if self.net_hits.0 == *query { self.net_hits.1.as_slice() } else { &[] };
                 let (a, changed) = markets_view::search(ui, query, hits);
@@ -61,9 +116,19 @@ impl TerminalApp {
                     self.search_pending = Some((query.clone(), Instant::now()));
                 }
             }
+            PaneKind::Research(r) => {
+                let (a, refresh) = r.show(ui, &self.worker);
+                actions.extend(a);
+                if refresh {
+                    r.request(id, &self.worker);
+                }
+                if let Some(n) = r.view.as_mut().and_then(|v| v.notice.take()) {
+                    self.status = n;
+                }
+            }
             PaneKind::News(n) => {
                 let offline = self.provider.eq_ignore_ascii_case("sample");
-                if let Some(refresh) = news(ui, n, offline) {
+                if let Some(refresh) = news(ui, n, offline, has_leaders) {
                     n.fetched = None;
                     n.loading = refresh;
                 }
@@ -72,18 +137,31 @@ impl TerminalApp {
                 let (a, refetch) = super::options_view::options_chain(ui, o);
                 actions.extend(a);
                 if refetch {
-                    o.fetched = None;
+                    o.fetched = Some(Instant::now());
+                    self.worker.send(Request::Options { pane: id, symbol: o.symbol.clone(), expiration: o.expiration });
                 }
             }
             PaneKind::OrderBook(b) => {
-                if let Some(a) = order_book(ui, b) {
-                    actions.push(a);
+                let (action, retry) = order_book(ui, b);
+                actions.extend(action);
+                if retry {
+                    self.worker.send(Request::RetryFeed { feed: tr_data::Feed::Book, pane: Some(id) });
                 }
             }
             PaneKind::Portfolio(pp) => {
                 let demo =
                     (self.prefs.trading.account_mode == crate::prefs::AccountMode::Demo).then_some(&*self.demo.pf);
-                for a in super::portfolio_view::portfolio(ui, pp, &self.broker, demo, &self.quotes) {
+                if let Some(pf) = demo.or(self.broker.portfolio.as_deref()) {
+                    super::portfolio_view::risk_chips(ui, pp, pf, &self.worker, id, &mut self.holding_risk);
+                }
+                for a in super::portfolio_view::portfolio(
+                    ui,
+                    pp,
+                    &self.broker,
+                    demo,
+                    &self.quotes,
+                    Some((&mut self.planning_stops, &mut self.planning_ui)),
+                ) {
                     use super::portfolio_view::PortAction as P;
                     match a {
                         P::Core(a) => actions.push(a),
@@ -115,7 +193,112 @@ impl TerminalApp {
                     }
                 }
             }
-            PaneKind::Watchlist | PaneKind::Settings | PaneKind::Help | PaneKind::Chart(_) => {}
+            PaneKind::Watchlist
+            | PaneKind::Settings
+            | PaneKind::Help
+            | PaneKind::Chart(_)
+            | PaneKind::Desk(_)
+            | PaneKind::Journal(_)
+            | PaneKind::TstackTune(_)
+            | PaneKind::StudioCorr(_)
+            | PaneKind::StudioLab(_)
+            | PaneKind::StudioResid(_)
+            | PaneKind::StudioAttr(_)
+            | PaneKind::Stats(_)
+            | PaneKind::Studio(_)
+            | PaneKind::StudioRoute(_)
+            | PaneKind::StudioDist(_)
+            | PaneKind::StudioSeason(_)
+            | PaneKind::Backtest(_)
+            | PaneKind::Lookalike(_)
+            | PaneKind::IntradayCompare(_)
+            | PaneKind::SessionPath(_)
+            | PaneKind::TrendWall(_)
+            | PaneKind::Rotation(_)
+            | PaneKind::Breadth(_)
+            | PaneKind::VolumePace(_)
+            | PaneKind::RealizedVol(_)
+            | PaneKind::Autocorr(_)
+            | PaneKind::GapFill(_)
+            | PaneKind::SessionExtreme(_)
+            | PaneKind::SessionClock(_)
+            | PaneKind::RelativePath(_)
+            | PaneKind::SessionBrief(_) => {}
+        }
+        if matches!(self.panes[i].kind, PaneKind::Desk(_)) {
+            actions.extend(self.desk(ui, id));
+        }
+        if matches!(self.panes[i].kind, PaneKind::Journal(_)) {
+            actions.extend(self.journal_pane(ui, id));
+        }
+        if matches!(self.panes[i].kind, PaneKind::StudioDist(_)) {
+            actions.extend(self.studio_dist_pane(ui, id));
+        }
+        if matches!(self.panes[i].kind, PaneKind::TstackTune(_)) {
+            self.tstack_tune_pane(ui, id);
+        }
+        if matches!(self.panes[i].kind, PaneKind::StudioCorr(_)) {
+            actions.extend(self.studio_corr_pane(ui, id));
+        }
+        if matches!(self.panes[i].kind, PaneKind::StudioLab(_)) {
+            actions.extend(self.studio_lab_pane(ui, id));
+        }
+        if matches!(self.panes[i].kind, PaneKind::StudioResid(_)) {
+            actions.extend(self.studio_resid_pane(ui, id));
+        }
+        if matches!(self.panes[i].kind, PaneKind::StudioAttr(_)) {
+            actions.extend(self.studio_attr_pane(ui, id));
+        }
+        if matches!(self.panes[i].kind, PaneKind::StudioSeason(_)) {
+            actions.extend(self.studio_season_pane(ui, id));
+        }
+        if matches!(self.panes[i].kind, PaneKind::Stats(_)) {
+            actions.extend(self.stats_pane(ui, id));
+        }
+        if matches!(self.panes[i].kind, PaneKind::Backtest(_)) {
+            actions.extend(self.backtest_pane(ui, id));
+        }
+        if matches!(self.panes[i].kind, PaneKind::Lookalike(_)) {
+            actions.extend(self.lookalike_pane(ui, id));
+        }
+        if matches!(self.panes[i].kind, PaneKind::IntradayCompare(_)) {
+            actions.extend(self.compare_pane(ui, id));
+        }
+        if matches!(self.panes[i].kind, PaneKind::SessionPath(_)) {
+            actions.extend(self.session_path_pane(ui, id));
+        }
+        if matches!(self.panes[i].kind, PaneKind::TrendWall(_)) {
+            actions.extend(self.trend_wall_pane(ui, id));
+        }
+        if matches!(self.panes[i].kind, PaneKind::Rotation(_)) {
+            actions.extend(self.rotation_pane(ui, id));
+        }
+        if matches!(self.panes[i].kind, PaneKind::Breadth(_)) {
+            actions.extend(self.breadth_pane(ui, id));
+        }
+        if matches!(self.panes[i].kind, PaneKind::VolumePace(_)) {
+            actions.extend(self.volume_pace_pane(ui, id));
+        }
+        if matches!(self.panes[i].kind, PaneKind::RealizedVol(_)) {
+            actions.extend(self.realized_vol_pane(ui, id));
+        }
+        if matches!(self.panes[i].kind, PaneKind::Autocorr(_)) {
+            actions.extend(self.autocorr_pane(ui, id));
+        }
+        if matches!(self.panes[i].kind, PaneKind::GapFill(_)) {
+            actions.extend(self.gap_fill_pane(ui, id));
+        }
+        if matches!(self.panes[i].kind, PaneKind::SessionExtreme(_)) {
+            actions.extend(self.session_extreme_pane(ui, id));
+        }
+        if matches!(self.panes[i].kind, PaneKind::SessionClock(_)) {
+            actions.extend(self.session_clock_pane(ui, id));
+        }
+        if matches!(self.panes[i].kind, PaneKind::RelativePath(_)) {
+            actions.extend(self.relative_path_pane(ui, id));
+        }
+        if matches!(self.panes[i].kind, PaneKind::SessionBrief(_)) {
+            actions.extend(self.session_brief_pane(ui, id));
         }
         match self.panes[i].kind {
             PaneKind::Watchlist => actions.extend(self.watchlist(ui)),
@@ -128,163 +311,141 @@ impl TerminalApp {
         }
         (actions, false)
     }
-
-    fn watchlist(&mut self, ui: &mut Ui) -> Vec<Action> {
-        let mut out = Vec::new();
-        let row_h = dp(22.0);
-        let w = ui.available_width();
-        let (hdr, _) = ui.allocate_exact_size(vec2(w, row_h), Sense::hover());
-        let p = ui.painter();
-        p.rect_filled(hdr, theme::CONTROL_RADIUS, theme::header());
-        let cols = [0.0, 0.34, 0.58, 0.79, 1.0];
-        let col = |r: Rect, k: usize| r.left() + 8.0 + (r.width() - 16.0) * cols[k];
-        p.text(pos2(col(hdr, 0), hdr.center().y), Align2::LEFT_CENTER, "Security", ui_font(11.5), muted());
-        for (k, h) in [(2, "Last"), (3, "Change"), (4, "%")] {
-            p.text(pos2(col(hdr, k), hdr.center().y), Align2::RIGHT_CENTER, h, ui_font(11.5), muted());
-        }
-        let mut remove = None;
-        egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
-            for s in &self.watchlist {
-                let sec = tr_data::security(s);
-                let (r, resp) = ui.allocate_exact_size(vec2(w, row_h), Sense::click());
-                widgets::hover_wash(ui, r, &resp, false);
-                let p = ui.painter();
-                p.text(pos2(col(r, 0), r.center().y), Align2::LEFT_CENTER, &sec.ticker, mono(12.5), amber());
-                p.text(
-                    pos2(col(r, 0) + 74.0, r.center().y),
-                    Align2::LEFT_CENTER,
-                    sec.class.yellow_key().label(),
-                    ui_font(11.0),
-                    muted(),
-                );
-                match self.quotes.get(s) {
-                    Some(q) => {
-                        let c = if q.change() >= 0.0 { theme::up() } else { theme::down() };
-                        let d = sec.decimals(q.last);
-                        p.text(
-                            pos2(col(r, 2), r.center().y),
-                            Align2::RIGHT_CENTER,
-                            format!("{:.d$}", q.last),
-                            mono(12.5),
-                            text(),
-                        );
-                        p.text(
-                            pos2(col(r, 3), r.center().y),
-                            Align2::RIGHT_CENTER,
-                            markets_view::change_text(&sec, q),
-                            mono(12.5),
-                            c,
-                        );
-                        p.text(
-                            pos2(col(r, 4), r.center().y),
-                            Align2::RIGHT_CENTER,
-                            format!("{:+.2}%", q.change_pct()),
-                            mono(12.5),
-                            c,
-                        );
-                    }
-                    None => {
-                        p.text(pos2(col(r, 4), r.center().y), Align2::RIGHT_CENTER, "…", mono(12.5), muted());
-                    }
-                }
-                let tradable = matches!(sec.class, tr_core::AssetClass::Equity | tr_core::AssetClass::Etf);
-                let pills = if tradable { widgets::buy_sell_pills().to_vec() } else { Vec::new() };
-                let tips = [format!("Buy {} (⇧B)", sec.ticker), format!("Sell {} (⇧S)", sec.ticker)];
-                let tips: Vec<&str> = tips.iter().map(String::as_str).collect();
-                match widgets::row_pills(ui, r, ("wl-pills", s), &pills, &tips) {
-                    Some(i) => out.push(Action::Command(format!("{} {s}", if i == 0 { "BUY" } else { "SELL" }))),
-                    None if resp.clicked() => out.push(Action::OpenChart(s.clone())),
-                    None => {}
-                }
-                resp.context_menu(|ui| {
-                    if tradable {
-                        for (label, side) in [("Buy", "BUY"), ("Sell", "SELL")] {
-                            if ui.button(format!("{label} {}…", sec.ticker)).clicked() {
-                                out.push(Action::Command(format!("{side} {s}")));
-                                ui.close();
-                            }
-                        }
-                        ui.separator();
-                    }
-                    if ui.button("Open Chart").clicked() {
-                        out.push(Action::OpenChart(s.clone()));
-                        ui.close();
-                    }
-                    if sec.has_congress_trades() && ui.button("Who in Congress Traded This").clicked() {
-                        out.push(Action::OpenTicker(sec.ticker.clone()));
-                        ui.close();
-                    }
-                    ui.separator();
-                    if ui.button("Remove from Watchlist").clicked() {
-                        remove = Some(s.clone());
-                        ui.close();
-                    }
-                });
-            }
-            ui.add_space(4.0);
-            ui.label(
-                RichText::new("WL ADD <KEY> to add · right-click a row for options").font(ui_font(11.0)).color(muted()),
-            );
-        });
-        if let Some(s) = remove {
-            self.watchlist.retain(|x| *x != s);
-        }
-        out
-    }
 }
 
 /// Headlines list. Returns `Some(_)` when a refresh was requested.
-fn news(ui: &mut Ui, n: &mut super::NewsPane, offline: bool) -> Option<bool> {
+fn news(ui: &mut Ui, n: &mut super::NewsPane, offline: bool, has_leaders: bool) -> Option<bool> {
+    use tr_data::news::{NewsScope, format_freshness, format_pub};
     let mut refresh = None;
+    let set_scope = |n: &mut super::NewsPane, scope: NewsScope, refresh: &mut Option<bool>| {
+        if n.scope != scope {
+            n.scope = scope;
+            n.batch = None;
+            *refresh = Some(true);
+        }
+    };
     ui.horizontal_wrapped(|ui| {
-        let title = match &n.symbol {
-            Some(s) => format!("{} headlines", tr_data::security(s).key()),
-            None => "Top market headlines".into(),
+        let title = match n.scope {
+            NewsScope::Symbol => n
+                .symbol
+                .as_deref()
+                .map(|s| format!("{} headlines", tr_data::security(s).key()))
+                .unwrap_or_else(|| "Headlines".into()),
+            NewsScope::Watchlist => "Watchlist headlines".into(),
+            NewsScope::Leaders => "Scanner-leader headlines".into(),
+            NewsScope::Top => "Top market headlines".into(),
         };
         ui.label(RichText::new(title).font(ui_font(12.5)).color(text()));
         if n.loading {
             ui.add(egui::Spinner::new().size(12.0));
         }
-        if n.symbol.is_some() && ui.small_button("Top News").on_hover_text("General market headlines").clicked() {
-            n.symbol = None;
-            n.items.clear();
-            refresh = Some(true);
+        if ui
+            .small_button("Watchlist")
+            .on_hover_text("Deduplicated headlines for the selected watchlist group")
+            .clicked()
+        {
+            set_scope(n, NewsScope::Watchlist, &mut refresh);
+        }
+        if has_leaders
+            && ui
+                .small_button("Leaders")
+                .on_hover_text("Top names from the open SCAN pane — not the whole archive")
+                .clicked()
+        {
+            set_scope(n, NewsScope::Leaders, &mut refresh);
+        }
+        if n.symbol.is_some()
+            && ui.small_button("This name").on_hover_text("Headlines for the linked security").clicked()
+        {
+            set_scope(n, NewsScope::Symbol, &mut refresh);
+        }
+        if ui.small_button("Top News").on_hover_text("One general market query").clicked() {
+            set_scope(n, NewsScope::Top, &mut refresh);
         }
         if ui.small_button("Refresh").clicked() {
             refresh = Some(true);
         }
     });
     ui.add_space(2.0);
-    if let Some(e) = &n.error {
-        ui.label(RichText::new(format!("Could not load news: {e}")).font(ui_font(12.0)).color(theme::down()));
+    let now = chrono::Utc::now().timestamp();
+    if let Some(batch) = &n.batch {
+        let mut meta = vec![format_freshness(batch.fetched_at, now)];
+        if !batch.queried.is_empty() {
+            meta.push(format!("{} name{}", batch.queried.len(), if batch.queried.len() == 1 { "" } else { "s" }));
+        }
+        meta.push(format!("{} headline{}", batch.items.len(), if batch.items.len() == 1 { "" } else { "s" }));
+        ui.label(RichText::new(meta.join(" · ")).font(ui_font(11.0)).color(muted()));
+        if batch.sample || offline {
+            ui.label(
+                RichText::new("Sample / offline mode: headlines are not invented and never enter research.")
+                    .font(ui_font(12.0))
+                    .color(theme::down()),
+            );
+        }
+        if batch.is_stale_at(now) {
+            ui.label(
+                RichText::new(format!(
+                    "Stale feed — last successful fetch {}.",
+                    format_freshness(batch.fetched_at, now)
+                ))
+                .font(ui_font(12.0))
+                .color(amber()),
+            );
+        }
+        if batch.is_partial() {
+            let failed = batch
+                .failures
+                .iter()
+                .map(|f| format!("{} ({})", tr_data::security(&f.symbol).ticker, f.error))
+                .collect::<Vec<_>>()
+                .join(" · ");
+            ui.label(
+                RichText::new(format!(
+                    "Partial: {} of {} names failed. {failed}",
+                    batch.failures.len(),
+                    batch.queried.len()
+                ))
+                .font(ui_font(12.0))
+                .color(amber()),
+            );
+        } else if batch.items.is_empty() && !batch.failures.is_empty() {
+            ui.label(
+                RichText::new(format!("Could not load news: {}", batch.failures[0].error))
+                    .font(ui_font(12.0))
+                    .color(theme::down()),
+            );
+        }
     }
-    if n.items.is_empty() && !n.loading {
-        let msg = if offline {
+    let items = n.batch.as_ref().map(|b| b.items.as_slice()).unwrap_or(&[]);
+    if items.is_empty() && !n.loading {
+        let msg = if offline || n.batch.as_ref().is_some_and(|b| b.sample) {
             "No headlines in offline sample mode (TR_PROVIDER=sample)."
+        } else if n.scope == NewsScope::Watchlist {
+            "No headlines for this watchlist. Add names with WL ADD, or Refresh."
+        } else if n.scope == NewsScope::Leaders {
+            "No scanner leaders yet. Run SCAN, then open Leaders."
         } else {
             "No headlines for this security right now."
         };
         ui.label(RichText::new(msg).font(ui_font(12.0)).color(muted()));
     }
-    let now = chrono::Utc::now().timestamp();
+    let show_ticker = matches!(n.scope, NewsScope::Watchlist | NewsScope::Leaders);
     egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
         let w = ui.available_width();
-        for item in &n.items {
-            let age = (now - item.ts).max(0);
-            let when = if age < 3600 {
-                format!("{}m", age / 60)
-            } else if age < 86_400 {
-                format!("{}h", age / 3600)
-            } else {
-                chrono::DateTime::from_timestamp(item.ts, 0).map(|d| d.format("%b %d").to_string()).unwrap_or_default()
-            };
-            let title = ui.painter().layout(item.title.clone(), ui_font(13.0), text(), (w - 70.0).max(80.0));
+        for item in items {
+            let when = format_pub(item.ts, now);
+            let extra = if show_ticker { item.tickers.first().cloned().unwrap_or_default() } else { String::new() };
+            let left = if extra.is_empty() { 60.0 } else { 108.0 };
+            let title = ui.painter().layout(item.title.clone(), ui_font(13.0), text(), (w - left - 10.0).max(80.0));
             let h = title.size().y + dp(20.0);
             let (r, resp) = ui.allocate_exact_size(vec2(w, h), Sense::click());
             widgets::hover_wash(ui, r, &resp, false);
             let p = ui.painter();
             p.text(pos2(r.left() + 6.0, r.top() + 4.0), Align2::LEFT_TOP, &when, mono(11.0), amber());
-            let tpos = pos2(r.left() + 60.0, r.top() + 3.0);
+            if !extra.is_empty() {
+                p.text(pos2(r.left() + 56.0, r.top() + 4.0), Align2::LEFT_TOP, &extra, mono(11.0), theme::up());
+            }
+            let tpos = pos2(r.left() + left, r.top() + 3.0);
             let th = title.size().y;
             p.galley(tpos, title, text());
             p.text(pos2(tpos.x, tpos.y + th + 2.0), Align2::LEFT_TOP, &item.publisher, ui_font(11.0), muted());
@@ -329,8 +490,27 @@ fn fmt_size(q: f64) -> String {
 }
 
 /// Price ladder: asks above, bids below, depth bars by cumulative size.
-fn order_book(ui: &mut Ui, b: &mut super::BookPane) -> Option<Action> {
+fn order_book(ui: &mut Ui, b: &mut super::BookPane) -> (Option<Action>, bool) {
     let mut action = None;
+    if b.feed_state.is_down() || (b.book.is_none() && b.error.is_some()) {
+        let state = if b.feed_state.is_down() {
+            b.feed_state.clone()
+        } else {
+            tr_data::FeedState::Unsupported { reason: b.error.clone().unwrap_or_default() }
+        };
+        if widgets::unavailable_card(ui, ui.available_rect_before_wrap(), &state) {
+            return (None, true);
+        }
+        return (None, false);
+    }
+    let mut shown = b.feed_state.clone();
+    if let tr_data::FeedState::Stale { age_secs, .. } = &mut shown {
+        *age_secs = (chrono::Utc::now().timestamp() - b.last_ok.unwrap_or(chrono::Utc::now().timestamp())).max(0);
+    }
+    widgets::stale_chip(ui, &shown);
+    if matches!(shown, tr_data::FeedState::Stale { .. }) {
+        ui.multiply_opacity(0.55);
+    }
     let key = tr_data::security(&b.symbol);
     let book: Option<OrderBook> = b.book.as_ref().map(|x| x.grouped(b.group));
     ui.horizontal_wrapped(|ui| {
@@ -342,10 +522,8 @@ fn order_book(ui: &mut Ui, b: &mut super::BookPane) -> Option<Action> {
         if let Some(bk) = &book {
             ui.label(RichText::new(&bk.source).font(ui_font(11.5)).color(muted()));
             if bk.simulated {
-                ui.label(
-                    RichText::new(" SIMULATED ").font(ui_font(10.5)).color(Color32::BLACK).background_color(amber()),
-                )
-                .on_hover_text("No free public order book for this market (or offline); levels are synthetic.");
+                widgets::chip(ui, widgets::ChipKind::Caution, "SIMULATED")
+                    .on_hover_text("Explicit sample mode; levels are synthetic.");
             }
         }
     });
@@ -374,7 +552,7 @@ fn order_book(ui: &mut Ui, b: &mut super::BookPane) -> Option<Action> {
     }
     let Some(book) = book else {
         ui.add(egui::Spinner::new());
-        return action;
+        return (action, false);
     };
     let rect = ui.available_rect_before_wrap();
     let d = key.decimals(book.mid().unwrap_or(1.0));
@@ -443,7 +621,7 @@ fn order_book(ui: &mut Ui, b: &mut super::BookPane) -> Option<Action> {
     }
     ui.allocate_rect(rect, Sense::hover());
     ui.ctx().request_repaint_after(std::time::Duration::from_millis(500));
-    action
+    (action, false)
 }
 
 #[cfg(test)]
@@ -457,5 +635,40 @@ mod tests {
         assert!((fx[1] - 1e-4).abs() < 1e-12);
         assert_eq!(fmt_size(1_500.0), "1.50K");
         assert_eq!(fmt_size(0.5), "0.50000");
+    }
+}
+
+#[cfg(test)]
+mod feed_tests {
+    use super::*;
+    #[test]
+    fn unavailable_book_paints_zero_price_levels() {
+        let mut b = super::super::BookPane::new("AAPL", 20, 0.0);
+        b.book = Some(OrderBook {
+            symbol: "AAPL".into(),
+            bids: vec![(123.45, 1234.0)],
+            asks: vec![(124.56, 2345.0)],
+            source: "fixture".into(),
+            simulated: false,
+        });
+        b.feed_state = tr_data::FeedState::Unsupported { reason: "No public order book for AAPL".into() };
+        let ctx = egui::Context::default();
+        let mut output = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(600.0, 400.0))),
+                ..Default::default()
+            },
+            |ui| {
+                order_book(ui, &mut b);
+            },
+        );
+        output.textures_delta.clear();
+        let texts: Vec<_> = output
+            .shapes
+            .iter()
+            .filter_map(|s| if let egui::Shape::Text(t) = &s.shape { Some(t.galley.job.text.clone()) } else { None })
+            .collect();
+        assert!(texts.iter().any(|t| t == "NO REAL DATA"));
+        assert!(texts.iter().all(|t| !t.chars().any(|c| c.is_ascii_digit())));
     }
 }

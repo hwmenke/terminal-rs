@@ -5,8 +5,8 @@
 //!
 //! Conventions follow the common charting definitions: EMA uses alpha = 2/(n+1) seeded with
 //! an SMA, RSI, ATR and ADX use Wilder smoothing, standard deviations are population ones,
-//! and VWAP and pivot levels reset each session (a day intraday, a month on daily bars, a
-//! year above that).
+//! and VWAP and pivot levels reset each session (a New York calendar day intraday, a month
+//! on daily bars, a year above that).
 //!
 //! The functions are grouped by family; [`registry`] lists every indicator with its
 //! parameters, placement and outputs, and is what the app's command line, picker and chart
@@ -14,6 +14,11 @@
 
 use crate::Bar;
 
+mod adaptive;
+mod trend_stack;
+pub use trend_stack::*;
+mod desk;
+pub use desk::*;
 mod levels;
 mod ma;
 mod momentum;
@@ -23,6 +28,7 @@ mod trend;
 mod volatility;
 mod volume;
 
+pub use adaptive::*;
 pub use levels::*;
 pub use ma::*;
 pub use momentum::*;
@@ -52,7 +58,7 @@ impl Ohlcv {
             high: bars.iter().map(|b| b.high).collect(),
             low: bars.iter().map(|b| b.low).collect(),
             close: bars.iter().map(|b| b.close).collect(),
-            volume: bars.iter().map(|b| b.volume).collect(),
+            volume: bars.iter().map(|b| b.volume_value().unwrap_or(NAN)).collect(),
         }
     }
 

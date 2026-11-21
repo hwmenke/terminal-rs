@@ -30,6 +30,7 @@ pub struct PortfolioPane {
     pub sort: PosSort,
     /// Orders: only open ones.
     pub open_only: bool,
+    pub open_risk: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
@@ -43,7 +44,14 @@ pub enum PosSort {
 
 impl PortfolioPane {
     pub fn new(view: PortView) -> Self {
-        Self { view, account: None, symbol: None, sort: PosSort::Value, open_only: false }
+        Self {
+            view,
+            account: None,
+            symbol: None,
+            sort: PosSort::Value,
+            open_only: false,
+            open_risk: false,
+        }
     }
 
     pub fn title(&self) -> String {
@@ -78,6 +86,10 @@ pub struct BrokerState {
     pub form: Credentials,
     pub reveal: bool,
     pub portfolio: Option<Box<Portfolio>>,
+    /// Invalidates portfolio requests when credentials are saved or forgotten.
+    pub credential_generation: u64,
+    /// Identifies the latest issued portfolio refresh within this app session.
+    pub portfolio_request_id: u64,
     pub error: Option<String>,
     pub loading: bool,
     pub fetched: Option<Instant>,
@@ -85,6 +97,8 @@ pub struct BrokerState {
     pub message: Option<(String, bool)>,
     /// A request in flight from Settings ("Registering…").
     pub busy: Option<&'static str>,
+    /// Credentials submitted for the pending user registration.
+    pub registering: Option<Credentials>,
     /// Last Connection Portal link, so it can be copied if no browser opened.
     pub portal_url: Option<String>,
     pub connecting_since: Option<Instant>,
@@ -121,11 +135,14 @@ impl BrokerState {
             from_env,
             reveal: false,
             portfolio: None,
+            credential_generation: 0,
+            portfolio_request_id: 0,
             error: None,
             loading: false,
             fetched: None,
             message,
             busy: None,
+            registering: None,
             portal_url: None,
             connecting_since: None,
             simulate,
@@ -152,7 +169,11 @@ impl BrokerState {
         if p.kind == tr_broker::InstrumentKind::Option {
             return None;
         }
-        quotes.get(&p.market_key()?).map(|q| q.last).filter(|x| x.is_finite() && *x > 0.0)
+        quotes
+            .get(&p.market_key()?)
+            .filter(|q| self.portfolio.as_ref().is_some_and(|pf| pf.simulated) || q.provenance.is_verified())
+            .map(|q| q.last)
+            .filter(|x| x.is_finite() && *x > 0.0)
     }
 }
 
@@ -184,24 +205,30 @@ impl TerminalApp {
             BrokerMode::Simulated => None,
             BrokerMode::Setup => return,
         };
+        b.portfolio_request_id += 1;
         b.loading = true;
         b.fetched = Some(Instant::now());
-        self.worker.send(Request::Portfolio(creds));
+        self.worker.send(Request::Portfolio(b.credential_generation, b.portfolio_request_id, creds));
     }
 
-    /// Periodic portfolio and quote refresh while a portfolio pane is visible.
+    /// Periodic portfolio discovery and refresh, plus quotes for visible portfolio panes.
     pub(super) fn broker_periodic(&mut self, visible: &[usize]) {
         let shown = visible.iter().any(|&i| matches!(self.panes[i].kind, PaneKind::Portfolio(_)));
-        if !shown {
-            return;
-        }
+        let brokerage_settings_shown = self.settings_tab == super::settings_view::SettingsTab::Brokerage
+            && visible.iter().any(|&i| matches!(self.panes[i].kind, PaneKind::Settings));
         let b = &self.broker;
         let connecting = b.connecting_since.is_some_and(|t| t.elapsed() < CONNECT_WINDOW);
         let every = if connecting { CONNECT_POLL } else { REFRESH };
-        // The demo account is local: live accounts load only while they are shown.
-        let live = !self.demo_mode();
-        if live && !b.loading && b.mode() != BrokerMode::Setup && b.fetched.is_none_or(|t| t.elapsed() > every) {
+        let discovering = brokerage_settings_shown && b.mode() == BrokerMode::Live && connecting;
+        if ((shown && !self.demo_mode()) || discovering)
+            && !b.loading
+            && b.mode() != BrokerMode::Setup
+            && b.fetched.is_none_or(|t| t.elapsed() > every)
+        {
             self.refresh_portfolio();
+        }
+        if !shown {
+            return;
         }
         // Reprice holdings with the terminal's own quotes.
         if let Some(pf) = self.shown_portfolio()
@@ -222,7 +249,11 @@ impl TerminalApp {
         }
     }
 
-    pub(super) fn on_portfolio(&mut self, result: Result<Box<Portfolio>, String>) {
+    pub(super) fn on_portfolio(&mut self, generation: u64, request_id: u64, result: Result<Box<Portfolio>, String>) {
+        if generation != self.broker.credential_generation || request_id != self.broker.portfolio_request_id {
+            return;
+        }
+        let result = self.keep_simulated_trades(result);
         let b = &mut self.broker;
         b.loading = false;
         if std::mem::take(&mut b.testing) {
@@ -268,8 +299,12 @@ impl TerminalApp {
 
     pub(super) fn on_broker_registered(&mut self, result: Result<(String, String), String>) {
         self.broker.busy = None;
+        let submitted = self.broker.registering.take();
         match result {
             Ok((id, secret)) => {
+                if let Some(form) = submitted {
+                    self.broker.form = form;
+                }
                 self.broker.form.user_id = id;
                 self.broker.form.user_secret = secret;
                 // SnapTrade returns the secret only once: persist it immediately.
@@ -304,8 +339,14 @@ impl TerminalApp {
                 b.saved = b.form.clone();
                 let mut creds = b.form.clone();
                 b.from_env = creds.apply_env(|k| std::env::var(k).ok());
+                if b.creds != creds {
+                    b.connecting_since = None;
+                    b.portal_url = None;
+                }
                 b.creds = creds;
                 b.message = Some((ok.into(), false));
+                b.credential_generation += 1;
+                b.loading = false;
                 b.portfolio = None;
                 b.error = None;
                 b.fetched = None;
@@ -322,11 +363,16 @@ impl TerminalApp {
                 b.form = Credentials::default();
                 let mut creds = Credentials::default();
                 b.from_env = creds.apply_env(|k| std::env::var(k).ok());
+                if b.creds != creds {
+                    b.connecting_since = None;
+                    b.portal_url = None;
+                }
                 b.creds = creds;
+                b.credential_generation += 1;
+                b.loading = false;
                 b.portfolio = None;
                 b.error = None;
                 b.fetched = None;
-                b.portal_url = None;
                 b.message = Some((
                     if b.from_env {
                         "Saved credentials removed (SNAPTRADE_* environment variables still apply).".into()
@@ -349,6 +395,7 @@ impl TerminalApp {
         let user_id = if form.user_id.trim().is_empty() { new_user_id() } else { form.user_id.trim().to_string() };
         self.broker.busy = Some("Registering user…");
         self.broker.message = None;
+        self.broker.registering = Some(form.clone());
         self.worker.send(Request::BrokerRegister { creds: form, user_id });
     }
 
@@ -381,6 +428,11 @@ impl TerminalApp {
         self.broker.disconnecting = None;
         match result {
             Ok(id) => {
+                // Reject all portfolio loads issued before disconnect completed, including
+                // refreshes started while it was pending. Keep fetched to bound polling.
+                self.broker.portfolio_request_id += 1;
+                self.broker.loading = false;
+                self.broker.testing = false;
                 let name = self
                     .broker
                     .portfolio
@@ -778,6 +830,662 @@ impl TerminalApp {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn discovery_app() -> (TerminalApp, tokio::sync::mpsc::UnboundedReceiver<Request>) {
+        let mut app = super::super::tests::test_app();
+        let (worker, requests) = crate::worker::Worker::test_channel();
+        app.worker = worker;
+        app.broker.creds = Credentials {
+            client_id: "mock-client".into(),
+            consumer_key: "mock-key".into(),
+            user_id: "mock-user".into(),
+            user_secret: "mock-secret".into(),
+        };
+        app.broker.portfolio = Some(Box::new(Portfolio::default()));
+        app.broker.loading = false;
+        let now = Instant::now();
+        app.broker.connecting_since = Some(now);
+        app.broker.fetched = Some(now - Duration::from_secs(21));
+        app.prefs.trading.account_mode = crate::prefs::AccountMode::Live;
+        app.settings_tab = super::super::SettingsTab::Brokerage;
+        app.panes.push(super::super::Pane { id: 1, kind: PaneKind::Settings, link: None, title: None, window: None });
+        (app, requests)
+    }
+
+    #[test]
+    fn credential_session_save_different_clears_portal_and_window() {
+        let (mut app, mut requests) = discovery_app();
+        app.broker.portal_url = Some("https://example.invalid/old-identity".into());
+        app.broker.form = app.broker.creds.clone();
+        app.broker.form.user_id = "different-mock-user".into();
+        app.save_broker_form("saved");
+        assert!(app.broker.message.as_ref().is_some_and(|(_, error)| !error));
+        assert_eq!(
+            (app.broker.connecting_since.is_none(), app.broker.portal_url.is_none()),
+            (true, true),
+            "connection window and portal must both be cleared"
+        );
+        assert!(requests.try_recv().is_err());
+    }
+
+    #[test]
+    fn credential_session_forget_clears_window() {
+        let (mut app, mut requests) = discovery_app();
+        app.broker.portal_url = Some("https://example.invalid/old-identity".into());
+        app.forget_broker_credentials();
+        assert!(app.broker.message.as_ref().is_some_and(|(_, error)| !error));
+        assert!(app.broker.connecting_since.is_none());
+        assert!(app.broker.portal_url.is_none());
+        assert!(requests.try_recv().is_err());
+    }
+
+    #[test]
+    fn credential_session_save_identical_keeps_portal_and_window() {
+        let (mut app, mut requests) = discovery_app();
+        app.broker.form = app.broker.creds.clone();
+        app.broker.form.apply_env(|k| std::env::var(k).ok());
+        app.broker.creds = app.broker.form.clone();
+        let since = app.broker.connecting_since;
+        let portal = Some("https://example.invalid/same-identity".to_string());
+        app.broker.portal_url = portal.clone();
+        app.save_broker_form("saved");
+        assert!(app.broker.message.as_ref().is_some_and(|(_, error)| !error));
+        assert_eq!(app.broker.connecting_since, since);
+        assert_eq!(app.broker.portal_url, portal);
+        assert!(requests.try_recv().is_err());
+    }
+
+    #[test]
+    fn credential_session_forget_identical_effective_credentials_keeps_session() {
+        let (mut app, mut requests) = discovery_app();
+        let mut effective = Credentials::default();
+        effective.apply_env(|k| std::env::var(k).ok());
+        app.broker.creds = effective;
+        let since = app.broker.connecting_since;
+        let portal = Some("https://example.invalid/same-identity".to_string());
+        app.broker.portal_url = portal.clone();
+        app.forget_broker_credentials();
+        assert!(app.broker.message.as_ref().is_some_and(|(_, error)| !error));
+        assert_eq!(app.broker.connecting_since, since);
+        assert_eq!(app.broker.portal_url, portal);
+        assert!(requests.try_recv().is_err());
+    }
+
+    #[test]
+    fn credential_session_persistence_failure_keeps_state() {
+        for forget in [false, true] {
+            let (mut app, mut requests) = discovery_app();
+            // A directory cannot be replaced by the credential file or removed as a file.
+            let tr_broker::secrets::Backend::File(path) = &app.broker.store.backend else {
+                panic!("fixture must use a file store")
+            };
+            let path = path.with_extension("blocked-store");
+            std::fs::create_dir_all(&path).unwrap();
+            app.broker.store = tr_broker::SecretStore::file(&path);
+            app.broker.form = app.broker.creds.clone();
+            app.broker.form.user_id = "different-mock-user".into();
+            let creds = app.broker.creds.clone();
+            let saved = app.broker.saved.clone();
+            let form = app.broker.form.clone();
+            let generation = app.broker.credential_generation;
+            let since = app.broker.connecting_since;
+            let portal = Some("https://example.invalid/old-identity".to_string());
+            app.broker.portal_url = portal.clone();
+            if forget {
+                app.forget_broker_credentials();
+            } else {
+                app.save_broker_form("saved");
+            }
+            assert!(app.broker.message.as_ref().is_some_and(|(_, error)| *error));
+            assert!(app.broker.creds == creds);
+            assert!(app.broker.saved == saved);
+            assert!(app.broker.form == form);
+            assert_eq!(app.broker.credential_generation, generation);
+            assert!(app.broker.portfolio.is_some());
+            assert!(app.broker.fetched.is_some());
+            assert_eq!(app.broker.connecting_since, since);
+            assert_eq!(app.broker.portal_url, portal);
+            assert!(requests.try_recv().is_err());
+            std::fs::remove_dir_all(path).unwrap();
+        }
+    }
+
+    #[test]
+    fn credential_session_new_save_stops_settings_discovery() {
+        let (mut app, mut requests) = discovery_app();
+        app.broker.form = app.broker.creds.clone();
+        app.broker.form.user_id = "different-mock-user".into();
+        app.save_broker_form("saved");
+        assert!(app.broker.message.as_ref().is_some_and(|(_, error)| !error));
+        assert!(app.broker.creds.is_ready());
+        app.broker_periodic(&[0]);
+        assert!(requests.try_recv().is_err(), "new credentials must not inherit Settings discovery");
+    }
+
+    #[test]
+    fn settings_brokerage_discovers_new_accounts() {
+        let (mut app, mut requests) = discovery_app();
+        app.panes.push(super::super::Pane { id: 2, kind: PaneKind::Settings, link: None, title: None, window: None });
+        app.focus = 1; // Discovery follows visibility even when another pane has focus.
+        app.broker_periodic(&[0]);
+        assert!(matches!(requests.try_recv(), Ok(Request::Portfolio(_, _, Some(_)))));
+        assert!(requests.try_recv().is_err(), "expected exactly one portfolio request");
+    }
+
+    #[test]
+    fn settings_discovery_requires_visible_brokerage_tab() {
+        for (visible, tab) in
+            [(vec![], super::super::SettingsTab::Brokerage), (vec![0], super::super::SettingsTab::Appearance)]
+        {
+            let (mut app, mut requests) = discovery_app();
+            app.settings_tab = tab;
+            app.broker_periodic(&visible);
+            assert!(requests.try_recv().is_err());
+        }
+    }
+
+    #[test]
+    fn settings_discovery_requires_active_window() {
+        for age in [None, Some(CONNECT_WINDOW), Some(CONNECT_WINDOW + Duration::from_secs(1))] {
+            let (mut app, mut requests) = discovery_app();
+            app.broker.connecting_since = age.map(|age| Instant::now() - age);
+            // Even a normally overdue refresh must not run for Settings outside discovery.
+            app.broker.fetched = Some(Instant::now() - REFRESH - Duration::from_secs(1));
+            app.broker_periodic(&[0]);
+            assert!(requests.try_recv().is_err(), "window age: {age:?}");
+        }
+    }
+
+    #[test]
+    fn settings_discovery_requires_ready_credentials() {
+        for simulate in [false, true] {
+            let (mut app, mut requests) = discovery_app();
+            app.broker.simulate = simulate;
+            app.broker.creds.user_secret.clear();
+            app.broker_periodic(&[0]);
+            assert!(requests.try_recv().is_err());
+        }
+    }
+
+    #[test]
+    fn settings_discovery_obeys_loading_and_cadence() {
+        for (loading, age) in [(true, 21), (false, 19)] {
+            let (mut app, mut requests) = discovery_app();
+            app.broker.loading = loading;
+            app.broker.fetched = Some(Instant::now() - Duration::from_secs(age));
+            app.broker_periodic(&[0]);
+            app.broker_periodic(&[0]);
+            assert!(requests.try_recv().is_err());
+        }
+        let (mut app, mut requests) = discovery_app();
+        app.broker_periodic(&[0]);
+        assert!(app.broker.loading);
+        app.broker_periodic(&[0]);
+        assert!(matches!(requests.try_recv(), Ok(Request::Portfolio(_, _, Some(_)))));
+        assert!(requests.try_recv().is_err());
+    }
+
+    #[test]
+    fn settings_discovery_in_demo_requires_window_and_never_requests_quotes() {
+        for connecting in [true, false] {
+            let (mut app, mut requests) = discovery_app();
+            app.prefs.trading.account_mode = crate::prefs::AccountMode::Demo;
+            // Nonempty holdings make accidental quote refresh observable.
+            app.broker.portfolio = Some(Box::new(tr_broker::sample::portfolio()));
+            app.demo.pf = Box::new(tr_broker::sample::portfolio());
+            if !connecting {
+                app.broker.connecting_since = None;
+                app.broker.fetched = None;
+            }
+            app.broker_periodic(&[0]);
+            if connecting {
+                assert!(matches!(requests.try_recv(), Ok(Request::Portfolio(_, _, Some(_)))));
+            }
+            assert!(requests.try_recv().is_err());
+            assert!(app.broker.last_quotes.is_none());
+        }
+    }
+
+    #[test]
+    fn visible_portfolio_retains_refresh_and_quote_behavior() {
+        for (demo, connecting, age, refresh) in
+            [(false, false, 121, true), (false, false, 21, false), (false, true, 21, true), (true, true, 121, false)]
+        {
+            let (mut app, mut requests) = discovery_app();
+            app.panes[0].kind = PaneKind::Portfolio(Box::new(PortfolioPane::new(PortView::Summary)));
+            app.prefs.trading.account_mode =
+                if demo { crate::prefs::AccountMode::Demo } else { crate::prefs::AccountMode::Live };
+            app.broker.connecting_since = connecting.then(Instant::now);
+            app.broker.fetched = Some(Instant::now() - Duration::from_secs(age));
+            app.broker.portfolio = Some(Box::new(tr_broker::sample::portfolio()));
+            app.demo.pf = Box::new(tr_broker::sample::portfolio());
+            app.broker_periodic(&[0]);
+            if refresh {
+                assert!(matches!(requests.try_recv(), Ok(Request::Portfolio(_, _, Some(_)))));
+            }
+            assert!(matches!(requests.try_recv(), Ok(Request::Quotes(_))));
+            assert!(requests.try_recv().is_err());
+        }
+    }
+
+    #[test]
+    fn disconnect_cancels_inflight_connection_test_feedback() {
+        let mut app = super::super::tests::test_app();
+        let (worker, mut requests, responses) = crate::worker::Worker::test_channel_with_responses();
+        app.worker = worker;
+        app.broker.creds = Credentials {
+            client_id: "mock-client".into(),
+            consumer_key: "mock-key".into(),
+            user_id: "mock-user".into(),
+            user_secret: "mock-secret".into(),
+        };
+        let mut portfolio = tr_broker::sample::portfolio();
+        portfolio.simulated = false;
+        let id = portfolio.connections[0].id.clone();
+        app.broker.portfolio = Some(Box::new(portfolio));
+        app.broker.testing = true;
+        app.broker.message = None;
+        app.refresh_portfolio();
+        let Request::Portfolio(generation, request_id, _) = requests.try_recv().unwrap() else {
+            panic!("expected test portfolio request")
+        };
+        let old = app.broker.portfolio.clone().unwrap();
+        app.disconnect_brokerage(id.clone());
+        assert!(matches!(requests.try_recv().unwrap(), Request::BrokerDisconnect { .. }));
+        assert!(responses.send(crate::worker::Response::BrokerDisconnected(Ok(id))).is_ok());
+        app.drain();
+        let message = app.broker.message.clone();
+        assert!(message.as_ref().is_some_and(|(text, error)| text.contains("disconnected") && !error));
+        assert!(!app.broker.testing);
+        assert!(responses.send(crate::worker::Response::Portfolio(generation, request_id, Ok(old))).is_ok());
+        app.drain();
+        assert_eq!(app.broker.message, message);
+        app.refresh_portfolio();
+        let Request::Portfolio(generation, fresh_request_id, _) = requests.try_recv().unwrap() else {
+            panic!("expected fresh portfolio request")
+        };
+        assert!(fresh_request_id > request_id);
+        let fresh = app.broker.portfolio.clone().unwrap();
+        assert!(responses.send(crate::worker::Response::Portfolio(generation, fresh_request_id, Ok(fresh))).is_ok());
+        app.drain();
+        assert_eq!(app.broker.message, message);
+        assert!(!app.broker.testing);
+    }
+
+    #[test]
+    fn disconnect_rejects_pre_disconnect_portfolio() {
+        let mut app = super::super::tests::test_app();
+        let (worker, mut requests, responses) = crate::worker::Worker::test_channel_with_responses();
+        app.worker = worker;
+        app.broker.creds = Credentials {
+            client_id: "mock-client".into(),
+            consumer_key: "mock-key".into(),
+            user_id: "mock-user".into(),
+            user_secret: "mock-secret".into(),
+        };
+        let mut portfolio = tr_broker::sample::portfolio();
+        portfolio.simulated = false;
+        let id = portfolio.connections[0].id.clone();
+        assert!(portfolio.accounts_of(&id).next().is_some());
+        app.broker.portfolio = Some(Box::new(portfolio));
+        app.refresh_portfolio();
+        let Request::Portfolio(generation, request_id, _) = requests.try_recv().unwrap() else {
+            panic!("expected portfolio request")
+        };
+        let old = app.broker.portfolio.clone().unwrap();
+        app.disconnect_brokerage(id.clone());
+        assert!(matches!(requests.try_recv().unwrap(), Request::BrokerDisconnect { id: sent, .. } if sent == id));
+        assert!(responses.send(crate::worker::Response::BrokerDisconnected(Ok(id.clone()))).is_ok());
+        app.drain();
+        let pf = app.broker.portfolio.as_ref().unwrap();
+        assert!(!pf.connections.iter().any(|c| c.id == id));
+        assert!(pf.accounts_of(&id).next().is_none());
+        assert!(responses.send(crate::worker::Response::Portfolio(generation, request_id, Ok(old))).is_ok());
+        app.drain();
+        let pf = app.broker.portfolio.as_ref().unwrap();
+        assert!(!pf.connections.iter().any(|c| c.id == id));
+        assert!(pf.accounts_of(&id).next().is_none());
+        assert!(!app.broker.loading);
+        assert!(requests.try_recv().is_err());
+        app.refresh_portfolio();
+        assert!(matches!(requests.try_recv().unwrap(), Request::Portfolio(_, next, _) if next > request_id));
+        assert!(app.broker.loading);
+    }
+
+    #[test]
+    fn disconnect_prunes_already_applied_portfolio() {
+        let mut app = super::super::tests::test_app();
+        let (worker, mut requests, responses) = crate::worker::Worker::test_channel_with_responses();
+        app.worker = worker;
+        app.broker.creds = Credentials {
+            client_id: "mock-client".into(),
+            consumer_key: "mock-key".into(),
+            user_id: "mock-user".into(),
+            user_secret: "mock-secret".into(),
+        };
+        let mut portfolio = tr_broker::sample::portfolio();
+        portfolio.simulated = false;
+        let id = portfolio.connections[0].id.clone();
+        assert!(portfolio.accounts_of(&id).next().is_some());
+        app.broker.portfolio = Some(Box::new(portfolio));
+        app.refresh_portfolio();
+        let Request::Portfolio(generation, request_id, _) = requests.try_recv().unwrap() else {
+            panic!("expected portfolio request")
+        };
+        let mut old = app.broker.portfolio.clone().unwrap();
+        old.warnings = vec!["response applied".into()];
+        app.disconnect_brokerage(id.clone());
+        assert!(matches!(requests.try_recv().unwrap(), Request::BrokerDisconnect { .. }));
+        assert!(responses.send(crate::worker::Response::Portfolio(generation, request_id, Ok(old))).is_ok());
+        app.drain();
+        assert_eq!(app.broker.portfolio.as_ref().unwrap().warnings, ["response applied"]);
+        let fetched = app.broker.fetched;
+        assert!(responses.send(crate::worker::Response::BrokerDisconnected(Ok(id.clone()))).is_ok());
+        app.drain();
+        assert!(app.broker.portfolio_request_id > request_id);
+        assert!(!app.broker.loading);
+        assert_eq!(app.broker.fetched, fetched);
+        assert!(requests.try_recv().is_err());
+        let pf = app.broker.portfolio.as_ref().unwrap();
+        assert!(!pf.connections.iter().any(|c| c.id == id));
+        assert!(pf.accounts_of(&id).next().is_none());
+        assert!(pf.positions.iter().all(|p| pf.accounts.iter().any(|a| a.id == p.account_id)));
+    }
+
+    #[test]
+    fn disconnect_failure_accepts_inflight_portfolio() {
+        let mut app = super::super::tests::test_app();
+        let (worker, mut requests, responses) = crate::worker::Worker::test_channel_with_responses();
+        app.worker = worker;
+        app.broker.creds = Credentials {
+            client_id: "mock-client".into(),
+            consumer_key: "mock-key".into(),
+            user_id: "mock-user".into(),
+            user_secret: "mock-secret".into(),
+        };
+        let mut portfolio = tr_broker::sample::portfolio();
+        portfolio.simulated = false;
+        let id = portfolio.connections[0].id.clone();
+        assert!(portfolio.accounts_of(&id).next().is_some());
+        app.broker.portfolio = Some(Box::new(portfolio));
+        app.refresh_portfolio();
+        let Request::Portfolio(generation, request_id, _) = requests.try_recv().unwrap() else {
+            panic!("expected portfolio request")
+        };
+        let mut old = app.broker.portfolio.clone().unwrap();
+        old.warnings = vec!["response applied".into()];
+        app.disconnect_brokerage(id.clone());
+        assert!(matches!(requests.try_recv().unwrap(), Request::BrokerDisconnect { .. }));
+        let fetched = app.broker.fetched;
+        assert!(responses.send(crate::worker::Response::BrokerDisconnected(Err("mock failure".into()))).is_ok());
+        app.drain();
+        assert_eq!(app.broker.portfolio_request_id, request_id);
+        assert!(app.broker.loading);
+        assert_eq!(app.broker.fetched, fetched);
+        assert!(requests.try_recv().is_err());
+        assert!(responses.send(crate::worker::Response::Portfolio(generation, request_id, Ok(old))).is_ok());
+        app.drain();
+        let pf = app.broker.portfolio.as_ref().unwrap();
+        assert_eq!(pf.warnings, ["response applied"]);
+        assert!(pf.connections.iter().any(|c| c.id == id));
+        assert!(pf.accounts_of(&id).next().is_some());
+        assert!(!app.broker.loading);
+    }
+
+    #[test]
+    fn disconnect_rejects_portfolio_issued_while_pending() {
+        let mut app = super::super::tests::test_app();
+        let (worker, mut requests, responses) = crate::worker::Worker::test_channel_with_responses();
+        app.worker = worker;
+        app.broker.creds = Credentials {
+            client_id: "mock-client".into(),
+            consumer_key: "mock-key".into(),
+            user_id: "mock-user".into(),
+            user_secret: "mock-secret".into(),
+        };
+        let mut portfolio = tr_broker::sample::portfolio();
+        portfolio.simulated = false;
+        let id = portfolio.connections[0].id.clone();
+        assert!(portfolio.accounts_of(&id).next().is_some());
+        app.broker.portfolio = Some(Box::new(portfolio));
+        app.disconnect_brokerage(id.clone());
+        assert!(matches!(requests.try_recv().unwrap(), Request::BrokerDisconnect { .. }));
+        app.refresh_portfolio();
+        let Request::Portfolio(generation, request_id, _) = requests.try_recv().unwrap() else {
+            panic!("expected portfolio request")
+        };
+        let mut old = app.broker.portfolio.clone().unwrap();
+        old.warnings = vec!["response applied".into()];
+        let fetched = app.broker.fetched;
+        assert!(responses.send(crate::worker::Response::BrokerDisconnected(Ok(id.clone()))).is_ok());
+        app.drain();
+        assert!(app.broker.portfolio_request_id > request_id);
+        assert!(!app.broker.loading);
+        assert_eq!(app.broker.fetched, fetched);
+        assert!(requests.try_recv().is_err());
+        assert!(responses.send(crate::worker::Response::Portfolio(generation, request_id, Ok(old))).is_ok());
+        app.drain();
+        let pf = app.broker.portfolio.as_ref().unwrap();
+        assert!(!pf.connections.iter().any(|c| c.id == id));
+        assert!(pf.accounts_of(&id).next().is_none());
+        assert!(pf.positions.iter().all(|p| pf.accounts.iter().any(|a| a.id == p.account_id)));
+    }
+
+    #[test]
+    fn registration_saves_submitted_keys_after_form_edits() {
+        let mut app = super::super::tests::test_app();
+        let (worker, mut requests, responses) = crate::worker::Worker::test_channel_with_responses();
+        app.worker = worker;
+        let submitted = Credentials {
+            client_id: "client_a".into(),
+            consumer_key: "key_a".into(),
+            ..Default::default()
+        };
+        app.broker.form = submitted.clone();
+        app.register_snaptrade_user();
+        let Request::BrokerRegister { creds, .. } = requests.try_recv().unwrap() else {
+            panic!("expected registration request")
+        };
+        assert_eq!(creds, submitted);
+        app.broker.form.client_id = "client_b".into();
+        app.broker.form.consumer_key = "key_b".into();
+        assert!(
+            responses
+                .send(crate::worker::Response::BrokerRegistered(Ok(("user_a".into(), "secret_a".into()))))
+                .is_ok()
+        );
+        app.drain();
+
+        let expected = Credentials { user_id: "user_a".into(), user_secret: "secret_a".into(), ..submitted };
+        assert_eq!(app.broker.creds, expected);
+        assert_eq!(app.broker.saved, expected);
+        assert_eq!(app.broker.store.load().unwrap(), Some(expected));
+    }
+
+    #[test]
+    fn live_price_respects_portfolio_quote_provenance() {
+        use tr_core::Provenance;
+
+        let mut app = super::super::tests::test_app();
+        let mut portfolio = tr_broker::sample::portfolio();
+        portfolio.simulated = false;
+        let position = &mut portfolio.positions[0];
+        position.units = 1.0;
+        position.multiplier = 1.0;
+        position.price = Some(100.0);
+        let position = position.clone();
+        let key = position.market_key().unwrap();
+        app.broker.portfolio = Some(Box::new(portfolio));
+
+        for provenance in [Provenance::Sample, Provenance::Missing, Provenance::Real, Provenance::Cached] {
+            let quotes = std::collections::HashMap::from([(
+                key.clone(),
+                tr_data::Quote {
+                    provenance,
+                    symbol: key.clone(),
+                    last: 999.0,
+                    prev_close: 999.0,
+                    ts: 0,
+                    spark: Vec::new(),
+                    stats: Default::default(),
+                },
+            )]);
+            let expected = if provenance.is_verified() { Some(999.0) } else { None };
+            let live = app.broker.live_price(&quotes, &position);
+            assert_eq!(live, expected, "real portfolio with {provenance:?} quote");
+            assert_eq!(position.market_value_at(live), Some(expected.unwrap_or(100.0)));
+
+            app.broker.portfolio.as_mut().unwrap().simulated = true;
+            assert_eq!(app.broker.live_price(&quotes, &position), Some(999.0));
+            app.broker.portfolio.as_mut().unwrap().simulated = false;
+        }
+    }
+
+    // Worker channels record requests and deliver mock results without brokerage/network I/O.
+    #[test]
+    fn portfolio_ignores_late_same_credentials_success() {
+        let mut app = super::super::tests::test_app();
+        let (worker, mut requests, responses) = crate::worker::Worker::test_channel_with_responses();
+        app.worker = worker;
+        app.refresh_portfolio();
+        let Request::Portfolio(a_generation, a_request_id, _) = requests.try_recv().unwrap() else {
+            panic!("expected portfolio A")
+        };
+        app.refresh_portfolio();
+        let Request::Portfolio(b_generation, b_request_id, _) = requests.try_recv().unwrap() else {
+            panic!("expected portfolio B")
+        };
+        assert_eq!(a_generation, b_generation);
+        assert!(b_request_id > a_request_id);
+        let mut newer = tr_broker::sample::portfolio();
+        newer.warnings = vec!["new".into()];
+        assert!(
+            responses.send(crate::worker::Response::Portfolio(b_generation, b_request_id, Ok(Box::new(newer)))).is_ok()
+        );
+        app.drain();
+        assert!(!app.broker.loading);
+        let mut older = tr_broker::sample::portfolio();
+        older.warnings = vec!["old".into()];
+        assert!(
+            responses.send(crate::worker::Response::Portfolio(a_generation, a_request_id, Ok(Box::new(older)))).is_ok()
+        );
+        app.drain();
+        assert_eq!(app.broker.portfolio.as_ref().unwrap().warnings, ["new"]);
+        assert!(!app.broker.loading);
+        assert!(app.broker.error.is_none());
+    }
+
+    #[test]
+    fn portfolio_ignores_late_same_credentials_error() {
+        let mut app = super::super::tests::test_app();
+        let (worker, mut requests, responses) = crate::worker::Worker::test_channel_with_responses();
+        app.worker = worker;
+        app.refresh_portfolio();
+        let Request::Portfolio(a_generation, a_request_id, _) = requests.try_recv().unwrap() else {
+            panic!("expected portfolio A")
+        };
+        app.refresh_portfolio();
+        let Request::Portfolio(b_generation, b_request_id, _) = requests.try_recv().unwrap() else {
+            panic!("expected portfolio B")
+        };
+        assert_eq!(a_generation, b_generation);
+        assert!(b_request_id > a_request_id);
+        let mut newer = tr_broker::sample::portfolio();
+        newer.warnings = vec!["new".into()];
+        assert!(
+            responses.send(crate::worker::Response::Portfolio(b_generation, b_request_id, Ok(Box::new(newer)))).is_ok()
+        );
+        app.drain();
+        assert!(!app.broker.loading);
+        assert!(
+            responses
+                .send(crate::worker::Response::Portfolio(a_generation, a_request_id, Err("old error".into())))
+                .is_ok()
+        );
+        app.drain();
+        assert_eq!(app.broker.portfolio.as_ref().unwrap().warnings, ["new"]);
+        assert!(!app.broker.loading);
+        assert!(app.broker.error.is_none());
+    }
+
+    #[test]
+    fn portfolio_ignores_late_response_after_save() {
+        let mut app = super::super::tests::test_app();
+        let (worker, mut requests, responses) = crate::worker::Worker::test_channel_with_responses();
+        app.worker = worker;
+        app.refresh_portfolio();
+        let Request::Portfolio(a_generation, a_request_id, _) = requests.try_recv().unwrap() else {
+            panic!("expected portfolio A")
+        };
+        app.broker.form.client_id = "B".into();
+        app.broker.form.consumer_key = "mock-key".into();
+        app.save_broker_form("saved B");
+        app.refresh_portfolio();
+        let Request::Portfolio(b_generation, b_request_id, _) = requests.try_recv().unwrap() else {
+            panic!("expected portfolio B")
+        };
+        let mut b = tr_broker::sample::portfolio();
+        b.warnings = vec!["B".into()];
+        assert!(
+            responses.send(crate::worker::Response::Portfolio(b_generation, b_request_id, Ok(Box::new(b)))).is_ok()
+        );
+        app.drain();
+        assert_eq!(app.broker.portfolio.as_ref().unwrap().warnings, ["B"]);
+        // A subsequent current request is still loading when obsolete A completes.
+        app.refresh_portfolio();
+        app.broker.error = Some("current error".into());
+        app.broker.testing = true;
+        let message = app.broker.message.clone();
+        assert!(
+            responses
+                .send(crate::worker::Response::Portfolio(
+                    a_generation,
+                    a_request_id,
+                    Ok(Box::new(tr_broker::sample::portfolio()))
+                ))
+                .is_ok()
+        );
+        app.drain();
+        assert_eq!(app.broker.portfolio.as_ref().unwrap().warnings, ["B"]);
+        assert!(app.broker.loading);
+        assert_eq!(app.broker.error.as_deref(), Some("current error"));
+        assert!(
+            responses
+                .send(crate::worker::Response::Portfolio(a_generation, a_request_id, Err("old error".into())))
+                .is_ok()
+        );
+        app.drain();
+        assert!(app.broker.loading);
+        assert_eq!(app.broker.error.as_deref(), Some("current error"));
+        assert!(app.broker.testing);
+        assert_eq!(app.broker.message, message);
+    }
+
+    #[test]
+    fn portfolio_ignores_late_response_after_forget() {
+        let mut app = super::super::tests::test_app();
+        let (worker, mut requests, responses) = crate::worker::Worker::test_channel_with_responses();
+        app.worker = worker;
+        app.refresh_portfolio();
+        let Request::Portfolio(a_generation, a_request_id, _) = requests.try_recv().unwrap() else {
+            panic!("expected portfolio A")
+        };
+        app.forget_broker_credentials();
+        let loading = app.broker.loading;
+        assert!(
+            responses
+                .send(crate::worker::Response::Portfolio(
+                    a_generation,
+                    a_request_id,
+                    Ok(Box::new(tr_broker::sample::portfolio()))
+                ))
+                .is_ok()
+        );
+        app.drain();
+        assert!(app.broker.portfolio.is_none());
+        assert_eq!(app.broker.loading, loading);
+        assert!(app.broker.error.is_none());
+    }
 
     #[test]
     fn user_ids_are_unique_and_anonymous() {

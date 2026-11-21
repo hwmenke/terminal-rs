@@ -179,6 +179,7 @@ pub struct PanelDefaults {
     pub timeframe: Timeframe,
     pub show_volume: bool,
     pub congress_markers: bool,
+    pub news_markers: bool,
     pub book_depth: usize,
 }
 
@@ -189,6 +190,7 @@ impl Default for PanelDefaults {
             timeframe: Timeframe::D1,
             show_volume: true,
             congress_markers: true,
+            news_markers: true,
             book_depth: 20,
         }
     }
@@ -221,13 +223,22 @@ pub struct TradingPrefs {
 /// Every rebindable action.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub enum Action {
+    Vault,
     Help,
     Congress,
     Politicians,
     Alerts,
     Watchlist,
+    Desk,
+    Journal,
     Refresh,
     FrameTiming,
+    StudioPrevLens,
+    StudioNextLens,
+    StudioCloseInspector,
+    StudioUndo,
+    CanvasBrush,
+    CanvasStrip,
     Portfolio,
     Positions,
     Orders,
@@ -261,7 +272,12 @@ pub enum Action {
     DrawHorizontal,
     DrawVertical,
     DrawFib,
+    DrawAnchoredVwap,
+    ToggleTrendCone,
+    ToggleStopCloud,
+    ToggleAuctionMap,
     ResetView,
+    JumpLatest,
     LogScale,
     Magnet,
     Layout1,
@@ -276,14 +292,23 @@ pub enum Action {
 }
 
 impl Action {
-    pub const ALL: [Action; 52] = [
+    pub const ALL: [Action; 66] = [
+        Action::Vault,
         Action::Help,
         Action::Congress,
         Action::Politicians,
         Action::Alerts,
         Action::Watchlist,
+        Action::Desk,
+        Action::Journal,
         Action::Refresh,
         Action::FrameTiming,
+        Action::StudioPrevLens,
+        Action::StudioNextLens,
+        Action::StudioCloseInspector,
+        Action::StudioUndo,
+        Action::CanvasBrush,
+        Action::CanvasStrip,
         Action::Portfolio,
         Action::Positions,
         Action::Orders,
@@ -317,7 +342,12 @@ impl Action {
         Action::DrawHorizontal,
         Action::DrawVertical,
         Action::DrawFib,
+        Action::DrawAnchoredVwap,
+        Action::ToggleTrendCone,
+        Action::ToggleStopCloud,
+        Action::ToggleAuctionMap,
         Action::ResetView,
+        Action::JumpLatest,
         Action::LogScale,
         Action::Magnet,
         Action::Layout1,
@@ -338,8 +368,16 @@ impl Action {
             Action::Politicians => "Politicians".into(),
             Action::Alerts => "Alerts".into(),
             Action::Watchlist => "Watchlist".into(),
+            Action::Desk => "PM Desk".into(),
+            Action::Journal => "Trade journal".into(),
             Action::Refresh => "Refresh Congress filings".into(),
             Action::FrameTiming => "Frame timing readout".into(),
+            Action::StudioPrevLens => "Studio: previous lens (local)".into(),
+            Action::StudioNextLens => "Studio: next lens (local)".into(),
+            Action::StudioCloseInspector => "Studio: close inspector (local)".into(),
+            Action::CanvasBrush => "Canvas: toggle dedicated brush (Escape cancels)".into(),
+            Action::CanvasStrip => "Canvas: toggle distribution strip".into(),
+            Action::StudioUndo => "Studio: parameter undo (outside text editing)".into(),
             Action::Portfolio => "Brokerage portfolio".into(),
             Action::Positions => "Brokerage positions".into(),
             Action::Orders => "Brokerage orders".into(),
@@ -374,7 +412,13 @@ impl Action {
             Action::DrawHorizontal => "Draw horizontal line".into(),
             Action::DrawVertical => "Draw vertical line".into(),
             Action::DrawFib => "Draw Fibonacci retracement".into(),
+            Action::Vault => "Open Bar Vault".into(),
+            Action::ToggleAuctionMap => "Toggle Auction Map".into(),
+            Action::ToggleStopCloud => "Toggle Stop Cloud".into(),
+            Action::ToggleTrendCone => "Toggle Trend Cone".into(),
+            Action::DrawAnchoredVwap => "Anchor VWAP on a clicked bar".into(),
             Action::ResetView => "Reset chart view".into(),
+            Action::JumpLatest => "Jump to the latest candle".into(),
             Action::LogScale => "Toggle log scale".into(),
             Action::Magnet => "Toggle magnet".into(),
             a => format!("Switch to layout {}", a.layout_slot().unwrap_or(0) + 1),
@@ -386,6 +430,8 @@ impl Action {
         use Action as A;
         match self {
             a if a.panel_spec().is_some() => "New panels",
+            A::CanvasBrush | A::CanvasStrip => "Workspace",
+            A::StudioPrevLens | A::StudioNextLens | A::StudioCloseInspector | A::StudioUndo => "Workspace",
             A::NextPane
             | A::PrevPane
             | A::ToggleSidebar
@@ -403,7 +449,12 @@ impl Action {
             | A::DrawHorizontal
             | A::DrawVertical
             | A::DrawFib
+            | A::ToggleAuctionMap
+            | A::ToggleStopCloud
+            | A::ToggleTrendCone
+            | A::DrawAnchoredVwap
             | A::ResetView
+            | A::JumpLatest
             | A::LogScale
             | A::Magnet => "Chart",
             A::Buy | A::Sell => "Trading",
@@ -577,8 +628,16 @@ impl Default for Keymap {
         bind(Action::Politicians, "F3");
         bind(Action::Alerts, "F4");
         bind(Action::Watchlist, "F5");
+        bind(Action::Desk, "F10");
+        bind(Action::Journal, "F11");
         bind(Action::Refresh, "F6");
         bind(Action::FrameTiming, "F12");
+        bind(Action::StudioPrevLens, "Alt+ArrowLeft");
+        bind(Action::StudioNextLens, "Alt+ArrowRight");
+        bind(Action::StudioCloseInspector, "Escape");
+        bind(Action::StudioUndo, "Ctrl+Z");
+        bind(Action::CanvasBrush, "Alt+Shift+B");
+        bind(Action::CanvasStrip, "Alt+Shift+D");
         bind(Action::Portfolio, "F7");
         bind(Action::Positions, "F8");
         bind(Action::Orders, "F9");
@@ -595,13 +654,19 @@ impl Default for Keymap {
         bind(Action::PopOut, "Cmd+Shift+P");
         bind(Action::SaveLayout, "Cmd+S");
         bind(Action::Settings, "Cmd+Comma");
-        // ⌘K on macOS, Ctrl+K elsewhere (`Cmd` is the platform command key).
-        bind(Action::CommandPalette, "Cmd+K");
+        // Ctrl+K focuses the toolbar; Shift keeps the full palette available everywhere.
+        bind(Action::CommandPalette, "Cmd+Shift+K");
         bind(Action::DrawTrendline, "Alt+T");
         bind(Action::DrawHorizontal, "Alt+H");
         bind(Action::DrawVertical, "Alt+V");
         bind(Action::DrawFib, "Alt+F");
+        bind(Action::DrawAnchoredVwap, "Alt+A");
+        bind(Action::ToggleStopCloud, "Alt+S");
+        bind(Action::ToggleTrendCone, "Alt+C");
+        bind(Action::ToggleAuctionMap, "Alt+P");
+        bind(Action::Vault, "Alt+B");
         bind(Action::ResetView, "Alt+R");
+        bind(Action::JumpLatest, "End");
         bind(Action::LogScale, "Alt+L");
         bind(Action::Magnet, "Alt+M");
         // ⌘1…⌘9, ⌘0 open panels; ⌥1…⌥9 switch saved layouts.
@@ -656,6 +721,7 @@ pub const PREFS_VERSION: u32 = 3;
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Prefs {
+    pub whats_news: tr_data::whats_news::Config,
     /// File format revision, for migrating defaults (absent in v1 files, hence 0).
     #[serde(default)]
     pub version: u32,
@@ -672,6 +738,7 @@ pub struct Prefs {
 impl Default for Prefs {
     fn default() -> Self {
         Self {
+            whats_news: Default::default(),
             version: PREFS_VERSION,
             appearance: Appearance::default(),
             hotkeys: Keymap::default(),
@@ -765,6 +832,23 @@ mod tests {
     use super::*;
 
     #[test]
+    fn alt_s_is_unique() {
+        let keys = Keymap::default();
+        assert_eq!(keys.0.get(&Action::ToggleStopCloud).unwrap(), "Alt+S");
+        let chord = Chord::parse("Alt+S").unwrap();
+        assert_eq!(Action::ToggleStopCloud.category(), "Chart");
+        assert_eq!(keys.action_for(egui::Key::S, egui::Modifiers::ALT), Some(Action::ToggleStopCloud));
+        assert_eq!(keys.0.values().filter(|k| Chord::parse(k) == Some(chord)).count(), 1);
+        let restored = Keymap(BTreeMap::new()).with_defaults();
+        assert_eq!(restored.0.get(&Action::ToggleStopCloud).unwrap(), "Alt+S");
+    }
+    #[test]
+    fn alt_b_opens_vault_and_action_registry_is_complete() {
+        let keys = Keymap::default();
+        assert_eq!(Action::ALL.len(), 66);
+        assert_eq!(keys.0.get(&Action::Vault), Some(&"Alt+B".to_string()));
+    }
+    #[test]
     fn chords_parse_and_round_trip() {
         let c = Chord::parse("Alt+T").unwrap();
         assert_eq!(c, Chord { key: Key::T, alt: true, shift: false, ctrl: false, command: false });
@@ -792,7 +876,7 @@ mod tests {
         assert_eq!(k.action_for(Key::Num1, Modifiers::COMMAND), Some(Action::NewChart));
         assert_eq!(k.action_for(Key::Num0, Modifiers::COMMAND), Some(Action::NewSearch));
         assert_eq!(k.action_for(Key::Num3, Modifiers::ALT), Some(Action::Layout3));
-        assert_eq!(k.action_for(Key::K, Modifiers::COMMAND), Some(Action::CommandPalette));
+        assert_eq!(k.action_for(Key::K, Modifiers::COMMAND | Modifiers::SHIFT), Some(Action::CommandPalette));
         // Every action has a default binding, and no two share one.
         let chords: Vec<Chord> = Action::ALL.iter().filter_map(|a| k.chord(*a)).collect();
         assert_eq!(chords.len(), Action::ALL.len());
@@ -893,5 +977,50 @@ mod tests {
         // Legacy fields are no longer written.
         let json = serde_json::to_string(&p).unwrap();
         assert!(!json.contains("font_scale") && json.contains("\"theme\":\"My Theme\""), "{json}");
+    }
+    #[test]
+    fn whats_news_config_persists_in_prefs_and_old_files_get_defaults() {
+        let dir = std::env::temp_dir().join(format!("terminal-rs-whats-news-prefs-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("prefs.json");
+        let mut prefs = Prefs::default();
+        prefs.whats_news = tr_data::whats_news::Config {
+            archive_path: "/archive/real prices.db".into(),
+            http_url: "http://localhost:8051".into(),
+            prefer_http: false,
+            enabled: true,
+        };
+        prefs.save(&path).unwrap();
+        assert_eq!(Prefs::load(&path).whats_news, prefs.whats_news);
+        prefs.whats_news.http_url.clear();
+        prefs.whats_news.archive_path.clear();
+        prefs.whats_news.enabled = false;
+        prefs.save(&path).unwrap();
+        assert_eq!(Prefs::load(&path).whats_news, prefs.whats_news);
+        let old: Prefs = serde_json::from_str("{}").unwrap();
+        assert_eq!(old.whats_news, tr_data::whats_news::Config::default());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn cone_hotkey_is_unique_and_chart_scoped() {
+        let keys = Keymap::default();
+        let cone = keys.0.get(&Action::ToggleTrendCone).unwrap();
+        assert_eq!(Chord::parse(cone), Chord::parse("Alt+C"));
+        assert_eq!(keys.0.values().filter(|key| *key == cone).count(), 1);
+        assert_eq!(Action::ToggleTrendCone.category(), "Chart");
+    }
+}
+
+#[cfg(test)]
+mod auction_tests {
+    use super::*;
+    #[test]
+    fn alt_p_is_unique_and_chart_scoped() {
+        let keys = Keymap::default();
+        let key = keys.0.get(&Action::ToggleAuctionMap).unwrap();
+        assert_eq!(Chord::parse(key), Chord::parse("Alt+P"));
+        assert_eq!(keys.0.values().filter(|k| *k == key).count(), 1);
+        assert_eq!(Action::ToggleAuctionMap.category(), "Chart");
     }
 }

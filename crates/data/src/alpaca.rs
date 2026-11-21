@@ -21,6 +21,9 @@ pub struct AlpacaProvider {
 }
 
 impl AlpacaProvider {
+    pub fn feed(&self) -> &str {
+        &self.feed
+    }
     pub fn new(key: String, secret: String, feed: String) -> Result<Self> {
         let client = reqwest::Client::builder().timeout(Duration::from_secs(20)).build()?;
         Ok(Self { client, key, secret, feed })
@@ -61,8 +64,12 @@ struct RawBar {
 /// Parse one page of `/v2/stocks/{symbol}/bars`.
 pub fn parse_bars_page(json: &str) -> Result<(Vec<Bar>, Option<String>)> {
     let page: BarsPage = serde_json::from_str(json).context("parsing Alpaca bars")?;
-    let bars =
-        page.bars.unwrap_or_default().into_iter().map(|b| Bar::new(b.t.timestamp(), b.o, b.h, b.l, b.c, b.v)).collect();
+    let bars = page
+        .bars
+        .unwrap_or_default()
+        .into_iter()
+        .map(|b| Bar::new(b.t.timestamp(), b.o, b.h, b.l, b.c, b.v).with_provenance(tr_core::Provenance::Real))
+        .collect();
     Ok((bars, page.next_page_token.filter(|t| !t.is_empty())))
 }
 
@@ -113,6 +120,10 @@ impl MarketData for AlpacaProvider {
         }
         out.sort_by_key(|b| b.ts);
         out.dedup_by_key(|b| b.ts);
+        // Alpaca bars are US stocks. Keep regular-session prints and do not resample them.
+        if matches!(tf, Timeframe::M1 | Timeframe::M5 | Timeframe::M15 | Timeframe::M30 | Timeframe::H1) {
+            out = crate::intraday::regular_only(out);
+        }
         Ok(crate::clip(out, end, limit))
     }
 }

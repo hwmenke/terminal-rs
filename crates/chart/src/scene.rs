@@ -63,7 +63,7 @@ impl SeriesGpu {
     pub fn build(bars: &[Bar]) -> Self {
         let closes: Vec<f64> = bars.iter().map(|b| b.close).collect();
         Self {
-            bars: SeriesRef { key: next_key(), version: 1, pyramid: Arc::new(BarPyramid::build(bars)) },
+            bars: SeriesRef { key: next_key(), version: 1, pyramid: Arc::new(BarPyramid::build(bars)), tint: None },
             closes: line_ref(&closes),
         }
     }

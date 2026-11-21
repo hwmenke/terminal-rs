@@ -23,10 +23,12 @@ Tests for the parsers and indicators, frame-time benchmarks, and a README noting
 ## Progress
 - [x] Command line, docking workspace (splits, tabs, drag and drop, pop-outs), saved layouts, link groups, rebindable hotkeys.
 - [x] wgpu charts: candles/bars/line/area, 1m–1M, SMA/EMA/VWAP/RSI/MACD/Bollinger, drawings, compare, log scale.
-- [x] Indicator library: 151 studies across moving averages, bands, momentum, trend, volatility, volume, statistics and pivots, from one registry driving the command line, `IND` picker, chart menu, help, panes/levels and saved layouts.
+- [x] Indicator library: 152 studies across moving averages, bands, momentum, trend, volatility, volume, statistics and pivots, from one registry driving the command line, `IND` picker, chart menu, help, panes/levels and saved layouts.
 - [x] Pluggable data providers (Yahoo, Binance/Coinbase, sample mode); multi-asset (equities, FX, crypto, rates, commodities, indices).
 - [x] Congress ingest from Senate eFD and House Clerk (PDF/XML), feed, politician profiles, per-ticker panel, chart markers with hover card, tracking alerts, freshness indicator.
 - [x] Native macOS look (unified toolbar, vibrancy sidebar on either side, SF fonts), options chains (OMON) with greeks.
 - [x] Theme system: built-in themes (Terminal Dark/Light, Bloomberg, High Contrast, Solarized, Nord, Monokai), live editor in Settings, custom themes as TOML files with TOML/JSON import/export, `THEME` command, ⌘⌥T cycling, optional theme per layout.
 - [x] Brokerage accounts through SnapTrade (read-only): setup screen, Keychain credential storage, Connection Portal, `PORT`/`ACCT`/`POS`/`ORD`/`ACTV` panes with live-repriced P&L.
 - [x] Tests for parsers, indicators, layouts, prefs, themes and the SnapTrade client; frame-time benchmarks; README.
+- [x] Paper strategy backtests vs buy-and-hold (`BACKTEST`) with costs, next-open fills, chronological holdout and completed-trade metrics. Sample bars refused.
+- [x] Historical lookalikes (`LOOKALIKE` / `KNN`) on verified archive bars: standardized Euclidean neighbors, incomplete horizons labelled, overlapping neighbors reduced, per-horizon counts before frequencies, chart jump to neighbor dates. Sample bars refused.

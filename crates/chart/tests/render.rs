@@ -200,3 +200,53 @@ fn zoomed_out_steps_stay_inside_their_group() {
     assert!(lit(790, 791) > 0, "the new session draws on its own bar");
     assert_eq!(lit(0, 790), 0, "and not over the previous session");
 }
+
+/// Reuse the same pane while series length, price level, class and chart type change.
+/// Exercises actual buffer uploads/bindings; the UI event harness lives in the app.
+#[test]
+fn switching_instruments_handles_empty_short_and_changed_series() {
+    let Some(mut h) = Headless::new(800, 400) else {
+        eprintln!("no wgpu adapter; skipping GPU switching test");
+        return;
+    };
+    for (i, input) in [
+        "SPY",
+        "AAPL US Equity",
+        "SPX Index",
+        "BTC",
+        "BTCUSD Curncy",
+        "USDBRL CURNCY",
+        "BRL=X",
+        "EURUSD Curncy",
+        "US10Y Govt",
+        "CL1 Comdty",
+        "???",
+        "",
+        "ação",
+        &"A".repeat(100_000),
+    ]
+    .iter()
+    .enumerate()
+    {
+        let Some(sec) = tr_core::Security::parse(input) else { continue };
+        for n in [0, 1, 2, 300] {
+            let bars = sample::for_security(&sec, Timeframe::D1, n, 1_790_000_000);
+            let series = SeriesGpu::build(&bars);
+            let viewport = Viewport::fit_last(n, 160, 800.0);
+            for chart_type in ChartType::ALL {
+                let out = price_pane(&PricePane {
+                    series: &series,
+                    chart_type,
+                    show_volume: true,
+                    overlays: &[],
+                    viewport: &viewport,
+                    height_px: 400.0,
+                    log: i % 2 == 0,
+                    manual_scale: None,
+                    style: Style::default(),
+                });
+                h.render(&mut [Frame { pane: 1, frame_no: 0, cmds: out.cmds }]);
+            }
+        }
+    }
+}

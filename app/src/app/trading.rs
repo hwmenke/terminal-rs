@@ -31,6 +31,7 @@ use tr_broker::trading::{
     self, Amount, Capability, OrderPreview, OrderRequest, OrderType, PlaceError, Side, TimeInForce,
 };
 use tr_broker::{Account, InstrumentKind, Order, demo};
+use tr_data::whats_news::{HandoffBlock, PlanContext};
 
 use super::TerminalApp;
 use super::broker::{BrokerMode, open_external};
@@ -80,6 +81,17 @@ pub struct Ticket {
     pub error: Option<String>,
     /// Result of the last placement.
     pub done: Option<String>,
+    /// Desk risk-plan snapshot for this symbol. Planning context only — not an order.
+    plan: Option<AttachedPlan>,
+}
+
+/// Immutable plan copied onto the ticket when Desk opens it.
+/// Cleared when the ticket symbol is no longer the one the plan was reviewed for.
+#[derive(Debug, Clone, PartialEq)]
+struct AttachedPlan {
+    /// Broker ticker (`AAPL`), matched against [`Ticket::symbol`].
+    symbol: String,
+    context: PlanContext,
 }
 
 fn parse_num(s: &str) -> Option<f64> {
@@ -115,6 +127,7 @@ impl Ticket {
             placing: false,
             error: None,
             done: None,
+            plan: None,
         }
     }
 
@@ -155,6 +168,21 @@ impl Ticket {
         self.review = false;
         self.error = None;
         self.done = None;
+        self.clear_stale_plan();
+    }
+
+    /// Drop planning context once the ticket is for a different symbol.
+    /// Quantity, side, and order type edits keep the snapshot: it is not the order.
+    fn clear_stale_plan(&mut self) {
+        let current = self.symbol.trim();
+        if self.plan.as_ref().is_some_and(|p| !p.symbol.eq_ignore_ascii_case(current)) {
+            self.plan = None;
+        }
+    }
+
+    /// Planning context for the current symbol, when Desk attached one.
+    pub(super) fn plan_context(&self) -> Option<&PlanContext> {
+        self.plan.as_ref().map(|p| &p.context)
     }
 
     /// The order the ticket describes, or why it is incomplete.
@@ -490,6 +518,50 @@ impl TerminalApp {
         }
     }
 
+    /// Open a market ticket from a reviewed long plan.
+    ///
+    /// The quantity is the plan's whole-share count. Entry, stop, target, and dollar risk
+    /// are attached as planning context and are not copied into the order's stop or limit.
+    pub(super) fn open_plan_ticket(&mut self, symbol: &str, context: PlanContext) {
+        if context.quantity == 0 {
+            self.status = HandoffBlock::ZeroShares.explain().into();
+            return;
+        }
+        if !context.entry.is_finite()
+            || context.entry <= 0.0
+            || !context.stop.is_finite()
+            || context.stop <= 0.0
+            || context.stop >= context.entry
+            || !context.dollar_risk.is_finite()
+            || context.dollar_risk <= 0.0
+            || context.target.is_some_and(|t| !t.is_finite() || t <= context.entry)
+        {
+            self.status = HandoffBlock::InvalidPlan.explain().into();
+            return;
+        }
+        self.open_ticket(
+            TradeArgs {
+                buy: Some(true),
+                symbol: Some(symbol.to_string()),
+                units: Some(context.quantity as f64),
+                ..Default::default()
+            },
+            None,
+        );
+        let Some(ticket) = self.trading.ticket.as_mut() else { return };
+        // A market buy of the planned shares. Stop and target stay off the order.
+        ticket.side = Side::Buy;
+        ticket.dollars = false;
+        ticket.all = false;
+        ticket.order_type = OrderType::Market;
+        ticket.limit.clear();
+        ticket.stop.clear();
+        ticket.advanced = false;
+        ticket.qty = fmt_input(context.quantity as f64);
+        ticket.plan = Some(AttachedPlan { symbol: ticket.symbol.clone(), context });
+        ticket.clear_stale_plan();
+    }
+
     /// Keep a `SELL ALL` ticket's quantity equal to the chosen account's whole position. Any
     /// manual edit of the quantity, or switching to Buy, ends it.
     fn sync_sell_all(&mut self) {
@@ -549,6 +621,26 @@ impl TerminalApp {
         self.quotes.get(&t.market_key()?).map(|q| q.last).filter(|x| x.is_finite() && *x > 0.0)
     }
 
+    /// The intraday clock's verdict on a stored quote. Sample quotes are not judged.
+    pub(super) fn market_print_block(&self, market_key: &str) -> Option<tr_data::intraday::MarketBlock> {
+        let q = self.quotes.get(market_key)?;
+        tr_data::intraday::market_order_block(
+            tr_data::security(market_key).class,
+            q.provenance,
+            q.ts,
+            chrono::Utc::now().timestamp(),
+        )
+    }
+
+    /// A market order needs a current verified print. Limit and stop orders keep the user's price.
+    fn refuse_market_order(&self, t: &Ticket) -> Option<String> {
+        if t.order_type != OrderType::Market {
+            return None;
+        }
+        let key = t.market_key()?;
+        self.market_print_block(&key).map(|block| block.explain().to_string())
+    }
+
     /// Keep the ticket's quote fresh and its expiry countdown ticking.
     pub(super) fn trading_periodic(&mut self, ctx: &egui::Context) {
         self.demo_periodic();
@@ -590,6 +682,9 @@ impl TerminalApp {
         }
         self.trading.last_submit = Some(Instant::now());
         let Some(t) = self.trading.ticket.as_ref() else { return };
+        if let Some(reason) = self.refuse_market_order(t) {
+            return self.ticket_error(reason);
+        }
         let quote = self.ticket_quote(t);
         let req = match t.request() {
             Ok(r) => r,
@@ -693,8 +788,12 @@ impl TerminalApp {
 
     /// The user confirmed: send the previewed order. Every precondition is checked again.
     fn ticket_place(&mut self) {
-        let Some(t) = self.trading.ticket.as_mut() else { return };
-        t.confirming = false;
+        if let Some(t) = self.trading.ticket.as_mut() {
+            t.confirming = false;
+        }
+        if let Some(reason) = self.trading.ticket.as_ref().and_then(|t| self.refuse_market_order(t)) {
+            return self.ticket_error(reason);
+        }
         let Some(t) = self.trading.ticket.as_ref() else { return };
         let quote = self.ticket_quote(t);
         let preview = match t.current_preview() {
@@ -969,6 +1068,8 @@ impl TerminalApp {
         let accounts = self.trade_accounts();
         let pf_loading = !demo_mode && self.broker.loading && self.broker.portfolio.is_none();
         let quote = self.trading.ticket.as_ref().and_then(|t| self.ticket_quote(t));
+        let print_block =
+            self.trading.ticket.as_ref().and_then(|t| t.market_key()).and_then(|k| self.market_print_block(&k));
         let change = self
             .trading
             .ticket
@@ -1110,11 +1211,19 @@ impl TerminalApp {
             );
             if r.changed() {
                 t.symbol = t.symbol.to_ascii_uppercase();
+                t.clear_stale_plan();
             }
             enter |= r.lost_focus() && fresh_enter(ui);
             match quote {
                 Some(q) => {
                     ui.label(RichText::new(price(q)).font(mono(12.5)).color(text()));
+                    if let Some(block) = print_block {
+                        let color = match block {
+                            tr_data::intraday::MarketBlock::Closed => amber(),
+                            tr_data::intraday::MarketBlock::Stale { .. } => theme::down(),
+                        };
+                        ui.label(RichText::new(block.badge()).font(mono(11.0)).color(color));
+                    }
                     if let Some(c) = change {
                         let col = if c >= 0.0 { theme::up() } else { theme::down() };
                         ui.label(RichText::new(format!("{c:+.2}%")).font(mono(11.5)).color(col));
@@ -1347,6 +1456,11 @@ impl TerminalApp {
                 }
             }
         }
+        if ready.as_ref().is_ok_and(|r| r.order_type == OrderType::Market)
+            && let Some(block) = print_block
+        {
+            problem = Some(block.explain().to_string());
+        }
         if let Some(p) = &problem {
             ui.label(RichText::new(p).font(ui_font(11.5)).color(amber()));
         }
@@ -1362,6 +1476,10 @@ impl TerminalApp {
         }
         if let Some(d) = &t.done {
             ui.label(RichText::new(d).font(ui_font(12.0)).color(theme::up()));
+        }
+
+        if let Some(plan) = t.plan_context() {
+            show_plan_context(ui, plan);
         }
 
         // The one button.
@@ -1424,7 +1542,11 @@ impl TerminalApp {
     }
 
     fn confirm_dialog(&mut self, ctx: &egui::Context) {
+        if let Some(t) = self.trading.ticket.as_mut() {
+            t.clear_stale_plan();
+        }
         let Some(t) = self.trading.ticket.as_ref() else { return };
+        let plan_note = t.plan_context().map(plan_review_text);
         let Some(p) = t.current_preview().cloned() else {
             if let Some(t) = self.trading.ticket.as_mut() {
                 t.confirming = false;
@@ -1490,6 +1612,10 @@ impl TerminalApp {
                     row(ui, "Cash after", RichText::new(money(c, &p.currency)).font(mono(12.5)).color(text()));
                 }
             });
+            if let Some(note) = &plan_note {
+                ui.add_space(dp(6.0));
+                ui.label(RichText::new(note).font(ui_font(11.5)).color(amber()));
+            }
             ui.add_space(dp(6.0));
             let warn = if p.simulated {
                 "Simulated: the order is recorded in the sample portfolio only.".to_string()
@@ -1981,6 +2107,22 @@ enum TicketAct {
     Mode(AccountMode),
 }
 
+/// One line for the ticket and the confirmation. Prices here are the reviewed plan, not the order.
+pub(super) fn plan_review_text(plan: &PlanContext) -> String {
+    let target = plan.target.map(price).unwrap_or_else(|| "none".into());
+    format!(
+        "Planning context only — not a submitted order and not a bracket: entry {} · stop {} · target {target} · risk budget {}.",
+        price(plan.entry),
+        price(plan.stop),
+        money(plan.dollar_risk, "USD"),
+    )
+}
+
+fn show_plan_context(ui: &mut Ui, plan: &PlanContext) {
+    ui.add_space(dp(4.0));
+    ui.label(RichText::new(plan_review_text(plan)).font(ui_font(11.5)).color(amber()));
+}
+
 /// Enter was pressed this frame (not an auto-repeat of a held key).
 fn fresh_enter(ui: &Ui) -> bool {
     ui.input(|i| {
@@ -2022,6 +2164,7 @@ fn account_line(a: &Account) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::app::tests::test_app;
 
     fn ticket() -> Ticket {
         let mut t = Ticket::new(1);
@@ -2119,5 +2262,290 @@ mod tests {
         let c = CapsCache { fetched: Some(chrono::Utc::now()), caps };
         let back: CapsCache = serde_json::from_slice(&serde_json::to_vec(&c).unwrap()).unwrap();
         assert_eq!(back, c);
+    }
+
+    fn reviewed_plan() -> PlanContext {
+        PlanContext { entry: 100.0, stop: 95.0, target: Some(110.0), dollar_risk: 250.0, quantity: 50 }
+    }
+
+    #[test]
+    fn plan_review_names_the_planning_prices_and_not_an_order() {
+        let note = plan_review_text(&reviewed_plan());
+        assert!(note.contains("entry 100.00"));
+        assert!(note.contains("stop 95.00"));
+        assert!(note.contains("target 110.00"));
+        assert!(note.contains("risk budget $250.00"));
+        assert!(note.contains("not a submitted order"));
+        assert!(note.contains("not a bracket"));
+        assert!(!note.contains("BUY"), "the note is context, not an order command");
+        let mut no_target = reviewed_plan();
+        no_target.target = None;
+        assert!(plan_review_text(&no_target).contains("target none"));
+    }
+
+    #[test]
+    fn plan_context_stays_until_the_ticket_symbol_changes() {
+        let mut app = test_app();
+        app.open_plan_ticket("AAPL US Equity", reviewed_plan());
+        let ticket = app.trading.ticket.as_ref().unwrap();
+        assert_eq!(ticket.plan_context().map(|p| p.quantity), Some(50));
+        assert!(ticket.stop.is_empty());
+        assert!(ticket.limit.is_empty());
+
+        // Editing the quantity or the side keeps the reviewed plan. It is not the order.
+        let ticket = app.trading.ticket.as_mut().unwrap();
+        ticket.qty = "7".into();
+        ticket.side = Side::Sell;
+        ticket.clear_stale_plan();
+        assert_eq!(ticket.plan_context().unwrap().quantity, 50);
+        assert_eq!(ticket.qty, "7");
+        assert_eq!(ticket.side, Side::Sell);
+        assert!(ticket.stop.is_empty() && ticket.limit.is_empty());
+
+        // A later ticket for the same symbol keeps the snapshot.
+        app.open_ticket(
+            TradeArgs {
+                buy: Some(true),
+                symbol: Some("AAPL US Equity".into()),
+                units: Some(4.0),
+                ..Default::default()
+            },
+            None,
+        );
+        let ticket = app.trading.ticket.as_ref().unwrap();
+        assert_eq!(ticket.symbol, "AAPL");
+        assert_eq!(ticket.qty, "4");
+        assert_eq!(ticket.plan_context().map(|p| p.entry), Some(100.0));
+        assert!(ticket.stop.is_empty());
+
+        // Reusing the ticket for another symbol drops the stale plan.
+        app.open_ticket(
+            TradeArgs {
+                buy: Some(true),
+                symbol: Some("MSFT US Equity".into()),
+                units: Some(3.0),
+                ..Default::default()
+            },
+            None,
+        );
+        let ticket = app.trading.ticket.as_ref().unwrap();
+        assert_eq!(ticket.symbol, "MSFT");
+        assert_eq!(ticket.qty, "3");
+        assert!(ticket.plan_context().is_none());
+
+        app.open_plan_ticket("NVDA US Equity", reviewed_plan());
+        let ticket = app.trading.ticket.as_mut().unwrap();
+        assert_eq!(ticket.symbol, "NVDA");
+        assert!(ticket.plan_context().is_some());
+        ticket.symbol = "AMD".into();
+        ticket.clear_stale_plan();
+        assert!(ticket.plan_context().is_none());
+    }
+
+    fn aapl_quote(ts: i64, last: f64, provenance: tr_data::Provenance) -> tr_data::Quote {
+        tr_data::Quote {
+            provenance,
+            symbol: "AAPL US Equity".into(),
+            last,
+            prev_close: last,
+            ts,
+            spark: vec![],
+            stats: tr_data::QuoteStats::default(),
+        }
+    }
+
+    fn buy_one(app: &mut crate::app::TerminalApp) {
+        app.open_ticket(
+            TradeArgs { buy: Some(true), symbol: Some("AAPL".into()), units: Some(1.0), ..Default::default() },
+            None,
+        );
+    }
+
+    #[test]
+    fn stale_verified_market_order_does_not_fill_and_a_limit_still_rests() {
+        let mut app = test_app();
+        app.quotes.insert("AAPL US Equity".into(), aapl_quote(1_700_000_000, 50.0, tr_data::Provenance::Real));
+        buy_one(&mut app);
+        app.ticket_submit();
+        let ticket = app.trading.ticket.as_ref().unwrap();
+        assert_eq!(ticket.error.as_deref(), Some(tr_data::intraday::MarketBlock::Stale { lag_secs: 1 }.explain()));
+        assert!(ticket.done.is_none());
+        assert_eq!(app.demo.book.held("AAPL"), 0.0);
+
+        let ctx = egui::Context::default();
+        let mut output = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(900.0, 700.0))),
+                ..Default::default()
+            },
+            |ui| {
+                let _ = app.ticket_ui(ui);
+            },
+        );
+        output.textures_delta.clear();
+        let mut text = String::new();
+        for clipped in &output.shapes {
+            walk_text(&clipped.shape, &mut text);
+        }
+        assert!(text.contains("STALE"), "{text}");
+        assert!(text.contains("last print is stale"), "{text}");
+
+        app.trading.last_submit = None;
+        app.open_ticket(
+            TradeArgs {
+                buy: Some(true),
+                symbol: Some("AAPL".into()),
+                units: Some(1.0),
+                limit: Some(1.0),
+                ..Default::default()
+            },
+            None,
+        );
+        app.ticket_submit();
+        let ticket = app.trading.ticket.as_ref().unwrap();
+        assert!(ticket.error.is_none(), "{:?}", ticket.error);
+        let done = ticket.done.as_deref().unwrap();
+        assert!(done.contains("working"), "{done}");
+        assert_eq!(app.demo.book.held("AAPL"), 0.0, "a resting limit is not a fill at the stale print");
+    }
+
+    fn walk_text(shape: &egui::Shape, out: &mut String) {
+        match shape {
+            egui::Shape::Text(t) => {
+                out.push_str(&t.galley.job.text);
+                out.push('\n');
+            }
+            egui::Shape::Vec(v) => v.iter().for_each(|s| walk_text(s, out)),
+            _ => {}
+        }
+    }
+
+    #[test]
+    fn sample_quotes_and_a_current_print_still_fill_market_orders() {
+        let mut sample = test_app();
+        sample.quotes.insert("AAPL US Equity".into(), aapl_quote(1_700_000_000, 40.0, tr_data::Provenance::Sample));
+        buy_one(&mut sample);
+        sample.ticket_submit();
+        assert!(sample.trading.ticket.as_ref().unwrap().error.is_none());
+        assert_eq!(sample.demo.book.held("AAPL"), 1.0, "sample quotes stay on the existing demo path");
+
+        let mut app = test_app();
+        let now = chrono::Utc::now().timestamp();
+        let ts = tr_data::intraday::regular_bucket(tr_core::Timeframe::M1, now).unwrap_or(now);
+        app.quotes.insert("AAPL US Equity".into(), aapl_quote(ts, 30.0, tr_data::Provenance::Real));
+        buy_one(&mut app);
+        app.ticket_submit();
+        let ticket = app.trading.ticket.as_ref().unwrap();
+        match tr_data::intraday::market_order_block(tr_core::AssetClass::Equity, tr_data::Provenance::Real, ts, now) {
+            None => {
+                assert!(ticket.error.is_none(), "{:?}", ticket.error);
+                assert_eq!(app.demo.book.held("AAPL"), 1.0);
+            }
+            Some(block) => {
+                assert_eq!(ticket.error.as_deref(), Some(block.explain()));
+                assert_eq!(app.demo.book.held("AAPL"), 0.0);
+            }
+        }
+    }
+
+    #[test]
+    fn demo_close_refuses_a_stale_verified_print() {
+        let mut app = test_app();
+        app.demo
+            .book
+            .submit(
+                &OrderRequest {
+                    account_id: demo::ACCOUNT_ID.into(),
+                    symbol: "AAPL".into(),
+                    side: Side::Buy,
+                    order_type: OrderType::Market,
+                    time_in_force: TimeInForce::Day,
+                    amount: Amount::Units(2.0),
+                    limit: None,
+                    stop: None,
+                },
+                Some(10.0),
+                chrono::Utc::now(),
+            )
+            .unwrap();
+        assert_eq!(app.demo.book.held("AAPL"), 2.0);
+        app.quotes.insert("AAPL US Equity".into(), aapl_quote(1_700_000_000, 50.0, tr_data::Provenance::Real));
+        app.demo_close("AAPL");
+        assert_eq!(app.demo.book.held("AAPL"), 2.0);
+        assert!(app.status.contains("last print is stale"), "{}", app.status);
+    }
+
+    fn rest_gtc_limit(app: &mut crate::app::TerminalApp) {
+        let order = app
+            .demo
+            .book
+            .submit(
+                &OrderRequest {
+                    account_id: demo::ACCOUNT_ID.into(),
+                    symbol: "AAPL".into(),
+                    side: Side::Buy,
+                    order_type: OrderType::Limit,
+                    time_in_force: TimeInForce::Gtc,
+                    amount: Amount::Units(1.0),
+                    limit: Some(100.0),
+                    stop: None,
+                },
+                Some(150.0),
+                chrono::Utc::now(),
+            )
+            .unwrap();
+        assert_eq!(order.status, "PENDING");
+    }
+
+    #[test]
+    fn a_stale_or_closed_quote_does_not_fill_a_resting_order() {
+        let mut app = test_app();
+        app.demo
+            .book
+            .submit(
+                &OrderRequest {
+                    account_id: demo::ACCOUNT_ID.into(),
+                    symbol: "AAPL".into(),
+                    side: Side::Buy,
+                    order_type: OrderType::Market,
+                    time_in_force: TimeInForce::Day,
+                    amount: Amount::Units(1.0),
+                    limit: None,
+                    stop: None,
+                },
+                Some(150.0),
+                chrono::Utc::now(),
+            )
+            .unwrap();
+        rest_gtc_limit(&mut app);
+        assert_eq!(app.demo.book.positions[0].price, Some(150.0));
+        app.quotes.insert("AAPL US Equity".into(), aapl_quote(1_700_000_000, 90.0, tr_data::Provenance::Real));
+        app.demo_on_quotes(&["AAPL US Equity".into()]);
+        assert_eq!(app.demo.book.held("AAPL"), 1.0, "the resting limit stays unfilled");
+        assert_eq!(app.demo.book.positions[0].price, Some(150.0), "a stale print does not reprice the position");
+        assert!(app.demo.book.orders.iter().any(|o| o.status == "PENDING" && o.limit_price == Some(100.0)));
+
+        let mut sample = test_app();
+        rest_gtc_limit(&mut sample);
+        sample.quotes.insert("AAPL US Equity".into(), aapl_quote(1_700_000_000, 90.0, tr_data::Provenance::Sample));
+        sample.demo_on_quotes(&["AAPL US Equity".into()]);
+        assert_eq!(sample.demo.book.held("AAPL"), 1.0, "sample quotes stay on the existing demo path");
+        assert!(sample.demo.book.orders.iter().any(|o| o.status == "EXECUTED"));
+
+        let mut clock = test_app();
+        rest_gtc_limit(&mut clock);
+        let now = chrono::Utc::now().timestamp();
+        let ts = tr_data::intraday::regular_bucket(tr_core::Timeframe::M1, now).unwrap_or(now);
+        clock.quotes.insert("AAPL US Equity".into(), aapl_quote(ts, 90.0, tr_data::Provenance::Real));
+        clock.demo_on_quotes(&["AAPL US Equity".into()]);
+        let blocked =
+            tr_data::intraday::market_order_block(tr_core::AssetClass::Equity, tr_data::Provenance::Real, ts, now);
+        if blocked.is_none() {
+            assert_eq!(clock.demo.book.held("AAPL"), 1.0);
+            assert!(clock.demo.book.orders.iter().all(|o| o.status == "EXECUTED"));
+        } else {
+            assert_eq!(clock.demo.book.held("AAPL"), 0.0);
+            assert!(clock.demo.book.orders.iter().any(|o| o.status == "PENDING"));
+        }
     }
 }

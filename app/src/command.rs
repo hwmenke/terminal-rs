@@ -7,6 +7,10 @@ use tr_chart::drawings::Tool;
 use tr_chart::scene::ChartType;
 pub use tr_core::indicators::registry::Spec as IndicatorSpec;
 use tr_core::{Security, Timeframe, YellowKey};
+use tr_data::trade_plans::{TrailKind, TrailSpec};
+
+/// Bound search, shaping and command parsing work for pasted input.
+pub const MAX_INPUT_BYTES: usize = 4096;
 
 /// Indicators on a new chart: the 20 and 50 bar simple moving averages.
 pub fn default_indicators() -> Vec<IndicatorSpec> {
@@ -73,8 +77,10 @@ impl TradeArgs {
     /// a typo never fills the ticket with something unintended.
     fn parse(buy: Option<bool>, rest: &[&str]) -> Option<TradeArgs> {
         let mut t = TradeArgs { buy, ..Default::default() };
-        let price =
-            |s: &str| s.trim_start_matches(['@', '$']).replace(',', "").parse::<f64>().ok().filter(|x| *x > 0.0);
+        // Finite and positive: `1e999`, `inf` and `NaN` must never reach the ticket.
+        let price = |s: &str| {
+            s.trim_start_matches(['@', '$']).replace(',', "").parse::<f64>().ok().filter(|x| x.is_finite() && *x > 0.0)
+        };
         let mut words = Vec::new();
         let mut i = 0;
         while i < rest.len() {
@@ -206,9 +212,144 @@ impl Range {
     }
 }
 
+/// Anchored VWAP subcommands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AnchorCmd {
+    /// Arm the one-click anchor tool.
+    Arm,
+    /// Today's cash open.
+    Open,
+    /// The latest session's high bar.
+    High,
+    /// The latest session's low bar.
+    Low,
+    /// Remove every anchor for the symbol.
+    Clear,
+}
+
+/// Default Cockpit ladder: fast, middle (main chart) and slow.
+pub const COCKPIT_LADDER: [Timeframe; 3] = [Timeframe::M1, Timeframe::M5, Timeframe::M15];
+
+/// Validate a `COCKPIT` ladder: empty for the default, else three strictly ascending
+/// intraday intervals.
+pub fn cockpit_ladder(spec: &str) -> Result<[Timeframe; 3], String> {
+    let tokens: Vec<&str> = spec.split_whitespace().collect();
+    if tokens.is_empty() {
+        return Ok(COCKPIT_LADDER);
+    }
+    let usage = "COCKPIT needs three ascending intraday intervals, e.g. COCKPIT 1m 5m 15m";
+    if tokens.len() != 3 {
+        return Err(usage.into());
+    }
+    let mut frames = [Timeframe::M1; 3];
+    for (slot, token) in frames.iter_mut().zip(&tokens) {
+        let tf = token.parse::<Timeframe>().map_err(|_| format!("COCKPIT: unknown interval {token}"))?;
+        if !tf.is_intraday() {
+            return Err(format!("COCKPIT: {} is not an intraday interval", tf.label()));
+        }
+        *slot = tf;
+    }
+    if !frames.windows(2).all(|w| w[0].seconds() < w[1].seconds()) {
+        return Err(format!("COCKPIT: intervals must be strictly ascending · {usage}"));
+    }
+    Ok(frames)
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum VaultCmd {
+    Open,
+    Verify,
+    Prune,
+    Drop { symbol: String, tf: Option<Timeframe> },
+}
+const VAULT_VERBS: [&str; 3] = ["DROP", "VERIFY", "PRUNE"];
+
+/// True when the words after `RESID` start with a residual verb (`SAVE`, `OPEN`, `CHECK`) or a
+/// `name=` save argument. Exact matches only: `RESID 1h`, `RESID DIST` and `RESID US Equity` stay tickers.
+fn resid_verb(rest: &[&str]) -> bool {
+    rest.first().is_some_and(|w| {
+        ["SAVE", "OPEN", "CHECK"].iter().any(|v| w.eq_ignore_ascii_case(v))
+            || w.get(..5).is_some_and(|p| p.eq_ignore_ascii_case("name="))
+    })
+}
+/// True when the words after `ATTR` start with `model=`, `obs=`, `from=` or `to=`. `ATTR 1h`,
+/// `ATTR DIST` and `ATTR US Equity` stay tickers.
+fn attr_key_word(rest: &[&str]) -> bool {
+    rest.first().is_some_and(|w| {
+        let w = w.to_ascii_lowercase();
+        ["model=", "obs=", "from=", "to="].iter().any(|k| w.starts_with(k))
+    })
+}
+fn parse_vault(rest: &[&str]) -> Option<VaultCmd> {
+    if rest.first().is_some_and(|s| s.eq_ignore_ascii_case("DROP")) {
+        let (sec, used) = Security::resolve_tokens(&rest[1..])?;
+        let tail = &rest[used + 1..];
+        let tf = match tail {
+            [] => None,
+            [tf] => Some(tf.parse::<Timeframe>().ok()?),
+            _ => return None,
+        };
+        if tf.is_some_and(|tf| !tr_data::cash_session::cash_bar_size(tf)) {
+            return None;
+        }
+        return Some(VaultCmd::Drop { symbol: sec.key(), tf });
+    }
+    match rest {
+        [] => Some(VaultCmd::Open),
+        [v] if v.eq_ignore_ascii_case("VERIFY") => Some(VaultCmd::Verify),
+        [v] if v.eq_ignore_ascii_case("PRUNE") => Some(VaultCmd::Prune),
+        _ => None,
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum StopCmd {
+    Toggle(Option<bool>),
+    Multiples(Vec<f64>),
+    Horizons(Option<(usize, usize)>),
+    Odds(bool),
+}
+fn parse_stops(rest: &[&str]) -> Option<StopCmd> {
+    let words: Vec<_> = rest.iter().map(|w| w.to_ascii_uppercase()).collect();
+    let r: Vec<_> = words.iter().map(String::as_str).collect();
+    let cmd = match r.as_slice() {
+        [] => StopCmd::Toggle(None),
+        ["ON"] => StopCmd::Toggle(Some(true)),
+        ["OFF"] => StopCmd::Toggle(Some(false)),
+        ["ODDS", "ON"] => StopCmd::Odds(true),
+        ["ODDS", "OFF"] => StopCmd::Odds(false),
+        ["H", "AUTO"] => StopCmd::Horizons(None),
+        ["H", a, b] => StopCmd::Horizons(Some((a.parse().ok()?, b.parse().ok()?))),
+        ["K", ks @ ..] => StopCmd::Multiples(ks.iter().map(|k| k.parse::<f64>()).collect::<Result<Vec<_>, _>>().ok()?),
+        _ => return None,
+    };
+    let mut p = tr_data::stop_cloud::Params::default();
+    match &cmd {
+        StopCmd::Multiples(ks) => p.ks = ks.clone(),
+        StopCmd::Horizons(h) => p.horizons = *h,
+        _ => {}
+    }
+    p.validate().ok()?;
+    Some(cmd)
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum Function {
+    Vault(VaultCmd),
     Timeframe(Timeframe),
+    TrendStack(Option<bool>),
+    TstackTune(Option<Timeframe>),
+    StackLadder(Option<Vec<Timeframe>>),
+    StackTint(Option<bool>),
+    StackSession(Option<bool>),
+    TruthRail(Option<bool>),
+    StackEdge(Option<bool>),
+    AuctionMap(AuctionCmd),
+    StopCloud(StopCmd),
+    TrendCone {
+        on: Option<bool>,
+        spec: Option<(usize, usize)>,
+    },
     ChartType(ChartType),
     /// Add or remove an indicator (any code from the catalog: `RSI`, `BB 20 2.5`, `ICHIMOKU`).
     Indicator(IndicatorSpec),
@@ -220,6 +361,8 @@ pub enum Function {
     Range(Range),
     Draw(Tool),
     ClearDrawings,
+    /// Restore the last deleted or cleared drawings for the current symbol.
+    UndoDrawings,
     Magnet,
     /// Congress trades: feed when used alone, per-ticker list after a symbol.
     Congress,
@@ -227,10 +370,42 @@ pub enum Function {
     Track(String),
     Untrack(String),
     Alerts,
+    ArmPlan {
+        entry: f64,
+        stop: f64,
+        target: Option<f64>,
+        risk: Option<f64>,
+        breakeven: Option<f64>,
+        trail: Option<TrailSpec>,
+    },
+    TrailPlan(Option<TrailSpec>),
+    BreakevenPlan(Option<f64>),
+    MovePlanStop(f64),
+    Plans,
+    CancelPlans(String),
+    /// `AAPL ALERT 150` / `AAPL ALERT VWAP` / `AAPL ALERT RVOL 2` / `AAPL ALERT SETUP NEAR_HIGH`.
+    SetPriceAlert(tr_data::price_alerts::AlertKind),
+    /// `UNALERT` / `UNALERT AAPL` — drop price, VWAP, RVOL, and setup rules.
+    ClearPriceAlert(String),
     Refresh,
+    History(String),
+    Universe,
+    Scan(String),
     Watchlist,
-    WatchAdd(Vec<String>),
-    WatchRemove(Vec<String>),
+    /// Earnings dates for the selected watchlist group (`EARNINGS`).
+    Earnings,
+    /// Session RVOL, VWAP, and return versus SPY for the selected watchlist group (`ISCAN`).
+    Intraday,
+    /// Saved 2×2 desk: 5-minute chart, ISCAN, breadth, and volume pace (`IDESK`).
+    IntradayDesk,
+    /// `COCKPIT [fast mid slow]` (`CKPT`): three linked native intraday charts. The ladder
+    /// is checked by [`cockpit_ladder`] when applied, so a bad one gets a status message.
+    Cockpit {
+        spec: String,
+    },
+    /// `AVWAP`, `AVWAP OPEN|HIGH|LOW|CLEAR`.
+    AnchoredVwap(AnchorCmd),
+    WatchCommand(String),
     /// `LAYOUT 1|2|2H|3|4|6` preset, `LAYOUT <name>` switch, or a layout subcommand
     /// (`SAVE`, `SAVEAS`, `NEW`, `RENAME`, `DUP`, `DEL`, `EXPORT`, `IMPORT`).
     Layout(String),
@@ -246,8 +421,10 @@ pub enum Function {
     PopOut,
     /// Put the focused pane in a colour link group (`None` = unlink).
     Link(Option<crate::layouts::Link>),
-    /// Headlines (for a security when used after one).
+    /// Watchlist / symbol headlines (`NEWS`, `AAPL CN`).
     News,
+    /// General market headlines (`TOP`).
+    TopNews,
     /// Order book depth (levels).
     OrderBook(Option<usize>),
     /// Option chain monitor (Bloomberg OMON).
@@ -263,6 +440,7 @@ pub enum Function {
     Title(String),
     ClosePane,
     Help,
+    Health,
     /// World equity indices / markets overview.
     Wei,
     /// US Treasury yield curve.
@@ -275,10 +453,350 @@ pub enum Function {
     Trade(TradeArgs),
     /// Switch between the demo account and live accounts (`DEMO`, `MODE LIVE`); `true` = live.
     AccountMode(bool),
+    /// Open linked daily + weekly archive charts for candidate review.
+    Review,
+    /// Watchlist-scoped PM Desk: leaders, group performance, position size.
+    Desk,
+    /// Trade journal / checklist (`JOURNAL`, `AAPL JOURNAL`, `AAPL JOURNAL 2026-10-24`).
+    Journal(String),
+    /// Distribution Studio for verified daily or intraday log returns.
+    Studio {
+        spec: String,
+    },
+    StudioRoute(tr_data::studio::StudioRoute),
+    StudioQuick {spec:String},
+    /// `RELATE [transform= h= beta= bands= matrix=]`: updates the focused Studio or opens a Relate lens.
+    StudioRelate {
+        spec: String,
+    },
+    StudioWhen {
+        spec: String,
+    },
+    /// Regression Lab: the words after `STUDIO lab` (interval and model edits).
+    StudioLab {
+        spec: String,
+    },
+    /// Frozen residual tickers: the words after `STUDIO resid` / `RESID` (`save`, `open`, `check`).
+    StudioResid {
+        spec: String,
+    },
+    /// Factor attribution of a saved model: the words after `STUDIO attr` (`model=`, `obs=`, `from=`, `to=`).
+    StudioAttr {
+        spec: String,
+    },
+    DistributionStrip,
+    StudioDist {
+        timeframe: Timeframe,
+    },
+    /// Set DIST Shape horizon without changing the existing timeframe command.
+    StudioDistHorizon(usize),
+    /// Relationship Studio: benchmark OLS and correlation.
+    StudioCorr {
+        spec: String,
+    },
+    /// Historical risk/return and conditional forward returns (`STATS`, `AAPL COND RSI < 30`).
+    Stats {
+        condition: String,
+        conditional: bool,
+    },
+    /// Calendar seasonality on verified daily or intraday history.
+    StudioSeason {
+        spec: String,
+    },
+    /// Paper strategy backtest vs buy-and-hold (`BACKTEST`, `AAPL BT ADTREND`).
+    Backtest {
+        spec: String,
+    },
+    /// Paper intraday VWAP and opening-range backtest (`IBT`, `AAPL IBT VWAP`).
+    IntradayBacktest {
+        spec: String,
+    },
+    /// Multi-symbol intraday compare, percent from each 09:30 open (`ICMP`, `AAPL ICMP MSFT`).
+    IntradayCompare {
+        spec: String,
+    },
+    /// Today versus the typical path of prior sessions (`SPATH`, `AAPL SPATH 20 15m`).
+    SessionPath {
+        spec: String,
+    },
+    /// Watchlist-wide native Trend Stack wall.
+    TrendWall {
+        spec: String,
+    },
+    EdgeWall {
+        spec: String,
+    },
+    /// Relative rotation from the verified daily research archive.
+    Rotation {
+        spec: String,
+    },
+    /// Share of a list at or above the open and session VWAP (`BRD`, `AAPL BRD MSFT`).
+    Breadth {
+        spec: String,
+    },
+    /// Cumulative volume versus prior sessions (`VPACE`, `AAPL VPACE 20 15m`).
+    VolumePace {
+        spec: String,
+    },
+    RealizedVol {
+        spec: String,
+    },
+    Autocorr {
+        spec: String,
+    },
+    /// Open versus the prior cash close, and how often that gap had filled (`GFILL`).
+    GapFill {
+        spec: String,
+    },
+    /// When the session high and low print (`XTRM`, `AAPL XTRM 20 15m`).
+    SessionExtreme {
+        spec: String,
+    },
+    /// Weekday by cash-bucket returns (`CLOCK`, `AAPL CLOCK 1h`).
+    SessionClock {
+        spec: String,
+    },
+    /// Percent from the 09:30 open minus SPY (`RPATH`, `AAPL RPATH 20 15m`).
+    RelativePath {
+        spec: String,
+    },
+    /// Path, pace, gap, extreme, and versus SPY for one name (`BRIEF`, `AAPL BRIEF`).
+    SessionBrief,
+    /// Prior close, open, opening range, and VWAP drawn on the chart (`MARKS`).
+    CashLevels,
+    /// Historical lookalikes / nearest neighbors (`LOOKALIKE`, `AAPL KNN 2024-01-15 K=15`).
+    Lookalike {
+        spec: String,
+    },
+    /// Jump the focused (or named) archive chart to a session date (`GOTO 2024-01-15`).
+    Goto {
+        date: String,
+    },
+    /// Attach a note to a historical chart date (`NOTE`, `AAPL NOTE 2026-10-24 text`).
+    JournalNote {
+        date: String,
+        text: String,
+    },
+    /// Pan the focused chart to the latest candle without changing zoom.
+    Latest,
+    /// Toggle a persisted review overlay on the focused chart.
+    ReviewOverlay(ReviewOverlay),
+    /// `EXPORT SCAN|JOURNAL|HIST|STATS|BACKTEST|LOOKALIKE|WORKSPACE [path]`.
+    Export(ExportKind, String),
+    /// `BACKUP [path]` — portable workspace backup (no credentials).
+    Backup(String),
+    /// `RESTORE path` — workspace, journal, or price-history file.
+    Restore(String),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExportKind {
+    Auto,
+    Scan,
+    Journal,
+    History,
+    Workspace,
+    Stats,
+    Backtest,
+    Lookalike,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReviewOverlay {
+    BoxLevels,
+    Strength,
+    Volume,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AuctionCmd {
+    Toggle(Option<bool>),
+    Composite(u8),
+    ValueArea(u8),
+    Naked(Option<bool>),
+    MaxAge(u8),
+    Filled(Option<bool>),
+    Strips(Option<bool>),
+    Ib(Option<bool>),
+}
+fn parse_auction(rest: &[&str]) -> Option<AuctionCmd> {
+    use AuctionCmd::*;
+    let words: Vec<_> = rest.iter().map(|s| s.to_ascii_uppercase()).collect();
+    let r: Vec<_> = words.iter().map(String::as_str).collect();
+    let number = |s: &str, lo, hi| s.parse::<u8>().ok().filter(|n| (lo..=hi).contains(n));
+    Some(match r.as_slice() {
+        ["VIS"] => Composite(0),
+        ["VA", n] => ValueArea(number(n, 50, 95)?),
+        ["NAKED", n] if number(n, 1, 20).is_some() => MaxAge(number(n, 1, 20)?),
+        ["NAKED", tail @ ..] => Naked(parse_switch(tail)?),
+        ["FILLED", tail @ ..] => Filled(parse_switch(tail)?),
+        ["STRIPS", tail @ ..] => Strips(parse_switch(tail)?),
+        ["IB", tail @ ..] => Ib(parse_switch(tail)?),
+        [n] if number(n, 1, 20).is_some() => Composite(number(n, 1, 20)?),
+        _ => Toggle(parse_switch(&r)?),
+    })
+}
+
+fn parse_cone(rest: &[&str]) -> Option<Function> {
+    if let [h] = rest
+        && let Ok(h) = h.parse::<usize>()
+    {
+        // `CONE <H>`: mean bootstrap block follows the horizon, since adjacent
+        // H-step paths overlap and stay dependent for about H origins.
+        return (1..=120).contains(&h).then_some(Function::TrendCone { on: Some(true), spec: Some((h, h.min(100))) });
+    }
+    if rest.len() <= 1 {
+        return Some(Function::TrendCone { on: parse_switch(rest)?, spec: None });
+    }
+    let [h, l] = rest else {
+        return None;
+    };
+    let (h, l) = (h.parse::<usize>().ok()?, l.parse::<usize>().ok()?);
+    if !(1..=120).contains(&h) || !(1..=100).contains(&l) {
+        return None;
+    }
+    Some(Function::TrendCone { on: Some(true), spec: Some((h, l)) })
+}
+
+fn parse_switch(rest: &[&str]) -> Option<Option<bool>> {
+    match rest {
+        [] => Some(None),
+        [arg] if arg.eq_ignore_ascii_case("ON") => Some(Some(true)),
+        [arg] if arg.eq_ignore_ascii_case("OFF") => Some(Some(false)),
+        _ => None,
+    }
 }
 
 fn num<T: std::str::FromStr>(t: Option<&&str>) -> Option<T> {
     t.and_then(|s| s.parse().ok())
+}
+
+fn parse_setup_name(s: &str) -> Option<String> {
+    tr_data::price_alerts::normalize_setup(s)
+}
+
+/// `2026-10-24 held 3 days` → date + text; otherwise the whole remainder is the note.
+fn split_note_args(rest: &[&str]) -> (String, String) {
+    match rest.split_first() {
+        Some((first, tail)) if tr_data::journal::parse_chart_date(first).is_ok() => (first.to_string(), tail.join(" ")),
+        _ => (String::new(), rest.join(" ")),
+    }
+}
+
+/// `150` · `ABOVE 150` · `BELOW 150` · `VWAP` · `VWAP BELOW` · `RVOL 2` · `NEAR_HIGH` · `SETUP NEAR_HIGH EXIT`.
+fn parse_alert_kind(rest: &[&str]) -> Option<tr_data::price_alerts::AlertKind> {
+    use tr_data::price_alerts::{AlertKind, PriceSide, SetupChange};
+    if rest.is_empty() {
+        return None;
+    }
+    let up: Vec<String> = rest.iter().map(|s| s.to_ascii_uppercase()).collect();
+    let first = up[0].as_str();
+    let change = |i: usize| match up.get(i).map(String::as_str) {
+        Some("EXIT" | "LEAVE" | "OFF") => SetupChange::Exit,
+        Some("EITHER" | "CHANGE" | "FLIP") => SetupChange::Either,
+        _ => SetupChange::Enter,
+    };
+    if first == "COMBO" {
+        if up.len() != 6 || up[4] != "RVOL" {
+            return None;
+        }
+        let setup = tr_data::price_alerts::normalize_combo_setup(&up[1])?;
+        let side = match up[2].as_str() {
+            "ABOVE" => PriceSide::Above,
+            "BELOW" => PriceSide::Below,
+            _ => return None,
+        };
+        let level: f64 = rest[3].parse().ok()?;
+        let multiple: f64 = rest[5].parse().ok()?;
+        if up[4] != "RVOL" {
+            return None;
+        }
+        return (level.is_finite() && level > 0.0 && multiple.is_finite() && multiple > 0.0)
+            .then_some(AlertKind::SetupPriceRvol { setup, side, level, multiple });
+    }
+    if first == "SETUP" {
+        let setup = parse_setup_name(up.get(1)?)?;
+        return Some(AlertKind::Setup { setup, change: change(2) });
+    }
+    if first == "VWAP" {
+        let side = match up.get(1).map(String::as_str) {
+            Some("BELOW" | "UNDER" | "LT") => PriceSide::Below,
+            Some("ABOVE" | "OVER" | "GT") | None => PriceSide::Above,
+            Some(_) => return None,
+        };
+        return Some(AlertKind::Vwap { side });
+    }
+    if first == "RVOL" {
+        let multiple: f64 = rest.get(1)?.parse().ok()?;
+        if !multiple.is_finite() || multiple <= 0.0 || up.len() != 2 {
+            return None;
+        }
+        return Some(AlertKind::Rvol { multiple });
+    }
+    if let Some(signal) = tr_data::session_alerts::SessionSignal::parse(first) {
+        if up.len() != 1 {
+            return None;
+        }
+        return Some(AlertKind::Session { signal });
+    }
+    if matches!(first, "ABOVE" | "OVER" | "GT") {
+        let level: f64 = rest.get(1)?.parse().ok()?;
+        return Some(AlertKind::Price { side: PriceSide::Above, level });
+    }
+    if matches!(first, "BELOW" | "UNDER" | "LT") {
+        let level: f64 = rest.get(1)?.parse().ok()?;
+        return Some(AlertKind::Price { side: PriceSide::Below, level });
+    }
+    if let Some(setup) = parse_setup_name(first) {
+        return Some(AlertKind::Setup { setup, change: change(1) });
+    }
+    let level: f64 = first.parse().ok()?;
+    (level.is_finite() && level > 0.0).then_some(AlertKind::Price { side: PriceSide::Above, level })
+}
+
+fn positive_plan_value(s: &str) -> Option<f64> {
+    s.parse::<f64>().ok().filter(|v| v.is_finite() && *v > 0.0)
+}
+fn parse_breakeven(s: &str) -> Option<f64> {
+    positive_plan_value(s.strip_suffix(['R', 'r']).unwrap_or(s)).filter(|r| *r <= 20.0)
+}
+fn parse_trail(s: &str) -> Option<TrailSpec> {
+    let (kind, number) = if let Some(n) = s.strip_suffix(['R', 'r']) {
+        (TrailKind::R, n)
+    } else if let Some(n) = s.strip_suffix('%') {
+        (TrailKind::Percent, n)
+    } else {
+        (TrailKind::Price, s)
+    };
+    let value = positive_plan_value(number)?;
+    if (kind == TrailKind::R && value > 20.0) || (kind == TrailKind::Percent && value >= 50.0) {
+        return None;
+    }
+    Some(TrailSpec { kind, value, source: "command".into() })
+}
+fn parse_plan(rest: &[&str]) -> Option<Function> {
+    let entry = positive_plan_value(rest.first()?)?;
+    if !rest.get(1)?.eq_ignore_ascii_case("STOP") {
+        return None;
+    }
+    let stop = positive_plan_value(rest.get(2)?)?;
+    let mut target = None;
+    let mut risk = None;
+    let mut breakeven = None;
+    let mut trail = None;
+    for pair in rest[3..].chunks(2) {
+        let [keyword, value] = pair else {
+            return None;
+        };
+        match keyword.to_ascii_uppercase().as_str() {
+            "TARGET" | "TGT" if target.is_none() => target = Some(positive_plan_value(value)?),
+            "RISK" if risk.is_none() => risk = Some(positive_plan_value(value)?),
+            "BE" | "BREAKEVEN" if breakeven.is_none() => breakeven = Some(parse_breakeven(value)?),
+            "TRAIL" if trail.is_none() => trail = Some(parse_trail(value)?),
+            _ => return None,
+        }
+    }
+    Some(Function::ArmPlan { entry, stop, target, risk, breakeven, trail })
 }
 
 fn parse_function(head: &str, rest: &[&str]) -> Option<Function> {
@@ -301,6 +819,11 @@ fn parse_function(head: &str, rest: &[&str]) -> Option<Function> {
             Some("DRAW") | Some("DRAWINGS") => Function::ClearDrawings,
             _ => Function::ClearIndicators,
         },
+        "UNDO" => match words().first().map(String::as_str) {
+            Some("DRAW") | Some("DRAWINGS") | None => Function::UndoDrawings,
+            _ => return None,
+        },
+        "UNDODRAW" | "UNDODRAWS" => Function::UndoDrawings,
         "CMP" | "COMPARE" | "COMP" => Function::Compare(rest.first().map(|s| s.to_ascii_uppercase())),
         "LOG" => Function::LogScale,
         "TL" | "TREND" | "TRENDLINE" => Function::Draw(Tool::Trendline),
@@ -308,19 +831,83 @@ fn parse_function(head: &str, rest: &[&str]) -> Option<Function> {
         "VL" | "VLINE" => Function::Draw(Tool::Vertical),
         "FIB" => Function::Draw(Tool::Fib),
         "MAGNET" | "MAG" => Function::Magnet,
+        "HIST" | "HISTORY" => Function::History(words().join(" ")),
+        "UNIV" if rest.is_empty() => Function::Universe,
+        "SCAN" => Function::Scan(words().join(" ")),
         "CONG" | "CONGRESS" => Function::Congress,
         "POL" | "PROFILE" => Function::Politician(joined()),
         "TRACK" => Function::Track(joined()),
         "UNTRACK" => Function::Untrack(joined()),
-        "ALRT" | "ALERTS" | "ALERT" => Function::Alerts,
+        "PLAN" => parse_plan(rest)?,
+        "TRAIL" if rest.len() == 1 => {
+            Function::TrailPlan(if rest[0].eq_ignore_ascii_case("OFF") { None } else { Some(parse_trail(rest[0])?) })
+        }
+        "BREAKEVEN" if rest.len() == 1 => Function::BreakevenPlan(if rest[0].eq_ignore_ascii_case("OFF") {
+            None
+        } else {
+            Some(parse_breakeven(rest[0])?)
+        }),
+        "MOVESTOP" if rest.len() == 1 => Function::MovePlanStop(positive_plan_value(rest[0])?),
+        "PLANS" if rest.is_empty() => Function::Plans,
+        "UNPLAN" if !rest.is_empty() => Function::CancelPlans(joined()),
+        "ALRT" | "ALERTS" => Function::Alerts,
+        "ALERT" if rest.is_empty() => Function::Alerts,
+        "ALERT" => Function::SetPriceAlert(parse_alert_kind(rest)?),
+        "UNALERT" | "RMALERT" | "DELALERT" => Function::ClearPriceAlert(joined()),
         "REFRESH" | "SYNC" => Function::Refresh,
-        "W" | "WL" | "WATCH" | "WATCHLIST" | "MON" => match words().first().map(String::as_str) {
-            Some("ADD") => Function::WatchAdd(words()[1..].to_vec()),
-            Some("DEL") | Some("RM") | Some("REMOVE") => Function::WatchRemove(words()[1..].to_vec()),
-            _ => Function::Watchlist,
-        },
+        "EARN" | "EARNINGS" | "ECAL" => Function::Earnings,
+        "ISCAN" | "INTRADAY" => Function::Intraday,
+        "IDESK" | "IDASH" => Function::IntradayDesk,
+        "VAULT" | "VLT" => Function::Vault(parse_vault(rest)?),
+        "COCKPIT" | "CKPT" => Function::Cockpit { spec: joined() },
+        "STOPS" | "SCLOUD" => Function::StopCloud(parse_stops(rest)?),
+        "AUCTION" | "AMAP" => Function::AuctionMap(parse_auction(rest)?),
+        "CONE" | "TRENDCONE" => parse_cone(rest)?,
+        "AVWAP" => Function::AnchoredVwap(match words().as_slice() {
+            [] => AnchorCmd::Arm,
+            [w] if w == "OPEN" => AnchorCmd::Open,
+            [w] if w == "HIGH" => AnchorCmd::High,
+            [w] if w == "LOW" => AnchorCmd::Low,
+            [w] if w == "CLEAR" => AnchorCmd::Clear,
+            _ => return None,
+        }),
+        "W" | "WL" | "WATCH" | "WATCHLIST" | "MON" => {
+            if rest.is_empty() {
+                Function::Watchlist
+            } else {
+                Function::WatchCommand(joined())
+            }
+        }
         "LAYOUT" | "GRID" | "LP" => Function::Layout(joined()),
         "LAYOUTS" => Function::Layouts,
+        "TSTACK" | "STACK" | "MTF" | "REGIME" => match rest {
+            [] => Function::TrendStack(None),
+            [arg] if arg.eq_ignore_ascii_case("ON") => Function::TrendStack(Some(true)),
+            [arg] if arg.eq_ignore_ascii_case("OFF") => Function::TrendStack(Some(false)),
+            [arg] if arg.eq_ignore_ascii_case("AUTO") => Function::StackLadder(None),
+            [arg, tail @ ..] if arg.eq_ignore_ascii_case("TUNE") => {
+                let tf = match tail {
+                    [] => None,
+                    [token] => Some(token.parse::<Timeframe>().ok()?),
+                    _ => return None,
+                };
+                Function::TstackTune(tf)
+            }
+            [arg, tail @ ..] if arg.eq_ignore_ascii_case("STOPS") => Function::StopCloud(parse_stops(tail)?),
+            [arg, tail @ ..] if arg.eq_ignore_ascii_case("CONE") => parse_cone(tail)?,
+            [arg, tail @ ..] if arg.eq_ignore_ascii_case("EDGE") => Function::StackEdge(parse_switch(tail)?),
+            [arg, tail @ ..] if arg.eq_ignore_ascii_case("TINT") => Function::StackTint(parse_switch(tail)?),
+            [arg, tail @ ..] if arg.eq_ignore_ascii_case("SESSION") => Function::StackSession(parse_switch(tail)?),
+            _ => {
+                if !rest.iter().all(|s| s.chars().any(|c| c.is_ascii_digit())) {
+                    return None;
+                }
+                let frames = rest.iter().map(|s| s.parse::<Timeframe>()).collect::<Result<Vec<_>, _>>().ok()?;
+                tr_core::indicators::ladder_custom(*frames.first()?, &frames, false).ok()?;
+                Function::StackLadder(Some(frames))
+            }
+        },
+        "RAIL" => Function::TruthRail(parse_switch(rest)?),
         "NEW" | "ADD" => Function::NewPanel(joined()),
         "SPLIT" | "SPLITV" | "SPLITH" => {
             let w = words();
@@ -334,7 +921,8 @@ fn parse_function(head: &str, rest: &[&str]) -> Option<Function> {
             None | Some("OFF" | "NONE" | "0") => None,
             Some(c) => Some(crate::layouts::Link::ALL.into_iter().find(|l| l.label().eq_ignore_ascii_case(c))?),
         }),
-        "N" | "CN" | "NEWS" | "TOP" => Function::News,
+        "N" | "CN" | "NEWS" => Function::News,
+        "TOP" => Function::TopNews,
         "OB" | "BOOK" | "DEPTH" | "DOM" => Function::OrderBook(num(rest.first())),
         "OMON" | "OMST" | "OPT" | "OPTIONS" | "CHAIN" => Function::Options,
         "SIDEBAR" | "SB" => Function::Sidebar(words().join(" ")),
@@ -345,6 +933,7 @@ fn parse_function(head: &str, rest: &[&str]) -> Option<Function> {
         "CLOSE" => Function::ClosePane,
         "HELP" | "?" | "H" => Function::Help,
         "WEI" | "MARKETS" | "WORLD" => Function::Wei,
+        "HEALTH" | "SRC" => Function::Health,
         "GC" | "YCRV" | "CURVE" | "YC" => Function::Curve,
         "SECF" | "SEARCH" | "FIND" => Function::Search(joined()),
         "PORT" | "PORTFOLIO" | "PRTU" => Function::Portfolio(PortView::Summary, words().join(" ")),
@@ -364,6 +953,154 @@ fn parse_function(head: &str, rest: &[&str]) -> Option<Function> {
             "LIVE" | "REAL" => Function::AccountMode(true),
             _ => return None,
         },
+        "REVIEW" | "REV" => Function::Review,
+        "DESK" | "PMDESK" | "RISK" => Function::Desk,
+        "JOURNAL" | "JRNL" | "CHECKLIST" | "TRADELOG" => Function::Journal(joined()),
+        // Studio words are also listed tickers: only valid Studio arguments make
+        // the command; anything else falls through to the ticker (see parse()).
+        "STUDIO" => {
+            // `lab` is checked before `parse_studio`, which would reject it as an unknown interval.
+            if rest.first().is_some_and(|w| w.eq_ignore_ascii_case("lab")) {
+                let tail = rest[1..].join(" ");
+                if tail.is_empty() {
+                    return Some(Function::StudioRoute(tr_data::studio::StudioRoute::Lab));
+                }
+                tr_data::studio_lab::LabArgs::parse(&tail).ok()?;
+                return Some(Function::StudioLab { spec: tail });
+            }
+            // `resid` words (save / open / check) likewise precede `parse_studio`.
+            if rest.first().is_some_and(|w| w.eq_ignore_ascii_case("resid")) && rest.len() > 1 {
+                let tail = rest[1..].join(" ");
+                tr_data::studio_residual::ResidArgs::parse(&tail).ok()?;
+                return Some(Function::StudioResid { spec: tail });
+            }
+            // `attr <words>` and the `screen=attribution` alias (exact first word) also precede `parse_studio`.
+            if rest.first().is_some_and(|w| w.eq_ignore_ascii_case("attr")) && rest.len() > 1 {
+                let tail = rest[1..].join(" ");
+                tr_data::studio_attribution::AttrArgs::parse(&tail).ok()?;
+                return Some(Function::StudioAttr { spec: tail });
+            }
+            if rest.first().is_some_and(|w| w.eq_ignore_ascii_case("screen=attribution")) {
+                let tail = rest[1..].join(" ");
+                if tail.is_empty() {
+                    return Some(Function::StudioRoute(tr_data::studio::StudioRoute::Attr));
+                }
+                tr_data::studio_attribution::AttrArgs::parse(&tail).ok()?;
+                return Some(Function::StudioAttr { spec: tail });
+            }
+            let spec = joined();
+            // LAB / RESID / ATTR are listed tickers, so their routes live behind STUDIO.
+            let route = match spec.to_ascii_lowercase().as_str() {
+                "lab" => Some(tr_data::studio::StudioRoute::Lab),
+                "resid" => Some(tr_data::studio::StudioRoute::Resid),
+                "attr" => Some(tr_data::studio::StudioRoute::Attr),
+                _ => None,
+            };
+            if let Some(route) = route {
+                return Some(Function::StudioRoute(route));
+            }
+            crate::app::studio_hub::parse_studio(&spec).ok()?;
+            Function::Studio { spec }
+        }
+        // RESID is a listed ticker: only the exact verbs `SAVE|OPEN|CHECK` and a leading `name=`
+        // make a command; every other `RESID …` form loads the ticker (see parse()).
+        "RESID" if resid_verb(rest) => {
+            let spec = joined();
+            tr_data::studio_residual::ResidArgs::parse(&spec).ok()?;
+            Function::StudioResid { spec }
+        }
+        // ATTR is a listed ticker: only a leading `model=|obs=|from=|to=` word makes a command.
+        "ATTR" if attr_key_word(rest) => {
+            let spec = joined();
+            tr_data::studio_attribution::AttrArgs::parse(&spec).ok()?;
+            Function::StudioAttr { spec }
+        }
+        "WHEN" => {
+            let spec = joined();
+            tr_data::studio_when::parse_command(&spec).ok()?;
+            Function::StudioWhen { spec }
+        }
+        // Bare RELATE or key=value words only; anything else (e.g. `RELATE US Equity`) is the ticker.
+        "RELATE" => {
+            let spec = joined();
+            tr_data::studio_corr::RelateArgs::parse(&rest.iter().copied().collect::<Vec<_>>()).ok()?;
+            Function::StudioRelate { spec }
+        }
+        "QUICK" => {let spec=joined();tr_data::studio_canvas::parse_spec(&spec).ok()?;Function::StudioQuick {spec}},
+        "DSTRIP" if rest.is_empty()=>Function::DistributionStrip,
+        "CORR" | "RBETA" => {
+            let spec = joined();
+            crate::app::studio_corr::parse_spec(&spec).ok()?;
+            Function::StudioCorr { spec }
+        }
+        "SEASON" | "SSN" => {
+            let spec = joined();
+            tr_data::studio_season::parse_timeframe(&spec).ok()?;
+            Function::StudioSeason { spec }
+        }
+        "STATS" | "STAT" | "STATISTICS" => Function::Stats { condition: joined(), conditional: !rest.is_empty() },
+        "COND" | "CDIST" | "CONDRET" => Function::Stats { condition: joined(), conditional: true },
+        "DIST" | "RDIST" if rest.len() == 1 && rest[0].to_ascii_uppercase().starts_with("H=") => {
+            let h = rest[0][2..].parse::<usize>().ok()?;
+            if !(1..=250).contains(&h) {
+                return None;
+            }
+            Function::StudioDistHorizon(h)
+        }
+        "DIST" | "RDIST" => Function::StudioDist {
+            timeframe: match rest {
+                [] => Timeframe::D1,
+                [tf] => tr_data::studio_dist::parse_timeframe(tf).ok()?,
+                _ => return None,
+            },
+        },
+        "BACKTEST" | "BT" | "BTEST" => Function::Backtest { spec: joined() },
+        "IBT" | "IBACKTEST" | "SETUPBT" => Function::IntradayBacktest { spec: joined() },
+        "LOOKALIKE" | "LOOKALIKES" | "KNN" | "ANALOG" | "ANALOGUE" | "NN" => Function::Lookalike { spec: joined() },
+        "ICMP" | "ICOMPARE" | "ICOMP" => Function::IntradayCompare { spec: joined() },
+        "SPATH" | "SESSIONPATH" | "TPATH" => Function::SessionPath { spec: joined() },
+        "TWALL" | "TGRID" | "STACKS" | "MTFGRID" => Function::TrendWall { spec: joined() },
+        "EWALL" => Function::EdgeWall { spec: joined() },
+        "RRG" | "ROT" | "ROTATION" | "ROTATE" => Function::Rotation { spec: joined() },
+        "BRD" | "BREADTH" | "SBREADTH" => Function::Breadth { spec: joined() },
+        "VPACE" | "VOLPACE" | "CUMVOL" => Function::VolumePace { spec: joined() },
+        "RVAR" | "REALVOL" | "REALIZEDVOL" => Function::RealizedVol { spec: joined() },
+        "ACOR" | "AUTOCORR" | "SERIALCORR" => Function::Autocorr { spec: joined() },
+        "GFILL" | "GAPFILL" => Function::GapFill { spec: joined() },
+        "XTRM" | "EXTREME" => Function::SessionExtreme { spec: joined() },
+        "CLOCK" => Function::SessionClock { spec: joined() },
+        "RPATH" | "RELPATH" => Function::RelativePath { spec: joined() },
+        "BRIEF" | "SBRIEF" if rest.is_empty() => Function::SessionBrief,
+        "MARKS" | "SMARKS" if rest.is_empty() => Function::CashLevels,
+        "GOTO" | "JUMP" | "GTO" => Function::Goto { date: joined() },
+        "NOTE" | "JNOTE" => {
+            let (date, text) = split_note_args(rest);
+            Function::JournalNote { date, text }
+        }
+        "LATEST" | "END" => Function::Latest,
+        "BOX" => Function::ReviewOverlay(ReviewOverlay::BoxLevels),
+        "RS" | "STRENGTH" => Function::ReviewOverlay(ReviewOverlay::Strength),
+        "VCTX" | "VOLCTX" => Function::ReviewOverlay(ReviewOverlay::Volume),
+        "EXPORT" => {
+            let w = words();
+            let (kind, path) = match w.first().map(String::as_str) {
+                Some("SCAN" | "UNIV") => (ExportKind::Scan, rest.get(1..).unwrap_or(&[]).join(" ")),
+                Some("JOURNAL" | "JRNL" | "CHECKLIST") => (ExportKind::Journal, rest.get(1..).unwrap_or(&[]).join(" ")),
+                Some("HIST" | "HISTORY") => (ExportKind::History, rest.get(1..).unwrap_or(&[]).join(" ")),
+                Some("STATS" | "STAT" | "COND" | "CDIST") => {
+                    (ExportKind::Stats, rest.get(1..).unwrap_or(&[]).join(" "))
+                }
+                Some("BACKTEST" | "BT" | "BTEST") => (ExportKind::Backtest, rest.get(1..).unwrap_or(&[]).join(" ")),
+                Some("LOOKALIKE" | "LOOKALIKES" | "KNN" | "ANALOG" | "ANALOGUE") => {
+                    (ExportKind::Lookalike, rest.get(1..).unwrap_or(&[]).join(" "))
+                }
+                Some("WORKSPACE" | "BACKUP" | "WS") => (ExportKind::Workspace, rest.get(1..).unwrap_or(&[]).join(" ")),
+                _ => (ExportKind::Auto, joined()),
+            };
+            Function::Export(kind, path)
+        }
+        "BACKUP" => Function::Backup(joined()),
+        "RESTORE" => Function::Restore(joined()),
         "RANGE" => Function::Range(Range::parse(rest.first()?)?),
         // Timeframes win where spellings overlap (`1D`, `1M`); otherwise try a range (`5D`, `YTD`),
         // then the indicator catalog (`RSI`, `BB 20 2.5`).
@@ -380,6 +1117,15 @@ fn parse_function(head: &str, rest: &[&str]) -> Option<Function> {
 
 /// Parse one command line. Returns `None` for empty or unrecognised input.
 pub fn parse(input: &str) -> Option<Command> {
+    if input.len() > MAX_INPUT_BYTES {
+        return None;
+    }
+    let input = input.trim();
+    let input = if input.get(input.len().saturating_sub(4)..).is_some_and(|t| t.eq_ignore_ascii_case("<GO>")) {
+        &input[..input.len() - 4]
+    } else {
+        input
+    };
     let tokens: Vec<&str> = input.split_whitespace().filter(|t| !t.eq_ignore_ascii_case("<GO>")).collect();
     let (&head, rest) = tokens.split_first()?;
     // `<TICKER> <YELLOW KEY>` is always a security, even if the ticker spells a function.
@@ -388,8 +1134,38 @@ pub fn parse(input: &str) -> Option<Command> {
         [us, k, ..] if us.eq_ignore_ascii_case("US") && YellowKey::parse(k).is_some() => true,
         _ => false,
     };
-    if !keyed && let Some(f) = parse_function(head, rest) {
-        return Some(Command::Function(f));
+    if !keyed {
+        if let Some(f) = parse_function(head, rest) {
+            return Some(Command::Function(f));
+        }
+        // Invalid stack arguments must not become a ticker followed by an interval.
+        if ["STUDIO", "TSTACK", "STACK", "MTF", "REGIME", "RAIL", "AVWAP", "AUCTION", "AMAP", "STOPS", "SCLOUD"]
+            .iter()
+            .any(|word| head.eq_ignore_ascii_case(word))
+        {
+            return None;
+        }
+        // VAULT and VLT are also listed tickers. Only a vault verb is guarded;
+        // anything else (`VLT 5m`, `VAULT GP`) loads the ticker, as does
+        // `VAULT US Equity` / `VLT Equity` for the bare security.
+        // The Studio words (DIST/RDIST, SEASON/SSN, CORR/RBETA) follow the same
+        // rule with no guard at all: the bare word or the word plus valid Studio
+        // arguments was already taken by parse_function above; anything else
+        // (`DIST 1W`, `SEASON 4H`) and the yellow-key form (`DIST US Equity`)
+        // load the ticker.
+        if ["VAULT", "VLT"].iter().any(|word| head.eq_ignore_ascii_case(word))
+            && rest.first().is_some_and(|verb| VAULT_VERBS.iter().any(|v| verb.eq_ignore_ascii_case(v)))
+        {
+            return None;
+        }
+        // A RESID verb with bad arguments is an error, never the ticker.
+        if head.eq_ignore_ascii_case("RESID") && resid_verb(rest) {
+            return None;
+        }
+        // Likewise an ATTR key word with bad arguments.
+        if head.eq_ignore_ascii_case("ATTR") && attr_key_word(rest) {
+            return None;
+        }
     }
     let (sec, used) = Security::resolve_tokens(&tokens)?;
     match tokens[used..].split_first() {
@@ -429,6 +1205,16 @@ pub fn hint(input: &str) -> String {
 
 fn describe(f: &Function) -> String {
     match f {
+        Function::StackLadder(frames) => format!("Trend Stack ladder {}", frames.as_ref().map(|f| f.iter().map(|t| t.label()).collect::<Vec<_>>().join("·")).unwrap_or_else(|| "AUTO".into())),
+        Function::StackTint(_) => "Regime Candle tint".into(),
+        Function::StackSession(_) => "Trend Stack session anchor".into(),
+        Function::StopCloud(_) => "ATR Stop Cloud · closed-bar guides and empirical Stop Odds".into(),
+        Function::AuctionMap(_) => "Auction Map · session profiles, composite, naked POC/VAH/VAL · ticker: AUCTION US Equity".into(),
+        Function::TrendCone { .. } => "Trend Cone · regime path quantiles + walk-forward coverage".into(),
+        Function::StackEdge(_) => "Trend Stack regime Edge study".into(),
+        Function::TruthRail(_) => "Truth Rail".into(),
+        Function::TstackTune(tf) => format!("TSTACK Plateau: 49 FDR-gated Edge tests{}", tf.map(|t| format!(" · {t}")).unwrap_or_default()),
+        Function::TrendStack(on) => format!("Trend Stack{}", match on { None => " toggle", Some(true) => " on", Some(false) => " off" }),
         Function::Timeframe(tf) => format!(
             "Interval {}",
             match tf {
@@ -454,16 +1240,60 @@ fn describe(f: &Function) -> String {
         Function::Range(r) => format!("Show {} at {}", r.label(), r.timeframe()),
         Function::Draw(t) => format!("Draw {}", t.label()),
         Function::ClearDrawings => "Remove all drawings".into(),
+        Function::UndoDrawings => "Undo the last drawing delete or clear on this symbol".into(),
         Function::Magnet => "Toggle magnet (snap to OHLC)".into(),
         Function::Congress => "Congressional trades".into(),
         Function::Politician(n) => format!("Politician profile: {n}"),
         Function::Track(n) => format!("Track {n} (alert on new filings)"),
         Function::Untrack(n) => format!("Stop tracking {n}"),
-        Function::Alerts => "Alerts".into(),
+        Function::Alerts => {
+            "Alerts: price levels, session VWAP crosses, session RVOL, session path/pace/gap/extreme/relative, setup changes, and tracked filings".into()
+        }
+        Function::TrailPlan(_) => "Set or clear a quote plan's trail (places no orders)".into(),
+        Function::BreakevenPlan(_) => "Set or clear a quote plan's breakeven rule (places no orders)".into(),
+        Function::MovePlanStop(_) => "Tighten a triggered quote plan's stop (places no orders)".into(),
+        Function::ArmPlan { .. } => "Arm an entry → stop/target quote plan (places no orders)".into(),
+        Function::Plans => "Open trade plans in Alerts".into(),
+        Function::CancelPlans(q) => format!("Cancel active trade plans for {q}"),
+        Function::SetPriceAlert(kind) => format!("Watch {}", kind.label()),
+        Function::ClearPriceAlert(q) if q.is_empty() => "Remove price/setup alerts for the focused name".into(),
+        Function::ClearPriceAlert(q) => format!("Remove price/setup alerts for {q}"),
         Function::Refresh => "Refresh congressional disclosures now".into(),
+        Function::History(args) => format!("Price history {args}"),
+        Function::Universe => "Browse Whats-News archive coverage".into(),
+        Function::Scan(name) => match tr_data::whats_news::ScanViewSpec::parse(name) {
+            Some(Ok(spec)) => spec.describe(),
+            Some(Err(e)) => e,
+            None => format!("Scan Whats-News archive: {name}"),
+        },
         Function::Watchlist => "Watchlist".into(),
-        Function::WatchAdd(s) => format!("Add {} to watchlist", s.join(", ")),
-        Function::WatchRemove(s) => format!("Remove {} from watchlist", s.join(", ")),
+        Function::Earnings => "Earnings calendar for the selected watchlist".into(),
+        Function::Intraday => {
+            "Intraday scan of the selected watchlist: session RVOL, close versus VWAP, and return versus SPY".into()
+        }
+        Function::IntradayDesk => {
+            "Intraday desk: 5-minute chart, ISCAN, breadth, and volume pace, saved as the Intraday layout".into()
+        }
+        Function::Vault(VaultCmd::Open) => {
+            "Bar Vault · verified closed intraday provider bars · for the tickers type VAULT US Equity / VLT US Equity"
+                .into()
+        }
+        Function::Vault(cmd) => format!("Bar Vault · {cmd:?} · verified closed intraday provider bars"),
+        Function::Cockpit { spec } => match cockpit_ladder(spec) {
+            Ok(frames) => format!(
+                "Intraday Cockpit: linked native {} charts with Time Link, Lens and anchored VWAP",
+                frames.iter().map(|t| t.label()).collect::<Vec<_>>().join(" · ")
+            ),
+            Err(e) => e,
+        },
+        Function::AnchoredVwap(cmd) => match cmd {
+            AnchorCmd::Arm => "Anchored VWAP: click a bar to anchor (verified bars only)".into(),
+            AnchorCmd::Open => "Anchored VWAP from today's cash open".into(),
+            AnchorCmd::High => "Anchored VWAP from the latest session's high bar".into(),
+            AnchorCmd::Low => "Anchored VWAP from the latest session's low bar".into(),
+            AnchorCmd::Clear => "Remove this name's anchored VWAPs".into(),
+        },
+        Function::WatchCommand(s) => format!("Watchlists: {s}"),
         Function::Layout(l) if l.trim().is_empty() => "Saved layouts".into(),
         Function::Layout(l) => format!("Layout {l}"),
         Function::Layouts => "Saved layouts".into(),
@@ -479,18 +1309,20 @@ fn describe(f: &Function) -> String {
         Function::PopOut => "Pop the focused pane out into its own window".into(),
         Function::Link(Some(l)) => format!("Link focused pane to the {} group", l.label()),
         Function::Link(None) => "Unlink focused pane".into(),
-        Function::News => "News headlines".into(),
+        Function::News => "Watchlist news (AAPL CN for one name)".into(),
+        Function::TopNews => "Top market headlines".into(),
         Function::OrderBook(_) => "Order book (depth)".into(),
         Function::Options => "Option chain: calls and puts by strike, IV and greeks".into(),
         Function::Sidebar(s) if s.is_empty() => "Toggle the sidebar".into(),
         Function::Sidebar(s) => format!("Sidebar {}", s.to_lowercase()),
-        Function::Settings => "Settings: theme, fonts, density, hotkeys, panels, layouts".into(),
+        Function::Settings => "Settings: theme, fonts, density, hotkeys, panels, layouts, backup".into(),
         Function::Update => "Check for updates".into(),
         Function::Theme(t) => format!("Theme {t}"),
         Function::Title(t) => format!("Rename tab to {t:?}"),
         Function::ClosePane => "Close focused pane".into(),
         Function::Help => "Help".into(),
         Function::Wei => "World markets overview".into(),
+        Function::Health => "Real data feed health".into(),
         Function::Curve => "US Treasury yield curve".into(),
         Function::Search(q) => format!("Search securities: {q}"),
         Function::Portfolio(v, a) if a.is_empty() => match v {
@@ -534,12 +1366,712 @@ fn describe(f: &Function) -> String {
         }
         Function::AccountMode(false) => "Switch to the DEMO account (paper trading)".into(),
         Function::AccountMode(true) => "Switch to LIVE brokerage accounts (asks first)".into(),
+        Function::Review => "Linked daily and weekly archive charts for candidate review".into(),
+        Function::Desk => {
+            "PM Desk: watchlist leaders, group performance, and position size from entry/stop/target/$ risk".into()
+        }
+        Function::Journal(q) if q.is_empty() => {
+            "Trade journal: setups, checklist, planned risk, outcomes in $ and R".into()
+        }
+        Function::Journal(q) => format!("Trade journal: {q}"),
+        Function::Studio { spec } => format!("Studio · native canvas and named lenses · {spec}"),
+        Function::StudioLab { spec } => format!("Regression Lab · multi-factor OLS, purged holdout, HAC · {spec}"),
+        Function::StudioResid { spec } => format!("Residual tickers · frozen fit scored on live data, never refit · {spec}"),
+        Function::StudioAttr { spec } => format!("Attribution · actual = drift + factors + residual, frozen fit never refit · {spec}"),
+        Function::StudioWhen { spec } => format!("When · fixed-family within-clock rule evidence · {spec}"),
+        Function::StudioRelate { spec } => {
+            format!("Relate · transforms, β and frozen-fit fair-value bands · {spec}")
+        }
+        Function::StudioQuick {spec} => format!("Quick canvas · level/index100/change/z/vol · {spec}"),
+        Function::DistributionStrip => "Toggle the closed-value distribution strip".into(),
+        Function::StudioRoute(route) => route.reason().into(),
+        Function::StudioCorr { spec } => format!(
+            "Relationship Studio · {} · for the tickers type CORR US Equity / RBETA US Equity",
+            if spec.is_empty() { "SPY" } else { spec }
+        ),
+        Function::StudioSeason { spec } => {
+            format!("Seasonality Studio {spec} · for the tickers type SEASON US Equity / SSN US Equity")
+        }
+        Function::Stats { condition, conditional } if condition.is_empty() => {
+            if *conditional {
+                "Conditional returns: what followed a filter vs the unconditional baseline".into()
+            } else {
+                "Statistics: historical risk, returns, RSI/KAMA bins and seasonality".into()
+            }
+        }
+        Function::Stats { condition, .. } => format!("Conditional returns after {condition}"),
+        Function::StudioDistHorizon(h) => format!("DIST Shape: {h}-bar log returns"),
+        Function::StudioDist { timeframe } => format!(
+            "Distribution Studio: {} log returns, tails, QQ, drawdowns and regimes · for the tickers type DIST US Equity / RDIST US Equity",
+            timeframe.label()
+        ),
+        Function::Backtest { spec } if spec.is_empty() => {
+            "Honest backtest: DSR, purged walk-forward and holdout tables vs buy-and-hold".into()
+        }
+        Function::Backtest { spec } => format!("Paper backtest vs buy-and-hold ({spec})"),
+        Function::IntradayBacktest { spec } if spec.is_empty() => {
+            "Honest intraday backtest: DSR and session walk-forward vs session hold".into()
+        }
+        Function::IntradayBacktest { spec } => format!("Paper intraday backtest ({spec})"),
+        Function::IntradayCompare { spec } if spec.is_empty() => {
+            "Intraday compare: each name as percent from its own 09:30 open, with SPY on the same clock".into()
+        }
+        Function::IntradayCompare { spec } => format!("Intraday compare from the 09:30 open ({spec})"),
+        Function::SessionPath { spec } if spec.is_empty() => {
+            "Session path: today versus the mean of prior sessions, each percent from its own 09:30 open".into()
+        }
+        Function::SessionPath { spec } => format!("Session path versus prior 09:30 opens ({spec})"),
+        Function::TrendWall { spec } => format!("Trend Wall from verified native bars ({spec})"),
+        Function::EdgeWall { spec } => format!("Edge Wall: wall-wide FDR evidence ({spec})"),
+        Function::Rotation { spec } => format!("Relative rotation graph from the verified research archive ({spec})"),
+        Function::Breadth { spec } if spec.is_empty() => {
+            "Session breadth: share of the watchlist at or above the 09:30 open and session VWAP".into()
+        }
+        Function::Breadth { spec } => format!("Session breadth at or above the open and VWAP ({spec})"),
+        Function::VolumePace { spec } if spec.is_empty() => {
+            "Volume pace: today's cumulative shares versus the mean of prior sessions".into()
+        }
+        Function::RealizedVol { spec } if spec.is_empty() => {
+            "Realized volatility: session and rolling log-return variation".into()
+        }
+        Function::Autocorr { spec } if spec.is_empty() => {
+            "Return autocorrelation: lag-one correlation of adjacent intraday returns".into()
+        }
+        Function::VolumePace { spec } => format!("Volume pace versus prior sessions ({spec})"),
+        Function::RealizedVol { spec } => format!("Realized volatility, rolling returns ({spec})"),
+        Function::Autocorr { spec } => format!("Return autocorrelation, rolling returns ({spec})"),
+        Function::GapFill { spec } if spec.is_empty() => {
+            "Gap fill: today's 09:30 open versus the prior cash close, and how often same-direction gaps had filled"
+                .into()
+        }
+        Function::GapFill { spec } => format!("Gap fill versus the prior cash close ({spec})"),
+        Function::SessionExtreme { spec } if spec.is_empty() => {
+            "Session extreme: when the high and the low print, against completed prior sessions".into()
+        }
+        Function::SessionExtreme { spec } => format!("Session extreme versus completed sessions ({spec})"),
+        Function::SessionClock { spec } => format!("Session Clock: weekday by cash-bucket returns ({spec})"),
+        Function::RelativePath { spec } if spec.is_empty() => {
+            "Relative path: percent from the 09:30 open minus SPY, against prior sessions".into()
+        }
+        Function::RelativePath { spec } => format!("Relative path versus SPY ({spec})"),
+        Function::SessionBrief => {
+            "Session brief: path, pace, gap, extreme, and versus SPY for one name, on verified 5-minute bars".into()
+        }
+        Function::CashLevels => {
+            "Chart levels: prior cash close, 09:30 open, opening-range high and low, and session VWAP".into()
+        }
+        Function::Lookalike { spec } if spec.is_empty() => {
+            "Historical lookalikes: nearest past conditions, per-horizon counts, jump to neighbor dates".into()
+        }
+        Function::Lookalike { spec } => format!("Historical lookalikes ({spec})"),
+        Function::Goto { date } if date.is_empty() => "Jump the focused archive chart to a YYYY-MM-DD session".into(),
+        Function::Goto { date } => format!("Jump the archive chart to {date}"),
+        Function::JournalNote { date, text } if date.is_empty() && text.is_empty() => {
+            "Attach a note to the focused chart date".into()
+        }
+        Function::JournalNote { date, text } if date.is_empty() => format!("Note on the focused chart date: {text}"),
+        Function::JournalNote { date, text } if text.is_empty() => format!("Open journal notes for {date}"),
+        Function::JournalNote { date, text } => format!("Note on {date}: {text}"),
+        Function::Latest => "Jump the focused chart to the latest candle".into(),
+        Function::ReviewOverlay(ReviewOverlay::BoxLevels) => {
+            "Toggle box levels (20-bar / 3-bar confirmation on this interval)".into()
+        }
+        Function::ReviewOverlay(ReviewOverlay::Strength) => {
+            "Toggle 21-bar close return (this series, not SPY-relative)".into()
+        }
+        Function::ReviewOverlay(ReviewOverlay::Volume) => {
+            "Toggle volume context (this bar / prior 20, plus 5/20)".into()
+        }
+        Function::Export(ExportKind::Auto, p) if p.is_empty() => {
+            "Export the focused scan, history or journal (or open Backup settings)".into()
+        }
+        Function::Export(ExportKind::Auto, p) => format!("Export the focused pane to {p}"),
+        Function::Export(ExportKind::Scan, p) if p.is_empty() => {
+            "Export scan / universe results with source and date".into()
+        }
+        Function::Export(ExportKind::Scan, p) => format!("Export scan results to {p}"),
+        Function::Export(ExportKind::Journal, p) if p.is_empty() => "Export trade journal entries".into(),
+        Function::Export(ExportKind::Journal, p) => format!("Export journal to {p}"),
+        Function::Export(ExportKind::History, p) if p.is_empty() => {
+            "Export archived daily price history with source and dates".into()
+        }
+        Function::Export(ExportKind::History, p) => format!("Export price history to {p}"),
+        Function::Export(ExportKind::Stats, p) if p.is_empty() => {
+            "Export statistics and conditional returns with source, as-of and provenance".into()
+        }
+        Function::Export(ExportKind::Stats, p) => format!("Export statistics to {p}"),
+        Function::Export(ExportKind::Backtest, p) if p.is_empty() => {
+            "Export the paper backtest with costs, holdout, execution and provenance".into()
+        }
+        Function::Export(ExportKind::Backtest, p) => format!("Export backtest to {p}"),
+        Function::Export(ExportKind::Lookalike, p) if p.is_empty() => {
+            "Export lookalikes with source, as-of, per-horizon counts and overlap".into()
+        }
+        Function::Export(ExportKind::Lookalike, p) => format!("Export lookalikes to {p}"),
+        Function::Export(ExportKind::Workspace, p) if p.is_empty() => {
+            "Back up personal workspace data (credentials excluded)".into()
+        }
+        Function::Export(ExportKind::Workspace, p) => format!("Back up workspace to {p}"),
+        Function::Backup(p) if p.is_empty() => "Back up personal workspace data (credentials excluded)".into(),
+        Function::Backup(p) => format!("Back up workspace to {p}"),
+        Function::Restore(p) if p.is_empty() => "Restore a workspace, journal or history export".into(),
+        Function::Restore(p) => format!("Restore {p}"),
     }
 }
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn stops_commands_aliases_and_subcommands_parse() {
+        use StopCmd::*;
+        for (text, cmd) in [
+            ("STOPS", Toggle(None)),
+            ("SCLOUD", Toggle(None)),
+            ("TSTACK STOPS", Toggle(None)),
+            ("STOPS ON", Toggle(Some(true))),
+            ("STOPS OFF", Toggle(Some(false))),
+            ("STOPS K 1 2 3", Multiples(vec![1.0, 2.0, 3.0])),
+            ("STOPS K 0.25 6", Multiples(vec![0.25, 6.0])),
+            ("STOPS H 12 48", Horizons(Some((12, 48)))),
+            ("STOPS H AUTO", Horizons(None)),
+            ("STOPS ODDS ON", Odds(true)),
+            ("STOPS ODDS OFF", Odds(false)),
+        ] {
+            assert_eq!(parse(text), Some(Command::Function(Function::StopCloud(cmd))), "{text}");
+        }
+        assert_eq!(
+            parse("AAPL STOPS"),
+            Some(Command::SymbolFunction("AAPL US Equity".into(), Function::StopCloud(Toggle(None))))
+        );
+    }
+    #[test]
+    fn stops_rejects_bad_arguments() {
+        for text in [
+            "STOPS FOO",
+            "SCLOUD FOO",
+            "TSTACK STOPS FOO",
+            "STOPS K 0",
+            "STOPS K 3 2",
+            "STOPS K",
+            "STOPS K NaN",
+            "STOPS K 1 1",
+            "STOPS K 7",
+            "STOPS H 48 12",
+            "STOPS H 0 5",
+            "STOPS H 1 251",
+            "STOPS H 12",
+            "STOPS ODDS MAYBE",
+        ] {
+            assert_eq!(parse(text), None, "{text}");
+        }
+    }
+    #[test]
+    fn stops_words_with_a_yellow_key_load_the_ticker() {
+        for word in ["STOPS", "SCLOUD"] {
+            assert!(tr_core::catalog::lookup(word, None).is_none());
+        }
+        for text in [
+            "STOPS US Equity",
+            "STOPS Equity",
+            "SCLOUD Equity",
+            "SCLOUD US Equity",
+            "stops us equity <GO>",
+            "ZZZS US Equity",
+        ] {
+            assert!(matches!(parse(text), Some(Command::Symbol(_))), "{text}");
+        }
+        assert!(
+            matches!(parse("STOPS US Equity 1h"),Some(Command::SymbolFunction(s,Function::Timeframe(Timeframe::H1))) if s=="STOPS US Equity")
+        );
+    }
+    #[test]
+    fn relationship_studio_commands() {
+        for alias in ["CORR", "RBETA"] {
+            assert_eq!(parse(alias), Some(Command::Function(Function::StudioCorr { spec: String::new() })));
+        }
+        assert_eq!(
+            parse("AAPL CORR"),
+            Some(Command::SymbolFunction("AAPL US Equity".into(), Function::StudioCorr { spec: String::new() }))
+        );
+        assert_eq!(
+            parse("AAPL CORR QQQ"),
+            Some(Command::SymbolFunction("AAPL US Equity".into(), Function::StudioCorr { spec: "QQQ".into() }))
+        );
+        assert_eq!(
+            parse("AAPL RBETA QQQ 1H"),
+            Some(Command::SymbolFunction("AAPL US Equity".into(), Function::StudioCorr { spec: "QQQ 1H".into() }))
+        );
+    }
+
+    #[test]
+    fn vault_commands_alias_symbol_and_guard() {
+        for cmd in ["VAULT", "VLT"] {
+            assert_eq!(parse(cmd), Some(Command::Function(Function::Vault(VaultCmd::Open))));
+        }
+        assert_eq!(
+            parse("AAPL VAULT"),
+            Some(Command::SymbolFunction("AAPL US Equity".into(), Function::Vault(VaultCmd::Open)))
+        );
+        assert_eq!(parse("VAULT VERIFY"), Some(Command::Function(Function::Vault(VaultCmd::Verify))));
+        assert_eq!(parse("VAULT PRUNE"), Some(Command::Function(Function::Vault(VaultCmd::Prune))));
+        for (text, tf) in [
+            ("VAULT DROP AAPL", None),
+            ("VLT DROP AAPL 1m", Some(Timeframe::M1)),
+            ("VAULT DROP AAPL US Equity 5m", Some(Timeframe::M5)),
+        ] {
+            assert_eq!(
+                parse(text),
+                Some(Command::Function(Function::Vault(VaultCmd::Drop { symbol: "AAPL US Equity".into(), tf })))
+            );
+        }
+        for text in [
+            "VAULT FOO",
+            "VLT FOO",
+            "VAULT DROP",
+            "VAULT DROP AAPL 1d",
+            "VAULT DROP AAPL 1m extra",
+            "VLT VERIFY NOW",
+            "vault prune all",
+        ] {
+            assert!(parse(text).is_none(), "{text}");
+        }
+        assert_eq!(parse("VAULT US Equity"), Some(Command::Symbol("VAULT US Equity".into())));
+    }
+    #[test]
+    fn studio_words_do_not_shadow_their_tickers() {
+        for word in ["DIST", "RDIST", "SEASON", "SSN", "CORR", "RBETA"] {
+            let key = format!("{word} US Equity");
+            // Bare word: the Studio command.
+            let Some(Command::Function(f)) = parse(word) else { panic!("{word} bare must be a Studio command") };
+            assert!(
+                matches!(f, Function::StudioDist { .. } | Function::StudioSeason { .. } | Function::StudioCorr { .. }),
+                "{word}"
+            );
+            // Word plus valid Studio arguments: still the command.
+            let with_args = format!("{word} 30m");
+            let Some(Command::Function(f)) = parse(&with_args) else { panic!("{with_args} must be a Studio command") };
+            assert!(
+                matches!(f, Function::StudioDist { .. } | Function::StudioSeason { .. } | Function::StudioCorr { .. }),
+                "{with_args}"
+            );
+            // Market-suffix forms load the ticker.
+            for text in [
+                format!("{word} US Equity"),
+                format!("{word} Equity"),
+                format!("{} us equity <GO>", word.to_lowercase()),
+            ] {
+                assert_eq!(parse(&text), Some(Command::Symbol(key.clone())), "{text}");
+            }
+            assert_eq!(
+                parse(&format!("{word} US Equity 1h")),
+                Some(Command::SymbolFunction(key.clone(), Function::Timeframe(Timeframe::H1))),
+                "{word} US Equity 1h"
+            );
+            // The ticker's own Studio pane.
+            assert!(
+                matches!(parse(&format!("{word} US Equity DIST")), Some(Command::SymbolFunction(k, Function::StudioDist { .. })) if k == key)
+            );
+            // Arguments that are not Studio arguments load the ticker with an interval.
+            assert_eq!(
+                parse(&format!("{word} 1W")),
+                Some(Command::SymbolFunction(key.clone(), Function::Timeframe(Timeframe::W1))),
+                "{word} 1W"
+            );
+        }
+        // LAB / RESID / ATTR are listed tickers; their routes live behind STUDIO.
+        for word in ["LAB", "RESID", "ATTR"] {
+            assert_eq!(parse(word), Some(Command::Symbol(format!("{word} US Equity"))), "{word}");
+            assert_eq!(parse(&format!("{word} US Equity")), Some(Command::Symbol(format!("{word} US Equity"))));
+        }
+        for (arg, route) in [
+            ("lab", tr_data::studio::StudioRoute::Lab),
+            ("resid", tr_data::studio::StudioRoute::Resid),
+            ("ATTR", tr_data::studio::StudioRoute::Attr),
+        ] {
+            assert_eq!(
+                parse(&format!("STUDIO {arg}")),
+                Some(Command::Function(Function::StudioRoute(route))),
+                "STUDIO {arg}"
+            );
+        }
+        // QUICK and WHEN follow the same shadow rules, including a weekly interval.
+        for word in ["QUICK", "WHEN"] {
+            let key = format!("{word} US Equity");
+            assert!(matches!(parse(word), Some(Command::Function(_))), "{word}");
+            assert_eq!(parse(&key), Some(Command::Symbol(key.clone())), "{word}");
+            assert_eq!(
+                parse(&format!("{word} 1W")),
+                Some(Command::SymbolFunction(key.clone(), Function::Timeframe(Timeframe::W1))),
+                "{word} 1W"
+            );
+            assert_eq!(parse(&format!("{} us equity <GO>", word.to_lowercase())), Some(Command::Symbol(key)));
+        }
+        assert_eq!(parse("CORR QQQ 1H"), Some(Command::Function(Function::StudioCorr { spec: "QQQ 1H".into() })));
+        assert_eq!(parse("SSN 1h"), Some(Command::Function(Function::StudioSeason { spec: "1h".into() })));
+        assert_eq!(
+            parse("SEASON 4H"),
+            Some(Command::SymbolFunction("SEASON US Equity".into(), Function::Timeframe(Timeframe::H4)))
+        );
+        assert_eq!(parse("RDIST 1D"), Some(Command::Function(Function::StudioDist { timeframe: Timeframe::D1 })));
+        for word in ["DIST", "RDIST", "SEASON", "SSN", "CORR", "RBETA"] {
+            assert!(hint(word).contains(&format!("{word} US Equity")), "{word}");
+        }
+    }
+    #[test]
+    fn vault_and_vlt_tickers_still_load() {
+        for t in ["VAULT", "VLT"] {
+            let key = format!("{t} US Equity");
+            for text in
+                [format!("{t} US Equity"), format!("{t} Equity"), format!("{} us equity <GO>", t.to_lowercase())]
+            {
+                assert_eq!(parse(&text), Some(Command::Symbol(key.clone())), "{text}");
+            }
+            assert_eq!(
+                parse(&format!("{t} 5m")),
+                Some(Command::SymbolFunction(key.clone(), Function::Timeframe(Timeframe::M5)))
+            );
+            assert_eq!(
+                parse(&format!("{t} US Equity 1h")),
+                Some(Command::SymbolFunction(key.clone(), Function::Timeframe(Timeframe::H1)))
+            );
+            // The ticker's own vault pane, and dropping the ticker's vault rows.
+            assert_eq!(
+                parse(&format!("{t} US Equity VAULT")),
+                Some(Command::SymbolFunction(key.clone(), Function::Vault(VaultCmd::Open)))
+            );
+            assert_eq!(
+                parse(&format!("VAULT DROP {t} US Equity 1m")),
+                Some(Command::Function(Function::Vault(VaultCmd::Drop {
+                    symbol: key.clone(),
+                    tf: Some(Timeframe::M1)
+                })))
+            );
+        }
+        assert!(hint("VLT").contains("VLT US Equity"));
+        assert_eq!(parse("ZZZT"), Some(Command::Symbol("ZZZT US Equity".into())));
+    }
+    #[test]
+    fn tstack_edge_command() {
+        for (text, on) in [("TSTACK EDGE", None), ("TSTACK EDGE ON", Some(true)), ("TSTACK EDGE OFF", Some(false))] {
+            assert_eq!(parse(text), Some(Command::Function(Function::StackEdge(on))));
+        }
+        assert_eq!(
+            parse("AAPL TSTACK EDGE ON"),
+            Some(Command::SymbolFunction("AAPL US Equity".into(), Function::StackEdge(Some(true))))
+        );
+        assert!(matches!(parse("EDGE"), Some(Command::Symbol(_))));
+    }
+    #[test]
+    fn health_command_and_src_alias() {
+        assert_eq!(parse("HEALTH"), Some(Command::Function(Function::Health)));
+        assert_eq!(parse("SRC"), Some(Command::Function(Function::Health)));
+        assert!(matches!(parse("SRC US Equity"), Some(Command::Symbol(_))));
+    }
+    #[test]
+    fn tstack_ladder_tokens_parse() {
+        use Timeframe::*;
+        assert_eq!(parse("TSTACK 5m 30m 4H"), Some(Command::Function(Function::StackLadder(Some(vec![M5, M30, H4])))));
+        assert_eq!(parse("TSTACK 1D 1W 1M"), Some(Command::Function(Function::StackLadder(Some(vec![D1, W1, MN1])))));
+        assert_eq!(parse("TSTACK AUTO"), Some(Command::Function(Function::StackLadder(None))));
+        assert_eq!(parse("TSTACK TINT"), Some(Command::Function(Function::StackTint(None))));
+        assert_eq!(parse("TSTACK TINT ON"), Some(Command::Function(Function::StackTint(Some(true)))));
+        assert_eq!(parse("TSTACK SESSION OFF"), Some(Command::Function(Function::StackSession(Some(false)))));
+        assert_eq!(parse("RAIL OFF"), Some(Command::Function(Function::TruthRail(Some(false)))));
+    }
+    #[test]
+    fn custom_ladder_rejects_descending_duplicate_sub_base_and_bare_letters() {
+        for text in [
+            "TSTACK 30m 5m",
+            "TSTACK 5m 5m",
+            "TSTACK D W",
+            "TSTACK 1D W",
+            "TSTACK 5m",
+            "TSTACK 7m 30m",
+            "TSTACK TINT ON EXTRA",
+            "RAIL ON EXTRA",
+        ] {
+            assert!(parse(text).is_none(), "{text}");
+        }
+    }
+    #[test]
+    fn cockpit_and_alias_parse_with_and_without_ladder() {
+        for alias in ["COCKPIT", "CKPT", "cockpit"] {
+            assert_eq!(parse(alias), Some(Command::Function(Function::Cockpit { spec: String::new() })));
+        }
+        assert_eq!(
+            parse("AAPL COCKPIT"),
+            Some(Command::SymbolFunction("AAPL US Equity".into(), Function::Cockpit { spec: String::new() }))
+        );
+        assert_eq!(parse("CKPT 5m 15m 1h"), Some(Command::Function(Function::Cockpit { spec: "5m 15m 1h".into() })));
+        assert_eq!(
+            parse("NVDA COCKPIT 1m 5m 30m"),
+            Some(Command::SymbolFunction("NVDA US Equity".into(), Function::Cockpit { spec: "1m 5m 30m".into() }))
+        );
+        use Timeframe::*;
+        assert_eq!(cockpit_ladder(""), Ok([M1, M5, M15]));
+        assert_eq!(cockpit_ladder("5m 15m 1h"), Ok([M5, M15, H1]));
+        assert!(hint("COCKPIT").contains("1m · 5m · 15m"));
+    }
+
+    #[test]
+    fn cockpit_rejects_descending_duplicate_and_daily_ladders() {
+        for spec in ["15m 5m 1m", "5m 5m 15m", "1m 5m 1D", "1D 1W 1M", "1m 5m", "1m 5m 15m 1h", "1m 5m 7q"] {
+            assert!(cockpit_ladder(spec).is_err(), "{spec}");
+            // The command still parses, so the app can answer with a status message.
+            let parsed = parse(&format!("COCKPIT {spec}"));
+            assert_eq!(parsed, Some(Command::Function(Function::Cockpit { spec: spec.into() })));
+            assert!(hint(&format!("COCKPIT {spec}")).starts_with("COCKPIT"), "{spec}");
+        }
+    }
+
+    #[test]
+    fn avwap_subcommands_parse() {
+        for (text, cmd) in [
+            ("AVWAP", AnchorCmd::Arm),
+            ("AVWAP OPEN", AnchorCmd::Open),
+            ("avwap high", AnchorCmd::High),
+            ("AVWAP LOW", AnchorCmd::Low),
+            ("AVWAP CLEAR", AnchorCmd::Clear),
+        ] {
+            assert_eq!(parse(text), Some(Command::Function(Function::AnchoredVwap(cmd))), "{text}");
+        }
+        assert_eq!(
+            parse("AAPL AVWAP OPEN"),
+            Some(Command::SymbolFunction("AAPL US Equity".into(), Function::AnchoredVwap(AnchorCmd::Open)))
+        );
+        assert!(parse("AVWAP FOO").is_none());
+        assert!(parse("AVWAP OPEN EXTRA").is_none());
+    }
+
+    #[test]
+    fn unknown_tickers_still_parse_as_symbols_after_cockpit_and_avwap() {
+        for ticker in ["CKP", "COCK", "AVW", "AVWA", "COCKPITS"] {
+            assert_eq!(parse(ticker), Some(Command::Symbol(format!("{ticker} US Equity"))), "{ticker}");
+        }
+        assert!(matches!(parse("COCKPIT US Equity"), Some(Command::Symbol(_))));
+        assert!(matches!(parse("AVWAP US Equity"), Some(Command::Symbol(_))));
+        assert!(matches!(parse("CKPT US Equity"), Some(Command::Symbol(_))));
+    }
+
+    #[test]
+    fn new_tstack_d_is_still_a_symbol() {
+        assert_eq!(parse("NEW TSTACK D"), Some(Command::Function(Function::NewPanel("TSTACK D".into()))));
+        for ticker in ["D", "W", "M"] {
+            let (sec, used) = Security::resolve_tokens(&[ticker]).unwrap();
+            assert_eq!(sec.ticker, ticker);
+            assert_eq!(used, 1);
+        }
+    }
+
+    #[test]
+    fn ewall_parses_with_and_without_spec() {
+        for (input, spec) in [("EWALL", ""), ("EWALL D WL Growth", "D WL Growth")] {
+            assert_eq!(parse(input), Some(Command::Function(Function::EdgeWall { spec: spec.into() })));
+        }
+    }
+    #[test]
+    fn ewall_us_equity_is_a_symbol() {
+        assert_eq!(parse("EWALL US Equity"), Some(Command::Symbol("EWALL US Equity".into())));
+    }
+    #[test]
+    fn twall_and_aliases_parse() {
+        for alias in ["TWALL", "TGRID", "STACKS", "MTFGRID"] {
+            assert_eq!(parse(alias), Some(Command::Function(Function::TrendWall { spec: String::new() })));
+        }
+        for (input, spec) in [
+            ("TWALL D", "D"),
+            ("TWALL WL Growth", "WL Growth"),
+            ("TWALL AAPL MSFT NVDA", "AAPL MSFT NVDA"),
+            ("TWALL EDGE", "EDGE"),
+        ] {
+            assert_eq!(parse(input), Some(Command::Function(Function::TrendWall { spec: spec.into() })));
+        }
+        assert_eq!(parse("TGRID US Equity"), Some(Command::Symbol("TGRID US Equity".into())));
+    }
+
     use super::*;
+
+    #[test]
+    fn tune_parses_without_stealing_ticker_or_stack_commands() {
+        assert_eq!(parse("TSTACK TUNE"), Some(Command::Function(Function::TstackTune(None))));
+        assert_eq!(parse("TSTACK TUNE 5m"), Some(Command::Function(Function::TstackTune(Some(Timeframe::M5)))));
+        assert_eq!(
+            parse("AAPL TSTACK TUNE 1H"),
+            Some(Command::SymbolFunction("AAPL US Equity".into(), Function::TstackTune(Some(Timeframe::H1))))
+        );
+        assert_eq!(
+            parse("aapl stack tune"),
+            Some(Command::SymbolFunction("AAPL US Equity".into(), Function::TstackTune(None)))
+        );
+        for bad in ["TSTACK TUNE nonsense", "TSTACK TUNE 5m 1H", "AAPL TSTACK TUNE OFF"] {
+            assert!(parse(bad).is_none(), "{bad}");
+        }
+        assert_eq!(parse("TUNE"), Some(Command::Symbol("TUNE US Equity".into())));
+        assert_eq!(
+            parse("TUNE 5m"),
+            Some(Command::SymbolFunction("TUNE US Equity".into(), Function::Timeframe(Timeframe::M5)))
+        );
+        assert_eq!(parse("TUNE US Equity"), Some(Command::Symbol("TUNE US Equity".into())));
+    }
+
+    #[test]
+    fn tstack_and_aliases_parse() {
+        for alias in ["TSTACK", "STACK", "MTF", "REGIME"] {
+            assert_eq!(parse(alias), Some(Command::Function(Function::TrendStack(None))));
+            assert_eq!(parse(&format!("{alias} ON")), Some(Command::Function(Function::TrendStack(Some(true)))));
+        }
+        assert_eq!(parse("TSTACK OFF"), Some(Command::Function(Function::TrendStack(Some(false)))));
+        assert_eq!(
+            parse("AAPL TSTACK"),
+            Some(Command::SymbolFunction("AAPL US Equity".into(), Function::TrendStack(None)))
+        );
+        assert!(parse("TSTACK FOO").is_none());
+        assert!(parse("TSTACK ON FOO").is_none());
+        assert!(matches!(parse("STACK US Equity"), Some(Command::Symbol(_))));
+    }
+
+    #[test]
+    fn rrg_and_aliases_parse() {
+        for cmd in ["RRG", "ROT", "ROTATION", "ROTATE"] {
+            assert_eq!(parse(cmd), Some(Command::Function(Function::Rotation { spec: String::new() })));
+        }
+        assert_eq!(
+            parse("AAPL RRG MSFT VS QQQ"),
+            Some(Command::SymbolFunction("AAPL US Equity".into(), Function::Rotation { spec: "MSFT VS QQQ".into() }))
+        );
+    }
+
+    #[test]
+    fn plan_command_parses_be_and_trail_forms() {
+        for (args, be, kind, value) in [
+            ("BE 1 TRAIL 2R", 1.0, TrailKind::R, 2.0),
+            ("TRAIL 3% BREAKEVEN 1.5R", 1.5, TrailKind::Percent, 3.0),
+            ("BE 1 TRAIL 4.2", 1.0, TrailKind::Price, 4.2),
+            ("RISK 300 TRAIL 2r TARGET 130 be 1r", 1.0, TrailKind::R, 2.0),
+        ] {
+            let cmd = format!("NVDA PLAN 100 STOP 90 {args}");
+            let Some(Command::SymbolFunction(_, Function::ArmPlan { breakeven, trail, .. })) = parse(&cmd) else {
+                panic!("{cmd}")
+            };
+            assert_eq!(breakeven, Some(be));
+            assert_eq!(trail, Some(TrailSpec { kind, value, source: "command".into() }));
+        }
+        for args in [
+            "BE 1 BE 2",
+            "BE 1 BREAKEVEN 2",
+            "TRAIL 1R TRAIL 2R",
+            "BE 0",
+            "BE NaN",
+            "BE 21",
+            "TRAIL -1",
+            "TRAIL 50%",
+            "TRAIL 21R",
+            "TRAIL INF",
+            "BE OFF",
+            "TRAIL OFF",
+            "TRAIL 2R extra",
+        ] {
+            assert!(parse(&format!("NVDA PLAN 100 STOP 90 {args}")).is_none(), "{args}");
+        }
+    }
+
+    #[test]
+    fn trail_breakeven_movestop_commands_parse() {
+        for (text, function) in [
+            (
+                "TRAIL 1.5R",
+                Function::TrailPlan(Some(TrailSpec { kind: TrailKind::R, value: 1.5, source: "command".into() })),
+            ),
+            (
+                "TRAIL 3%",
+                Function::TrailPlan(Some(TrailSpec { kind: TrailKind::Percent, value: 3.0, source: "command".into() })),
+            ),
+            (
+                "TRAIL 4.2",
+                Function::TrailPlan(Some(TrailSpec { kind: TrailKind::Price, value: 4.2, source: "command".into() })),
+            ),
+            ("TRAIL OFF", Function::TrailPlan(None)),
+            ("BREAKEVEN 1r", Function::BreakevenPlan(Some(1.0))),
+            ("breakeven off", Function::BreakevenPlan(None)),
+            ("MOVESTOP 145", Function::MovePlanStop(145.0)),
+        ] {
+            assert_eq!(parse(text), Some(Command::Function(function.clone())));
+            assert_eq!(
+                parse(&format!("NVDA {text}")),
+                Some(Command::SymbolFunction("NVDA US Equity".into(), function.clone()))
+            );
+            assert!(describe(&function).ends_with("(places no orders)"));
+        }
+        for text in [
+            "TRAIL 0",
+            "TRAIL NaN",
+            "TRAIL 21R",
+            "BREAKEVEN 0",
+            "BREAKEVEN 21",
+            "BREAKEVEN 1RR",
+            "MOVESTOP 0",
+            "MOVESTOP OFF",
+            "MOVESTOP 1 extra",
+        ] {
+            assert!(parse(&format!("NVDA {text}")).is_none(), "{text}");
+        }
+    }
+
+    #[test]
+    fn bare_be_still_parses_as_a_security() {
+        assert_eq!(parse("BE"), Some(Command::Symbol("BE US Equity".into())));
+        assert_eq!(
+            parse("BE PLAN 100 STOP 90 BE 1"),
+            Some(Command::SymbolFunction(
+                "BE US Equity".into(),
+                Function::ArmPlan {
+                    entry: 100.0,
+                    stop: 90.0,
+                    target: None,
+                    risk: None,
+                    breakeven: Some(1.0),
+                    trail: None
+                }
+            ))
+        );
+    }
+
+    #[test]
+    fn plan_command_parses_levels_target_and_risk() {
+        for (command, target, risk) in [
+            ("NVDA PLAN 142.5 STOP 138.2 TARGET 151.1 RISK 300", Some(151.1), Some(300.0)),
+            ("nvda plan 142.5 stop 138.2 risk 300", None, Some(300.0)),
+            ("NVDA PLAN 142.5 STOP 138.2", None, None),
+            ("NVDA PLAN 142.5 STOP 138.2 TGT 151.1", Some(151.1), None),
+        ] {
+            assert_eq!(
+                parse(command),
+                Some(Command::SymbolFunction(
+                    "NVDA US Equity".into(),
+                    Function::ArmPlan { entry: 142.5, stop: 138.2, target, risk, breakeven: None, trail: None }
+                ))
+            );
+        }
+        for command in [
+            "NVDA PLAN 142.5",
+            "NVDA PLAN 142.5 138.2",
+            "NVDA PLAN x STOP 138.2",
+            "NVDA PLAN 142.5 STOP NaN",
+            "NVDA PLAN 142.5 STOP 138.2 RISK 0",
+            "NVDA PLAN 142.5 STOP 138.2 TARGET -1",
+            "NVDA PLAN 142.5 STOP 138.2 RISK",
+            "NVDA PLAN 142.5 STOP 138.2 TARGET 151 TARGET 152",
+        ] {
+            assert!(parse(command).is_none(), "{command}");
+        }
+    }
+
+    #[test]
+    fn plans_and_unplan_parse() {
+        assert_eq!(parse("PLANS"), Some(Command::Function(Function::Plans)));
+        assert_eq!(parse("unplan nvda"), Some(Command::Function(Function::CancelPlans("nvda".into()))));
+        assert!(describe(&Function::Plans).contains("trade plans"));
+    }
 
     #[test]
     fn symbols() {
@@ -573,6 +2105,157 @@ mod tests {
     }
 
     #[test]
+    fn distribution_studio_commands() {
+        for alias in ["DIST", "RDIST", "dist"] {
+            assert_eq!(parse(alias), Some(Command::Function(Function::StudioDist { timeframe: Timeframe::D1 })));
+        }
+        assert_eq!(
+            parse("AAPL DIST"),
+            Some(Command::SymbolFunction("AAPL US Equity".into(), Function::StudioDist { timeframe: Timeframe::D1 }))
+        );
+        assert_eq!(parse("DIST 1H"), Some(Command::Function(Function::StudioDist { timeframe: Timeframe::H1 })));
+        assert_eq!(
+            parse("AAPL RDIST 30m"),
+            Some(Command::SymbolFunction("AAPL US Equity".into(), Function::StudioDist { timeframe: Timeframe::M30 }))
+        );
+        assert_eq!(
+            parse("AAPL US Equity DIST 1m"),
+            Some(Command::SymbolFunction("AAPL US Equity".into(), Function::StudioDist { timeframe: Timeframe::M1 }))
+        );
+        for invalid in ["AAPL DIST 1W", "AAPL DIST nonsense", "AAPL DIST 1H junk"] {
+            assert_eq!(parse(invalid), None);
+        }
+        assert!(hint("DIST 1H").contains("Distribution Studio"));
+    }
+
+    #[test]
+    fn research_commands() {
+        assert_eq!(parse("hist"), Some(Command::Function(Function::History(String::new()))));
+        assert_eq!(parse("HIST ADD aapl,msft"), Some(Command::Function(Function::History("ADD AAPL,MSFT".into()))));
+        for action in ["REFRESH", "CANCEL", "RESUME", "RETRY"] {
+            assert_eq!(parse(&format!("HIST {action}")), Some(Command::Function(Function::History(action.into()))));
+        }
+        assert_eq!(parse("UNIV <GO>"), Some(Command::Function(Function::Universe)));
+        assert_eq!(parse("scan darvas_breakout"), Some(Command::Function(Function::Scan("DARVAS_BREAKOUT".into()))));
+        assert_eq!(parse("SCAN"), Some(Command::Function(Function::Scan(String::new()))));
+        assert_eq!(parse("SCAN MA"), Some(Command::Function(Function::Scan("MA".into()))));
+        assert_eq!(parse("SCAN VCP_LENS"), Some(Command::Function(Function::Scan("VCP_LENS".into()))));
+        assert_eq!(parse("SCAN VIEW PATTERN"), Some(Command::Function(Function::Scan("VIEW PATTERN".into()))));
+        assert_eq!(parse("scan view rsi-c"), Some(Command::Function(Function::Scan("VIEW RSI-C".into()))));
+        let Some(Command::Function(Function::Scan(raw))) = parse("scan view rsic n=9 k=3") else { panic!("not a scan") };
+        let spec = tr_data::whats_news::ScanViewSpec::parse(&raw).unwrap().unwrap();
+        assert_eq!(spec.canonical(), "VIEW RSI-C N=9 K=3");
+        // The listed words stay tickers when typed alone.
+        for word in ["VIEW", "PATTERN", "RSIC", "COIL", "MA", "STR", "LAB", "RESID", "ATTR"] {
+            assert!(matches!(parse(word), Some(Command::Symbol(_))), "{word}");
+        }
+        assert!(hint("SCAN VIEW FOO").contains("Unknown view"));
+        assert!(hint("SCAN VIEW").contains("needs PATTERN or RSI-C"));
+        assert!(hint("SCAN VIEW PATTERN").contains("Scanner view: Pattern — 63/21-bar daily and 52/26-week extremes, thirds"));
+        assert!(hint("SCAN NEAR_HIGH").contains("Scan Whats-News archive"));
+        assert_eq!(parse("REVIEW"), Some(Command::Function(Function::Review)));
+        assert_eq!(parse("DESK"), Some(Command::Function(Function::Desk)));
+        assert_eq!(parse("PMDESK"), Some(Command::Function(Function::Desk)));
+        assert_eq!(parse("AAPL DESK"), Some(Command::SymbolFunction("AAPL US Equity".into(), Function::Desk)));
+        assert_eq!(parse("JOURNAL"), Some(Command::Function(Function::Journal(String::new()))));
+        assert_eq!(parse("JRNL"), Some(Command::Function(Function::Journal(String::new()))));
+        assert_eq!(parse("CHECKLIST"), Some(Command::Function(Function::Journal(String::new()))));
+        assert_eq!(
+            parse("AAPL JOURNAL"),
+            Some(Command::SymbolFunction("AAPL US Equity".into(), Function::Journal(String::new())))
+        );
+        assert_eq!(
+            parse("AAPL JOURNAL 2026-10-24"),
+            Some(Command::SymbolFunction("AAPL US Equity".into(), Function::Journal("2026-10-24".into())))
+        );
+        assert_eq!(
+            parse("NOTE 2026-10-24 gap and go"),
+            Some(Command::Function(Function::JournalNote { date: "2026-10-24".into(), text: "gap and go".into() }))
+        );
+        assert_eq!(
+            parse("AAPL NOTE 2026-03-15 wait for 20-day"),
+            Some(Command::SymbolFunction(
+                "AAPL US Equity".into(),
+                Function::JournalNote { date: "2026-03-15".into(), text: "wait for 20-day".into() }
+            ))
+        );
+        assert_eq!(parse("LATEST"), Some(Command::Function(Function::Latest)));
+        assert_eq!(parse("END"), Some(Command::Function(Function::Latest)));
+        assert_eq!(parse("AAPL REVIEW"), Some(Command::SymbolFunction("AAPL US Equity".into(), Function::Review)));
+        assert_eq!(parse("BOX"), Some(Command::Function(Function::ReviewOverlay(ReviewOverlay::BoxLevels))));
+        assert_eq!(parse("RS"), Some(Command::Function(Function::ReviewOverlay(ReviewOverlay::Strength))));
+        assert_eq!(parse("VCTX"), Some(Command::Function(Function::ReviewOverlay(ReviewOverlay::Volume))));
+        assert_eq!(parse("EXPORT"), Some(Command::Function(Function::Export(ExportKind::Auto, String::new()))));
+        assert_eq!(
+            parse("EXPORT SCAN ~/Downloads/scan.json"),
+            Some(Command::Function(Function::Export(ExportKind::Scan, "~/Downloads/scan.json".into())))
+        );
+        assert_eq!(
+            parse("EXPORT JOURNAL"),
+            Some(Command::Function(Function::Export(ExportKind::Journal, String::new())))
+        );
+        assert_eq!(parse("EXPORT HIST"), Some(Command::Function(Function::Export(ExportKind::History, String::new()))));
+        assert_eq!(
+            parse("STATS"),
+            Some(Command::Function(Function::Stats { condition: String::new(), conditional: false }))
+        );
+        assert_eq!(
+            parse("AAPL STATS"),
+            Some(Command::SymbolFunction(
+                "AAPL US Equity".into(),
+                Function::Stats { condition: String::new(), conditional: false }
+            ))
+        );
+        assert_eq!(
+            parse("COND RSI(14) < 30"),
+            Some(Command::Function(Function::Stats { condition: "RSI(14) < 30".into(), conditional: true }))
+        );
+        assert_eq!(parse("SEASON"), Some(Command::Function(Function::StudioSeason { spec: String::new() })));
+        assert_eq!(parse("SSN"), Some(Command::Function(Function::StudioSeason { spec: String::new() })));
+        assert_eq!(parse("SEASON 1H"), Some(Command::Function(Function::StudioSeason { spec: "1H".into() })));
+        assert_eq!(
+            parse("AAPL SEASON"),
+            Some(Command::SymbolFunction("AAPL US Equity".into(), Function::StudioSeason { spec: String::new() }))
+        );
+        assert_eq!(
+            parse("AAPL SEASON 30M"),
+            Some(Command::SymbolFunction("AAPL US Equity".into(), Function::StudioSeason { spec: "30M".into() }))
+        );
+        assert_eq!(
+            parse("AAPL SSN 30M"),
+            Some(Command::SymbolFunction("AAPL US Equity".into(), Function::StudioSeason { spec: "30M".into() }))
+        );
+        assert_eq!(parse("EXPORT STATS"), Some(Command::Function(Function::Export(ExportKind::Stats, String::new()))));
+        assert_eq!(parse("BACKTEST"), Some(Command::Function(Function::Backtest { spec: String::new() })));
+        assert_eq!(
+            parse("AAPL BT ADTREND"),
+            Some(Command::SymbolFunction("AAPL US Equity".into(), Function::Backtest { spec: "ADTREND".into() }))
+        );
+        assert_eq!(
+            parse("EXPORT BACKTEST"),
+            Some(Command::Function(Function::Export(ExportKind::Backtest, String::new())))
+        );
+        assert_eq!(parse("LOOKALIKE"), Some(Command::Function(Function::Lookalike { spec: String::new() })));
+        assert_eq!(
+            parse("AAPL KNN 2024-01-15 K=15"),
+            Some(Command::SymbolFunction(
+                "AAPL US Equity".into(),
+                Function::Lookalike { spec: "2024-01-15 K=15".into() }
+            ))
+        );
+        assert_eq!(parse("GOTO 2024-01-15"), Some(Command::Function(Function::Goto { date: "2024-01-15".into() })));
+        assert_eq!(
+            parse("EXPORT LOOKALIKE"),
+            Some(Command::Function(Function::Export(ExportKind::Lookalike, String::new())))
+        );
+        assert_eq!(parse("BACKUP"), Some(Command::Function(Function::Backup(String::new()))));
+        assert_eq!(
+            parse("RESTORE ~/Downloads/workspace.json"),
+            Some(Command::Function(Function::Restore("~/Downloads/workspace.json".into())))
+        );
+    }
+
+    #[test]
     fn functions() {
         let ind = |code: &str, params: &[f64]| {
             Some(Command::Function(Function::Indicator(IndicatorSpec::new(code, params).unwrap())))
@@ -582,6 +2265,9 @@ mod tests {
         assert_eq!(parse("bb 20 2.5"), ind("BB", &[20.0, 2.5]));
         assert_eq!(parse("MACD"), ind("MACD", &[12.0, 26.0, 9.0]));
         assert_eq!(parse("ichimoku"), ind("ICHIMOKU", &[]));
+        assert_eq!(parse("ADTREND"), ind("ADTREND", &[]));
+        assert_eq!(parse("ATREND"), ind("ADTREND", &[]));
+        assert_eq!(parse("ADAPTIVE"), ind("ADTREND", &[]));
         assert_eq!(parse("IND STOCH 5 3 3"), ind("STOCH", &[5.0, 3.0, 3.0]));
         assert_eq!(parse("IND"), Some(Command::Function(Function::IndicatorPicker(String::new()))));
         assert_eq!(parse("study volume"), Some(Command::Function(Function::IndicatorPicker("volume".into()))));
@@ -591,11 +2277,10 @@ mod tests {
         assert_eq!(parse("CMP"), Some(Command::Function(Function::Compare(None))));
         assert_eq!(parse("FIB"), Some(Command::Function(Function::Draw(Tool::Fib))));
         assert_eq!(parse("CLEAR DRAW"), Some(Command::Function(Function::ClearDrawings)));
+        assert_eq!(parse("UNDO DRAW"), Some(Command::Function(Function::UndoDrawings)));
+        assert_eq!(parse("UNDO"), Some(Command::Function(Function::UndoDrawings)));
         assert_eq!(parse("POL Nancy Pelosi"), Some(Command::Function(Function::Politician("Nancy Pelosi".into()))));
-        assert_eq!(
-            parse("WL ADD msft nvda"),
-            Some(Command::Function(Function::WatchAdd(vec!["MSFT".into(), "NVDA".into()])))
-        );
+        assert_eq!(parse("WL ADD msft nvda"), Some(Command::Function(Function::WatchCommand("ADD msft nvda".into()))));
         assert_eq!(parse("LAYOUT 4"), Some(Command::Function(Function::Layout("4".into()))));
         assert_eq!(
             parse("LAYOUT save Morning Desk"),
@@ -611,6 +2296,143 @@ mod tests {
         assert_eq!(parse("LINK OFF"), Some(Command::Function(Function::Link(None))));
         assert_eq!(parse("LINK PINK"), None);
         assert_eq!(parse("AAPL CN"), Some(Command::SymbolFunction("AAPL US Equity".into(), Function::News)));
+        assert_eq!(parse("NEWS"), Some(Command::Function(Function::News)));
+        assert_eq!(parse("ALERTS"), Some(Command::Function(Function::Alerts)));
+        assert_eq!(parse("EARNINGS"), Some(Command::Function(Function::Earnings)));
+        assert_eq!(parse("ECAL"), Some(Command::Function(Function::Earnings)));
+        assert_eq!(parse("EARN"), Some(Command::Function(Function::Earnings)));
+        assert_eq!(parse("ISCAN"), Some(Command::Function(Function::Intraday)));
+        assert_eq!(parse("INTRADAY"), Some(Command::Function(Function::Intraday)));
+        assert!(hint("ISCAN").contains("session RVOL"));
+        assert_eq!(parse("IDESK"), Some(Command::Function(Function::IntradayDesk)));
+        assert_eq!(parse("IDASH"), Some(Command::Function(Function::IntradayDesk)));
+        assert_eq!(parse("AAPL IDESK"), Some(Command::SymbolFunction("AAPL US Equity".into(), Function::IntradayDesk)));
+        assert!(hint("IDESK").contains("Intraday desk"));
+        assert_eq!(parse("DESK"), Some(Command::Function(Function::Desk)));
+        assert_eq!(parse("ALERT"), Some(Command::Function(Function::Alerts)));
+        assert_eq!(
+            parse("AAPL ALERT 150"),
+            Some(Command::SymbolFunction(
+                "AAPL US Equity".into(),
+                Function::SetPriceAlert(tr_data::price_alerts::AlertKind::Price {
+                    side: tr_data::price_alerts::PriceSide::Above,
+                    level: 150.0,
+                })
+            ))
+        );
+        assert_eq!(
+            parse("AAPL ALERT BELOW 140"),
+            Some(Command::SymbolFunction(
+                "AAPL US Equity".into(),
+                Function::SetPriceAlert(tr_data::price_alerts::AlertKind::Price {
+                    side: tr_data::price_alerts::PriceSide::Below,
+                    level: 140.0,
+                })
+            ))
+        );
+        assert_eq!(
+            parse("AAPL ALERT VWAP"),
+            Some(Command::SymbolFunction(
+                "AAPL US Equity".into(),
+                Function::SetPriceAlert(tr_data::price_alerts::AlertKind::Vwap {
+                    side: tr_data::price_alerts::PriceSide::Above,
+                })
+            ))
+        );
+        assert_eq!(
+            parse("AAPL US Equity ALERT VWAP BELOW"),
+            Some(Command::SymbolFunction(
+                "AAPL US Equity".into(),
+                Function::SetPriceAlert(tr_data::price_alerts::AlertKind::Vwap {
+                    side: tr_data::price_alerts::PriceSide::Below,
+                })
+            ))
+        );
+        assert_eq!(
+            parse("AAPL ALERT VWAP ABOVE"),
+            Some(Command::SymbolFunction(
+                "AAPL US Equity".into(),
+                Function::SetPriceAlert(tr_data::price_alerts::AlertKind::Vwap {
+                    side: tr_data::price_alerts::PriceSide::Above,
+                })
+            ))
+        );
+        assert_eq!(parse("AAPL ALERT VWAP NOPE"), None);
+        assert!(hint("AAPL ALERT VWAP").contains("above session VWAP"));
+        assert_eq!(
+            parse("AAPL ALERT RVOL 2"),
+            Some(Command::SymbolFunction(
+                "AAPL US Equity".into(),
+                Function::SetPriceAlert(tr_data::price_alerts::AlertKind::Rvol { multiple: 2.0 })
+            ))
+        );
+        assert_eq!(
+            parse("AAPL US Equity ALERT RVOL 2.5"),
+            Some(Command::SymbolFunction(
+                "AAPL US Equity".into(),
+                Function::SetPriceAlert(tr_data::price_alerts::AlertKind::Rvol { multiple: 2.5 })
+            ))
+        );
+        assert_eq!(parse("AAPL ALERT RVOL"), None);
+        assert_eq!(parse("AAPL ALERT RVOL 0"), None);
+        assert_eq!(parse("AAPL ALERT RVOL 2 BELOW"), None);
+        assert!(hint("AAPL ALERT RVOL 2").contains("session RVOL 2.00×"));
+        assert_eq!(
+            parse("AAPL ALERT PATH"),
+            Some(Command::SymbolFunction(
+                "AAPL US Equity".into(),
+                Function::SetPriceAlert(tr_data::price_alerts::AlertKind::Session {
+                    signal: tr_data::session_alerts::SessionSignal::Path,
+                })
+            ))
+        );
+        assert_eq!(
+            parse("AAPL ALERT VPACE"),
+            Some(Command::SymbolFunction(
+                "AAPL US Equity".into(),
+                Function::SetPriceAlert(tr_data::price_alerts::AlertKind::Session {
+                    signal: tr_data::session_alerts::SessionSignal::Pace,
+                })
+            ))
+        );
+        assert!(matches!(
+            parse("NVDA ALERT GFILL"),
+            Some(Command::SymbolFunction(_, Function::SetPriceAlert(tr_data::price_alerts::AlertKind::Session { signal })))
+                if signal == tr_data::session_alerts::SessionSignal::Gap
+        ));
+        assert!(matches!(
+            parse("AAPL ALERT XTRM"),
+            Some(Command::SymbolFunction(_, Function::SetPriceAlert(tr_data::price_alerts::AlertKind::Session { signal })))
+                if signal == tr_data::session_alerts::SessionSignal::Extreme
+        ));
+        assert!(matches!(
+            parse("MSFT ALERT RELPATH"),
+            Some(Command::SymbolFunction(_, Function::SetPriceAlert(tr_data::price_alerts::AlertKind::Session { signal })))
+                if signal == tr_data::session_alerts::SessionSignal::Relative
+        ));
+        assert_eq!(parse("AAPL ALERT PATH 5"), None);
+        assert_eq!(parse("AAPL ALERT HILO"), None);
+        assert!(hint("AAPL ALERT PATH").contains("usual session path"));
+        assert!(matches!(
+            parse("AAPL RVOL"),
+            Some(Command::SymbolFunction(_, Function::Indicator(ref spec))) if spec.code == "RVOL"
+        ));
+        assert!(matches!(
+            parse("AAPL VWAP"),
+            Some(Command::SymbolFunction(_, Function::Indicator(ref spec))) if spec.code == "VWAP"
+        ));
+        assert_eq!(
+            parse("NVDA ALERT SETUP NEAR_HIGH EXIT"),
+            Some(Command::SymbolFunction(
+                "NVDA US Equity".into(),
+                Function::SetPriceAlert(tr_data::price_alerts::AlertKind::Setup {
+                    setup: "NEAR_HIGH".into(),
+                    change: tr_data::price_alerts::SetupChange::Exit,
+                })
+            ))
+        );
+        assert_eq!(parse("UNALERT AAPL"), Some(Command::Function(Function::ClearPriceAlert("AAPL".into()))));
+        assert_eq!(parse("TOP"), Some(Command::Function(Function::TopNews)));
         assert_eq!(
             parse("BTCUSD CRNCY OB 50"),
             Some(Command::SymbolFunction("BTCUSD Curncy".into(), Function::OrderBook(Some(50))))
@@ -647,6 +2469,129 @@ mod tests {
         for v in PortView::ALL {
             assert_eq!(parse(v.code()), f(v, ""), "{} round-trips", v.code());
         }
+    }
+
+    #[test]
+    fn resid_command_grammar_keeps_ticker() {
+        let tick = |s: &str| Command::Symbol("RESID US Equity".into()) == parse(s).unwrap_or(Command::Symbol(String::new()));
+        // Every non-verb form still loads the RESID ticker (or its interval).
+        assert!(tick("RESID") && tick("RESID US Equity"));
+        assert_eq!(
+            parse("RESID 1h"),
+            Some(Command::SymbolFunction("RESID US Equity".into(), Function::Timeframe(Timeframe::H1)))
+        );
+        assert_eq!(
+            parse("RESID 1W"),
+            Some(Command::SymbolFunction("RESID US Equity".into(), Function::Timeframe(Timeframe::W1)))
+        );
+        assert!(!matches!(parse("RESID DIST"), Some(Command::Function(Function::StudioResid { .. }))));
+        assert!(!matches!(parse("RESID 1h"), Some(Command::Function(Function::StudioResid { .. }))));
+        // The canonical forms.
+        assert_eq!(
+            parse("STUDIO resid"),
+            Some(Command::Function(Function::StudioRoute(tr_data::studio::StudioRoute::Resid)))
+        );
+        assert_eq!(
+            parse("STUDIO resid open AAPL-v-SPY-v1"),
+            Some(Command::Function(Function::StudioResid { spec: "open AAPL-v-SPY-v1".into() }))
+        );
+        assert!(matches!(
+            parse("STUDIO resid save name=AAPL-v-SPY monitor=250"),
+            Some(Command::Function(Function::StudioResid { .. }))
+        ));
+        assert!(matches!(parse("STUDIO resid check"), Some(Command::Function(Function::StudioResid { .. }))));
+        // The aliases.
+        for ok in ["RESID OPEN AAPL-v-SPY-v1", "RESID CHECK", "RESID check x-v2", "RESID SAVE", "RESID name=AAPL-v-SPY", "resid save name=a_b monitor=20"] {
+            assert!(matches!(parse(ok), Some(Command::Function(Function::StudioResid { .. }))), "{ok}");
+        }
+        // A verb with bad arguments is an error, never the ticker.
+        for bad in [
+            "RESID OPEN",
+            "RESID OPEN ../x",
+            "RESID SAVE monitor=5",
+            "RESID name=a b",
+            "STUDIO resid open ../x",
+            "STUDIO resid open",
+            "STUDIO resid save monitor=5",
+            "STUDIO resid frob",
+        ] {
+            assert_eq!(parse(bad), None, "{bad}");
+        }
+    }
+
+    #[test]
+    fn attr_command_grammar_keeps_ticker() {
+        use tr_data::studio::StudioRoute;
+        // The bare word and every non-key form still load the ticker.
+        assert_eq!(parse("ATTR"), Some(Command::Symbol("ATTR US Equity".into())));
+        assert_eq!(parse("ATTR US Equity"), Some(Command::Symbol("ATTR US Equity".into())));
+        assert_eq!(
+            parse("ATTR 1h"),
+            Some(Command::SymbolFunction("ATTR US Equity".into(), Function::Timeframe(Timeframe::H1)))
+        );
+        assert!(!matches!(parse("ATTR DIST"), Some(Command::Function(Function::StudioAttr { .. }))));
+        // Canonical and routes.
+        for s in ["STUDIO attr", "STUDIO ATTR", "STUDIO screen=attribution"] {
+            assert_eq!(parse(s), Some(Command::Function(Function::StudioRoute(StudioRoute::Attr))), "{s}");
+        }
+        assert_eq!(
+            parse("STUDIO attr model=AAPL-v-SPY-v1 obs=20"),
+            Some(Command::Function(Function::StudioAttr { spec: "model=AAPL-v-SPY-v1 obs=20".into() }))
+        );
+        for ok in [
+            "STUDIO screen=attribution obs=5",
+            "ATTR model=AAPL-v-SPY-v1",
+            "attr obs=5",
+            "ATTR from=2026-03-02 to=2026-03-20",
+            "STUDIO attr to=2026-03-02T14:30",
+        ] {
+            assert!(matches!(parse(ok), Some(Command::Function(Function::StudioAttr { .. }))), "{ok}");
+        }
+        // A key word with bad arguments is an error, never the ticker.
+        for bad in ["ATTR model=../x", "ATTR obs=0", "ATTR obs=5 from=2026-03-02", "STUDIO attr bogus", "STUDIO attr obs=1001"] {
+            assert_eq!(parse(bad), None, "{bad}");
+        }
+    }
+
+    #[test]
+    fn order_ticket_rejects_non_finite_price() {
+        let t = |s: &str| match parse(s) {
+            Some(Command::Function(Function::Trade(t))) => Some(t),
+            Some(Command::SymbolFunction(k, Function::Trade(mut t))) => {
+                t.symbol = Some(k);
+                Some(t)
+            }
+            _ => None,
+        };
+        for bad in ["inf", "-inf", "NaN", "1e999", "0", "-5", "0.0", "-0.5"] {
+            // limit, stop, `@` shorthand, notional and quantity: none may accept the value.
+            for form in [
+                format!("BUY AAPL 1 LMT {bad}"),
+                format!("BUY AAPL 1 LIMIT {bad}"),
+                format!("SELL AAPL 1 STP {bad}"),
+                format!("SELL AAPL 1 STOP {bad}"),
+                format!("BUY AAPL 1 @{bad}"),
+                format!("BUY AAPL ${bad}"),
+                format!("BUY AAPL {bad}"),
+            ] {
+                assert_eq!(t(&form), None, "{form}");
+            }
+        }
+        for bad in [
+            "BUY AAPL 1e999",
+            "BUY AAPL 1 LMT inf",
+            "BUY AAPL 1 @inf",
+            "SELL AAPL 1 STP 1e309",
+            "BUY NVDA $1e999",
+            "BUY AAPL 1 LMT infinity",
+            "BUY AAPL 1 LMT NaN",
+        ] {
+            assert_eq!(t(bad), None, "{bad}");
+        }
+        let ok = t("BUY AAPL 10 LMT 150").expect("finite positive price still parses");
+        assert_eq!((ok.units, ok.limit), (Some(10.0), Some(150.0)));
+        assert_eq!(t("SELL AAPL 1 STP 99.5").and_then(|a| a.stop), Some(99.5));
+        assert_eq!(t("BUY AAPL $1000").and_then(|a| a.notional), Some(1000.0));
     }
 
     #[test]
@@ -741,6 +2686,160 @@ mod tests {
                 }
                 assert_eq!(parse(&format!("IND {code}")), parse(code), "IND {code}");
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod combo_tests {
+    use super::*;
+    #[test]
+    fn combo_command_is_strict() {
+        assert!(matches!(
+            parse_alert_kind(&["COMBO", "NEAR_HIGH", "ABOVE", "250", "RVOL", "2"]),
+            Some(tr_data::price_alerts::AlertKind::SetupPriceRvol { level: 250.0, multiple: 2.0, .. })
+        ));
+        for args in [
+            "COMBO ALL ABOVE 250 RVOL 2",
+            "COMBO ONEIL_LENS ABOVE 250 RVOL 2",
+            "COMBO NEAR_HIGH ABOVE 250 RVOL",
+            "COMBO NEAR_HIGH ABOVE 250 RVOL 2 extra",
+            "COMBO NEAR_HIGH OVER 250 RVOL 2",
+            "COMBO NEAR_HIGH BELOW NaN RVOL 2",
+            "COMBO NEAR_HIGH BELOW 250 RVOL 0",
+        ] {
+            assert!(parse_alert_kind(&args.split_whitespace().collect::<Vec<_>>()).is_none(), "{args}");
+        }
+    }
+
+    #[test]
+    fn cone_commands_aliases_parameters_and_symbol_prefix() {
+        for name in ["CONE", "TRENDCONE", "TSTACK CONE"] {
+            for (suffix, on) in [("", None), (" ON", Some(true)), (" OFF", Some(false))] {
+                assert_eq!(
+                    parse(&format!("{name}{suffix}")),
+                    Some(Command::Function(Function::TrendCone { on, spec: None }))
+                );
+            }
+        }
+        assert_eq!(
+            parse("AAPL CONE 30 7"),
+            Some(Command::SymbolFunction(
+                "AAPL US Equity".into(),
+                Function::TrendCone { on: Some(true), spec: Some((30, 7)) }
+            ))
+        );
+        for (input, spec) in [("CONE 30", (30, 30)), ("CONE 120", (120, 100))] {
+            assert_eq!(parse(input), Some(Command::Function(Function::TrendCone { on: Some(true), spec: Some(spec) })));
+        }
+        for input in ["CONE 0 5", "CONE 121 5", "CONE 20 0", "CONE 20 101", "CONE 0", "CONE 121", "CONE 20 5 extra"] {
+            assert!(parse(input).is_none(), "{input}");
+        }
+        assert!(matches!(parse("ZZUNKNOWN"), Some(Command::Symbol(_))));
+    }
+}
+#[cfg(test)]
+mod auction_tests {
+    use super::*;
+    #[test]
+    fn auction_and_alias_parse_with_all_subcommands() {
+        use AuctionCmd::*;
+        for (text, cmd) in [
+            ("AUCTION", Toggle(None)),
+            ("amap", Toggle(None)),
+            ("AUCTION ON", Toggle(Some(true))),
+            ("AUCTION OFF", Toggle(Some(false))),
+            ("AUCTION 10", Composite(10)),
+            ("AUCTION VIS", Composite(0)),
+            ("AUCTION VA 68", ValueArea(68)),
+            ("AUCTION NAKED", Naked(None)),
+            ("AUCTION NAKED OFF", Naked(Some(false))),
+            ("AUCTION NAKED ON", Naked(Some(true))),
+            ("AUCTION NAKED 15", MaxAge(15)),
+            ("AUCTION FILLED", Filled(None)),
+            ("AUCTION FILLED ON", Filled(Some(true))),
+            ("AUCTION STRIPS OFF", Strips(Some(false))),
+            ("AUCTION IB ON", Ib(Some(true))),
+        ] {
+            assert_eq!(parse(text), Some(Command::Function(Function::AuctionMap(cmd))), "{text}");
+        }
+        assert_eq!(
+            parse("AAPL AUCTION 5"),
+            Some(Command::SymbolFunction("AAPL US Equity".into(), Function::AuctionMap(Composite(5))))
+        );
+    }
+    #[test]
+    fn auction_rejects_out_of_range_and_unknown_arguments() {
+        for text in [
+            "AUCTION 0",
+            "AUCTION 21",
+            "AUCTION VA 30",
+            "AUCTION VA 96",
+            "AUCTION 5m",
+            "AUCTION FOO",
+            "AMAP FOO",
+            "AUCTION NAKED 21",
+            "AUCTION IB MAYBE",
+            "AUCTION FILLED ON OFF",
+        ] {
+            assert_eq!(parse(text), None, "{text}");
+        }
+    }
+    #[test]
+    fn auction_words_with_a_yellow_key_load_the_ticker() {
+        for text in ["AUCTION US Equity", "AMAP Equity", "amap us equity <GO>"] {
+            assert!(matches!(parse(text), Some(Command::Symbol(_))), "{text}");
+        }
+        assert!(matches!(
+            parse("AUCTION US Equity 1h"),
+            Some(Command::SymbolFunction(_, Function::Timeframe(Timeframe::H1)))
+        ));
+        assert!(matches!(parse("ZZZQ"), Some(Command::Symbol(_))));
+        assert!(tr_core::catalog::lookup("AUCTION", None).is_none());
+        assert!(tr_core::catalog::lookup("AMAP", None).is_none());
+    }
+    #[test]
+    fn lab_command_does_not_shadow_ticker() {
+        // LAB is a listed ticker, with or without its key; the Lab is reached through STUDIO lab.
+        assert_eq!(parse("LAB"), Some(Command::Symbol("LAB US Equity".into())));
+        assert_eq!(parse("LAB US Equity"), Some(Command::Symbol("LAB US Equity".into())));
+        assert!(!matches!(
+            parse("LAB factors=SPY"),
+            Some(Command::Function(Function::StudioLab { .. }) | Command::SymbolFunction(_, Function::StudioLab { .. }))
+        ));
+        assert_eq!(
+            parse("STUDIO lab"),
+            Some(Command::Function(Function::StudioRoute(tr_data::studio::StudioRoute::Lab)))
+        );
+        assert_eq!(
+            parse("STUDIO lab 5m factors=SPY,TLT"),
+            Some(Command::Function(Function::StudioLab { spec: "5m factors=SPY,TLT".into() }))
+        );
+        assert_eq!(
+            parse("AAPL STUDIO lab factors=SPY"),
+            Some(Command::SymbolFunction("AAPL US Equity".into(), Function::StudioLab { spec: "factors=SPY".into() }))
+        );
+        assert!(matches!(
+            parse("STUDIO LAB factor=TLT transform=change h=5 lag=1"),
+            Some(Command::Function(Function::StudioLab { .. }))
+        ));
+        assert_eq!(parse("STUDIO lab factors="), None);
+        assert_eq!(parse("STUDIO lab h=3"), None);
+        assert_eq!(parse("STUDIO lab transform=change"), None);
+    }
+    #[test]
+    fn honest_backtest_words_remain_explicit_tickers() {
+        for word in ["BT", "IBT", "BACKTEST", "BTEST", "IBACKTEST", "SETUPBT", "DSR", "WF", "HONEST"] {
+            let key = format!("{word} US Equity");
+            for text in
+                [key.clone(), format!("{} us equity <GO>", word.to_lowercase()), format!("{word} US Equity<GO>")]
+            {
+                assert_eq!(parse(&text), Some(Command::Symbol(key.clone())), "{text}");
+            }
+            assert_eq!(
+                parse(&format!("{key} 1h")),
+                Some(Command::SymbolFunction(key, Function::Timeframe(Timeframe::H1)))
+            );
         }
     }
 }

@@ -16,6 +16,11 @@ struct Uniforms {
     extra: vec4<f32>,
     // reveal front, ramp (bars), line front (both relative to left_hi), pane opacity
     anim: vec4<f32>,
+    neutral: vec4<f32>,
+    tint: vec4<f32>,
+    // Candle-tint colours for model state (regime); never the sign colours.
+    regime_up: vec4<f32>,
+    regime_down: vec4<f32>,
 };
 
 @group(0) @binding(0) var<uniform> u: Uniforms;
@@ -104,6 +109,7 @@ struct Bar {
 };
 
 @group(1) @binding(0) var<storage, read> bars: array<Bar>;
+@group(2) @binding(0) var<storage, read> regime: array<f32>;
 
 // 18 vertices per bar: three rectangles. Candles use wick + body; OHLC bars use
 // stem + open tick + close tick.
@@ -119,6 +125,18 @@ fn vs_candle(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) -
     let low = mix(b.open, b.low, g);
     let close = mix(b.open, b.close, g);
     var color = select(u.down, u.up, b.close >= b.open);
+    // LOD candles use the last actual completed observation in their bucket.
+    let index = u32(b.x + b.w - 1.0);
+    if (u.tint.x > 0.0 && index < arrayLength(&regime)) {
+        let value = regime[index];
+        var tint = u.neutral;
+        if (value != 0.0) {
+            let hue = select(u.regime_down, u.regime_up, value > 0.0);
+            tint = vec4<f32>(mix(u.neutral.rgb, hue.rgb, 0.35 + 0.65 * abs(value)), color.a);
+            if ((value > 0.0) != (b.close >= b.open)) { tint = vec4<f32>(tint.rgb * 0.6, tint.a); }
+        }
+        color = mix(color, tint, u.tint.x);
+    }
     color.a = color.a * clamp(g * 3.0, 0.0, 1.0);
     let cx = x_ndc(b.x + b.w * 0.5);
     let half_body = max((b.w * u.params.x * 0.5) / u.view.x * 2.0, px_to_ndc_x(0.5));
@@ -151,6 +169,9 @@ fn vs_candle(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) -
 @vertex
 fn vs_volume(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) -> VsOut {
     let b = bars[ii];
+    if (!(b.volume > 0.0)) {
+        return degenerate();
+    }
     let g = grow(b.x + b.w * 0.5);
     if (g <= 0.0) {
         return degenerate();

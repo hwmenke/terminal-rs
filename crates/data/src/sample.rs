@@ -44,6 +44,9 @@ impl SampleProvider {
 
 #[async_trait]
 impl MarketData for SampleProvider {
+    fn mode(&self) -> crate::DataMode {
+        crate::DataMode::ExplicitSample
+    }
     fn name(&self) -> &str {
         "sample"
     }
@@ -64,6 +67,10 @@ impl MarketData for SampleProvider {
         Ok(simulated_book(symbol, last, depth, chrono::Utc::now().timestamp_millis() as u64 / 500))
     }
 
+    fn has_live_feed(&self, _symbol: &str, _tf: Timeframe) -> bool {
+        self.live_ticks
+    }
+
     /// Random-walk ticks on the last bar every 400 ms, rolling into new bars on schedule.
     fn live(&self, symbol: &str, tf: Timeframe) -> Option<LiveFeed> {
         if !self.live_ticks {
@@ -81,13 +88,14 @@ impl MarketData for SampleProvider {
                 let now = chrono::Utc::now().timestamp();
                 let bucket = tf.bucket_start(now);
                 if bucket > bar.ts {
-                    bar = Bar::new(bucket, bar.close, bar.close, bar.close, bar.close, 0.0);
+                    bar = Bar::new(bucket, bar.close, bar.close, bar.close, bar.close, 0.0)
+                        .with_provenance(tr_core::Provenance::Sample);
                 }
                 let px = bar.close * (tick_vol * rng.normal()).exp();
                 bar.close = px;
                 bar.high = bar.high.max(px);
                 bar.low = bar.low.min(px);
-                bar.volume += (rng.f64() * 100.0).round();
+                bar.volume = bar.volume_value().unwrap_or(0.0) + (rng.f64() * 100.0).round();
                 if tx.send(bar).await.is_err() {
                     break;
                 }
@@ -199,6 +207,22 @@ pub fn simulated_book(symbol: &str, mid: f64, depth: usize, step: u64) -> OrderB
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn live_feed_follows_the_tick_flag_without_opening_a_stream() {
+        let off = SampleProvider::at(0, 10);
+        assert!(!off.has_live_feed("AAPL", Timeframe::M1));
+        let on = SampleProvider::at(0, 10).with_live_ticks();
+        assert!(on.has_live_feed("AAPL", Timeframe::M1));
+    }
+
+    #[tokio::test]
+    async fn sample_quotes_carry_sample_provenance() {
+        let provider = SampleProvider::at(1_790_000_000, 100);
+        let quotes = provider.quotes(&["AAPL US Equity".into()]).await.unwrap();
+        assert_eq!(quotes.len(), 1);
+        assert_eq!(quotes[0].provenance, tr_core::Provenance::Sample);
+    }
 
     #[tokio::test]
     async fn paging_is_contiguous() {
