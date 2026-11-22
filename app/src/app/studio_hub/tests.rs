@@ -573,3 +573,76 @@ async fn accepted_native_daily_report_populates_header_receipt() {
     assert!(receipt.contains("CLOSED THRU") && receipt.contains("Whats-News disabled"));
     assert!(!receipt.contains("awaiting"));
 }
+
+#[test]
+fn split_layout_never_shrinks_chart_below_minimum() {
+    for native in [true, false] {
+        let min = chart_min(native);
+        let mut h = 120.;
+        while h <= 1600. {
+            for f in [0.2, 0.5, 0.75] {
+                match split_layout(h, f, native) {
+                    Split::Side { chart_h } => {
+                        assert!(chart_h >= min && chart_h <= h - ANALYSIS_MIN - 10. + 0.01, "{h} {f} {chart_h}");
+                    }
+                    Split::Stacked { chart_h } => {
+                        assert_eq!(chart_h, min);
+                        assert!(h < min + ANALYSIS_MIN + 10.);
+                    }
+                }
+            }
+            // The chrome cap leaves room for the chart whenever the pane can fit both at all.
+            let cap = chrome_cap(h, native);
+            assert!(cap >= 76.);
+            if h >= 76. + min + ANALYSIS_MIN + 10. {
+                assert!(h - cap >= min + ANALYSIS_MIN, "{h}: cap {cap}");
+            }
+            h += 7.;
+        }
+    }
+}
+
+/// Rendered: with a long source receipt, About and Build notes all open, the native chart keeps its
+/// minimum at every pane height (it used to fall to 120pt and below).
+#[test]
+fn native_chart_keeps_its_minimum_with_header_details_open() {
+    // Price plot = chart minimum minus the time axis, volume strip and chart header.
+    const CHROME_BELOW_MIN: f32 = 60.;
+    let floor = CHART_MIN_NATIVE - CHROME_BELOW_MIN;
+    for ((width, height), ppp) in [(1440., 900.), (1100., 700.), (900., 560.), (700., 480.), (1280., 420.)]
+        .into_iter()
+        .flat_map(|s| [(s, 1.0f32), (s, 2.0)])
+    {
+        let ctx = egui::Context::default();
+        ctx.set_pixels_per_point(ppp);
+        let (worker, mut requests) = crate::worker::Worker::test_channel();
+        let mut pane = prepared_relate(&worker, &mut requests);
+        pane.quick = false;
+        pane.about_open = true;
+        pane.build_open = true;
+        let mut plot = None;
+        for i in 0..4 {
+            let mut out = ctx.run_ui(
+                egui::RawInput {
+                    time: Some(1. + i as f64 * 0.1),
+                    screen_rect: Some(Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(width, height))),
+                    viewports: std::iter::once((
+                        egui::ViewportId::ROOT,
+                        egui::ViewportInfo { native_pixels_per_point: Some(ppp), ..Default::default() },
+                    ))
+                    .collect(),
+                    ..Default::default()
+                },
+                |ui| {
+                    pane.show(ui, 201, &worker, false, true);
+                },
+            );
+            out.textures_delta.clear();
+            plot = pane.chart.studio_test_plot();
+        }
+        let plot = plot.expect("native chart painted");
+        // The price pane sits inside the chart minus axes/volume; it must stay a real chart.
+        assert!(plot.height() >= floor, "{width}x{height}@{ppp}: price plot only {} high (floor {floor})", plot.height());
+        assert!(plot.width() > 100., "{width}x{height}: plot {} wide", plot.width());
+    }
+}

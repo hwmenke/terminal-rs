@@ -540,6 +540,36 @@
       "budget_us": 2000,
       "relative": false,
       "class": "frame"
+    },
+    "paint.studio_numeric_table.steady.ui": {
+      "budget_us": 2500,
+      "relative": false,
+      "class": "frame"
+    },
+    "paint.studio_numeric_table.steady.tess": {
+      "budget_us": 800,
+      "relative": false,
+      "class": "frame"
+    },
+    "paint.studio_numeric_table.steady.total": {
+      "budget_us": 3500,
+      "relative": false,
+      "class": "frame"
+    },
+    "paint.studio_legend.steady.ui": {
+      "budget_us": 1500,
+      "relative": false,
+      "class": "frame"
+    },
+    "paint.studio_legend.steady.tess": {
+      "budget_us": 1500,
+      "relative": false,
+      "class": "frame"
+    },
+    "paint.studio_legend.steady.total": {
+      "budget_us": 2500,
+      "relative": false,
+      "class": "frame"
     }
   }
 }

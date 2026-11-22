@@ -5,7 +5,8 @@
 use super::studio_corr::{CorrCache, load_rows, relate_ui::signed};
 use super::studio_dist::stamp;
 use super::{PaneKind, TerminalApp};
-use crate::widgets::{HeatScale, MathCard, MathCardExt, stat_tile};
+use crate::fmt_num::{self, CoefScale};
+use crate::widgets::{HeatScale, MathCard, MathCardExt, NumCell, NumCol, NumRow, numeric_table, stat_tile};
 use crate::{congress_view::Action, dock::PaneId, theme, worker::Request};
 use egui::{Align2, Color32, Pos2, Rect, RichText, Sense, Stroke, Ui, pos2, vec2};
 use std::sync::{Arc, LazyLock};
@@ -596,15 +597,20 @@ fn coef_card(r: &LabReport, shown: usize, j: usize) -> MathCard {
             c = c.input("covariance", i.covariance.label());
             match (i.se[j], i.interval[j]) {
                 (Some(se), Some((lo, hi))) => {
-                    c = c.input("SE", format!("{se:.6e}")).input("95% CI", format!("{} … {}", signed(lo, 6), signed(hi, 6)));
+                    // Exact (unrounded) values live here; the table shows rounded, scaled text.
+                    c = c
+                        .input("β exact", fmt_num::exact(Some(fit.coefficients[j])))
+                        .input("SE", format!("{se:.6e}"))
+                        .input("SE exact", fmt_num::exact(Some(se)))
+                        .input("95% CI", format!("{} … {}", signed(lo, 6), signed(hi, 6)));
                     if let Some(z) = i.z[j] {
                         c = c.input("z", signed(z, 3));
                     }
                     if let Some(p) = i.p[j] {
-                        c = c.input("p", format!("{p:.3}"));
+                        c = c.input("p", fmt_num::prob(Some(p))).input("p exact", fmt_num::exact(Some(p)));
                     }
                     if let Some(q) = i.q[j] {
-                        c = c.input("q (BY)", format!("{q:.3}"));
+                        c = c.input("q (BY)", fmt_num::prob(Some(q))).input("q exact", fmt_num::exact(Some(q)));
                     }
                 }
                 _ => {
@@ -905,7 +911,7 @@ fn pct(v: f64) -> String {
     format!("{v:.0}")
 }
 
-fn table(ui: &mut Ui, r: &LabReport, st: &mut LabUi, width: f32) {
+pub(super) fn table(ui: &mut Ui, r: &LabReport, st: &mut LabUi, width: f32) {
     let Some(fit) = &r.fit else { return };
     let shown = st.shown_cov.min(3);
     let inf: Option<&CoefInference> = r.inference_at(shown);
@@ -929,15 +935,40 @@ fn table(ui: &mut Ui, r: &LabReport, st: &mut LabUi, width: f32) {
     }
     ui.label(ui_text(COV_NOTES[shown], 10., theme::muted()));
     let unit = r.units.first().map_or("", |u| u.label());
-    let row_h = 34.;
-    let col = |f: f32| f * width;
     let max_vif = fit.vif.iter().copied().fold(10., f64::max);
     let heat = HeatScale::sequential(max_vif, "VIF", pct);
-    // Header
-    let (hr, _) = ui.allocate_exact_size(vec2(width, 16.), Sense::hover());
-    for (x, t) in [(0.0, format!("Term · β [{unit}]")), (0.34, "SE".into()), (0.46, "95% CI".into()), (0.74, "z".into()), (0.82, "p".into()), (0.89, "q".into()), (0.95, "VIF".into())] {
-        ui.painter().text(hr.left_center() + vec2(col(x), 0.), Align2::LEFT_CENTER, t, theme::ui_font(9.), theme::muted());
-    }
+    // Slope rows share one display scale for β, SE and both CI ends; the intercept (usually orders of
+    // magnitude smaller) has its own and says so in its cells. The unit tag travels with the header.
+    // The exponent follows the largest of β / SE / CI ends; the decimals follow the SEs only, so a CI end
+    // near zero or one tiny β cannot force false precision on every row.
+    let slope_scale = CoefScale::pick_with(
+        (1..fit.k).flat_map(|j| {
+            let mut v = vec![fit.coefficients[j]];
+            if let Some(i) = inf {
+                v.extend(i.se[j]);
+                if let Some((a, b)) = i.interval[j] {
+                    v.extend([a, b]);
+                }
+            }
+            v
+        }),
+        (1..fit.k).filter_map(|j| inf.and_then(|i| i.se[j])),
+    );
+    let icpt_scale = CoefScale::pick_with(
+        std::iter::once(fit.coefficients[0]).chain(inf.and_then(|i| i.se[0])),
+        inf.and_then(|i| i.se[0]),
+    );
+    let unit_tag = [unit.to_string(), slope_scale.tag()].iter().filter(|s| !s.is_empty()).cloned().collect::<Vec<_>>().join(" ");
+    let cols = [
+        NumCol::label("Term", 84.),
+        NumCol::value(format!("β [{unit_tag}]"), 64.),
+        NumCol::value("SE", 62.).detail(),
+        NumCol::graphic("95% CI", 70.),
+        NumCol::value("z", 48.).detail(),
+        NumCol::value("p", 52.).detail(),
+        NumCol::value("q", 52.).detail(),
+        NumCol::value("VIF", 52.).detail(),
+    ];
     // Shared whisker scale across factor rows, including zero.
     let (mut lo, mut hi) = (0f64, 0f64);
     if let Some(i) = inf {
@@ -949,48 +980,68 @@ fn table(ui: &mut Ui, r: &LabReport, st: &mut LabUi, width: f32) {
         }
     }
     let span = (hi - lo).max(1e-300);
-    for j in 0..fit.k {
-        let (rect, resp) = ui.allocate_exact_size(vec2(width, row_h), Sense::hover());
-        #[cfg(test)]
-        if j == 1 {
-            ui.ctx().data_mut(|d| d.insert_temp(egui::Id::new("lab-probe"), rect));
-        }
-        let p = ui.painter();
-        if resp.hovered() {
-            p.rect_filled(rect, 0., theme::grid().gamma_multiply(0.2));
-            p.rect_filled(Rect::from_min_size(rect.min, vec2(2., rect.height())), 0., theme::accent());
-        }
-        let b = fit.coefficients[j];
-        p.text(rect.left_top() + vec2(4., 2.), Align2::LEFT_TOP, term_name(r, j), theme::mono(10.), theme::text());
-        let y2 = rect.top() + 21.;
-        let beta_txt = if j == 0 { format!("{b:+.3e}").replacen('-', "\u{2212}", 1) } else { signed(b, 4) };
-        p.text(pos2(rect.left() + 4., y2), Align2::LEFT_CENTER, beta_txt, theme::mono(10.), theme::sign(b));
-        let usable = inf.is_some_and(|i| i.se[j].is_some());
-        let se = inf.and_then(|i| i.se[j]);
-        p.text(pos2(rect.left() + col(0.34), y2), Align2::LEFT_CENTER, se.map_or("—".into(), |s| format!("{s:.2e}")), theme::mono(10.), theme::muted());
-        if j > 0 {
-            if let Some((a, c)) = inf.and_then(|i| i.interval[j]) {
-                let (x0, x1) = (rect.left() + col(0.46), rect.left() + col(0.72));
-                let xm = |v: f64| x0 + (x1 - x0) * ((v - lo) / span) as f32;
-                let excl = a > 0. || c < 0.;
-                let ink = if excl && usable { theme::text() } else { theme::muted().gamma_multiply(0.6) };
-                p.line_segment([pos2(xm(a), y2), pos2(xm(c), y2)], Stroke::new(if excl && usable { 2. } else { 1. }, ink));
-                p.vline(xm(0.), (y2 - 5.)..=(y2 + 5.), Stroke::new(1., theme::muted()));
-                p.circle_stroke(pos2(xm(b), y2), 2.5, Stroke::new(1., ink));
+    let rows: Vec<NumRow> = (0..fit.k)
+        .map(|j| {
+            let b = fit.coefficients[j];
+            let (scale, own_tag) = if j == 0 {
+                (icpt_scale, icpt_scale.exp != slope_scale.exp)
+            } else {
+                (slope_scale, false)
+            };
+            // An intercept scaled differently from the header says so in its own cells.
+            let tagged = |s: String| {
+                if own_tag && s != fmt_num::MISSING { format!("{s} {}", if scale.exp == 0 { "×10⁰".into() } else { scale.tag() }) } else { s }
+            };
+            let usable = inf.is_some_and(|i| i.se[j].is_some());
+            let se = inf.and_then(|i| i.se[j]);
+            let z = inf.and_then(|i| i.z[j]);
+            let mut ci = NumCell::new("", theme::muted());
+            if j > 0
+                && let Some((a, c)) = inf.and_then(|i| i.interval[j])
+            {
+                ci = ci.graphic(move |p, slot| {
+                    let (x0, x1) = (slot.left() + 4., slot.right() - 4.);
+                    let y2 = slot.center().y;
+                    let xm = |v: f64| x0 + (x1 - x0) * ((v - lo) / span) as f32;
+                    let excl = a > 0. || c < 0.;
+                    let ink = if excl && usable { theme::text() } else { theme::muted().gamma_multiply(0.6) };
+                    p.line_segment([pos2(xm(a), y2), pos2(xm(c), y2)], Stroke::new(if excl && usable { 2. } else { 1. }, ink));
+                    p.vline(xm(0.), (y2 - 5.)..=(y2 + 5.), Stroke::new(1., theme::muted()));
+                    p.circle_stroke(pos2(xm(b), y2), 2.5, Stroke::new(1., ink));
+                });
             }
-        }
-        let z = inf.and_then(|i| i.z[j]);
-        p.text(pos2(rect.left() + col(0.74), y2), Align2::LEFT_CENTER, z.map_or("—".into(), |z| signed(z, 2)), theme::mono(10.), z.map_or(theme::muted(), theme::sign));
-        for (x, v) in [(0.82, inf.and_then(|i| i.p[j])), (0.89, inf.and_then(|i| i.q[j]))] {
-            p.text(pos2(rect.left() + col(x), y2), Align2::LEFT_CENTER, v.map_or("—".into(), |v| format!("{v:.3}")), theme::mono(10.), theme::muted());
-        }
-        if j > 0 {
-            let v = fit.vif[j - 1];
-            let cell = Rect::from_min_size(pos2(rect.left() + col(0.94), rect.top() + 12.), vec2(width * 0.06 + 2., 18.));
-            p.rect_filled(cell, 2., heat.fill(v));
-            p.text(cell.center(), Align2::CENTER_CENTER, format!("{v:.2}"), theme::mono(9.), heat.ink(v));
+            let vif = if j > 0 {
+                let v = fit.vif[j - 1];
+                NumCell::new(fmt_num::level(v), theme::text()).chip(heat.fill(v), heat.ink(v))
+            } else {
+                NumCell::new(fmt_num::MISSING, theme::muted())
+            };
+            NumRow {
+                cells: vec![
+                    NumCell::new(term_name(r, j), theme::text()),
+                    NumCell::new(tagged(scale.signed(Some(b))), theme::sign(b)),
+                    NumCell::new(tagged(scale.unsigned(se)), theme::muted()),
+                    ci,
+                    NumCell::new(fmt_num::signed_opt(z, 2), z.map_or(theme::muted(), theme::sign)),
+                    NumCell::new(fmt_num::prob(inf.and_then(|i| i.p[j])), theme::muted()),
+                    NumCell::new(fmt_num::prob(inf.and_then(|i| i.q[j])), theme::muted()),
+                    vif,
+                ],
+            }
+        })
+        .collect();
+    let out = numeric_table(ui, ui.id().with(("lab-coef-table", r.key)), &cols, &rows, width);
+    #[cfg(test)]
+    if let Some(rect) = out.rows.get(1) {
+        ui.ctx().data_mut(|d| d.insert_temp(egui::Id::new("lab-probe"), *rect));
+        ui.ctx().data_mut(|d| d.insert_temp(egui::Id::new("lab-table-probe"), (out.compact, out.all_rects())));
+        ui.ctx().data_mut(|d| d.insert_temp(egui::Id::new("lab-table-shown"), out.shown.clone()));
+    }
+    for (j, resp) in out.responses.into_iter().enumerate() {
+        let vif_slot = out.cells[j][7];
+        if j > 0 && vif_slot != Rect::NOTHING {
             // The VIF cell has its own card; the rest of the row explains the coefficient.
-            ui.interact(cell, ui.id().with(("lab-vif", j)), Sense::hover()).math_card(|| vif_card(r, shown, j - 1));
+            ui.interact(vif_slot, ui.id().with(("lab-vif", j)), Sense::hover()).math_card(|| vif_card(r, shown, j - 1));
         }
         resp.math_card(|| coef_card(r, shown, j));
     }
@@ -1011,9 +1062,9 @@ fn strip(ui: &mut Ui, r: &LabReport, st: &LabUi) {
             stamp(fit.train_start),
             stamp(fit.train_end),
             stamp(fit.split_ts),
-            h.purged,
-            fit.n_train,
-            h.n_test,
+            fmt_num::count(h.purged as u64),
+            fmt_num::count(fit.n_train as u64),
+            fmt_num::count(h.n_test as u64),
             100 - r.spec.holdout_pct
         ),
         9.5,
@@ -1031,8 +1082,8 @@ fn strip(ui: &mut Ui, r: &LabReport, st: &LabUi) {
         };
         stat_tile(ui, label, &value, ink, || oos_card(r, shown));
         stat_tile(ui, "R²_in · in-sample, descriptive", &fit.r2_in.map_or("—".into(), |v| signed(v, 4)), theme::text(), || r2_in_card(r, shown));
-        stat_tile(ui, "σ (training residual)", &format!("{:.3e}", fit.residual_sigma), theme::text(), || sigma_card(r, shown));
-        stat_tile(ui, "κ∞ · rank", &format!("{:.2e} · {}/{}", fit.kappa_inf, fit.rank, fit.k), theme::text(), || condition_card(r, shown));
+        stat_tile(ui, "σ (training residual)", &fmt_num::level(fit.residual_sigma), theme::text(), || sigma_card(r, shown));
+        stat_tile(ui, "κ∞ · rank", &format!("{} · {}/{}", fmt_num::level(fit.kappa_inf), fit.rank, fit.k), theme::text(), || condition_card(r, shown));
     });
     if !h.forecast_style {
         ui.label(ui_text("contemporaneous fit — not a forecast", 10., theme::muted()));
@@ -1157,8 +1208,12 @@ pub(crate) fn panel(ui: &mut Ui, id: PaneId, r: &LabReport, st: &mut LabUi) {
             return;
         }
         super::studio_dist::studio_heading(ui, "COEFFICIENTS");
-        if width >= 600. {
-            let tw = 340f32.min(width * 0.45);
+        // The coefficient grid needs ~600pt for every column (β, SE, whisker, z, p, q, VIF). Side by
+        // side only when the plots keep a usable width beside it; otherwise the table stacks full-width
+        // above the plots, so wide panes never fall back to the compact grid.
+        const TABLE_W: f32 = 600.;
+        if width >= TABLE_W + 12. + 360. {
+            let tw = TABLE_W;
             ui.horizontal_top(|ui| {
                 ui.vertical(|ui| {
                     ui.set_width(width - tw - 12.);

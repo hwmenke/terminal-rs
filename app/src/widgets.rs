@@ -6,6 +6,9 @@ use egui::{
     vec2,
 };
 
+mod numeric_table;
+pub use numeric_table::*;
+
 use crate::anim;
 use crate::theme::{self, ui_font};
 

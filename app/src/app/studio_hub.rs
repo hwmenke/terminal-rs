@@ -724,6 +724,15 @@ impl StudioPane {
         let area = ui.available_rect_before_wrap();
         let wide = area.width() >= 900.;
         let narrow = area.width() < 600.;
+        // The chart is allocated first: header, lens rail and the About/Build notes live in a
+        // height-capped scroll area, so source details can never squeeze the native chart.
+        let native = !self.chart.canvas_view().enabled;
+        let chrome_cap = chrome_cap(area.height(), native);
+        egui::ScrollArea::vertical()
+            .id_salt((id, "studio-chrome"))
+            .max_height(chrome_cap)
+            .auto_shrink([false, true])
+            .show(ui, |ui| {
         // At normal widths the receipt header is 44pt and lens rail 32pt. Narrow controls wrap.
         let header = ui.scope(|ui| {
             ui.set_min_height(44.);
@@ -770,6 +779,7 @@ impl StudioPane {
         if self.build_open {
             egui::Frame::group(ui.style()).show(ui,|ui|{ui.label("BUILD · Residual tickers (STUDIO resid) and attribution (STUDIO attr) available");ui.label("Regression Lab (STUDIO lab factors=SPY,TLT) fits multi-factor OLS with a purged frozen holdout. Save residual freezes a fit into an immutable model; STUDIO resid open <id> scores it on live data and never refits; STUDIO attr model=<id> obs=20 splits a window's move into drift + factor contributions + residual from that frozen model.");});
         }
+            });
         let content = ui.available_rect_before_wrap();
         let mut body = content;
         if self.inspector_open && wide {
@@ -783,7 +793,7 @@ impl StudioPane {
         child.set_clip_rect(body.intersect(ui.clip_rect()));
         if self.quick {
             self.canvas(&mut child,body,id,worker,sample,focused);
-        } else if narrow {
+        } else if narrow || matches!(split_layout(body.height(), self.canvas_fraction, native), Split::Stacked { .. }) {
             egui::ScrollArea::vertical().id_salt((id, "studio-stack")).show(&mut child, |ui| {
                 let height=if self.chart.canvas_view().enabled {480.}else{240.};
                 let (canvas, _) = ui.allocate_exact_size(vec2(ui.available_width(), height), Sense::hover());
@@ -792,8 +802,10 @@ impl StudioPane {
                 actions.extend(self.analysis(ui, id, worker, sample));
             });
         } else {
-            let min:f32=if self.chart.canvas_view().enabled {280.}else{120.};
-            let h = (body.height() * self.canvas_fraction).clamp(min.min((body.height()-1.).max(1.)),(body.height()-1.).max(1.));
+            let h = match split_layout(body.height(), self.canvas_fraction, native) {
+                Split::Side { chart_h } => chart_h,
+                Split::Stacked { chart_h } => chart_h,
+            };
             let canvas = Rect::from_min_size(body.min, vec2(body.width(), h));
             self.canvas(&mut child, canvas, id, worker, sample, focused);
             let split = Rect::from_min_size(pos2(body.left(), canvas.bottom()), vec2(body.width(), 6.));
@@ -1177,6 +1189,43 @@ pub(super) fn prepared_relate(
     assert!(c.fair_value_overlay(&symbol).is_some());
     while requests.try_recv().is_ok() {}
     pane
+}
+
+/// Smallest chart the Studio will allocate: native price chart / Quick canvas (points).
+pub(crate) const CHART_MIN_NATIVE: f32 = 240.;
+pub(crate) const CHART_MIN_CANVAS: f32 = 280.;
+/// Analysis needs at least this much beside the chart before the stack falls back to scrolling.
+pub(crate) const ANALYSIS_MIN: f32 = 140.;
+const SPLIT_GAP: f32 = 10.;
+
+pub(crate) fn chart_min(native: bool) -> f32 {
+    if native { CHART_MIN_NATIVE } else { CHART_MIN_CANVAS }
+}
+
+/// How the body below the chrome is divided.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) enum Split {
+    /// Chart above, analysis below, draggable divider.
+    Side { chart_h: f32 },
+    /// Not enough height for both: chart at its minimum, everything scrolls.
+    Stacked { chart_h: f32 },
+}
+
+/// Chart height for a body of `body_h`. The chart never goes below [`chart_min`]; when the analysis
+/// would then fall under [`ANALYSIS_MIN`] the layout stacks and scrolls instead of squeezing.
+pub(crate) fn split_layout(body_h: f32, fraction: f32, native: bool) -> Split {
+    let min = chart_min(native);
+    if body_h < min + ANALYSIS_MIN + SPLIT_GAP {
+        return Split::Stacked { chart_h: min };
+    }
+    let max = body_h - ANALYSIS_MIN - SPLIT_GAP;
+    Split::Side { chart_h: (body_h * fraction).clamp(min, max) }
+}
+
+/// Tallest the header/lens rail/notes block may be: whatever the chart and a usable analysis leave
+/// free, but never less than the 76pt default (44pt header + 32pt lens rail), then it scrolls.
+pub(crate) fn chrome_cap(area_h: f32, native: bool) -> f32 {
+    (area_h - chart_min(native) - ANALYSIS_MIN - SPLIT_GAP).max(76.)
 }
 
 #[cfg(test)]
