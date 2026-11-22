@@ -317,6 +317,9 @@ pub struct BacktestReport {
     pub ticker: String,
     pub provenance: Provenance,
     pub source: String,
+    /// Structured source receipt (display only; set by the worker, daily runs).
+    #[serde(default)]
+    pub source_receipt: Option<crate::source_receipt::SourceReceipt>,
     pub as_of: String,
     pub series_start: String,
     pub series_end: String,
@@ -747,6 +750,7 @@ pub fn compute_report(
         ticker: ticker.into(),
         provenance,
         source: provenance.source_label(source).into(),
+        source_receipt: None,
         as_of: evaluate_end.clone(),
         series_start: train_start.clone(),
         series_end: evaluate_end.clone(),

@@ -540,22 +540,35 @@ impl StudioPane {
         match self.children.iter().find(|c| c.kind() == self.lens)? {
             StudioLensState::When(p) => p.error.as_deref(),
             StudioLensState::Relate(p) => p.error.as_deref(),
-            _ => None,
+            StudioLensState::Dist(p) => p.error.as_deref(),
+            StudioLensState::Season(p) => p.error.as_deref(),
+            StudioLensState::Backtest(p) => p.error.as_deref(),
         }
     }
     /// Structured receipts of the visible lens (one compact chip; full chain on hover/Inspector).
-    fn receipt_parts(&self) -> (Vec<tr_data::source_receipt::SourceReceipt>, Vec<String>) {
+    fn receipt_parts(&self) -> Vec<crate::widgets::ChipPart<'_>> {
+        use crate::widgets::{chip_one, chip_parts_opt};
         match self.children.iter().find(|c| c.kind() == self.lens) {
-            Some(StudioLensState::Relate(p)) if p.report.is_some() => {
-                let r = p.report.as_ref().unwrap();
-                let labels = [&r.symbol, &r.benchmark].map(|s| tr_data::security(s).ticker).to_vec();
-                (r.receipts.clone(), labels)
+            Some(StudioLensState::Relate(p)) => p
+                .report
+                .as_ref()
+                .map(|r| chip_parts_opt(&[r.symbol.as_str(), r.benchmark.as_str()], &r.receipts))
+                .unwrap_or_default(),
+            Some(StudioLensState::When(p)) => p
+                .report
+                .as_ref()
+                .map(|r| r.source_receipts.iter().map(|c| (r.report.symbol.as_str(), c)).collect())
+                .unwrap_or_default(),
+            Some(StudioLensState::Dist(p)) => {
+                p.report.as_ref().map(|r| chip_one(r.symbol.as_str(), &r.source_receipt)).unwrap_or_default()
             }
-            Some(StudioLensState::When(p)) if p.report.is_some() => {
-                let r = p.report.as_ref().unwrap();
-                (r.source_receipts.clone(), vec![tr_data::security(&r.report.symbol).ticker])
+            Some(StudioLensState::Season(p)) => {
+                p.report.as_ref().map(|r| chip_one(r.symbol.as_str(), &r.source_receipt)).unwrap_or_default()
             }
-            _ => (vec![], vec![]),
+            Some(StudioLensState::Backtest(p)) => {
+                p.report.as_ref().map(|r| chip_one(r.symbol.as_str(), &r.source_receipt)).unwrap_or_default()
+            }
+            _ => vec![],
         }
     }
     fn receipt(&self) -> String {
@@ -612,8 +625,7 @@ impl StudioPane {
     fn inspector(&mut self, ui: &mut Ui) {
         ui.label(RichText::new("STUDIO INPUTS").font(theme::ui_font(16.)).strong());
         // Full source chain (attempts, clocks, gaps) lives here, not in the pane header.
-        let (receipts, labels) = self.receipt_parts();
-        let chain = crate::widgets::source_chip_detail(&receipts, &labels, &self.receipt());
+        let chain = crate::widgets::source_chip_detail(&self.receipt_parts(), &self.receipt());
         egui::CollapsingHeader::new(RichText::new("Source chain").font(theme::ui_font(11.))).show(ui, |ui| {
             ui.label(RichText::new(chain).font(theme::mono(10.)).color(theme::muted()));
         });
@@ -732,8 +744,7 @@ impl StudioPane {
                     self.inspector_open = !self.inspector_open;
                 }
             });
-            let (receipts, labels) = self.receipt_parts();
-            crate::widgets::source_chip(ui, "", &receipts, &labels, &self.receipt());
+            crate::widgets::source_chip(ui, "", &self.receipt_parts(), || self.receipt());
         });
         let _ = header;
         ui.scope(|ui| {

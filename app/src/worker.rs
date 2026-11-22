@@ -2020,7 +2020,14 @@ async fn research_daily_receipt(
                 0 => Ok((s.history.db(move |db| db.daily(&ticker)).await?, "Local research archive".into())),
                 1 => {
                     anyhow::ensure!(bridge.enabled, "disabled");
-                    let external = bridge.histories_for(std::slice::from_ref(&ticker)).await?;
+                    // A service outage is flagged structurally; unverified data is a data problem.
+                    let external = bridge.histories_for(std::slice::from_ref(&ticker)).await.map_err(|e| {
+                        if tr_data::whats_news::is_unverified(&e) {
+                            e
+                        } else {
+                            anyhow::Error::new(crate::daily_research::WhatsNewsUnreachable(format!("{e:#}")))
+                        }
+                    })?;
                     external.provenance.require_verified("Daily research").map_err(anyhow::Error::msg)?;
                     if let Some(skip) = external.data.skipped.iter().find(|v| v.symbol.eq_ignore_ascii_case(&ticker)) {
                         anyhow::bail!("{}", skip.reason);
@@ -2950,23 +2957,28 @@ async fn research_rotation(
 ) -> anyhow::Result<tr_data::rotation::RotationReport> {
     let query = query.clone();
     let bridge = s.whats_news.borrow().1.bridge();
-    let (benchmark, source) = research_daily(s, &bridge, &query.benchmark).await?;
+    let (benchmark, bench_receipt) = research_daily_receipt(s, &bridge, &query.benchmark).await?;
     let mut named = Vec::new();
-    let mut sources = vec![format!("{}: {}", query.benchmark, source)];
+    let mut sources = vec![format!("{}: {}", query.benchmark, bench_receipt.detail)];
+    // (symbol, receipt) pairs for the loaded names only, benchmark first.
+    let mut receipts = vec![(query.benchmark.clone(), bench_receipt)];
     for symbol in &query.symbols {
-        let result = research_daily(s, &bridge, symbol).await.map(|(bars, source)| {
-            sources.push(format!("{symbol}: {source}"));
+        let result = research_daily_receipt(s, &bridge, symbol).await.map(|(bars, receipt)| {
+            sources.push(format!("{symbol}: {}", receipt.detail));
+            receipts.push((symbol.clone(), receipt));
             bars
         }).map_err(|e| format!("{e:#}"));
         named.push((symbol.clone(), result));
     }
     let source = sources.join("; ");
     let expected = tr_data::history::calendar::last_expected_session(chrono::Utc::now());
-    tokio::task::spawn_blocking(move || {
+    let mut report = tokio::task::spawn_blocking(move || {
         tr_data::rotation::build_report(&benchmark, named, &query, &source, expected)
     })
     .await?
-    .map_err(anyhow::Error::msg)
+    .map_err(anyhow::Error::msg)?;
+    report.source_receipts = receipts;
+    Ok(report)
 }
 
 /// Load one name from the local archive, then Whats-News. Sample/display bars never enter.
@@ -2982,17 +2994,18 @@ async fn research_stats(
     if ticker.is_empty() {
         anyhow::bail!("Statistics refused: invalid security");
     }
-    let (bars, source) = research_daily(s, bridge, key).await?;
+    let (bars, receipt) = research_daily_receipt(s, bridge, key).await?;
     let key = tr_data::security(key).key();
-    let snapshot = tokio::task::spawn_blocking({
+    let mut snapshot = tokio::task::spawn_blocking({
         let condition = condition.to_string();
         let horizons = horizons.to_vec();
-        let source = source.clone();
+        let source = receipt.detail.clone();
         let ticker = ticker.clone();
         move || tr_data::stats::compute_snapshot(&key, &ticker, &bars, &condition, &horizons, &source)
     })
     .await?
     .map_err(anyhow::Error::msg)?;
+    snapshot.stats.source_receipt = Some(receipt);
     Ok(snapshot)
 }
 
@@ -3154,7 +3167,8 @@ async fn research_backtest(
     if ticker.is_empty() {
         anyhow::bail!("Backtest refused: invalid security");
     }
-    let (bars, source) = research_daily(s, bridge, key).await?;
+    let (bars, structured) = research_daily_receipt(s, bridge, key).await?;
+    let source = structured.detail.clone();
     let strategies = tr_data::backtest::parse_strategies(spec, allow_short).map_err(anyhow::Error::msg)?;
     let settings = tr_data::backtest::RunSettings {
         holdout_frac: tr_data::backtest::parse_holdout(holdout),
@@ -3191,7 +3205,11 @@ async fn research_backtest(
         },
     )
     .await?;
-    Ok((report, receipt))
+    // The science cache is keyed on inputs, never on the receipt: attach this load's receipt to
+    // a copy so a cache hit still names the provider that served this run.
+    let mut report = Arc::unwrap_or_clone(report);
+    report.source_receipt = Some(structured);
+    Ok((Arc::new(report), receipt))
 }
 
 /// Verified regular-session bars only. Sample substitution is refused before a setup is scored.
@@ -4746,10 +4764,9 @@ async fn handle_inner(s: &Arc<Shared>, req: Request, force: bool) {
                         "Distribution Studio: sample / demo mode has no real data. Verified bars are required."
                     );
                 }
-                let (bars, source, observed_at, gaps) = if timeframe == Timeframe::D1 {
-                    let (bars, source) =
-                        research_daily(s, &config.bridge(), &symbol).await?;
-                    (bars, source, Some(chrono::Utc::now().timestamp()), Vec::new())
+                let (bars, source, observed_at, gaps, structured) = if timeframe == Timeframe::D1 {
+                    let (bars, receipt) = research_daily_receipt(s, &config.bridge(), &symbol).await?;
+                    (bars, receipt.detail.clone(), Some(chrono::Utc::now().timestamp()), Vec::new(), Some(receipt))
                 } else {
                     let (bars, stitch) =
                         research_history(s, &symbol, timeframe, default_limit(timeframe), "Distribution Studio").await?;
@@ -4760,11 +4777,14 @@ async fn handle_inner(s: &Arc<Shared>, req: Request, force: bool) {
                         )
                     });
                     let observed_at = (!stale && stitch.live_ok).then_some(stitch.fetched_at).flatten();
-                    (bars, stitch.label(), observed_at, stitch.gaps)
+                    (bars, stitch.label(), observed_at, stitch.gaps, None)
                 };
-                crate::app::studio_dist::build_report(symbol, bars, timeframe, window, source, observed_at, gaps)
-                    .await
-                    .map_err(anyhow::Error::msg)
+                let mut report =
+                    crate::app::studio_dist::build_report(symbol, bars, timeframe, window, source, observed_at, gaps)
+                        .await
+                        .map_err(anyhow::Error::msg)?;
+                report.source_receipt = structured;
+                Ok(report)
             }
             .await;
             send(Response::StudioDist { pane, generation, result: result.map_err(|e| format!("{e:#}")) });
@@ -4921,8 +4941,11 @@ async fn handle_inner(s: &Arc<Shared>, req: Request, force: bool) {
                 if !tr_data::cash_session::is_cash(&tr_data::security(&symbol)) {
                     anyhow::bail!("SEASON currently requires a US cash-session equity, ETF or index");
                 }
+                let mut structured = None;
                 let (bars, source, observed, gaps) = if tf == Timeframe::D1 {
-                    let (bars, source) = research_daily(s, &config.bridge(), &symbol).await?;
+                    let (bars, receipt) = research_daily_receipt(s, &config.bridge(), &symbol).await?;
+                    let source = receipt.detail.clone();
+                    structured = Some(receipt);
                     (bars, source, chrono::Utc::now().timestamp(), Vec::new())
                 } else {
                     let (bars, info) = research_history(s, &symbol, tf, tr_data::cash_session::research_fetch_limit(tf), "Seasonality").await?;
@@ -4935,9 +4958,18 @@ async fn handle_inner(s: &Arc<Shared>, req: Request, force: bool) {
                 let now = chrono::Utc::now().timestamp();
                 let jobs = s.jobs.clone();
                 let reports = s.reports.clone();
-                tokio::task::spawn_blocking(move || {
+                let report = tokio::task::spawn_blocking(move || {
                     cached_season_report(&reports, &jobs, &symbol, tf, &bars, &source, observed.min(now), now, &gaps)
-                }).await?.map_err(anyhow::Error::msg)
+                }).await?.map_err(anyhow::Error::msg)?;
+                // Cache is keyed on inputs, not the receipt: attach this load's receipt to a copy.
+                Ok(match structured {
+                    Some(receipt) => {
+                        let mut report = Arc::unwrap_or_clone(report);
+                        report.source_receipt = Some(receipt);
+                        Arc::new(report)
+                    }
+                    None => report,
+                })
             }.await.map_err(|e| format!("{e:#}"));
             send(Response::StudioSeason { pane, generation, result });
         }

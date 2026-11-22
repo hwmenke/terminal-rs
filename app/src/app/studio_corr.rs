@@ -625,11 +625,10 @@ fn render(ui: &mut Ui, r: &CorrReport) {
         .font(theme::mono(11.0))
         .color(theme::muted()),
     )
-    .on_hover_text(crate::widgets::source_chip_detail(
-        &r.receipts,
-        &[&r.symbol, &r.benchmark].map(|s| tr_data::security(s).ticker),
-        &r.source,
-    ));
+    .on_hover_ui(|ui| {
+        let parts = crate::widgets::chip_parts_opt(&[r.symbol.as_str(), r.benchmark.as_str()], &r.receipts);
+        ui.label(crate::widgets::source_chip_detail(&parts, &r.source));
+    });
     ui.label(
         RichText::new(format!(
             "{} common / {} asset / {} benchmark price bars",

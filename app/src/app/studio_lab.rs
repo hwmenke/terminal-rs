@@ -520,18 +520,11 @@ fn clock(r: &LabReport) -> String {
 
 /// One compact source line; the full chain (attempts, clocks) is on hover.
 fn receipt(ui: &mut Ui, r: &LabReport) {
-    let labels: Vec<String> = std::iter::once(&r.symbol)
-        .chain(r.spec.factors.iter().map(|f| &f.symbol))
-        .map(|s| tr_data::security(s).ticker)
-        .collect();
-    let legacy = format!(
-        "{} · CLOSED THRU {} · {} · {}",
-        r.provenance.label(),
-        stamp(r.closed_thru),
-        clock(r),
-        r.source
-    );
-    crate::widgets::source_chip(ui, r.provenance.label(), &r.source_receipts, &labels, &legacy);
+    // Label/receipt pairs come from the report itself (failed factors are already excluded).
+    let parts = crate::widgets::chip_parts(&r.source_receipts);
+    crate::widgets::source_chip(ui, r.provenance.label(), &parts, || {
+        format!("CLOSED THRU {} · {} · {}", stamp(r.closed_thru), clock(r), r.source)
+    });
 }
 
 // ---- MathCards ----------------------------------------------------------------------------------

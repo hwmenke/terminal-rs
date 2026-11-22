@@ -1218,10 +1218,11 @@ fn when_guard(p: &super::studio_when::WhenPane, out: &egui::FullOutput, hover: b
         "block 95%",
         "PRIOR-ONLY",
         "Q5",
-        "CLOSED THRU",
     ] {
         assert!(txt.contains(word), "When missing {word}: {txt}");
     }
+    // The source chip now lives in the Studio header only (UX slice 1 fix L4).
+    assert!(!txt.contains("Yahoo ·") && !txt.contains(" bars · +"), "When lens body must not repeat the chip");
     let r = &p.report.as_ref().unwrap().report;
     // 120 sessions incl. two half days = 9,288 expected slots; every horizon
     // keeps its completed in-session outcomes (slots − sessions·h − warm-up).
@@ -1257,8 +1258,9 @@ fn source_chip_frame(ctx: &egui::Context, index: usize) -> egui::FullOutput {
             ..Default::default()
         },
         |ui| {
+            let parts = [("SPX", &receipts[0]), ("SPY", &receipts[1])];
             for _ in 0..40 {
-                crate::widgets::source_chip(ui, "REAL", &receipts, &["SPX".into(), "SPY".into()], "legacy");
+                crate::widgets::source_chip(ui, "REAL", &parts, || "legacy".into());
             }
         },
     );

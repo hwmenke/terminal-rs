@@ -44,12 +44,58 @@ impl Receipt {
     }
 }
 
+/// Sentence appended to a daily-research failure only when the Whats-News stage failed because
+/// the service was unreachable/unconfigured (not for "no history for this ticker"). Panes and the
+/// footer test for it with [`error_needs_whats_news`]; nothing else in an error text counts.
+pub(crate) const WHATS_NEWS_OFFLINE_NOTE: &str = "Whats-News was unreachable for this request.";
+
+/// Failure of the Whats-News stage that is a service outage (as opposed to the ticker simply
+/// having no history there). Raised by the worker's stage-1 fetch and read by [`resolve`].
+#[derive(Debug)]
+pub(crate) struct WhatsNewsUnreachable(pub String);
+impl std::fmt::Display for WhatsNewsUnreachable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+impl std::error::Error for WhatsNewsUnreachable {}
+
+/// Structured result of an exhausted daily resolution.
+#[derive(Debug)]
+pub(crate) struct DailyUnavailable {
+    pub message: String,
+    /// The Whats-News stage failed on reachability, so an outage plausibly caused this result.
+    pub needs_whats_news: bool,
+}
+impl std::fmt::Display for DailyUnavailable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)?;
+        if self.needs_whats_news {
+            write!(f, " {WHATS_NEWS_OFFLINE_NOTE}")?;
+        }
+        Ok(())
+    }
+}
+impl std::error::Error for DailyUnavailable {}
+
+/// True when this resolver failure was affected by a Whats-News outage.
+pub(crate) fn needs_whats_news(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<DailyUnavailable>().is_some_and(|e| e.needs_whats_news)
+}
+
+/// Pane/footer check on the error text a worker response carried (the text embeds the resolver's
+/// structured flag as [`WHATS_NEWS_OFFLINE_NOTE`]; an unknown ticker never contains it).
+pub(crate) fn error_needs_whats_news(text: &str) -> bool {
+    text.contains(WHATS_NEWS_OFFLINE_NOTE)
+}
+
 pub(crate) async fn resolve<F, Fut>(key: &str, observed_at: i64, mut fetch: F) -> anyhow::Result<Receipt>
 where
     F: FnMut(usize) -> Fut,
     Fut: std::future::Future<Output = anyhow::Result<(Vec<Bar>, String)>>,
 {
     let mut fallback = Vec::new();
+    let mut needs_whats_news = false;
     for (i, name) in ["Local research archive", "Whats-News (HTTP / SQLite)", "Native provider"].iter().enumerate() {
         let result = async {
             let (mut bars, source) = fetch(i).await?;
@@ -69,13 +115,19 @@ where
                 };
                 return Ok(Receipt { bars, source, provider_id, fallback, observed_at });
             }
-            Err(e) => fallback.push(format!("{name}: {e:#}")),
+            Err(e) => {
+                needs_whats_news |= i == 1 && e.downcast_ref::<WhatsNewsUnreachable>().is_some();
+                fallback.push(format!("{name}: {e:#}"))
+            }
         }
     }
-    anyhow::bail!(
-        "Daily research unavailable for {key}. {}. Retry, or open Settings > Whats-News; HIST can download verified daily history.",
-        fallback.join("; ")
-    )
+    Err(anyhow::Error::new(DailyUnavailable {
+        message: format!(
+            "Daily research unavailable for {key}. {}. Retry, or open Settings > Whats-News; HIST can download verified daily history.",
+            fallback.join("; ")
+        ),
+        needs_whats_news,
+    }))
 }
 
 #[cfg(test)]
@@ -170,6 +222,38 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(archive.summary().provider_id, "archive");
+    }
+
+    #[tokio::test]
+    async fn whats_news_flag_is_structural_not_text() {
+        // Whats-News unreachable and every other source failed: flagged, and the text says so.
+        let down = resolve("AAPL", 1_740_000_000, |stage| async move {
+            if stage == 1 {
+                return Err(anyhow::Error::new(WhatsNewsUnreachable("connection refused".into())));
+            }
+            anyhow::bail!("failure {stage}")
+        })
+        .await
+        .err()
+        .unwrap();
+        assert!(needs_whats_news(&down) && error_needs_whats_news(&down.to_string()), "{down:#}");
+        // Unknown ticker: the same Whats-News words appear in the generic recovery text, but the
+        // Whats-News stage merely had no history, so nothing is flagged.
+        let unknown = resolve("ZZZZ", 1_740_000_000, |_| async { anyhow::bail!("no daily history for ZZZZ") })
+            .await
+            .err()
+            .unwrap();
+        assert!(unknown.to_string().contains("Settings > Whats-News"));
+        assert!(!needs_whats_news(&unknown) && !error_needs_whats_news(&unknown.to_string()));
+        // Reachability failure covered by a later source is not an error at all.
+        let covered = resolve("AAPL", 1_740_000_000, |stage| async move {
+            if stage < 2 {
+                return Err(anyhow::Error::new(WhatsNewsUnreachable("offline".into())));
+            }
+            Ok((bars(Provenance::Real), "yahoo (native provider)".into()))
+        })
+        .await;
+        assert!(covered.is_ok());
     }
 
     #[tokio::test]

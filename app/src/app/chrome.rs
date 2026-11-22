@@ -1090,14 +1090,20 @@ impl TerminalApp {
         }
     }
 
-    /// True when the focused pane's own result failed because it needed Whats-News. An offline
-    /// optional service that another source covered does not affect the result.
+    /// True when the focused pane's own result failed because the daily resolver's Whats-News stage
+    /// was unreachable (a structured flag on the resolver error; see `daily_research`). An offline
+    /// optional service that another source covered, or an unknown ticker, does not affect it.
     fn whats_news_affects_focus(&self) -> bool {
-        let needs = |e: Option<&str>| e.is_some_and(|e| e.contains("Whats-News"));
+        use crate::daily_research::error_needs_whats_news as needs;
+        let needs = |e: Option<&str>| e.is_some_and(needs);
         match self.panes.iter().find(|p| p.id == self.focus).map(|p| &p.kind) {
             Some(super::PaneKind::Studio(s)) => needs(s.lens_error()),
             Some(super::PaneKind::StudioLab(p)) => needs(p.error.as_deref()),
             Some(super::PaneKind::Stats(p)) => needs(p.error.as_deref()),
+            Some(super::PaneKind::StudioDist(p)) => needs(p.error.as_deref()),
+            Some(super::PaneKind::StudioSeason(p)) => needs(p.error.as_deref()),
+            Some(super::PaneKind::Rotation(p)) => needs(p.error.as_deref()),
+            Some(super::PaneKind::Backtest(p)) => needs(p.error.as_deref()),
             _ => false,
         }
     }
@@ -1121,8 +1127,12 @@ impl TerminalApp {
                 if health.message.is_empty() { String::new() } else { format!(" · {}", health.message) }
             )
         } else {
-            // Optional service: a short grey label; the endpoint/start-service text is on hover.
-            "Whats-News offline".to_string()
+            // Optional service: a short grey label that names the real state ("Disconnected" reads as
+            // offline; "Not configured" stays honest); endpoint/start-service text is on hover.
+            match health.state {
+                tr_data::whats_news::LinkState::Disconnected => "Whats-News offline".to_string(),
+                _ => format!("Whats-News: {}", health.label()),
+            }
         };
         let color = whats_news_color(health.connected(), !health.message.is_empty(), affected);
         let p = ui.painter_at(link_rect.shrink2(vec2(8.0, 0.0)));
@@ -1589,6 +1599,27 @@ mod tests {
         assert_eq!(whats_news_color(false, true, true), amber());
         assert_eq!(whats_news_color(true, false, false), theme::up());
         assert_eq!(whats_news_color(true, true, false), amber());
+    }
+
+    #[test]
+    fn footer_turns_amber_only_for_a_structured_whats_news_outage() {
+        use crate::daily_research::{DailyUnavailable, WHATS_NEWS_OFFLINE_NOTE};
+        let outage = DailyUnavailable { message: "Daily research unavailable for AAPL. x".into(), needs_whats_news: true };
+        let unknown = DailyUnavailable { message: "Daily research unavailable for ZZZZ. no history".into(), needs_whats_news: false };
+        let (outage, unknown) = (outage.to_string(), unknown.to_string());
+        assert!(outage.contains(WHATS_NEWS_OFFLINE_NOTE) && !unknown.contains(WHATS_NEWS_OFFLINE_NOTE));
+        let mut app = chart_app();
+        let mut pane = super::super::studio_dist::DistPane::new("AAPL", tr_core::Timeframe::D1, tr_data::studio_dist::Window::All);
+        pane.error = Some(unknown);
+        app.open_panel(super::super::PaneKind::StudioDist(Box::new(pane)));
+        assert!(!app.whats_news_affects_focus(), "an unknown ticker is not an outage");
+        let Some(super::super::PaneKind::StudioDist(p)) =
+            app.panes.iter_mut().find(|p| p.id == app.focus).map(|p| &mut p.kind)
+        else {
+            panic!("focused Distribution pane")
+        };
+        p.error = Some(outage);
+        assert!(app.whats_news_affects_focus(), "Dist/Season/Rotation/Backtest errors count too");
     }
 
     #[test]

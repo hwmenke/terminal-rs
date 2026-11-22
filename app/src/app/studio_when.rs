@@ -581,10 +581,20 @@ fn period_row(ui: &mut Ui, p: &mut WhenPane) {
         if custom {
             ui.label(RichText::new("●").font(theme::ui_font(9.)).color(theme::accent()));
         }
-        if edit.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) && !p.period_draft.trim().is_empty() {
+        // Invalid input is a hint beside the field only: the accepted report (and its numbers)
+        // stays untouched and no pane-level error appears.
+        if !p.period_draft.trim().is_empty() {
             match data::WhenPeriod::parse(p.period_draft.trim()) {
-                Ok(d @ data::WhenPeriod::Since(_)) => pick = Some(d),
-                _ => p.error = Some("Custom period is a start date, YYYY-MM-DD".into()),
+                Ok(d @ data::WhenPeriod::Since(_)) => {
+                    if edit.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                        pick = Some(d);
+                    }
+                }
+                _ => {
+                    ui.label(
+                        RichText::new("start date as YYYY-MM-DD").font(theme::ui_font(10.)).color(theme::caution()),
+                    );
+                }
             }
         }
         if let Some(w) = p.report.as_ref().and_then(|r| r.report.window.as_ref()) {
@@ -676,7 +686,8 @@ pub(super) fn view(
     horizon: &mut usize,
 ) -> Rect {
     let r = &p.report;
-    crate::widgets::source_chip(ui, "", &p.source_receipts, &[r.symbol.clone()], &p.receipt);
+    // The source chip lives in the Studio header (When is only ever hosted there); the lens
+    // body keeps just the window line.
     if let Some(w) = &r.window {
         ui.label(RichText::new(window_line(w, r.sessions)).font(theme::mono(10.)).color(theme::muted()));
     }

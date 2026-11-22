@@ -111,6 +111,8 @@ pub struct SeasonReport {
     pub timeframe: Timeframe,
     pub provenance: Provenance,
     pub source: String,
+    /// Structured source receipt (display only; set by the worker, not part of any cache key).
+    pub source_receipt: Option<crate::source_receipt::SourceReceipt>,
     pub observed_at: i64,
     pub start: String,
     pub end: String,
@@ -448,6 +450,7 @@ pub fn compute_with_gaps(
         timeframe: tf,
         provenance,
         source: source.into(),
+        source_receipt: None,
         observed_at: observed,
         start: dates[0].to_string(),
         end: dates[dates.len() - 1].to_string(),

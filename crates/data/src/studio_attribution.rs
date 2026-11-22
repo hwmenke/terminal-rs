@@ -252,6 +252,9 @@ pub struct AttributionReport {
     pub path: Vec<AttrPathPoint>,
     pub receipts: Vec<SeriesReceipt>,
     pub source: String,
+    /// `(symbol, receipt)` per loaded row, target first (display only).
+    #[serde(default)]
+    pub source_receipts: Vec<(String, crate::source_receipt::SourceReceipt)>,
     pub provenance: Provenance,
     pub closed_thru: i64,
     pub observed_at: Option<i64>,
@@ -518,6 +521,7 @@ fn blank(fit: &FrozenFit, r: &ResidualReport, w: &AttrWindow, mode: AttrMode, re
         path: vec![],
         receipts: r.receipts.clone(),
         source: r.source.clone(),
+        source_receipts: r.source_receipts.clone(),
         provenance: r.provenance,
         closed_thru: r.closed_thru,
         observed_at: r.observed_at,
@@ -838,6 +842,7 @@ pub fn attribute(fit: &FrozenFit, r: &ResidualReport, w: &AttrWindow) -> Attribu
         path,
         receipts: r.receipts.clone(),
         source: r.source.clone(),
+        source_receipts: r.source_receipts.clone(),
         provenance: r.provenance,
         closed_thru: r.closed_thru,
         observed_at: r.observed_at,

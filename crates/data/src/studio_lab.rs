@@ -710,9 +710,11 @@ pub struct LabReport {
     pub diagnostics: Option<LabDiagnostics>,
     pub points: Vec<LabPoint>,
     pub source: String,
-    /// Structured source receipts, target first (display/Inspector; not part of the key).
+    /// `(symbol, receipt)` pairs, target first, loaded series only: label and receipt travel
+    /// together, so a failed factor can never shift a receipt onto another ticker
+    /// (display/Inspector only; not part of the key).
     #[serde(default)]
-    pub source_receipts: Vec<crate::source_receipt::SourceReceipt>,
+    pub source_receipts: Vec<(String, crate::source_receipt::SourceReceipt)>,
     pub provenance: Provenance,
     pub closed_thru: i64,
     pub observed_at: Option<i64>,
@@ -803,8 +805,11 @@ pub fn compute(
 ) -> LabReport {
     let mut report = compute_inner(target, factors, spec, tf, daily, source, closed_thru, observed_at, key);
     // Structured receipts in the same order as the joined `source` text (target first, loaded rows only).
-    report.source_receipts =
-        std::iter::once(target).chain(factors).filter(|r| r.error.is_none()).filter_map(|r| r.receipt.clone()).collect();
+    report.source_receipts = std::iter::once(target)
+        .chain(factors)
+        .filter(|r| r.error.is_none())
+        .filter_map(|r| r.receipt.clone().map(|c| (r.symbol.clone(), c)))
+        .collect();
     report
 }
 

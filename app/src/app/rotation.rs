@@ -350,9 +350,9 @@ impl TerminalApp {
                         .font(mono(11.0))
                         .color(if stale { amber() } else { theme::up() }),
                     );
-                    ui.label(
-                        RichText::new(format!("as of {} · {}", r.as_of, r.source)).font(mono(11.0)).color(muted()),
-                    );
+                    ui.label(RichText::new(format!("as of {}", r.as_of)).font(mono(11.0)).color(muted()));
+                    let parts = crate::widgets::chip_parts(&r.source_receipts);
+                    crate::widgets::source_chip(ui, "", &parts, || r.source.clone());
                     if r.week_in_progress {
                         ui.label(RichText::new("WTD").font(mono(11.0)).color(amber()));
                     }

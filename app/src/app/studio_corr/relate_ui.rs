@@ -258,18 +258,19 @@ pub(super) fn panel(ui: &mut Ui, id: PaneId, r: &CorrReport, rel: &RelateReport)
             .font(theme::ui_font(11.0))
             .color(theme::muted()),
         );
-        let receipts: Vec<_> = rel.receipts.iter().flatten().cloned().collect();
-        // Unstructured fallback keeps the closed-thru date first so the one-line truncation never drops it.
-        let legacy = format!(
-            "CLOSED THRU {} · benchmark gaps {} · asset: {} · benchmark: {}",
-            stamp(r.closed_thru),
-            rel.benchmark_gaps.len(),
-            rel.sources[0],
-            rel.sources[1],
-        );
-        let labels = [&r.symbol, &r.benchmark].map(|s| tr_data::security(s).ticker).to_vec();
+        // Positional per side: a side without a receipt drops its own label, never the other's.
+        let parts = crate::widgets::chip_parts_opt(&[r.symbol.as_str(), r.benchmark.as_str()], &rel.receipts);
         ui.horizontal(|ui| {
-            crate::widgets::source_chip(ui, "", &receipts, &labels, &legacy);
+            // Unstructured fallback keeps the closed-thru date first so the one-line truncation never drops it.
+            crate::widgets::source_chip(ui, "", &parts, || {
+                format!(
+                    "CLOSED THRU {} · benchmark gaps {} · asset: {} · benchmark: {}",
+                    stamp(r.closed_thru),
+                    rel.benchmark_gaps.len(),
+                    rel.sources[0],
+                    rel.sources[1],
+                )
+            });
             if !rel.benchmark_gaps.is_empty() {
                 ui.label(
                     RichText::new(format!("· benchmark gaps {}", rel.benchmark_gaps.len()))

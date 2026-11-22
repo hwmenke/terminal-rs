@@ -138,7 +138,8 @@ report, mask and shading.
 Daily When analyses the **latest 10 calendar years** of closed daily bars by
 default, anchored on the last closed bar (never the wall clock). The 5Y / 10Y /
 20Y / Custom (start date) controls change the disclosed period; the window line
-shows the period, dates, session count and warm-up. The command forms are
+shows the period, dates, session count and warm-up. An unparsable custom date is an
+inline hint beside the field (the accepted report is untouched, no pane error). The command forms are
 `period=5y|10y|20y` and `since=YYYY-MM-DD` (keyed only: bare `5Y`, `10Y`, `20Y`
 remain tickers). Up to `WARMUP_BARS` (1,000 = the maximum feature period) closed
 bars before the window are read so indicators are warm, but those slots get no

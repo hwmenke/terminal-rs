@@ -278,13 +278,10 @@ pub(in crate::app) fn view(
         RichText::new(format!("REGIME FINGERPRINTS · {} log returns by lagged-vol regime", r.timeframe.label()))
             .strong(),
     );
-    crate::widgets::source_chip(
-        ui,
-        "",
-        &[],
-        &[],
-        &format!("CLOSED THRU {} · {} · {}", stamp(r.end), r.provenance.label(), r.source),
-    );
+    let parts = crate::widgets::chip_one(&r.symbol, &r.source_receipt);
+    crate::widgets::source_chip(ui, "", &parts, || {
+        format!("CLOSED THRU {} · {} · {}", stamp(r.end), r.provenance.label(), r.source)
+    });
     let f = &r.regime;
     ui.label(format!(
         "classified {} / {} returns · warm-up {} · gap-excluded {}",

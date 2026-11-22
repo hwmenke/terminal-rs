@@ -185,7 +185,7 @@ fn intraday_ignores_period_in_key() {
 
 #[test]
 fn missing_sessions_keep_resets_and_horizon_boundaries() {
-    // Sessions 1500 and 2000 are missing inside the 5Y window (about 1,260 sessions).
+    // Sessions 2000 and 2001 are missing inside the 5Y window (about 1,260 sessions).
     let inp = input(daily(day(2016, 1, 4), 2_400, &[2_000, 2_001]));
     let r = compute(&inp, &spec("close>0", WhenPeriod::Years(5))).unwrap();
     let w = r.window.clone().unwrap();

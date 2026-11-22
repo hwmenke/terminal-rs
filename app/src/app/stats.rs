@@ -268,19 +268,16 @@ pub(super) fn show(
 }
 
 fn provenance_line(ui: &mut Ui, s: &StatsReport) {
-    ui.label(
-        RichText::new(format!(
-            "{} · {} · as-of {} · {} … {} · {} daily bars",
-            s.provenance.label(),
-            s.source,
-            s.as_of,
-            s.start,
-            s.end,
-            s.bars
-        ))
-        .font(mono(11.5))
-        .color(theme::provenance(s.provenance)),
-    );
+    ui.horizontal_wrapped(|ui| {
+        ui.label(
+            RichText::new(format!("{} · as-of {} · {} … {}", s.provenance.label(), s.as_of, s.start, s.end))
+                .font(mono(11.5))
+                .color(theme::provenance(s.provenance)),
+        );
+        // Structured receipt when present; the full chain stays on hover and in the MathCards.
+        let parts = crate::widgets::chip_one(&s.symbol, &s.source_receipt);
+        crate::widgets::source_chip(ui, "", &parts, || format!("{} · {} daily bars", s.source, s.bars));
+    });
 }
 
 fn pct(v: Option<f64>, scale: f64) -> String {

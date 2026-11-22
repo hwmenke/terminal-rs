@@ -988,14 +988,16 @@ pub(crate) fn panel(ui: &mut Ui, id: PaneId, fit: &FrozenFit, a: &AttributionRep
     path_chart(ui, a, width);
     caveats(ui, a);
     // One line; the full receipt text is on hover.
-    let legacy = format!(
-        "{} · CLOSED THRU {} · {} · {}",
-        a.provenance.label(),
-        stamp(a.closed_thru),
-        clock(a, fit.model.tf == Timeframe::D1),
-        a.source
-    );
-    crate::widgets::source_chip(ui, "", &[], &[], &legacy);
+    let parts = crate::widgets::chip_parts(&a.source_receipts);
+    crate::widgets::source_chip(ui, a.provenance.label(), &parts, || {
+        format!(
+            "{} · CLOSED THRU {} · {} · {}",
+            a.provenance.label(),
+            stamp(a.closed_thru),
+            clock(a, fit.model.tf == Timeframe::D1),
+            a.source
+        )
+    });
 }
 
 fn reserve(ui: &mut Ui, text: &str) {
