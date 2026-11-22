@@ -1,4 +1,7 @@
 //! Closed provider bars, separate from the mutable display cache. Call on a worker.
+pub mod daily;
+#[cfg(test)]
+mod daily_tests;
 pub mod merge;
 use crate::{BarCache, DataMode, stable_hash::bars_digest};
 use anyhow::{Result, bail};
@@ -106,6 +109,9 @@ pub struct VaultSnapshot {
     pub events: Vec<String>,
     pub bytes: u64,
     pub disabled: bool,
+    /// Daily series metadata (no OHLC rows are read to build it) and recent revisions.
+    pub daily: Vec<daily::DailySummary>,
+    pub daily_revisions: Vec<daily::DailyRevision>,
 }
 /// Quant modules historically require uniform provenance. A worker may normalise
 /// verified cache/live tags only with the stitch witness from this vault.
@@ -122,6 +128,14 @@ pub fn research_bars<'a>(bars: &'a [Bar], info: Option<&StitchInfo>) -> Result<s
     }
     Ok(std::borrow::Cow::Owned(bars.iter().map(|b| b.with_provenance(Provenance::Cached)).collect()))
 }
+pub(crate) const V2_SCHEMA: &str = "CREATE TABLE IF NOT EXISTS vault_series (
+          id INTEGER PRIMARY KEY,symbol TEXT NOT NULL,tf TEXT NOT NULL,source TEXT NOT NULL,epoch INTEGER NOT NULL DEFAULT 1,
+          first_ts INTEGER,last_ts INTEGER,bars INTEGER NOT NULL DEFAULT 0,created_at INTEGER NOT NULL,last_ingest INTEGER,last_read INTEGER,note TEXT,
+          UNIQUE(symbol,tf,source));
+          CREATE TABLE IF NOT EXISTS vault_bars (series_id INTEGER NOT NULL,ts INTEGER NOT NULL,o REAL NOT NULL,h REAL NOT NULL,l REAL NOT NULL,c REAL NOT NULL,v REAL NOT NULL,first_seen INTEGER NOT NULL,last_seen INTEGER NOT NULL,confirms INTEGER NOT NULL DEFAULT 1,PRIMARY KEY(series_id,ts)) WITHOUT ROWID;
+          CREATE TABLE IF NOT EXISTS vault_sessions (series_id INTEGER NOT NULL,date TEXT NOT NULL,expected INTEGER NOT NULL DEFAULT 0,present INTEGER NOT NULL DEFAULT 0,holes INTEGER NOT NULL DEFAULT 0,fetch_ok INTEGER NOT NULL DEFAULT 0,fetch_fail INTEGER NOT NULL DEFAULT 0,corrected INTEGER NOT NULL DEFAULT 0,last_seen INTEGER,PRIMARY KEY(series_id,date)) WITHOUT ROWID;
+          CREATE TABLE IF NOT EXISTS vault_events (id INTEGER PRIMARY KEY,at INTEGER NOT NULL,series_id INTEGER,kind TEXT NOT NULL,ts INTEGER,detail TEXT NOT NULL);
+          CREATE TABLE IF NOT EXISTS vault_reports (key BLOB PRIMARY KEY,kind TEXT NOT NULL,symbol TEXT NOT NULL,tf TEXT NOT NULL,code_version INTEGER NOT NULL,created_at INTEGER NOT NULL,last_hit INTEGER NOT NULL,body BLOB NOT NULL) WITHOUT ROWID;";
 pub struct BarVault {
     cache: BarCache,
     enabled: bool,
@@ -168,7 +182,7 @@ impl BarVault {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let conn = Connection::open(path.as_ref())?;
         let version: i64 = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
-        if version > 2 {
+        if version > 3 {
             drop(conn);
             let conn = Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
             return Ok(Self { cache: BarCache { conn }, enabled: false });
@@ -190,23 +204,20 @@ impl BarVault {
     fn from_connection(mut conn: Connection) -> Result<Self> {
         conn.busy_timeout(std::time::Duration::from_secs(2))?;
         let version: i64 = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
-        if version > 2 {
+        if version > 3 {
             return Ok(Self { cache: BarCache { conn }, enabled: false });
         }
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         BarCache::init_tables(&tx)?;
-        tx.execute_batch("CREATE TABLE IF NOT EXISTS vault_series (
-          id INTEGER PRIMARY KEY,symbol TEXT NOT NULL,tf TEXT NOT NULL,source TEXT NOT NULL,epoch INTEGER NOT NULL DEFAULT 1,
-          first_ts INTEGER,last_ts INTEGER,bars INTEGER NOT NULL DEFAULT 0,created_at INTEGER NOT NULL,last_ingest INTEGER,last_read INTEGER,note TEXT,
-          UNIQUE(symbol,tf,source));
-          CREATE TABLE IF NOT EXISTS vault_bars (series_id INTEGER NOT NULL,ts INTEGER NOT NULL,o REAL NOT NULL,h REAL NOT NULL,l REAL NOT NULL,c REAL NOT NULL,v REAL NOT NULL,first_seen INTEGER NOT NULL,last_seen INTEGER NOT NULL,confirms INTEGER NOT NULL DEFAULT 1,PRIMARY KEY(series_id,ts)) WITHOUT ROWID;
-          CREATE TABLE IF NOT EXISTS vault_sessions (series_id INTEGER NOT NULL,date TEXT NOT NULL,expected INTEGER NOT NULL DEFAULT 0,present INTEGER NOT NULL DEFAULT 0,holes INTEGER NOT NULL DEFAULT 0,fetch_ok INTEGER NOT NULL DEFAULT 0,fetch_fail INTEGER NOT NULL DEFAULT 0,corrected INTEGER NOT NULL DEFAULT 0,last_seen INTEGER,PRIMARY KEY(series_id,date)) WITHOUT ROWID;
-          CREATE TABLE IF NOT EXISTS vault_events (id INTEGER PRIMARY KEY,at INTEGER NOT NULL,series_id INTEGER,kind TEXT NOT NULL,ts INTEGER,detail TEXT NOT NULL);
-          CREATE TABLE IF NOT EXISTS vault_reports (key BLOB PRIMARY KEY,kind TEXT NOT NULL,symbol TEXT NOT NULL,tf TEXT NOT NULL,code_version INTEGER NOT NULL,created_at INTEGER NOT NULL,last_hit INTEGER NOT NULL,body BLOB NOT NULL) WITHOUT ROWID;")?;
+        tx.execute_batch(V2_SCHEMA)?;
+        tx.execute_batch(daily::DAILY_SCHEMA)?;
         if version < 2 {
             event(&tx, 0, None, "migrate", None, "v2: display cache preserved; legacy bars not promoted")?;
         }
-        tx.pragma_update(None, "user_version", 2)?;
+        if version < 3 {
+            event(&tx, 0, None, "migrate", None, "v3: daily vault tables added; intraday and display cache untouched")?;
+        }
+        tx.pragma_update(None, "user_version", 3)?;
         tx.commit()?;
         Ok(Self { cache: BarCache { conn }, enabled: true })
     }
@@ -507,7 +518,14 @@ impl BarVault {
             .collect::<rusqlite::Result<_>>()?;
         let pages: i64 = self.cache.conn.pragma_query_value(None, "page_count", |r| r.get(0))?;
         let size: i64 = self.cache.conn.pragma_query_value(None, "page_size", |r| r.get(0))?;
-        Ok(VaultSnapshot { series, events, bytes: (pages * size) as u64, disabled: false })
+        Ok(VaultSnapshot {
+            series,
+            events,
+            bytes: (pages * size) as u64,
+            disabled: false,
+            daily: self.daily_summaries(symbol)?,
+            daily_revisions: self.daily_revisions(symbol, 100)?,
+        })
     }
     pub fn verify(&mut self, at: i64) -> Result<String> {
         if !self.enabled {
@@ -518,13 +536,23 @@ impl BarVault {
             bail!("vault quick_check: {check}");
         }
         let rows = series_list(&self.cache.conn)?;
+        let daily = self.daily_verify()?;
+        let daily_n = self.daily_summaries(None)?.iter().filter(|s| s.bars > 0).count();
         let tx = self.cache.conn.transaction()?;
         for (sid, tf) in &rows {
             rebuild(&tx, *sid, *tf, at)?;
         }
         event(&tx, at, None, "verify", None, "quick_check ok; counters rebuilt")?;
+        for p in &daily {
+            event(&tx, at, None, "daily_verify_failed", None, p)?;
+        }
         tx.commit()?;
-        Ok(format!("VAULT verified {} series · quick_check ok", rows.len()))
+        let tail = if daily.is_empty() {
+            format!(" · {daily_n} daily series content-hash ok")
+        } else {
+            format!(" · DAILY CONTENT CHECK FAILED: {}", daily.join("; "))
+        };
+        Ok(format!("VAULT verified {} series · quick_check ok{tail}", rows.len()))
     }
     pub fn drop_series(&mut self, symbol: &str, tf: Option<Timeframe>, at: i64) -> Result<usize> {
         if !self.enabled {
@@ -1076,7 +1104,7 @@ mod tests {
         let v = BarVault::from_connection(conn).unwrap();
         assert_eq!(v.load("AAPL", Timeframe::M5, 10).unwrap()[0].provenance, Provenance::Missing);
         assert!(v.snapshot(None, 0).unwrap().series.is_empty());
-        assert_eq!(v.cache.conn.pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0)).unwrap(), 2);
+        assert_eq!(v.cache.conn.pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0)).unwrap(), 3);
         let mut cache = BarCache::open_in_memory().unwrap();
         let b = bars("2026-11-10");
         cache.store("AAPL", Timeframe::M5, &b).unwrap();

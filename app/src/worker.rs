@@ -91,6 +91,16 @@ pub enum Request {
     },
     VaultVerify,
     VaultPrune,
+    /// Real market refresh of daily history. `None` = the configured symbol set.
+    VaultDailyRefresh {
+        symbols: Option<Vec<String>>,
+    },
+    VaultDailyCancel,
+    /// Canonical configured symbols; with `auto` the worker refreshes due symbols itself.
+    ConfigureDailyVault {
+        symbols: Vec<String>,
+        auto: bool,
+    },
 
     Health,
     RetryFeed {
@@ -636,6 +646,9 @@ impl Request {
             Self::VaultDrop { .. } => "VaultDrop",
             Self::VaultVerify => "VaultVerify",
             Self::VaultPrune => "VaultPrune",
+            Self::VaultDailyRefresh { .. } => "VaultDailyRefresh",
+            Self::VaultDailyCancel => "VaultDailyCancel",
+            Self::ConfigureDailyVault { .. } => "ConfigureDailyVault",
             Self::Health => "Health",
             Self::RetryFeed { .. } => "RetryFeed",
             Self::HistoryStatus => "HistoryStatus",
@@ -862,6 +875,8 @@ pub enum Response {
         generation: u64,
         result: Result<Arc<tr_data::vault::VaultSnapshot>, String>,
     },
+    /// Daily refresh progress, sent at most four times per second.
+    VaultDailyProgress(Arc<crate::daily_vault::Progress>),
 
     Feed {
         feed: Feed,
@@ -1265,10 +1280,12 @@ struct FineSlot {
     completed: std::sync::atomic::AtomicI64,
 }
 type NativeKey = (String, Timeframe, Option<i64>, usize);
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct VaultObservation {
     at: i64,
     admitted: bool,
+    /// Daily write-through result for D1 responses (`Err` = persistence failed).
+    daily: Option<Result<tr_data::vault::daily::DailyIngest, String>>,
 }
 type NativeResult = Result<(Vec<Bar>, String, VaultObservation), Arc<anyhow::Error>>;
 type NativeSlot = tokio::sync::OnceCell<NativeResult>;
@@ -1308,6 +1325,8 @@ struct Shared {
     auction_fine: std::sync::Mutex<HashMap<String, Arc<FineSlot>>>,
     wall_fetches: tokio::sync::Semaphore,
     cache: Arc<std::sync::Mutex<Option<BarVault>>>,
+    /// Daily Vault maintenance coordinator (bounded, paced, cancellable).
+    daily: crate::daily_vault::Coordinator,
     reports: Arc<tr_data::report_cache::ReportCache>,
     native: std::sync::Mutex<HashMap<NativeKey, Arc<NativeSlot>>>,
     chart_sources: std::sync::Mutex<HashMap<PaneId, (u64, String)>>,
@@ -1498,6 +1517,7 @@ impl Worker {
             wall_edge: Default::default(),
             wall_edge_compute: Arc::new(tokio::sync::Semaphore::new(4)),
             cache: Default::default(),
+            daily: Default::default(),
             reports: Default::default(),
             native: Default::default(),
             chart_sources: Default::default(),
@@ -1916,6 +1936,137 @@ async fn cache_op<T: Send + 'static>(
     .ok()
     .flatten()
 }
+/// Daily-vault operation on the blocking pool. Unlike `cache_op`, failures are returned, never
+/// collapsed to absence, so persistence status can be shown. Sample mode never reaches the vault.
+async fn daily_op<T: Send + 'static>(
+    s: &Shared,
+    f: impl FnOnce(&mut BarVault) -> anyhow::Result<T> + Send + 'static,
+) -> anyhow::Result<T> {
+    anyhow::ensure!(!s.sample_mode(), "VAULT OFF · sample mode never reads or writes the vault");
+    let cache = s.cache.clone();
+    tokio::task::spawn_blocking(move || {
+        let mut guard = cache.lock().map_err(|_| anyhow::anyhow!("vault lock poisoned"))?;
+        let vault = guard.as_mut().ok_or_else(|| anyhow::anyhow!("vault unavailable"))?;
+        anyhow::ensure!(vault.enabled(), "vault disabled (newer schema)");
+        f(vault)
+    })
+    .await
+    .map_err(|e| anyhow::anyhow!("vault task failed: {e}"))?
+}
+/// The one admission path for every acquisition boundary. `Err` = persistence failed.
+async fn persist_daily(
+    s: &Shared,
+    fetch: tr_data::vault::daily::DailyFetch,
+) -> Result<tr_data::vault::daily::DailyIngest, String> {
+    daily_op(s, move |v| v.daily_ingest(&fetch)).await.map_err(|e| format!("{e:#}"))
+}
+fn classify_daily(error: anyhow::Error) -> crate::daily_vault::JobError {
+    use crate::daily_vault::JobError;
+    use tr_data::health::{DownKind, Unavailable};
+    let message = format!("{error:#}");
+    if let Some(u) = error.chain().find_map(|e| e.downcast_ref::<Unavailable>()) {
+        return match u.kind {
+            DownKind::Offline | DownKind::RateLimited | DownKind::Startup => JobError::Transient {
+                message,
+                retry_after: u
+                    .retry_at
+                    .map(|t| Duration::from_secs((t - chrono::Utc::now().timestamp()).max(0) as u64)),
+            },
+            DownKind::Empty | DownKind::Unsupported | DownKind::Rejected => JobError::Permanent(message),
+        };
+    }
+    let lower = message.to_ascii_lowercase();
+    if ["unverified", "malformed", "unsupported", "refused", "invalid"].iter().any(|w| lower.contains(w)) {
+        JobError::Permanent(message)
+    } else {
+        JobError::Transient { message, retry_after: None }
+    }
+}
+/// One symbol: persist the local research archive (no network), then refresh from the native
+/// provider. Both go through the same admission path; neither can invent a bar.
+async fn daily_job(s: &Shared, symbol: String) -> Result<String, crate::daily_vault::JobError> {
+    use crate::daily_vault::{JobError, archive_source, build_fetch, refresh_symbol};
+    use tr_data::vault::daily::{DailyExtent, DailyIngest};
+    let key = tr_data::security(&symbol).key();
+    let now = chrono::Utc::now().timestamp();
+    let ticker = tr_data::whats_news::archive_ticker(&key);
+    if let Ok(bars) = s.history.db(move |db| db.daily(&ticker)).await
+        && !bars.is_empty()
+    {
+        let archive = build_fetch(&key, archive_source(), bars, now, DailyExtent::FullAvailable);
+        if let Err(e) = persist_daily(s, archive).await {
+            return Err(JobError::Permanent(format!("VAULT WRITE FAILED: {e}")));
+        }
+    }
+    let state = {
+        let key = key.clone();
+        daily_op(s, move |v| v.daily_native_state(&key)).await.map_err(|e| JobError::Permanent(format!("{e:#}")))?
+    };
+    let report = refresh_symbol(&key, state, now, |limit| {
+        let key = key.clone();
+        async move {
+            let (_, _, observation) =
+                native_fetch(s, &key, Timeframe::D1, None, limit).await.map_err(classify_daily)?;
+            match observation.daily {
+                Some(Ok(result)) => Ok(result),
+                Some(Err(e)) => Err(JobError::Permanent(format!("VAULT WRITE FAILED: {e}"))),
+                None => Ok(DailyIngest::Rejected("provider response was not stored".into())),
+            }
+        }
+    })
+    .await;
+    if let Err(JobError::Permanent(why)) | Err(JobError::Transient { message: why, .. }) = &report {
+        let (key, why) = (key.clone(), why.clone());
+        let _ = daily_op(s, move |v| v.daily_note_native_failure(&key, now, &why)).await;
+    }
+    report
+}
+async fn run_daily(s: &Shared, symbols: Vec<String>, only_due: bool) {
+    let now = chrono::Utc::now().timestamp();
+    let symbols = if only_due {
+        let picked = daily_op(s, move |v| {
+            let mut due = vec![];
+            for symbol in symbols {
+                let state = v.daily_state(&tr_data::security(&symbol).key())?;
+                if crate::daily_vault::due(state.as_ref(), now) {
+                    due.push(symbol);
+                }
+            }
+            Ok(due)
+        })
+        .await;
+        match picked {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::debug!("daily vault auto-update skipped: {e:#}");
+                return;
+            }
+        }
+    } else {
+        symbols
+    };
+    if symbols.is_empty() {
+        return;
+    }
+    let result = s
+        .daily
+        .run(
+            symbols,
+            crate::daily_vault::Pacing::default(),
+            |p| s.send(Response::VaultDailyProgress(Arc::new(p))),
+            |symbol| daily_job(s, symbol),
+        )
+        .await;
+    s.send(Response::Status(match result {
+        None => "VAULT DAILY · a refresh is already running".into(),
+        Some(p) => format!(
+            "VAULT DAILY · {} refreshed · {} failed{}",
+            p.done,
+            p.failed,
+            if p.cancelled { " · cancelled (committed bars kept)" } else { "" }
+        ),
+    }));
+}
 async fn display_cached(s: &Shared, symbol: &str, tf: Timeframe, limit: usize) -> Option<(Vec<Bar>, Option<i64>)> {
     let symbol = symbol.to_owned();
     cache_op(s, move |v| Ok((v.load(&symbol, tf, limit)?, v.fetched_at(&symbol, tf)?))).await
@@ -1969,6 +2120,10 @@ async fn native_fetch_with_clock(
                 Err(error) => {
                     let symbol = key.0.clone();
                     let detail = format!("{error:#}");
+                    if tf == Timeframe::D1 {
+                        let (symbol, detail) = (symbol.clone(), detail.clone());
+                        let _ = daily_op(s, move |v| v.daily_note_failure(&symbol, None, at, &detail)).await;
+                    }
                     cache_op(s, move |v| {
                         let id = v.sole_series(&symbol, tf)?.unwrap_or(tr_data::vault::SeriesId {
                             symbol,
@@ -1989,7 +2144,25 @@ async fn native_fetch_with_clock(
                     .await
                     .is_some_and(|out| out.quarantined || out.inserted + out.confirmed + out.corrected > 0);
             }
-            Ok((bars, source, VaultObservation { at, admitted: ready }))
+            // Daily write-through: closed, verified rows only, via the shared admission path.
+            let mut daily = None;
+            if tf == Timeframe::D1 && !s.sample_mode() {
+                // Native provider adapters do not declare a complete available history, so a
+                // large limit never proves "full"; write-through stays a window.
+                let extent = tr_data::vault::daily::DailyExtent::Window;
+                let mut fetch = crate::daily_vault::build_fetch(
+                    &key.0,
+                    crate::daily_vault::native_source(&source),
+                    bars.clone(),
+                    at,
+                    extent,
+                );
+                // A maximum-history request is a comparison run (planning clock only; the
+                // returned length is never read as completeness).
+                fetch.full_compare = end.is_none() && limit >= crate::daily_vault::FULL_LIMIT;
+                daily = Some(persist_daily(s, fetch).await);
+            }
+            Ok((bars, source, VaultObservation { at, admitted: ready, daily }))
         })
         .await
         .clone();
@@ -2001,51 +2174,134 @@ async fn native_fetch_with_clock(
 }
 
 /// Whole-series daily admission; no display-cache reads or provider splicing.
-async fn research_daily(s: &Shared, bridge: &tr_data::whats_news::Bridge, key: &str) -> anyhow::Result<(Vec<Bar>, String)> {
-    let (bars, receipt) = research_daily_receipt(s, bridge, key).await?;
-    Ok((bars, receipt.detail))
+async fn research_daily(
+    s: &Shared,
+    bridge: &tr_data::whats_news::Bridge,
+    key: &str,
+) -> anyhow::Result<(Vec<Bar>, String)> {
+    let receipt = research_daily_receipt(s, bridge, key).await?;
+    let label = receipt.label();
+    Ok((receipt.bars, label))
 }
 
-/// Same admission, with the structured receipt (provider id, closed-thru, bars, attempts).
-async fn research_daily_receipt(
+/// Pane-facing view of the same admission: bars plus the structured [`SourceReceipt`].
+async fn research_daily_source(
     s: &Shared,
     bridge: &tr_data::whats_news::Bridge,
     key: &str,
 ) -> anyhow::Result<(Vec<Bar>, tr_data::source_receipt::SourceReceipt)> {
-    let ticker = tr_data::whats_news::archive_ticker(key);
-    let receipt = crate::daily_research::resolve(key, chrono::Utc::now().timestamp(), |stage| {
-        let ticker = ticker.clone();
-        async move {
-            match stage {
-                0 => Ok((s.history.db(move |db| db.daily(&ticker)).await?, "Local research archive".into())),
-                1 => {
-                    anyhow::ensure!(bridge.enabled, "disabled");
-                    // A service outage is flagged structurally; unverified data is a data problem.
-                    let external = bridge.histories_for(std::slice::from_ref(&ticker)).await.map_err(|e| {
-                        if tr_data::whats_news::is_unverified(&e) {
-                            e
-                        } else {
-                            anyhow::Error::new(crate::daily_research::WhatsNewsUnreachable(format!("{e:#}")))
-                        }
-                    })?;
-                    external.provenance.require_verified("Daily research").map_err(anyhow::Error::msg)?;
-                    if let Some(skip) = external.data.skipped.iter().find(|v| v.symbol.eq_ignore_ascii_case(&ticker)) {
-                        anyhow::bail!("{}", skip.reason);
-                    }
-                    let bars = external.data.bars.into_iter().find(|(k, _)| k.eq_ignore_ascii_case(&ticker)).map(|(_, b)| b).unwrap_or_default();
-                    Ok((bars, format!("Whats-News ({})", external.source)))
-                }
-                _ => {
-                    anyhow::ensure!(!s.sample_mode(), "Native daily research refused: sample / offline display mode");
-                    let (bars, source, _) = native_fetch(s, key, Timeframe::D1, None, 100_000).await?;
-                    Bar::require_verified(&bars, "Native daily research").map_err(anyhow::Error::msg)?;
-                    Ok((bars, format!("{source} (native provider)")))
-                }
-            }
-        }
-    }).await?;
+    let receipt = research_daily_receipt(s, bridge, key).await?;
     let summary = receipt.summary();
     Ok((receipt.bars, summary))
+}
+
+/// Archive -> Whats-News -> native -> VAULT, one whole series from exactly one source. Verified
+/// upstream responses are written through to the daily vault (outside any lock, after whole-
+/// response validation); the vault stage is last and is never written back into itself.
+async fn research_daily_receipt(
+    s: &Shared,
+    bridge: &tr_data::whats_news::Bridge,
+    key: &str,
+) -> anyhow::Result<crate::daily_research::Receipt> {
+    use crate::daily_research::{Acquired, Stage, StoredMeta};
+    let ticker = tr_data::whats_news::archive_ticker(key);
+    let observed = chrono::Utc::now().timestamp();
+    crate::daily_research::resolve(
+        key,
+        observed,
+        |stage| {
+            let ticker = ticker.clone();
+            async move {
+                match stage {
+                    Stage::Archive => Ok(Acquired::upstream(
+                        s.history.db(move |db| db.daily(&ticker)).await?,
+                        "Local research archive",
+                    )),
+                    Stage::WhatsNews => {
+                        anyhow::ensure!(bridge.enabled, "disabled");
+                        // A service outage is flagged structurally; unverified data is a data problem.
+                        let external = bridge.histories_for(std::slice::from_ref(&ticker)).await.map_err(|e| {
+                            if tr_data::whats_news::is_unverified(&e) {
+                                e
+                            } else {
+                                anyhow::Error::new(crate::daily_research::WhatsNewsUnreachable(format!("{e:#}")))
+                            }
+                        })?;
+                        external.provenance.require_verified("Daily research").map_err(anyhow::Error::msg)?;
+                        if let Some(skip) =
+                            external.data.skipped.iter().find(|v| v.symbol.eq_ignore_ascii_case(&ticker))
+                        {
+                            anyhow::bail!("{}", skip.reason);
+                        }
+                        let bars = external
+                            .data
+                            .bars
+                            .into_iter()
+                            .find(|(k, _)| k.eq_ignore_ascii_case(&ticker))
+                            .map(|(_, b)| b)
+                            .unwrap_or_default();
+                        Ok(Acquired::upstream(bars, format!("Whats-News ({})", external.source)))
+                    }
+                    Stage::Native => {
+                        anyhow::ensure!(
+                            !s.sample_mode(),
+                            "Native daily research refused: sample / offline display mode"
+                        );
+                        let (bars, source, observation) =
+                            native_fetch(s, key, Timeframe::D1, None, crate::daily_vault::FULL_LIMIT).await?;
+                        Bar::require_verified(&bars, "Native daily research").map_err(anyhow::Error::msg)?;
+                        let mut got = Acquired::upstream(bars, format!("{source} (native provider)"));
+                        // native_fetch already wrote through at the provider boundary.
+                        got.warnings
+                            .extend(observation.daily.as_ref().and_then(crate::daily_vault::persistence_warning));
+                        Ok(got)
+                    }
+                    Stage::Vault => {
+                        anyhow::ensure!(!s.sample_mode(), "VAULT OFF · sample mode never reads or writes the vault");
+                        let symbol = tr_data::security(key).key();
+                        match daily_op(s, move |v| v.daily_best(&symbol)).await? {
+                            tr_data::vault::daily::DailyRead::Hit(h) => {
+                                let mut got = Acquired::upstream(h.bars, h.id.source.clone());
+                                got.stored = Some(StoredMeta {
+                                    original_source: h.id.source,
+                                    basis: h.basis.label(),
+                                    fetched_at: h.fetched_at,
+                                    closed_thru: h.closed_thru,
+                                    generation: h.generation,
+                                    revisions: h.revisions,
+                                    warnings: h.warnings,
+                                });
+                                Ok(got)
+                            }
+                            tr_data::vault::daily::DailyRead::Empty => anyhow::bail!("no stored daily bars"),
+                        }
+                    }
+                }
+            }
+        },
+        |stage, bars: Vec<Bar>, source: String| {
+            async move {
+                if s.sample_mode() {
+                    return None;
+                }
+                let origin = match stage {
+                    Stage::Archive => crate::daily_vault::archive_source(),
+                    Stage::WhatsNews => crate::daily_vault::whats_news_source(&source),
+                    // Native persisted at the provider boundary; the vault is never written back.
+                    Stage::Native | Stage::Vault => return None,
+                };
+                let fetch = crate::daily_vault::build_fetch(
+                    key,
+                    origin,
+                    bars,
+                    observed,
+                    tr_data::vault::daily::DailyExtent::FullAvailable,
+                );
+                crate::daily_vault::persistence_warning(&persist_daily(s, fetch).await)
+            }
+        },
+    )
+    .await
 }
 
 /// Research reads: daily goes through the archive-first verified source chain
@@ -2066,16 +2322,32 @@ async fn research_history(
         anyhow::bail!("{operation} refused: sample / offline display mode");
     }
     let bridge = s.whats_news.borrow().1.bridge();
-    let (bars, receipt) = research_daily_receipt(s, &bridge, symbol).await?;
-    let info = tr_data::vault::StitchInfo {
-        source: receipt.detail.clone(),
-        fetched_at: Some(chrono::Utc::now().timestamp()),
-        live_ok: true,
-        live_bars: bars.len(),
-        receipt: Some(receipt),
-        ..Default::default()
+    let receipt = research_daily_receipt(s, &bridge, symbol).await?;
+    let label = receipt.label();
+    let summary = receipt.summary();
+    // A vault fallback is stored data: never presented as live, observation clock = its own save.
+    let info = match &receipt.stored {
+        Some(m) => tr_data::vault::StitchInfo {
+            source: label,
+            vault_bars: receipt.bars.len(),
+            oldest_ts: receipt.bars.first().map(|b| b.ts),
+            epoch: m.generation.min(u64::from(u32::MAX)) as u32,
+            live_ok: false,
+            fetched_at: Some(m.fetched_at),
+            note: Some(format!("VAULT FALLBACK · closed thru {}", m.closed_thru)),
+            receipt: Some(summary),
+            ..Default::default()
+        },
+        None => tr_data::vault::StitchInfo {
+            source: label,
+            fetched_at: Some(chrono::Utc::now().timestamp()),
+            live_ok: true,
+            live_bars: receipt.bars.len(),
+            receipt: Some(summary),
+            ..Default::default()
+        },
     };
-    Ok((bars, info))
+    Ok((receipt.bars, info))
 }
 
 /// Fetch only the provider's ordinary depth, then read a larger local window.
@@ -2125,7 +2397,7 @@ async fn stitch_native(
     limit: usize,
     observation: VaultObservation,
 ) -> (Vec<Bar>, tr_data::vault::StitchInfo) {
-    let VaultObservation { at, admitted: ready } = observation;
+    let VaultObservation { at, admitted: ready, .. } = observation;
     let observed = !bars.is_empty() && bars.iter().all(|b| b.provenance == tr_core::Provenance::Real);
     let fallback = tr_data::vault::StitchInfo {
         source: source.clone(),
@@ -2407,9 +2679,10 @@ async fn fetch_stack_lane(
         Ok(bars)
     } else if archive {
         let bridge = s.whats_news.borrow().1.bridge();
-        research_daily(s, &bridge, symbol).await.map(|(bars, _)| {
-            if tf == Timeframe::D1 { bars } else { tf.resample(&bars) }
-        }).map_err(|e| format!("{e:#}"))
+        research_daily(s, &bridge, symbol)
+            .await
+            .map(|(bars, _)| if tf == Timeframe::D1 { bars } else { tf.resample(&bars) })
+            .map_err(|e| format!("{e:#}"))
     } else {
         analysis_bars(s, symbol, tf, 400, "Trend Stack").await.map(|(bars, _)| bars).map_err(|e| format!("{e:#}"))
     };
@@ -2957,17 +3230,20 @@ async fn research_rotation(
 ) -> anyhow::Result<tr_data::rotation::RotationReport> {
     let query = query.clone();
     let bridge = s.whats_news.borrow().1.bridge();
-    let (benchmark, bench_receipt) = research_daily_receipt(s, &bridge, &query.benchmark).await?;
+    let (benchmark, bench_receipt) = research_daily_source(s, &bridge, &query.benchmark).await?;
     let mut named = Vec::new();
     let mut sources = vec![format!("{}: {}", query.benchmark, bench_receipt.detail)];
     // (symbol, receipt) pairs for the loaded names only, benchmark first.
     let mut receipts = vec![(query.benchmark.clone(), bench_receipt)];
     for symbol in &query.symbols {
-        let result = research_daily_receipt(s, &bridge, symbol).await.map(|(bars, receipt)| {
-            sources.push(format!("{symbol}: {}", receipt.detail));
-            receipts.push((symbol.clone(), receipt));
-            bars
-        }).map_err(|e| format!("{e:#}"));
+        let result = research_daily_source(s, &bridge, symbol)
+            .await
+            .map(|(bars, receipt)| {
+                sources.push(format!("{symbol}: {}", receipt.detail));
+                receipts.push((symbol.clone(), receipt));
+                bars
+            })
+            .map_err(|e| format!("{e:#}"));
         named.push((symbol.clone(), result));
     }
     let source = sources.join("; ");
@@ -2994,7 +3270,7 @@ async fn research_stats(
     if ticker.is_empty() {
         anyhow::bail!("Statistics refused: invalid security");
     }
-    let (bars, receipt) = research_daily_receipt(s, bridge, key).await?;
+    let (bars, receipt) = research_daily_source(s, bridge, key).await?;
     let key = tr_data::security(key).key();
     let mut snapshot = tokio::task::spawn_blocking({
         let condition = condition.to_string();
@@ -3167,7 +3443,7 @@ async fn research_backtest(
     if ticker.is_empty() {
         anyhow::bail!("Backtest refused: invalid security");
     }
-    let (bars, structured) = research_daily_receipt(s, bridge, key).await?;
+    let (bars, structured) = research_daily_source(s, bridge, key).await?;
     let source = structured.detail.clone();
     let strategies = tr_data::backtest::parse_strategies(spec, allow_short).map_err(anyhow::Error::msg)?;
     let settings = tr_data::backtest::RunSettings {
@@ -4023,9 +4299,35 @@ async fn handle_inner(s: &Arc<Shared>, req: Request, force: bool) {
         Request::VaultPrune => {
             let n = cache_op(s, |v| v.prune(chrono::Utc::now().timestamp())).await;
             s.send(Response::Status(
-                n.map(|n| format!("VAULT PRUNE · {n} bars removed"))
+                n.map(|n| format!("VAULT PRUNE · {n} intraday bars removed · daily history is retained"))
                     .unwrap_or_else(|| "VAULT unavailable or disabled".into()),
             ));
+        }
+        Request::ConfigureDailyVault { symbols, auto } => {
+            s.daily.configure(symbols.clone(), auto);
+            if auto && !s.sample_mode() {
+                run_daily(s, symbols, true).await;
+            }
+        }
+        Request::VaultDailyRefresh { symbols } => {
+            if s.sample_mode() {
+                s.send(Response::Status("VAULT OFF · sample mode never reads or writes the vault".into()));
+            } else {
+                let list = symbols.unwrap_or_else(|| s.daily.configured().0);
+                if list.is_empty() {
+                    s.send(Response::Status("VAULT DAILY REFRESH · no symbols configured".into()));
+                } else {
+                    run_daily(s, list, false).await;
+                }
+            }
+        }
+        Request::VaultDailyCancel => {
+            let text = if s.daily.cancel() {
+                "VAULT DAILY · cancelling: no new requests start; committed bars are kept"
+            } else {
+                "VAULT DAILY · nothing is running"
+            };
+            s.send(Response::Status(text.into()));
         }
 
         Request::ConfigureWhatsNews { .. } => unreachable!("configured in dispatcher"),
@@ -4573,14 +4875,15 @@ async fn handle_inner(s: &Arc<Shared>, req: Request, force: bool) {
                 // Bounded string parse before any provider call.
                 tr_data::studio_when::WhenSpec::parse(&rule, threshold).map_err(anyhow::Error::msg)?;
                 let (bars, source, observed_at, stitch, receipt) = if tf == Timeframe::D1 {
-                    let (bars, receipt) = research_daily_receipt(s, &config.bridge(), &symbol).await?;
+                    let (bars, receipt) = research_daily_source(s, &config.bridge(), &symbol).await?;
                     (bars, receipt.detail.clone(), Some(chrono::Utc::now().timestamp()), None, Some(receipt))
                 } else {
                     if !tr_data::cash_session::cash_bar_size(tf) {
                         anyhow::bail!("When: unsupported session interval");
                     }
                     let (bars, info) =
-                        research_history(s, &symbol, tf, tr_data::cash_session::research_fetch_limit(tf), "When").await?;
+                        research_history(s, &symbol, tf, tr_data::cash_session::research_fetch_limit(tf), "When")
+                            .await?;
                     let mut r = tr_data::source_receipt::SourceReceipt::new(
                         &info.source,
                         bars.len(),
@@ -4663,8 +4966,7 @@ async fn handle_inner(s: &Arc<Shared>, req: Request, force: bool) {
                                 anyhow::bail!("Sample mode: no comparison provider calls");
                             }
                             if input.tf == Timeframe::D1 {
-                                let (bars, source) =
-                                    research_daily(s, &config.bridge(), &symbol).await?;
+                                let (bars, source) = research_daily(s, &config.bridge(), &symbol).await?;
                                 Ok::<_, anyhow::Error>(tr_data::studio_canvas::CanvasInput {
                                     symbol: symbol.clone(),
                                     tf: input.tf,
@@ -4765,11 +5067,12 @@ async fn handle_inner(s: &Arc<Shared>, req: Request, force: bool) {
                     );
                 }
                 let (bars, source, observed_at, gaps, structured) = if timeframe == Timeframe::D1 {
-                    let (bars, receipt) = research_daily_receipt(s, &config.bridge(), &symbol).await?;
+                    let (bars, receipt) = research_daily_source(s, &config.bridge(), &symbol).await?;
                     (bars, receipt.detail.clone(), Some(chrono::Utc::now().timestamp()), Vec::new(), Some(receipt))
                 } else {
                     let (bars, stitch) =
-                        research_history(s, &symbol, timeframe, default_limit(timeframe), "Distribution Studio").await?;
+                        research_history(s, &symbol, timeframe, default_limit(timeframe), "Distribution Studio")
+                            .await?;
                     let stale = s.provider.health().is_some_and(|h| {
                         matches!(
                             h.snapshot()[Feed::Bars as usize].state,
@@ -4799,8 +5102,7 @@ async fn handle_inner(s: &Arc<Shared>, req: Request, force: bool) {
                     let observed = info.live_ok.then_some(info.fetched_at).flatten();
                     (bars, info.label(), observed, Some(info))
                 } else {
-                    let (bars, source) =
-                        research_daily(s, &config.bridge(), &symbol).await?;
+                    let (bars, source) = research_daily(s, &config.bridge(), &symbol).await?;
                     (tf.resample(&bars), source, Some(chrono::Utc::now().timestamp()), None)
                 };
                 let reports = s.reports.clone();
@@ -4937,20 +5239,30 @@ async fn handle_inner(s: &Arc<Shared>, req: Request, force: bool) {
         }
         Request::StudioSeason { pane, generation, symbol, tf } => {
             let result = async {
-                if s.sample_mode() { anyhow::bail!("SEASON: no real data in sample / offline display mode"); }
+                if s.sample_mode() {
+                    anyhow::bail!("SEASON: no real data in sample / offline display mode");
+                }
                 if !tr_data::cash_session::is_cash(&tr_data::security(&symbol)) {
                     anyhow::bail!("SEASON currently requires a US cash-session equity, ETF or index");
                 }
                 let mut structured = None;
                 let (bars, source, observed, gaps) = if tf == Timeframe::D1 {
-                    let (bars, receipt) = research_daily_receipt(s, &config.bridge(), &symbol).await?;
+                    let (bars, receipt) = research_daily_source(s, &config.bridge(), &symbol).await?;
                     let source = receipt.detail.clone();
                     structured = Some(receipt);
                     (bars, source, chrono::Utc::now().timestamp(), Vec::new())
                 } else {
-                    let (bars, info) = research_history(s, &symbol, tf, tr_data::cash_session::research_fetch_limit(tf), "Seasonality").await?;
+                    let (bars, info) = research_history(
+                        s,
+                        &symbol,
+                        tf,
+                        tr_data::cash_session::research_fetch_limit(tf),
+                        "Seasonality",
+                    )
+                    .await?;
                     // Normalise mixed verified cache/live tags only with the original vault witness.
-                    let bars = tr_data::vault::research_bars(&bars, Some(&info)).map_err(anyhow::Error::msg)?.into_owned();
+                    let bars =
+                        tr_data::vault::research_bars(&bars, Some(&info)).map_err(anyhow::Error::msg)?.into_owned();
                     // A stale vault must not use wall time to close an observed pending bar.
                     let observed = info.fetched_at.unwrap_or_else(|| bars.last().map(|b| b.ts).unwrap_or(0));
                     (bars, info.source, observed, info.gaps)
@@ -6794,6 +7106,8 @@ where
 }
 
 #[cfg(test)]
+mod daily_tests;
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -8142,6 +8456,7 @@ mod tests {
                 cache: Arc::new(std::sync::Mutex::new(
                     cache.map(|c| BarVault::from_cache(c).expect("vault migration")),
                 )),
+                daily: Default::default(),
                 reports: Default::default(),
                 native: Default::default(),
                 chart_sources: Default::default(),
@@ -9467,6 +9782,7 @@ mod tests {
             wall_edge: Default::default(),
             wall_edge_compute: Arc::new(tokio::sync::Semaphore::new(4)),
             cache: Default::default(),
+            daily: Default::default(),
             reports: Default::default(),
             native: Default::default(),
             chart_sources: Default::default(),

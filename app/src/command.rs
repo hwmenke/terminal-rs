@@ -261,8 +261,13 @@ pub enum VaultCmd {
     Verify,
     Prune,
     Drop { symbol: String, tf: Option<Timeframe> },
+    /// `VAULT DAILY`: open the Daily coverage tab.
+    Daily,
+    /// `VAULT DAILY REFRESH [symbol]`: fetch and store real daily history (`None` = configured set).
+    DailyRefresh { symbol: Option<String> },
+    DailyCancel,
 }
-const VAULT_VERBS: [&str; 3] = ["DROP", "VERIFY", "PRUNE"];
+const VAULT_VERBS: [&str; 4] = ["DROP", "VERIFY", "PRUNE", "DAILY"];
 
 /// True when the words after `RESID` start with a residual verb (`SAVE`, `OPEN`, `CHECK`) or a
 /// `name=` save argument. Exact matches only: `RESID 1h`, `RESID DIST` and `RESID US Equity` stay tickers.
@@ -293,6 +298,19 @@ fn parse_vault(rest: &[&str]) -> Option<VaultCmd> {
             return None;
         }
         return Some(VaultCmd::Drop { symbol: sec.key(), tf });
+    }
+    // Exact `DAILY` only; malformed trailing words are rejected, never reinterpreted.
+    if rest.first().is_some_and(|s| s.eq_ignore_ascii_case("DAILY")) {
+        return match &rest[1..] {
+            [] => Some(VaultCmd::Daily),
+            [v] if v.eq_ignore_ascii_case("CANCEL") => Some(VaultCmd::DailyCancel),
+            [v] if v.eq_ignore_ascii_case("REFRESH") => Some(VaultCmd::DailyRefresh { symbol: None }),
+            [v, tokens @ ..] if v.eq_ignore_ascii_case("REFRESH") => {
+                let (sec, used) = Security::resolve_tokens(tokens)?;
+                (used == tokens.len()).then(|| VaultCmd::DailyRefresh { symbol: Some(sec.key()) })
+            }
+            _ => None,
+        };
     }
     match rest {
         [] => Some(VaultCmd::Open),
@@ -1275,8 +1293,19 @@ fn describe(f: &Function) -> String {
             "Intraday desk: 5-minute chart, ISCAN, breadth, and volume pace, saved as the Intraday layout".into()
         }
         Function::Vault(VaultCmd::Open) => {
-            "Bar Vault · verified closed intraday provider bars · for the tickers type VAULT US Equity / VLT US Equity"
+            "Bar Vault · verified closed intraday provider bars + stored real daily history (VAULT DAILY, VAULT DAILY REFRESH [symbol], VAULT DAILY CANCEL) · for the tickers type VAULT US Equity / VLT US Equity"
                 .into()
+        }
+        Function::Vault(VaultCmd::Daily) => {
+            "Daily Vault · coverage, source, last closed bar and revisions for every stored real daily series".into()
+        }
+        Function::Vault(VaultCmd::DailyRefresh { symbol }) => format!(
+            "Daily Vault refresh · fetches real closed daily bars for {} and stores them; nothing is generated",
+            symbol.as_deref().unwrap_or("every configured symbol")
+        ),
+        Function::Vault(VaultCmd::DailyCancel) => "Daily Vault · cancel queued/in-flight refresh (committed bars are kept)".into(),
+        Function::Vault(VaultCmd::Prune) => {
+            "Bar Vault · PRUNE applies to intraday retention only; daily history is retained".into()
         }
         Function::Vault(cmd) => format!("Bar Vault · {cmd:?} · verified closed intraday provider bars"),
         Function::Cockpit { spec } => match cockpit_ladder(spec) {
@@ -1636,6 +1665,49 @@ mod tests {
             assert!(parse(text).is_none(), "{text}");
         }
         assert_eq!(parse("VAULT US Equity"), Some(Command::Symbol("VAULT US Equity".into())));
+    }
+
+    #[test]
+    fn daily_commands_preserve_vault_and_vlt_tickers() {
+        let vault = |c| Some(Command::Function(Function::Vault(c)));
+        assert_eq!(parse("VAULT DAILY"), vault(VaultCmd::Daily));
+        assert_eq!(parse("vlt daily"), vault(VaultCmd::Daily));
+        assert_eq!(parse("VAULT DAILY CANCEL"), vault(VaultCmd::DailyCancel));
+        assert_eq!(parse("VAULT DAILY REFRESH"), vault(VaultCmd::DailyRefresh { symbol: None }));
+        assert_eq!(
+            parse("VAULT DAILY REFRESH AAPL US Equity"),
+            vault(VaultCmd::DailyRefresh { symbol: Some("AAPL US Equity".into()) })
+        );
+        assert_eq!(
+            parse("VLT DAILY REFRESH AAPL"),
+            vault(VaultCmd::DailyRefresh { symbol: Some("AAPL US Equity".into()) })
+        );
+        assert_eq!(
+            parse("VAULT DAILY REFRESH SPX Index"),
+            vault(VaultCmd::DailyRefresh { symbol: Some("SPX Index".into()) })
+        );
+        // Malformed trailing arguments are rejected (and never become a ticker load).
+        for text in [
+            "VAULT DAILY FOO",
+            "VAULT DAILY REFRESH AAPL US Equity extra",
+            "VAULT DAILY CANCEL NOW",
+            "VAULT DAILY REFRESH !!!",
+            "VLT DAILY 1d",
+        ] {
+            assert!(parse(text).is_none(), "{text}");
+        }
+        // Existing ticker behaviour is untouched; the new words are not aliases of anything.
+        assert_eq!(parse("VAULT"), vault(VaultCmd::Open));
+        assert_eq!(parse("VLT"), vault(VaultCmd::Open));
+        assert_eq!(parse("VAULT US Equity"), Some(Command::Symbol("VAULT US Equity".into())));
+        assert!(!matches!(parse("VLT 5m"), Some(Command::Function(Function::Vault(_)))));
+        assert_eq!(
+            parse("AAPL VAULT"),
+            Some(Command::SymbolFunction("AAPL US Equity".into(), Function::Vault(VaultCmd::Open)))
+        );
+        for bare in ["DAILY", "REFRESH"] {
+            assert!(!matches!(parse(bare), Some(Command::Function(Function::Vault(_)))), "{bare} is not a vault alias");
+        }
     }
     #[test]
     fn studio_words_do_not_shadow_their_tickers() {

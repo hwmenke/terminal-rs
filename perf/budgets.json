@@ -17,6 +17,26 @@
       "class": "load",
       "over_target": true
     },
+    "data.daily_vault_read_25k": {
+      "budget_us": 40000,
+      "relative": false,
+      "class": "load"
+    },
+    "data.daily_vault_update_10_of_25k": {
+      "budget_us": 60000,
+      "relative": false,
+      "class": "load"
+    },
+    "data.daily_vault_snapshot_500": {
+      "budget_us": 20000,
+      "relative": false,
+      "class": "load"
+    },
+    "data.daily_vault_replace_25k": {
+      "budget_us": 150000,
+      "relative": false,
+      "class": "load"
+    },
     "data.bars_digest_23k": {
       "budget_us": 5000,
       "relative": true,
