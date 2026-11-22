@@ -20,6 +20,9 @@ mod health_view;
 mod hotkeys_view;
 mod journal;
 mod lookalike;
+mod nav;
+#[cfg(test)]
+mod setup_state_tests;
 mod options_view;
 mod palette_view;
 mod panels;

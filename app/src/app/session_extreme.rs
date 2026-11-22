@@ -14,31 +14,41 @@ pub struct SessionExtremePane {
     pub extreme: Option<SessionExtreme>,
     pub loading: bool,
     pub error: Option<String>,
+    /// A typo in the request (bar size, sessions…): a "check the inputs" card, not a failed run.
+    pub input_error: Option<String>,
+    /// Text-box buffer of the ticker chooser; the real `symbol` is only set on commit. Not persisted.
+    pub ticker_draft: String,
 }
 
 impl SessionExtremePane {
     pub fn new(symbol: impl Into<String>, spec: impl Into<String>) -> Self {
         let symbol = symbol.into();
         let symbol = if symbol.trim().is_empty() { symbol } else { tr_data::security(&symbol).key() };
-        Self { symbol, spec: spec.into(), tf: "5m".into(), generation: 0, extreme: None, loading: false, error: None }
+        Self { symbol, spec: spec.into(), tf: "5m".into(), generation: 0, extreme: None, loading: false, error: None, input_error: None, ticker_draft: String::new() }
     }
 
     pub fn request(&mut self, pane: PaneId, worker: &crate::worker::Worker) {
         let symbol = self.symbol.trim();
         if symbol.is_empty() {
-            self.error = Some("XTRM needs a ticker (AAPL XTRM). Sample prices are never used.".into());
+            // Needs input, not an error: the pane shows a ticker chooser.
             self.loading = false;
             return;
         }
         if let Err(err) = session_extreme::parse_query(&self.spec, &self.tf) {
-            self.error = Some(err);
+            self.input_error = Some(err);
             self.loading = false;
             return;
+        }
+        self.input_error = None;
+        // A kept snapshot belongs to one ticker: never show it under another name.
+        // Nor under another bar size.
+        let tf = session_extreme::parse_query(&self.spec, &self.tf).ok().map(|q| q.timeframe);
+        if self.extreme.as_ref().is_some_and(|x| !crate::widgets::same_security(&x.symbol, symbol) || Some(x.timeframe) != tf) {
+            self.extreme = None;
         }
         self.generation += 1;
         self.loading = true;
         self.error = None;
-        self.extreme = None;
         worker.send(Request::SessionExtreme {
             pane,
             generation: self.generation,
@@ -66,8 +76,8 @@ impl SessionExtremePane {
                 self.extreme = Some(extreme);
                 self.error = None;
             }
+            // Keep the previous snapshot; run_state labels it as such.
             Err(err) => {
-                self.extreme = None;
                 self.error = Some(err);
             }
         }
@@ -77,10 +87,8 @@ impl SessionExtremePane {
 impl TerminalApp {
     pub(super) fn open_session_extreme(&mut self, symbol: Option<&str>, spec: &str) {
         let symbol = symbol.map(|s| tr_data::security(s).key()).or_else(|| self.focused_symbol()).unwrap_or_default();
-        let mut pane = SessionExtremePane::new(symbol, spec);
-        if pane.symbol.is_empty() {
-            pane.error = Some("XTRM needs a ticker (AAPL XTRM). Sample prices are never used.".into());
-        }
+        // No focused ticker is a setup state (a ticker chooser), not an error.
+        let pane = SessionExtremePane::new(symbol, spec);
         let ticker = if pane.symbol.is_empty() { "High".into() } else { tr_data::security(&pane.symbol).ticker };
         self.status = format!("{ticker}: when the session high and low print");
         self.open_panel(PaneKind::SessionExtreme(Box::new(pane)));
@@ -90,41 +98,56 @@ impl TerminalApp {
         let i = self.idx(id).expect("session extreme pane");
         let sample_offline = self.provider.eq_ignore_ascii_case("sample");
         let mut reload = false;
+        let watchlist = self.watchlist.clone();
         {
             let PaneKind::SessionExtreme(pane) = &mut self.panes[i].kind else { return vec![] };
-            if !pane.loading && pane.extreme.is_none() && pane.error.is_none() && !pane.symbol.trim().is_empty() {
+            if !pane.loading && pane.extreme.is_none() && pane.error.is_none() && pane.input_error.is_none() && !pane.symbol.trim().is_empty() {
                 pane.request(id, &self.worker);
             }
-            ui.horizontal_wrapped(|ui| {
-                ui.label(RichText::new("Session extreme").strong().color(text()));
-                ui.label(RichText::new("when the high and low print").font(mono(11.0)).color(amber()));
-                if ui.small_button("Reload").on_hover_text("Read verified regular-session bars again").clicked() {
+            let has_symbol = !pane.symbol.trim().is_empty();
+            let context = if let Some(x) = &pane.extreme {
+                x.ticker.clone()
+            } else if has_symbol {
+                tr_data::security(&pane.symbol).ticker
+            } else {
+                "when the high and low print".into()
+            };
+            // Intraday results carry no structured receipt, so the chip is the honest compact legacy line.
+            let legacy = pane.extreme.as_ref().map(|x| {
+                format!("{} · {} · {} · {}", x.date, x.timeframe.label(), x.provenance.label(), x.source)
+            });
+            let source = legacy.as_deref().map(|l| crate::widgets::HeaderSource { lead: "", parts: &[], legacy: l });
+            crate::widgets::pane_header(ui, "Session extreme", &context, source, |ui| {
+                if has_symbol
+                    && crate::widgets::header_button(ui, "Reload", "Read verified regular-session bars again", false)
+                        .clicked()
+                {
                     reload = true;
                 }
             });
-            ui.label(
-                RichText::new(
-                    "The minute is the first regular print of the session high or low. A later tie does not move it. Only a complete session votes, because a missing bar might hold the extreme. Today's marker is the running high and low so far. The rate past the last print is not a forecast. A bare number is how many prior sessions to keep.",
-                )
-                .font(ui_font(11.5))
-                .color(muted()),
+            if !has_symbol {
+                let what = "See when the session high and low usually print, on real intraday bars.";
+                if let Some(key) = crate::widgets::needs_ticker(ui, what, &mut pane.ticker_draft, &watchlist) {
+                    pane.symbol = key;
+                    pane.ticker_draft.clear();
+                    pane.request(id, &self.worker);
+                }
+                return Vec::new();
+            }
+            crate::widgets::methodology(
+                ui,
+                (id, "xtrm-method"),
+                "The minute is the first regular print of the session high or low. A later tie does not move it. Only a complete session votes, because a missing bar might hold the extreme. Today's marker is the running high and low so far. The rate past the last print is not a forecast. A bare number is how many prior sessions to keep.",
             );
             if sample_offline {
-                ui.label(
-                    RichText::new(
-                        "Sample / offline display mode does not feed this pane. The extreme never falls back to sample bars.",
-                    )
-                    .font(ui_font(12.0))
-                    .color(theme::down()),
+                crate::widgets::chip(
+                    ui,
+                    crate::widgets::ChipKind::Neutral,
+                    "Sample display mode: this pane needs live research data and never uses sample bars",
                 );
             }
             ui.horizontal_wrapped(|ui| {
-                ui.label(RichText::new("Ticker").color(muted()));
-                let changed = ui
-                    .add(egui::TextEdit::singleline(&mut pane.symbol).desired_width(140.0).hint_text("AAPL"))
-                    .lost_focus()
-                    && ui.input(|i| i.key_pressed(egui::Key::Enter));
-                if changed {
+                if crate::widgets::anchor_field(ui, "Ticker", &mut pane.ticker_draft, &pane.symbol) {
                     reload = true;
                 }
                 ui.label(RichText::new("Sessions").color(muted()));
@@ -153,16 +176,25 @@ impl TerminalApp {
                     }
                 }
             });
-            if let Some(err) = &pane.error {
-                ui.label(RichText::new(err).font(mono(12.0)).color(theme::down()));
-            } else if pane.loading {
-                ui.label(RichText::new("Reading verified intraday bars…").font(mono(12.0)).color(muted()));
-            }
-            if let Some(extreme) = &pane.extreme {
+            let show = if let Some(e) = &pane.input_error {
+                crate::widgets::input_error_card(ui, e);
+                false
+            } else {
+                crate::widgets::run_state(
+                    ui,
+                    pane.loading,
+                    pane.error.as_deref(),
+                    pane.extreme.is_some(),
+                    "Reading verified intraday bars…",
+                    &mut reload,
+                )
+            };
+            if show && let Some(extreme) = &pane.extreme {
                 render_extreme(ui, extreme);
             }
         }
         if reload && let PaneKind::SessionExtreme(pane) = &mut self.panes[i].kind {
+            crate::widgets::commit_anchor(&mut pane.symbol, &mut pane.ticker_draft);
             pane.request(id, &self.worker);
         }
         Vec::new()
@@ -170,18 +202,7 @@ impl TerminalApp {
 }
 
 fn render_extreme(ui: &mut Ui, extreme: &SessionExtreme) {
-    ui.label(
-        RichText::new(format!(
-            "{} · {} · {} complete sessions · {} · {}",
-            extreme.date,
-            extreme.timeframe.label(),
-            extreme.priors_used,
-            extreme.provenance.label(),
-            extreme.source
-        ))
-        .font(mono(11.5))
-        .color(theme::provenance(extreme.provenance)),
-    );
+    ui.label(RichText::new(format!("{} complete sessions", extreme.priors_used)).font(mono(11.0)).color(muted()));
     ui.label(RichText::new(summary_line(extreme)).font(mono(12.0)).color(text()));
     for note in &extreme.notes {
         ui.label(RichText::new(note).font(ui_font(11.5)).color(amber()));

@@ -728,34 +728,45 @@ impl StudioPane {
         // height-capped scroll area, so source details can never squeeze the native chart.
         let native = !self.chart.canvas_view().enabled;
         let chrome_cap = chrome_cap(area.height(), native);
+        let mut build_route: Option<&'static str> = None;
         egui::ScrollArea::vertical()
             .id_salt((id, "studio-chrome"))
             .max_height(chrome_cap)
             .auto_shrink([false, true])
             .show(ui, |ui| {
         // At normal widths the receipt header is 44pt and lens rail 32pt. Narrow controls wrap.
-        let header = ui.scope(|ui| {
-            ui.set_min_height(44.);
-            ui.horizontal_wrapped(|ui| {
-                ui.label(RichText::new(if self.quick {"QUICK"}else{"STUDIO"}).font(theme::ui_font(20.)).strong());
-                ui.label(
-                    RichText::new(format!("{} · {}", self.context.symbol, self.context.tf.label()))
-                        .font(theme::mono(13.)),
-                );
-                ui.label(self.lens.label());
-                if ui.small_button("Copy command").clicked() {
-                    ui.ctx().copy_text(self.command());
-                }
-                if ui.small_button("About").clicked() {
-                    self.about_open = !self.about_open;
-                }
-                if ui.small_button("Inspector").clicked() {
-                    self.inspector_open = !self.inspector_open;
-                }
-            });
-            crate::widgets::source_chip(ui, "", &self.receipt_parts(), || self.receipt());
-        });
-        let _ = header;
+        // Shared pane header: title + instrument/period/lens, actions on the right, one source chip.
+        let context = format!(
+            "{} · {}{}",
+            self.context.symbol,
+            self.context.tf.label(),
+            if self.quick { String::new() } else { format!(" · {}", self.lens.label()) }
+        );
+        let (mut copy, mut about, mut inspector) = (false, false, false);
+        {
+            let parts = self.receipt_parts();
+            let legacy = if parts.is_empty() { self.receipt() } else { String::new() };
+            crate::widgets::pane_header(
+                ui,
+                if self.quick { "QUICK" } else { "STUDIO" },
+                &context,
+                Some(crate::widgets::HeaderSource { lead: "", parts: &parts, legacy: &legacy }),
+                |ui| {
+                    inspector = crate::widgets::header_button(ui, "Inspector", "Inputs, span selection and the full source chain", self.inspector_open).clicked();
+                    about = crate::widgets::header_button(ui, "About", "What Studio is, in one line", self.about_open).clicked();
+                    copy = crate::widgets::header_button(ui, "Copy command", "Copy the command that recreates this view", false).clicked();
+                },
+            );
+        }
+        if copy {
+            ui.ctx().copy_text(self.command());
+        }
+        if about {
+            self.about_open = !self.about_open;
+        }
+        if inspector {
+            self.inspector_open = !self.inspector_open;
+        }
         ui.scope(|ui| {
             ui.set_min_height(32.);
             ui.horizontal_wrapped(|ui| {
@@ -768,16 +779,27 @@ impl StudioPane {
                 let quick_canvas=self.chart.canvas_view().enabled;
                 if ui.selectable_label(quick_canvas,"Quick canvas").clicked(){let mut view=self.chart.canvas_view();view.enabled=true;self.chart.set_canvas_view(view);}
                 if ui.selectable_label(!quick_canvas,"Native chart").clicked(){let mut view=self.chart.canvas_view();view.enabled=false;self.chart.set_canvas_view(view);}
-                if ui.small_button("Build").clicked() {
+                if crate::widgets::header_button(ui, "Build", "Fit and score factor models: Lab → Residual → Attribution", self.build_open).clicked() {
                     self.build_open = !self.build_open;
                 }
             });
         });
         if self.about_open {
-            egui::Frame::group(ui.style()).show(ui,|ui|{ui.label("Studio connects the native time canvas to existing verified-data research. Each lens retains its original methods, MathCards and receipt. Quick adds descriptive canvas arithmetic. Copy command saves inputs, not historical data revisions.");});
+            ui.add(egui::Label::new(RichText::new("Native time canvas plus verified-data lenses; each lens keeps its own methods, MathCards and receipt. Copy command saves inputs, not data.").font(theme::ui_font(11.5)).color(theme::muted())).wrap());
         }
         if self.build_open {
-            egui::Frame::group(ui.style()).show(ui,|ui|{ui.label("BUILD · Residual tickers (STUDIO resid) and attribution (STUDIO attr) available");ui.label("Regression Lab (STUDIO lab factors=SPY,TLT) fits multi-factor OLS with a purged frozen holdout. Save residual freezes a fit into an immutable model; STUDIO resid open <id> scores it on live data and never refits; STUDIO attr model=<id> obs=20 splits a window's move into drift + factor contributions + residual from that frozen model.");});
+            // Direct route actions, one per step of the model workflow; methodology stays on hover.
+            ui.horizontal_wrapped(|ui| {
+                for (label, cmd, hover) in [
+                    ("Regression Lab", "STUDIO lab", "Fit multi-factor OLS with a purged frozen holdout"),
+                    ("Residual tickers", "STUDIO resid", "Score a saved frozen model on live data; never refits"),
+                    ("Attribution", "STUDIO attr", "Split a window's move into drift + factors + residual from a frozen model"),
+                ] {
+                    if crate::widgets::header_button(ui, label, hover, false).clicked() {
+                        build_route = Some(cmd);
+                    }
+                }
+            });
         }
             });
         let content = ui.available_rect_before_wrap();
@@ -789,6 +811,9 @@ impl StudioPane {
             egui::ScrollArea::vertical().id_salt((id, "inspector-scroll")).show(&mut child, |ui| self.inspector(ui));
         }
         let mut actions = vec![];
+        if let Some(cmd) = build_route {
+            actions.push(Action::Command(cmd.into()));
+        }
         let mut child = ui.new_child(UiBuilder::new().max_rect(body).id_salt((id, "studio-body")));
         child.set_clip_rect(body.intersect(ui.clip_rect()));
         if self.quick {

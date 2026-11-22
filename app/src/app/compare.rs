@@ -13,31 +13,55 @@ pub struct ComparePane {
     pub chart: Option<CompareChart>,
     pub loading: bool,
     pub error: Option<String>,
+    /// A typo in the request (bar size, names…): a "check the inputs" card, not a failed run.
+    pub input_error: Option<String>,
+    /// Text-box buffer of the ticker chooser; the real `symbol` is only set on commit. Not persisted.
+    pub ticker_draft: String,
 }
 
 impl ComparePane {
     pub fn new(symbol: impl Into<String>, peers: impl Into<String>) -> Self {
         let symbol = symbol.into();
         let symbol = if symbol.trim().is_empty() { symbol } else { tr_data::security(&symbol).key() };
-        Self { symbol, peers: peers.into(), tf: "5m".into(), generation: 0, chart: None, loading: false, error: None }
+        Self { symbol, peers: peers.into(), tf: "5m".into(), generation: 0, chart: None, loading: false, error: None, input_error: None, ticker_draft: String::new() }
     }
 
     pub fn request(&mut self, pane: PaneId, worker: &crate::worker::Worker) {
         let symbol = self.symbol.trim();
         if symbol.is_empty() {
-            self.error = Some("ICMP needs a ticker (AAPL ICMP MSFT). Sample prices are never used.".into());
+            // Needs input, not an error: the pane shows a ticker chooser.
             self.loading = false;
             return;
         }
         if let Err(err) = intraday_compare::parse_query(symbol, &self.peers, &self.tf) {
-            self.error = Some(err);
+            self.input_error = Some(err);
             self.loading = false;
             return;
+        }
+        self.input_error = None;
+        // A kept snapshot belongs to one ticker: never show it under another name.
+        // Nor under another bar size or peer set.
+        let query = intraday_compare::parse_query(symbol, &self.peers, &self.tf).ok();
+        let key_set = |names: &mut dyn Iterator<Item = &String>, anchor: &str| {
+            let mut keys: Vec<String> = names.map(|n| tr_data::security(n).key()).collect();
+            keys.push(tr_data::security(anchor).key());
+            keys.sort();
+            keys.dedup();
+            keys
+        };
+        let stale = |c: &CompareChart| {
+            let Some(q) = query.as_ref() else { return true };
+            c.timeframe != q.timeframe
+                || key_set(&mut c.series.iter().map(|s| &s.symbol), &c.anchor)
+                    != key_set(&mut q.symbols.iter(), &q.anchor)
+        };
+        if self.chart.as_ref().is_some_and(|c| !crate::widgets::same_security(&c.anchor, symbol) || stale(c)) {
+            // (stale covers bar size and peer set)
+            self.chart = None;
         }
         self.generation += 1;
         self.loading = true;
         self.error = None;
-        self.chart = None;
         worker.send(Request::IntradayCompare {
             pane,
             generation: self.generation,
@@ -65,8 +89,8 @@ impl ComparePane {
                 self.chart = Some(chart);
                 self.error = None;
             }
+            // Keep the previous snapshot; run_state labels it as such.
             Err(err) => {
-                self.chart = None;
                 self.error = Some(err);
             }
         }
@@ -76,10 +100,8 @@ impl ComparePane {
 impl TerminalApp {
     pub(super) fn open_intraday_compare(&mut self, symbol: Option<&str>, spec: &str) {
         let symbol = symbol.map(|s| tr_data::security(s).key()).or_else(|| self.focused_symbol()).unwrap_or_default();
-        let mut pane = ComparePane::new(symbol, spec);
-        if pane.symbol.is_empty() {
-            pane.error = Some("ICMP needs a ticker (AAPL ICMP MSFT). Sample prices are never used.".into());
-        }
+        // No focused ticker is a setup state (a ticker chooser), not an error.
+        let pane = ComparePane::new(symbol, spec);
         let ticker = if pane.symbol.is_empty() { "Compare".into() } else { tr_data::security(&pane.symbol).ticker };
         self.status = format!("{ticker}: intraday compare, percent from each 09:30 open");
         self.open_panel(PaneKind::IntradayCompare(Box::new(pane)));
@@ -89,41 +111,54 @@ impl TerminalApp {
         let i = self.idx(id).expect("compare pane");
         let sample_offline = self.provider.eq_ignore_ascii_case("sample");
         let mut reload = false;
+        let watchlist = self.watchlist.clone();
         {
             let PaneKind::IntradayCompare(pane) = &mut self.panes[i].kind else { return vec![] };
-            if !pane.loading && pane.chart.is_none() && pane.error.is_none() && !pane.symbol.trim().is_empty() {
+            if !pane.loading && pane.chart.is_none() && pane.error.is_none() && pane.input_error.is_none() && !pane.symbol.trim().is_empty() {
                 pane.request(id, &self.worker);
             }
-            ui.horizontal_wrapped(|ui| {
-                ui.label(RichText::new("Session compare").strong().color(text()));
-                ui.label(RichText::new("percent from the 09:30 open").font(mono(11.0)).color(amber()));
-                if ui.small_button("Reload").on_hover_text("Read verified regular-session bars again").clicked() {
+            let has_symbol = !pane.symbol.trim().is_empty();
+            let context = if let Some(c) = &pane.chart {
+                c.anchor_ticker.clone()
+            } else if has_symbol {
+                tr_data::security(&pane.symbol).ticker
+            } else { "% from 09:30 open".into() };
+            // Intraday results carry no structured receipt, so the chip is the honest compact legacy line.
+            let legacy = pane.chart.as_ref().map(|c| {
+                format!("{} · {} · {} · {}", c.date, c.timeframe.label(), c.provenance.label(), c.source)
+            });
+            let source = legacy.as_deref().map(|l| crate::widgets::HeaderSource { lead: "", parts: &[], legacy: l });
+            crate::widgets::pane_header(ui, "Session compare", &context, source, |ui| {
+                if has_symbol
+                    && crate::widgets::header_button(ui, "Reload", "Read verified regular-session bars again", false)
+                        .clicked()
+                {
                     reload = true;
                 }
             });
-            ui.label(
-                RichText::new(
-                    "Each line is that name's close divided by its own 09:30 open. The zero line is the open. SPY is on the same clock. A missing bucket is a gap. Premarket and after-hours prints stay off the chart.",
-                )
-                .font(ui_font(11.5))
-                .color(muted()),
+            if !has_symbol {
+                let what = "Compare one name against peers as percent from each 09:30 open, on real intraday bars.";
+                if let Some(key) = crate::widgets::needs_ticker(ui, what, &mut pane.ticker_draft, &watchlist) {
+                    pane.symbol = key;
+                    pane.ticker_draft.clear();
+                    pane.request(id, &self.worker);
+                }
+                return Vec::new();
+            }
+            crate::widgets::methodology(
+                ui,
+                (id, "icmp-method"),
+                "Each line is that name's close divided by its own 09:30 open. The zero line is the open. SPY is on the same clock. A missing bucket is a gap. Premarket and after-hours prints stay off the chart.",
             );
             if sample_offline {
-                ui.label(
-                    RichText::new(
-                        "Sample / offline display mode does not feed this pane. The compare never falls back to sample bars.",
-                    )
-                    .font(ui_font(12.0))
-                    .color(theme::down()),
+                crate::widgets::chip(
+                    ui,
+                    crate::widgets::ChipKind::Neutral,
+                    "Sample display mode: this pane needs live research data and never uses sample bars",
                 );
             }
             ui.horizontal_wrapped(|ui| {
-                ui.label(RichText::new("Anchor").color(muted()));
-                let changed = ui
-                    .add(egui::TextEdit::singleline(&mut pane.symbol).desired_width(140.0).hint_text("AAPL"))
-                    .lost_focus()
-                    && ui.input(|i| i.key_pressed(egui::Key::Enter));
-                if changed {
+                if crate::widgets::anchor_field(ui, "Anchor", &mut pane.ticker_draft, &pane.symbol) {
                     reload = true;
                 }
                 ui.label(RichText::new("Names").color(muted()));
@@ -142,16 +177,25 @@ impl TerminalApp {
                     }
                 }
             });
-            if let Some(err) = &pane.error {
-                ui.label(RichText::new(err).font(mono(12.0)).color(theme::down()));
-            } else if pane.loading {
-                ui.label(RichText::new("Reading verified intraday bars…").font(mono(12.0)).color(muted()));
-            }
-            if let Some(chart) = &pane.chart {
+            let show = if let Some(e) = &pane.input_error {
+                crate::widgets::input_error_card(ui, e);
+                false
+            } else {
+                crate::widgets::run_state(
+                    ui,
+                    pane.loading,
+                    pane.error.as_deref(),
+                    pane.chart.is_some(),
+                    "Reading verified intraday bars…",
+                    &mut reload,
+                )
+            };
+            if show && let Some(chart) = &pane.chart {
                 render_chart(ui, chart);
             }
         }
         if reload && let PaneKind::IntradayCompare(pane) = &mut self.panes[i].kind {
+            crate::widgets::commit_anchor(&mut pane.symbol, &mut pane.ticker_draft);
             pane.request(id, &self.worker);
         }
         Vec::new()
@@ -159,17 +203,6 @@ impl TerminalApp {
 }
 
 fn render_chart(ui: &mut Ui, chart: &CompareChart) {
-    ui.label(
-        RichText::new(format!(
-            "{} · {} · {} · {}",
-            chart.date,
-            chart.timeframe.label(),
-            chart.provenance.label(),
-            chart.source
-        ))
-        .font(mono(11.5))
-        .color(theme::provenance(chart.provenance)),
-    );
     for note in &chart.notes {
         ui.label(RichText::new(note).font(ui_font(11.5)).color(amber()));
     }
@@ -375,6 +408,7 @@ mod tests {
     use crate::app::tests::test_app;
     use crate::command::{Command, Function};
     use chrono::NaiveDate;
+    use egui::{Color32, Rect};
     use tr_core::{Bar, Provenance, Timeframe};
     use tr_data::intraday_compare::{NamedBars, build_chart};
 
@@ -418,6 +452,168 @@ mod tests {
             }
             _ => panic!("unexpected request"),
         }
+    }
+
+    fn real_chart() -> CompareChart {
+        let date = NaiveDate::from_ymd_opt(2026, 1, 5).unwrap();
+        let bar = |hour, min, open, close| {
+            let ts = tr_core::ny::to_utc(date.and_hms_opt(hour, min, 0).unwrap());
+            Bar::new(ts, open, open.max(close) + 0.1, open.min(close) - 0.1, close, 100.0)
+                .with_provenance(Provenance::Real)
+        };
+        build_chart(
+            "AAPL",
+            Timeframe::M30,
+            &[
+                NamedBars { symbol: "AAPL".into(), bars: vec![bar(9, 30, 10.0, 10.2)], error: None },
+                NamedBars { symbol: "SPY".into(), bars: vec![bar(9, 30, 20.0, 20.0)], error: None },
+            ],
+            "unit",
+        )
+        .unwrap()
+    }
+
+    fn render_compare(app: &mut TerminalApp) -> Vec<(String, Color32)> {
+        let id = app.focus;
+        let ctx = egui::Context::default();
+        let mut out = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(700.0, 600.0))),
+                ..Default::default()
+            },
+            |ui| {
+                app.compare_pane(ui, id);
+            },
+        );
+        out.textures_delta.clear();
+        crate::widgets::painted_texts(&out)
+    }
+
+    #[test]
+    fn reload_keeps_the_previous_snapshot_and_a_failed_refresh_labels_it() {
+        let (worker, mut requests) = crate::worker::Worker::test_channel();
+        let mut pane = ComparePane::new("AAPL", "");
+        pane.generation = 1;
+        pane.accept(1, Ok(real_chart()));
+        assert!(pane.chart.is_some());
+        // Reload: the old chart stays while the new request is in flight.
+        pane.request(7, &worker);
+        assert!(pane.loading && pane.chart.is_some());
+        assert!(requests.try_recv().is_ok());
+        // A failed refresh keeps the old chart and records the error.
+        pane.accept(pane.generation, Err("request timed out".into()));
+        assert!(pane.chart.is_some() && pane.error.as_deref() == Some("request timed out"));
+
+        // Rendered: banner over the retained chart, no jump to a bare LOADING card.
+        let mut app = test_app();
+        pane.error = None;
+        pane.loading = true;
+        app.open_panel(PaneKind::IntradayCompare(Box::new(pane)));
+        let t = render_compare(&mut app);
+        assert!(t.iter().any(|(s, _)| s == "Updating · showing previous snapshot"), "{t:?}");
+        assert!(!t.iter().any(|(s, _)| s == "LOADING"));
+        assert!(t.iter().any(|(s, _)| s == "Name"), "previous chart table must stay on screen");
+
+        let PaneKind::IntradayCompare(p) = &mut app.panes.last_mut().unwrap().kind else { unreachable!() };
+        p.loading = false;
+        p.error = Some("request timed out".into());
+        let t = render_compare(&mut app);
+        assert!(t.iter().any(|(s, _)| s.starts_with("Previous snapshot · refresh failed")), "{t:?}");
+        // Refused (unverified) data still clears the result: unavailable stays unavailable.
+        let mut sample = real_chart();
+        sample.provenance = Provenance::Sample;
+        let PaneKind::IntradayCompare(p) = &mut app.panes.last_mut().unwrap().kind else { unreachable!() };
+        p.generation = 5;
+        p.accept(5, Ok(sample));
+        assert!(p.chart.is_none() && p.error.is_some());
+    }
+
+    #[test]
+    fn a_kept_result_never_shows_under_another_ticker() {
+        let (worker, mut requests) = crate::worker::Worker::test_channel();
+        let mut pane = ComparePane::new("AAPL", "");
+        pane.generation = 1;
+        pane.accept(1, Ok(real_chart()));
+        // Same-symbol reload keeps the snapshot and shows the previous-snapshot banner.
+        pane.request(7, &worker);
+        assert!(pane.chart.is_some() && requests.try_recv().is_ok());
+        let mut app = test_app();
+        app.open_panel(PaneKind::IntradayCompare(Box::new(pane)));
+        let t = render_compare(&mut app);
+        assert!(t.iter().any(|(s, _)| s == "Updating · showing previous snapshot"), "{t:?}");
+        // Another ticker drops the AAPL result: a plain LOADING card, no stale numbers.
+        let PaneKind::IntradayCompare(p) = &mut app.panes.last_mut().unwrap().kind else { unreachable!() };
+        p.symbol = "MSFT".into();
+        p.request(7, &worker);
+        assert!(p.chart.is_none() && p.loading);
+        let t = render_compare(&mut app);
+        assert!(t.iter().any(|(s, _)| s == "LOADING"), "{t:?}");
+        assert!(!t.iter().any(|(s, _)| s.contains("previous snapshot")), "{t:?}");
+    }
+
+    #[test]
+    fn a_linked_symbol_change_is_not_undone_by_a_reload_commit() {
+        let mut app = test_app();
+        let mut pane = ComparePane::new("AAPL", "");
+        pane.generation = 1;
+        pane.accept(1, Ok(real_chart()));
+        app.open_panel(PaneKind::IntradayCompare(Box::new(pane)));
+        render_compare(&mut app);
+        let PaneKind::IntradayCompare(p) = &mut app.panes.last_mut().unwrap().kind else { unreachable!() };
+        assert_eq!(p.ticker_draft, "AAPL US Equity");
+        // The link path rewrites the symbol; the unfocused box follows it.
+        p.symbol = "MSFT US Equity".into();
+        render_compare(&mut app);
+        let PaneKind::IntradayCompare(p) = &mut app.panes.last_mut().unwrap().kind else { unreachable!() };
+        assert_eq!(p.ticker_draft, "MSFT US Equity");
+        crate::widgets::commit_anchor(&mut p.symbol, &mut p.ticker_draft);
+        assert_eq!(p.symbol, "MSFT US Equity");
+        // An uncommitted, blurred edit is discarded, not loaded by Reload.
+        p.ticker_draft = "MSF".into();
+        render_compare(&mut app);
+        let PaneKind::IntradayCompare(p) = &mut app.panes.last_mut().unwrap().kind else { unreachable!() };
+        crate::widgets::commit_anchor(&mut p.symbol, &mut p.ticker_draft);
+        assert_eq!(p.symbol, "MSFT US Equity");
+    }
+
+    #[test]
+    fn a_bar_size_or_peer_change_drops_the_kept_result() {
+        let (worker, mut requests) = crate::worker::Worker::test_channel();
+        let mut pane = ComparePane::new("AAPL", "");
+        pane.generation = 1;
+        pane.accept(1, Ok(real_chart()));
+        assert_eq!(pane.tf, "30m");
+        pane.request(7, &worker);
+        assert!(pane.chart.is_some(), "same spec keeps the snapshot");
+        assert!(requests.try_recv().is_ok());
+        pane.tf = "5m".into();
+        pane.request(7, &worker);
+        assert!(pane.chart.is_none(), "another bar size must not show the old chart");
+        pane.accept(pane.generation, Ok(real_chart()));
+        pane.tf = "30m".into();
+        pane.peers = "MSFT".into();
+        pane.request(7, &worker);
+        assert!(pane.chart.is_none(), "another peer set must not show the old chart");
+    }
+
+    #[test]
+    fn emptying_the_anchor_draft_keeps_the_loaded_pane() {
+        let mut app = test_app();
+        let mut pane = ComparePane::new("AAPL", "");
+        pane.generation = 1;
+        pane.accept(1, Ok(real_chart()));
+        pane.ticker_draft.clear();
+        app.open_panel(PaneKind::IntradayCompare(Box::new(pane)));
+        let t = render_compare(&mut app);
+        assert!(t.iter().any(|(s, _)| s == "Anchor"), "the field must stay, not flip to the chooser: {t:?}");
+        // The draft only becomes the symbol when committed, and never when empty.
+        let mut symbol = "AAPL US Equity".to_string();
+        let mut draft = "  ".to_string();
+        crate::widgets::commit_anchor(&mut symbol, &mut draft);
+        assert_eq!(symbol, "AAPL US Equity");
+        let mut draft = "msft".to_string();
+        crate::widgets::commit_anchor(&mut symbol, &mut draft);
+        assert_eq!(symbol, "MSFT US Equity");
     }
 
     #[test]

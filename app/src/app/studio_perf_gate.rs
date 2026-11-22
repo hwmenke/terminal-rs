@@ -177,6 +177,8 @@ fn perf_gate_paint_studios() {
     best.extend(source_chip_sample());
     best.extend(numeric_table_sample());
     best.extend(legend_sample());
+    best.extend(pane_chrome_sample());
+    best.extend(sidebar_sample());
     let ids: BTreeSet<_> = budgets.cases.keys().filter(|id| id.starts_with("paint.studio_")).cloned().collect();
     assert_eq!(best.keys().cloned().collect::<BTreeSet<_>>(), ids, "stale/missing studio budgets");
     for _ in 0..2 {
@@ -203,6 +205,8 @@ fn perf_gate_paint_studios() {
             .chain(source_chip_sample())
             .chain(numeric_table_sample())
             .chain(legend_sample())
+            .chain(pane_chrome_sample())
+            .chain(sidebar_sample())
         {
             if s.median_us < best[&id].median_us {
                 best.insert(id, s);
@@ -1359,6 +1363,149 @@ fn legend_sample() -> BTreeMap<String, Summary> {
         std::hint::black_box(primitives);
         for (metric, v) in [("ui", ui_us), ("tess", tess_us), ("total", ui_us + tess_us)] {
             times.entry(format!("paint.studio_legend.steady.{metric}")).or_default().push(v);
+        }
+    }
+    times.into_iter().map(|(id, mut s)| (id, tr_perf::summarize(&mut s))).collect()
+}
+/// UX cleanup slice 3: shared pane chrome. Twelve `pane_header`s (with a source chip), every
+/// `analysis_state` card, the ticker chooser and the run-state ladder, all laid out and painted per frame.
+fn pane_chrome_frame(ctx: &egui::Context, index: usize) -> egui::FullOutput {
+    use crate::widgets::{AnalysisKind, AnalysisState};
+    use tr_data::source_receipt::SourceReceipt;
+    let receipt = SourceReceipt::new("yahoo", 24_841, Some(1_763_596_800));
+    let mut buf = String::new();
+    let watch: Vec<String> = ["AAPL", "MSFT", "SPY"].iter().map(|s| tr_data::security(s).key()).collect();
+    let mut out = ctx.run_ui(
+        egui::RawInput {
+            time: Some(1. + index as f64 * 0.2),
+            screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(1000., 4000.))),
+            ..Default::default()
+        },
+        |ui| {
+            let parts = [("SPX", &receipt)];
+            for k in 0..12 {
+                ui.push_id(k, |ui| {
+                    crate::widgets::pane_header(
+                        ui,
+                        "Pane",
+                        "SPX · 1D",
+                        Some(crate::widgets::HeaderSource { lead: "", parts: &parts, legacy: "" }),
+                        |ui| {
+                            crate::widgets::header_button(ui, "Reload", "", false);
+                            crate::widgets::header_button(ui, "Inspector", "", k % 2 == 0);
+                        },
+                    );
+                });
+            }
+            for kind in AnalysisKind::ALL {
+                ui.push_id(kind as u8, |ui| {
+                    crate::widgets::analysis_state(ui, &AnalysisState::new(kind, "Title", "Detail text"), |_| {});
+                });
+            }
+            ui.push_id("picker", |ui| {
+                crate::widgets::needs_ticker(ui, "Pick one", &mut buf, &watch);
+            });
+            let mut retry = false;
+            ui.push_id("ladder", |ui| {
+                crate::widgets::run_state(ui, true, None, true, "Loading", &mut retry);
+                crate::widgets::run_state(ui, false, Some("timed out"), true, "", &mut retry);
+            });
+        },
+    );
+    out.textures_delta.clear();
+    out
+}
+fn pane_chrome_sample() -> BTreeMap<String, Summary> {
+    let ctx = egui::Context::default();
+    for i in 0..20 {
+        finite(&ctx, pane_chrome_frame(&ctx, i));
+    }
+    let mut times: BTreeMap<String, Vec<f64>> = BTreeMap::new();
+    for i in 0..120 {
+        let start = Instant::now();
+        let mut out = pane_chrome_frame(&ctx, i + 20);
+        let ui_us = start.elapsed().as_secs_f64() * 1e6;
+        if i == 60 {
+            let txt = text(&out.shapes);
+            assert_eq!(txt.matches("Yahoo · thru Nov 20").count(), 12, "{txt}");
+            assert_eq!(txt.matches("24,841 bars").count(), 12);
+            // Every state is present and distinct; the ready state paints nothing.
+            for label in ["LOADING", "CHOOSE", "NO RESULTS", "UNAVAILABLE", "PREVIOUS SNAPSHOT", "FAILED"] {
+                assert!(txt.contains(label), "missing {label}: {txt}");
+            }
+            assert!(txt.contains("Use ticker") && txt.contains("AAPL"), "ticker chooser");
+            assert!(txt.contains("Updating · showing previous snapshot") && txt.contains("refresh failed"), "{txt}");
+            assert!(out.shapes.len() >= 12 * 3 + 6, "chrome painted: {}", out.shapes.len());
+        }
+        let start = Instant::now();
+        let primitives = ctx.tessellate(std::mem::take(&mut out.shapes), out.pixels_per_point);
+        let tess_us = start.elapsed().as_secs_f64() * 1e6;
+        assert!(!primitives.is_empty());
+        std::hint::black_box(primitives);
+        for (metric, v) in [("ui", ui_us), ("tess", tess_us), ("total", ui_us + tess_us)] {
+            times.entry(format!("paint.studio_pane_chrome.steady.{metric}")).or_default().push(v);
+        }
+    }
+    times.into_iter().map(|(id, mut s)| (id, tr_perf::summarize(&mut s))).collect()
+}
+/// The real sidebar: every destination row, exact active state (Studio focused on the When lens),
+/// grouped sections and a twelve-name watchlist whose provenance is stated once.
+fn sidebar_sample() -> BTreeMap<String, Summary> {
+    use tr_data::studio::StudioLens;
+    let mut app = super::tests::test_app();
+    app.watchlist = ["AAPL", "MSFT", "NVDA", "SPY", "QQQ", "TLT", "GLD", "AMZN", "GOOGL", "META", "TSLA", "IWM"]
+        .iter()
+        .map(|s| tr_data::security(s).key())
+        .collect();
+    let studio = super::studio_hub::StudioPane::new(super::studio_hub::StudioViewSpec {
+        lens: StudioLens::When,
+        ..Default::default()
+    });
+    app.open_panel(super::PaneKind::Studio(Box::new(studio)));
+    let ctx = egui::Context::default();
+    let frame = |ctx: &egui::Context, app: &mut super::TerminalApp, i: usize| {
+        let mut out = ctx.run_ui(
+            egui::RawInput {
+                time: Some(1. + i as f64 * 0.2),
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(1000., 1600.))),
+                ..Default::default()
+            },
+            |ui| {
+                app.sidebar(ui, Rect::from_min_size(Pos2::ZERO, vec2(260., 1600.)));
+            },
+        );
+        out.textures_delta.clear();
+        out
+    };
+    for i in 0..20 {
+        finite(&ctx, frame(&ctx, &mut app, i));
+    }
+    let mut times: BTreeMap<String, Vec<f64>> = BTreeMap::new();
+    for i in 0..120 {
+        let start = Instant::now();
+        let mut out = frame(&ctx, &mut app, i + 20);
+        let ui_us = start.elapsed().as_secs_f64() * 1e6;
+        if i == 60 {
+            let txt = text(&out.shapes);
+            for word in ["Research", "Sessions", "Markets", "Trading", "When", "Add cash levels to chart", "Commands & Hotkeys"] {
+                assert!(txt.contains(word), "sidebar missing {word}");
+            }
+            assert!(!txt.contains("PDF"), "stray mnemonic");
+            let focused = app.panes.iter().find(|p| p.id == app.focus).map(|p| &p.kind);
+            let lit: Vec<_> = super::nav::NavDest::ALL
+                .into_iter()
+                .filter(|d| d.active(focused, app.settings_tab))
+                .collect();
+            assert_eq!(lit, [super::nav::NavDest::When], "exactly the focused lens is lit");
+            assert!(out.shapes.len() > 150, "sidebar painted: {}", out.shapes.len());
+        }
+        let start = Instant::now();
+        let primitives = ctx.tessellate(std::mem::take(&mut out.shapes), out.pixels_per_point);
+        let tess_us = start.elapsed().as_secs_f64() * 1e6;
+        assert!(!primitives.is_empty());
+        std::hint::black_box(primitives);
+        for (metric, v) in [("ui", ui_us), ("tess", tess_us), ("total", ui_us + tess_us)] {
+            times.entry(format!("paint.studio_sidebar.steady.{metric}")).or_default().push(v);
         }
     }
     times.into_iter().map(|(id, mut s)| (id, tr_perf::summarize(&mut s))).collect()
