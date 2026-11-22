@@ -29,6 +29,7 @@ use tr_data::anchored_vwap::AvwapKey;
 mod auction;
 mod cockpit;
 mod fair_value;
+mod legend;
 mod session_cache;
 pub mod studio_canvas;
 mod stop_cloud;
@@ -342,6 +343,8 @@ pub struct ChartState {
     generation: u64,
     studio_owned: bool,
     studio_plot: Option<Rect>,
+    /// Legend rows placed this frame by `paint_legend` (the one layout owner; fair value appends).
+    legend: std::cell::RefCell<legend::LegendRows>,
     /// Price scale of the last native (non-canvas) frame; `y_of` handles log scale.
     studio_scale: Option<tr_chart::viewport::PriceScale>,
     viewport: Option<Viewport>,
@@ -494,6 +497,7 @@ impl ChartState {
             generation: 0,
             studio_owned: false,
             studio_plot: None,
+            legend: Default::default(),
             studio_scale: None,
             viewport: None,
             manual_scale: None,
@@ -3276,35 +3280,30 @@ impl ChartState {
         let chg = b.close - prev;
         let col = if chg >= 0.0 { theme::up() } else { theme::down() };
         let dec = self.sec.decimals(b.close);
-        let mut x = price_rect.left() + 6.0;
-        let y = price_rect.top() + 4.0;
-        let put = |text: String, color: Color32, x: &mut f32| {
-            let g = p.layout_no_wrap(text, mono(11.5), color);
-            p.galley(pos2(*x, y), g.clone(), color);
-            *x += g.size().x + 8.0;
-        };
-        put(format!("{} · {}", self.sec.ticker, self.tf), amber(), &mut x);
+        // One allocator owns every legend row (measured heights, wrapped header); the Studio
+        // fair-value caption appends below the last row through the same state.
+        let mut rows = legend::LegendRows::begin(price_rect, ui.ctx().cumulative_pass_nr());
+        let mut segs: Vec<(String, Color32)> = vec![(format!("{} · {}", self.sec.ticker, self.tf), amber())];
         for (k, val) in [("O", b.open), ("H", b.high), ("L", b.low), ("C", b.close)] {
-            put(format!("{k}{val:.dec$}"), col, &mut x);
+            segs.push((format!("{k}{val:.dec$}"), col));
         }
-        put(format!("{:+.dec$} ({:+.2}%)", chg, if prev != 0.0 { chg / prev * 100.0 } else { 0.0 }), col, &mut x);
-        put(format!("Vol {}", scale::format_volume(b.volume_value().unwrap_or(f64::NAN))), muted(), &mut x);
+        segs.push((format!("{:+.dec$} ({:+.2}%)", chg, if prev != 0.0 { chg / prev * 100.0 } else { 0.0 }), col));
+        segs.push((format!("Vol {}", scale::format_volume(b.volume_value().unwrap_or(f64::NAN))), muted()));
+        rows.put_inline(&p, &segs, mono(11.5), 8.0);
 
         // Overlay indicator values, one per line.
-        let mut ly = y + 16.0;
+        let mut ly = rows.cursor();
         self.paint_session_lines(ui, price_rect, &mut ly);
+        rows.reserve_to(ly, "session");
         // With the Auction Map on, one line from its report replaces VP / VAH.
         if let Some(line) = self.auction_legend_line() {
-            p.text(pos2(price_rect.left() + 6.0, ly), Align2::LEFT_TOP, line, mono(11.0), theme::series(2));
-            ly += 14.0;
+            rows.put(&p, &line, mono(11.0), theme::series(2));
         }
         if let Some(line) = &self.earnings {
-            p.text(pos2(price_rect.left() + 6.0, ly), Align2::LEFT_TOP, line, mono(11.0), amber());
-            ly += 14.0;
+            rows.put(&p, line, mono(11.0), amber());
         }
         if let Some(line) = &self.ex_dividend {
-            p.text(pos2(price_rect.left() + 6.0, ly), Align2::LEFT_TOP, line, mono(11.0), amber());
-            ly += 14.0;
+            rows.put(&p, line, mono(11.0), amber());
         }
         let value_at = |l: &LineRef| l.pyramid.data.get(i).map(|p| p[1] as f64).filter(|v| v.is_finite());
         for bi in self.built.iter().filter(|b| !b.spec.is_pane()) {
@@ -3343,23 +3342,14 @@ impl ChartState {
             } else {
                 bi.spec.label()
             };
-            p.text(
-                pos2(price_rect.left() + 6.0, ly),
-                Align2::LEFT_TOP,
-                format!("{}  {}", title, vals.join(" ")),
-                mono(11.0),
-                c,
-            );
-            ly += 14.0;
+            rows.put(&p, &format!("{}  {}", title, vals.join(" ")), mono(11.0), c);
             if let Some(z) = &bi.honest_z {
-                let top = ly;
+                let top = rows.cursor();
                 let color = if z.muted() { muted() } else { amber() };
-                p.text(pos2(price_rect.left() + 6.0, ly), Align2::LEFT_TOP, &z.label_text, mono(10.0), color);
-                ly += 14.0;
-                p.text(pos2(price_rect.left() + 6.0, ly), Align2::LEFT_TOP, &z.tail_text, mono(10.0), color);
-                ly += 14.0;
+                rows.put(&p, &z.label_text, mono(10.0), color);
+                rows.put(&p, &z.tail_text, mono(10.0), color);
                 ui.interact(
-                    Rect::from_min_max(pos2(price_rect.left() + 4.0, top), pos2(price_rect.right(), ly)),
+                    Rect::from_min_max(pos2(price_rect.left() + 4.0, top), pos2(price_rect.right(), rows.cursor())),
                     ui.id().with(("honest-z", bi.spec.label())),
                     Sense::hover(),
                 )
@@ -3367,27 +3357,18 @@ impl ChartState {
             } else if bi.spec.code == "ZBAND"
                 && let Some(reason) = &bi.refused
             {
-                p.text(pos2(price_rect.left() + 6.0, ly), Align2::LEFT_TOP, reason, mono(10.0), theme::alert());
-                ly += 14.0;
+                rows.put(&p, reason, mono(10.0), theme::alert());
             }
         }
         let hidden = self.built.iter().filter(|b| b.spec.is_pane()).count().saturating_sub(sub_rects.len());
         if hidden > 0 {
             let note =
                 format!("+{hidden} more oscillator{} (max {MAX_SUB_PANES} panes)", if hidden == 1 { "" } else { "s" });
-            p.text(pos2(price_rect.left() + 6.0, ly), Align2::LEFT_TOP, note, mono(11.0), muted());
-            ly += 14.0;
+            rows.put(&p, &note, mono(11.0), muted());
         }
         if self.show_spy_strength && self.tf == Timeframe::D1 {
             if let Some(value) = self.spy_strength.as_ref().and_then(value_at) {
-                p.text(
-                    pos2(price_rect.left() + 6.0, ly),
-                    Align2::LEFT_TOP,
-                    format!("RS/SPY {value:.2} · base 100"),
-                    mono(11.0),
-                    theme::series(6),
-                );
-                ly += 14.0;
+                rows.put(&p, &format!("RS/SPY {value:.2} · base 100"), mono(11.0), theme::series(6));
             }
         }
         if let (Some(sym), Some(line)) = (&self.compare, &self.compare_line) {
@@ -3398,28 +3379,24 @@ impl ChartState {
                 (Some(r), Some(rel)) => format!("CMP {sym}  {r:.2}  ({rel:+.2}% vs {})", self.symbol),
                 _ => format!("CMP {sym}"),
             };
-            p.text(pos2(price_rect.left() + 6.0, ly), Align2::LEFT_TOP, text, mono(11.0), theme::series(5));
-            ly += 14.0;
+            rows.put(&p, &text, mono(11.0), theme::series(5));
         }
+        let mut ly = rows.cursor();
         ly = self.paint_review_hud(&p, price_rect, ly);
         ly = self.paint_adaptive_hud(&p, price_rect, ly);
         if self.show_stack {
             ly = self.paint_stack_hud(&p, price_rect, ly);
         }
+        rows.reserve_to(ly, "hud");
         if let Some(tool) = self.draw.tool {
             let msg = if self.draw.pending.is_some() {
                 "click second point (Esc cancels)"
             } else {
                 "click to place (Esc cancels)"
             };
-            p.text(
-                pos2(price_rect.left() + 6.0, ly),
-                Align2::LEFT_TOP,
-                format!("{}: {msg}", tool.label()),
-                mono(11.0),
-                amber(),
-            );
+            rows.put(&p, &format!("{}: {msg}", tool.label()), mono(11.0), amber());
         }
+        *self.legend.borrow_mut() = rows;
         for (r, bi, _) in sub_rects {
             let b = &self.built[*bi];
             let painter = ui.painter_at(*r);

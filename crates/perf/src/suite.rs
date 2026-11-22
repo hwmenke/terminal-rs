@@ -88,6 +88,35 @@ pub fn all(scale: Scale) -> Vec<Case> {
         assert!(b.unavailable.iter().all(Option::is_none));
         b.draws * b.sessions
     });
+    // UX cleanup slice 1: default 10Y window over a >20,000-session daily history (SPX-like depth).
+    let when_daily_n = if full { 24_841 } else { 20_500 };
+    let when_daily = {
+        let bars = fixtures::daily(when_daily_n, 1_234);
+        tr_data::studio_canvas::CanvasInput {
+            symbol: "AAPL US Equity".into(),
+            tf: Timeframe::D1,
+            observed_at: Some(bars.last().unwrap().ts + 3 * 86_400),
+            stitch: None,
+            source: "benchmark fixture only".into(),
+            bars: std::sync::Arc::new(bars),
+        }
+    };
+    let when_daily_spec = tr_data::studio_when::WhenSpec::parse("RSI(14)<45", 0.).unwrap();
+    add!("studio.when_daily_10y_of_24k", move || {
+        let r = bb(tr_data::studio_when::compute(bb(&when_daily), &when_daily_spec).unwrap());
+        let w = r.window.as_ref().expect("daily window");
+        assert!(when_daily.bars.len() > 20_000, "history exceeds the 20,000-session grid limit");
+        assert_eq!(w.period, tr_data::studio_when::WhenPeriod::Years(10));
+        assert_eq!(w.warmup_bars, tr_data::studio_when::WARMUP_BARS);
+        assert!(r.sessions > 2_400 && r.sessions < 2_700, "ten calendar years of sessions");
+        assert_eq!(r.mask.ts[0], w.scored_from, "warm-up never enters scored rows");
+        assert!(r.mask.values.iter().flatten().filter(|v| **v == 1.).count() > 100, "rule must match");
+        for c in &r.cells {
+            assert!(c.raw_n > 2_000 && c.raw_n < r.sessions, "windowed completed outcomes at h={}", c.horizon);
+            assert!(c.mean_contrast.p.is_some() && c.hit_contrast.p.is_some());
+        }
+        r.cells.iter().map(|c| c.raw_n).sum()
+    });
     let subset_bars = fixtures::daily(if full { 5001 } else { 501 }, 17);
     let subset_dist = tr_data::studio_dist::compute(
         "AAPL US Equity",

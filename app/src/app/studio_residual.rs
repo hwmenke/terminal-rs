@@ -498,11 +498,10 @@ fn clock(r: &ResidualReport, tf: Timeframe) -> String {
 }
 
 fn receipt(ui: &mut Ui, r: &ResidualReport, tf: Timeframe) {
-    ui.label(mono_text(
-        format!("{} · CLOSED THRU {} · {} · {}", r.provenance.label(), stamp(r.closed_thru), clock(r, tf), r.source),
-        10.,
-        theme::muted(),
-    ));
+    let parts = crate::widgets::chip_parts(&r.source_receipts);
+    crate::widgets::source_chip(ui, r.provenance.label(), &parts, || {
+        format!("CLOSED THRU {} · {} · {}", stamp(r.closed_thru), clock(r, tf), r.source)
+    });
 }
 
 pub(super) fn caution_corner(ui: &Ui, rect: Rect) {

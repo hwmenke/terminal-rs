@@ -408,7 +408,12 @@ pub(super) fn show(
             );
         }
         if !pane.receipt.is_empty() {
-            ui.label(RichText::new(&pane.receipt).color(muted()).font(mono(11.0)));
+            let parts = pane
+                .report
+                .as_ref()
+                .map(|r| crate::widgets::chip_one(&r.symbol, &r.source_receipt))
+                .unwrap_or_default();
+            crate::widgets::source_chip(ui, "", &parts, || pane.receipt.clone());
         }
         if let Some(err) = &pane.error {
             ui.label(RichText::new(err).font(mono(12.0)).color(theme::down()));

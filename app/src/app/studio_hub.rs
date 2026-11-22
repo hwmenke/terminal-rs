@@ -25,6 +25,8 @@ pub struct StudioInputs {
     pub horizons: String,
     pub when_threshold: f64,
     pub when_horizon: usize,
+    /// When analysis period token (`period=10y` / `since=YYYY-MM-DD`); empty = default 10Y.
+    pub when_period: String,
     pub strategies: String,
     pub holdout: String,
     pub commission: String,
@@ -49,6 +51,7 @@ impl Default for StudioInputs {
             horizons: "5, 10".into(),
             when_threshold: tr_data::studio_when::DEFAULT_THRESHOLD_BP,
             when_horizon: 6,
+            when_period: String::new(),
             strategies: "ALL".into(),
             holdout: "20%".into(),
             commission: format!("{:.0}", tr_data::backtest::DEFAULT_COMMISSION_BPS),
@@ -63,6 +66,13 @@ impl Default for StudioInputs {
     }
 }
 impl StudioInputs {
+    /// Saved/typed When period; anything unparsable restores the default 10Y.
+    pub fn when_period_value(&self) -> tr_data::studio_when::WhenPeriod {
+        let t = self.when_period.trim();
+        t.split_once('=')
+            .and_then(|(_, v)| tr_data::studio_when::WhenPeriod::parse(v).ok())
+            .unwrap_or_default()
+    }
     /// `corr_horizon` restricted to the supported {1, 5, 20} (hand-edited layouts restore 1).
     pub fn valid_corr_horizon(&self) -> usize {
         if [1, 5, 20].contains(&self.corr_horizon) { self.corr_horizon } else { 1 }
@@ -242,6 +252,7 @@ impl StudioPane {
                     inputs.condition = p.condition.clone();
                     inputs.when_threshold = p.threshold;
                     inputs.when_horizon = p.horizon;
+                    inputs.when_period = p.period.token();
                 }
                 StudioLensState::Season(_) => {}
                 StudioLensState::Backtest(p) => {
@@ -382,7 +393,8 @@ impl StudioPane {
                 StudioLensState::Relate(Box::new(c))
             }
             StudioLens::When => {
-                let c = studio_when::WhenPane::new(s, tf, &p.condition, p.when_threshold, p.when_horizon);
+                let c = studio_when::WhenPane::new(s, tf, &p.condition, p.when_threshold, p.when_horizon)
+                    .with_period(p.when_period_value());
                 StudioLensState::When(Box::new(c))
             }
             StudioLens::Season => StudioLensState::Season(Box::new(studio_season::SeasonPane::new(s, tf.label()))),
@@ -522,6 +534,43 @@ impl StudioPane {
             ui.allocate_space(vec2(ui.available_width(), 130.));
         }
     }
+    /// Error text of the visible lens, if it failed (used by the status bar to decide whether an
+    /// optional-service outage actually affects the current result).
+    pub(super) fn lens_error(&self) -> Option<&str> {
+        match self.children.iter().find(|c| c.kind() == self.lens)? {
+            StudioLensState::When(p) => p.error.as_deref(),
+            StudioLensState::Relate(p) => p.error.as_deref(),
+            StudioLensState::Dist(p) => p.error.as_deref(),
+            StudioLensState::Season(p) => p.error.as_deref(),
+            StudioLensState::Backtest(p) => p.error.as_deref(),
+        }
+    }
+    /// Structured receipts of the visible lens (one compact chip; full chain on hover/Inspector).
+    fn receipt_parts(&self) -> Vec<crate::widgets::ChipPart<'_>> {
+        use crate::widgets::{chip_one, chip_parts_opt};
+        match self.children.iter().find(|c| c.kind() == self.lens) {
+            Some(StudioLensState::Relate(p)) => p
+                .report
+                .as_ref()
+                .map(|r| chip_parts_opt(&[r.symbol.as_str(), r.benchmark.as_str()], &r.receipts))
+                .unwrap_or_default(),
+            Some(StudioLensState::When(p)) => p
+                .report
+                .as_ref()
+                .map(|r| r.source_receipts.iter().map(|c| (r.report.symbol.as_str(), c)).collect())
+                .unwrap_or_default(),
+            Some(StudioLensState::Dist(p)) => {
+                p.report.as_ref().map(|r| chip_one(r.symbol.as_str(), &r.source_receipt)).unwrap_or_default()
+            }
+            Some(StudioLensState::Season(p)) => {
+                p.report.as_ref().map(|r| chip_one(r.symbol.as_str(), &r.source_receipt)).unwrap_or_default()
+            }
+            Some(StudioLensState::Backtest(p)) => {
+                p.report.as_ref().map(|r| chip_one(r.symbol.as_str(), &r.source_receipt)).unwrap_or_default()
+            }
+            _ => vec![],
+        }
+    }
     fn receipt(&self) -> String {
         match self.children.iter().find(|c| c.kind() == self.lens) {
             Some(StudioLensState::Dist(p)) if p.report.is_some() => {
@@ -551,12 +600,17 @@ impl StudioPane {
             _ => "Source / CLOSED THRU unavailable · awaiting accepted real-data receipt".into(),
         }
     }
-    fn command(&self) -> String {
+    pub(super) fn command(&self) -> String {
         if self.quick {let c=self.chart.canvas_view();return format!("{} QUICK {} {} mode={}",self.context.symbol,c.peers.iter().map(|s|tr_data::security(s).ticker).collect::<Vec<_>>().join(" "),self.context.tf.label(),c.spec.mode.code());}
         let rule = if self.lens == StudioLens::When {
             let p = self.view().inputs;
             let condition = if p.condition.trim().is_empty() { tr_data::studio_when::DEFAULT_RULE } else { &p.condition };
-            format!(" rule=\"{condition}\" h={} threshold={}bp", p.when_horizon, p.when_threshold)
+            let period = if self.context.tf == Timeframe::D1 {
+                format!(" {}", p.when_period_value().token())
+            } else {
+                String::new()
+            };
+            format!(" rule=\"{condition}\" h={} threshold={}bp{period}", p.when_horizon, p.when_threshold)
         } else {
             String::new()
         };
@@ -570,6 +624,11 @@ impl StudioPane {
     }
     fn inspector(&mut self, ui: &mut Ui) {
         ui.label(RichText::new("STUDIO INPUTS").font(theme::ui_font(16.)).strong());
+        // Full source chain (attempts, clocks, gaps) lives here, not in the pane header.
+        let chain = crate::widgets::source_chip_detail(&self.receipt_parts(), &self.receipt());
+        egui::CollapsingHeader::new(RichText::new("Source chain").font(theme::ui_font(11.))).show(ui, |ui| {
+            ui.label(RichText::new(chain).font(theme::mono(10.)).color(theme::muted()));
+        });
         ui.horizontal_wrapped(|ui| {
             ui.label("Symbol");
             ui.add(egui::TextEdit::singleline(&mut self.symbol_edit).desired_width(160.));
@@ -665,29 +724,49 @@ impl StudioPane {
         let area = ui.available_rect_before_wrap();
         let wide = area.width() >= 900.;
         let narrow = area.width() < 600.;
+        // The chart is allocated first: header, lens rail and the About/Build notes live in a
+        // height-capped scroll area, so source details can never squeeze the native chart.
+        let native = !self.chart.canvas_view().enabled;
+        let chrome_cap = chrome_cap(area.height(), native);
+        let mut build_route: Option<&'static str> = None;
+        egui::ScrollArea::vertical()
+            .id_salt((id, "studio-chrome"))
+            .max_height(chrome_cap)
+            .auto_shrink([false, true])
+            .show(ui, |ui| {
         // At normal widths the receipt header is 44pt and lens rail 32pt. Narrow controls wrap.
-        let header = ui.scope(|ui| {
-            ui.set_min_height(44.);
-            ui.horizontal_wrapped(|ui| {
-                ui.label(RichText::new(if self.quick {"QUICK"}else{"STUDIO"}).font(theme::ui_font(20.)).strong());
-                ui.label(
-                    RichText::new(format!("{} · {}", self.context.symbol, self.context.tf.label()))
-                        .font(theme::mono(13.)),
-                );
-                ui.label(self.lens.label());
-                if ui.small_button("Copy command").clicked() {
-                    ui.ctx().copy_text(self.command());
-                }
-                if ui.small_button("About").clicked() {
-                    self.about_open = !self.about_open;
-                }
-                if ui.small_button("Inspector").clicked() {
-                    self.inspector_open = !self.inspector_open;
-                }
-            });
-            ui.label(RichText::new(self.receipt()).font(theme::mono(10.)).color(theme::muted()));
-        });
-        let _ = header;
+        // Shared pane header: title + instrument/period/lens, actions on the right, one source chip.
+        let context = format!(
+            "{} · {}{}",
+            self.context.symbol,
+            self.context.tf.label(),
+            if self.quick { String::new() } else { format!(" · {}", self.lens.label()) }
+        );
+        let (mut copy, mut about, mut inspector) = (false, false, false);
+        {
+            let parts = self.receipt_parts();
+            let legacy = if parts.is_empty() { self.receipt() } else { String::new() };
+            crate::widgets::pane_header(
+                ui,
+                if self.quick { "QUICK" } else { "STUDIO" },
+                &context,
+                Some(crate::widgets::HeaderSource { lead: "", parts: &parts, legacy: &legacy }),
+                |ui| {
+                    inspector = crate::widgets::header_button(ui, "Inspector", "Inputs, span selection and the full source chain", self.inspector_open).clicked();
+                    about = crate::widgets::header_button(ui, "About", "What Studio is, in one line", self.about_open).clicked();
+                    copy = crate::widgets::header_button(ui, "Copy command", "Copy the command that recreates this view", false).clicked();
+                },
+            );
+        }
+        if copy {
+            ui.ctx().copy_text(self.command());
+        }
+        if about {
+            self.about_open = !self.about_open;
+        }
+        if inspector {
+            self.inspector_open = !self.inspector_open;
+        }
         ui.scope(|ui| {
             ui.set_min_height(32.);
             ui.horizontal_wrapped(|ui| {
@@ -700,17 +779,29 @@ impl StudioPane {
                 let quick_canvas=self.chart.canvas_view().enabled;
                 if ui.selectable_label(quick_canvas,"Quick canvas").clicked(){let mut view=self.chart.canvas_view();view.enabled=true;self.chart.set_canvas_view(view);}
                 if ui.selectable_label(!quick_canvas,"Native chart").clicked(){let mut view=self.chart.canvas_view();view.enabled=false;self.chart.set_canvas_view(view);}
-                if ui.small_button("Build").clicked() {
+                if crate::widgets::header_button(ui, "Build", "Fit and score factor models: Lab → Residual → Attribution", self.build_open).clicked() {
                     self.build_open = !self.build_open;
                 }
             });
         });
         if self.about_open {
-            egui::Frame::group(ui.style()).show(ui,|ui|{ui.label("Studio connects the native time canvas to existing verified-data research. Each lens retains its original methods, MathCards and receipt. Quick adds descriptive canvas arithmetic. Copy command saves inputs, not historical data revisions.");});
+            ui.add(egui::Label::new(RichText::new("Native time canvas plus verified-data lenses; each lens keeps its own methods, MathCards and receipt. Copy command saves inputs, not data.").font(theme::ui_font(11.5)).color(theme::muted())).wrap());
         }
         if self.build_open {
-            egui::Frame::group(ui.style()).show(ui,|ui|{ui.label("BUILD · Residual tickers (STUDIO resid) and attribution (STUDIO attr) available");ui.label("Regression Lab (STUDIO lab factors=SPY,TLT) fits multi-factor OLS with a purged frozen holdout. Save residual freezes a fit into an immutable model; STUDIO resid open <id> scores it on live data and never refits; STUDIO attr model=<id> obs=20 splits a window's move into drift + factor contributions + residual from that frozen model.");});
+            // Direct route actions, one per step of the model workflow; methodology stays on hover.
+            ui.horizontal_wrapped(|ui| {
+                for (label, cmd, hover) in [
+                    ("Regression Lab", "STUDIO lab", "Fit multi-factor OLS with a purged frozen holdout"),
+                    ("Residual tickers", "STUDIO resid", "Score a saved frozen model on live data; never refits"),
+                    ("Attribution", "STUDIO attr", "Split a window's move into drift + factors + residual from a frozen model"),
+                ] {
+                    if crate::widgets::header_button(ui, label, hover, false).clicked() {
+                        build_route = Some(cmd);
+                    }
+                }
+            });
         }
+            });
         let content = ui.available_rect_before_wrap();
         let mut body = content;
         if self.inspector_open && wide {
@@ -720,11 +811,14 @@ impl StudioPane {
             egui::ScrollArea::vertical().id_salt((id, "inspector-scroll")).show(&mut child, |ui| self.inspector(ui));
         }
         let mut actions = vec![];
+        if let Some(cmd) = build_route {
+            actions.push(Action::Command(cmd.into()));
+        }
         let mut child = ui.new_child(UiBuilder::new().max_rect(body).id_salt((id, "studio-body")));
         child.set_clip_rect(body.intersect(ui.clip_rect()));
         if self.quick {
             self.canvas(&mut child,body,id,worker,sample,focused);
-        } else if narrow {
+        } else if narrow || matches!(split_layout(body.height(), self.canvas_fraction, native), Split::Stacked { .. }) {
             egui::ScrollArea::vertical().id_salt((id, "studio-stack")).show(&mut child, |ui| {
                 let height=if self.chart.canvas_view().enabled {480.}else{240.};
                 let (canvas, _) = ui.allocate_exact_size(vec2(ui.available_width(), height), Sense::hover());
@@ -733,8 +827,10 @@ impl StudioPane {
                 actions.extend(self.analysis(ui, id, worker, sample));
             });
         } else {
-            let min:f32=if self.chart.canvas_view().enabled {280.}else{120.};
-            let h = (body.height() * self.canvas_fraction).clamp(min.min((body.height()-1.).max(1.)),(body.height()-1.).max(1.));
+            let h = match split_layout(body.height(), self.canvas_fraction, native) {
+                Split::Side { chart_h } => chart_h,
+                Split::Stacked { chart_h } => chart_h,
+            };
             let canvas = Rect::from_min_size(body.min, vec2(body.width(), h));
             self.canvas(&mut child, canvas, id, worker, sample, focused);
             let split = Rect::from_min_size(pos2(body.left(), canvas.bottom()), vec2(body.width(), 6.));
@@ -1120,6 +1216,43 @@ pub(super) fn prepared_relate(
     pane
 }
 
+/// Smallest chart the Studio will allocate: native price chart / Quick canvas (points).
+pub(crate) const CHART_MIN_NATIVE: f32 = 240.;
+pub(crate) const CHART_MIN_CANVAS: f32 = 280.;
+/// Analysis needs at least this much beside the chart before the stack falls back to scrolling.
+pub(crate) const ANALYSIS_MIN: f32 = 140.;
+const SPLIT_GAP: f32 = 10.;
+
+pub(crate) fn chart_min(native: bool) -> f32 {
+    if native { CHART_MIN_NATIVE } else { CHART_MIN_CANVAS }
+}
+
+/// How the body below the chrome is divided.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) enum Split {
+    /// Chart above, analysis below, draggable divider.
+    Side { chart_h: f32 },
+    /// Not enough height for both: chart at its minimum, everything scrolls.
+    Stacked { chart_h: f32 },
+}
+
+/// Chart height for a body of `body_h`. The chart never goes below [`chart_min`]; when the analysis
+/// would then fall under [`ANALYSIS_MIN`] the layout stacks and scrolls instead of squeezing.
+pub(crate) fn split_layout(body_h: f32, fraction: f32, native: bool) -> Split {
+    let min = chart_min(native);
+    if body_h < min + ANALYSIS_MIN + SPLIT_GAP {
+        return Split::Stacked { chart_h: min };
+    }
+    let max = body_h - ANALYSIS_MIN - SPLIT_GAP;
+    Split::Side { chart_h: (body_h * fraction).clamp(min, max) }
+}
+
+/// Tallest the header/lens rail/notes block may be: whatever the chart and a usable analysis leave
+/// free, but never less than the 76pt default (44pt header + 32pt lens rail), then it scrolls.
+pub(crate) fn chrome_cap(area_h: f32, native: bool) -> f32 {
+    (area_h - chart_min(native) - ANALYSIS_MIN - SPLIT_GAP).max(76.)
+}
+
 #[cfg(test)]
 mod tests;
 
@@ -1181,6 +1314,7 @@ fn when_inputs(inputs: &mut StudioInputs, cmd: tr_data::studio_when::WhenCommand
     inputs.condition = cmd.rule.unwrap_or_else(|| tr_data::studio_when::DEFAULT_RULE.into());
     inputs.when_threshold = cmd.threshold.unwrap_or(tr_data::studio_when::DEFAULT_THRESHOLD_BP);
     inputs.when_horizon = cmd.horizon.unwrap_or(6);
+    inputs.when_period = cmd.period.map(|p| p.token()).unwrap_or_default();
 }
 
 /// A Studio opened on the When lens from `WHEN` arguments (daily by default).
@@ -1214,6 +1348,9 @@ impl TerminalApp {
                 if let Some(p) = s.when_mut() {
                     if let Some(h) = cmd.horizon {
                         p.horizon = h;
+                    }
+                    if let Some(period) = cmd.period {
+                        p.set_period(period);
                     }
                     if let Some(t) = cmd.threshold
                         && p.threshold != t

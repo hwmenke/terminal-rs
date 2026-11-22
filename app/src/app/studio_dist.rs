@@ -374,14 +374,14 @@ pub(super) fn show(
                 regimes::view(ui, r, pane.rotation.as_deref(), pane.rotation_loading, &mut pane.regime_sel);
             });
         } else {
-            ui.push_id(id, |ui| report_view(ui, id, r, &mut pane.best_k));
+            ui.push_id(id, |ui| report_view(ui, id, r, &mut pane.best_k, embedded));
         }
     }
     vec![]
 }
 
 /// The whole report below the controls. Split out so it can be rendered headless.
-fn report_view(ui: &mut Ui, id: PaneId, r: &Report, best_k: &mut usize) {
+fn report_view(ui: &mut Ui, id: PaneId, r: &Report, best_k: &mut usize, embedded: bool) {
     gap_warning(ui, &r.gaps);
     ui.label(
         RichText::new(format!(
@@ -396,8 +396,11 @@ fn report_view(ui: &mut Ui, id: PaneId, r: &Report, best_k: &mut usize) {
         .font(mono(11.0))
         .color(muted()),
     );
-    ui.label(RichText::new(&r.source).font(mono(10.5)).color(muted()))
-        .on_hover_text("Data source and vault coverage for this series");
+    // Hosted in the Studio, the header already carries the chip.
+    if !embedded {
+        let parts = crate::widgets::chip_one(&r.symbol, &r.source_receipt);
+        crate::widgets::source_chip(ui, "", &parts, || r.source.clone());
+    }
     ui.label(
         RichText::new(format!(
             "{}: {} · {} shows available coverage; missing bars are never filled.",
@@ -1108,16 +1111,36 @@ mod tests {
         assert!(gap_text(&[(a, b), (b + 86_400, b + 3 * 86_400)]).unwrap().contains("2 gaps"));
     }
     #[test]
+    fn dist_body_shows_one_compact_chip_not_the_fallback_chain() {
+        let bars = fixture();
+        let chain = "yahoo (native provider) · CLOSED THRU 2026-11-20 · fallback: Local research archive: none; Whats-News (HTTP / SQLite): offline";
+        let mut r = dist::compute("AAPL", &bars, Timeframe::D1, Window::All, chain, None).unwrap();
+        let mut receipt = tr_data::source_receipt::SourceReceipt::new("yahoo", bars.len(), bars.last().map(|b| b.ts));
+        receipt.detail = chain.into();
+        receipt.attempts = vec!["Local research archive: none".into(), "Whats-News (HTTP / SQLite): offline".into()];
+        r.source_receipt = Some(receipt);
+        let ctx = egui::Context::default();
+        let mut out = ctx.run_ui(Default::default(), |ui| report_view(ui, r_id(), &r, &mut 5, false));
+        out.textures_delta.clear();
+        let text = format!("{:?}", out.shapes);
+        assert!(text.contains("Yahoo · thru"), "{text}");
+        assert!(!text.contains("Local research archive") && !text.contains("Whats-News (HTTP"), "chain stays on hover");
+        // Hosted in the Studio the header owns the chip: no second source line in the lens.
+        let mut out = ctx.run_ui(Default::default(), |ui| report_view(ui, r_id(), &r, &mut 5, true));
+        out.textures_delta.clear();
+        assert!(!format!("{:?}", out.shapes).contains("Yahoo · thru"));
+    }
+    #[test]
     fn dist_view_warns_on_vault_gap() {
         let bars = fixture();
         let gap = (bars[10].ts, bars[11].ts);
         let r = dist::compute_with_gaps("AAPL", &bars, Timeframe::D1, Window::All, "unit", None, &[gap]).unwrap();
         let ctx = egui::Context::default();
-        let mut output = ctx.run_ui(Default::default(), |ui| report_view(ui, r_id(), &r, &mut 5));
+        let mut output = ctx.run_ui(Default::default(), |ui| report_view(ui, r_id(), &r, &mut 5, false));
         output.textures_delta.clear();
         assert!(format!("{:?}", output.shapes).contains("UNVERIFIED JOIN"));
         let clean = dist::compute("AAPL", &bars, Timeframe::D1, Window::All, "unit", None).unwrap();
-        let mut output = ctx.run_ui(Default::default(), |ui| report_view(ui, r_id(), &clean, &mut 5));
+        let mut output = ctx.run_ui(Default::default(), |ui| report_view(ui, r_id(), &clean, &mut 5, false));
         output.textures_delta.clear();
         assert!(!format!("{:?}", output.shapes).contains("UNVERIFIED JOIN"));
     }

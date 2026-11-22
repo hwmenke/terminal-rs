@@ -372,6 +372,33 @@ fn lab_missing_factor_not_dropped() {
 }
 
 #[test]
+fn lab_receipts_stay_paired_with_their_symbols_when_a_factor_fails() {
+    use crate::source_receipt::SourceReceipt;
+    let n = 200;
+    let (t, f) = related(n, 0.8, 6);
+    let with = |mut r: NamedBars, id: &str, bars: usize| {
+        r.receipt = Some(SourceReceipt::new(id, bars, Some(T0)));
+        r
+    };
+    let target = with(named(TGT, &days(n), &t), "yahoo", n);
+    let good = with(named(F1, &days(n), &f), "archive", n);
+    let mut failed = with(named(F2, &days(n), &walk(n, 9)), "whats-news", 7);
+    failed.error = Some("no archive".into());
+    let spec = LabSpec {
+        factors: vec![
+            FactorSpec::new(F2, Transform::LogReturn { h: 1 }, 0),
+            FactorSpec::new(F1, Transform::LogReturn { h: 1 }, 0),
+        ],
+        ..Default::default()
+    };
+    // The failed factor comes first: positional receipts would label "archive" as F2.
+    let r = compute(&target, &[failed, good], &spec, Timeframe::D1, true, "unit", 0, None, 1);
+    let pairs: Vec<(&str, &str)> =
+        r.source_receipts.iter().map(|(s, c)| (s.as_str(), c.provider_id.as_str())).collect();
+    assert_eq!(pairs, vec![(TGT, "yahoo"), (F1, "archive")]);
+}
+
+#[test]
 fn lab_key_changes_on_old_bar_correction() {
     let n = 120;
     let (target, factor) = rel_rows(n, 0.8, 2);

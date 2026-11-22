@@ -128,6 +128,9 @@ pub struct StatsReport {
     pub ticker: String,
     pub provenance: Provenance,
     pub source: String,
+    /// Structured source receipt (display only; set by the worker).
+    #[serde(default)]
+    pub source_receipt: Option<crate::source_receipt::SourceReceipt>,
     pub as_of: String,
     pub start: String,
     pub end: String,
@@ -903,6 +906,7 @@ pub fn compute_stats(
         ticker: ticker.into(),
         provenance,
         source: provenance.source_label(source).into(),
+        source_receipt: None,
         as_of: bars.last().map(|b| bar_date(b.ts)).unwrap_or_default(),
         start: bars.first().map(|b| bar_date(b.ts)).unwrap_or_default(),
         end: bars.last().map(|b| bar_date(b.ts)).unwrap_or_default(),

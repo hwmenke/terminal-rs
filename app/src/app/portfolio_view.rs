@@ -380,9 +380,9 @@ fn toolbar(
                 {
                     out.push(PortAction::TradingSettings);
                 }
-                ui.label(RichText::new("Paper trading · virtual cash").font(ui_font(11.0)).color(muted()));
+                ui.label(RichText::new("virtual cash").font(ui_font(11.0)).color(muted()));
                 super::trading::mode_badge(ui, false)
-                    .on_hover_text("The demo account is selected. Switch to live accounts from the toolbar badge.");
+                    .on_hover_text("The paper-trading account is selected. Switch to live accounts in Trading settings (gear) or with MODE LIVE.");
             });
             return;
         }

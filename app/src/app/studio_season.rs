@@ -228,14 +228,14 @@ pub(super) fn show(
                     ui.label(r.or_unavailable.as_deref().unwrap_or("OR Lens unavailable"));
                 }
             } else {
-                report_view(ui, id, r);
+                report_view(ui, id, r, embedded);
             }
         });
     }
     vec![]
 }
 
-fn report_view(ui: &mut Ui, id: PaneId, r: &SeasonReport) {
+fn report_view(ui: &mut Ui, id: PaneId, r: &SeasonReport, embedded: bool) {
     super::studio_dist::gap_warning(ui, &r.gaps);
     ui.label(
         RichText::new(format!(
@@ -250,15 +250,17 @@ fn report_view(ui: &mut Ui, id: PaneId, r: &SeasonReport) {
         .font(theme::mono(11.0))
         .color(theme::muted()),
     );
-    ui.label(
-        RichText::new(format!(
-            "{} · observed {} UTC",
-            r.source,
-            chrono::DateTime::from_timestamp(r.observed_at, 0).unwrap_or_default().format("%Y-%m-%d %H:%M")
-        ))
-        .font(theme::mono(10.5))
-        .color(theme::muted()),
-    );
+    // Hosted in the Studio, the header already carries the chip.
+    if !embedded {
+        let parts = crate::widgets::chip_one(&r.symbol, &r.source_receipt);
+        crate::widgets::source_chip(ui, "", &parts, || {
+            format!(
+                "{} · observed {} UTC",
+                r.source,
+                chrono::DateTime::from_timestamp(r.observed_at, 0).unwrap_or_default().format("%Y-%m-%d %H:%M")
+            )
+        });
+    }
     ui.label(
         RichText::new(format!(
             "Grey = small sample (n < {MIN_N}) or incomplete. Calendar buckets use New York exchange dates. \
@@ -923,7 +925,7 @@ mod tests {
         // No forward window crosses the gap: only same-session windows remain.
         assert_eq!(r.forwards[0].baseline.count, 2 * (13 - 5));
         let ctx = egui::Context::default();
-        let mut output = ctx.run_ui(Default::default(), |ui| report_view(ui, 1, &r));
+        let mut output = ctx.run_ui(Default::default(), |ui| report_view(ui, 1, &r, false));
         output.textures_delta.clear();
         assert!(format!("{:?}", output.shapes).contains("UNVERIFIED JOIN"));
     }

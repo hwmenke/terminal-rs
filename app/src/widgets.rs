@@ -6,6 +6,11 @@ use egui::{
     vec2,
 };
 
+mod analysis;
+mod numeric_table;
+pub use analysis::*;
+pub use numeric_table::*;
+
 use crate::anim;
 use crate::theme::{self, ui_font};
 
@@ -584,6 +589,8 @@ pub enum Icon {
     Plus,
     More,
     Gear,
+    /// A painted cross for remove/dismiss (the `✕` glyph is missing from some UI fonts).
+    Close,
 }
 
 /// Draw a simple line icon centred in `r`.
@@ -697,6 +704,10 @@ pub fn draw_icon(p: &egui::Painter, r: Rect, icon: Icon, color: Color32) {
                 );
             }
             p.circle_stroke(c, 4.6 * u, s);
+        }
+        Icon::Close => {
+            p.line_segment([pt(-4.5, -4.5), pt(4.5, 4.5)], s);
+            p.line_segment([pt(-4.5, 4.5), pt(4.5, -4.5)], s);
         }
         Icon::Star => {
             let pts: Vec<Pos2> = (0..=10)
@@ -1157,5 +1168,98 @@ pub fn seq_key(p: &egui::Painter, at: Pos2, labels: &[&str]) {
         p.rect_filled(Rect::from_min_size(pos2(x, at.y + 2.), vec2(9., 8.)), 0., seq_ramp(i + 1));
         p.text(pos2(x + 12., at.y), Align2::LEFT_TOP, *label, theme::mono(9.), theme::muted());
         x += 12. + label.len() as f32 * 5.5 + 8.;
+    }
+}
+
+// ---- source chip ------------------------------------------------------------------------------
+
+/// One series' label (raw symbol) paired with its structured receipt. Label and receipt always
+/// travel together, so filtering can never shift a receipt onto another ticker.
+pub type ChipPart<'a> = (&'a str, &'a tr_data::source_receipt::SourceReceipt);
+
+/// Borrowed `(label, receipt)` parts from owned pairs (no clones).
+pub fn chip_parts(pairs: &[(String, tr_data::source_receipt::SourceReceipt)]) -> Vec<ChipPart<'_>> {
+    pairs.iter().map(|(l, r)| (l.as_str(), r)).collect()
+}
+
+/// Positional receipts with their labels; a missing receipt drops its own label with it.
+pub fn chip_parts_opt<'a>(
+    labels: &[&'a str],
+    receipts: &'a [Option<tr_data::source_receipt::SourceReceipt>],
+) -> Vec<ChipPart<'a>> {
+    labels.iter().zip(receipts).filter_map(|(l, r)| r.as_ref().map(|r| (*l, r))).collect()
+}
+
+/// A single structured receipt as one part.
+pub fn chip_one<'a>(label: &'a str, r: &'a Option<tr_data::source_receipt::SourceReceipt>) -> Vec<ChipPart<'a>> {
+    r.iter().map(|r| (label, r)).collect()
+}
+
+/// Chip line for a research pane: the first series' receipt (the target's own bar
+/// count, not an aligned sample size) plus `+N series` for the others.
+pub fn source_chip_text(parts: &[ChipPart]) -> Option<String> {
+    parts.first().map(|(_, r)| r.chip_with(parts.len() - 1))
+}
+
+/// Hover/Inspector text: every series' full receipt, including failed earlier attempts.
+pub fn source_chip_detail(parts: &[ChipPart], legacy: &str) -> String {
+    if parts.is_empty() {
+        return legacy.to_string();
+    }
+    parts
+        .iter()
+        .map(|(l, r)| if l.is_empty() { r.full() } else { format!("{}: {}", tr_data::security(l).ticker, r.full()) })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// One compact muted source line, e.g. `Yahoo · thru Nov 20 · 24,841 bars · +1 series`.
+/// The full chain (attempts, clocks, gaps) is built lazily on hover. With no structured
+/// receipt the `legacy` text (built only then) is shown truncated, never as a text wall; the
+/// full text stays on hover. `lead` only prefixes a structured chip.
+pub fn source_chip(ui: &mut Ui, lead: &str, parts: &[ChipPart], legacy: impl FnOnce() -> String) -> Response {
+    let (text, legacy) = match source_chip_text(parts) {
+        Some(body) => (if lead.is_empty() { body } else { format!("{lead} · {body}") }, String::new()),
+        None => {
+            let legacy = legacy();
+            let head: String = legacy.chars().take(48).collect();
+            (if head.len() < legacy.len() { format!("{head}…") } else { head }, legacy)
+        }
+    };
+    ui.add(egui::Label::new(egui::RichText::new(text).font(theme::mono(10.)).color(theme::muted())).truncate())
+        .on_hover_ui(|ui| {
+            ui.label(source_chip_detail(parts, &legacy));
+        })
+}
+
+#[cfg(test)]
+mod source_chip_tests {
+    use super::*;
+    use tr_data::source_receipt::SourceReceipt;
+    #[test]
+    fn chip_is_one_line_and_hover_keeps_chain() {
+        let mut a = SourceReceipt::new("yahoo", 24_841, Some(1_763_596_800));
+        a.attempts = vec!["Local research archive: no daily history".into(), "Whats-News: offline".into()];
+        let b = SourceReceipt::new("yahoo", 9_000, Some(1_763_596_800));
+        let parts = [("AAPL", &a), ("SPY", &b)];
+        let text = source_chip_text(&parts).unwrap();
+        assert!(text.starts_with("Yahoo · thru Nov 20") && text.contains("24,841 bars") && text.ends_with("+1 series"));
+        assert!(!text.contains("archive") && !text.contains('\n'));
+        let hover = source_chip_detail(&parts, "legacy");
+        assert!(hover.contains("AAPL:") && hover.contains("SPY:") && hover.contains("Whats-News: offline"));
+        assert_eq!(source_chip_detail(&[], "legacy text"), "legacy text");
+        assert!(source_chip_text(&[]).is_none());
+    }
+    #[test]
+    fn missing_receipt_drops_its_own_label_not_the_neighbours() {
+        let bench = SourceReceipt::new("whats-news", 3_000, Some(1_763_596_800));
+        let recs = [None, Some(bench)];
+        let parts = chip_parts_opt(&["AAPL", "SPY"], &recs);
+        assert_eq!(parts.len(), 1);
+        assert_eq!(parts[0].0, "SPY");
+        let hover = source_chip_detail(&parts, "legacy");
+        assert!(hover.starts_with("SPY:") && !hover.contains("AAPL"), "{hover}");
+        // The chip shows the benchmark's own count; nothing is relabelled as the asset.
+        assert!(source_chip_text(&parts).unwrap().contains("3,000 bars"));
     }
 }

@@ -443,6 +443,17 @@ pub fn ui_font(size: f32) -> FontId {
 pub const CARD_RADIUS: u8 = 10;
 pub const CONTROL_RADIUS: u8 = 6;
 
+/// One spacing scale (points) shared by headers, cards, chips and empty states.
+pub const SP_XS: f32 = 4.0;
+pub const SP_S: f32 = 6.0;
+pub const SP_M: f32 = 8.0;
+pub const SP_L: f32 = 12.0;
+pub const SP_XL: f32 = 16.0;
+/// Predictable control height for header actions, pickers and chip rows.
+pub const CONTROL_H: f32 = 24.0;
+/// Minimum height of a pane-level state card so loading → result does not jump.
+pub const STATE_CARD_H: f32 = 132.0;
+
 /// Use the system UI fonts when present (read from the OS at runtime, not bundled).
 fn install_fonts(ctx: &egui::Context, mono: MonoFont) {
     if FONTS.with(Cell::get) == Some(mono) {

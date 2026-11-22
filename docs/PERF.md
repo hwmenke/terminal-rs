@@ -1028,3 +1028,26 @@ kept as a `#[cfg(test)]` reference). F2(c) (fast Theil–Sen) was not needed: `c
 over 70% headroom. The `paint.studio_corr` “before” values are from the slice 3 PERF notes; no
 A/B build of the base was run for tess/total. No budget or baseline was edited, except the
 new-case budgets added above.
+
+## UX cleanup slice 3 — shared pane chrome and sidebar
+
+New absolute paint cases (new entries only; no existing budget, workload or `perf/baseline.json` entry changed;
+they report as New until a baseline is recorded). Both assert meaningful work at frame 60.
+
+* `paint.studio_pane_chrome.steady.{ui,tess,total}` — twelve `pane_header`s with a source chip, all `analysis_state`
+  cards (Loading / Choose / No results / Unavailable / Previous snapshot / Failed), the ticker chooser and the
+  run-state ladder. Asserts every state label, 12 chips, the chooser and both retained-snapshot banners.
+* `paint.studio_sidebar.steady.{ui,tess,total}` — the real sidebar (test app, Studio focused on the When lens, 12
+  watchlist names). Asserts the Research/Sessions/Markets/Trading sections, "Add cash levels to chart", no `PDF`
+  mnemonic, and that exactly the When row is active.
+
+| Metric (µs, median) | Measured | Budget |
+| --- | ---: | ---: |
+| `paint.studio_pane_chrome.steady.ui` | 137.7 | 1000 |
+| `paint.studio_pane_chrome.steady.tess` | 73.9 | 500 |
+| `paint.studio_pane_chrome.steady.total` | 214.1 | 1500 |
+| `paint.studio_sidebar.steady.ui` | 81.1 | 800 |
+| `paint.studio_sidebar.steady.tess` | 52.5 | 500 |
+| `paint.studio_sidebar.steady.total` | 133.7 | 1200 |
+
+The slice's logic lives in the app crate (not reachable from `crates/perf`), so there is no new compute-suite case.

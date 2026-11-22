@@ -133,6 +133,7 @@ struct Loaded {
     source: String,
     gaps: Vec<(i64, i64)>,
     observed_at: Option<i64>,
+    receipt: Option<tr_data::source_receipt::SourceReceipt>,
 }
 
 /// Successful real-data loads keyed by (symbol, interval). Failures are never
@@ -208,7 +209,18 @@ where
                 tr_data::stats::require_research_bars(&bars, "Relationship research").map_err(anyhow::Error::msg)?;
                 let n = tr_data::closed::closed_len(tf, &bars, tr_data::security(&key).class, info.fetched_at);
                 bars.truncate(n);
-                Ok(Loaded { bars, source: if tf == Timeframe::D1 { info.source.clone() } else { info.label() }, gaps: info.gaps, observed_at: info.fetched_at })
+                let source = if tf == Timeframe::D1 { info.source.clone() } else { info.label() };
+                let receipt = info.receipt.clone().or_else(|| {
+                    let mut r = tr_data::source_receipt::SourceReceipt::new(
+                        &info.source,
+                        bars.len(),
+                        bars.last().map(|b| b.ts),
+                    );
+                    r.observed_at = info.fetched_at;
+                    r.detail = source.clone();
+                    (!r.provider_id.is_empty()).then_some(r)
+                });
+                Ok(Loaded { bars, source, gaps: info.gaps, observed_at: info.fetched_at, receipt })
             });
             if let Ok(loaded) = &result {
                 cache.put(key.clone(), tf, loaded.clone(), generation);
@@ -221,8 +233,8 @@ where
     loaded
         .into_iter()
         .map(|(key, result)| match result {
-            Ok(Loaded { bars, source, gaps, observed_at }) => {
-                (NamedBars { symbol: key, bars, source, error: None, gaps }, observed_at)
+            Ok(Loaded { bars, source, gaps, observed_at, receipt }) => {
+                (NamedBars { symbol: key, bars, source, error: None, gaps, receipt }, observed_at)
             }
             // A failed ticker is listed as unavailable; never substituted.
             Err(e) => (NamedBars { symbol: key, error: Some(format!("{e:#}")), ..Default::default() }, None),
@@ -613,7 +625,10 @@ fn render(ui: &mut Ui, r: &CorrReport) {
         .font(theme::mono(11.0))
         .color(theme::muted()),
     )
-    .on_hover_text(&r.source);
+    .on_hover_ui(|ui| {
+        let parts = crate::widgets::chip_parts_opt(&[r.symbol.as_str(), r.benchmark.as_str()], &r.receipts);
+        ui.label(crate::widgets::source_chip_detail(&parts, &r.source));
+    });
     ui.label(
         RichText::new(format!(
             "{} common / {} asset / {} benchmark price bars",
@@ -1889,7 +1904,7 @@ mod cache_v2_tests {
     #[test]
     fn archive_invalidation_rejects_inflight_old_generation() {
         let cache = super::CorrCache::default();
-        let row = super::Loaded { bars: vec![], source: "archive".into(), gaps: vec![], observed_at: None };
+        let row = super::Loaded { bars: vec![], source: "archive".into(), gaps: vec![], observed_at: None, receipt: None };
         cache.put("AAPL".into(), Timeframe::D1, row.clone(), 0);
         assert!(cache.get("AAPL", Timeframe::D1).is_some());
         cache.invalidate();

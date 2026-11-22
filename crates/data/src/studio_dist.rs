@@ -134,6 +134,8 @@ pub struct Report {
     pub regime: crate::studio_regime::RegimeFingerprints,
     pub symbol: String,
     pub source: String,
+    /// Structured source receipt (display only; set by the worker, not part of any cache key).
+    pub source_receipt: Option<crate::source_receipt::SourceReceipt>,
     pub provenance: Provenance,
     pub timeframe: Timeframe,
     pub window: Window,
@@ -357,6 +359,7 @@ pub fn compute_with_gaps(
         regime: crate::studio_regime::fingerprints(&[], &[], hash.finish()),
         symbol: symbol.into(),
         source: source.into(),
+        source_receipt: None,
         provenance: Bar::provenance(bars),
         timeframe: tf,
         window,

@@ -9,6 +9,7 @@ use egui::{
     Ui, UiBuilder, ViewportCommand, pos2, vec2,
 };
 
+use super::nav::NavDest;
 use super::{PaneKind, TerminalApp};
 use crate::anim;
 use crate::command::{self, Function};
@@ -115,29 +116,13 @@ impl TerminalApp {
         ui.interact(chip, Id::new("source-chip"), Sense::hover()).on_hover_text(self.provider_label());
         x = chip.right() + 8.0;
 
-        // Which account trades: DEMO (paper) or LIVE (real money, in red). Click to switch.
-        let live_mode = !self.demo_mode();
-        let (label, fill) = if live_mode { ("LIVE", theme::down()) } else { ("DEMO", theme::accent()) };
-        let badge_text = p.layout_no_wrap(label.into(), mono(11.0), Color32::WHITE);
-        let badge = Rect::from_min_size(pos2(x, cy - 10.0), vec2(badge_text.size().x + 18.0, 20.0));
-        let resp = ui.interact(badge, Id::new("account-mode-badge"), Sense::click());
-        let fill = if resp.hovered() { fill } else { fill.gamma_multiply(0.9) };
-        p.rect_filled(badge, 10.0, fill);
-        p.galley(badge.center() - badge_text.size() / 2.0, badge_text, Color32::WHITE);
-        let tip = if live_mode {
-            "LIVE: portfolio panes and orders use your real brokerage accounts. Click to switch to the demo account."
-        } else {
-            "DEMO: paper trading with virtual cash. Click to switch to your live brokerage accounts."
-        };
-        if resp.on_hover_text(tip).clicked() {
-            let next = if live_mode { crate::prefs::AccountMode::Demo } else { crate::prefs::AccountMode::Live };
-            self.set_account_mode(next, false);
-        }
-        if live_mode {
-            // A red rule along the toolbar so live mode is never mistaken for the demo.
+        // The account mode (paper trading / LIVE) is an execution setting, not a data mode: it
+        // is shown only in Portfolio and order-entry panes. Real-money mode keeps a red rule
+        // along the toolbar as a safety cue; paper trading shows nothing here.
+        if !self.demo_mode() {
             p.hline(rect.x_range(), rect.bottom() - 1.0, Stroke::new(2.0, theme::down()));
         }
-        x = badge.right() + 10.0;
+        x += 2.0;
 
         // Right-hand cluster, laid out from the right edge: one-line clock (UTC on hover).
         let now = chrono::Local::now();
@@ -561,42 +546,53 @@ impl TerminalApp {
         child.set_clip_rect(body.intersect(ui.clip_rect()));
         egui::ScrollArea::vertical().auto_shrink([false, false]).show(&mut child, |ui| {
             ui.spacing_mut().item_spacing.y = 1.0;
-            let focused = self.idx(self.focus).map(|i| self.panes[i].kind.panel_type());
-            let is_focused = |k: &PaneKind| focused == Some(k.panel_type());
-
             section(ui, "Watchlist");
+            // Provenance is stated once for the list; a row only repeats it when it differs.
+            let shared = shared_provenance(self.watchlist.iter().filter_map(|k| self.quotes.get(k)).map(|q| q.provenance));
+            if let Some((p, n)) = shared {
+                ui.label(
+                    egui::RichText::new(format!("{} · {n} quote{}", p.label(), if n == 1 { "" } else { "s" }))
+                        .font(mono(10.0))
+                        .color(theme::provenance(p)),
+                );
+            }
             let mut remove = None;
             for key in &self.watchlist {
                 let sec = tr_data::security(key);
-                let (r, resp) = ui.allocate_exact_size(vec2(ui.available_width(), dp(38.0)), Sense::click());
+                let provenance = self.quotes.get(key).map(|q| q.provenance);
+                let exception = provenance.is_some_and(|p| shared.is_some_and(|(s, _)| s != p));
+                let dy = if exception { dp(6.0) } else { 0.0 };
+                let h = if exception { dp(38.0) } else { dp(28.0) };
+                let (r, resp) = ui.allocate_exact_size(vec2(ui.available_width(), h), Sense::click());
                 widgets::hover_wash(ui, r, &resp, false);
                 let pt = ui.painter();
                 pt.text(
-                    pos2(r.left() + 8.0, r.center().y - dp(6.0)),
+                    pos2(r.left() + 8.0, r.center().y - dy),
                     Align2::LEFT_CENTER,
                     &sec.ticker,
                     mono(12.0),
                     text(),
                 );
-                let provenance = self.quotes.get(key).map(|q| q.provenance).unwrap_or_default();
-                pt.text(
-                    pos2(r.left() + 8.0, r.bottom() - 1.0),
-                    Align2::LEFT_BOTTOM,
-                    provenance.label(),
-                    mono(10.0),
-                    theme::provenance(provenance),
-                );
+                if let (true, Some(p)) = (exception, provenance) {
+                    pt.text(
+                        pos2(r.left() + 8.0, r.bottom() - 1.0),
+                        Align2::LEFT_BOTTOM,
+                        p.label(),
+                        mono(10.0),
+                        theme::provenance(p),
+                    );
+                }
                 if let Some(q) = self.quotes.get(key) {
                     let up = q.change() >= 0.0;
                     let c = if up { theme::up() } else { theme::down() };
                     let pct = format!("{:+.2}%", q.change_pct());
                     let pill =
-                        Rect::from_min_size(pos2(r.right() - 62.0, r.center().y - dp(6.0) - 8.0), vec2(58.0, 16.0));
+                        Rect::from_min_size(pos2(r.right() - 62.0, r.center().y - dy - 8.0), vec2(58.0, 16.0));
                     pt.rect_filled(pill, 4.0, c.gamma_multiply(0.16));
                     pt.text(pill.right_center() - vec2(5.0, 0.0), Align2::RIGHT_CENTER, pct, mono(11.0), c);
                     let d = sec.decimals(q.last);
                     pt.text(
-                        pos2(pill.left() - 8.0, r.center().y - dp(6.0)),
+                        pos2(pill.left() - 8.0, r.center().y - dy),
                         Align2::RIGHT_CENTER,
                         format!("{:.d$}", q.last),
                         mono(11.5),
@@ -604,7 +600,7 @@ impl TerminalApp {
                     );
                 } else {
                     pt.text(
-                        pos2(r.right() - 8.0, r.center().y - dp(6.0)),
+                        pos2(r.right() - 8.0, r.center().y - dy),
                         Align2::RIGHT_CENTER,
                         sec.class.yellow_key().label(),
                         ui_font(10.5),
@@ -641,294 +637,29 @@ impl TerminalApp {
                 }
                 self.watchlists_changed();
             }
-            if nav_row(ui, Icon::List, "Open Watchlist Pane", None, is_focused(&PaneKind::Watchlist)).clicked() {
-                out.push(SidebarCmd::Function(Function::Watchlist));
-            }
-            if nav_row(
-                ui,
-                Icon::Chart,
-                "Studio",
-                Some("STUDIO"),
-                self.panes.iter().any(|p| p.id == self.focus && matches!(p.kind, PaneKind::Studio(_))),
-            )
-            .clicked()
-            {
-                out.push(SidebarCmd::Function(Function::Studio { spec: String::new() }));
-            }
-            if nav_row(ui,Icon::Chart,"Quick canvas",Some("QUICK"),false).clicked(){out.push(SidebarCmd::Function(Function::StudioQuick {spec:String::new()}));}
-            if nav_row(ui, Icon::Chart, "When", Some("WHEN"), false).clicked() {
-                out.push(SidebarCmd::Function(Function::StudioWhen { spec: String::new() }));
-            }
-            if nav_row(ui, Icon::Chart, "Regression Lab", Some("STUDIO lab"), false).clicked() {
-                out.push(SidebarCmd::Function(Function::StudioRoute(tr_data::studio::StudioRoute::Lab)));
-            }
-            if nav_row(ui, Icon::Chart, "Residual tickers", Some("STUDIO resid"), false).clicked() {
-                out.push(SidebarCmd::Function(Function::StudioRoute(tr_data::studio::StudioRoute::Resid)));
-            }
-            if nav_row(ui, Icon::Chart, "Attribution", Some("STUDIO attr"), false).clicked() {
-                out.push(SidebarCmd::Function(Function::StudioRoute(tr_data::studio::StudioRoute::Attr)));
-            }
-            if nav_row(
-                ui,
-                Icon::Gauge,
-                "Statistics",
-                Some("STATS"),
-                is_focused(&PaneKind::Stats(Box::new(super::stats::StatsPane::new(
-                    String::new(),
-                    String::new(),
-                    false,
-                )))),
-            )
-            .clicked()
-            {
-                out.push(SidebarCmd::Function(Function::Stats { condition: String::new(), conditional: false }));
-            }
-            if nav_row(
-                ui,
-                Icon::Chart,
-                "Backtest",
-                Some("BT"),
-                is_focused(&PaneKind::Backtest(Box::new(super::backtest::BacktestPane::new(
-                    String::new(),
-                    String::new(),
-                )))),
-            )
-            .clicked()
-            {
-                out.push(SidebarCmd::Function(Function::Backtest { spec: String::new() }));
-            }
-            if nav_row(
-                ui,
-                Icon::Chart,
-                "Intraday BT",
-                Some("IBT"),
-                is_focused(&PaneKind::Backtest(Box::new(super::backtest::BacktestPane::intraday(
-                    String::new(),
-                    String::new(),
-                )))),
-            )
-            .clicked()
-            {
-                out.push(SidebarCmd::Function(Function::IntradayBacktest { spec: String::new() }));
-            }
-            if nav_row(
-                ui,
-                Icon::Chart,
-                "Session compare",
-                Some("ICMP"),
-                is_focused(&PaneKind::IntradayCompare(Box::new(super::compare::ComparePane::new(
-                    String::new(),
-                    String::new(),
-                )))),
-            )
-            .clicked()
-            {
-                out.push(SidebarCmd::Function(Function::IntradayCompare { spec: String::new() }));
-            }
-            if nav_row(
-                ui,
-                Icon::Chart,
-                "Session path",
-                Some("SPATH"),
-                is_focused(&PaneKind::SessionPath(Box::new(super::session_path::SessionPathPane::new(
-                    String::new(),
-                    String::new(),
-                )))),
-            )
-            .clicked()
-            {
-                out.push(SidebarCmd::Function(Function::SessionPath { spec: String::new() }));
-            }
-            if nav_row(
-                ui,
-                Icon::Chart,
-                "Session breadth",
-                Some("BRD"),
-                is_focused(&PaneKind::Breadth(Box::new(super::session_breadth::BreadthPane::new(String::new())))),
-            )
-            .clicked()
-            {
-                out.push(SidebarCmd::Function(Function::Breadth { spec: String::new() }));
-            }
-            if nav_row(
-                ui,
-                Icon::Chart,
-                "Trend Wall",
-                Some("TWALL"),
-                is_focused(&PaneKind::TrendWall(Box::new(super::trend_wall::TrendWallPane::new("")))),
-            )
-            .clicked()
-            {
-                out.push(SidebarCmd::Function(Function::TrendWall { spec: String::new() }));
-            }
-            if nav_row(
-                ui,
-                Icon::Chart,
-                "Rotation",
-                Some("RRG"),
-                is_focused(&PaneKind::Rotation(Box::new(super::rotation::RotationPane::new("")))),
-            )
-            .clicked()
-            {
-                out.push(SidebarCmd::Function(Function::Rotation { spec: String::new() }));
-            }
-            if nav_row(
-                ui,
-                Icon::Chart,
-                "Volume pace",
-                Some("VPACE"),
-                is_focused(&PaneKind::VolumePace(Box::new(super::volume_pace::VolumePacePane::new(
-                    String::new(),
-                    String::new(),
-                )))),
-            )
-            .clicked()
-            {
-                out.push(SidebarCmd::Function(Function::VolumePace { spec: String::new() }));
-            }
-            if nav_row(
-                ui,
-                Icon::Chart,
-                "Gap fill",
-                Some("GFILL"),
-                is_focused(&PaneKind::GapFill(Box::new(super::gap_fill::GapFillPane::new(
-                    String::new(),
-                    String::new(),
-                )))),
-            )
-            .clicked()
-            {
-                out.push(SidebarCmd::Function(Function::GapFill { spec: String::new() }));
-            }
-            if nav_row(
-                ui,
-                Icon::Chart,
-                "Session extreme",
-                Some("XTRM"),
-                is_focused(&PaneKind::SessionExtreme(Box::new(super::session_extreme::SessionExtremePane::new(
-                    String::new(),
-                    String::new(),
-                )))),
-            )
-            .clicked()
-            {
-                out.push(SidebarCmd::Function(Function::SessionExtreme { spec: String::new() }));
-            }
-            if nav_row(
-                ui,
-                Icon::Chart,
-                "Session Clock",
-                Some("CLOCK"),
-                is_focused(&PaneKind::SessionClock(Box::new(super::session_clock::SessionClockPane::new(
-                    String::new(),
-                    String::new(),
-                )))),
-            )
-            .clicked()
-            {
-                out.push(SidebarCmd::Function(Function::SessionClock { spec: String::new() }));
-            }
-            if nav_row(
-                ui,
-                Icon::Chart,
-                "Relative path",
-                Some("RPATH"),
-                is_focused(&PaneKind::RelativePath(Box::new(super::relative_path::RelativePathPane::new(
-                    String::new(),
-                    String::new(),
-                )))),
-            )
-            .clicked()
-            {
-                out.push(SidebarCmd::Function(Function::RelativePath { spec: String::new() }));
-            }
-            if nav_row(
-                ui,
-                Icon::Chart,
-                "Session brief",
-                Some("BRIEF"),
-                is_focused(&PaneKind::SessionBrief(Box::new(super::session_brief::SessionBriefPane::new(
-                    String::new(),
-                )))),
-            )
-            .clicked()
-            {
-                out.push(SidebarCmd::Function(Function::SessionBrief));
-            }
-            if nav_row(ui, Icon::Chart, "Cash levels", Some("MARKS"), false).clicked() {
-                out.push(SidebarCmd::Function(Function::CashLevels));
-            }
-            if nav_row(
-                ui,
-                Icon::Search,
-                "Lookalikes",
-                Some("KNN"),
-                is_focused(&PaneKind::Lookalike(Box::new(super::lookalike::LookalikePane::new(
-                    String::new(),
-                    String::new(),
-                )))),
-            )
-            .clicked()
-            {
-                out.push(SidebarCmd::Function(Function::Lookalike { spec: String::new() }));
-            }
-            if nav_row(
-                ui,
-                Icon::Grid,
-                "PM Desk",
-                Some("DESK"),
-                is_focused(&PaneKind::Desk(Box::new(super::desk::DeskPane::new(String::new())))),
-            )
-            .clicked()
-            {
-                out.push(SidebarCmd::Function(Function::Desk));
-            }
-            let journal_badge = (self.journal.open_count() > 0).then(|| self.journal.open_count().to_string());
-            if nav_row(
-                ui,
-                Icon::List,
-                "Journal",
-                journal_badge.as_deref().or(Some("JRNL")),
-                is_focused(&PaneKind::Journal(Box::new(super::journal::JournalPane::new(String::new())))),
-            )
-            .clicked()
-            {
-                out.push(SidebarCmd::Function(Function::Journal(String::new())));
-            }
+            // Selection comes from the exact focused screen (kind, Studio lens, Quick flag).
+            let focused_kind = self.idx(self.focus).map(|i| &self.panes[i].kind);
+            let lit: Vec<NavDest> =
+                NavDest::ALL.into_iter().filter(|d| d.active(focused_kind, self.settings_tab)).collect();
+            dest_row(ui, NavDest::Watchlist, None, &lit, &mut out);
 
+            section(ui, "Research");
+            for d in NavDest::RESEARCH {
+                dest_row(ui, d, None, &lit, &mut out);
+            }
+            section(ui, "Sessions");
+            for d in NavDest::SESSIONS {
+                dest_row(ui, d, None, &lit, &mut out);
+            }
             section(ui, "Markets");
-            let items = [
-                (
-                    Icon::List,
-                    "Price history",
-                    "HIST",
-                    Function::History(String::new()),
-                    PaneKind::Research(Box::new(super::research::ResearchPane::price_history())),
-                ),
-                (Icon::Globe, "World Markets", "WEI", Function::Wei, PaneKind::Wei),
-                (Icon::Curve, "Yield Curve", "GC", Function::Curve, PaneKind::Curve),
-                (
-                    Icon::Chart,
-                    "Options",
-                    "OMON",
-                    Function::Options,
-                    PaneKind::Options(Box::new(super::OptionsPane::new("", 0, true))),
-                ),
-                (
-                    Icon::Search,
-                    "Security Search",
-                    "SECF",
-                    Function::Search(String::new()),
-                    PaneKind::Search { query: String::new() },
-                ),
-            ];
-            for (icon, label, code, f, kind) in items {
-                if nav_row(ui, icon, label, Some(code), is_focused(&kind)).clicked() {
-                    out.push(SidebarCmd::Function(f));
-                }
+            for d in NavDest::MARKETS {
+                dest_row(ui, d, None, &lit, &mut out);
             }
 
-            section(ui, "Portfolio");
+            section(ui, "Trading");
+            dest_row(ui, NavDest::Desk, None, &lit, &mut out);
+            let journal_badge = (self.journal.open_count() > 0).then(|| self.journal.open_count().to_string());
+            dest_row(ui, NavDest::Journal, journal_badge.as_deref(), &lit, &mut out);
             let focused_view = self.idx(self.focus).and_then(|i| match &self.panes[i].kind {
                 PaneKind::Portfolio(pp) => Some(pp.view),
                 _ => None,
@@ -965,26 +696,10 @@ impl TerminalApp {
 
             section(ui, "Congress");
             let unread = self.unread_alerts();
-            if nav_row(
-                ui,
-                Icon::List,
-                "Latest Trades",
-                Some("CONG"),
-                is_focused(&PaneKind::Feed { filter: Default::default() }),
-            )
-            .clicked()
-            {
-                out.push(SidebarCmd::Function(Function::Congress));
-            }
-            if nav_row(ui, Icon::People, "Politicians", Some("POL"), is_focused(&PaneKind::Politicians)).clicked() {
-                out.push(SidebarCmd::Function(Function::Politician(String::new())));
-            }
+            dest_row(ui, NavDest::Feed, None, &lit, &mut out);
+            dest_row(ui, NavDest::Politicians, None, &lit, &mut out);
             let badge = (unread > 0).then(|| unread.to_string());
-            if nav_row(ui, Icon::Bell, "Alerts", badge.as_deref().or(Some("ALRT")), is_focused(&PaneKind::Alerts))
-                .clicked()
-            {
-                out.push(SidebarCmd::Function(Function::Alerts));
-            }
+            dest_row(ui, NavDest::Alerts, badge.as_deref(), &lit, &mut out);
             let tracked: Vec<_> = self.politicians.iter().filter(|s| s.tracked).collect();
             if !tracked.is_empty() {
                 section(ui, "Tracked");
@@ -1021,12 +736,8 @@ impl TerminalApp {
             self.sidebar_layouts(ui, &mut out);
 
             section(ui, "More");
-            if nav_row(ui, Icon::Gear, "Settings", Some("PDF"), is_focused(&PaneKind::Settings)).clicked() {
-                out.push(SidebarCmd::Function(Function::Settings));
-            }
-            if nav_row(ui, Icon::Star, "Commands & Hotkeys", Some("HELP"), is_focused(&PaneKind::Help)).clicked() {
-                out.push(SidebarCmd::Function(Function::Help));
-            }
+            dest_row(ui, NavDest::Settings, None, &lit, &mut out);
+            dest_row(ui, NavDest::Help, None, &lit, &mut out);
             ui.add_space(12.0);
         });
         out
@@ -1106,6 +817,24 @@ impl TerminalApp {
         }
     }
 
+    /// True when the focused pane's own result failed because the daily resolver's Whats-News stage
+    /// was unreachable (a structured flag on the resolver error; see `daily_research`). An offline
+    /// optional service that another source covered, or an unknown ticker, does not affect it.
+    fn whats_news_affects_focus(&self) -> bool {
+        use crate::daily_research::error_needs_whats_news as needs;
+        let needs = |e: Option<&str>| e.is_some_and(needs);
+        match self.panes.iter().find(|p| p.id == self.focus).map(|p| &p.kind) {
+            Some(super::PaneKind::Studio(s)) => needs(s.lens_error()),
+            Some(super::PaneKind::StudioLab(p)) => needs(p.error.as_deref()),
+            Some(super::PaneKind::Stats(p)) => needs(p.error.as_deref()),
+            Some(super::PaneKind::StudioDist(p)) => needs(p.error.as_deref()),
+            Some(super::PaneKind::StudioSeason(p)) => needs(p.error.as_deref()),
+            Some(super::PaneKind::Rotation(p)) => needs(p.error.as_deref()),
+            Some(super::PaneKind::Backtest(p)) => needs(p.error.as_deref()),
+            _ => false,
+        }
+    }
+
     pub(super) fn status_bar(&mut self, ui: &Ui, rect: Rect) {
         let strip = Rect::from_min_max(
             pos2((rect.right() - 300.0).max(rect.left()), rect.top()),
@@ -1113,6 +842,7 @@ impl TerminalApp {
         );
         self.health_strip(ui, strip);
         let link_rect = Rect::from_min_max(rect.min, pos2(strip.left(), rect.top() + 22.0));
+        let affected = self.whats_news_affects_focus();
         let health = &self.whats_news_health;
         let label = if health.connected() {
             format!(
@@ -1124,9 +854,14 @@ impl TerminalApp {
                 if health.message.is_empty() { String::new() } else { format!(" · {}", health.message) }
             )
         } else {
-            format!("Whats-News: {} · {}", health.label(), health.message)
+            // Optional service: a short grey label that names the real state ("Disconnected" reads as
+            // offline; "Not configured" stays honest); endpoint/start-service text is on hover.
+            match health.state {
+                tr_data::whats_news::LinkState::Disconnected => "Whats-News offline".to_string(),
+                _ => format!("Whats-News: {}", health.label()),
+            }
         };
-        let color = if health.connected() && health.message.is_empty() { theme::up() } else { amber() };
+        let color = whats_news_color(health.connected(), !health.message.is_empty(), affected);
         let p = ui.painter_at(link_rect.shrink2(vec2(8.0, 0.0)));
         p.text(pos2(link_rect.left() + 10.0, link_rect.center().y), Align2::LEFT_CENTER, label, ui_font(11.5), color);
         let clicked = ui
@@ -1250,6 +985,16 @@ impl TerminalApp {
 }
 
 /// Small grey section header, as in a macOS source list.
+/// Footer Whats-News colour: green when healthy, amber for a connected-with-warning service or
+/// when an offline service actually affects the focused result, otherwise quiet grey.
+pub(super) fn whats_news_color(connected: bool, has_message: bool, affected: bool) -> egui::Color32 {
+    match (connected, has_message, affected) {
+        (true, false, _) => theme::up(),
+        (true, true, _) | (false, _, true) => amber(),
+        (false, _, false) => muted(),
+    }
+}
+
 fn section(ui: &mut Ui, label: &str) {
     ui.add_space(10.0);
     ui.label(RichText::new(label).font(ui_font(11.0)).color(muted()));
@@ -1279,6 +1024,32 @@ fn compact_money(x: f64) -> String {
         format!("{a:.0}")
     };
     if x < 0.0 { format!("-${s}") } else { format!("${s}") }
+}
+
+/// The most common provenance among `items` (ties → the first seen) and how many items there
+/// are, or `None` for an empty list. Used to state watchlist provenance once.
+fn shared_provenance(items: impl Iterator<Item = tr_core::Provenance>) -> Option<(tr_core::Provenance, usize)> {
+    let mut counts: Vec<(tr_core::Provenance, usize)> = Vec::new();
+    let mut total = 0;
+    for p in items {
+        total += 1;
+        match counts.iter_mut().find(|(q, _)| *q == p) {
+            Some(c) => c.1 += 1,
+            None => counts.push((p, 1)),
+        }
+    }
+    let best = counts.iter().fold(None::<(tr_core::Provenance, usize)>, |b, c| match b {
+        Some(b) if b.1 >= c.1 => Some(b),
+        _ => Some(*c),
+    })?;
+    Some((best.0, total))
+}
+
+fn dest_row(ui: &mut Ui, d: NavDest, badge: Option<&str>, lit: &[NavDest], out: &mut Vec<SidebarCmd>) {
+    let resp = nav_row(ui, d.icon(), d.label(), badge.or(d.code()), lit.contains(&d));
+    if resp.clicked() {
+        out.push(SidebarCmd::Function(d.function()));
+    }
 }
 
 fn nav_row(ui: &mut Ui, icon: Icon, label: &str, trailing: Option<&str>, selected: bool) -> egui::Response {
@@ -1535,6 +1306,73 @@ mod tests {
         step(vec![Event::PointerMoved(go), click(go, true)]);
         step(vec![click(go, false)]);
         assert_eq!(app.panes[0].kind.symbol(), Some("MSFT US Equity"));
+    }
+
+    fn shape_text(shapes: &[egui::epaint::ClippedShape]) -> String {
+        fn walk(s: &egui::Shape) -> String {
+            match s {
+                egui::Shape::Text(t) => t.galley.job.text.clone(),
+                egui::Shape::Vec(v) => v.iter().map(walk).collect::<Vec<_>>().join("\n"),
+                _ => String::new(),
+            }
+        }
+        shapes.iter().map(|s| walk(&s.shape)).collect::<Vec<_>>().join("\n")
+    }
+
+    /// The research toolbar never paints the paper/live account pill, in either account mode.
+    #[test]
+    fn toolbar_has_no_account_mode_pill_and_mode_semantics_unchanged() {
+        for mode in [crate::prefs::AccountMode::Demo, crate::prefs::AccountMode::Live] {
+            let ctx = egui::Context::default();
+            let mut app = chart_app();
+            app.prefs.trading.account_mode = mode;
+            let mut out = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(1200.0, 700.0))),
+                    ..Default::default()
+                },
+                |ui| {
+                    let rect = app.toolbar_rect(ui.max_rect());
+                    app.toolbar(ui, rect, 0.0);
+                },
+            );
+            out.textures_delta.clear();
+            let text = shape_text(&out.shapes);
+            assert!(!text.contains("DEMO") && !text.contains("LIVE") && !text.contains("Paper trading"), "{text}");
+            assert_eq!(app.prefs.trading.account_mode, mode, "painting never changes the account mode");
+            assert_eq!(app.demo_mode(), mode == crate::prefs::AccountMode::Demo);
+        }
+    }
+
+    #[test]
+    fn whats_news_footer_is_grey_unless_the_result_needs_it() {
+        let grey = whats_news_color(false, true, false);
+        assert_eq!(grey, muted());
+        assert_ne!(grey, amber());
+        assert_eq!(whats_news_color(false, true, true), amber());
+        assert_eq!(whats_news_color(true, false, false), theme::up());
+        assert_eq!(whats_news_color(true, true, false), amber());
+    }
+
+    #[test]
+    fn footer_turns_amber_only_for_a_structured_whats_news_outage() {
+        use crate::daily_research::{DailyUnavailable, WHATS_NEWS_OFFLINE_NOTE};
+        let outage = DailyUnavailable { message: "Daily research unavailable for AAPL. x".into(), needs_whats_news: true };
+        let unknown = DailyUnavailable { message: "Daily research unavailable for ZZZZ. no history".into(), needs_whats_news: false };
+        let (outage, unknown) = (outage.to_string(), unknown.to_string());
+        assert!(outage.contains(WHATS_NEWS_OFFLINE_NOTE) && !unknown.contains(WHATS_NEWS_OFFLINE_NOTE));
+        let mut app = chart_app();
+        let mut pane = super::super::studio_dist::DistPane::new("AAPL", tr_core::Timeframe::D1, tr_data::studio_dist::Window::All);
+        pane.error = Some(unknown);
+        app.open_panel(super::super::PaneKind::StudioDist(Box::new(pane)));
+        assert!(!app.whats_news_affects_focus(), "an unknown ticker is not an outage");
+        let Some(super::super::PaneKind::StudioDist(p)) =
+            app.panes.iter_mut().find(|p| p.id == app.focus).map(|p| &mut p.kind)
+        else {
+            panic!("focused Distribution pane")
+        };
+        p.error = Some(outage);
+        assert!(app.whats_news_affects_focus(), "Dist/Season/Rotation/Backtest errors count too");
     }
 
     #[test]

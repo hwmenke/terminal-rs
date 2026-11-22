@@ -86,6 +86,8 @@ pub struct RotationReport {
     pub tracks: Vec<Track>,
     pub skipped: Vec<Skipped>,
     pub source: String,
+    /// `(symbol, receipt)` for the benchmark then each loaded name (display only).
+    pub source_receipts: Vec<(String, crate::source_receipt::SourceReceipt)>,
     pub provenance: Provenance,
     pub as_of: NaiveDate,
     pub expected: NaiveDate,
@@ -240,6 +242,7 @@ pub fn build_report(
         tracks: vec![],
         skipped: q.skipped.clone(),
         source: source.into(),
+        source_receipts: vec![],
         provenance: Bar::provenance(bench),
         as_of,
         expected,

@@ -196,3 +196,120 @@ fn save_residual_explains_each_disabled_state() {
     let reason = pane.save_disabled_reason(false).unwrap();
     assert!(reason.contains("successful verified-data fit") && reason.contains("Reload"));
 }
+
+fn table_probe(width: f32, ppp: f32, cov: usize) -> (bool, Vec<Rect>, String) {
+    let report = fixture_report(400);
+    let ctx = egui::Context::default();
+    let mut st = LabUi { shown_cov: cov, ..Default::default() };
+    let mut shapes_text = String::new();
+    for pass in 0..2 {
+        let mut out = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(width + 60., 1200.))),
+                viewports: std::iter::once((
+                    egui::ViewportId::ROOT,
+                    egui::ViewportInfo { native_pixels_per_point: Some(ppp), ..Default::default() },
+                ))
+                .collect(),
+                ..Default::default()
+            },
+            |ui| {
+                ui.ctx().set_pixels_per_point(ppp);
+                table(ui, &report, &mut st, width);
+            },
+        );
+        out.textures_delta.clear();
+        if pass == 1 {
+            shapes_text = out
+                .shapes
+                .iter()
+                .filter_map(|s| if let egui::Shape::Text(t) = &s.shape { Some(t.galley.job.text.clone()) } else { None })
+                .collect::<Vec<_>>()
+                .join("\n");
+        }
+    }
+    let (compact, rects) = ctx.data(|d| d.get_temp::<(bool, Vec<Rect>)>(egui::Id::new("lab-table-probe"))).unwrap();
+    (compact, rects, shapes_text)
+}
+
+#[test]
+fn lab_coefficient_cells_never_intersect_at_all_pane_widths_and_scales() {
+    for ppp in [1.0, 2.0] {
+        for width in [320., 480., 640., 900.] {
+            for cov in 0..4 {
+                let (compact, rects, text) = table_probe(width, ppp, cov);
+                assert_eq!(compact, width <= 480.);
+                assert!(rects.len() >= 8, "{width}: {}", rects.len());
+                for (i, a) in rects.iter().enumerate() {
+                    for b in &rects[i + 1..] {
+                        assert!(!a.intersects(*b), "{width}@{ppp} cov {cov}: {a:?} overlaps {b:?}");
+                    }
+                }
+                assert!(text.contains("Term"), "{text}");
+                assert!(!text.lines().any(|l| l == "0.000"), "p/q must never print 0.000");
+            }
+        }
+    }
+}
+
+#[test]
+fn lab_wide_table_shows_all_columns_and_compact_hides_inference_columns() {
+    let (_, _, wide) = table_probe(900., 1., 0);
+    for h in ["SE", "95% CI", "VIF"] {
+        assert!(wide.lines().any(|l| l == h), "{h} header at 900: {wide}");
+    }
+    let (_, _, narrow) = table_probe(320., 1., 0);
+    assert!(narrow.contains("click a row for SE"), "{narrow}");
+    // The heat key also prints "VIF"; the grid header is the one that disappears.
+    let n = |t: &str| t.lines().filter(|l| *l == "VIF").count();
+    assert_eq!(n(&wide), n(&narrow) + 1, "VIF header leaves the grid on narrow panes");
+}
+
+/// Renders the real report body (`panel`, the path the app takes) at a pane width.
+fn panel_probe(width: f32, ppp: f32) -> (Vec<bool>, bool, Vec<Rect>) {
+    let report = fixture_report(400);
+    let ctx = egui::Context::default();
+    let mut st = LabUi::default();
+    for _ in 0..2 {
+        let mut out = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(width, 2400.))),
+                viewports: std::iter::once((
+                    egui::ViewportId::ROOT,
+                    egui::ViewportInfo { native_pixels_per_point: Some(ppp), ..Default::default() },
+                ))
+                .collect(),
+                ..Default::default()
+            },
+            |ui| {
+                ui.ctx().set_pixels_per_point(ppp);
+                ui.set_width(width);
+                panel(ui, 1, &report, &mut st);
+            },
+        );
+        out.textures_delta.clear();
+    }
+    let shown = ctx.data(|d| d.get_temp::<Vec<bool>>(egui::Id::new("lab-table-shown"))).unwrap();
+    let (compact, rects) = ctx.data(|d| d.get_temp::<(bool, Vec<Rect>)>(egui::Id::new("lab-table-probe"))).unwrap();
+    (shown, compact, rects)
+}
+
+#[test]
+fn lab_pane_shows_the_full_grid_on_wide_panes_and_compact_on_narrow_ones() {
+    for ppp in [1.0, 2.0] {
+        for width in [640., 900., 1100., 1440.] {
+            let (shown, compact, rects) = panel_probe(width, ppp);
+            assert!(!compact, "pane {width}");
+            assert!(shown.iter().all(|s| *s), "z/p/q/VIF need grid columns at pane {width}@{ppp}: {shown:?}");
+            for (i, a) in rects.iter().enumerate() {
+                for b in &rects[i + 1..] {
+                    assert!(!a.intersects(*b), "pane {width}: {a:?} overlaps {b:?}");
+                }
+            }
+        }
+        for width in [320., 480.] {
+            let (shown, compact, _) = panel_probe(width, ppp);
+            assert!(compact && !shown.iter().all(|s| *s), "pane {width}: {shown:?}");
+        }
+    }
+}

@@ -797,6 +797,9 @@ pub struct ResidualReport {
     pub dropped: Vec<(String, usize)>,
     pub receipts: Vec<SeriesReceipt>,
     pub source: String,
+    /// `(symbol, receipt)` per loaded row, target first (display only; not part of any key).
+    #[serde(default)]
+    pub source_receipts: Vec<(String, crate::source_receipt::SourceReceipt)>,
     pub provenance: Provenance,
     pub closed_thru: i64,
     pub observed_at: Option<i64>,
@@ -868,6 +871,7 @@ fn blank_report(
         dropped: vec![],
         receipts: vec![],
         source: source.into(),
+        source_receipts: vec![],
         provenance,
         closed_thru,
         observed_at,
@@ -1066,6 +1070,10 @@ pub fn score(
         dropped: design.dropped.clone(),
         receipts: design.receipts.clone(),
         source: source.into(),
+        source_receipts: std::iter::once(target)
+            .chain(factors)
+            .filter_map(|r| r.receipt.clone().map(|c| (r.symbol.clone(), c)))
+            .collect(),
         provenance,
         closed_thru,
         observed_at,

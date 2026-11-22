@@ -162,7 +162,9 @@ gets the native title bar with traffic lights, window vibrancy behind the sideba
   `TR_BROKER=sample`) they show a clearly labelled simulated portfolio. See
   [Brokerage setup](#brokerage-setup-snaptrade).
 - **Demo account and easy trading** — a **DEMO** paper-trading account ($100,000 virtual cash) is
-  selected by default; the toolbar badge shows DEMO or a red **LIVE** and switches between them
+  selected by default; Portfolio and order panes show **Paper trading** or a red **LIVE** (the
+  research toolbar shows neither — account mode is not a data mode; real-money mode keeps a thin
+  red rule along the toolbar). Switch with `MODE LIVE` / `DEMO` or Settings › Trading
   (switching to live asks first and is remembered). Buy/Sell buttons sit on charts, watchlist rows
   and positions (plus **Close**), ⇧B / ⇧S trade the security in focus, and `BUY AAPL 10`,
   `SELL ALL TSLA`, `BUY NVDA $500`, `SELL MSFT 5 LMT 410` work from the command line or ⌘K. One
@@ -438,8 +440,8 @@ are repriced with the terminal's live quotes where a market key exists.
 
 The **demo account** needs no setup: it is a local paper-trading account (`demo-account.json` in
 the app data folder) with no commissions, no short selling and Day orders expiring at the 4 p.m.
-New York close. Switch to your brokerage accounts with the toolbar badge, `MODE LIVE`, or
-Settings › Trading (`DEMO` switches back).
+New York close. Switch to your brokerage accounts with `MODE LIVE`, the order ticket's
+DEMO/LIVE switch, or Settings › Trading (`DEMO` switches back).
 
 Live trading is **off** until you enable it in **Settings › Trading**, which asks you to
 acknowledge that confirmed orders are real. Then:
@@ -668,7 +670,9 @@ When, Season and Backtest. `AAPL WHEN 5m RSI(14)<30` (or `STUDIO lens=when
 rule="RSI(14)<30"`) shades the accepted rule mask on the native chart and prints
 fixed-family (m=8) within-clock HAC/BY evidence at h=1,3,6,12 bars, shared-bin
 distributions, session-block probability tiles and prior-only quintile buckets;
-`WHEN h=6 threshold=10bp` adjusts the focused When lens. COND has an explicit
+`WHEN h=6 threshold=10bp` adjusts the focused When lens. Daily When analyses the latest
+10 calendar years of closed bars by default (`period=5y|10y|20y` or `since=YYYY-MM-DD`; 5Y/10Y/20Y/Custom
+controls disclose the period; earlier warm-up bars are never scored). COND has an explicit
 Open in When action. Committing a span in Distribution adds a selected-versus-rest
 comparison. See [When](docs/STUDIO_WHEN.md). `STUDIO lens=relate
 benchmark=QQQ` selects a benchmark. Local Alt+Left/Right cycles lenses, Escape

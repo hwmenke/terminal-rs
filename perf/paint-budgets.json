@@ -525,6 +525,81 @@
       "budget_us": 2000,
       "relative": false,
       "class": "frame"
+    },
+    "paint.studio_source_chip.steady.ui": {
+      "budget_us": 1200,
+      "relative": false,
+      "class": "frame"
+    },
+    "paint.studio_source_chip.steady.tess": {
+      "budget_us": 800,
+      "relative": false,
+      "class": "frame"
+    },
+    "paint.studio_source_chip.steady.total": {
+      "budget_us": 2000,
+      "relative": false,
+      "class": "frame"
+    },
+    "paint.studio_numeric_table.steady.ui": {
+      "budget_us": 2500,
+      "relative": false,
+      "class": "frame"
+    },
+    "paint.studio_numeric_table.steady.tess": {
+      "budget_us": 800,
+      "relative": false,
+      "class": "frame"
+    },
+    "paint.studio_numeric_table.steady.total": {
+      "budget_us": 3500,
+      "relative": false,
+      "class": "frame"
+    },
+    "paint.studio_legend.steady.ui": {
+      "budget_us": 1500,
+      "relative": false,
+      "class": "frame"
+    },
+    "paint.studio_legend.steady.tess": {
+      "budget_us": 1500,
+      "relative": false,
+      "class": "frame"
+    },
+    "paint.studio_legend.steady.total": {
+      "budget_us": 2500,
+      "relative": false,
+      "class": "frame"
+    },
+    "paint.studio_pane_chrome.steady.ui": {
+      "budget_us": 1000,
+      "relative": false,
+      "class": "frame"
+    },
+    "paint.studio_pane_chrome.steady.tess": {
+      "budget_us": 500,
+      "relative": false,
+      "class": "frame"
+    },
+    "paint.studio_pane_chrome.steady.total": {
+      "budget_us": 1500,
+      "relative": false,
+      "class": "frame"
+    },
+    "paint.studio_sidebar.steady.ui": {
+      "budget_us": 800,
+      "relative": false,
+      "class": "frame"
+    },
+    "paint.studio_sidebar.steady.tess": {
+      "budget_us": 500,
+      "relative": false,
+      "class": "frame"
+    },
+    "paint.studio_sidebar.steady.total": {
+      "budget_us": 1200,
+      "relative": false,
+      "class": "frame"
     }
   }
 }

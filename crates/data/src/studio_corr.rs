@@ -19,6 +19,8 @@ pub struct NamedBars {
     pub error: Option<String>,
     /// Vault UNVERIFIED JOIN gaps `(last before, first after)`; no return spans one.
     pub gaps: Vec<(i64, i64)>,
+    /// Structured source receipt (display/Inspector/provider identity); not part of any cache key.
+    pub receipt: Option<crate::source_receipt::SourceReceipt>,
 }
 
 /// How bars are joined and annualised.
@@ -402,6 +404,10 @@ pub struct CorrReport {
     pub benchmark: String,
     pub provenance: Provenance,
     pub source: String,
+    /// Structured receipts, positional `[asset, benchmark]`; a missing side stays `None` so a
+    /// receipt can never be labelled with the other series' ticker.
+    #[serde(default)]
+    pub receipts: [Option<crate::source_receipt::SourceReceipt>; 2],
     pub as_of: i64,
     #[serde(default)]
     pub closed_thru: i64,
@@ -748,6 +754,7 @@ pub fn compute_series_at_horizon(
         benchmark: benchmark.symbol.clone(),
         provenance: Bar::provenance(&asset.bars).combine(Bar::provenance(other)),
         source: source.into(),
+        receipts: [asset.receipt.clone(), benchmark.receipt.clone()],
         as_of: prices.last().unwrap().0,
         closed_thru: prices.last().unwrap().0,
         observed_at: None,
@@ -935,6 +942,7 @@ mod tests {
             source: "unit".into(),
             error,
             gaps: vec![],
+            receipt: None,
         };
         let rows =
             vec![row("A", a.clone(), None), row("B", b.clone(), None), row("TLT", vec![], Some("no archive".into()))];
@@ -1107,6 +1115,29 @@ mod horizon_tests {
             assert!((r.returns[0].asset - (a.bars[h].close / a.bars[0].close).ln()).abs() < 1e-12);
         }
         assert!(compute_series_at_horizon(&a, &b, &[], options, "test", 2).is_err());
+    }
+    #[test]
+    fn receipts_are_positional_when_the_asset_has_none() {
+        use crate::source_receipt::SourceReceipt;
+        let bars = |scale: f64| -> Vec<Bar> {
+            (0..60)
+                .map(|i| {
+                    let p = (4. + scale * (0.001 * i as f64 + (i % 7) as f64 * 0.0001)).exp();
+                    Bar::new(i * 86_400, p, p, p, p, 10.).with_provenance(Provenance::Real)
+                })
+                .collect()
+        };
+        let a = NamedBars { symbol: "A".into(), bars: bars(1.2), ..Default::default() };
+        let b = NamedBars {
+            symbol: "B".into(),
+            bars: bars(0.9),
+            receipt: Some(SourceReceipt::new("yahoo", 60, Some(59 * 86_400))),
+            ..Default::default()
+        };
+        let options = Options { annual_periods: 252., daily: true };
+        let r = compute_series(&a, &b, &[], options, "test").unwrap();
+        assert!(r.receipts[0].is_none(), "asset has no receipt");
+        assert_eq!(r.receipts[1].as_ref().map(|c| c.provider_id.as_str()), Some("yahoo"));
     }
     #[test]
     fn old_report_json_defaults_to_one_bar_and_unavailable_robust() {
