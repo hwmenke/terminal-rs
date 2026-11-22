@@ -354,14 +354,15 @@ fn editor(ui: &mut Ui, id: PaneId, pane: &mut LabPane) -> bool {
     let mut remove = None;
     for i in 0..pane.draft.factors.len().min(pane.draft_syms.len()) {
         ui.horizontal_wrapped(|ui| {
+            // Remove leads the row so it can never wrap away from the factor it removes.
+            if crate::widgets::icon_button(ui, crate::widgets::Icon::Close, "Remove factor", false).clicked() {
+                remove = Some(i);
+            }
             let r = ui.add(egui::TextEdit::singleline(&mut pane.draft_syms[i]).desired_width(56.).font(theme::mono(11.)));
             apply |= r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
             transform_combo(ui, (id, "f", i), &mut pane.draft.factors[i].transform);
             ui.label(ui_text("lag", 10., theme::muted()));
             ui.add(egui::DragValue::new(&mut pane.draft.factors[i].lag).range(0..=MAX_LAG).speed(0.2));
-            if ui.small_button("✕").on_hover_text("Remove factor").clicked() {
-                remove = Some(i);
-            }
         });
     }
     if let Some(i) = remove {

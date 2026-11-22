@@ -54,6 +54,22 @@ impl FeedFilter {
     }
 }
 
+/// Why a feed shows no rows: nothing was ingested, or the filters exclude everything.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FeedEmpty {
+    NoDisclosures,
+    NoMatches,
+}
+
+/// `None` when at least one row is shown.
+pub fn feed_empty(total: usize, shown: usize) -> Option<FeedEmpty> {
+    match (total, shown) {
+        (_, 1..) => None,
+        (0, 0) => Some(FeedEmpty::NoDisclosures),
+        (_, 0) => Some(FeedEmpty::NoMatches),
+    }
+}
+
 fn tx_text(t: TxType) -> (&'static str, Color32) {
     match t {
         TxType::Purchase => ("BUY ", theme::up()),
@@ -204,8 +220,34 @@ pub fn feed(ui: &mut Ui, trades: &[Trade], filter: &mut FeedFilter, status: &str
     });
     header(ui, "FILED    TRADED   LAG  POLITICIAN             PTY  C  TYPE TICKER AMOUNT        OWNER    ASSET");
     let rows: Vec<&Trade> = trades.iter().filter(|t| filter.matches(t)).collect();
-    if rows.is_empty() {
-        plain(ui, "No disclosures yet. Ingest runs in the background (REFRESH to force).", muted());
+    match feed_empty(trades.len(), rows.len()) {
+        Some(FeedEmpty::NoMatches) => {
+            let detail = format!("{} disclosures are loaded; none match the active filters.", trades.len());
+            crate::widgets::analysis_state(
+                ui,
+                &crate::widgets::AnalysisState::empty("No matches for these filters", &detail),
+                |ui| {
+                    if ui.button("Clear filters").clicked() {
+                        *filter = FeedFilter::default();
+                    }
+                },
+            );
+        }
+        Some(FeedEmpty::NoDisclosures) => {
+            crate::widgets::analysis_state(
+                ui,
+                &crate::widgets::AnalysisState::empty(
+                    "No disclosures yet",
+                    "Ingest runs in the background; refresh to force a pull.",
+                ),
+                |ui| {
+                    if ui.button("Refresh").clicked() {
+                        out.push(Action::Command("REFRESH".into()));
+                    }
+                },
+            );
+        }
+        None => {}
     }
     let row_h = 16.0;
     ScrollArea::both().id_salt("feed").auto_shrink([false, false]).show_rows(ui, row_h, rows.len(), |ui, range| {
@@ -446,6 +488,39 @@ mod tests {
             filed_date: NaiveDate::from_ymd_opt(2026, 1, 20).unwrap(),
             source_url: String::new(),
         }
+    }
+
+    fn render_feed(trades: &[Trade], filter: &mut FeedFilter) -> Vec<(String, Color32)> {
+        let ctx = egui::Context::default();
+        let mut out = ctx.run_ui(Default::default(), |ui| {
+            feed(ui, trades, filter, "");
+        });
+        out.textures_delta.clear();
+        crate::widgets::painted_texts(&out)
+    }
+
+    #[test]
+    fn feed_empty_separates_no_data_from_no_matches() {
+        assert_eq!(feed_empty(0, 0), Some(FeedEmpty::NoDisclosures));
+        assert_eq!(feed_empty(5, 0), Some(FeedEmpty::NoMatches));
+        assert_eq!(feed_empty(5, 2), None);
+    }
+
+    #[test]
+    fn filtered_empty_says_no_matches_and_offers_clear_filters() {
+        let t = trade(Party::Democrat, Chamber::Senate, TxType::Purchase, Some("AAPL"));
+        let mut filter = FeedFilter { party: Some(Party::Republican), ..Default::default() };
+        let texts = render_feed(std::slice::from_ref(&t), &mut filter);
+        let has = |s: &str| texts.iter().any(|(t, _)| t == s);
+        assert!(has("No matches for these filters"), "{texts:?}");
+        assert!(has("Clear filters"));
+        assert!(!has("No disclosures yet"));
+        // The honest empty-dataset message is still reachable.
+        let texts = render_feed(&[], &mut FeedFilter::default());
+        let has = |s: &str| texts.iter().any(|(t, _)| t == s);
+        assert!(has("No disclosures yet") && has("Refresh") && !has("No matches for these filters"));
+        // Neither state is an error colour.
+        assert!(texts.iter().all(|(_, c)| *c != theme::down() && *c != theme::alert()));
     }
 
     #[test]

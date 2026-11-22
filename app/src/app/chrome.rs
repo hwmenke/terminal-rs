@@ -9,6 +9,7 @@ use egui::{
     Ui, UiBuilder, ViewportCommand, pos2, vec2,
 };
 
+use super::nav::NavDest;
 use super::{PaneKind, TerminalApp};
 use crate::anim;
 use crate::command::{self, Function};
@@ -545,42 +546,53 @@ impl TerminalApp {
         child.set_clip_rect(body.intersect(ui.clip_rect()));
         egui::ScrollArea::vertical().auto_shrink([false, false]).show(&mut child, |ui| {
             ui.spacing_mut().item_spacing.y = 1.0;
-            let focused = self.idx(self.focus).map(|i| self.panes[i].kind.panel_type());
-            let is_focused = |k: &PaneKind| focused == Some(k.panel_type());
-
             section(ui, "Watchlist");
+            // Provenance is stated once for the list; a row only repeats it when it differs.
+            let shared = shared_provenance(self.watchlist.iter().filter_map(|k| self.quotes.get(k)).map(|q| q.provenance));
+            if let Some((p, n)) = shared {
+                ui.label(
+                    egui::RichText::new(format!("{} · {n} quote{}", p.label(), if n == 1 { "" } else { "s" }))
+                        .font(mono(10.0))
+                        .color(theme::provenance(p)),
+                );
+            }
             let mut remove = None;
             for key in &self.watchlist {
                 let sec = tr_data::security(key);
-                let (r, resp) = ui.allocate_exact_size(vec2(ui.available_width(), dp(38.0)), Sense::click());
+                let provenance = self.quotes.get(key).map(|q| q.provenance);
+                let exception = provenance.is_some_and(|p| shared.is_some_and(|(s, _)| s != p));
+                let dy = if exception { dp(6.0) } else { 0.0 };
+                let h = if exception { dp(38.0) } else { dp(28.0) };
+                let (r, resp) = ui.allocate_exact_size(vec2(ui.available_width(), h), Sense::click());
                 widgets::hover_wash(ui, r, &resp, false);
                 let pt = ui.painter();
                 pt.text(
-                    pos2(r.left() + 8.0, r.center().y - dp(6.0)),
+                    pos2(r.left() + 8.0, r.center().y - dy),
                     Align2::LEFT_CENTER,
                     &sec.ticker,
                     mono(12.0),
                     text(),
                 );
-                let provenance = self.quotes.get(key).map(|q| q.provenance).unwrap_or_default();
-                pt.text(
-                    pos2(r.left() + 8.0, r.bottom() - 1.0),
-                    Align2::LEFT_BOTTOM,
-                    provenance.label(),
-                    mono(10.0),
-                    theme::provenance(provenance),
-                );
+                if let (true, Some(p)) = (exception, provenance) {
+                    pt.text(
+                        pos2(r.left() + 8.0, r.bottom() - 1.0),
+                        Align2::LEFT_BOTTOM,
+                        p.label(),
+                        mono(10.0),
+                        theme::provenance(p),
+                    );
+                }
                 if let Some(q) = self.quotes.get(key) {
                     let up = q.change() >= 0.0;
                     let c = if up { theme::up() } else { theme::down() };
                     let pct = format!("{:+.2}%", q.change_pct());
                     let pill =
-                        Rect::from_min_size(pos2(r.right() - 62.0, r.center().y - dp(6.0) - 8.0), vec2(58.0, 16.0));
+                        Rect::from_min_size(pos2(r.right() - 62.0, r.center().y - dy - 8.0), vec2(58.0, 16.0));
                     pt.rect_filled(pill, 4.0, c.gamma_multiply(0.16));
                     pt.text(pill.right_center() - vec2(5.0, 0.0), Align2::RIGHT_CENTER, pct, mono(11.0), c);
                     let d = sec.decimals(q.last);
                     pt.text(
-                        pos2(pill.left() - 8.0, r.center().y - dp(6.0)),
+                        pos2(pill.left() - 8.0, r.center().y - dy),
                         Align2::RIGHT_CENTER,
                         format!("{:.d$}", q.last),
                         mono(11.5),
@@ -588,7 +600,7 @@ impl TerminalApp {
                     );
                 } else {
                     pt.text(
-                        pos2(r.right() - 8.0, r.center().y - dp(6.0)),
+                        pos2(r.right() - 8.0, r.center().y - dy),
                         Align2::RIGHT_CENTER,
                         sec.class.yellow_key().label(),
                         ui_font(10.5),
@@ -625,294 +637,29 @@ impl TerminalApp {
                 }
                 self.watchlists_changed();
             }
-            if nav_row(ui, Icon::List, "Open Watchlist Pane", None, is_focused(&PaneKind::Watchlist)).clicked() {
-                out.push(SidebarCmd::Function(Function::Watchlist));
-            }
-            if nav_row(
-                ui,
-                Icon::Chart,
-                "Studio",
-                Some("STUDIO"),
-                self.panes.iter().any(|p| p.id == self.focus && matches!(p.kind, PaneKind::Studio(_))),
-            )
-            .clicked()
-            {
-                out.push(SidebarCmd::Function(Function::Studio { spec: String::new() }));
-            }
-            if nav_row(ui,Icon::Chart,"Quick canvas",Some("QUICK"),false).clicked(){out.push(SidebarCmd::Function(Function::StudioQuick {spec:String::new()}));}
-            if nav_row(ui, Icon::Chart, "When", Some("WHEN"), false).clicked() {
-                out.push(SidebarCmd::Function(Function::StudioWhen { spec: String::new() }));
-            }
-            if nav_row(ui, Icon::Chart, "Regression Lab", Some("STUDIO lab"), false).clicked() {
-                out.push(SidebarCmd::Function(Function::StudioRoute(tr_data::studio::StudioRoute::Lab)));
-            }
-            if nav_row(ui, Icon::Chart, "Residual tickers", Some("STUDIO resid"), false).clicked() {
-                out.push(SidebarCmd::Function(Function::StudioRoute(tr_data::studio::StudioRoute::Resid)));
-            }
-            if nav_row(ui, Icon::Chart, "Attribution", Some("STUDIO attr"), false).clicked() {
-                out.push(SidebarCmd::Function(Function::StudioRoute(tr_data::studio::StudioRoute::Attr)));
-            }
-            if nav_row(
-                ui,
-                Icon::Gauge,
-                "Statistics",
-                Some("STATS"),
-                is_focused(&PaneKind::Stats(Box::new(super::stats::StatsPane::new(
-                    String::new(),
-                    String::new(),
-                    false,
-                )))),
-            )
-            .clicked()
-            {
-                out.push(SidebarCmd::Function(Function::Stats { condition: String::new(), conditional: false }));
-            }
-            if nav_row(
-                ui,
-                Icon::Chart,
-                "Backtest",
-                Some("BT"),
-                is_focused(&PaneKind::Backtest(Box::new(super::backtest::BacktestPane::new(
-                    String::new(),
-                    String::new(),
-                )))),
-            )
-            .clicked()
-            {
-                out.push(SidebarCmd::Function(Function::Backtest { spec: String::new() }));
-            }
-            if nav_row(
-                ui,
-                Icon::Chart,
-                "Intraday BT",
-                Some("IBT"),
-                is_focused(&PaneKind::Backtest(Box::new(super::backtest::BacktestPane::intraday(
-                    String::new(),
-                    String::new(),
-                )))),
-            )
-            .clicked()
-            {
-                out.push(SidebarCmd::Function(Function::IntradayBacktest { spec: String::new() }));
-            }
-            if nav_row(
-                ui,
-                Icon::Chart,
-                "Session compare",
-                Some("ICMP"),
-                is_focused(&PaneKind::IntradayCompare(Box::new(super::compare::ComparePane::new(
-                    String::new(),
-                    String::new(),
-                )))),
-            )
-            .clicked()
-            {
-                out.push(SidebarCmd::Function(Function::IntradayCompare { spec: String::new() }));
-            }
-            if nav_row(
-                ui,
-                Icon::Chart,
-                "Session path",
-                Some("SPATH"),
-                is_focused(&PaneKind::SessionPath(Box::new(super::session_path::SessionPathPane::new(
-                    String::new(),
-                    String::new(),
-                )))),
-            )
-            .clicked()
-            {
-                out.push(SidebarCmd::Function(Function::SessionPath { spec: String::new() }));
-            }
-            if nav_row(
-                ui,
-                Icon::Chart,
-                "Session breadth",
-                Some("BRD"),
-                is_focused(&PaneKind::Breadth(Box::new(super::session_breadth::BreadthPane::new(String::new())))),
-            )
-            .clicked()
-            {
-                out.push(SidebarCmd::Function(Function::Breadth { spec: String::new() }));
-            }
-            if nav_row(
-                ui,
-                Icon::Chart,
-                "Trend Wall",
-                Some("TWALL"),
-                is_focused(&PaneKind::TrendWall(Box::new(super::trend_wall::TrendWallPane::new("")))),
-            )
-            .clicked()
-            {
-                out.push(SidebarCmd::Function(Function::TrendWall { spec: String::new() }));
-            }
-            if nav_row(
-                ui,
-                Icon::Chart,
-                "Rotation",
-                Some("RRG"),
-                is_focused(&PaneKind::Rotation(Box::new(super::rotation::RotationPane::new("")))),
-            )
-            .clicked()
-            {
-                out.push(SidebarCmd::Function(Function::Rotation { spec: String::new() }));
-            }
-            if nav_row(
-                ui,
-                Icon::Chart,
-                "Volume pace",
-                Some("VPACE"),
-                is_focused(&PaneKind::VolumePace(Box::new(super::volume_pace::VolumePacePane::new(
-                    String::new(),
-                    String::new(),
-                )))),
-            )
-            .clicked()
-            {
-                out.push(SidebarCmd::Function(Function::VolumePace { spec: String::new() }));
-            }
-            if nav_row(
-                ui,
-                Icon::Chart,
-                "Gap fill",
-                Some("GFILL"),
-                is_focused(&PaneKind::GapFill(Box::new(super::gap_fill::GapFillPane::new(
-                    String::new(),
-                    String::new(),
-                )))),
-            )
-            .clicked()
-            {
-                out.push(SidebarCmd::Function(Function::GapFill { spec: String::new() }));
-            }
-            if nav_row(
-                ui,
-                Icon::Chart,
-                "Session extreme",
-                Some("XTRM"),
-                is_focused(&PaneKind::SessionExtreme(Box::new(super::session_extreme::SessionExtremePane::new(
-                    String::new(),
-                    String::new(),
-                )))),
-            )
-            .clicked()
-            {
-                out.push(SidebarCmd::Function(Function::SessionExtreme { spec: String::new() }));
-            }
-            if nav_row(
-                ui,
-                Icon::Chart,
-                "Session Clock",
-                Some("CLOCK"),
-                is_focused(&PaneKind::SessionClock(Box::new(super::session_clock::SessionClockPane::new(
-                    String::new(),
-                    String::new(),
-                )))),
-            )
-            .clicked()
-            {
-                out.push(SidebarCmd::Function(Function::SessionClock { spec: String::new() }));
-            }
-            if nav_row(
-                ui,
-                Icon::Chart,
-                "Relative path",
-                Some("RPATH"),
-                is_focused(&PaneKind::RelativePath(Box::new(super::relative_path::RelativePathPane::new(
-                    String::new(),
-                    String::new(),
-                )))),
-            )
-            .clicked()
-            {
-                out.push(SidebarCmd::Function(Function::RelativePath { spec: String::new() }));
-            }
-            if nav_row(
-                ui,
-                Icon::Chart,
-                "Session brief",
-                Some("BRIEF"),
-                is_focused(&PaneKind::SessionBrief(Box::new(super::session_brief::SessionBriefPane::new(
-                    String::new(),
-                )))),
-            )
-            .clicked()
-            {
-                out.push(SidebarCmd::Function(Function::SessionBrief));
-            }
-            if nav_row(ui, Icon::Chart, "Cash levels", Some("MARKS"), false).clicked() {
-                out.push(SidebarCmd::Function(Function::CashLevels));
-            }
-            if nav_row(
-                ui,
-                Icon::Search,
-                "Lookalikes",
-                Some("KNN"),
-                is_focused(&PaneKind::Lookalike(Box::new(super::lookalike::LookalikePane::new(
-                    String::new(),
-                    String::new(),
-                )))),
-            )
-            .clicked()
-            {
-                out.push(SidebarCmd::Function(Function::Lookalike { spec: String::new() }));
-            }
-            if nav_row(
-                ui,
-                Icon::Grid,
-                "PM Desk",
-                Some("DESK"),
-                is_focused(&PaneKind::Desk(Box::new(super::desk::DeskPane::new(String::new())))),
-            )
-            .clicked()
-            {
-                out.push(SidebarCmd::Function(Function::Desk));
-            }
-            let journal_badge = (self.journal.open_count() > 0).then(|| self.journal.open_count().to_string());
-            if nav_row(
-                ui,
-                Icon::List,
-                "Journal",
-                journal_badge.as_deref().or(Some("JRNL")),
-                is_focused(&PaneKind::Journal(Box::new(super::journal::JournalPane::new(String::new())))),
-            )
-            .clicked()
-            {
-                out.push(SidebarCmd::Function(Function::Journal(String::new())));
-            }
+            // Selection comes from the exact focused screen (kind, Studio lens, Quick flag).
+            let focused_kind = self.idx(self.focus).map(|i| &self.panes[i].kind);
+            let lit: Vec<NavDest> =
+                NavDest::ALL.into_iter().filter(|d| d.active(focused_kind, self.settings_tab)).collect();
+            dest_row(ui, NavDest::Watchlist, None, &lit, &mut out);
 
+            section(ui, "Research");
+            for d in NavDest::RESEARCH {
+                dest_row(ui, d, None, &lit, &mut out);
+            }
+            section(ui, "Sessions");
+            for d in NavDest::SESSIONS {
+                dest_row(ui, d, None, &lit, &mut out);
+            }
             section(ui, "Markets");
-            let items = [
-                (
-                    Icon::List,
-                    "Price history",
-                    "HIST",
-                    Function::History(String::new()),
-                    PaneKind::Research(Box::new(super::research::ResearchPane::price_history())),
-                ),
-                (Icon::Globe, "World Markets", "WEI", Function::Wei, PaneKind::Wei),
-                (Icon::Curve, "Yield Curve", "GC", Function::Curve, PaneKind::Curve),
-                (
-                    Icon::Chart,
-                    "Options",
-                    "OMON",
-                    Function::Options,
-                    PaneKind::Options(Box::new(super::OptionsPane::new("", 0, true))),
-                ),
-                (
-                    Icon::Search,
-                    "Security Search",
-                    "SECF",
-                    Function::Search(String::new()),
-                    PaneKind::Search { query: String::new() },
-                ),
-            ];
-            for (icon, label, code, f, kind) in items {
-                if nav_row(ui, icon, label, Some(code), is_focused(&kind)).clicked() {
-                    out.push(SidebarCmd::Function(f));
-                }
+            for d in NavDest::MARKETS {
+                dest_row(ui, d, None, &lit, &mut out);
             }
 
-            section(ui, "Portfolio");
+            section(ui, "Trading");
+            dest_row(ui, NavDest::Desk, None, &lit, &mut out);
+            let journal_badge = (self.journal.open_count() > 0).then(|| self.journal.open_count().to_string());
+            dest_row(ui, NavDest::Journal, journal_badge.as_deref(), &lit, &mut out);
             let focused_view = self.idx(self.focus).and_then(|i| match &self.panes[i].kind {
                 PaneKind::Portfolio(pp) => Some(pp.view),
                 _ => None,
@@ -949,26 +696,10 @@ impl TerminalApp {
 
             section(ui, "Congress");
             let unread = self.unread_alerts();
-            if nav_row(
-                ui,
-                Icon::List,
-                "Latest Trades",
-                Some("CONG"),
-                is_focused(&PaneKind::Feed { filter: Default::default() }),
-            )
-            .clicked()
-            {
-                out.push(SidebarCmd::Function(Function::Congress));
-            }
-            if nav_row(ui, Icon::People, "Politicians", Some("POL"), is_focused(&PaneKind::Politicians)).clicked() {
-                out.push(SidebarCmd::Function(Function::Politician(String::new())));
-            }
+            dest_row(ui, NavDest::Feed, None, &lit, &mut out);
+            dest_row(ui, NavDest::Politicians, None, &lit, &mut out);
             let badge = (unread > 0).then(|| unread.to_string());
-            if nav_row(ui, Icon::Bell, "Alerts", badge.as_deref().or(Some("ALRT")), is_focused(&PaneKind::Alerts))
-                .clicked()
-            {
-                out.push(SidebarCmd::Function(Function::Alerts));
-            }
+            dest_row(ui, NavDest::Alerts, badge.as_deref(), &lit, &mut out);
             let tracked: Vec<_> = self.politicians.iter().filter(|s| s.tracked).collect();
             if !tracked.is_empty() {
                 section(ui, "Tracked");
@@ -1005,12 +736,8 @@ impl TerminalApp {
             self.sidebar_layouts(ui, &mut out);
 
             section(ui, "More");
-            if nav_row(ui, Icon::Gear, "Settings", Some("PDF"), is_focused(&PaneKind::Settings)).clicked() {
-                out.push(SidebarCmd::Function(Function::Settings));
-            }
-            if nav_row(ui, Icon::Star, "Commands & Hotkeys", Some("HELP"), is_focused(&PaneKind::Help)).clicked() {
-                out.push(SidebarCmd::Function(Function::Help));
-            }
+            dest_row(ui, NavDest::Settings, None, &lit, &mut out);
+            dest_row(ui, NavDest::Help, None, &lit, &mut out);
             ui.add_space(12.0);
         });
         out
@@ -1297,6 +1024,32 @@ fn compact_money(x: f64) -> String {
         format!("{a:.0}")
     };
     if x < 0.0 { format!("-${s}") } else { format!("${s}") }
+}
+
+/// The most common provenance among `items` (ties → the first seen) and how many items there
+/// are, or `None` for an empty list. Used to state watchlist provenance once.
+fn shared_provenance(items: impl Iterator<Item = tr_core::Provenance>) -> Option<(tr_core::Provenance, usize)> {
+    let mut counts: Vec<(tr_core::Provenance, usize)> = Vec::new();
+    let mut total = 0;
+    for p in items {
+        total += 1;
+        match counts.iter_mut().find(|(q, _)| *q == p) {
+            Some(c) => c.1 += 1,
+            None => counts.push((p, 1)),
+        }
+    }
+    let best = counts.iter().fold(None::<(tr_core::Provenance, usize)>, |b, c| match b {
+        Some(b) if b.1 >= c.1 => Some(b),
+        _ => Some(*c),
+    })?;
+    Some((best.0, total))
+}
+
+fn dest_row(ui: &mut Ui, d: NavDest, badge: Option<&str>, lit: &[NavDest], out: &mut Vec<SidebarCmd>) {
+    let resp = nav_row(ui, d.icon(), d.label(), badge.or(d.code()), lit.contains(&d));
+    if resp.clicked() {
+        out.push(SidebarCmd::Function(d.function()));
+    }
 }
 
 fn nav_row(ui: &mut Ui, icon: Icon, label: &str, trailing: Option<&str>, selected: bool) -> egui::Response {
