@@ -6,6 +6,11 @@ use egui::{
     vec2,
 };
 
+mod analysis;
+mod numeric_table;
+pub use analysis::*;
+pub use numeric_table::*;
+
 use crate::anim;
 use crate::theme::{self, ui_font};
 
@@ -584,6 +589,8 @@ pub enum Icon {
     Plus,
     More,
     Gear,
+    /// A painted cross for remove/dismiss (the `✕` glyph is missing from some UI fonts).
+    Close,
 }
 
 /// Draw a simple line icon centred in `r`.
@@ -697,6 +704,10 @@ pub fn draw_icon(p: &egui::Painter, r: Rect, icon: Icon, color: Color32) {
                 );
             }
             p.circle_stroke(c, 4.6 * u, s);
+        }
+        Icon::Close => {
+            p.line_segment([pt(-4.5, -4.5), pt(4.5, 4.5)], s);
+            p.line_segment([pt(-4.5, 4.5), pt(4.5, -4.5)], s);
         }
         Icon::Star => {
             let pts: Vec<Pos2> = (0..=10)

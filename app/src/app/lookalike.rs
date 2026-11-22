@@ -1,6 +1,6 @@
 //! Historical lookalike pane (`LOOKALIKE`, `KNN`): nearest past conditions.
 use super::{PaneKind, TerminalApp};
-use crate::theme::{self, amber, mono, muted, text, ui_font};
+use crate::theme::{amber, mono, muted, text, ui_font};
 use crate::{congress_view::Action, dock::PaneId, worker::Request};
 use egui::{RichText, ScrollArea, Sense, Ui};
 use tr_data::lookalike::{self, HorizonSummary, LookalikeQuery, LookalikeReport};
@@ -17,6 +17,10 @@ pub struct LookalikePane {
     pub loading: bool,
     pub error: Option<String>,
     pub selected: Option<usize>,
+    /// A typo in the request (as-of date…): a "check the inputs" card, not a failed run.
+    pub input_error: Option<String>,
+    /// Text-box buffer of the ticker chooser; the real `symbol` is only set on commit. Not persisted.
+    pub ticker_draft: String,
 }
 
 impl LookalikePane {
@@ -35,6 +39,8 @@ impl LookalikePane {
             loading: false,
             error: None,
             selected: None,
+            input_error: None,
+            ticker_draft: String::new(),
         }
     }
 
@@ -77,29 +83,32 @@ impl LookalikePane {
                 self.as_of = report.as_of.clone();
                 self.report = Some(report);
             }
-            Err(e) => {
-                self.error = Some(e);
-                self.report = None;
-            }
+            // Keep the previous snapshot; run_state labels it as such.
+            Err(e) => self.error = Some(e),
         }
     }
 
     pub fn request(&mut self, pane: PaneId, worker: &crate::worker::Worker) {
         let symbol = self.symbol.trim();
         if symbol.is_empty() {
-            self.error =
-                Some("LOOKALIKE needs a ticker (AAPL LOOKALIKE). Sample/display prices are never used.".into());
+            // Needs input, not an error: the pane shows a ticker chooser.
             self.loading = false;
             return;
         }
         let query = match self.query() {
             Ok(q) => q,
             Err(e) => {
-                self.error = Some(e);
+                self.input_error = Some(e);
                 self.loading = false;
                 return;
             }
         };
+        self.input_error = None;
+        // A kept snapshot belongs to one ticker: never show it under another name.
+        if self.report.as_ref().is_some_and(|r| !crate::widgets::same_security(&r.symbol, symbol)) {
+            self.report = None;
+            self.selected = None;
+        }
         self.generation += 1;
         self.loading = true;
         self.error = None;
@@ -159,11 +168,8 @@ impl TerminalApp {
 
     pub(super) fn open_lookalike(&mut self, symbol: Option<&str>, spec: &str) {
         let symbol = symbol.map(|s| tr_data::security(s).key()).or_else(|| self.focused_symbol()).unwrap_or_default();
-        let mut pane = LookalikePane::new(symbol, spec);
-        if pane.symbol.is_empty() {
-            pane.error =
-                Some("LOOKALIKE needs a ticker (AAPL LOOKALIKE). Sample/display prices are never used.".into());
-        }
+        // No focused ticker is a setup state (a ticker chooser), not an error.
+        let pane = LookalikePane::new(symbol, spec);
         let ticker = if pane.symbol.is_empty() { "Lookalikes".into() } else { tr_data::security(&pane.symbol).ticker };
         self.status = format!("{ticker}: historical lookalikes (verified archive only, paper / research)");
         self.open_panel(PaneKind::Lookalike(Box::new(pane)));
@@ -176,50 +182,60 @@ impl TerminalApp {
         let mut reload = false;
         let mut export = false;
         let mut jump: Option<(String, i64)> = None;
+        let watchlist = self.watchlist.clone();
         {
             let PaneKind::Lookalike(pane) = &mut self.panes[i].kind else { return vec![] };
-            if !pane.loading && pane.report.is_none() && pane.error.is_none() && !pane.symbol.trim().is_empty() {
+            if !pane.loading && pane.report.is_none() && pane.error.is_none() && pane.input_error.is_none() && !pane.symbol.trim().is_empty() {
                 pane.request(id, &self.worker);
             }
 
-            ui.horizontal_wrapped(|ui| {
-                ui.label(RichText::new("Lookalikes").strong().color(text()));
-                ui.label(RichText::new("paper / research only").font(mono(11.0)).color(amber()));
-                if ui.small_button("Reload").on_hover_text("Recompute from the research archive").clicked() {
-                    reload = true;
-                }
-                if ui
-                    .small_button("Export")
-                    .on_hover_text("Write lookalike JSON with source, as-of, counts and overlap (EXPORT LOOKALIKE)")
-                    .clicked()
+            let has_symbol = !pane.symbol.trim().is_empty();
+            let context = if let Some(r) = &pane.report {
+                r.ticker.clone()
+            } else if has_symbol {
+                tr_data::security(&pane.symbol).ticker
+            } else {
+                "paper / research only".into()
+            };
+            let legacy = pane.report.as_ref().map(|r| format!("{} · {}", r.provenance.label(), r.source));
+            let source = legacy.as_deref().map(|l| crate::widgets::HeaderSource { lead: "", parts: &[], legacy: l });
+            crate::widgets::pane_header(ui, "Lookalikes", &context, source, |ui| {
+                if has_symbol
+                    && crate::widgets::header_button(ui, "Export", "Write lookalike JSON with source, as-of, counts and overlap (EXPORT LOOKALIKE)", false)
+                        .clicked()
                 {
                     export = true;
                 }
+                if has_symbol
+                    && crate::widgets::header_button(ui, "Reload", "Recompute from the research archive", false).clicked()
+                {
+                    reload = true;
+                }
             });
-            ui.label(
-                RichText::new(
-                    "Find past sessions that looked like this date, jump the archive chart to a neighbor, and compare subsequent returns. Counts come before frequencies. Incomplete horizons are labelled, never invented.",
-                )
-                .font(ui_font(11.5))
-                .color(muted()),
+            if !has_symbol {
+                let what = "Find past sessions that looked like this one in the verified research archive and compare what happened next.";
+                if let Some(key) = crate::widgets::needs_ticker(ui, what, &mut pane.ticker_draft, &watchlist) {
+                    pane.symbol = key;
+                    pane.ticker_draft.clear();
+                    pane.request(id, &self.worker);
+                }
+                return actions;
+            }
+            crate::widgets::methodology(
+                ui,
+                (id, "knn-method"),
+                "Find past sessions that looked like this date, jump the archive chart to a neighbor, and compare subsequent returns. Counts come before frequencies. Incomplete horizons are labelled, never invented.",
             );
             if sample_offline {
-                ui.label(
-                    RichText::new(
-                        "Sample / offline display mode does not feed this pane. Lookalikes never fall back to sample bars.",
-                    )
-                    .font(ui_font(12.0))
-                    .color(theme::down()),
+                crate::widgets::chip(
+                    ui,
+                    crate::widgets::ChipKind::Neutral,
+                    "Sample display mode: this pane needs the research archive and never uses sample bars",
                 );
             }
 
             ui.horizontal_wrapped(|ui| {
-                ui.label(RichText::new("Ticker").color(muted()));
-                let changed = ui
-                    .add(egui::TextEdit::singleline(&mut pane.symbol).desired_width(110.0).hint_text("AAPL"))
-                    .lost_focus()
-                    && ui.input(|i| i.key_pressed(egui::Key::Enter));
-                if changed {
+                if crate::widgets::anchor_field(ui, "Ticker", &mut pane.ticker_draft, &pane.symbol) {
                     reload = true;
                 }
                 ui.label(RichText::new("As-of").color(muted()));
@@ -257,19 +273,27 @@ impl TerminalApp {
                 }
             });
 
-            if let Some(err) = &pane.error {
-                ui.label(RichText::new(err).font(mono(12.0)).color(theme::down()));
-            } else if pane.loading {
-                ui.label(RichText::new("Reading research archive…").font(mono(12.0)).color(muted()));
-            }
-
-            if pane.report.is_some() {
+            let show = if let Some(e) = &pane.input_error {
+                crate::widgets::input_error_card(ui, e);
+                false
+            } else {
+                crate::widgets::run_state(
+                    ui,
+                    pane.loading,
+                    pane.error.as_deref(),
+                    pane.report.is_some(),
+                    "Reading research archive…",
+                    &mut reload,
+                )
+            };
+            if show && pane.report.is_some() {
                 jump = render_report(ui, pane);
             }
         }
 
         if reload {
             if let PaneKind::Lookalike(pane) = &mut self.panes[i].kind {
+                crate::widgets::commit_anchor(&mut pane.symbol, &mut pane.ticker_draft);
                 pane.request(id, &self.worker);
             }
         }
@@ -288,16 +312,11 @@ fn render_report(ui: &mut Ui, pane: &mut LookalikePane) -> Option<(String, i64)>
     let mut jump = None;
     ui.label(
         RichText::new(format!(
-            "{} · {} · as-of {} · {} … {} · {} daily bars",
-            report.provenance.label(),
-            report.source,
-            report.as_of,
-            report.start,
-            report.end,
-            report.bars
+            "as-of {} · {} … {} · {} daily bars",
+            report.as_of, report.start, report.end, report.bars
         ))
         .font(mono(11.5))
-        .color(theme::provenance(report.provenance)),
+        .color(muted()),
     );
     ui.label(
         RichText::new(format!(

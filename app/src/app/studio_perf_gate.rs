@@ -175,6 +175,10 @@ fn perf_gate_paint_studios() {
     best.extend(resid_sample());
     best.extend(attr_sample());
     best.extend(source_chip_sample());
+    best.extend(numeric_table_sample());
+    best.extend(legend_sample());
+    best.extend(pane_chrome_sample());
+    best.extend(sidebar_sample());
     let ids: BTreeSet<_> = budgets.cases.keys().filter(|id| id.starts_with("paint.studio_")).cloned().collect();
     assert_eq!(best.keys().cloned().collect::<BTreeSet<_>>(), ids, "stale/missing studio budgets");
     for _ in 0..2 {
@@ -199,6 +203,10 @@ fn perf_gate_paint_studios() {
             .chain(resid_sample())
             .chain(attr_sample())
             .chain(source_chip_sample())
+            .chain(numeric_table_sample())
+            .chain(legend_sample())
+            .chain(pane_chrome_sample())
+            .chain(sidebar_sample())
         {
             if s.median_us < best[&id].median_us {
                 best.insert(id, s);
@@ -1267,6 +1275,241 @@ fn source_chip_frame(ctx: &egui::Context, index: usize) -> egui::FullOutput {
     out.textures_delta.clear();
     out
 }
+/// Measured numeric table: the Lab coefficient table at 900 (wide grid) and 320 (compact grid) over a
+/// real-fit-shaped report built in code; layout, typed formatting and painting all run per frame.
+fn numeric_table_frame(
+    ctx: &egui::Context,
+    report: &tr_data::studio_lab::LabReport,
+    st: &mut super::studio_lab::LabUi,
+    index: usize,
+) -> egui::FullOutput {
+    let mut out = ctx.run_ui(
+        egui::RawInput {
+            time: Some(1. + index as f64 * 0.2),
+            screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(1000., 4000.))),
+            ..Default::default()
+        },
+        |ui| {
+            for width in [900., 320.] {
+                for k in 0..4 {
+                    ui.push_id((width as u32, k), |ui| super::studio_lab::table(ui, report, st, width));
+                }
+            }
+        },
+    );
+    out.textures_delta.clear();
+    out
+}
+fn numeric_table_sample() -> BTreeMap<String, Summary> {
+    let ctx = egui::Context::default();
+    let report = super::studio_lab::fixture_report(400);
+    assert!(report.fit.is_some());
+    let mut st = super::studio_lab::LabUi::default();
+    for i in 0..20 {
+        finite(&ctx, numeric_table_frame(&ctx, &report, &mut st, i));
+    }
+    let mut times: BTreeMap<String, Vec<f64>> = BTreeMap::new();
+    for i in 0..120 {
+        let start = Instant::now();
+        let mut out = numeric_table_frame(&ctx, &report, &mut st, i + 20);
+        let ui_us = start.elapsed().as_secs_f64() * 1e6;
+        if i == 60 {
+            let txt = text(&out.shapes);
+            // 8 tables, each with its header and k = 1 + 7 factor rows; compact ones hide z/p/q/VIF.
+            assert_eq!(txt.matches("Term").count(), 8, "{txt}");
+            assert_eq!(txt.matches("95% CI").count(), 8);
+            assert_eq!(txt.matches("click a row for SE").count(), 4, "compact hint");
+            assert!(txt.contains("intercept") && txt.contains('\u{2212}'), "typed signs");
+            assert!(out.shapes.len() >= 8 * 8, "rows painted: {}", out.shapes.len());
+        }
+        let start = Instant::now();
+        let primitives = ctx.tessellate(std::mem::take(&mut out.shapes), out.pixels_per_point);
+        let tess_us = start.elapsed().as_secs_f64() * 1e6;
+        assert!(!primitives.is_empty());
+        std::hint::black_box(primitives);
+        for (metric, v) in [("ui", ui_us), ("tess", tess_us), ("total", ui_us + tess_us)] {
+            times.entry(format!("paint.studio_numeric_table.steady.{metric}")).or_default().push(v);
+        }
+    }
+    times.into_iter().map(|(id, mut s)| (id, tr_perf::summarize(&mut s))).collect()
+}
+/// One legend owner: OHLC header, SMA20 / SMA50 and the fair-value caption laid out through the
+/// shared allocator every frame (relate fixture with real fixture bars; indicators built in code).
+fn legend_sample() -> BTreeMap<String, Summary> {
+    let ctx = egui::Context::default();
+    let (worker, mut requests) = crate::worker::Worker::test_channel();
+    let mut pane = super::studio_hub::prepared_relate(&worker, &mut requests);
+    pane.chart.studio_test_add_smas();
+    for i in 0..20 {
+        finite(&ctx, fv_frame(&ctx, &mut pane, &worker, 1440., false, i));
+    }
+    while requests.try_recv().is_ok() {}
+    let mut times: BTreeMap<String, Vec<f64>> = BTreeMap::new();
+    for i in 0..120 {
+        let start = Instant::now();
+        let mut out = fv_frame(&ctx, &mut pane, &worker, 1440., false, i + 20);
+        let ui_us = start.elapsed().as_secs_f64() * 1e6;
+        if i == 60 {
+            let (rows, disjoint) = pane.chart.studio_test_legend();
+            disjoint.unwrap();
+            assert!(rows.len() >= 4, "OHLC + SMA20 + SMA50 + caption rows: {rows:?}");
+            let txt = text(&out.shapes);
+            assert!(txt.contains("Fair value · frozen fit") && txt.contains("SMA"), "{txt}");
+        }
+        let start = Instant::now();
+        let primitives = ctx.tessellate(std::mem::take(&mut out.shapes), out.pixels_per_point);
+        let tess_us = start.elapsed().as_secs_f64() * 1e6;
+        assert!(!primitives.is_empty());
+        std::hint::black_box(primitives);
+        for (metric, v) in [("ui", ui_us), ("tess", tess_us), ("total", ui_us + tess_us)] {
+            times.entry(format!("paint.studio_legend.steady.{metric}")).or_default().push(v);
+        }
+    }
+    times.into_iter().map(|(id, mut s)| (id, tr_perf::summarize(&mut s))).collect()
+}
+/// UX cleanup slice 3: shared pane chrome. Twelve `pane_header`s (with a source chip), every
+/// `analysis_state` card, the ticker chooser and the run-state ladder, all laid out and painted per frame.
+fn pane_chrome_frame(ctx: &egui::Context, index: usize) -> egui::FullOutput {
+    use crate::widgets::{AnalysisKind, AnalysisState};
+    use tr_data::source_receipt::SourceReceipt;
+    let receipt = SourceReceipt::new("yahoo", 24_841, Some(1_763_596_800));
+    let mut buf = String::new();
+    let watch: Vec<String> = ["AAPL", "MSFT", "SPY"].iter().map(|s| tr_data::security(s).key()).collect();
+    let mut out = ctx.run_ui(
+        egui::RawInput {
+            time: Some(1. + index as f64 * 0.2),
+            screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(1000., 4000.))),
+            ..Default::default()
+        },
+        |ui| {
+            let parts = [("SPX", &receipt)];
+            for k in 0..12 {
+                ui.push_id(k, |ui| {
+                    crate::widgets::pane_header(
+                        ui,
+                        "Pane",
+                        "SPX · 1D",
+                        Some(crate::widgets::HeaderSource { lead: "", parts: &parts, legacy: "" }),
+                        |ui| {
+                            crate::widgets::header_button(ui, "Reload", "", false);
+                            crate::widgets::header_button(ui, "Inspector", "", k % 2 == 0);
+                        },
+                    );
+                });
+            }
+            for kind in AnalysisKind::ALL {
+                ui.push_id(kind as u8, |ui| {
+                    crate::widgets::analysis_state(ui, &AnalysisState::new(kind, "Title", "Detail text"), |_| {});
+                });
+            }
+            ui.push_id("picker", |ui| {
+                crate::widgets::needs_ticker(ui, "Pick one", &mut buf, &watch);
+            });
+            let mut retry = false;
+            ui.push_id("ladder", |ui| {
+                crate::widgets::run_state(ui, true, None, true, "Loading", &mut retry);
+                crate::widgets::run_state(ui, false, Some("timed out"), true, "", &mut retry);
+            });
+        },
+    );
+    out.textures_delta.clear();
+    out
+}
+fn pane_chrome_sample() -> BTreeMap<String, Summary> {
+    let ctx = egui::Context::default();
+    for i in 0..20 {
+        finite(&ctx, pane_chrome_frame(&ctx, i));
+    }
+    let mut times: BTreeMap<String, Vec<f64>> = BTreeMap::new();
+    for i in 0..120 {
+        let start = Instant::now();
+        let mut out = pane_chrome_frame(&ctx, i + 20);
+        let ui_us = start.elapsed().as_secs_f64() * 1e6;
+        if i == 60 {
+            let txt = text(&out.shapes);
+            assert_eq!(txt.matches("Yahoo · thru Nov 20").count(), 12, "{txt}");
+            assert_eq!(txt.matches("24,841 bars").count(), 12);
+            // Every state is present and distinct; the ready state paints nothing.
+            for label in ["LOADING", "CHOOSE", "NO RESULTS", "UNAVAILABLE", "PREVIOUS SNAPSHOT", "FAILED"] {
+                assert!(txt.contains(label), "missing {label}: {txt}");
+            }
+            assert!(txt.contains("Use ticker") && txt.contains("AAPL"), "ticker chooser");
+            assert!(txt.contains("Updating · showing previous snapshot") && txt.contains("refresh failed"), "{txt}");
+            assert!(out.shapes.len() >= 12 * 3 + 6, "chrome painted: {}", out.shapes.len());
+        }
+        let start = Instant::now();
+        let primitives = ctx.tessellate(std::mem::take(&mut out.shapes), out.pixels_per_point);
+        let tess_us = start.elapsed().as_secs_f64() * 1e6;
+        assert!(!primitives.is_empty());
+        std::hint::black_box(primitives);
+        for (metric, v) in [("ui", ui_us), ("tess", tess_us), ("total", ui_us + tess_us)] {
+            times.entry(format!("paint.studio_pane_chrome.steady.{metric}")).or_default().push(v);
+        }
+    }
+    times.into_iter().map(|(id, mut s)| (id, tr_perf::summarize(&mut s))).collect()
+}
+/// The real sidebar: every destination row, exact active state (Studio focused on the When lens),
+/// grouped sections and a twelve-name watchlist whose provenance is stated once.
+fn sidebar_sample() -> BTreeMap<String, Summary> {
+    use tr_data::studio::StudioLens;
+    let mut app = super::tests::test_app();
+    app.watchlist = ["AAPL", "MSFT", "NVDA", "SPY", "QQQ", "TLT", "GLD", "AMZN", "GOOGL", "META", "TSLA", "IWM"]
+        .iter()
+        .map(|s| tr_data::security(s).key())
+        .collect();
+    let studio = super::studio_hub::StudioPane::new(super::studio_hub::StudioViewSpec {
+        lens: StudioLens::When,
+        ..Default::default()
+    });
+    app.open_panel(super::PaneKind::Studio(Box::new(studio)));
+    let ctx = egui::Context::default();
+    let frame = |ctx: &egui::Context, app: &mut super::TerminalApp, i: usize| {
+        let mut out = ctx.run_ui(
+            egui::RawInput {
+                time: Some(1. + i as f64 * 0.2),
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(1000., 1600.))),
+                ..Default::default()
+            },
+            |ui| {
+                app.sidebar(ui, Rect::from_min_size(Pos2::ZERO, vec2(260., 1600.)));
+            },
+        );
+        out.textures_delta.clear();
+        out
+    };
+    for i in 0..20 {
+        finite(&ctx, frame(&ctx, &mut app, i));
+    }
+    let mut times: BTreeMap<String, Vec<f64>> = BTreeMap::new();
+    for i in 0..120 {
+        let start = Instant::now();
+        let mut out = frame(&ctx, &mut app, i + 20);
+        let ui_us = start.elapsed().as_secs_f64() * 1e6;
+        if i == 60 {
+            let txt = text(&out.shapes);
+            for word in ["Research", "Sessions", "Markets", "Trading", "When", "Add cash levels to chart", "Commands & Hotkeys"] {
+                assert!(txt.contains(word), "sidebar missing {word}");
+            }
+            assert!(!txt.contains("PDF"), "stray mnemonic");
+            let focused = app.panes.iter().find(|p| p.id == app.focus).map(|p| &p.kind);
+            let lit: Vec<_> = super::nav::NavDest::ALL
+                .into_iter()
+                .filter(|d| d.active(focused, app.settings_tab))
+                .collect();
+            assert_eq!(lit, [super::nav::NavDest::When], "exactly the focused lens is lit");
+            assert!(out.shapes.len() > 150, "sidebar painted: {}", out.shapes.len());
+        }
+        let start = Instant::now();
+        let primitives = ctx.tessellate(std::mem::take(&mut out.shapes), out.pixels_per_point);
+        let tess_us = start.elapsed().as_secs_f64() * 1e6;
+        assert!(!primitives.is_empty());
+        std::hint::black_box(primitives);
+        for (metric, v) in [("ui", ui_us), ("tess", tess_us), ("total", ui_us + tess_us)] {
+            times.entry(format!("paint.studio_sidebar.steady.{metric}")).or_default().push(v);
+        }
+    }
+    times.into_iter().map(|(id, mut s)| (id, tr_perf::summarize(&mut s))).collect()
+}
 fn source_chip_sample() -> BTreeMap<String, Summary> {
     let ctx = egui::Context::default();
     for i in 0..20 {
@@ -1642,7 +1885,8 @@ fn fv_guard(pane: &super::studio_hub::StudioPane, out: &egui::FullOutput, hover:
     let txt = text(&out.shapes);
     // The default viewport shows the latest bars, which are all out of sample; the in-sample note is
     // printed only when an in-sample region is on screen.
-    for word in ["FAIR VALUE · logret h=5", "frozen fit thru", "residual ±σ bands (target space)"] {
+    // The caption is short; the fit, thru-date and band definition are on its hover.
+    for word in ["Fair value · frozen fit"] {
         assert!(txt.contains(word), "fair-value overlay missing {word}: {txt}");
     }
     assert!(fv_strips(out) > 20, "band fills missing: {}", fv_strips(out));
@@ -1721,7 +1965,64 @@ fn fair_value_overlay_paints_bands_and_actual_hover() {
     pane.corr_mut().unwrap().relate.as_mut().unwrap().bands = false;
     let out = fv_frame(&ctx, &mut pane, &worker, 1440., false, 200);
     assert_eq!(fv_strips(&out), 0);
-    assert!(text(&out.shapes).contains("FAIR VALUE · "));
+    assert!(text(&out.shapes).contains("Fair value · frozen fit"));
+}
+#[test]
+fn fair_value_caption_hover_defines_fit_thru_bands_and_source() {
+    let ctx = egui::Context::default();
+    let (worker, mut requests) = crate::worker::Worker::test_channel();
+    let mut pane = super::studio_hub::prepared_relate(&worker, &mut requests);
+    for i in 0..5 {
+        fv_frame(&ctx, &mut pane, &worker, 1440., false, i);
+    }
+    ctx.all_styles_mut(|s| s.interaction.tooltip_delay = 0.);
+    let (rows, _) = pane.chart.studio_test_legend();
+    let cap = rows.iter().find(|(t, _)| t.starts_with("Fair value · frozen fit")).expect("caption row").1;
+    let mut seen = String::new();
+    for i in 0..12 {
+        let mut out = ctx.run_ui(
+            egui::RawInput {
+                time: Some(10. + i as f64 * 0.2),
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(1440., 900.))),
+                events: vec![egui::Event::PointerMoved(cap.center())],
+                ..Default::default()
+            },
+            |ui| {
+                pane.show(ui, 201, &worker, false, true);
+            },
+        );
+        out.textures_delta.clear();
+        seen = text(&out.shapes);
+    }
+    for word in ["frozen fit thru", "residual ±σ bands", "source"] {
+        assert!(seen.contains(word), "caption hover missing {word}: {seen}");
+    }
+}
+#[test]
+fn legend_rows_ohlc_sma_and_fair_value_never_intersect_at_widths_and_scales() {
+    for ppp in [1.0f32, 2.0] {
+        for width in [480., 640., 900., 1440.] {
+            let ctx = egui::Context::default();
+            ctx.set_pixels_per_point(ppp);
+            let (worker, mut requests) = crate::worker::Worker::test_channel();
+            let mut pane = super::studio_hub::prepared_relate(&worker, &mut requests);
+            pane.chart.studio_test_add_smas();
+            for i in 0..3 {
+                fv_frame(&ctx, &mut pane, &worker, width, false, i);
+            }
+            let (rows, disjoint) = pane.chart.studio_test_legend();
+            disjoint.unwrap_or_else(|e| panic!("{width}@{ppp}: {e}"));
+            let find = |p: &str| rows.iter().find(|(t, _)| t.starts_with(p)).map(|(_, r)| *r);
+            let ohlc = rows.first().expect("OHLC header row").1;
+            let (s20, s50) = (find("SMA(20)").or_else(|| find("SMA 20")).or_else(|| find("SMA20")), find("SMA(50)").or_else(|| find("SMA 50")).or_else(|| find("SMA50")));
+            let fair = find("Fair value · frozen fit").expect("fair-value caption row");
+            let (s20, s50) = (s20.unwrap_or_else(|| panic!("SMA20 row in {:?}", rows.iter().map(|r| &r.0).collect::<Vec<_>>())), s50.expect("SMA50 row"));
+            // Four distinct rows stacked top to bottom: OHLC, SMA20, SMA50, then the fair-value caption.
+            for (a, b) in [(ohlc, s20), (s20, s50), (s50, fair)] {
+                assert!(!a.intersects(b) && a.top() < b.top(), "{width}@{ppp}: {a:?} vs {b:?}");
+            }
+        }
+    }
 }
 #[test]
 fn fair_value_gap_breaks_split_band_polygons() {
@@ -1756,12 +2057,12 @@ fn fair_value_clears_on_context_change() {
     let (worker, mut requests) = crate::worker::Worker::test_channel();
     let mut pane = super::studio_hub::prepared_relate(&worker, &mut requests);
     let out = fv_frame(&ctx, &mut pane, &worker, 1440., false, 0);
-    assert!(text(&out.shapes).contains("FAIR VALUE · "));
+    assert!(text(&out.shapes).contains("Fair value · frozen fit"));
     let old = pane.corr_mut().unwrap().generation;
     let report = pane.corr_mut().unwrap().report.clone().unwrap();
     pane.set_context_symbol("MSFT US Equity");
     let out = fv_frame(&ctx, &mut pane, &worker, 1440., false, 1);
-    assert!(!text(&out.shapes).contains("FAIR VALUE"), "overlay must clear on the same frame");
+    assert!(!text(&out.shapes).contains("Fair value · frozen fit"), "overlay must clear on the same frame");
     assert!(fv_band_meshes(&out).is_empty());
     // A late response carrying the old token is ignored by the replacement child.
     pane.ensure_child();
@@ -1778,15 +2079,15 @@ fn fair_value_not_painted_in_quick_canvas_mode_or_for_other_inputs() {
     // Changed inputs: the accepted report no longer matches, so nothing is painted.
     pane.corr_mut().unwrap().relate.as_mut().unwrap().transform = tr_data::studio::Transform::Change { h: 5 };
     let out = fv_frame(&ctx, &mut pane, &worker, 1440., false, 0);
-    assert!(!text(&out.shapes).contains("FAIR VALUE"));
+    assert!(!text(&out.shapes).contains("Fair value · frozen fit"));
     pane.corr_mut().unwrap().relate.as_mut().unwrap().transform = tr_data::studio::Transform::LogReturn { h: 5 };
-    assert!(text(&fv_frame(&ctx, &mut pane, &worker, 1440., false, 1).shapes).contains("FAIR VALUE"));
+    assert!(text(&fv_frame(&ctx, &mut pane, &worker, 1440., false, 1).shapes).contains("Fair value · frozen fit"));
     // Quick canvas: the y axis is not price, so the overlay must not paint.
     let mut view = pane.chart.canvas_view();
     view.enabled = true;
     pane.chart.set_canvas_view(view);
     let out = fv_frame(&ctx, &mut pane, &worker, 1440., false, 2);
-    assert!(!text(&out.shapes).contains("FAIR VALUE"));
+    assert!(!text(&out.shapes).contains("Fair value · frozen fit"));
 }
 #[test]
 fn relate_bands_hover_text_distinguishes_residual_band_from_mean_ci() {

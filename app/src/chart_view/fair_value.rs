@@ -9,6 +9,11 @@ use super::*;
 use egui::epaint::{Mesh, Vertex};
 use tr_data::studio_corr::{CorrReport, FairValuePoint, RelateReport};
 
+/// Legend caption (the fit thru-date, bands and source are on hover).
+pub(crate) const FAIR_VALUE_CAPTION: &str = "Fair value · frozen fit";
+const FAIR_VALUE_NOTE: &str = "dimmed = in-sample · lighter = embargo";
+const FAIR_VALUE_NOTE_DETAIL: &str = "dimmed = in-sample descriptive (training prefix); lighter dim = embargo (h−1 rows, not fitted)";
+
 /// One drawable run: consecutive overlay points that map to consecutive chart bars with the same
 /// in-sample state and no break.
 struct Run {
@@ -36,6 +41,29 @@ impl ChartState {
     pub(crate) fn studio_test_x_of(&self, ts: i64) -> Option<f32> {
         let idx = self.fair_value_bar(ts)?;
         Some(self.studio_plot?.left() + self.viewport?.x_center(idx) as f32)
+    }
+
+    /// Test probe: SMA20 + SMA50 built from the chart's own (fixture) bars so the legend carries
+    /// indicator rows like a live chart.
+    #[cfg(test)]
+    pub(crate) fn studio_test_add_smas(&mut self) {
+        self.indicators = crate::command::default_indicators();
+        let built = crate::worker::build_indicators(&self.bars, self.tf, &self.indicators, &theme::palette());
+        self.on_indicators(self.generation, built);
+        assert_eq!(self.built.len(), 2);
+    }
+
+    /// Test probe: the price plot rect of the last native frame.
+    #[cfg(test)]
+    pub(crate) fn studio_test_plot(&self) -> Option<egui::Rect> {
+        self.studio_plot
+    }
+
+    /// Test probe: this frame's legend rows and whether they are pairwise disjoint.
+    #[cfg(test)]
+    pub(crate) fn studio_test_legend(&self) -> (Vec<(String, egui::Rect)>, Result<(), String>) {
+        let rows = self.legend.borrow();
+        (rows.rows.clone(), rows.disjoint())
     }
 
     /// Hover target: the overlay point on the bar under `x` (pixels from the plot's left edge).
@@ -143,7 +171,7 @@ impl ChartState {
                 Stroke::new(1.5, [accent.gamma_multiply(0.55), accent.gamma_multiply(0.78), accent][run.state as usize]);
             painter.extend(egui::Shape::dashed_line(&line, stroke, 6.0, 4.0));
         }
-        let caption = format!(
+        let detail = format!(
             "FAIR VALUE · {} · frozen fit thru {} · residual ±σ bands (target space) · {} · source {}",
             fit.transform.short(),
             chrono::DateTime::from_timestamp(fit.train_end, 0).map_or_else(String::new, |d| d.format("%Y-%m-%d").to_string()),
@@ -154,19 +182,25 @@ impl ChartState {
             },
             corr.source
         );
-        painter.text(rect.left_top() + vec2(8., 24.), egui::Align2::LEFT_TOP, caption, theme::ui_font(10.), theme::muted());
-        if runs.iter().any(|r| r.state < 2) {
-            painter.text(
-                rect.left_top() + vec2(8., 38.),
-                egui::Align2::LEFT_TOP,
-                "dimmed = in-sample descriptive (training prefix); lighter dim = embargo (h−1 rows, not fitted)",
-                theme::ui_font(10.),
-                theme::muted(),
-            );
+        // Captions go through the chart's single legend allocator: measured rows below the last
+        // OHLC / indicator row, never at a fixed top offset. The long text is the hover.
+        let mut captions: Vec<Rect> = Vec::new();
+        {
+            let mut rows = self.legend.borrow_mut();
+            rows.ensure(rect, ui.ctx().cumulative_pass_nr());
+            let cap = rows.put(&painter, FAIR_VALUE_CAPTION, theme::ui_font(10.), theme::muted());
+            ui.interact(cap, ui.id().with((self.id, "fair-value-caption")), egui::Sense::hover()).on_hover_text(detail);
+            captions.push(cap);
+            if runs.iter().any(|r| r.state < 2) {
+                let note = rows.put(&painter, FAIR_VALUE_NOTE, theme::ui_font(10.), theme::muted());
+                ui.interact(note, ui.id().with((self.id, "fair-value-note")), egui::Sense::hover()).on_hover_text(FAIR_VALUE_NOTE_DETAIL);
+                captions.push(note);
+            }
         }
         // Hover: nearest overlay point on the bar under the pointer.
         if let Some(pos) = ui.input(|i| i.pointer.hover_pos())
             && rect.contains(pos)
+            && !captions.iter().any(|c| c.contains(pos))
             && ui.rect_contains_pointer(rect)
             && let Some(p) = self.fair_value_at(rel, (pos.x - rect.left()) as f64)
             && let Some(idx) = self.fair_value_bar(p.ts)
