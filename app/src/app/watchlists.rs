@@ -217,6 +217,27 @@ impl TerminalApp {
         self.watchlist = self.watchlists.symbols();
         self.last_quotes = None;
         self.save_settings();
+        self.submit_daily_vault();
+    }
+    /// Configured Daily Vault symbols: every watchlist group, the default watchlist and the
+    /// preference extras, canonicalised and deduplicated. Sent as an intention; the worker
+    /// does any fetching. Sample mode never submits.
+    pub(super) fn submit_daily_vault(&self) {
+        if self.worker.mode() == tr_data::DataMode::ExplicitSample {
+            return;
+        }
+        let watch = self.watchlists.symbols();
+        let symbols = crate::daily_vault::configured_symbols(
+            watch
+                .iter()
+                .map(String::as_str)
+                .chain(super::DEFAULT_WATCHLIST)
+                .chain(self.prefs.daily_vault.extra_symbols.iter().map(String::as_str)),
+        );
+        self.worker.send(crate::worker::Request::ConfigureDailyVault {
+            symbols,
+            auto: self.prefs.daily_vault.auto_update,
+        });
     }
     pub(super) fn selected_member(&self) -> Option<Member> {
         if let Some(i) = self.idx(self.focus) {

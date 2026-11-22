@@ -730,9 +730,27 @@ pub struct Prefs {
     pub panels: PanelDefaults,
     /// Order entry through SnapTrade (off unless the user turns it on).
     pub trading: TradingPrefs,
+    /// Daily Vault maintenance (absent in older files: defaults apply).
+    #[serde(default)]
+    pub daily_vault: DailyVaultPrefs,
     /// A custom theme built from v2 appearance overrides, for the app to save.
     #[serde(skip)]
     pub migrated_theme: Option<crate::themes::Theme>,
+}
+
+/// Daily Vault settings. The configured symbol set is the watchlists, the default watchlist and
+/// `extra_symbols`; removing a symbol stops automatic updates but never deletes stored data.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct DailyVaultPrefs {
+    /// Refresh due symbols automatically (at most once per symbol per UTC day).
+    pub auto_update: bool,
+    pub extra_symbols: Vec<String>,
+}
+impl Default for DailyVaultPrefs {
+    fn default() -> Self {
+        Self { auto_update: true, extra_symbols: vec![] }
+    }
 }
 
 impl Default for Prefs {
@@ -744,6 +762,7 @@ impl Default for Prefs {
             hotkeys: Keymap::default(),
             panels: PanelDefaults::default(),
             trading: TradingPrefs::default(),
+            daily_vault: DailyVaultPrefs::default(),
             migrated_theme: None,
         }
     }

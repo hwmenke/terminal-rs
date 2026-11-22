@@ -150,6 +150,12 @@ pub struct Snapshot<T> {
     pub source: String,
     pub data: T,
 }
+/// Stable, URL-free identity of the Whats-News transport behind a snapshot's prose `source`.
+/// It names the transport only: the original market-data vendor is not known here, so the daily
+/// vault stores it with an unknown adjustment basis.
+pub fn transport_id(source: &str) -> &'static str {
+    if source.contains("SQLite") { "whats-news:sqlite" } else { "whats-news:http" }
+}
 /// SCAN snapshot with cached breadth of the full loaded universe.
 #[derive(Debug, Clone)]
 pub struct ScanSnapshot {

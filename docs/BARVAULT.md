@@ -128,3 +128,59 @@ No live provider was queried to establish Alpaca H1 anchoring or IEX sparsity. T
 ## Measured timings
 
 Run the offline storage microbenchmark with `cargo bench -p tr-data --bench barvault --profile dev`. It seeds 100,000 cash-grid fixture bars into in-memory SQLite, then measures five agreeing ingests of 2,730 overlapping bars and five 20,000-bar reads. On this workspace (dev profile, in-memory SQLite), the original build measured **192.0 ms per ingest** (it re-read the whole series); with range-bounded ingest (overlap read, per-day session rebuild, incremental counters) it measures **~20 ms per ingest** and **~8 ms per read**. Coverage and the pane snapshot read only `vault_sessions` counters, and pruning finds its cut with an indexed `OFFSET`; only explicit `VAULT VERIFY` re-reads full series. They measure local storage work, not providers, UI latency or physical disk durability.
+
+## Daily Vault (schema v3)
+
+Owner goal: never need synthetic data. Every verified, **closed** real daily OHLCV series obtained from any
+source is kept in this same SQLite file (`bars.sqlite3`, additive v2→v3 migration in one `Immediate`
+transaction; intraday and display-cache rows are untouched and never promoted). Sample mode never opens,
+reads or writes it (`VAULT OFF · sample mode never reads or writes the vault`).
+
+- **Series identity** is `(symbol, source)`. The source id is `origin:name#basis` (e.g.
+  `native:yahoo#quote-ohlcv-v1`, `archive:research#unknown-basis-v1`, `whats-news:http#unknown-basis-v1`).
+  A source or basis change is a new series; sources are never spliced, rescaled or re-baselined. No URL or
+  credential is stored.
+- **Admission** (`vault/daily.rs`): the whole response is validated first (verified provenance, `valid_ohlc`,
+  ascending unique dates, conflicting duplicate dates reject the batch, volume absent = SQL NULL, never 0),
+  then only closed rows are kept. Closure: `UsCashV1` (every row tested against
+  `history::calendar::last_expected_session`, 15-minute grace, early closes), `UtcDailyV1` (crypto),
+  `ConservativeSuccessorV1` (FX/futures/yields/foreign: a row is final only with a later row in the same fetch
+  and a date before the observation's UTC date; the last row stays pending; calendar shown as `unknown calendar`).
+- **Revisions**: per field tolerance `max(1e-8, 1e-6·max(|a|,|b|))` (volume `max(0.5, 1e-8·max)`). Agreement keeps
+  stored values exactly. Disagreement records one pending revision (old/new FNV-1a change hashes,
+  `fnv1a64-bars-v1`; hashes are checksums, not restorable copies), keeps the old series readable with a
+  `PENDING REVISION` warning, and is applied only by an atomic full replacement from the same source that
+  covers every stored date. Failure leaves the old generation intact.
+- **Resolver**: archive → Whats-News → native → **VAULT** (last). Receipt starts
+  `VAULT (<original source>) CLOSED THRU <date>`; fallback is the deterministic whole series with greatest
+  closed-through, then most bars, then source id. It is Cached, never LIVE; reads never advance its clock.
+  Upstream successes are returned even if persistence fails (`VAULT WRITE FAILED: …`).
+- **Write-through** happens at the native D1 boundary, the archive and Whats-News resolver stages and the
+  explicit refresh job, all through `BarVault::daily_ingest`.
+- **Commands**: `VAULT DAILY`, `VAULT DAILY REFRESH [symbol]`, `VAULT DAILY CANCEL`, `VAULT VERIFY` (also checks
+  daily content hashes). `VAULT PRUNE`/`DROP` are intraday-only; daily history is retained.
+- **Maintenance** (`app/src/daily_vault.rs`): configured symbols = all watchlist groups + default watchlist +
+  `prefs.daily_vault.extra_symbols`, canonicalised (`^GSPC` → `SPX Index`). ≤2 concurrent requests, ≥1 s between
+  starts, 4 attempts with 2/4/8 s backoff (provider `Retry-After` wins), no retry of unsupported/unverified data,
+  cooperative cancel, progress ≤4/s, auto-update at most once per symbol per UTC day (`auto_update`, default on).
+  Incremental refresh requests 60 bars (≥ the seven-day overlap); a full same-source comparison (a
+  `FULL_LIMIT` request) runs every 30 days. For native series the comparison timestamp (`last_full_at`) is
+  recorded whenever a `FULL_LIMIT` request was made, while coverage stays `provider-limited`.
+- **Limits**: no cursor/staging tables (one whole-series request per symbol/source, replacement is one
+  transaction); `HIST` service completion hook and Whats-News network refetch jobs are not implemented; the
+  US calendar is approximate historically; FX/futures/yield closure is conservative, not calendar-exact.
+- **Native completeness**: native provider write-through is always a `Window` (coverage `provider-limited`);
+  a large `limit` never proves full history. Only the local research archive and Whats-News whole-series
+  history are stored as `FullAvailable`. A pending revision is applied by any same-source fetch that covers
+  every previously stored date (a covering window applies the revision and appends newer dates, but is not
+  labelled full history: coverage stays `provider-limited`). A non-covering window only records the single
+  pending revision and never deletes or rewrites stored rows. At most one pending revision exists per series. Native maintenance is planned from the native source's own state, never
+  from archive bars or the archive's `last_full_at`.
+- **Dropped spec items** (not implemented):
+  - No write-through on the archive-chart `daily_window` / `bars_window` path.
+  - No pinned-source vault fallback on that path, or on the native daily-chart error path.
+  - The configured symbol set is watchlists + default watchlist + `prefs.daily_vault.extra_symbols` only;
+    saved pane and benchmark symbols are not included.
+  - Eligibility is checked on startup and on watchlist changes, not on a periodic timer.
+  - Refresh jobs do not resume in-flight work across a process restart (jobs are bounded, paced and retried
+    with backoff within a run only).

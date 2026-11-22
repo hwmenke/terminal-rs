@@ -15,6 +15,49 @@ pub struct VaultPane {
     pub error: Option<String>,
     confirm_prune: bool,
     confirm_drop: Option<(String, Option<tr_core::Timeframe>)>,
+    pub daily_tab: bool,
+    pub progress: Option<Arc<crate::daily_vault::Progress>>,
+    selected: Option<String>,
+}
+/// One plain-language backfill/coverage status for a daily series. Missing observations stay
+/// missing; an unknown calendar is said so rather than counted.
+pub(crate) fn daily_status(s: &tr_data::vault::daily::DailySummary, running: bool) -> (String, bool) {
+    if running {
+        return ("running".into(), false);
+    }
+    if s.pending_revisions > 0 {
+        return (format!("REVISION PENDING ({})", s.pending_revisions), true);
+    }
+    if s.bars == 0 {
+        return (format!("failed: {}", s.last_error.as_deref().unwrap_or("no data stored")), true);
+    }
+    if s.last_error.is_some() {
+        return (format!("stale · last attempt failed: {}", s.last_error.as_deref().unwrap_or("")), true);
+    }
+    (if s.coverage == "full-available" { "full available" } else { "partial · provider window" }.into(), false)
+}
+pub(crate) fn daily_row_text(s: &tr_data::vault::daily::DailySummary, today: chrono::NaiveDate) -> String {
+    let date = |d: Option<chrono::NaiveDate>| d.map(|d| d.to_string()).unwrap_or_else(|| "—".into());
+    let stamp = |t: Option<i64>| t.map(tr_data::stats::bar_date).unwrap_or_else(|| "—".into());
+    let lag = s
+        .closed_thru
+        .map(|d| format!("{}d", (today - d).num_days().max(0)))
+        .unwrap_or_else(|| "—".into());
+    format!(
+        "{:<16} {:<34} {:>6} {} → {} · closed {} (+{}{}) · missing {} · rev {} · fetched {} tried {}",
+        tr_data::security(&s.id.symbol).ticker,
+        s.id.source,
+        s.bars,
+        date(s.first_date),
+        date(s.last_date),
+        date(s.closed_thru),
+        lag,
+        if s.policy == tr_data::vault::daily::DailyClosePolicy::UsCashV1 { "" } else { " ±cal?" },
+        s.missing_sessions.map(|m| m.to_string()).unwrap_or_else(|| "unknown calendar".into()),
+        s.revisions,
+        stamp(s.last_fetch_at),
+        stamp(s.last_attempt_at),
+    )
 }
 impl VaultPane {
     pub fn new(symbol: Option<String>) -> Self {
@@ -26,6 +69,101 @@ impl VaultPane {
             error: None,
             confirm_prune: false,
             confirm_drop: None,
+            daily_tab: false,
+            progress: None,
+            selected: None,
+        }
+    }
+    fn show_daily(&mut self, ui: &mut Ui, id: u64, w: &Worker, snapshot: &VaultSnapshot) {
+        ui.horizontal_wrapped(|ui| {
+            if ui.button("Reload coverage").on_hover_text("Reads the stored snapshot only; no market fetch").clicked() {
+                self.request(id, w);
+            }
+            if ui.button("Refresh symbol").on_hover_text("Fetch real closed daily bars for the selected symbol").clicked() {
+                if let Some(sym) = self.selected.clone().or_else(|| self.symbol.clone()) {
+                    w.send(Request::VaultDailyRefresh { symbols: Some(vec![sym]) });
+                }
+            }
+            if ui.button("Refresh all").on_hover_text("Configured symbols: watchlists + defaults + extras").clicked() {
+                w.send(Request::VaultDailyRefresh { symbols: None });
+            }
+            if ui.button("Cancel").clicked() {
+                w.send(Request::VaultDailyCancel);
+            }
+            if ui.button("Verify").clicked() {
+                w.send(Request::VaultVerify);
+            }
+        });
+        let running_now: Vec<String> = self.progress.as_ref().map(|p| p.current.clone()).unwrap_or_default();
+        if let Some(p) = self.progress.as_ref().filter(|p| p.running || p.total > 0) {
+            ui.label(
+                RichText::new(format!(
+                    "{} · {}/{} done · {} failed · {} active · {} queued{}",
+                    if p.running { "REFRESHING" } else { "LAST REFRESH" },
+                    p.done,
+                    p.total,
+                    p.failed,
+                    p.active,
+                    p.queued,
+                    if p.cancelled { " · CANCELLED" } else { "" }
+                ))
+                .font(theme::mono(11.))
+                .color(if p.failed > 0 { theme::caution() } else { theme::cyan() }),
+            );
+        }
+        let bars: usize = snapshot.daily.iter().map(|s| s.bars).sum();
+        ui.label(format!("{} daily series · {} bars · history is never pruned", snapshot.daily.len(), bars));
+        if snapshot.daily.is_empty() {
+            ui.label("No stored daily series yet. Use Refresh all, or open a daily chart: real closed verified bars are kept from then on. Nothing is ever generated.");
+        }
+        let today = chrono::Utc::now().date_naive();
+        let row_h = ui.text_style_height(&egui::TextStyle::Monospace) + 6.;
+        egui::ScrollArea::vertical().id_salt("daily-rows").max_height(ui.available_height() * 0.6).show_rows(
+            ui,
+            row_h,
+            snapshot.daily.len(),
+            |ui, range| {
+                for s in &snapshot.daily[range] {
+                    let (status, bad) = daily_status(s, running_now.contains(&s.id.symbol));
+                    let selected = self.selected.as_deref() == Some(s.id.symbol.as_str());
+                    ui.horizontal(|ui| {
+                        if ui
+                            .selectable_label(selected, RichText::new(daily_row_text(s, today)).font(theme::mono(11.)))
+                            .clicked()
+                        {
+                            self.selected = Some(s.id.symbol.clone());
+                        }
+                        ui.label(RichText::new(status).font(theme::mono(11.)).color(if bad { theme::alert() } else { theme::muted() }));
+                    });
+                }
+            },
+        );
+        ui.separator();
+        ui.label(RichText::new("Revisions (hashes are change checksums, not restorable copies)").small());
+        for r in snapshot.daily_revisions.iter().take(12) {
+            ui.label(
+                RichText::new(format!(
+                    "{} · {} · {} → {} · {} dates {}..{} · {:016x} → {:016x} · {} · {}",
+                    tr_data::stats::bar_date(r.detected_at),
+                    tr_data::security(&r.id.symbol).ticker,
+                    r.old_generation,
+                    r.new_generation.map(|g| g.to_string()).unwrap_or_else(|| "—".into()),
+                    r.changed,
+                    r.first_date,
+                    r.last_date,
+                    r.old_hash,
+                    r.new_hash,
+                    if r.applied { "applied" } else { "PENDING" },
+                    r.reason
+                ))
+                .font(theme::mono(10.))
+                .color(if r.applied { theme::muted() } else { theme::caution() }),
+            );
+        }
+        if let Some(p) = &self.progress {
+            for line in p.log.iter().rev().take(6) {
+                ui.label(RichText::new(line).small().color(theme::muted()));
+            }
         }
     }
     pub fn request(&mut self, pane: u64, w: &Worker) {
@@ -55,14 +193,18 @@ impl VaultPane {
         }
         ui.horizontal(|ui| {
             ui.label(RichText::new("BAR VAULT").font(theme::mono(18.)).color(theme::amber()));
-            if ui.button("Refresh").clicked() {
-                self.request(id, w);
-            }
-            if ui.button("Verify").clicked() {
-                w.send(Request::VaultVerify);
-            }
-            if ui.button("Prune…").clicked() {
-                self.confirm_prune = true;
+            ui.selectable_value(&mut self.daily_tab, false, "Intraday");
+            ui.selectable_value(&mut self.daily_tab, true, "Daily");
+            if !self.daily_tab {
+                if ui.button("Refresh").clicked() {
+                    self.request(id, w);
+                }
+                if ui.button("Verify").clicked() {
+                    w.send(Request::VaultVerify);
+                }
+                if ui.button("Prune…").on_hover_text("Intraday retention only; daily history is retained").clicked() {
+                    self.confirm_prune = true;
+                }
             }
         });
         if self.confirm_prune {
@@ -79,7 +221,7 @@ impl VaultPane {
         }
         if let Some((symbol, tf)) = self.confirm_drop.clone() {
             ui.horizontal(|ui| {
-                ui.label(format!("Delete vaulted {symbol} {tf:?} from every source?"));
+                ui.label(format!("Delete vaulted INTRADAY {symbol} {tf:?} from every source? (daily history is kept)"));
                 if ui.button("Delete").clicked() {
                     w.send(Request::VaultDrop { symbol, tf });
                     self.confirm_drop = None;
@@ -99,6 +241,11 @@ impl VaultPane {
         };
         if snapshot.disabled {
             ui.label("VAULT DISABLED · newer schema");
+            return;
+        }
+        if self.daily_tab {
+            let snapshot = snapshot.clone();
+            self.show_daily(ui, id, w, &snapshot);
             return;
         }
         let bars: usize = snapshot.series.iter().map(|s| s.bars).sum();
@@ -256,6 +403,26 @@ impl TerminalApp {
         match cmd {
             crate::command::VaultCmd::Open => self.open_panel(PaneKind::Vault(Box::new(VaultPane::new(symbol)))),
             crate::command::VaultCmd::Verify => self.worker.send(Request::VaultVerify),
+            crate::command::VaultCmd::Daily => {
+                let mut p = VaultPane::new(symbol);
+                p.daily_tab = true;
+                self.open_panel(PaneKind::Vault(Box::new(p)));
+            }
+            crate::command::VaultCmd::DailyRefresh { symbol: target } => {
+                if self.worker.mode() == tr_data::DataMode::ExplicitSample {
+                    self.status = "VAULT OFF · sample mode never reads or writes the vault".into();
+                } else {
+                    self.worker.send(Request::VaultDailyRefresh { symbols: target.map(|t| vec![t]) });
+                    let mut p = VaultPane::new(None);
+                    p.daily_tab = true;
+                    self.open_panel(PaneKind::Vault(Box::new(p)));
+                }
+            }
+            crate::command::VaultCmd::DailyCancel => {
+                if self.worker.mode() != tr_data::DataMode::ExplicitSample {
+                    self.worker.send(Request::VaultDailyCancel);
+                }
+            }
             crate::command::VaultCmd::Prune => {
                 let mut p = VaultPane::new(symbol);
                 p.confirm_prune = true;
@@ -342,6 +509,48 @@ mod tests {
                 assert_ne!(shapes[i], shapes[j]);
             }
         }
+    }
+    #[test]
+    fn daily_vault_paint_is_snapshot_only() {
+        use tr_data::vault::daily::*;
+        let (worker, mut requests) = Worker::test_live_channel();
+        let summary = DailySummary {
+            id: DailySeriesId { symbol: "AAPL US Equity".into(), source: "native:yahoo#quote-ohlcv-v1".into() },
+            basis: AdjustmentBasis::ProviderQuoteOhlcvV1,
+            policy: DailyClosePolicy::UsCashV1,
+            generation: 2,
+            first_date: "2020-01-02".parse().ok(),
+            last_date: "2026-11-10".parse().ok(),
+            bars: 1700,
+            closed_thru: "2026-11-10".parse().ok(),
+            missing_sessions: Some(3),
+            last_fetch_at: Some(1_790_000_000),
+            last_attempt_at: Some(1_790_000_100),
+            last_error: None,
+            revisions: 1,
+            pending_revisions: 1,
+            coverage: "partial".into(),
+            content_hash: Some(7),
+        };
+        let mut pane = VaultPane::new(None);
+        pane.daily_tab = true;
+        pane.snapshot = Some(Arc::new(VaultSnapshot { daily: vec![summary.clone()], ..Default::default() }));
+        let ctx = egui::Context::default();
+        for _ in 0..3 {
+            let mut output = ctx.run_ui(egui::RawInput::default(), |ui| pane.show(ui, 1, &worker));
+            output.textures_delta.clear();
+        }
+        assert!(requests.try_recv().is_err(), "repainting sends no requests");
+        let (status, bad) = daily_status(&summary, false);
+        assert!(bad && status.contains("REVISION PENDING"));
+        let text = daily_row_text(&summary, "2026-11-12".parse().unwrap());
+        assert!(text.contains("closed 2026-11-10 (+2d") && text.contains("missing 3") && text.contains("1700"), "{text}");
+        let unknown = DailySummary { policy: DailyClosePolicy::ConservativeSuccessorV1, missing_sessions: None, ..summary };
+        assert!(daily_row_text(&unknown, "2026-11-12".parse().unwrap()).contains("unknown calendar"));
+        // Stale generations are ignored.
+        pane.generation = 5;
+        pane.accept(4, Err("late".into()));
+        assert!(pane.error.is_none());
     }
     #[test]
     fn stale_snapshot_cannot_replace_current_generation() {

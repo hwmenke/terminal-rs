@@ -20,6 +20,9 @@ mod themes;
 mod widgets;
 mod worker;
 mod daily_research;
+mod daily_vault;
+#[cfg(test)]
+mod daily_vault_tests;
 mod fmt_num;
 
 use std::time::Instant;

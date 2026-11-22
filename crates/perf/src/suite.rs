@@ -234,6 +234,80 @@ pub fn all(scale: Scale) -> Vec<Case> {
         let o = bb(v.borrow_mut().ingest(&i, &b[b.len() - 390..], DataMode::Live, cut).unwrap());
         o.inserted + o.confirmed + o.corrected
     });
+    {
+        // Daily Vault (deterministic constructed inputs; every database is built outside the timed region).
+        use tr_data::vault::daily::{
+            AdjustmentBasis, DailyClosePolicy, DailyExtent, DailyFetch, DailyIngest, DailyRead, DailySeriesId,
+        };
+        let n = if full { 25_000 } else { 500 };
+        let observed = 1_795_132_800; // 2026-11-20T00:00Z: every fixture row (last 2026-10-30) is closed
+        let dsym = "AAPL US Equity";
+        let mk = |symbol: &str, bars: Vec<tr_core::Bar>, extent| DailyFetch {
+            id: DailySeriesId { symbol: symbol.into(), source: "bench-fixture#quote-ohlcv-v1".into() },
+            basis: AdjustmentBasis::ProviderQuoteOhlcvV1,
+            close_policy: DailyClosePolicy::UsCashV1,
+            fetched_at: observed,
+            observed_at: observed,
+            upstream_fetched_at: None,
+            bars,
+            extent,
+            full_compare: false,
+        };
+        let a = fixtures::daily(n, 11);
+        let dvault = Rc::new(RefCell::new(BarVault::open_in_memory().unwrap()));
+        dvault.borrow_mut().daily_ingest(&mk(dsym, a.clone(), DailyExtent::FullAvailable)).unwrap();
+        let did = DailySeriesId { symbol: dsym.into(), source: "bench-fixture#quote-ohlcv-v1".into() };
+        let (v, i) = (dvault.clone(), did.clone());
+        add!("data.daily_vault_read_25k", move || match v.borrow().daily_read(&i).unwrap() {
+            DailyRead::Hit(h) => {
+                assert_eq!(h.bars.len(), n);
+                assert!(h.bars.iter().all(|b| b.valid_ohlc()));
+                h.bars.len()
+            }
+            DailyRead::Empty => panic!("daily series missing"),
+        });
+        let (v, tail) = (dvault.clone(), a[a.len() - 10..].to_vec());
+        let upd = mk(dsym, tail, DailyExtent::Window);
+        add!("data.daily_vault_update_10_of_25k", move || {
+            let DailyIngest::Stored(o) = bb(v.borrow_mut().daily_ingest(bb(&upd)).unwrap()) else { panic!("rejected") };
+            assert_eq!((o.confirmed, o.inserted, o.revised), (10, 0, 0));
+            assert!(o.content_hash != 0);
+            o.confirmed
+        });
+        let many = Rc::new(RefCell::new(BarVault::open_in_memory().unwrap()));
+        let small = fixtures::daily(20, 12);
+        for k in 0..500 {
+            many.borrow_mut()
+                .daily_ingest(&mk(&format!("P{k:04} US Equity"), small.clone(), DailyExtent::Window))
+                .unwrap();
+        }
+        let v = many.clone();
+        add!("data.daily_vault_snapshot_500", move || {
+            let s = bb(v.borrow().daily_summaries(None).unwrap());
+            assert_eq!(s.len(), 500);
+            assert!(s.iter().all(|x| x.bars == 20 && x.content_hash.is_some()));
+            s.len()
+        });
+        // Alternate between two scalings of the same dates: every iteration is a real revision.
+        let scaled: Vec<tr_core::Bar> = a
+            .iter()
+            .map(|b| tr_core::Bar { open: b.open * 1.5, high: b.high * 1.5, low: b.low * 1.5, close: b.close * 1.5, ..*b })
+            .collect();
+        // Index 0 = original (active at start), index 1 = scaled; the first iteration applies the scaled one.
+        let versions = [mk(dsym, a.clone(), DailyExtent::FullAvailable), mk(dsym, scaled, DailyExtent::FullAvailable)];
+        let rvault = Rc::new(RefCell::new(BarVault::open_in_memory().unwrap()));
+        rvault.borrow_mut().daily_ingest(&mk(dsym, a.clone(), DailyExtent::FullAvailable)).unwrap();
+        let (v, flip) = (rvault, std::cell::Cell::new(1usize));
+        add!("data.daily_vault_replace_25k", move || {
+            let k = flip.get();
+            flip.set(k + 1);
+            let DailyIngest::Stored(o) = bb(v.borrow_mut().daily_ingest(bb(&versions[k % 2])).unwrap()) else {
+                panic!("rejected")
+            };
+            assert!(o.replaced && o.revised == n && o.generation as usize >= 2);
+            o.revised
+        });
+    }
     let b = m1.clone();
     add!("data.bars_digest_23k", move || {
         bb(stable_hash::bars_digest(bb(&b)));

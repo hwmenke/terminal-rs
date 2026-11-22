@@ -1519,6 +1519,7 @@ impl TerminalApp {
         app.worker
             .send(Request::ConfigureWhatsNews { epoch: app.whats_news_epoch, config: app.prefs.whats_news.clone() });
         app.apply_doc(doc);
+        app.submit_daily_vault();
         if !app.store.exists(&app.layout_name) {
             app.save_layout();
         }
@@ -2059,6 +2060,22 @@ impl TerminalApp {
                     if let Some(PaneKind::Vault(p)) = self.panes.iter_mut().find(|p| p.id == pane).map(|p| &mut p.kind)
                     {
                         p.accept(generation, result);
+                    }
+                }
+                Response::VaultDailyProgress(progress) => {
+                    // Progress only updates state; a changed result count asks for a fresh
+                    // snapshot (a request, never a paint-time read).
+                    let worker = &self.worker;
+                    for pane in &mut self.panes {
+                        if let PaneKind::Vault(v) = &mut pane.kind {
+                            let moved = v.progress.as_ref().is_none_or(|old| {
+                                old.done + old.failed != progress.done + progress.failed || old.running != progress.running
+                            });
+                            v.progress = Some(progress.clone());
+                            if moved {
+                                v.request(pane.id, worker);
+                            }
+                        }
                     }
                 }
 
